@@ -367,10 +367,14 @@ fn read_entry(
         _ => bail!("Unknown type tag: {}", type_tag),
     };
 
+    let now = Instant::now();
     let entry = Entry {
         value,
         expires_at,
-        created_at: Instant::now(),
+        created_at: now,
+        version: 0,
+        last_access: now,
+        access_counter: 5,
     };
 
     Ok((key, entry))
