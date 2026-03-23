@@ -1,7 +1,8 @@
 //! Auto-save timer: triggers BGSAVE based on configured rules (N changes in M seconds).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;

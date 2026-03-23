@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use rand::seq::IndexedRandom;
@@ -20,7 +21,7 @@ pub async fn run_active_expiration(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let mut dbs = db.lock().unwrap();
+                let mut dbs = db.lock();
                 for db in dbs.iter_mut() {
                     expire_cycle(db);
                 }

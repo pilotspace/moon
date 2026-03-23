@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use bytes::Bytes;
 use tracing::{error, info};
@@ -37,7 +38,7 @@ pub fn bgsave_start(
 
     // Clone snapshot under the lock
     let snapshot: Vec<Vec<(Bytes, crate::storage::entry::Entry)>> = {
-        let dbs = db.lock().unwrap();
+        let dbs = db.lock();
         dbs.iter()
             .map(|db| {
                 db.data()

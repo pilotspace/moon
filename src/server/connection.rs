@@ -1,8 +1,9 @@
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use parking_lot::Mutex;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -59,6 +60,11 @@ fn extract_bytes(frame: &Frame) -> Option<Bytes> {
 /// the connection enters subscriber mode where only SUBSCRIBE, UNSUBSCRIBE,
 /// PSUBSCRIBE, PUNSUBSCRIBE, PING, and QUIT commands are accepted. Published
 /// messages are forwarded via tokio::select! on the subscriber's mpsc receiver.
+///
+/// Pipeline batching: In normal mode, collects all immediately available frames
+/// into a batch, executes them under a single lock acquisition, then writes all
+/// responses outside the lock. This reduces lock acquisitions from N per pipeline
+/// to 1 per batch cycle.
 pub async fn handle_connection(
     stream: TcpStream,
     db: Arc<Mutex<Vec<Database>>>,
@@ -105,7 +111,7 @@ pub async fn handle_connection(
                                         for arg in cmd_args {
                                             if let Some(channel) = extract_bytes(arg) {
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                pubsub_registry.lock().unwrap().subscribe(channel.clone(), sub);
+                                                pubsub_registry.lock().subscribe(channel.clone(), sub);
                                                 subscription_count += 1;
                                                 if framed.send(pubsub::subscribe_response(&channel, subscription_count)).await.is_err() {
                                                     break;
@@ -116,10 +122,10 @@ pub async fn handle_connection(
                                     b"UNSUBSCRIBE" => {
                                         if cmd_args.is_empty() {
                                             // Unsubscribe from all channels
-                                            let removed = pubsub_registry.lock().unwrap().unsubscribe_all(subscriber_id);
+                                            let removed = pubsub_registry.lock().unsubscribe_all(subscriber_id);
                                             if removed.is_empty() {
                                                 // No channels, send response with count 0
-                                                subscription_count = pubsub_registry.lock().unwrap().total_subscription_count(subscriber_id);
+                                                subscription_count = pubsub_registry.lock().total_subscription_count(subscriber_id);
                                                 let _ = framed.send(pubsub::unsubscribe_response(
                                                     &Bytes::from_static(b""),
                                                     subscription_count,
@@ -135,7 +141,7 @@ pub async fn handle_connection(
                                         } else {
                                             for arg in cmd_args {
                                                 if let Some(channel) = extract_bytes(arg) {
-                                                    pubsub_registry.lock().unwrap().unsubscribe(channel.as_ref(), subscriber_id);
+                                                    pubsub_registry.lock().unsubscribe(channel.as_ref(), subscriber_id);
                                                     subscription_count = subscription_count.saturating_sub(1);
                                                     if framed.send(pubsub::unsubscribe_response(&channel, subscription_count)).await.is_err() {
                                                         break;
@@ -154,7 +160,7 @@ pub async fn handle_connection(
                                         for arg in cmd_args {
                                             if let Some(pattern) = extract_bytes(arg) {
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                pubsub_registry.lock().unwrap().psubscribe(pattern.clone(), sub);
+                                                pubsub_registry.lock().psubscribe(pattern.clone(), sub);
                                                 subscription_count += 1;
                                                 if framed.send(pubsub::psubscribe_response(&pattern, subscription_count)).await.is_err() {
                                                     break;
@@ -164,9 +170,9 @@ pub async fn handle_connection(
                                     }
                                     b"PUNSUBSCRIBE" => {
                                         if cmd_args.is_empty() {
-                                            let removed = pubsub_registry.lock().unwrap().punsubscribe_all(subscriber_id);
+                                            let removed = pubsub_registry.lock().punsubscribe_all(subscriber_id);
                                             if removed.is_empty() {
-                                                subscription_count = pubsub_registry.lock().unwrap().total_subscription_count(subscriber_id);
+                                                subscription_count = pubsub_registry.lock().total_subscription_count(subscriber_id);
                                                 let _ = framed.send(pubsub::punsubscribe_response(
                                                     &Bytes::from_static(b""),
                                                     subscription_count,
@@ -182,7 +188,7 @@ pub async fn handle_connection(
                                         } else {
                                             for arg in cmd_args {
                                                 if let Some(pattern) = extract_bytes(arg) {
-                                                    pubsub_registry.lock().unwrap().punsubscribe(pattern.as_ref(), subscriber_id);
+                                                    pubsub_registry.lock().punsubscribe(pattern.as_ref(), subscriber_id);
                                                     subscription_count = subscription_count.saturating_sub(1);
                                                     if framed.send(pubsub::punsubscribe_response(&pattern, subscription_count)).await.is_err() {
                                                         break;
@@ -243,96 +249,118 @@ pub async fn handle_connection(
             continue;
         }
 
-        // Normal mode
+        // Normal mode with pipeline batching
         tokio::select! {
-            result = framed.next() => {
-                match result {
-                    Some(Ok(frame)) => {
-                        // Check auth gate before dispatching
-                        if !authenticated {
-                            match extract_command(&frame) {
-                                Some((ref cmd, cmd_args)) if cmd.as_slice() == b"AUTH" => {
-                                    let response = conn_cmd::auth(cmd_args, &requirepass);
-                                    if response == Frame::SimpleString(Bytes::from_static(b"OK")) {
-                                        authenticated = true;
-                                    }
-                                    if framed.send(response).await.is_err() {
-                                        break;
-                                    }
-                                    continue;
+            first_result = framed.next() => {
+                let first_frame = match first_result {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(_)) => break,
+                    None => break,
+                };
+
+                // Collect batch: first frame + all immediately available frames
+                let mut batch = vec![first_frame];
+                const MAX_BATCH: usize = 1024;
+                while batch.len() < MAX_BATCH {
+                    match framed.next().now_or_never() {
+                        Some(Some(Ok(frame))) => batch.push(frame),
+                        _ => break,
+                    }
+                }
+
+                // Process batch
+                let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
+                let mut aof_entries: Vec<Bytes> = Vec::new();
+                let mut should_quit = false;
+                let mut break_outer = false;
+
+                for frame in batch {
+                    // --- AUTH gate (unauthenticated) ---
+                    if !authenticated {
+                        match extract_command(&frame) {
+                            Some((ref cmd, cmd_args)) if cmd.as_slice() == b"AUTH" => {
+                                let response = conn_cmd::auth(cmd_args, &requirepass);
+                                if response == Frame::SimpleString(Bytes::from_static(b"OK")) {
+                                    authenticated = true;
                                 }
-                                Some((ref cmd, _)) if cmd.as_slice() == b"QUIT" => {
-                                    let _ = framed.send(Frame::SimpleString(Bytes::from_static(b"OK"))).await;
-                                    break;
-                                }
-                                _ => {
-                                    if framed.send(Frame::Error(
-                                        Bytes::from_static(b"NOAUTH Authentication required.")
-                                    )).await.is_err() {
-                                        break;
-                                    }
-                                    continue;
-                                }
+                                responses.push(response);
+                                continue;
+                            }
+                            Some((ref cmd, _)) if cmd.as_slice() == b"QUIT" => {
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                should_quit = true;
+                                break;
+                            }
+                            _ => {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"NOAUTH Authentication required.")
+                                ));
+                                continue;
                             }
                         }
+                    }
 
-                        // Handle AUTH when already authenticated
-                        if let Some((ref cmd, cmd_args)) = extract_command(&frame) {
-                            if cmd.as_slice() == b"AUTH" {
-                                let response = conn_cmd::auth(cmd_args, &requirepass);
-                                if framed.send(response).await.is_err() {
+                    // --- Connection-level command intercepts (no db lock needed) ---
+                    if let Some((ref cmd, cmd_args)) = extract_command(&frame) {
+                        // AUTH when already authenticated
+                        if cmd.as_slice() == b"AUTH" {
+                            responses.push(conn_cmd::auth(cmd_args, &requirepass));
+                            continue;
+                        }
+                        // BGSAVE -- handle outside lock
+                        if cmd.as_slice() == b"BGSAVE" {
+                            let response = crate::command::persistence::bgsave_start(
+                                db.clone(),
+                                config.dir.clone(),
+                                config.dbfilename.clone(),
+                            );
+                            responses.push(response);
+                            continue;
+                        }
+                        // BGREWRITEAOF
+                        if cmd.as_slice() == b"BGREWRITEAOF" {
+                            let response = if let Some(ref tx) = aof_tx {
+                                crate::command::persistence::bgrewriteaof_start(tx, db.clone())
+                            } else {
+                                Frame::Error(Bytes::from_static(b"ERR AOF is not enabled"))
+                            };
+                            responses.push(response);
+                            continue;
+                        }
+                        // CONFIG
+                        if cmd.as_slice() == b"CONFIG" {
+                            responses.push(handle_config(cmd_args, &runtime_config, &config));
+                            continue;
+                        }
+                        // SUBSCRIBE / PSUBSCRIBE: enter subscriber mode
+                        // Flush accumulated responses first, then handle subscribe and break batch
+                        if cmd.as_slice() == b"SUBSCRIBE" || cmd.as_slice() == b"PSUBSCRIBE" {
+                            // Flush accumulated responses first
+                            for resp in responses.drain(..) {
+                                if framed.send(resp).await.is_err() {
+                                    break_outer = true;
                                     break;
                                 }
-                                continue;
                             }
-                            if cmd.as_slice() == b"BGSAVE" {
-                                let response = crate::command::persistence::bgsave_start(
-                                    db.clone(),
-                                    config.dir.clone(),
-                                    config.dbfilename.clone(),
-                                );
-                                if framed.send(response).await.is_err() {
-                                    break;
-                                }
-                                continue;
+                            if break_outer {
+                                break;
                             }
-                            if cmd.as_slice() == b"BGREWRITEAOF" {
+                            // Send AOF entries accumulated so far
+                            for bytes in aof_entries.drain(..) {
                                 if let Some(ref tx) = aof_tx {
-                                    let response = crate::command::persistence::bgrewriteaof_start(
-                                        tx,
-                                        db.clone(),
-                                    );
-                                    if framed.send(response).await.is_err() {
-                                        break;
-                                    }
-                                } else {
-                                    if framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR AOF is not enabled"),
-                                    )).await.is_err() {
-                                        break;
-                                    }
+                                    let _ = tx.send(AofMessage::Append(bytes)).await;
                                 }
-                                continue;
+                                if let Some(ref counter) = change_counter {
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-
-                            // Intercept CONFIG command
-                            if cmd.as_slice() == b"CONFIG" {
-                                let response = handle_config(cmd_args, &runtime_config, &config);
-                                if framed.send(response).await.is_err() {
-                                    break;
-                                }
-                                continue;
-                            }
-
-                            // SUBSCRIBE / PSUBSCRIBE: enter subscriber mode
-                            if cmd.as_slice() == b"SUBSCRIBE" || cmd.as_slice() == b"PSUBSCRIBE" {
-                                if cmd_args.is_empty() {
-                                    let cmd_lower = if cmd.as_slice() == b"SUBSCRIBE" { "subscribe" } else { "psubscribe" };
-                                    let _ = framed.send(Frame::Error(Bytes::from(format!(
-                                        "ERR wrong number of arguments for '{}' command", cmd_lower
-                                    )))).await;
-                                    continue;
-                                }
+                            // Handle subscribe
+                            if cmd_args.is_empty() {
+                                let cmd_lower = if cmd.as_slice() == b"SUBSCRIBE" { "subscribe" } else { "psubscribe" };
+                                let _ = framed.send(Frame::Error(Bytes::from(format!(
+                                    "ERR wrong number of arguments for '{}' command", cmd_lower
+                                )))).await;
+                            } else {
                                 // Allocate subscriber resources if not yet done
                                 if pubsub_tx.is_none() {
                                     let (tx, rx) = mpsc::channel::<Frame>(256);
@@ -345,7 +373,7 @@ pub async fn handle_connection(
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
                                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                         {
-                                            let mut registry = pubsub_registry.lock().unwrap();
+                                            let mut registry = pubsub_registry.lock();
                                             if is_pattern {
                                                 registry.psubscribe(channel_or_pattern.clone(), sub);
                                             } else {
@@ -359,234 +387,209 @@ pub async fn handle_connection(
                                             pubsub::subscribe_response(&channel_or_pattern, subscription_count)
                                         };
                                         if framed.send(response).await.is_err() {
+                                            break_outer = true;
                                             break;
                                         }
                                     }
                                 }
-                                continue; // next iteration enters subscriber mode
                             }
-
-                            // PUBLISH: fan out through registry (not a write command for AOF)
-                            if cmd.as_slice() == b"PUBLISH" {
-                                if cmd_args.len() != 2 {
-                                    let _ = framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
-                                    )).await;
-                                    continue;
-                                }
-                                let channel = match extract_bytes(&cmd_args[0]) {
-                                    Some(b) => b,
-                                    None => {
-                                        let _ = framed.send(Frame::Error(
-                                            Bytes::from_static(b"ERR invalid channel"),
-                                        )).await;
-                                        continue;
-                                    }
-                                };
-                                let message = match extract_bytes(&cmd_args[1]) {
-                                    Some(b) => b,
-                                    None => {
-                                        let _ = framed.send(Frame::Error(
-                                            Bytes::from_static(b"ERR invalid message"),
-                                        )).await;
-                                        continue;
-                                    }
-                                };
-                                let count = pubsub_registry.lock().unwrap().publish(&channel, &message);
-                                if framed.send(Frame::Integer(count)).await.is_err() {
-                                    break;
-                                }
-                                continue;
-                            }
-
-                            // UNSUBSCRIBE / PUNSUBSCRIBE when not subscribed
-                            if cmd.as_slice() == b"UNSUBSCRIBE" {
-                                let channel_name = if !cmd_args.is_empty() {
-                                    extract_bytes(&cmd_args[0]).unwrap_or(Bytes::from_static(b""))
-                                } else {
-                                    Bytes::from_static(b"")
-                                };
-                                let _ = framed.send(pubsub::unsubscribe_response(&channel_name, 0)).await;
-                                continue;
-                            }
-                            if cmd.as_slice() == b"PUNSUBSCRIBE" {
-                                let pattern_name = if !cmd_args.is_empty() {
-                                    extract_bytes(&cmd_args[0]).unwrap_or(Bytes::from_static(b""))
-                                } else {
-                                    Bytes::from_static(b"")
-                                };
-                                let _ = framed.send(pubsub::punsubscribe_response(&pattern_name, 0)).await;
-                                continue;
-                            }
-
-                            // --- Transaction commands: MULTI/EXEC/DISCARD/WATCH/UNWATCH ---
-
-                            if cmd.as_slice() == b"MULTI" {
-                                if in_multi {
-                                    let _ = framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR MULTI calls can not be nested"),
-                                    )).await;
-                                } else {
-                                    in_multi = true;
-                                    command_queue.clear();
-                                    let _ = framed.send(Frame::SimpleString(
-                                        Bytes::from_static(b"OK"),
-                                    )).await;
-                                }
-                                continue;
-                            }
-
-                            if cmd.as_slice() == b"EXEC" {
-                                if !in_multi {
-                                    let _ = framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR EXEC without MULTI"),
-                                    )).await;
-                                } else {
-                                    in_multi = false;
-                                    let (result, aof_entries) = execute_transaction(
-                                        &db,
-                                        &command_queue,
-                                        &watched_keys,
-                                        &mut selected_db,
-                                    );
-                                    command_queue.clear();
-                                    watched_keys.clear();
-                                    // Send AOF entries collected during atomic execution
-                                    for bytes in aof_entries {
-                                        if let Some(ref tx) = aof_tx {
-                                            let _ = tx.send(AofMessage::Append(bytes)).await;
-                                        }
-                                        if let Some(ref counter) = change_counter {
-                                            counter.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                    let _ = framed.send(result).await;
-                                }
-                                continue;
-                            }
-
-                            if cmd.as_slice() == b"DISCARD" {
-                                if !in_multi {
-                                    let _ = framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR DISCARD without MULTI"),
-                                    )).await;
-                                } else {
-                                    in_multi = false;
-                                    command_queue.clear();
-                                    watched_keys.clear();
-                                    let _ = framed.send(Frame::SimpleString(
-                                        Bytes::from_static(b"OK"),
-                                    )).await;
-                                }
-                                continue;
-                            }
-
-                            if cmd.as_slice() == b"WATCH" {
-                                if in_multi {
-                                    let _ = framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR WATCH inside MULTI is not allowed"),
-                                    )).await;
-                                } else if cmd_args.is_empty() {
-                                    let _ = framed.send(Frame::Error(
-                                        Bytes::from_static(b"ERR wrong number of arguments for 'watch' command"),
-                                    )).await;
-                                } else {
-                                    {
-                                        let dbs = db.lock().unwrap();
-                                        for arg in cmd_args {
-                                            if let Frame::BulkString(key) = arg {
-                                                let version = dbs[selected_db].get_version(key);
-                                                watched_keys.insert(key.clone(), version);
-                                            }
-                                        }
-                                    } // MutexGuard dropped here before await
-                                    let _ = framed.send(Frame::SimpleString(
-                                        Bytes::from_static(b"OK"),
-                                    )).await;
-                                }
-                                continue;
-                            }
-
-                            if cmd.as_slice() == b"UNWATCH" {
-                                watched_keys.clear();
-                                let _ = framed.send(Frame::SimpleString(
-                                    Bytes::from_static(b"OK"),
-                                )).await;
-                                continue;
-                            }
+                            // Remaining batch frames after SUBSCRIBE are dropped (subscriber mode takes over)
+                            break;
                         }
-
-                        // If in MULTI mode, queue the command and respond QUEUED
-                        if in_multi {
-                            command_queue.push(frame);
-                            let _ = framed.send(Frame::SimpleString(
-                                Bytes::from_static(b"QUEUED"),
-                            )).await;
+                        // PUBLISH
+                        if cmd.as_slice() == b"PUBLISH" {
+                            if cmd_args.len() != 2 {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
+                                ));
+                            } else {
+                                let channel = extract_bytes(&cmd_args[0]);
+                                let message = extract_bytes(&cmd_args[1]);
+                                match (channel, message) {
+                                    (Some(ch), Some(msg)) => {
+                                        let count = pubsub_registry.lock().publish(&ch, &msg);
+                                        responses.push(Frame::Integer(count));
+                                    }
+                                    _ => responses.push(Frame::Error(
+                                        Bytes::from_static(b"ERR invalid channel or message"),
+                                    )),
+                                }
+                            }
                             continue;
                         }
-
-                        // Check if this is a write command BEFORE dispatch (which consumes the frame)
-                        let is_write = extract_command(&frame)
-                            .map(|(ref cmd, _)| aof::is_write_command(cmd))
-                            .unwrap_or(false);
-
-                        // If this is a write command, check eviction first
-                        if is_write {
-                            let eviction_result = {
-                                let rt = runtime_config.read().unwrap();
-                                let mut dbs = db.lock().unwrap();
-                                try_evict_if_needed(&mut dbs[selected_db], &rt)
+                        // UNSUBSCRIBE / PUNSUBSCRIBE when not subscribed
+                        if cmd.as_slice() == b"UNSUBSCRIBE" {
+                            let ch = if !cmd_args.is_empty() {
+                                extract_bytes(&cmd_args[0]).unwrap_or(Bytes::from_static(b""))
+                            } else {
+                                Bytes::from_static(b"")
                             };
-                            if let Err(oom_frame) = eviction_result {
-                                if framed.send(oom_frame).await.is_err() {
-                                    break;
-                                }
-                                continue;
+                            responses.push(pubsub::unsubscribe_response(&ch, 0));
+                            continue;
+                        }
+                        if cmd.as_slice() == b"PUNSUBSCRIBE" {
+                            let pat = if !cmd_args.is_empty() {
+                                extract_bytes(&cmd_args[0]).unwrap_or(Bytes::from_static(b""))
+                            } else {
+                                Bytes::from_static(b"")
+                            };
+                            responses.push(pubsub::punsubscribe_response(&pat, 0));
+                            continue;
+                        }
+                        // MULTI
+                        if cmd.as_slice() == b"MULTI" {
+                            if in_multi {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR MULTI calls can not be nested"),
+                                ));
+                            } else {
+                                in_multi = true;
+                                command_queue.clear();
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             }
+                            continue;
                         }
-
-                        // Serialize for AOF before dispatch consumes the frame
-                        let aof_bytes = if is_write && aof_tx.is_some() {
-                            let mut buf = BytesMut::new();
-                            crate::protocol::serialize::serialize(&frame, &mut buf);
-                            Some(buf.freeze())
-                        } else {
-                            None
-                        };
-
-                        // Normal dispatch
-                        let result = {
-                            let mut dbs = db.lock().unwrap();
-                            let db_count = dbs.len();
-                            dispatch(&mut dbs[selected_db], frame, &mut selected_db, db_count)
-                        };
-                        let (response, should_quit) = match result {
-                            DispatchResult::Response(f) => (f, false),
-                            DispatchResult::Quit(f) => (f, true),
-                        };
-
-                        // Log to AOF after successful dispatch (not error responses)
-                        if let Some(bytes) = aof_bytes {
-                            if !matches!(&response, Frame::Error(_)) {
-                                if let Some(ref tx) = aof_tx {
-                                    let _ = tx.send(AofMessage::Append(bytes)).await;
-                                }
-                                // Increment change counter for auto-save
-                                if let Some(ref counter) = change_counter {
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
+                        // EXEC
+                        if cmd.as_slice() == b"EXEC" {
+                            if !in_multi {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR EXEC without MULTI"),
+                                ));
+                            } else {
+                                in_multi = false;
+                                let (result, txn_aof_entries) = execute_transaction(
+                                    &db,
+                                    &command_queue,
+                                    &watched_keys,
+                                    &mut selected_db,
+                                );
+                                command_queue.clear();
+                                watched_keys.clear();
+                                responses.push(result);
+                                aof_entries.extend(txn_aof_entries);
                             }
+                            continue;
                         }
-
-                        if framed.send(response).await.is_err() {
-                            break;
+                        // DISCARD
+                        if cmd.as_slice() == b"DISCARD" {
+                            if !in_multi {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR DISCARD without MULTI"),
+                                ));
+                            } else {
+                                in_multi = false;
+                                command_queue.clear();
+                                watched_keys.clear();
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            }
+                            continue;
                         }
-                        if should_quit {
-                            break;
+                        // WATCH
+                        if cmd.as_slice() == b"WATCH" {
+                            if in_multi {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR WATCH inside MULTI is not allowed"),
+                                ));
+                            } else if cmd_args.is_empty() {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR wrong number of arguments for 'watch' command"),
+                                ));
+                            } else {
+                                let dbs = db.lock();
+                                for arg in cmd_args {
+                                    if let Frame::BulkString(key) = arg {
+                                        let version = dbs[selected_db].get_version(key);
+                                        watched_keys.insert(key.clone(), version);
+                                    }
+                                }
+                                // guard dropped here
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            }
+                            continue;
+                        }
+                        // UNWATCH
+                        if cmd.as_slice() == b"UNWATCH" {
+                            watched_keys.clear();
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            continue;
                         }
                     }
-                    Some(Err(_)) => break,
-                    None => break,
+
+                    // --- MULTI queue mode ---
+                    if in_multi {
+                        command_queue.push(frame);
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                        continue;
+                    }
+
+                    // --- Normal dispatch (needs db lock) ---
+                    let is_write = extract_command(&frame)
+                        .map(|(ref cmd, _)| aof::is_write_command(cmd))
+                        .unwrap_or(false);
+
+                    // Serialize for AOF before dispatch
+                    let aof_bytes = if is_write && aof_tx.is_some() {
+                        let mut buf = BytesMut::new();
+                        crate::protocol::serialize::serialize(&frame, &mut buf);
+                        Some(buf.freeze())
+                    } else {
+                        None
+                    };
+
+                    // Eviction check + dispatch under single lock
+                    let result = {
+                        let mut dbs = db.lock();
+                        // Eviction once per write
+                        if is_write {
+                            let rt = runtime_config.read().unwrap();
+                            if let Err(oom_frame) = try_evict_if_needed(&mut dbs[selected_db], &rt) {
+                                responses.push(oom_frame);
+                                continue; // Skip this command but process rest of batch
+                            }
+                        }
+                        let db_count = dbs.len();
+                        dispatch(&mut dbs[selected_db], frame, &mut selected_db, db_count)
+                    }; // MutexGuard dropped here -- BEFORE any await
+
+                    let (response, quit) = match result {
+                        DispatchResult::Response(f) => (f, false),
+                        DispatchResult::Quit(f) => (f, true),
+                    };
+
+                    // Collect AOF entry for successful writes
+                    if let Some(bytes) = aof_bytes {
+                        if !matches!(&response, Frame::Error(_)) {
+                            aof_entries.push(bytes);
+                        }
+                    }
+
+                    responses.push(response);
+                    if quit {
+                        should_quit = true;
+                        break;
+                    }
+                }
+
+                // --- Write all responses OUTSIDE the lock ---
+                for response in responses {
+                    if framed.send(response).await.is_err() {
+                        break_outer = true;
+                        break;
+                    }
+                }
+
+                // --- Send AOF entries OUTSIDE the lock ---
+                for bytes in aof_entries {
+                    if let Some(ref tx) = aof_tx {
+                        let _ = tx.send(AofMessage::Append(bytes)).await;
+                    }
+                    if let Some(ref counter) = change_counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                if break_outer || should_quit {
+                    break;
                 }
             }
             _ = shutdown.cancelled() => {
@@ -600,7 +603,7 @@ pub async fn handle_connection(
 
     // Cleanup: remove subscriber from all channels/patterns on disconnect
     if subscriber_id != 0 {
-        let mut registry = pubsub_registry.lock().unwrap();
+        let mut registry = pubsub_registry.lock();
         registry.unsubscribe_all(subscriber_id);
         registry.punsubscribe_all(subscriber_id);
     }
@@ -659,7 +662,7 @@ fn execute_transaction(
     watched_keys: &HashMap<Bytes, u32>,
     selected_db: &mut usize,
 ) -> (Frame, Vec<Bytes>) {
-    let mut dbs = db.lock().unwrap();
+    let mut dbs = db.lock();
     let db_count = dbs.len();
 
     // Check WATCH versions -- if any key's version changed, abort

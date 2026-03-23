@@ -22,6 +22,7 @@ futures = "0.3"
 ordered-float = "5"
 rand = "0.9"
 crc32fast = "1"
+parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

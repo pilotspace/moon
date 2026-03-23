@@ -2,7 +2,8 @@
 //! for crash recovery. Supports three fsync policies and AOF rewriting for compaction.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
@@ -350,7 +351,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 pub async fn rewrite_aof(db: Arc<Mutex<Vec<Database>>>, aof_path: &Path) -> anyhow::Result<()> {
     // Clone database state under lock
     let snapshot: Vec<Vec<(Bytes, Entry)>> = {
-        let dbs = db.lock().unwrap();
+        let dbs = db.lock();
         dbs.iter()
             .map(|db| {
                 db.data()

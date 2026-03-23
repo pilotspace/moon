@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -53,13 +54,13 @@ pub async fn run_with_shutdown(
     let rdb_path = PathBuf::from(&config.dir).join(&config.dbfilename);
 
     if config.appendonly == "yes" && aof_path.exists() {
-        let mut dbs = db.lock().unwrap();
+        let mut dbs = db.lock();
         match aof::replay_aof(&mut dbs, &aof_path) {
             Ok(n) => info!("AOF loaded: {} commands replayed from {}", n, aof_path.display()),
             Err(e) => error!("AOF load failed: {}. Starting with empty database.", e),
         }
     } else if rdb_path.exists() {
-        let mut dbs = db.lock().unwrap();
+        let mut dbs = db.lock();
         match rdb::load(&mut dbs, &rdb_path) {
             Ok(count) => info!("RDB loaded: {} keys from {}", count, rdb_path.display()),
             Err(e) => error!("Failed to load RDB: {}. Starting with empty database.", e),
