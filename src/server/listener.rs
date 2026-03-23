@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::ServerConfig;
+use crate::persistence::rdb;
 use crate::storage::Database;
 
 use super::connection;
@@ -42,6 +44,18 @@ pub async fn run_with_shutdown(
     let databases: Vec<Database> = (0..config.databases).map(|_| Database::new()).collect();
     let db = Arc::new(Mutex::new(databases));
 
+    // Load RDB snapshot on startup if file exists
+    let rdb_path = PathBuf::from(&config.dir).join(&config.dbfilename);
+    if rdb_path.exists() {
+        let mut dbs = db.lock().unwrap();
+        match rdb::load(&mut dbs, &rdb_path) {
+            Ok(count) => info!("RDB loaded: {} keys from {}", count, rdb_path.display()),
+            Err(e) => error!("Failed to load RDB: {}. Starting with empty database.", e),
+        }
+    }
+
+    let config = Arc::new(config);
+
     // Spawn active expiration background task
     let exp_db = db.clone();
     let exp_token = token.child_token();
@@ -56,7 +70,8 @@ pub async fn run_with_shutdown(
                         let db = db.clone();
                         let conn_token = token.child_token();
                         let requirepass = config.requirepass.clone();
-                        tokio::spawn(connection::handle_connection(stream, db, conn_token, requirepass));
+                        let config = config.clone();
+                        tokio::spawn(connection::handle_connection(stream, db, conn_token, requirepass, config));
                     }
                     Err(e) => {
                         error!("Accept error: {}", e);

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::connection as conn_cmd;
 use crate::command::{dispatch, DispatchResult};
+use crate::config::ServerConfig;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
@@ -39,6 +40,7 @@ pub async fn handle_connection(
     db: Arc<Mutex<Vec<Database>>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
+    config: Arc<ServerConfig>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -81,6 +83,17 @@ pub async fn handle_connection(
                         if let Some((ref cmd, cmd_args)) = extract_command(&frame) {
                             if cmd.as_slice() == b"AUTH" {
                                 let response = conn_cmd::auth(cmd_args, &requirepass);
+                                if framed.send(response).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if cmd.as_slice() == b"BGSAVE" {
+                                let response = crate::command::persistence::bgsave_start(
+                                    db.clone(),
+                                    config.dir.clone(),
+                                    config.dbfilename.clone(),
+                                );
                                 if framed.send(response).await.is_err() {
                                     break;
                                 }

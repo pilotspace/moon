@@ -2,6 +2,7 @@ pub mod connection;
 pub mod hash;
 pub mod key;
 pub mod list;
+pub mod persistence;
 pub mod set;
 pub mod sorted_set;
 pub mod string;
