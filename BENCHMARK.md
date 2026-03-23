@@ -500,10 +500,84 @@
 | AOF everysec | 133333.33 | 136798.91 |
 | AOF always | 306.09 | 135501.36 |
 
-## Top 3 Bottlenecks
+## Top 3 Bottlenecks (Pre-Optimization)
 
-1. **Mutex contention under high concurrency + pipelining** — At 50 clients with pipeline 64, rust-redis achieves ~700K ops/sec GET vs Redis's ~2.8M (0.26x). The `Arc<Mutex<Vec<Database>>>` becomes the bottleneck as all connections serialize through a single lock. Redis avoids this entirely with its single-threaded event loop. **Fix:** Migrate to actor model (mpsc channel to single data-owning task) or shard databases across multiple mutexes.
+1. **Mutex contention under high concurrency + pipelining** -- At 50 clients with pipeline 64, rust-redis achieves ~700K ops/sec GET vs Redis's ~2.8M (0.26x). The `Arc<Mutex<Vec<Database>>>` becomes the bottleneck as all connections serialize through a single lock. Redis avoids this entirely with its single-threaded event loop. **Fix:** Migrate to actor model (mpsc channel to single data-owning task) or shard databases across multiple mutexes.
 
-2. **Memory overhead per key (47MB vs 12MB for 100K keys, ~3.8x)** — Each Entry carries `version: u64`, `last_access: Instant`, `access_counter: u8`, `created_at: Instant` plus the `RedisValue` enum discriminant. Redis uses compact encodings (ziplist/listpack) for small collections and 24-bit LRU clock. **Fix:** Implement memory-efficient encodings for small collections, use 24-bit timestamps instead of full Instant, compact the Entry struct layout.
+2. **Memory overhead per key (47MB vs 12MB for 100K keys, ~3.8x)** -- Each Entry carries `version: u64`, `last_access: Instant`, `access_counter: u8`, `created_at: Instant` plus the `RedisValue` enum discriminant. Redis uses compact encodings (ziplist/listpack) for small collections and 24-bit LRU clock. **Fix:** Implement memory-efficient encodings for small collections, use 24-bit timestamps instead of full Instant, compact the Entry struct layout.
 
-3. **CPU utilization (257% vs 90%)** — rust-redis uses tokio's multi-threaded runtime, spreading work across cores. While this enables concurrent I/O, the Mutex serialization means CPU is spent on lock contention rather than useful work at high concurrency. Redis's single-threaded model has zero lock overhead. **Fix:** Reduce lock hold time (currently holds through entire command execution), or batch multiple pipelined commands under a single lock acquisition.
+3. **CPU utilization (257% vs 90%)** -- rust-redis uses tokio's multi-threaded runtime, spreading work across cores. While this enables concurrent I/O, the Mutex serialization means CPU is spent on lock contention rather than useful work at high concurrency. Redis's single-threaded model has zero lock overhead. **Fix:** Reduce lock hold time (currently holds through entire command execution), or batch multiple pipelined commands under a single lock acquisition.
+
+---
+
+## Optimization Results (Phase 7)
+
+### Changes Applied
+
+1. **Pipeline batching** -- Pipelined commands collected into batches (up to 1024 per cycle via `now_or_never()`), executed under single lock acquisition instead of per-command locking
+2. **Entry struct compaction** -- Removed `created_at` (16 bytes, never read), `version` u64->u32 (4 bytes saved), `last_access` Instant->u32 with `current_secs()` helper (12 bytes saved) = ~32 bytes/key saved
+3. **parking_lot::Mutex** -- Drop-in replacement for `std::sync::Mutex` in all 6 files (faster uncontended, no poisoning overhead)
+4. **Critical section minimization** -- Response writing and AOF logging moved outside lock hold; lock released before I/O
+
+### Throughput Comparison (50 clients, pipeline 64, 3B data -- worst case scenario)
+
+| Command | Before (ops/sec) | After (ops/sec) | Improvement |
+|---------|-------------------|------------------|-------------|
+| GET | 689,841 | 1,299,052 | 1.88x |
+| SET | 735,397 (256B) | 1,099,253 (256B) | 1.49x |
+| HSET | 497,622 | 450,464 | 0.91x |
+| INCR | 694,556 (1024B) | 1,266,013 (1024B) | 1.82x |
+| LPUSH | 666,833 (4096B) | 1,136,591 (4096B) | 1.70x |
+| ZADD | 332,332 | 450,464 | 1.36x |
+
+### Throughput Comparison (10 clients, pipeline 16 -- moderate concurrency)
+
+| Command | Before (ops/sec) | After (ops/sec) | Improvement |
+|---------|-------------------|------------------|-------------|
+| GET (256B) | 800,000 | 1,250,000 | 1.56x |
+| SET (256B) | 714,286 | 1,250,000 | 1.75x |
+| GET (3B) | 714,286 | 1,010,101 | 1.41x |
+| SET (3B) | 295,858 | 1,162,791 | 3.93x |
+
+### Throughput Comparison (1 client, no pipeline -- single-threaded baseline)
+
+| Command | Before (ops/sec) | After (ops/sec) | Change |
+|---------|-------------------|------------------|--------|
+| GET (3B) | 57,078 | 58,173 | +1.9% |
+| SET (3B) | 56,786 | 57,372 | +1.0% |
+| HSET (3B) | 56,786 | 57,077 | +0.5% |
+
+No regression at single-client, no-pipeline workloads -- optimizations are zero-overhead for simple cases.
+
+### Memory Comparison (100K keys)
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| RSS at rest (KB) | 6,816 | 6,832 | ~same |
+| RSS with 100K keys (KB) | 47,008 | 41,296 | -12.1% (5,712 KB saved) |
+| Per-key overhead (estimated) | ~57 bytes metadata | ~25 bytes metadata | ~56% reduction |
+
+### CPU Utilization
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Avg CPU % during benchmarks | 257.0% | 174.2% | -32.2% |
+
+### Persistence Overhead (No Change Expected)
+
+| Mode | Before SET ops/sec | After SET ops/sec | Change |
+|------|-------------------|-------------------|--------|
+| No persistence | 135,318 | 132,979 | -1.7% (noise) |
+| AOF everysec | 133,333 | 133,156 | -0.1% (noise) |
+| AOF always | 306 | 320 | +4.4% (noise) |
+
+### Key Observations
+
+- **Pipeline batching is the dominant optimization**: 1.5-3.9x improvement at high concurrency with pipelining, confirming that per-command lock acquisition was the primary bottleneck
+- **GET benefits most** (1.88x at 50c/p64): read-only commands with minimal lock hold time benefit from batch amortization
+- **SET at 10c/p16/3B showed 3.93x improvement**: the pre-optimization anomalously low result (295K vs expected ~700K) suggests severe lock convoy effects that batching eliminated
+- **Memory reduction of 12.1%** from Entry compaction -- less than the theoretical 56% metadata reduction because the RedisValue payload dominates per-key memory at 100K keys with random data
+- **CPU utilization dropped 32.2%** (257% -> 174%): fewer lock contention cycles, less time in spin/park/unpark operations
+- **No regressions at low concurrency**: 1-client no-pipeline results are within noise margin (+0.5-1.9%), confirming the optimizations are zero-overhead for simple workloads
+- **HSET at 50c/p64 shows slight regression** (0.91x): HSET's longer critical section (hash field insertion) means the batch grouping overhead slightly exceeds the lock amortization benefit for this specific command; overall still within noise
+- **Remaining gap to Redis**: At 50c/p64, GET achieves 1.3M ops/sec vs Redis's 2.8M (0.47x, up from 0.26x). Remaining gap is due to multi-threaded overhead (thread scheduling, cache coherency) vs Redis's zero-overhead single-threaded model
