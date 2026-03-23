@@ -3,6 +3,7 @@ pub mod hash;
 pub mod key;
 pub mod list;
 pub mod set;
+pub mod sorted_set;
 pub mod string;
 
 use bytes::Bytes;
@@ -135,6 +136,25 @@ pub fn dispatch(
         b"SRANDMEMBER" => DispatchResult::Response(set::srandmember(db, cmd_args)),
         b"SPOP" => DispatchResult::Response(set::spop(db, cmd_args)),
         b"SSCAN" => DispatchResult::Response(set::sscan(db, cmd_args)),
+        // Sorted set commands
+        b"ZADD" => DispatchResult::Response(sorted_set::zadd(db, cmd_args)),
+        b"ZREM" => DispatchResult::Response(sorted_set::zrem(db, cmd_args)),
+        b"ZSCORE" => DispatchResult::Response(sorted_set::zscore(db, cmd_args)),
+        b"ZCARD" => DispatchResult::Response(sorted_set::zcard(db, cmd_args)),
+        b"ZINCRBY" => DispatchResult::Response(sorted_set::zincrby(db, cmd_args)),
+        b"ZRANK" => DispatchResult::Response(sorted_set::zrank(db, cmd_args)),
+        b"ZREVRANK" => DispatchResult::Response(sorted_set::zrevrank(db, cmd_args)),
+        b"ZPOPMIN" => DispatchResult::Response(sorted_set::zpopmin(db, cmd_args)),
+        b"ZPOPMAX" => DispatchResult::Response(sorted_set::zpopmax(db, cmd_args)),
+        b"ZSCAN" => DispatchResult::Response(sorted_set::zscan(db, cmd_args)),
+        b"ZRANGE" => DispatchResult::Response(sorted_set::zrange(db, cmd_args)),
+        b"ZREVRANGE" => DispatchResult::Response(sorted_set::zrevrange(db, cmd_args)),
+        b"ZRANGEBYSCORE" => DispatchResult::Response(sorted_set::zrangebyscore(db, cmd_args)),
+        b"ZREVRANGEBYSCORE" => DispatchResult::Response(sorted_set::zrevrangebyscore(db, cmd_args)),
+        b"ZCOUNT" => DispatchResult::Response(sorted_set::zcount(db, cmd_args)),
+        b"ZLEXCOUNT" => DispatchResult::Response(sorted_set::zlexcount(db, cmd_args)),
+        b"ZUNIONSTORE" => DispatchResult::Response(sorted_set::zunionstore(db, cmd_args)),
+        b"ZINTERSTORE" => DispatchResult::Response(sorted_set::zinterstore(db, cmd_args)),
         _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
             "ERR unknown command '{}', with args beginning with: ",
             String::from_utf8_lossy(&cmd_name)
