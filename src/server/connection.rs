@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
@@ -78,6 +79,11 @@ pub async fn handle_connection(
     let mut pubsub_rx: Option<mpsc::Receiver<Frame>> = None;
     let mut pubsub_tx: Option<mpsc::Sender<Frame>> = None;
     let mut subscriber_id: u64 = 0;
+
+    // Transaction (MULTI/EXEC) connection-local state
+    let mut in_multi: bool = false;
+    let mut command_queue: Vec<Frame> = Vec::new();
+    let mut watched_keys: HashMap<Bytes, u64> = HashMap::new();
 
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
@@ -412,6 +418,111 @@ pub async fn handle_connection(
                                 let _ = framed.send(pubsub::punsubscribe_response(&pattern_name, 0)).await;
                                 continue;
                             }
+
+                            // --- Transaction commands: MULTI/EXEC/DISCARD/WATCH/UNWATCH ---
+
+                            if cmd.as_slice() == b"MULTI" {
+                                if in_multi {
+                                    let _ = framed.send(Frame::Error(
+                                        Bytes::from_static(b"ERR MULTI calls can not be nested"),
+                                    )).await;
+                                } else {
+                                    in_multi = true;
+                                    command_queue.clear();
+                                    let _ = framed.send(Frame::SimpleString(
+                                        Bytes::from_static(b"OK"),
+                                    )).await;
+                                }
+                                continue;
+                            }
+
+                            if cmd.as_slice() == b"EXEC" {
+                                if !in_multi {
+                                    let _ = framed.send(Frame::Error(
+                                        Bytes::from_static(b"ERR EXEC without MULTI"),
+                                    )).await;
+                                } else {
+                                    in_multi = false;
+                                    let (result, aof_entries) = execute_transaction(
+                                        &db,
+                                        &command_queue,
+                                        &watched_keys,
+                                        &mut selected_db,
+                                    );
+                                    command_queue.clear();
+                                    watched_keys.clear();
+                                    // Send AOF entries collected during atomic execution
+                                    for bytes in aof_entries {
+                                        if let Some(ref tx) = aof_tx {
+                                            let _ = tx.send(AofMessage::Append(bytes)).await;
+                                        }
+                                        if let Some(ref counter) = change_counter {
+                                            counter.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    let _ = framed.send(result).await;
+                                }
+                                continue;
+                            }
+
+                            if cmd.as_slice() == b"DISCARD" {
+                                if !in_multi {
+                                    let _ = framed.send(Frame::Error(
+                                        Bytes::from_static(b"ERR DISCARD without MULTI"),
+                                    )).await;
+                                } else {
+                                    in_multi = false;
+                                    command_queue.clear();
+                                    watched_keys.clear();
+                                    let _ = framed.send(Frame::SimpleString(
+                                        Bytes::from_static(b"OK"),
+                                    )).await;
+                                }
+                                continue;
+                            }
+
+                            if cmd.as_slice() == b"WATCH" {
+                                if in_multi {
+                                    let _ = framed.send(Frame::Error(
+                                        Bytes::from_static(b"ERR WATCH inside MULTI is not allowed"),
+                                    )).await;
+                                } else if cmd_args.is_empty() {
+                                    let _ = framed.send(Frame::Error(
+                                        Bytes::from_static(b"ERR wrong number of arguments for 'watch' command"),
+                                    )).await;
+                                } else {
+                                    {
+                                        let dbs = db.lock().unwrap();
+                                        for arg in cmd_args {
+                                            if let Frame::BulkString(key) = arg {
+                                                let version = dbs[selected_db].get_version(key);
+                                                watched_keys.insert(key.clone(), version);
+                                            }
+                                        }
+                                    } // MutexGuard dropped here before await
+                                    let _ = framed.send(Frame::SimpleString(
+                                        Bytes::from_static(b"OK"),
+                                    )).await;
+                                }
+                                continue;
+                            }
+
+                            if cmd.as_slice() == b"UNWATCH" {
+                                watched_keys.clear();
+                                let _ = framed.send(Frame::SimpleString(
+                                    Bytes::from_static(b"OK"),
+                                )).await;
+                                continue;
+                            }
+                        }
+
+                        // If in MULTI mode, queue the command and respond QUEUED
+                        if in_multi {
+                            command_queue.push(frame);
+                            let _ = framed.send(Frame::SimpleString(
+                                Bytes::from_static(b"QUEUED"),
+                            )).await;
+                            continue;
                         }
 
                         // Check if this is a write command BEFORE dispatch (which consumes the frame)
@@ -533,4 +644,68 @@ fn handle_config(
             String::from_utf8_lossy(&subcmd)
         ))),
     }
+}
+
+/// Execute a queued transaction atomically under a single database lock.
+///
+/// Checks WATCH versions first -- if any watched key's version has changed since
+/// the snapshot was taken, the transaction is aborted and Frame::Null is returned.
+///
+/// Returns the result Frame (Array of responses, or Null on abort) and a Vec of
+/// AOF byte entries for write commands that succeeded (caller sends them async).
+fn execute_transaction(
+    db: &Arc<Mutex<Vec<Database>>>,
+    command_queue: &[Frame],
+    watched_keys: &HashMap<Bytes, u64>,
+    selected_db: &mut usize,
+) -> (Frame, Vec<Bytes>) {
+    let mut dbs = db.lock().unwrap();
+    let db_count = dbs.len();
+
+    // Check WATCH versions -- if any key's version changed, abort
+    for (key, watched_version) in watched_keys {
+        let current_version = dbs[*selected_db].get_version(key);
+        if current_version != *watched_version {
+            return (Frame::Null, Vec::new()); // Transaction aborted
+        }
+    }
+
+    // Execute all queued commands atomically (under the same lock)
+    let mut results = Vec::with_capacity(command_queue.len());
+    let mut aof_entries: Vec<Bytes> = Vec::new();
+
+    for cmd_frame in command_queue {
+        let frame_clone = cmd_frame.clone();
+
+        // Check if this is a write command for AOF logging
+        let is_write = extract_command(&frame_clone)
+            .map(|(ref cmd, _)| aof::is_write_command(cmd))
+            .unwrap_or(false);
+
+        // Serialize for AOF before dispatch consumes the frame
+        let aof_bytes = if is_write {
+            let mut buf = BytesMut::new();
+            crate::protocol::serialize::serialize(&frame_clone, &mut buf);
+            Some(buf.freeze())
+        } else {
+            None
+        };
+
+        let result = dispatch(&mut dbs[*selected_db], frame_clone, selected_db, db_count);
+        let response = match result {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => f, // QUIT inside MULTI just returns OK
+        };
+
+        // Collect AOF entry for successful writes (not error responses)
+        if let Some(bytes) = aof_bytes {
+            if !matches!(&response, Frame::Error(_)) {
+                aof_entries.push(bytes);
+            }
+        }
+
+        results.push(response);
+    }
+
+    (Frame::Array(results), aof_entries)
 }
