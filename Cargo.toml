@@ -2,6 +2,11 @@
 name = "rust-redis"
 version = "0.1.0"
 edition = "2024"
+description = "A high-performance Redis-compatible server written in Rust"
+license = "MIT"
+repository = "https://github.com/tindang/rust-redis"
+keywords = ["redis", "database", "cache", "server"]
+categories = ["database", "network-programming"]
 
 [dependencies]
 bytes = "1.10"
