@@ -21,167 +21,142 @@ pub enum DispatchResult {
     Quit(Frame),
 }
 
-/// Dispatch a command frame to the appropriate handler.
+/// Dispatch a pre-extracted command to the appropriate handler.
 ///
-/// Extracts the command name from the first element of a Frame::Array,
-/// converts it to uppercase for case-insensitive matching, and routes
-/// to the appropriate handler function.
+/// `cmd` is the raw command name bytes (not uppercased).
+/// `args` is the slice of argument frames (excluding the command name).
+/// Uses `eq_ignore_ascii_case` for zero-allocation case-insensitive matching.
 pub fn dispatch(
     db: &mut Database,
-    frame: Frame,
+    cmd: &[u8],
+    args: &[Frame],
     selected_db: &mut usize,
     db_count: usize,
 ) -> DispatchResult {
-    let args = match frame {
-        Frame::Array(args) if !args.is_empty() => args,
-        _ => {
-            return DispatchResult::Response(Frame::Error(Bytes::from_static(
-                b"ERR invalid command format",
-            )))
-        }
-    };
+    if cmd.eq_ignore_ascii_case(b"PING") { return DispatchResult::Response(connection::ping(args)); }
+    if cmd.eq_ignore_ascii_case(b"ECHO") { return DispatchResult::Response(connection::echo(args)); }
+    if cmd.eq_ignore_ascii_case(b"QUIT") { return DispatchResult::Quit(Frame::SimpleString(Bytes::from_static(b"OK"))); }
+    if cmd.eq_ignore_ascii_case(b"SELECT") { return DispatchResult::Response(connection::select(args, selected_db, db_count)); }
+    if cmd.eq_ignore_ascii_case(b"COMMAND") { return DispatchResult::Response(connection::command(args)); }
+    if cmd.eq_ignore_ascii_case(b"INFO") { return DispatchResult::Response(connection::info(db, args)); }
+    // Key management commands
+    if cmd.eq_ignore_ascii_case(b"DEL") { return DispatchResult::Response(key::del(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"EXISTS") { return DispatchResult::Response(key::exists(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"EXPIRE") { return DispatchResult::Response(key::expire(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"PEXPIRE") { return DispatchResult::Response(key::pexpire(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"TTL") { return DispatchResult::Response(key::ttl(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"PTTL") { return DispatchResult::Response(key::pttl(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"PERSIST") { return DispatchResult::Response(key::persist(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"TYPE") { return DispatchResult::Response(key::type_cmd(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"UNLINK") { return DispatchResult::Response(key::unlink(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SCAN") { return DispatchResult::Response(key::scan(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"KEYS") { return DispatchResult::Response(key::keys(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"RENAME") { return DispatchResult::Response(key::rename(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"RENAMENX") { return DispatchResult::Response(key::renamenx(db, args)); }
+    // String commands
+    if cmd.eq_ignore_ascii_case(b"GET") { return DispatchResult::Response(string::get(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SET") { return DispatchResult::Response(string::set(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"MGET") { return DispatchResult::Response(string::mget(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"MSET") { return DispatchResult::Response(string::mset(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"INCR") { return DispatchResult::Response(string::incr(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"DECR") { return DispatchResult::Response(string::decr(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"INCRBY") { return DispatchResult::Response(string::incrby(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"DECRBY") { return DispatchResult::Response(string::decrby(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"INCRBYFLOAT") { return DispatchResult::Response(string::incrbyfloat(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"APPEND") { return DispatchResult::Response(string::append(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"STRLEN") { return DispatchResult::Response(string::strlen(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SETNX") { return DispatchResult::Response(string::setnx(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SETEX") { return DispatchResult::Response(string::setex(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"PSETEX") { return DispatchResult::Response(string::psetex(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"GETSET") { return DispatchResult::Response(string::getset(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"GETDEL") { return DispatchResult::Response(string::getdel(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"GETEX") { return DispatchResult::Response(string::getex(db, args)); }
+    // Hash commands
+    if cmd.eq_ignore_ascii_case(b"HSET") { return DispatchResult::Response(hash::hset(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HGET") { return DispatchResult::Response(hash::hget(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HDEL") { return DispatchResult::Response(hash::hdel(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HMSET") { return DispatchResult::Response(hash::hmset(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HMGET") { return DispatchResult::Response(hash::hmget(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HGETALL") { return DispatchResult::Response(hash::hgetall(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HEXISTS") { return DispatchResult::Response(hash::hexists(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HLEN") { return DispatchResult::Response(hash::hlen(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HKEYS") { return DispatchResult::Response(hash::hkeys(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HVALS") { return DispatchResult::Response(hash::hvals(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HINCRBY") { return DispatchResult::Response(hash::hincrby(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HINCRBYFLOAT") { return DispatchResult::Response(hash::hincrbyfloat(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HSETNX") { return DispatchResult::Response(hash::hsetnx(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"HSCAN") { return DispatchResult::Response(hash::hscan(db, args)); }
+    // List commands
+    if cmd.eq_ignore_ascii_case(b"LPUSH") { return DispatchResult::Response(list::lpush(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"RPUSH") { return DispatchResult::Response(list::rpush(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LPOP") { return DispatchResult::Response(list::lpop(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"RPOP") { return DispatchResult::Response(list::rpop(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LLEN") { return DispatchResult::Response(list::llen(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LRANGE") { return DispatchResult::Response(list::lrange(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LINDEX") { return DispatchResult::Response(list::lindex(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LSET") { return DispatchResult::Response(list::lset(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LINSERT") { return DispatchResult::Response(list::linsert(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LREM") { return DispatchResult::Response(list::lrem(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LTRIM") { return DispatchResult::Response(list::ltrim(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LPOS") { return DispatchResult::Response(list::lpos(db, args)); }
+    // Set commands
+    if cmd.eq_ignore_ascii_case(b"SADD") { return DispatchResult::Response(set::sadd(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SREM") { return DispatchResult::Response(set::srem(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SMEMBERS") { return DispatchResult::Response(set::smembers(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SCARD") { return DispatchResult::Response(set::scard(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SISMEMBER") { return DispatchResult::Response(set::sismember(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SMISMEMBER") { return DispatchResult::Response(set::smismember(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SINTER") { return DispatchResult::Response(set::sinter(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SUNION") { return DispatchResult::Response(set::sunion(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SDIFF") { return DispatchResult::Response(set::sdiff(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SINTERSTORE") { return DispatchResult::Response(set::sinterstore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SUNIONSTORE") { return DispatchResult::Response(set::sunionstore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SDIFFSTORE") { return DispatchResult::Response(set::sdiffstore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SRANDMEMBER") { return DispatchResult::Response(set::srandmember(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SPOP") { return DispatchResult::Response(set::spop(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"SSCAN") { return DispatchResult::Response(set::sscan(db, args)); }
+    // Sorted set commands
+    if cmd.eq_ignore_ascii_case(b"ZADD") { return DispatchResult::Response(sorted_set::zadd(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZREM") { return DispatchResult::Response(sorted_set::zrem(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZSCORE") { return DispatchResult::Response(sorted_set::zscore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZCARD") { return DispatchResult::Response(sorted_set::zcard(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZINCRBY") { return DispatchResult::Response(sorted_set::zincrby(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZRANK") { return DispatchResult::Response(sorted_set::zrank(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZREVRANK") { return DispatchResult::Response(sorted_set::zrevrank(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZPOPMIN") { return DispatchResult::Response(sorted_set::zpopmin(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZPOPMAX") { return DispatchResult::Response(sorted_set::zpopmax(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZSCAN") { return DispatchResult::Response(sorted_set::zscan(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZRANGE") { return DispatchResult::Response(sorted_set::zrange(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZREVRANGE") { return DispatchResult::Response(sorted_set::zrevrange(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZRANGEBYSCORE") { return DispatchResult::Response(sorted_set::zrangebyscore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") { return DispatchResult::Response(sorted_set::zrevrangebyscore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZCOUNT") { return DispatchResult::Response(sorted_set::zcount(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZLEXCOUNT") { return DispatchResult::Response(sorted_set::zlexcount(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZUNIONSTORE") { return DispatchResult::Response(sorted_set::zunionstore(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"ZINTERSTORE") { return DispatchResult::Response(sorted_set::zinterstore(db, args)); }
 
-    let cmd_name = match &args[0] {
-        Frame::BulkString(s) => s.to_ascii_uppercase(),
-        Frame::SimpleString(s) => s.to_ascii_uppercase(),
-        _ => {
-            return DispatchResult::Response(Frame::Error(Bytes::from_static(
-                b"ERR invalid command name",
-            )))
-        }
-    };
-
-    let cmd_args = &args[1..];
-
-    match cmd_name.as_slice() {
-        b"PING" => DispatchResult::Response(connection::ping(cmd_args)),
-        b"ECHO" => DispatchResult::Response(connection::echo(cmd_args)),
-        b"QUIT" => DispatchResult::Quit(Frame::SimpleString(Bytes::from_static(b"OK"))),
-        b"SELECT" => {
-            DispatchResult::Response(connection::select(cmd_args, selected_db, db_count))
-        }
-        b"COMMAND" => DispatchResult::Response(connection::command(cmd_args)),
-        b"INFO" => DispatchResult::Response(connection::info(db, cmd_args)),
-        // Key management commands
-        b"DEL" => DispatchResult::Response(key::del(db, cmd_args)),
-        b"EXISTS" => DispatchResult::Response(key::exists(db, cmd_args)),
-        b"EXPIRE" => DispatchResult::Response(key::expire(db, cmd_args)),
-        b"PEXPIRE" => DispatchResult::Response(key::pexpire(db, cmd_args)),
-        b"TTL" => DispatchResult::Response(key::ttl(db, cmd_args)),
-        b"PTTL" => DispatchResult::Response(key::pttl(db, cmd_args)),
-        b"PERSIST" => DispatchResult::Response(key::persist(db, cmd_args)),
-        b"TYPE" => DispatchResult::Response(key::type_cmd(db, cmd_args)),
-        b"UNLINK" => DispatchResult::Response(key::unlink(db, cmd_args)),
-        b"SCAN" => DispatchResult::Response(key::scan(db, cmd_args)),
-        b"KEYS" => DispatchResult::Response(key::keys(db, cmd_args)),
-        b"RENAME" => DispatchResult::Response(key::rename(db, cmd_args)),
-        b"RENAMENX" => DispatchResult::Response(key::renamenx(db, cmd_args)),
-        // String commands
-        b"GET" => DispatchResult::Response(string::get(db, cmd_args)),
-        b"SET" => DispatchResult::Response(string::set(db, cmd_args)),
-        b"MGET" => DispatchResult::Response(string::mget(db, cmd_args)),
-        b"MSET" => DispatchResult::Response(string::mset(db, cmd_args)),
-        b"INCR" => DispatchResult::Response(string::incr(db, cmd_args)),
-        b"DECR" => DispatchResult::Response(string::decr(db, cmd_args)),
-        b"INCRBY" => DispatchResult::Response(string::incrby(db, cmd_args)),
-        b"DECRBY" => DispatchResult::Response(string::decrby(db, cmd_args)),
-        b"INCRBYFLOAT" => DispatchResult::Response(string::incrbyfloat(db, cmd_args)),
-        b"APPEND" => DispatchResult::Response(string::append(db, cmd_args)),
-        b"STRLEN" => DispatchResult::Response(string::strlen(db, cmd_args)),
-        b"SETNX" => DispatchResult::Response(string::setnx(db, cmd_args)),
-        b"SETEX" => DispatchResult::Response(string::setex(db, cmd_args)),
-        b"PSETEX" => DispatchResult::Response(string::psetex(db, cmd_args)),
-        b"GETSET" => DispatchResult::Response(string::getset(db, cmd_args)),
-        b"GETDEL" => DispatchResult::Response(string::getdel(db, cmd_args)),
-        b"GETEX" => DispatchResult::Response(string::getex(db, cmd_args)),
-        // Hash commands
-        b"HSET" => DispatchResult::Response(hash::hset(db, cmd_args)),
-        b"HGET" => DispatchResult::Response(hash::hget(db, cmd_args)),
-        b"HDEL" => DispatchResult::Response(hash::hdel(db, cmd_args)),
-        b"HMSET" => DispatchResult::Response(hash::hmset(db, cmd_args)),
-        b"HMGET" => DispatchResult::Response(hash::hmget(db, cmd_args)),
-        b"HGETALL" => DispatchResult::Response(hash::hgetall(db, cmd_args)),
-        b"HEXISTS" => DispatchResult::Response(hash::hexists(db, cmd_args)),
-        b"HLEN" => DispatchResult::Response(hash::hlen(db, cmd_args)),
-        b"HKEYS" => DispatchResult::Response(hash::hkeys(db, cmd_args)),
-        b"HVALS" => DispatchResult::Response(hash::hvals(db, cmd_args)),
-        b"HINCRBY" => DispatchResult::Response(hash::hincrby(db, cmd_args)),
-        b"HINCRBYFLOAT" => DispatchResult::Response(hash::hincrbyfloat(db, cmd_args)),
-        b"HSETNX" => DispatchResult::Response(hash::hsetnx(db, cmd_args)),
-        b"HSCAN" => DispatchResult::Response(hash::hscan(db, cmd_args)),
-        // List commands
-        b"LPUSH" => DispatchResult::Response(list::lpush(db, cmd_args)),
-        b"RPUSH" => DispatchResult::Response(list::rpush(db, cmd_args)),
-        b"LPOP" => DispatchResult::Response(list::lpop(db, cmd_args)),
-        b"RPOP" => DispatchResult::Response(list::rpop(db, cmd_args)),
-        b"LLEN" => DispatchResult::Response(list::llen(db, cmd_args)),
-        b"LRANGE" => DispatchResult::Response(list::lrange(db, cmd_args)),
-        b"LINDEX" => DispatchResult::Response(list::lindex(db, cmd_args)),
-        b"LSET" => DispatchResult::Response(list::lset(db, cmd_args)),
-        b"LINSERT" => DispatchResult::Response(list::linsert(db, cmd_args)),
-        b"LREM" => DispatchResult::Response(list::lrem(db, cmd_args)),
-        b"LTRIM" => DispatchResult::Response(list::ltrim(db, cmd_args)),
-        b"LPOS" => DispatchResult::Response(list::lpos(db, cmd_args)),
-        // Set commands
-        b"SADD" => DispatchResult::Response(set::sadd(db, cmd_args)),
-        b"SREM" => DispatchResult::Response(set::srem(db, cmd_args)),
-        b"SMEMBERS" => DispatchResult::Response(set::smembers(db, cmd_args)),
-        b"SCARD" => DispatchResult::Response(set::scard(db, cmd_args)),
-        b"SISMEMBER" => DispatchResult::Response(set::sismember(db, cmd_args)),
-        b"SMISMEMBER" => DispatchResult::Response(set::smismember(db, cmd_args)),
-        b"SINTER" => DispatchResult::Response(set::sinter(db, cmd_args)),
-        b"SUNION" => DispatchResult::Response(set::sunion(db, cmd_args)),
-        b"SDIFF" => DispatchResult::Response(set::sdiff(db, cmd_args)),
-        b"SINTERSTORE" => DispatchResult::Response(set::sinterstore(db, cmd_args)),
-        b"SUNIONSTORE" => DispatchResult::Response(set::sunionstore(db, cmd_args)),
-        b"SDIFFSTORE" => DispatchResult::Response(set::sdiffstore(db, cmd_args)),
-        b"SRANDMEMBER" => DispatchResult::Response(set::srandmember(db, cmd_args)),
-        b"SPOP" => DispatchResult::Response(set::spop(db, cmd_args)),
-        b"SSCAN" => DispatchResult::Response(set::sscan(db, cmd_args)),
-        // Sorted set commands
-        b"ZADD" => DispatchResult::Response(sorted_set::zadd(db, cmd_args)),
-        b"ZREM" => DispatchResult::Response(sorted_set::zrem(db, cmd_args)),
-        b"ZSCORE" => DispatchResult::Response(sorted_set::zscore(db, cmd_args)),
-        b"ZCARD" => DispatchResult::Response(sorted_set::zcard(db, cmd_args)),
-        b"ZINCRBY" => DispatchResult::Response(sorted_set::zincrby(db, cmd_args)),
-        b"ZRANK" => DispatchResult::Response(sorted_set::zrank(db, cmd_args)),
-        b"ZREVRANK" => DispatchResult::Response(sorted_set::zrevrank(db, cmd_args)),
-        b"ZPOPMIN" => DispatchResult::Response(sorted_set::zpopmin(db, cmd_args)),
-        b"ZPOPMAX" => DispatchResult::Response(sorted_set::zpopmax(db, cmd_args)),
-        b"ZSCAN" => DispatchResult::Response(sorted_set::zscan(db, cmd_args)),
-        b"ZRANGE" => DispatchResult::Response(sorted_set::zrange(db, cmd_args)),
-        b"ZREVRANGE" => DispatchResult::Response(sorted_set::zrevrange(db, cmd_args)),
-        b"ZRANGEBYSCORE" => DispatchResult::Response(sorted_set::zrangebyscore(db, cmd_args)),
-        b"ZREVRANGEBYSCORE" => DispatchResult::Response(sorted_set::zrevrangebyscore(db, cmd_args)),
-        b"ZCOUNT" => DispatchResult::Response(sorted_set::zcount(db, cmd_args)),
-        b"ZLEXCOUNT" => DispatchResult::Response(sorted_set::zlexcount(db, cmd_args)),
-        b"ZUNIONSTORE" => DispatchResult::Response(sorted_set::zunionstore(db, cmd_args)),
-        b"ZINTERSTORE" => DispatchResult::Response(sorted_set::zinterstore(db, cmd_args)),
-        _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
-            "ERR unknown command '{}', with args beginning with: ",
-            String::from_utf8_lossy(&cmd_name)
-        )))),
-    }
+    DispatchResult::Response(Frame::Error(Bytes::from(format!(
+        "ERR unknown command '{}', with args beginning with: ",
+        String::from_utf8_lossy(cmd)
+    ))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_command(parts: &[&[u8]]) -> Frame {
-        Frame::Array(
-            parts
-                .iter()
-                .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
-                .collect(),
-        )
+    fn make_args(parts: &[&[u8]]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
+            .collect()
     }
 
     #[test]
     fn test_dispatch_ping() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        let result = dispatch(&mut db, make_command(&[b"PING"]), &mut selected, 16);
+        let result = dispatch(&mut db, b"PING", &[], &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"PONG")))
@@ -194,7 +169,7 @@ mod tests {
     fn test_dispatch_case_insensitive() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        let result = dispatch(&mut db, make_command(&[b"ping"]), &mut selected, 16);
+        let result = dispatch(&mut db, b"ping", &[], &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"PONG")))
@@ -207,7 +182,7 @@ mod tests {
     fn test_dispatch_quit() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        let result = dispatch(&mut db, make_command(&[b"QUIT"]), &mut selected, 16);
+        let result = dispatch(&mut db, b"QUIT", &[], &mut selected, 16);
         match result {
             DispatchResult::Quit(f) => {
                 assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"OK")))
@@ -220,12 +195,7 @@ mod tests {
     fn test_dispatch_unknown_command() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"FAKECMD"]),
-            &mut selected,
-            16,
-        );
+        let result = dispatch(&mut db, b"FAKECMD", &[], &mut selected, 16);
         match result {
             DispatchResult::Response(Frame::Error(s)) => {
                 assert!(s.starts_with(b"ERR unknown command"));
@@ -235,45 +205,19 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_invalid_format() {
-        let mut db = Database::new();
-        let mut selected = 0usize;
-        let result = dispatch(
-            &mut db,
-            Frame::SimpleString(Bytes::from_static(b"PING")),
-            &mut selected,
-            16,
-        );
-        match result {
-            DispatchResult::Response(Frame::Error(_)) => {}
-            _ => panic!("Expected error response"),
-        }
-    }
-
-    #[test]
     fn test_dispatch_get_set() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        // SET foo bar
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"SET", b"foo", b"bar"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"foo", b"bar"]);
+        let result = dispatch(&mut db, b"SET", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"OK")));
             }
             _ => panic!("Expected Response"),
         }
-        // GET foo
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"GET", b"foo"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"foo"]);
+        let result = dispatch(&mut db, b"GET", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::BulkString(Bytes::from_static(b"bar")));
@@ -286,26 +230,16 @@ mod tests {
     fn test_dispatch_hset_hget() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        // HSET myhash field1 value1
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"HSET", b"myhash", b"field1", b"value1"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"myhash", b"field1", b"value1"]);
+        let result = dispatch(&mut db, b"HSET", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::Integer(1));
             }
             _ => panic!("Expected Response"),
         }
-        // HGET myhash field1
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"HGET", b"myhash", b"field1"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"myhash", b"field1"]);
+        let result = dispatch(&mut db, b"HGET", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::BulkString(Bytes::from_static(b"value1")));
@@ -318,41 +252,22 @@ mod tests {
     fn test_dispatch_lpush_lrange() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        // LPUSH mylist a b c
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"LPUSH", b"mylist", b"a", b"b", b"c"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"mylist", b"a", b"b", b"c"]);
+        let result = dispatch(&mut db, b"LPUSH", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::Integer(3));
             }
             _ => panic!("Expected Response"),
         }
-        // LRANGE mylist 0 -1 -> [c, b, a]
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"LRANGE", b"mylist", b"0", b"-1"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"mylist", b"0", b"-1"]);
+        let result = dispatch(&mut db, b"LRANGE", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(Frame::Array(items)) => {
                 assert_eq!(items.len(), 3);
-                assert_eq!(
-                    items[0],
-                    Frame::BulkString(Bytes::from_static(b"c"))
-                );
-                assert_eq!(
-                    items[1],
-                    Frame::BulkString(Bytes::from_static(b"b"))
-                );
-                assert_eq!(
-                    items[2],
-                    Frame::BulkString(Bytes::from_static(b"a"))
-                );
+                assert_eq!(items[0], Frame::BulkString(Bytes::from_static(b"c")));
+                assert_eq!(items[1], Frame::BulkString(Bytes::from_static(b"b")));
+                assert_eq!(items[2], Frame::BulkString(Bytes::from_static(b"a")));
             }
             _ => panic!("Expected Array response"),
         }
@@ -362,42 +277,21 @@ mod tests {
     fn test_dispatch_sadd_smembers() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        // SADD myset a b c
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"SADD", b"myset", b"a", b"b", b"c"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"myset", b"a", b"b", b"c"]);
+        let result = dispatch(&mut db, b"SADD", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::Integer(3));
             }
             _ => panic!("Expected Response"),
         }
-        // SMEMBERS myset
-        let result = dispatch(
-            &mut db,
-            make_command(&[b"SMEMBERS", b"myset"]),
-            &mut selected,
-            16,
-        );
+        let args = make_args(&[b"myset"]);
+        let result = dispatch(&mut db, b"SMEMBERS", &args, &mut selected, 16);
         match result {
             DispatchResult::Response(Frame::Array(members)) => {
                 assert_eq!(members.len(), 3);
             }
             _ => panic!("Expected Array response"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_empty_array() {
-        let mut db = Database::new();
-        let mut selected = 0usize;
-        let result = dispatch(&mut db, Frame::Array(vec![]), &mut selected, 16);
-        match result {
-            DispatchResult::Response(Frame::Error(_)) => {}
-            _ => panic!("Expected error response"),
         }
     }
 }

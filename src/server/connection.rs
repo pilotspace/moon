@@ -22,13 +22,14 @@ use crate::storage::Database;
 
 use super::codec::RespCodec;
 
-/// Extract command name (uppercased) and args from a Frame::Array.
-fn extract_command(frame: &Frame) -> Option<(Vec<u8>, &[Frame])> {
+/// Extract command name (as raw byte slice reference) and args from a Frame::Array.
+/// Returns the name without allocation -- callers use `eq_ignore_ascii_case` for matching.
+fn extract_command(frame: &Frame) -> Option<(&[u8], &[Frame])> {
     match frame {
         Frame::Array(args) if !args.is_empty() => {
             let name = match &args[0] {
-                Frame::BulkString(s) => s.to_ascii_uppercase(),
-                Frame::SimpleString(s) => s.to_ascii_uppercase(),
+                Frame::BulkString(s) => s.as_ref(),
+                Frame::SimpleString(s) => s.as_ref(),
                 _ => return None,
             };
             Some((name, &args[1..]))
@@ -99,9 +100,9 @@ pub async fn handle_connection(
                 result = framed.next() => {
                     match result {
                         Some(Ok(frame)) => {
-                            if let Some((ref cmd, cmd_args)) = extract_command(&frame) {
-                                match cmd.as_slice() {
-                                    b"SUBSCRIBE" => {
+                            if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                                match cmd {
+                                    _ if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") => {
                                         if cmd_args.is_empty() {
                                             let _ = framed.send(Frame::Error(
                                                 Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"),
@@ -119,7 +120,7 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
-                                    b"UNSUBSCRIBE" => {
+                                    _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
                                         if cmd_args.is_empty() {
                                             // Unsubscribe from all channels
                                             let removed = pubsub_registry.lock().unsubscribe_all(subscriber_id);
@@ -150,7 +151,7 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
-                                    b"PSUBSCRIBE" => {
+                                    _ if cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") => {
                                         if cmd_args.is_empty() {
                                             let _ = framed.send(Frame::Error(
                                                 Bytes::from_static(b"ERR wrong number of arguments for 'psubscribe' command"),
@@ -168,7 +169,7 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
-                                    b"PUNSUBSCRIBE" => {
+                                    _ if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") => {
                                         if cmd_args.is_empty() {
                                             let removed = pubsub_registry.lock().punsubscribe_all(subscriber_id);
                                             if removed.is_empty() {
@@ -197,14 +198,14 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
-                                    b"PING" => {
+                                    _ if cmd.eq_ignore_ascii_case(b"PING") => {
                                         // In subscriber mode, PING returns Array per Redis spec
                                         let _ = framed.send(Frame::Array(vec![
                                             Frame::BulkString(Bytes::from_static(b"pong")),
                                             Frame::BulkString(Bytes::from_static(b"")),
                                         ])).await;
                                     }
-                                    b"QUIT" => {
+                                    _ if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                         let _ = framed.send(Frame::SimpleString(Bytes::from_static(b"OK"))).await;
                                         break;
                                     }
@@ -278,7 +279,7 @@ pub async fn handle_connection(
                     // --- AUTH gate (unauthenticated) ---
                     if !authenticated {
                         match extract_command(&frame) {
-                            Some((ref cmd, cmd_args)) if cmd.as_slice() == b"AUTH" => {
+                            Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
                                 let response = conn_cmd::auth(cmd_args, &requirepass);
                                 if response == Frame::SimpleString(Bytes::from_static(b"OK")) {
                                     authenticated = true;
@@ -286,7 +287,7 @@ pub async fn handle_connection(
                                 responses.push(response);
                                 continue;
                             }
-                            Some((ref cmd, _)) if cmd.as_slice() == b"QUIT" => {
+                            Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 should_quit = true;
                                 break;
@@ -301,14 +302,14 @@ pub async fn handle_connection(
                     }
 
                     // --- Connection-level command intercepts (no db lock needed) ---
-                    if let Some((ref cmd, cmd_args)) = extract_command(&frame) {
+                    if let Some((cmd, cmd_args)) = extract_command(&frame) {
                         // AUTH when already authenticated
-                        if cmd.as_slice() == b"AUTH" {
+                        if cmd.eq_ignore_ascii_case(b"AUTH") {
                             responses.push(conn_cmd::auth(cmd_args, &requirepass));
                             continue;
                         }
                         // BGSAVE -- handle outside lock
-                        if cmd.as_slice() == b"BGSAVE" {
+                        if cmd.eq_ignore_ascii_case(b"BGSAVE") {
                             let response = crate::command::persistence::bgsave_start(
                                 db.clone(),
                                 config.dir.clone(),
@@ -318,7 +319,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // BGREWRITEAOF
-                        if cmd.as_slice() == b"BGREWRITEAOF" {
+                        if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
                             let response = if let Some(ref tx) = aof_tx {
                                 crate::command::persistence::bgrewriteaof_start(tx, db.clone())
                             } else {
@@ -328,13 +329,13 @@ pub async fn handle_connection(
                             continue;
                         }
                         // CONFIG
-                        if cmd.as_slice() == b"CONFIG" {
+                        if cmd.eq_ignore_ascii_case(b"CONFIG") {
                             responses.push(handle_config(cmd_args, &runtime_config, &config));
                             continue;
                         }
                         // SUBSCRIBE / PSUBSCRIBE: enter subscriber mode
                         // Flush accumulated responses first, then handle subscribe and break batch
-                        if cmd.as_slice() == b"SUBSCRIBE" || cmd.as_slice() == b"PSUBSCRIBE" {
+                        if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
                             // Flush accumulated responses first
                             for resp in responses.drain(..) {
                                 if framed.send(resp).await.is_err() {
@@ -356,7 +357,7 @@ pub async fn handle_connection(
                             }
                             // Handle subscribe
                             if cmd_args.is_empty() {
-                                let cmd_lower = if cmd.as_slice() == b"SUBSCRIBE" { "subscribe" } else { "psubscribe" };
+                                let cmd_lower = if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") { "subscribe" } else { "psubscribe" };
                                 let _ = framed.send(Frame::Error(Bytes::from(format!(
                                     "ERR wrong number of arguments for '{}' command", cmd_lower
                                 )))).await;
@@ -368,7 +369,7 @@ pub async fn handle_connection(
                                     pubsub_tx = Some(tx);
                                     pubsub_rx = Some(rx);
                                 }
-                                let is_pattern = cmd.as_slice() == b"PSUBSCRIBE";
+                                let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                                 for arg in cmd_args {
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
                                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
@@ -397,7 +398,7 @@ pub async fn handle_connection(
                             break;
                         }
                         // PUBLISH
-                        if cmd.as_slice() == b"PUBLISH" {
+                        if cmd.eq_ignore_ascii_case(b"PUBLISH") {
                             if cmd_args.len() != 2 {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
@@ -418,7 +419,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // UNSUBSCRIBE / PUNSUBSCRIBE when not subscribed
-                        if cmd.as_slice() == b"UNSUBSCRIBE" {
+                        if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
                             let ch = if !cmd_args.is_empty() {
                                 extract_bytes(&cmd_args[0]).unwrap_or(Bytes::from_static(b""))
                             } else {
@@ -427,7 +428,7 @@ pub async fn handle_connection(
                             responses.push(pubsub::unsubscribe_response(&ch, 0));
                             continue;
                         }
-                        if cmd.as_slice() == b"PUNSUBSCRIBE" {
+                        if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
                             let pat = if !cmd_args.is_empty() {
                                 extract_bytes(&cmd_args[0]).unwrap_or(Bytes::from_static(b""))
                             } else {
@@ -437,7 +438,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // MULTI
-                        if cmd.as_slice() == b"MULTI" {
+                        if cmd.eq_ignore_ascii_case(b"MULTI") {
                             if in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR MULTI calls can not be nested"),
@@ -450,7 +451,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // EXEC
-                        if cmd.as_slice() == b"EXEC" {
+                        if cmd.eq_ignore_ascii_case(b"EXEC") {
                             if !in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR EXEC without MULTI"),
@@ -471,7 +472,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // DISCARD
-                        if cmd.as_slice() == b"DISCARD" {
+                        if cmd.eq_ignore_ascii_case(b"DISCARD") {
                             if !in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR DISCARD without MULTI"),
@@ -485,7 +486,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // WATCH
-                        if cmd.as_slice() == b"WATCH" {
+                        if cmd.eq_ignore_ascii_case(b"WATCH") {
                             if in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR WATCH inside MULTI is not allowed"),
@@ -508,7 +509,7 @@ pub async fn handle_connection(
                             continue;
                         }
                         // UNWATCH
-                        if cmd.as_slice() == b"UNWATCH" {
+                        if cmd.eq_ignore_ascii_case(b"UNWATCH") {
                             watched_keys.clear();
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             continue;
@@ -523,9 +524,16 @@ pub async fn handle_connection(
                     }
 
                     // --- Normal dispatch (needs db lock) ---
-                    let is_write = extract_command(&frame)
-                        .map(|(ref cmd, _)| aof::is_write_command(cmd))
-                        .unwrap_or(false);
+                    let (cmd, cmd_args) = match extract_command(&frame) {
+                        Some(pair) => pair,
+                        None => {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR invalid command format",
+                            )));
+                            continue;
+                        }
+                    };
+                    let is_write = aof::is_write_command(cmd);
 
                     // Serialize for AOF before dispatch
                     let aof_bytes = if is_write && aof_tx.is_some() {
@@ -548,7 +556,7 @@ pub async fn handle_connection(
                             }
                         }
                         let db_count = dbs.len();
-                        dispatch(&mut dbs[selected_db], frame, &mut selected_db, db_count)
+                        dispatch(&mut dbs[selected_db], cmd, cmd_args, &mut selected_db, db_count)
                     }; // MutexGuard dropped here -- BEFORE any await
 
                     let (response, quit) = match result {
@@ -622,8 +630,8 @@ fn handle_config(
     }
 
     let subcmd = match &args[0] {
-        Frame::BulkString(s) => s.to_ascii_uppercase(),
-        Frame::SimpleString(s) => s.to_ascii_uppercase(),
+        Frame::BulkString(s) => s.as_ref(),
+        Frame::SimpleString(s) => s.as_ref(),
         _ => {
             return Frame::Error(Bytes::from_static(
                 b"ERR unknown subcommand for CONFIG",
@@ -633,19 +641,17 @@ fn handle_config(
 
     let sub_args = &args[1..];
 
-    match subcmd.as_slice() {
-        b"GET" => {
-            let rt = runtime_config.read().unwrap();
-            config_cmd::config_get(&rt, server_config, sub_args)
-        }
-        b"SET" => {
-            let mut rt = runtime_config.write().unwrap();
-            config_cmd::config_set(&mut rt, sub_args)
-        }
-        _ => Frame::Error(Bytes::from(format!(
+    if subcmd.eq_ignore_ascii_case(b"GET") {
+        let rt = runtime_config.read().unwrap();
+        config_cmd::config_get(&rt, server_config, sub_args)
+    } else if subcmd.eq_ignore_ascii_case(b"SET") {
+        let mut rt = runtime_config.write().unwrap();
+        config_cmd::config_set(&mut rt, sub_args)
+    } else {
+        Frame::Error(Bytes::from(format!(
             "ERR unknown subcommand '{}'. Try CONFIG GET, CONFIG SET.",
-            String::from_utf8_lossy(&subcmd)
-        ))),
+            String::from_utf8_lossy(subcmd)
+        )))
     }
 }
 
@@ -678,23 +684,30 @@ fn execute_transaction(
     let mut aof_entries: Vec<Bytes> = Vec::new();
 
     for cmd_frame in command_queue {
-        let frame_clone = cmd_frame.clone();
+        // Extract command name and args (zero-alloc)
+        let (cmd, cmd_args) = match extract_command(cmd_frame) {
+            Some(pair) => pair,
+            None => {
+                results.push(Frame::Error(Bytes::from_static(
+                    b"ERR invalid command format",
+                )));
+                continue;
+            }
+        };
 
         // Check if this is a write command for AOF logging
-        let is_write = extract_command(&frame_clone)
-            .map(|(ref cmd, _)| aof::is_write_command(cmd))
-            .unwrap_or(false);
+        let is_write = aof::is_write_command(cmd);
 
-        // Serialize for AOF before dispatch consumes the frame
+        // Serialize for AOF before dispatch
         let aof_bytes = if is_write {
             let mut buf = BytesMut::new();
-            crate::protocol::serialize::serialize(&frame_clone, &mut buf);
+            crate::protocol::serialize::serialize(cmd_frame, &mut buf);
             Some(buf.freeze())
         } else {
             None
         };
 
-        let result = dispatch(&mut dbs[*selected_db], frame_clone, selected_db, db_count);
+        let result = dispatch(&mut dbs[*selected_db], cmd, cmd_args, selected_db, db_count);
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f, // QUIT inside MULTI just returns OK

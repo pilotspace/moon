@@ -200,10 +200,22 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
 
         match parse::parse(&mut buf, &config) {
             Ok(Some(frame)) => {
-                // Dispatch the command to restore state
+                // Extract command name and args, then dispatch
+                let (cmd, cmd_args) = match &frame {
+                    Frame::Array(arr) if !arr.is_empty() => {
+                        let name = match &arr[0] {
+                            Frame::BulkString(s) => s.as_ref(),
+                            Frame::SimpleString(s) => s.as_ref(),
+                            _ => { count += 1; continue; }
+                        };
+                        (name as &[u8], &arr[1..])
+                    }
+                    _ => { count += 1; continue; }
+                };
                 let result = dispatch(
                     &mut databases[selected_db],
-                    frame,
+                    cmd,
+                    cmd_args,
                     &mut selected_db,
                     db_count,
                 );
