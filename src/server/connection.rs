@@ -11,9 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
-use crate::command::{dispatch, dispatch_read, is_read_command, DispatchResult};
+use crate::command::{dispatch, DispatchResult};
 use crate::config::{RuntimeConfig, ServerConfig};
-use crate::storage::entry::current_time_ms;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::{self, PubSubRegistry};
@@ -273,12 +272,18 @@ pub async fn handle_connection(
                     }
                 }
 
-                // Process batch
+                // Process batch using two-phase execution:
+                // Phase 1: Handle connection-level intercepts, collect dispatchable frames
+                // Phase 2: Acquire ONE write lock, execute ALL dispatchable frames
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut aof_entries: Vec<Bytes> = Vec::new();
                 let mut should_quit = false;
                 let mut break_outer = false;
 
+                // Dispatchable frame: (response_index, frame, is_write, aof_bytes)
+                let mut dispatchable: Vec<(usize, Frame, bool, Option<Bytes>)> = Vec::new();
+
+                // === Phase 1: Connection-level intercepts ===
                 for frame in batch {
                     // --- AUTH gate (unauthenticated) ---
                     if !authenticated {
@@ -340,6 +345,42 @@ pub async fn handle_connection(
                         // SUBSCRIBE / PSUBSCRIBE: enter subscriber mode
                         // Flush accumulated responses first, then handle subscribe and break batch
                         if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                            // Execute any pending dispatchable frames before switching modes
+                            if !dispatchable.is_empty() {
+                                let mut guard = db[selected_db].write();
+                                guard.refresh_now();
+                                let db_count = db.len();
+                                for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
+                                    if is_write {
+                                        let rt = runtime_config.read().unwrap();
+                                        if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
+                                            responses[resp_idx] = oom_frame;
+                                            continue;
+                                        }
+                                    }
+                                    let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
+                                    let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                                    let (response, quit) = match result {
+                                        DispatchResult::Response(f) => (f, false),
+                                        DispatchResult::Quit(f) => (f, true),
+                                    };
+                                    if let Some(bytes) = aof_bytes {
+                                        if !matches!(&response, Frame::Error(_)) {
+                                            aof_entries.push(bytes);
+                                        }
+                                    }
+                                    responses[resp_idx] = response;
+                                    if quit {
+                                        should_quit = true;
+                                        break;
+                                    }
+                                }
+                            } // lock dropped here
+
+                            if should_quit {
+                                break;
+                            }
+
                             // Flush accumulated responses first
                             for resp in responses.drain(..) {
                                 if framed.send(resp).await.is_err() {
@@ -527,67 +568,64 @@ pub async fn handle_connection(
                         continue;
                     }
 
-                    // --- Normal dispatch (needs db lock) ---
-                    let (cmd, cmd_args) = match extract_command(&frame) {
-                        Some(pair) => pair,
+                    // --- Collect for phase 2 dispatch (needs db lock) ---
+                    match extract_command(&frame) {
+                        Some((cmd, _cmd_args)) => {
+                            let is_write = aof::is_write_command(cmd);
+
+                            // Serialize for AOF before dispatch
+                            let aof_bytes = if is_write && aof_tx.is_some() {
+                                let mut buf = BytesMut::new();
+                                crate::protocol::serialize::serialize(&frame, &mut buf);
+                                Some(buf.freeze())
+                            } else {
+                                None
+                            };
+
+                            // Reserve a slot in responses for phase 2 to fill
+                            let resp_idx = responses.len();
+                            responses.push(Frame::Null); // placeholder
+                            dispatchable.push((resp_idx, frame, is_write, aof_bytes));
+                        }
                         None => {
                             responses.push(Frame::Error(Bytes::from_static(
                                 b"ERR invalid command format",
                             )));
-                            continue;
                         }
-                    };
-                    let is_write = aof::is_write_command(cmd);
+                    }
+                }
 
-                    // Serialize for AOF before dispatch
-                    let aof_bytes = if is_write && aof_tx.is_some() {
-                        let mut buf = BytesMut::new();
-                        crate::protocol::serialize::serialize(&frame, &mut buf);
-                        Some(buf.freeze())
-                    } else {
-                        None
-                    };
-
-                    // Dispatch: read commands use shared read lock, write commands use exclusive write lock
-                    let is_read = is_read_command(cmd);
-                    let result = if is_read {
-                        let guard = db[selected_db].read();
-                        let now_ms = current_time_ms();
-                        let db_count = db.len();
-                        dispatch_read(&*guard, cmd, cmd_args, now_ms, &mut selected_db, db_count)
-                    } else {
-                        let mut guard = db[selected_db].write();
-                        guard.refresh_now();
-                        // Eviction once per write
+                // === Phase 2: Execute ALL dispatchable frames under ONE write lock ===
+                if !dispatchable.is_empty() && !should_quit {
+                    let mut guard = db[selected_db].write();
+                    guard.refresh_now();
+                    let db_count = db.len();
+                    for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable {
                         if is_write {
                             let rt = runtime_config.read().unwrap();
                             if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
-                                responses.push(oom_frame);
-                                continue; // Skip this command but process rest of batch
+                                responses[resp_idx] = oom_frame;
+                                continue;
                             }
                         }
-                        let db_count = db.len();
-                        dispatch(&mut *guard, cmd, cmd_args, &mut selected_db, db_count)
-                    }; // lock guard dropped here -- BEFORE any await
-
-                    let (response, quit) = match result {
-                        DispatchResult::Response(f) => (f, false),
-                        DispatchResult::Quit(f) => (f, true),
-                    };
-
-                    // Collect AOF entry for successful writes
-                    if let Some(bytes) = aof_bytes {
-                        if !matches!(&response, Frame::Error(_)) {
-                            aof_entries.push(bytes);
+                        let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
+                        let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                        let (response, quit) = match result {
+                            DispatchResult::Response(f) => (f, false),
+                            DispatchResult::Quit(f) => (f, true),
+                        };
+                        if let Some(bytes) = aof_bytes {
+                            if !matches!(&response, Frame::Error(_)) {
+                                aof_entries.push(bytes);
+                            }
+                        }
+                        responses[resp_idx] = response;
+                        if quit {
+                            should_quit = true;
+                            break;
                         }
                     }
-
-                    responses.push(response);
-                    if quit {
-                        should_quit = true;
-                        break;
-                    }
-                }
+                } // lock dropped here -- BEFORE any await
 
                 // --- Write all responses OUTSIDE the lock ---
                 for response in responses {
