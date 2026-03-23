@@ -1,13 +1,16 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::command::connection as conn_cmd;
 use crate::command::{dispatch, DispatchResult};
 use crate::config::ServerConfig;
+use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::storage::Database;
 
@@ -35,12 +38,17 @@ fn extract_command(frame: &Frame) -> Option<(Vec<u8>, &[Frame])> {
 ///
 /// When `requirepass` is set, clients must authenticate via AUTH before any other
 /// commands are accepted (except QUIT).
+///
+/// When `aof_tx` is provided, write commands are logged to the AOF file.
+/// When `change_counter` is provided, write commands increment the counter for auto-save.
 pub async fn handle_connection(
     stream: TcpStream,
     db: Arc<Mutex<Vec<Database>>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
     config: Arc<ServerConfig>,
+    aof_tx: Option<mpsc::Sender<AofMessage>>,
+    change_counter: Option<Arc<AtomicU64>>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -99,7 +107,39 @@ pub async fn handle_connection(
                                 }
                                 continue;
                             }
+                            if cmd.as_slice() == b"BGREWRITEAOF" {
+                                if let Some(ref tx) = aof_tx {
+                                    let response = crate::command::persistence::bgrewriteaof_start(
+                                        tx,
+                                        db.clone(),
+                                    );
+                                    if framed.send(response).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    if framed.send(Frame::Error(
+                                        Bytes::from_static(b"ERR AOF is not enabled"),
+                                    )).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
                         }
+
+                        // Check if this is a write command BEFORE dispatch (which consumes the frame)
+                        let is_write = extract_command(&frame)
+                            .map(|(ref cmd, _)| aof::is_write_command(cmd))
+                            .unwrap_or(false);
+
+                        // Serialize for AOF before dispatch consumes the frame
+                        let aof_bytes = if is_write && aof_tx.is_some() {
+                            let mut buf = BytesMut::new();
+                            crate::protocol::serialize::serialize(&frame, &mut buf);
+                            Some(buf.freeze())
+                        } else {
+                            None
+                        };
 
                         // Normal dispatch
                         let result = {
@@ -111,6 +151,20 @@ pub async fn handle_connection(
                             DispatchResult::Response(f) => (f, false),
                             DispatchResult::Quit(f) => (f, true),
                         };
+
+                        // Log to AOF after successful dispatch (not error responses)
+                        if let Some(bytes) = aof_bytes {
+                            if !matches!(&response, Frame::Error(_)) {
+                                if let Some(ref tx) = aof_tx {
+                                    let _ = tx.send(AofMessage::Append(bytes)).await;
+                                }
+                                // Increment change counter for auto-save
+                                if let Some(ref counter) = change_counter {
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+
                         if framed.send(response).await.is_err() {
                             break;
                         }

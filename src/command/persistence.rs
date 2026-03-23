@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use tracing::{error, info};
 
+use tokio::sync::mpsc;
+
+use crate::persistence::aof::AofMessage;
 use crate::persistence::rdb;
 use crate::protocol::Frame;
 use crate::storage::Database;
@@ -60,6 +63,24 @@ pub fn bgsave_start(
     });
 
     Frame::SimpleString(Bytes::from_static(b"Background saving started"))
+}
+
+/// Start a background AOF rewrite (BGREWRITEAOF command).
+///
+/// Sends a Rewrite message to the AOF writer task, which will generate
+/// synthetic commands from current database state and replace the AOF file.
+pub fn bgrewriteaof_start(
+    aof_tx: &mpsc::Sender<AofMessage>,
+    db: Arc<Mutex<Vec<Database>>>,
+) -> Frame {
+    match aof_tx.try_send(AofMessage::Rewrite(db)) {
+        Ok(()) => Frame::SimpleString(Bytes::from_static(
+            b"Background append only file rewriting started",
+        )),
+        Err(_) => Frame::Error(Bytes::from_static(
+            b"ERR Background AOF rewrite failed to start",
+        )),
+    }
 }
 
 #[cfg(test)]

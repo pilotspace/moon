@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::ServerConfig;
+use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
 use crate::persistence::rdb;
 use crate::storage::Database;
 
@@ -44,9 +47,17 @@ pub async fn run_with_shutdown(
     let databases: Vec<Database> = (0..config.databases).map(|_| Database::new()).collect();
     let db = Arc::new(Mutex::new(databases));
 
-    // Load RDB snapshot on startup if file exists
+    // Startup restore: AOF takes priority over RDB
+    let aof_path = PathBuf::from(&config.dir).join(&config.appendfilename);
     let rdb_path = PathBuf::from(&config.dir).join(&config.dbfilename);
-    if rdb_path.exists() {
+
+    if config.appendonly == "yes" && aof_path.exists() {
+        let mut dbs = db.lock().unwrap();
+        match aof::replay_aof(&mut dbs, &aof_path) {
+            Ok(n) => info!("AOF loaded: {} commands replayed from {}", n, aof_path.display()),
+            Err(e) => error!("AOF load failed: {}. Starting with empty database.", e),
+        }
+    } else if rdb_path.exists() {
         let mut dbs = db.lock().unwrap();
         match rdb::load(&mut dbs, &rdb_path) {
             Ok(count) => info!("RDB loaded: {} keys from {}", count, rdb_path.display()),
@@ -55,6 +66,43 @@ pub async fn run_with_shutdown(
     }
 
     let config = Arc::new(config);
+
+    // Set up AOF writer task if appendonly is enabled
+    let aof_tx: Option<mpsc::Sender<AofMessage>> = if config.appendonly == "yes" {
+        let (tx, rx) = mpsc::channel::<AofMessage>(10_000);
+        let aof_token = token.child_token();
+        let fsync = FsyncPolicy::from_str(&config.appendfsync);
+        let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+        tokio::spawn(aof::aof_writer_task(rx, aof_file_path, fsync, aof_token));
+        info!("AOF enabled with fsync policy: {:?}", fsync);
+        Some(tx)
+    } else {
+        None
+    };
+
+    // Set up change counter for auto-save
+    let change_counter = Arc::new(AtomicU64::new(0));
+
+    // Set up auto-save timer if save rules are configured
+    if config.save.is_some() {
+        let rules = crate::persistence::auto_save::parse_save_rules(&config.save);
+        if !rules.is_empty() {
+            let auto_save_db = db.clone();
+            let auto_save_token = token.child_token();
+            let auto_save_counter = change_counter.clone();
+            let dir = config.dir.clone();
+            let dbfilename = config.dbfilename.clone();
+            tokio::spawn(crate::persistence::auto_save::run_auto_save(
+                auto_save_db,
+                rules,
+                dir,
+                dbfilename,
+                auto_save_counter,
+                auto_save_token,
+            ));
+            info!("Auto-save timer started");
+        }
+    }
 
     // Spawn active expiration background task
     let exp_db = db.clone();
@@ -71,7 +119,12 @@ pub async fn run_with_shutdown(
                         let conn_token = token.child_token();
                         let requirepass = config.requirepass.clone();
                         let config = config.clone();
-                        tokio::spawn(connection::handle_connection(stream, db, conn_token, requirepass, config));
+                        let aof_tx = aof_tx.clone();
+                        let change_counter = Some(change_counter.clone());
+                        tokio::spawn(connection::handle_connection(
+                            stream, db, conn_token, requirepass, config,
+                            aof_tx, change_counter,
+                        ));
                     }
                     Err(e) => {
                         error!("Accept error: {}", e);
@@ -80,6 +133,10 @@ pub async fn run_with_shutdown(
             }
             _ = token.cancelled() => {
                 info!("Server shutting down");
+                // Send shutdown to AOF writer
+                if let Some(ref tx) = aof_tx {
+                    let _ = tx.send(AofMessage::Shutdown).await;
+                }
                 break;
             }
         }

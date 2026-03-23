@@ -25,6 +25,12 @@ async fn start_server() -> (u16, CancellationToken) {
         port,
         databases: 16,
         requirepass: None,
+        appendonly: "no".to_string(),
+        appendfsync: "everysec".to_string(),
+        save: None,
+        dir: ".".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
     };
 
     tokio::spawn(async move {
@@ -53,6 +59,12 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         port,
         databases: 16,
         requirepass: Some(password.to_string()),
+        appendonly: "no".to_string(),
+        appendfsync: "everysec".to_string(),
+        save: None,
+        dir: ".".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
     };
 
     tokio::spawn(async move {
