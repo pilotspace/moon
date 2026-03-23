@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod key;
+pub mod string;
 
 use bytes::Bytes;
 
@@ -64,6 +65,27 @@ pub fn dispatch(
         b"PTTL" => DispatchResult::Response(key::pttl(db, cmd_args)),
         b"PERSIST" => DispatchResult::Response(key::persist(db, cmd_args)),
         b"TYPE" => DispatchResult::Response(key::type_cmd(db, cmd_args)),
+        b"KEYS" => DispatchResult::Response(key::keys(db, cmd_args)),
+        b"RENAME" => DispatchResult::Response(key::rename(db, cmd_args)),
+        b"RENAMENX" => DispatchResult::Response(key::renamenx(db, cmd_args)),
+        // String commands
+        b"GET" => DispatchResult::Response(string::get(db, cmd_args)),
+        b"SET" => DispatchResult::Response(string::set(db, cmd_args)),
+        b"MGET" => DispatchResult::Response(string::mget(db, cmd_args)),
+        b"MSET" => DispatchResult::Response(string::mset(db, cmd_args)),
+        b"INCR" => DispatchResult::Response(string::incr(db, cmd_args)),
+        b"DECR" => DispatchResult::Response(string::decr(db, cmd_args)),
+        b"INCRBY" => DispatchResult::Response(string::incrby(db, cmd_args)),
+        b"DECRBY" => DispatchResult::Response(string::decrby(db, cmd_args)),
+        b"INCRBYFLOAT" => DispatchResult::Response(string::incrbyfloat(db, cmd_args)),
+        b"APPEND" => DispatchResult::Response(string::append(db, cmd_args)),
+        b"STRLEN" => DispatchResult::Response(string::strlen(db, cmd_args)),
+        b"SETNX" => DispatchResult::Response(string::setnx(db, cmd_args)),
+        b"SETEX" => DispatchResult::Response(string::setex(db, cmd_args)),
+        b"PSETEX" => DispatchResult::Response(string::psetex(db, cmd_args)),
+        b"GETSET" => DispatchResult::Response(string::getset(db, cmd_args)),
+        b"GETDEL" => DispatchResult::Response(string::getdel(db, cmd_args)),
+        b"GETEX" => DispatchResult::Response(string::getex(db, cmd_args)),
         _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
             "ERR unknown command '{}', with args beginning with: ",
             String::from_utf8_lossy(&cmd_name)
@@ -154,6 +176,38 @@ mod tests {
         match result {
             DispatchResult::Response(Frame::Error(_)) => {}
             _ => panic!("Expected error response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_get_set() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // SET foo bar
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"SET", b"foo", b"bar"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"OK")));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // GET foo
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"GET", b"foo"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from_static(b"bar")));
+            }
+            _ => panic!("Expected Response"),
         }
     }
 
