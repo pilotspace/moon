@@ -110,7 +110,11 @@ start_rust_server() {
     shift
     local extra_args=("$@")
     log "Starting rust-redis on port $port ${extra_args[*]:-}"
-    "$RUST_BINARY" --port "$port" "${extra_args[@]}" &
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        "$RUST_BINARY" --port "$port" "${extra_args[@]}" &
+    else
+        "$RUST_BINARY" --port "$port" &
+    fi
     RUST_PID=$!
     wait_for_server "$port"
 }
@@ -129,7 +133,11 @@ start_redis_server() {
     shift
     local extra_args=("$@")
     log "Starting redis-server on port $port ${extra_args[*]:-}"
-    redis-server --port "$port" --save "" --daemonize no "${extra_args[@]}" &
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        redis-server --port "$port" --save "" --daemonize no "${extra_args[@]}" &
+    else
+        redis-server --port "$port" --save "" --daemonize no &
+    fi
     REDIS_PID=$!
     wait_for_server "$port"
 }
