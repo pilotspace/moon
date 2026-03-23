@@ -216,18 +216,15 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
 
     while i < args.len() {
         let arg = match extract_bytes(&args[i]) {
-            Some(b) => b,
+            Some(b) => b.as_ref(),
             None => break,
         };
-        let upper = arg.to_ascii_uppercase();
-        match upper.as_slice() {
-            b"NX" => { nx = true; i += 1; }
-            b"XX" => { xx = true; i += 1; }
-            b"GT" => { gt = true; i += 1; }
-            b"LT" => { lt = true; i += 1; }
-            b"CH" => { ch = true; i += 1; }
-            _ => break,
-        }
+        if arg.eq_ignore_ascii_case(b"NX") { nx = true; i += 1; }
+        else if arg.eq_ignore_ascii_case(b"XX") { xx = true; i += 1; }
+        else if arg.eq_ignore_ascii_case(b"GT") { gt = true; i += 1; }
+        else if arg.eq_ignore_ascii_case(b"LT") { lt = true; i += 1; }
+        else if arg.eq_ignore_ascii_case(b"CH") { ch = true; i += 1; }
+        else { break; }
     }
 
     // NX and XX are mutually exclusive
@@ -624,38 +621,35 @@ pub fn zscan(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 2;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(b) => b,
+            Some(b) => b.as_ref(),
             None => { i += 1; continue; }
         };
-        let upper = opt.to_ascii_uppercase();
-        match upper.as_slice() {
-            b"MATCH" => {
-                if i + 1 < args.len() {
-                    pattern = extract_bytes(&args[i + 1]).map(|b| b.as_ref());
-                    i += 2;
-                } else {
-                    return err_wrong_args("ZSCAN");
-                }
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            if i + 1 < args.len() {
+                pattern = extract_bytes(&args[i + 1]).map(|b| b.as_ref());
+                i += 2;
+            } else {
+                return err_wrong_args("ZSCAN");
             }
-            b"COUNT" => {
-                if i + 1 < args.len() {
-                    let count_b = match extract_bytes(&args[i + 1]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZSCAN"),
-                    };
-                    scan_count = match std::str::from_utf8(count_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                    {
-                        Some(c) => c,
-                        None => return err("ERR value is not an integer or out of range"),
-                    };
-                    i += 2;
-                } else {
-                    return err_wrong_args("ZSCAN");
-                }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            if i + 1 < args.len() {
+                let count_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZSCAN"),
+                };
+                scan_count = match std::str::from_utf8(count_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                {
+                    Some(c) => c,
+                    None => return err("ERR value is not an integer or out of range"),
+                };
+                i += 2;
+            } else {
+                return err_wrong_args("ZSCAN");
             }
-            _ => { i += 1; }
+        } else {
+            i += 1;
         }
     }
 
@@ -768,40 +762,38 @@ pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 3;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(b) => b,
+            Some(b) => b.as_ref(),
             None => { i += 1; continue; }
         };
-        let upper = opt.to_ascii_uppercase();
-        match upper.as_slice() {
-            b"BYSCORE" => { by_score = true; i += 1; }
-            b"BYLEX" => { by_lex = true; i += 1; }
-            b"REV" => { rev = true; i += 1; }
-            b"WITHSCORES" => { withscores = true; i += 1; }
-            b"LIMIT" => {
-                if i + 2 < args.len() {
-                    let off_b = match extract_bytes(&args[i + 1]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZRANGE"),
-                    };
-                    let cnt_b = match extract_bytes(&args[i + 2]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZRANGE"),
-                    };
-                    limit_offset = std::str::from_utf8(off_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    limit_count = std::str::from_utf8(cnt_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    if limit_offset.is_none() || limit_count.is_none() {
-                        return err("ERR value is not an integer or out of range");
-                    }
-                    i += 3;
-                } else {
-                    return err_wrong_args("ZRANGE");
+        if opt.eq_ignore_ascii_case(b"BYSCORE") { by_score = true; i += 1; }
+        else if opt.eq_ignore_ascii_case(b"BYLEX") { by_lex = true; i += 1; }
+        else if opt.eq_ignore_ascii_case(b"REV") { rev = true; i += 1; }
+        else if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
+        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+            if i + 2 < args.len() {
+                let off_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGE"),
+                };
+                let cnt_b = match extract_bytes(&args[i + 2]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGE"),
+                };
+                limit_offset = std::str::from_utf8(off_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                limit_count = std::str::from_utf8(cnt_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                if limit_offset.is_none() || limit_count.is_none() {
+                    return err("ERR value is not an integer or out of range");
                 }
+                i += 3;
+            } else {
+                return err_wrong_args("ZRANGE");
             }
-            _ => { i += 1; }
+        } else {
+            i += 1;
         }
     }
 
@@ -1038,7 +1030,7 @@ pub fn zrevrange(db: &mut Database, args: &[Frame]) -> Frame {
 
     let withscores = args.len() > 3
         && extract_bytes(&args[3])
-            .map(|b| b.to_ascii_uppercase() == b"WITHSCORES")
+            .map(|b| b.eq_ignore_ascii_case(b"WITHSCORES"))
             .unwrap_or(false);
 
     match db.get_sorted_set(key) {
@@ -1075,37 +1067,35 @@ pub fn zrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 3;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(b) => b,
+            Some(b) => b.as_ref(),
             None => { i += 1; continue; }
         };
-        let upper = opt.to_ascii_uppercase();
-        match upper.as_slice() {
-            b"WITHSCORES" => { withscores = true; i += 1; }
-            b"LIMIT" => {
-                if i + 2 < args.len() {
-                    let off_b = match extract_bytes(&args[i + 1]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZRANGEBYSCORE"),
-                    };
-                    let cnt_b = match extract_bytes(&args[i + 2]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZRANGEBYSCORE"),
-                    };
-                    limit_offset = std::str::from_utf8(off_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    limit_count = std::str::from_utf8(cnt_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    if limit_offset.is_none() || limit_count.is_none() {
-                        return err("ERR value is not an integer or out of range");
-                    }
-                    i += 3;
-                } else {
-                    return err_wrong_args("ZRANGEBYSCORE");
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
+        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+            if i + 2 < args.len() {
+                let off_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGEBYSCORE"),
+                };
+                let cnt_b = match extract_bytes(&args[i + 2]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGEBYSCORE"),
+                };
+                limit_offset = std::str::from_utf8(off_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                limit_count = std::str::from_utf8(cnt_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                if limit_offset.is_none() || limit_count.is_none() {
+                    return err("ERR value is not an integer or out of range");
                 }
+                i += 3;
+            } else {
+                return err_wrong_args("ZRANGEBYSCORE");
             }
-            _ => { i += 1; }
+        } else {
+            i += 1;
         }
     }
 
@@ -1144,37 +1134,35 @@ pub fn zrevrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 3;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(b) => b,
+            Some(b) => b.as_ref(),
             None => { i += 1; continue; }
         };
-        let upper = opt.to_ascii_uppercase();
-        match upper.as_slice() {
-            b"WITHSCORES" => { withscores = true; i += 1; }
-            b"LIMIT" => {
-                if i + 2 < args.len() {
-                    let off_b = match extract_bytes(&args[i + 1]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZREVRANGEBYSCORE"),
-                    };
-                    let cnt_b = match extract_bytes(&args[i + 2]) {
-                        Some(b) => b,
-                        None => return err_wrong_args("ZREVRANGEBYSCORE"),
-                    };
-                    limit_offset = std::str::from_utf8(off_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    limit_count = std::str::from_utf8(cnt_b)
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    if limit_offset.is_none() || limit_count.is_none() {
-                        return err("ERR value is not an integer or out of range");
-                    }
-                    i += 3;
-                } else {
-                    return err_wrong_args("ZREVRANGEBYSCORE");
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
+        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+            if i + 2 < args.len() {
+                let off_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZREVRANGEBYSCORE"),
+                };
+                let cnt_b = match extract_bytes(&args[i + 2]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZREVRANGEBYSCORE"),
+                };
+                limit_offset = std::str::from_utf8(off_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                limit_count = std::str::from_utf8(cnt_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                if limit_offset.is_none() || limit_count.is_none() {
+                    return err("ERR value is not an integer or out of range");
                 }
+                i += 3;
+            } else {
+                return err_wrong_args("ZREVRANGEBYSCORE");
             }
-            _ => { i += 1; }
+        } else {
+            i += 1;
         }
     }
 
@@ -1320,49 +1308,48 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
 
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(b) => b,
+            Some(b) => b.as_ref(),
             None => { i += 1; continue; }
         };
-        let upper = opt.to_ascii_uppercase();
-        match upper.as_slice() {
-            b"WEIGHTS" => {
-                for w in 0..numkeys {
-                    if i + 1 + w >= args.len() {
-                        return err_wrong_args(cmd_name);
-                    }
-                    let wb = match extract_bytes(&args[i + 1 + w]) {
-                        Some(b) => b,
-                        None => return err_wrong_args(cmd_name),
-                    };
-                    let wval: f64 = match std::str::from_utf8(wb)
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                    {
-                        Some(v) => v,
-                        None => return err("ERR weight value is not a float"),
-                    };
-                    weights[w] = wval;
-                }
-                i += 1 + numkeys;
-            }
-            b"AGGREGATE" => {
-                if i + 1 >= args.len() {
+        if opt.eq_ignore_ascii_case(b"WEIGHTS") {
+            for w in 0..numkeys {
+                if i + 1 + w >= args.len() {
                     return err_wrong_args(cmd_name);
                 }
-                let agg_b = match extract_bytes(&args[i + 1]) {
+                let wb = match extract_bytes(&args[i + 1 + w]) {
                     Some(b) => b,
                     None => return err_wrong_args(cmd_name),
                 };
-                let agg_upper = agg_b.to_ascii_uppercase();
-                aggregate = match agg_upper.as_slice() {
-                    b"SUM" => AggregateOp::Sum,
-                    b"MIN" => AggregateOp::Min,
-                    b"MAX" => AggregateOp::Max,
-                    _ => return err("ERR syntax error"),
+                let wval: f64 = match std::str::from_utf8(wb)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                {
+                    Some(v) => v,
+                    None => return err("ERR weight value is not a float"),
                 };
-                i += 2;
+                weights[w] = wval;
             }
-            _ => { i += 1; }
+            i += 1 + numkeys;
+        } else if opt.eq_ignore_ascii_case(b"AGGREGATE") {
+            if i + 1 >= args.len() {
+                return err_wrong_args(cmd_name);
+            }
+            let agg_b = match extract_bytes(&args[i + 1]) {
+                Some(b) => b.as_ref(),
+                None => return err_wrong_args(cmd_name),
+            };
+            aggregate = if agg_b.eq_ignore_ascii_case(b"SUM") {
+                AggregateOp::Sum
+            } else if agg_b.eq_ignore_ascii_case(b"MIN") {
+                AggregateOp::Min
+            } else if agg_b.eq_ignore_ascii_case(b"MAX") {
+                AggregateOp::Max
+            } else {
+                return err("ERR syntax error");
+            };
+            i += 2;
+        } else {
+            i += 1;
         }
     }
 

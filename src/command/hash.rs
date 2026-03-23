@@ -475,36 +475,31 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 2;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(o) => o.clone(),
+            Some(o) => o.as_ref(),
             None => {
                 i += 1;
                 continue;
             }
         };
-        let opt_upper = opt.to_ascii_uppercase();
-        match opt_upper.as_slice() {
-            b"MATCH" => {
-                i += 1;
-                if i < args.len() {
-                    match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
-                }
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            i += 1;
+            if i < args.len() {
+                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
             }
-            b"COUNT" => {
-                i += 1;
-                if i < args.len() {
-                    if let Some(v) = extract_bytes(&args[i]) {
-                        if let Some(c) = std::str::from_utf8(v)
-                            .ok()
-                            .and_then(|s| s.parse::<usize>().ok())
-                        {
-                            if c > 0 {
-                                count = c;
-                            }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            i += 1;
+            if i < args.len() {
+                if let Some(v) = extract_bytes(&args[i]) {
+                    if let Some(c) = std::str::from_utf8(v)
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if c > 0 {
+                            count = c;
                         }
                     }
                 }
             }
-            _ => {}
         }
         i += 1;
     }

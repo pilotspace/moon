@@ -760,31 +760,26 @@ pub fn sscan(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 2;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(o) => o,
+            Some(o) => o.as_ref(),
             None => {
                 i += 1;
                 continue;
             }
         };
-        let opt_upper: Vec<u8> = opt.to_ascii_uppercase();
-        match opt_upper.as_slice() {
-            b"MATCH" => {
-                i += 1;
-                if i < args.len() {
-                    match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
-                }
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            i += 1;
+            if i < args.len() {
+                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
             }
-            b"COUNT" => {
-                i += 1;
-                if i < args.len() {
-                    if let Some(c) = parse_int(&args[i]) {
-                        if c > 0 {
-                            count = c as usize;
-                        }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            i += 1;
+            if i < args.len() {
+                if let Some(c) = parse_int(&args[i]) {
+                    if c > 0 {
+                        count = c as usize;
                     }
                 }
             }
-            _ => {}
         }
         i += 1;
     }

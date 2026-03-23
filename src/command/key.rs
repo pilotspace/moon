@@ -521,31 +521,25 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
                 continue;
             }
         };
-        let opt_upper: Vec<u8> = opt.to_ascii_uppercase();
-        match opt_upper.as_slice() {
-            b"MATCH" => {
-                i += 1;
-                if i < args.len() {
-                    match_pattern = extract_key(&args[i]);
-                }
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            i += 1;
+            if i < args.len() {
+                match_pattern = extract_key(&args[i]);
             }
-            b"COUNT" => {
-                i += 1;
-                if i < args.len() {
-                    if let Some(c) = parse_int(&args[i]) {
-                        if c > 0 {
-                            count = c as usize;
-                        }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            i += 1;
+            if i < args.len() {
+                if let Some(c) = parse_int(&args[i]) {
+                    if c > 0 {
+                        count = c as usize;
                     }
                 }
             }
-            b"TYPE" => {
-                i += 1;
-                if i < args.len() {
-                    type_filter = extract_key(&args[i]);
-                }
+        } else if opt.eq_ignore_ascii_case(b"TYPE") {
+            i += 1;
+            if i < args.len() {
+                type_filter = extract_key(&args[i]);
             }
-            _ => {}
         }
         i += 1;
     }

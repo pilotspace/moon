@@ -91,10 +91,9 @@ pub fn command(args: &[Frame]) -> Frame {
     if args.is_empty() {
         return Frame::Integer(0);
     }
-    // Check for DOCS subcommand (case-insensitive)
+    // Check for DOCS subcommand (case-insensitive, zero-alloc)
     if let Some(Frame::BulkString(sub)) | Some(Frame::SimpleString(sub)) = args.first() {
-        let upper = sub.to_ascii_uppercase();
-        if upper.as_slice() == b"DOCS" || upper.as_slice() == b"COUNT" {
+        if sub.eq_ignore_ascii_case(b"DOCS") || sub.eq_ignore_ascii_case(b"COUNT") {
             return Frame::Array(vec![]);
         }
     }

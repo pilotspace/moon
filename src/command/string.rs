@@ -65,83 +65,81 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     let mut keepttl = false;
     let mut get_old = false;
 
-    // Parse options from args[2..]
+    // Parse options from args[2..] using zero-alloc case-insensitive comparison
     let mut i = 2;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.to_ascii_uppercase(),
+            Some(b) => b.as_ref(),
             None => {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
         };
-        match opt.as_slice() {
-            b"EX" => {
-                i += 1;
-                if i >= args.len() {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-                }
-                match parse_positive_i64(&args[i]) {
-                    Some(secs) => expiry = Some(Duration::from_secs(secs as u64)),
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
-                }
-            }
-            b"PX" => {
-                i += 1;
-                if i >= args.len() {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-                }
-                match parse_positive_i64(&args[i]) {
-                    Some(ms) => expiry = Some(Duration::from_millis(ms as u64)),
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
-                }
-            }
-            b"EXAT" => {
-                i += 1;
-                if i >= args.len() {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-                }
-                match parse_positive_i64(&args[i]) {
-                    Some(ts) => {
-                        expiry_instant = Some(unix_secs_to_instant(ts as u64));
-                    }
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
-                }
-            }
-            b"PXAT" => {
-                i += 1;
-                if i >= args.len() {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-                }
-                match parse_positive_i64(&args[i]) {
-                    Some(ts_ms) => {
-                        expiry_instant = Some(unix_millis_to_instant(ts_ms as u64));
-                    }
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
-                }
-            }
-            b"NX" => nx = true,
-            b"XX" => xx = true,
-            b"KEEPTTL" => keepttl = true,
-            b"GET" => get_old = true,
-            _ => {
+        if opt.eq_ignore_ascii_case(b"EX") {
+            i += 1;
+            if i >= args.len() {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
+            match parse_positive_i64(&args[i]) {
+                Some(secs) => expiry = Some(Duration::from_secs(secs as u64)),
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
+                }
+            }
+        } else if opt.eq_ignore_ascii_case(b"PX") {
+            i += 1;
+            if i >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[i]) {
+                Some(ms) => expiry = Some(Duration::from_millis(ms as u64)),
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
+                }
+            }
+        } else if opt.eq_ignore_ascii_case(b"EXAT") {
+            i += 1;
+            if i >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[i]) {
+                Some(ts) => {
+                    expiry_instant = Some(unix_secs_to_instant(ts as u64));
+                }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
+                }
+            }
+        } else if opt.eq_ignore_ascii_case(b"PXAT") {
+            i += 1;
+            if i >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[i]) {
+                Some(ts_ms) => {
+                    expiry_instant = Some(unix_millis_to_instant(ts_ms as u64));
+                }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
+                }
+            }
+        } else if opt.eq_ignore_ascii_case(b"NX") {
+            nx = true;
+        } else if opt.eq_ignore_ascii_case(b"XX") {
+            xx = true;
+        } else if opt.eq_ignore_ascii_case(b"KEEPTTL") {
+            keepttl = true;
+        } else if opt.eq_ignore_ascii_case(b"GET") {
+            get_old = true;
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
         i += 1;
     }
@@ -677,89 +675,84 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
         None => return Frame::Null,
     };
 
-    // Parse options
+    // Parse options using zero-alloc case-insensitive comparison
     if args.len() > 1 {
         let opt = match extract_bytes(&args[1]) {
-            Some(b) => b.to_ascii_uppercase(),
+            Some(b) => b.as_ref(),
             None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
         };
-        match opt.as_slice() {
-            b"PERSIST" => {
-                if let Some(entry) = db.get_mut(&key) {
-                    entry.expires_at = None;
+        if opt.eq_ignore_ascii_case(b"PERSIST") {
+            if let Some(entry) = db.get_mut(&key) {
+                entry.expires_at = None;
+            }
+        } else if opt.eq_ignore_ascii_case(b"EX") {
+            if args.len() < 3 {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[2]) {
+                Some(secs) => {
+                    if let Some(entry) = db.get_mut(&key) {
+                        entry.expires_at =
+                            Some(Instant::now() + Duration::from_secs(secs as u64));
+                    }
+                }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
                 }
             }
-            b"EX" => {
-                if args.len() < 3 {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        } else if opt.eq_ignore_ascii_case(b"PX") {
+            if args.len() < 3 {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[2]) {
+                Some(ms) => {
+                    if let Some(entry) = db.get_mut(&key) {
+                        entry.expires_at =
+                            Some(Instant::now() + Duration::from_millis(ms as u64));
+                    }
                 }
-                match parse_positive_i64(&args[2]) {
-                    Some(secs) => {
-                        if let Some(entry) = db.get_mut(&key) {
-                            entry.expires_at =
-                                Some(Instant::now() + Duration::from_secs(secs as u64));
-                        }
-                    }
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
                 }
             }
-            b"PX" => {
-                if args.len() < 3 {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        } else if opt.eq_ignore_ascii_case(b"EXAT") {
+            if args.len() < 3 {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[2]) {
+                Some(ts) => {
+                    if let Some(entry) = db.get_mut(&key) {
+                        entry.expires_at = Some(unix_secs_to_instant(ts as u64));
+                    }
                 }
-                match parse_positive_i64(&args[2]) {
-                    Some(ms) => {
-                        if let Some(entry) = db.get_mut(&key) {
-                            entry.expires_at =
-                                Some(Instant::now() + Duration::from_millis(ms as u64));
-                        }
-                    }
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
                 }
             }
-            b"EXAT" => {
-                if args.len() < 3 {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        } else if opt.eq_ignore_ascii_case(b"PXAT") {
+            if args.len() < 3 {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            match parse_positive_i64(&args[2]) {
+                Some(ts_ms) => {
+                    if let Some(entry) = db.get_mut(&key) {
+                        entry.expires_at = Some(unix_millis_to_instant(ts_ms as u64));
+                    }
                 }
-                match parse_positive_i64(&args[2]) {
-                    Some(ts) => {
-                        if let Some(entry) = db.get_mut(&key) {
-                            entry.expires_at = Some(unix_secs_to_instant(ts as u64));
-                        }
-                    }
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
                 }
             }
-            b"PXAT" => {
-                if args.len() < 3 {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-                }
-                match parse_positive_i64(&args[2]) {
-                    Some(ts_ms) => {
-                        if let Some(entry) = db.get_mut(&key) {
-                            entry.expires_at = Some(unix_millis_to_instant(ts_ms as u64));
-                        }
-                    }
-                    None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR value is not an integer or out of range",
-                        ))
-                    }
-                }
-            }
-            _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
     }
 

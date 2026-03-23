@@ -381,7 +381,7 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LINSERT"),
     };
     let position = match extract_bytes(&args[1]) {
-        Some(p) => p.to_ascii_uppercase(),
+        Some(p) => p.as_ref(),
         None => return err_wrong_args("LINSERT"),
     };
     let pivot = match extract_bytes(&args[2]) {
@@ -393,14 +393,14 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LINSERT"),
     };
 
-    let before = match position.as_slice() {
-        b"BEFORE" => true,
-        b"AFTER" => false,
-        _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR syntax error",
-            ))
-        }
+    let before = if position.eq_ignore_ascii_case(b"BEFORE") {
+        true
+    } else if position.eq_ignore_ascii_case(b"AFTER") {
+        false
+    } else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR syntax error",
+        ));
     };
 
     // If key doesn't exist, return 0
@@ -594,7 +594,7 @@ pub fn lpos(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 2;
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
-            Some(o) => o.to_ascii_uppercase(),
+            Some(o) => o.as_ref(),
             None => return err_wrong_args("LPOS"),
         };
         i += 1;
@@ -610,32 +610,29 @@ pub fn lpos(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
         i += 1;
-        match opt.as_slice() {
-            b"RANK" => {
-                if val == 0 {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative values meaning from the end of the list",
-                    ));
-                }
-                rank = val;
+        if opt.eq_ignore_ascii_case(b"RANK") {
+            if val == 0 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative values meaning from the end of the list",
+                ));
             }
-            b"COUNT" => {
-                if val < 0 {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR COUNT can't be negative",
-                    ));
-                }
-                count = Some(val as usize);
+            rank = val;
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            if val < 0 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR COUNT can't be negative",
+                ));
             }
-            b"MAXLEN" => {
-                if val < 0 {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR MAXLEN can't be negative",
-                    ));
-                }
-                maxlen = val as usize;
+            count = Some(val as usize);
+        } else if opt.eq_ignore_ascii_case(b"MAXLEN") {
+            if val < 0 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR MAXLEN can't be negative",
+                ));
             }
-            _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            maxlen = val as usize;
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
     }
 
