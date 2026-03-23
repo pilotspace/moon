@@ -426,6 +426,98 @@ impl Database {
     pub fn data(&self) -> &HashMap<Bytes, Entry> {
         &self.data
     }
+
+    // ---- Read-only methods for RwLock read path ----
+    // These take `now_ms` as a parameter and do NOT mutate state:
+    // no expired-key removal, no LRU touch.
+
+    /// Read-only get: checks expiry, returns None if expired, but does NOT
+    /// remove expired keys or touch LRU. Used with RwLock read path.
+    pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
+        let entry = self.data.get(key)?;
+        if entry.is_expired_at(now_ms) {
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Read-only existence check: returns false if expired.
+    pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        self.data
+            .get(key)
+            .map(|e| !e.is_expired_at(now_ms))
+            .unwrap_or(false)
+    }
+
+    /// Read-only hash access. Returns None if key missing or expired, Err if wrong type.
+    pub fn get_hash_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
+            Some(entry) => match &entry.value {
+                RedisValue::Hash(map) => Ok(Some(map)),
+                _ => Err(Self::wrongtype_error()),
+            },
+        }
+    }
+
+    /// Read-only list access. Returns None if key missing or expired, Err if wrong type.
+    pub fn get_list_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<&VecDeque<Bytes>>, Frame> {
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
+            Some(entry) => match &entry.value {
+                RedisValue::List(list) => Ok(Some(list)),
+                _ => Err(Self::wrongtype_error()),
+            },
+        }
+    }
+
+    /// Read-only set access. Returns None if key missing or expired, Err if wrong type.
+    pub fn get_set_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<&HashSet<Bytes>>, Frame> {
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
+            Some(entry) => match &entry.value {
+                RedisValue::Set(set) => Ok(Some(set)),
+                _ => Err(Self::wrongtype_error()),
+            },
+        }
+    }
+
+    /// Read-only sorted set access. Returns None if key missing or expired, Err if wrong type.
+    pub fn get_sorted_set_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<
+        Option<(
+            &HashMap<Bytes, f64>,
+            &BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+        )>,
+        Frame,
+    > {
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
+            Some(entry) => match &entry.value {
+                RedisValue::SortedSet { members, scores } => Ok(Some((members, scores))),
+                _ => Err(Self::wrongtype_error()),
+            },
+        }
+    }
 }
 
 impl Default for Database {
