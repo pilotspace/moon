@@ -130,6 +130,13 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     Frame::BulkString(Bytes::from(sections))
 }
 
+/// INFO command handler (read-only variant for RwLock read path).
+///
+/// Identical to info() -- Database methods used (len, expires_count) are already &self.
+pub fn info_readonly(db: &Database, args: &[Frame]) -> Frame {
+    info(db, args)
+}
+
 /// AUTH command handler.
 ///
 /// Authenticates the client with the configured password.

@@ -789,6 +789,71 @@ fn format_float(val: f64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read-only variants for RwLock read path
+// ---------------------------------------------------------------------------
+
+/// GET (read-only): uses get_if_alive instead of get.
+pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("GET");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GET"),
+    };
+    match db.get_if_alive(key, now_ms) {
+        Some(entry) => match &entry.value {
+            RedisValue::String(v) => Frame::BulkString(v.clone()),
+            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        None => Frame::Null,
+    }
+}
+
+/// MGET (read-only).
+pub fn mget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("MGET");
+    }
+    let mut results = Vec::with_capacity(args.len());
+    for arg in args {
+        let key = match extract_bytes(arg) {
+            Some(k) => k,
+            None => {
+                results.push(Frame::Null);
+                continue;
+            }
+        };
+        match db.get_if_alive(key, now_ms) {
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => results.push(Frame::BulkString(v.clone())),
+                _ => results.push(Frame::Null),
+            },
+            None => results.push(Frame::Null),
+        }
+    }
+    Frame::Array(results)
+}
+
+/// STRLEN (read-only).
+pub fn strlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("STRLEN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("STRLEN"),
+    };
+    match db.get_if_alive(key, now_ms) {
+        Some(entry) => match &entry.value {
+            RedisValue::String(v) => Frame::Integer(v.len() as i64),
+            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        None => Frame::Integer(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

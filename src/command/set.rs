@@ -830,6 +830,319 @@ pub fn sscan(db: &mut Database, args: &[Frame]) -> Frame {
 // Tests
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Read-only variants for RwLock read path
+// ---------------------------------------------------------------------------
+
+/// Collect sets read-only (no mutation, no expiry removal).
+fn collect_sets_readonly(
+    db: &Database,
+    keys: &[&Bytes],
+    now_ms: u64,
+) -> Result<Vec<Option<HashSet<Bytes>>>, Frame> {
+    let mut sets = Vec::with_capacity(keys.len());
+    for key in keys {
+        match db.get_set_if_alive(key, now_ms) {
+            Ok(Some(set)) => sets.push(Some(set.clone())),
+            Ok(None) => sets.push(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(sets)
+}
+
+/// SMEMBERS (read-only).
+pub fn smembers_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("SMEMBERS");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SMEMBERS"),
+    };
+    match db.get_set_if_alive(key, now_ms) {
+        Ok(Some(set)) => {
+            let members: Vec<Frame> = set.iter().map(|m| Frame::BulkString(m.clone())).collect();
+            Frame::Array(members)
+        }
+        Ok(None) => Frame::Array(vec![]),
+        Err(e) => e,
+    }
+}
+
+/// SCARD (read-only).
+pub fn scard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("SCARD");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SCARD"),
+    };
+    match db.get_set_if_alive(key, now_ms) {
+        Ok(Some(set)) => Frame::Integer(set.len() as i64),
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+    }
+}
+
+/// SISMEMBER (read-only).
+pub fn sismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("SISMEMBER");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SISMEMBER"),
+    };
+    let member = match extract_bytes(&args[1]) {
+        Some(m) => m,
+        None => return err_wrong_args("SISMEMBER"),
+    };
+    match db.get_set_if_alive(key, now_ms) {
+        Ok(Some(set)) => {
+            if set.contains(member) { Frame::Integer(1) } else { Frame::Integer(0) }
+        }
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+    }
+}
+
+/// SMISMEMBER (read-only).
+pub fn smismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("SMISMEMBER");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SMISMEMBER"),
+    };
+    match db.get_set_if_alive(key, now_ms) {
+        Ok(maybe_set) => {
+            let results: Vec<Frame> = args[1..]
+                .iter()
+                .map(|arg| {
+                    let member = extract_bytes(arg);
+                    match (maybe_set, member) {
+                        (Some(set), Some(m)) => {
+                            if set.contains(m) { Frame::Integer(1) } else { Frame::Integer(0) }
+                        }
+                        _ => Frame::Integer(0),
+                    }
+                })
+                .collect();
+            Frame::Array(results)
+        }
+        Err(e) => e,
+    }
+}
+
+/// SINTER (read-only).
+pub fn sinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SINTER");
+    }
+    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
+    if keys.len() != args.len() {
+        return err_wrong_args("SINTER");
+    }
+    let sets = match collect_sets_readonly(db, &keys, now_ms) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
+    for s in sets {
+        match s {
+            Some(set) => concrete.push(set),
+            None => return Frame::Array(vec![]),
+        }
+    }
+    if concrete.is_empty() {
+        return Frame::Array(vec![]);
+    }
+    concrete.sort_by_key(|s| s.len());
+    let mut result = concrete[0].clone();
+    for other in &concrete[1..] {
+        result.retain(|m| other.contains(m));
+    }
+    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
+    Frame::Array(members)
+}
+
+/// SUNION (read-only).
+pub fn sunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SUNION");
+    }
+    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
+    if keys.len() != args.len() {
+        return err_wrong_args("SUNION");
+    }
+    let sets = match collect_sets_readonly(db, &keys, now_ms) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let mut result = HashSet::new();
+    for s in sets {
+        if let Some(set) = s {
+            result.extend(set);
+        }
+    }
+    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
+    Frame::Array(members)
+}
+
+/// SDIFF (read-only).
+pub fn sdiff_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SDIFF");
+    }
+    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
+    if keys.len() != args.len() {
+        return err_wrong_args("SDIFF");
+    }
+    let sets = match collect_sets_readonly(db, &keys, now_ms) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let mut result = match &sets[0] {
+        Some(set) => set.clone(),
+        None => return Frame::Array(vec![]),
+    };
+    for s in &sets[1..] {
+        if let Some(set) = s {
+            result.retain(|m| !set.contains(m));
+        }
+    }
+    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
+    Frame::Array(members)
+}
+
+/// SRANDMEMBER (read-only).
+pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() || args.len() > 2 {
+        return err_wrong_args("SRANDMEMBER");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SRANDMEMBER"),
+    };
+    let set = match db.get_set_if_alive(key, now_ms) {
+        Ok(Some(s)) => s.clone(),
+        Ok(None) => {
+            return if args.len() == 1 { Frame::Null } else { Frame::Array(vec![]) };
+        }
+        Err(e) => return e,
+    };
+    if set.is_empty() {
+        return if args.len() == 1 { Frame::Null } else { Frame::Array(vec![]) };
+    }
+    let members: Vec<&Bytes> = set.iter().collect();
+    let mut rng = rand::rng();
+    if args.len() == 1 {
+        let chosen = members.choose(&mut rng).unwrap();
+        return Frame::BulkString((*chosen).clone());
+    }
+    let count = match parse_int(&args[1]) {
+        Some(c) => c,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
+    };
+    if count == 0 {
+        return Frame::Array(vec![]);
+    }
+    if count > 0 {
+        let n = std::cmp::min(count as usize, members.len());
+        let chosen: Vec<Frame> = members.choose_multiple(&mut rng, n)
+            .map(|m| Frame::BulkString((*m).clone()))
+            .collect();
+        Frame::Array(chosen)
+    } else {
+        let n = count.unsigned_abs() as usize;
+        let mut result = Vec::with_capacity(n);
+        for _ in 0..n {
+            let chosen = members.choose(&mut rng).unwrap();
+            result.push(Frame::BulkString((*chosen).clone()));
+        }
+        Frame::Array(result)
+    }
+}
+
+/// SSCAN (read-only).
+pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("SSCAN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SSCAN"),
+    };
+    let cursor: usize = match extract_bytes(&args[1])
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse().ok())
+    {
+        Some(c) => c,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
+    };
+    let mut match_pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut i = 2;
+    while i < args.len() {
+        let opt = match extract_bytes(&args[i]) {
+            Some(o) => o.as_ref(),
+            None => { i += 1; continue; }
+        };
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            i += 1;
+            if i < args.len() {
+                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
+            }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            i += 1;
+            if i < args.len() {
+                if let Some(c) = parse_int(&args[i]) {
+                    if c > 0 { count = c as usize; }
+                }
+            }
+        }
+        i += 1;
+    }
+    let members: Vec<Bytes> = match db.get_set_if_alive(key, now_ms) {
+        Ok(Some(set)) => {
+            let mut v: Vec<Bytes> = set.iter().cloned().collect();
+            v.sort();
+            v
+        }
+        Ok(None) => vec![],
+        Err(e) => return e,
+    };
+    let total = members.len();
+    let mut results = Vec::new();
+    let mut pos = cursor;
+    let mut checked = 0;
+    while pos < total && checked < count {
+        let member = &members[pos];
+        pos += 1;
+        checked += 1;
+        if let Some(pattern) = match_pattern {
+            if !glob_match(pattern, member) { continue; }
+        }
+        results.push(Frame::BulkString(member.clone()));
+    }
+    let next_cursor = if pos >= total {
+        Bytes::from_static(b"0")
+    } else {
+        Bytes::from(pos.to_string())
+    };
+    Frame::Array(vec![
+        Frame::BulkString(next_cursor),
+        Frame::Array(results),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

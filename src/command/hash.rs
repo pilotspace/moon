@@ -554,6 +554,245 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// Read-only variants for RwLock read path
+// ---------------------------------------------------------------------------
+
+/// HGET (read-only).
+pub fn hget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("HGET");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HGET"),
+    };
+    let field = match extract_bytes(&args[1]) {
+        Some(f) => f,
+        None => return err_wrong_args("HGET"),
+    };
+    match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(map)) => match map.get(field) {
+            Some(v) => Frame::BulkString(v.clone()),
+            None => Frame::Null,
+        },
+        Ok(None) => Frame::Null,
+        Err(e) => e,
+    }
+}
+
+/// HMGET (read-only).
+pub fn hmget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("HMGET");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HMGET"),
+    };
+    let map_opt = match db.get_hash_if_alive(key, now_ms) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let mut results = Vec::with_capacity(args.len() - 1);
+    for arg in &args[1..] {
+        let field = match extract_bytes(arg) {
+            Some(f) => f,
+            None => {
+                results.push(Frame::Null);
+                continue;
+            }
+        };
+        match &map_opt {
+            Some(map) => match map.get(field) {
+                Some(v) => results.push(Frame::BulkString(v.clone())),
+                None => results.push(Frame::Null),
+            },
+            None => results.push(Frame::Null),
+        }
+    }
+    Frame::Array(results)
+}
+
+/// HGETALL (read-only).
+pub fn hgetall_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("HGETALL");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HGETALL"),
+    };
+    match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(map)) => {
+            let mut result = Vec::with_capacity(map.len() * 2);
+            for (field, value) in map {
+                result.push(Frame::BulkString(field.clone()));
+                result.push(Frame::BulkString(value.clone()));
+            }
+            Frame::Array(result)
+        }
+        Ok(None) => Frame::Array(vec![]),
+        Err(e) => e,
+    }
+}
+
+/// HLEN (read-only).
+pub fn hlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("HLEN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HLEN"),
+    };
+    match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(map)) => Frame::Integer(map.len() as i64),
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+    }
+}
+
+/// HKEYS (read-only).
+pub fn hkeys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("HKEYS");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HKEYS"),
+    };
+    match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(map)) => {
+            let fields: Vec<Frame> = map.keys().map(|k| Frame::BulkString(k.clone())).collect();
+            Frame::Array(fields)
+        }
+        Ok(None) => Frame::Array(vec![]),
+        Err(e) => e,
+    }
+}
+
+/// HVALS (read-only).
+pub fn hvals_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("HVALS");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HVALS"),
+    };
+    match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(map)) => {
+            let values: Vec<Frame> = map.values().map(|v| Frame::BulkString(v.clone())).collect();
+            Frame::Array(values)
+        }
+        Ok(None) => Frame::Array(vec![]),
+        Err(e) => e,
+    }
+}
+
+/// HEXISTS (read-only).
+pub fn hexists_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("HEXISTS");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HEXISTS"),
+    };
+    let field = match extract_bytes(&args[1]) {
+        Some(f) => f,
+        None => return err_wrong_args("HEXISTS"),
+    };
+    match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(map)) => {
+            if map.contains_key(field) { Frame::Integer(1) } else { Frame::Integer(0) }
+        }
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+    }
+}
+
+/// HSCAN (read-only).
+pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("HSCAN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HSCAN"),
+    };
+    let cursor: usize = match extract_bytes(&args[1]) {
+        Some(c) => match std::str::from_utf8(c).ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n,
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
+        },
+        None => return err_wrong_args("HSCAN"),
+    };
+    let mut match_pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut i = 2;
+    while i < args.len() {
+        let opt = match extract_bytes(&args[i]) {
+            Some(o) => o.as_ref(),
+            None => { i += 1; continue; }
+        };
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            i += 1;
+            if i < args.len() {
+                match_pattern = extract_bytes(&args[i]).map(|b| b.as_ref());
+            }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            i += 1;
+            if i < args.len() {
+                if let Some(v) = extract_bytes(&args[i]) {
+                    if let Some(c) = std::str::from_utf8(v).ok().and_then(|s| s.parse::<usize>().ok()) {
+                        if c > 0 { count = c; }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let map = match db.get_hash_if_alive(key, now_ms) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Frame::Array(vec![
+                Frame::BulkString(Bytes::from_static(b"0")),
+                Frame::Array(vec![]),
+            ]);
+        }
+        Err(e) => return e,
+    };
+    let mut fields: Vec<(&Bytes, &Bytes)> = map.iter().collect();
+    fields.sort_by(|a, b| a.0.cmp(b.0));
+    let total = fields.len();
+    let mut results = Vec::new();
+    let mut pos = cursor;
+    let mut checked = 0;
+    while pos < total && checked < count {
+        let (field, value) = fields[pos];
+        pos += 1;
+        checked += 1;
+        if let Some(pattern) = match_pattern {
+            if !super::key::glob_match(pattern, field) {
+                continue;
+            }
+        }
+        results.push(Frame::BulkString(field.clone()));
+        results.push(Frame::BulkString(value.clone()));
+    }
+    let next_cursor = if pos >= total {
+        Bytes::from_static(b"0")
+    } else {
+        Bytes::from(pos.to_string())
+    };
+    Frame::Array(vec![
+        Frame::BulkString(next_cursor),
+        Frame::Array(results),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

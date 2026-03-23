@@ -141,6 +141,130 @@ pub fn dispatch(
     ))))
 }
 
+/// Check if a command is read-only (safe to execute under a shared read lock).
+pub fn is_read_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"GET")
+        || cmd.eq_ignore_ascii_case(b"MGET")
+        || cmd.eq_ignore_ascii_case(b"EXISTS")
+        || cmd.eq_ignore_ascii_case(b"TTL")
+        || cmd.eq_ignore_ascii_case(b"PTTL")
+        || cmd.eq_ignore_ascii_case(b"TYPE")
+        || cmd.eq_ignore_ascii_case(b"STRLEN")
+        || cmd.eq_ignore_ascii_case(b"KEYS")
+        || cmd.eq_ignore_ascii_case(b"SCAN")
+        || cmd.eq_ignore_ascii_case(b"HGET")
+        || cmd.eq_ignore_ascii_case(b"HMGET")
+        || cmd.eq_ignore_ascii_case(b"HGETALL")
+        || cmd.eq_ignore_ascii_case(b"HLEN")
+        || cmd.eq_ignore_ascii_case(b"HKEYS")
+        || cmd.eq_ignore_ascii_case(b"HVALS")
+        || cmd.eq_ignore_ascii_case(b"HEXISTS")
+        || cmd.eq_ignore_ascii_case(b"HSCAN")
+        || cmd.eq_ignore_ascii_case(b"LLEN")
+        || cmd.eq_ignore_ascii_case(b"LRANGE")
+        || cmd.eq_ignore_ascii_case(b"LINDEX")
+        || cmd.eq_ignore_ascii_case(b"LPOS")
+        || cmd.eq_ignore_ascii_case(b"SCARD")
+        || cmd.eq_ignore_ascii_case(b"SISMEMBER")
+        || cmd.eq_ignore_ascii_case(b"SMISMEMBER")
+        || cmd.eq_ignore_ascii_case(b"SMEMBERS")
+        || cmd.eq_ignore_ascii_case(b"SINTER")
+        || cmd.eq_ignore_ascii_case(b"SUNION")
+        || cmd.eq_ignore_ascii_case(b"SDIFF")
+        || cmd.eq_ignore_ascii_case(b"SRANDMEMBER")
+        || cmd.eq_ignore_ascii_case(b"SSCAN")
+        || cmd.eq_ignore_ascii_case(b"ZSCORE")
+        || cmd.eq_ignore_ascii_case(b"ZCARD")
+        || cmd.eq_ignore_ascii_case(b"ZRANK")
+        || cmd.eq_ignore_ascii_case(b"ZREVRANK")
+        || cmd.eq_ignore_ascii_case(b"ZRANGE")
+        || cmd.eq_ignore_ascii_case(b"ZREVRANGE")
+        || cmd.eq_ignore_ascii_case(b"ZRANGEBYSCORE")
+        || cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE")
+        || cmd.eq_ignore_ascii_case(b"ZCOUNT")
+        || cmd.eq_ignore_ascii_case(b"ZLEXCOUNT")
+        || cmd.eq_ignore_ascii_case(b"ZSCAN")
+        || cmd.eq_ignore_ascii_case(b"PING")
+        || cmd.eq_ignore_ascii_case(b"ECHO")
+        || cmd.eq_ignore_ascii_case(b"COMMAND")
+        || cmd.eq_ignore_ascii_case(b"INFO")
+}
+
+/// Dispatch a read-only command under a shared read lock.
+///
+/// Takes `&Database` (immutable) and `now_ms` for expiry checks.
+/// Only called for commands where `is_read_command` returns true.
+/// SELECT is NOT a read command (it mutates connection state) but is handled
+/// separately in the connection handler.
+pub fn dispatch_read(
+    db: &Database,
+    cmd: &[u8],
+    args: &[Frame],
+    now_ms: u64,
+    _selected_db: &mut usize,
+    _db_count: usize,
+) -> DispatchResult {
+    // Connection-level commands (no db mutation)
+    if cmd.eq_ignore_ascii_case(b"PING") { return DispatchResult::Response(connection::ping(args)); }
+    if cmd.eq_ignore_ascii_case(b"ECHO") { return DispatchResult::Response(connection::echo(args)); }
+    if cmd.eq_ignore_ascii_case(b"COMMAND") { return DispatchResult::Response(connection::command(args)); }
+    if cmd.eq_ignore_ascii_case(b"INFO") { return DispatchResult::Response(connection::info_readonly(db, args)); }
+    // String read commands
+    if cmd.eq_ignore_ascii_case(b"GET") { return DispatchResult::Response(string::get_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"MGET") { return DispatchResult::Response(string::mget_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"STRLEN") { return DispatchResult::Response(string::strlen_readonly(db, args, now_ms)); }
+    // Key read commands
+    if cmd.eq_ignore_ascii_case(b"EXISTS") { return DispatchResult::Response(key::exists_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"TTL") { return DispatchResult::Response(key::ttl_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"PTTL") { return DispatchResult::Response(key::pttl_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"TYPE") { return DispatchResult::Response(key::type_cmd_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"KEYS") { return DispatchResult::Response(key::keys_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SCAN") { return DispatchResult::Response(key::scan_readonly(db, args, now_ms)); }
+    // Hash read commands
+    if cmd.eq_ignore_ascii_case(b"HGET") { return DispatchResult::Response(hash::hget_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HMGET") { return DispatchResult::Response(hash::hmget_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HGETALL") { return DispatchResult::Response(hash::hgetall_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HLEN") { return DispatchResult::Response(hash::hlen_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HKEYS") { return DispatchResult::Response(hash::hkeys_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HVALS") { return DispatchResult::Response(hash::hvals_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HEXISTS") { return DispatchResult::Response(hash::hexists_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"HSCAN") { return DispatchResult::Response(hash::hscan_readonly(db, args, now_ms)); }
+    // List read commands
+    if cmd.eq_ignore_ascii_case(b"LLEN") { return DispatchResult::Response(list::llen_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"LRANGE") { return DispatchResult::Response(list::lrange_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"LINDEX") { return DispatchResult::Response(list::lindex_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"LPOS") { return DispatchResult::Response(list::lpos_readonly(db, args, now_ms)); }
+    // Set read commands
+    if cmd.eq_ignore_ascii_case(b"SMEMBERS") { return DispatchResult::Response(set::smembers_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SCARD") { return DispatchResult::Response(set::scard_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SISMEMBER") { return DispatchResult::Response(set::sismember_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SMISMEMBER") { return DispatchResult::Response(set::smismember_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SINTER") { return DispatchResult::Response(set::sinter_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SUNION") { return DispatchResult::Response(set::sunion_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SDIFF") { return DispatchResult::Response(set::sdiff_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SRANDMEMBER") { return DispatchResult::Response(set::srandmember_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"SSCAN") { return DispatchResult::Response(set::sscan_readonly(db, args, now_ms)); }
+    // Sorted set read commands
+    if cmd.eq_ignore_ascii_case(b"ZSCORE") { return DispatchResult::Response(sorted_set::zscore_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZCARD") { return DispatchResult::Response(sorted_set::zcard_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZRANK") { return DispatchResult::Response(sorted_set::zrank_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZREVRANK") { return DispatchResult::Response(sorted_set::zrevrank_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZRANGE") { return DispatchResult::Response(sorted_set::zrange_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZREVRANGE") { return DispatchResult::Response(sorted_set::zrevrange_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZRANGEBYSCORE") { return DispatchResult::Response(sorted_set::zrangebyscore_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") { return DispatchResult::Response(sorted_set::zrevrangebyscore_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZCOUNT") { return DispatchResult::Response(sorted_set::zcount_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZLEXCOUNT") { return DispatchResult::Response(sorted_set::zlexcount_readonly(db, args, now_ms)); }
+    if cmd.eq_ignore_ascii_case(b"ZSCAN") { return DispatchResult::Response(sorted_set::zscan_readonly(db, args, now_ms)); }
+
+    // Fallback: should not be reached if is_read_command is correct
+    // but for safety, return error
+    DispatchResult::Response(Frame::Error(Bytes::from(format!(
+        "ERR unknown command '{}', with args beginning with: ",
+        String::from_utf8_lossy(cmd)
+    ))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

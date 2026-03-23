@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
-use crate::command::{dispatch, DispatchResult};
+use crate::command::{dispatch, dispatch_read, is_read_command, DispatchResult};
 use crate::config::{RuntimeConfig, ServerConfig};
+use crate::storage::entry::current_time_ms;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::{self, PubSubRegistry};
@@ -547,8 +548,14 @@ pub async fn handle_connection(
                         None
                     };
 
-                    // Eviction check + dispatch under per-db write lock
-                    let result = {
+                    // Dispatch: read commands use shared read lock, write commands use exclusive write lock
+                    let is_read = is_read_command(cmd);
+                    let result = if is_read {
+                        let guard = db[selected_db].read();
+                        let now_ms = current_time_ms();
+                        let db_count = db.len();
+                        dispatch_read(&*guard, cmd, cmd_args, now_ms, &mut selected_db, db_count)
+                    } else {
                         let mut guard = db[selected_db].write();
                         guard.refresh_now();
                         // Eviction once per write
@@ -561,7 +568,7 @@ pub async fn handle_connection(
                         }
                         let db_count = db.len();
                         dispatch(&mut *guard, cmd, cmd_args, &mut selected_db, db_count)
-                    }; // RwLockWriteGuard dropped here -- BEFORE any await
+                    }; // lock guard dropped here -- BEFORE any await
 
                     let (response, quit) = match result {
                         DispatchResult::Response(f) => (f, false),

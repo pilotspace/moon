@@ -600,6 +600,222 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// Read-only variants for RwLock read path
+// ---------------------------------------------------------------------------
+
+/// EXISTS (read-only).
+pub fn exists_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("EXISTS");
+    }
+    let mut count: i64 = 0;
+    for arg in args {
+        if let Some(key) = extract_key(arg) {
+            if db.exists_if_alive(key, now_ms) {
+                count += 1;
+            }
+        }
+    }
+    Frame::Integer(count)
+}
+
+/// TTL (read-only).
+pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("TTL");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("TTL"),
+    };
+    match db.get_if_alive(key, now_ms) {
+        None => Frame::Integer(-2),
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                let now = current_time_ms();
+                if now >= entry.expires_at_ms {
+                    Frame::Integer(-2)
+                } else {
+                    Frame::Integer(((entry.expires_at_ms - now) / 1000) as i64)
+                }
+            }
+        }
+    }
+}
+
+/// PTTL (read-only).
+pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("PTTL");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("PTTL"),
+    };
+    match db.get_if_alive(key, now_ms) {
+        None => Frame::Integer(-2),
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                let now = current_time_ms();
+                if now >= entry.expires_at_ms {
+                    Frame::Integer(-2)
+                } else {
+                    Frame::Integer((entry.expires_at_ms - now) as i64)
+                }
+            }
+        }
+    }
+}
+
+/// TYPE (read-only).
+pub fn type_cmd_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("TYPE");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("TYPE"),
+    };
+    match db.get_if_alive(key, now_ms) {
+        None => Frame::SimpleString(Bytes::from_static(b"none")),
+        Some(entry) => {
+            let type_name = entry.value.type_name();
+            Frame::SimpleString(Bytes::from_static(type_name.as_bytes()))
+        }
+    }
+}
+
+/// KEYS (read-only).
+pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("KEYS");
+    }
+    let pattern = match extract_key(&args[0]) {
+        Some(p) => p,
+        None => return err_wrong_args("KEYS"),
+    };
+
+    let mut result = Vec::new();
+    for key in db.keys() {
+        if db.exists_if_alive(key, now_ms) && glob_match(pattern, key) {
+            result.push(Frame::BulkString(key.clone()));
+        }
+    }
+    Frame::Array(result)
+}
+
+/// SCAN (read-only).
+pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SCAN");
+    }
+
+    let cursor_str = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SCAN"),
+    };
+    let cursor: usize = match std::str::from_utf8(cursor_str)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(c) => c,
+        None => {
+            return Frame::Error(Bytes::from_static(b"ERR invalid cursor"))
+        }
+    };
+
+    let mut match_pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut type_filter: Option<&[u8]> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        let opt = match extract_key(&args[i]) {
+            Some(o) => o,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"MATCH") {
+            i += 1;
+            if i < args.len() {
+                match_pattern = extract_key(&args[i]);
+            }
+        } else if opt.eq_ignore_ascii_case(b"COUNT") {
+            i += 1;
+            if i < args.len() {
+                if let Some(c) = parse_int(&args[i]) {
+                    if c > 0 {
+                        count = c as usize;
+                    }
+                }
+            }
+        } else if opt.eq_ignore_ascii_case(b"TYPE") {
+            i += 1;
+            if i < args.len() {
+                type_filter = extract_key(&args[i]);
+            }
+        }
+        i += 1;
+    }
+
+    // Collect all non-expired keys sorted for deterministic iteration
+    let mut sorted_keys: Vec<Bytes> = db.keys()
+        .filter(|k| db.exists_if_alive(k, now_ms))
+        .cloned()
+        .collect();
+    sorted_keys.sort();
+
+    let total = sorted_keys.len();
+    let mut results = Vec::new();
+    let mut pos = cursor;
+    let mut checked = 0;
+
+    while pos < total && checked < count {
+        let key = &sorted_keys[pos];
+        pos += 1;
+        checked += 1;
+
+        // TYPE filter
+        if let Some(tf) = type_filter {
+            if let Some(entry) = db.get_if_alive(key, now_ms) {
+                let tn = entry.value.type_name().as_bytes();
+                if !tf.eq_ignore_ascii_case(tn) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        // MATCH filter
+        if let Some(pattern) = match_pattern {
+            if !glob_match(pattern, key) {
+                continue;
+            }
+        }
+
+        results.push(Frame::BulkString(key.clone()));
+    }
+
+    let next_cursor = if pos >= total {
+        Bytes::from_static(b"0")
+    } else {
+        Bytes::from(pos.to_string())
+    };
+
+    Frame::Array(vec![
+        Frame::BulkString(next_cursor),
+        Frame::Array(results),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
