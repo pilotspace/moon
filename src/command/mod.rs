@@ -106,6 +106,19 @@ pub fn dispatch(
         b"HINCRBYFLOAT" => DispatchResult::Response(hash::hincrbyfloat(db, cmd_args)),
         b"HSETNX" => DispatchResult::Response(hash::hsetnx(db, cmd_args)),
         b"HSCAN" => DispatchResult::Response(hash::hscan(db, cmd_args)),
+        // List commands
+        b"LPUSH" => DispatchResult::Response(list::lpush(db, cmd_args)),
+        b"RPUSH" => DispatchResult::Response(list::rpush(db, cmd_args)),
+        b"LPOP" => DispatchResult::Response(list::lpop(db, cmd_args)),
+        b"RPOP" => DispatchResult::Response(list::rpop(db, cmd_args)),
+        b"LLEN" => DispatchResult::Response(list::llen(db, cmd_args)),
+        b"LRANGE" => DispatchResult::Response(list::lrange(db, cmd_args)),
+        b"LINDEX" => DispatchResult::Response(list::lindex(db, cmd_args)),
+        b"LSET" => DispatchResult::Response(list::lset(db, cmd_args)),
+        b"LINSERT" => DispatchResult::Response(list::linsert(db, cmd_args)),
+        b"LREM" => DispatchResult::Response(list::lrem(db, cmd_args)),
+        b"LTRIM" => DispatchResult::Response(list::ltrim(db, cmd_args)),
+        b"LPOS" => DispatchResult::Response(list::lpos(db, cmd_args)),
         _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
             "ERR unknown command '{}', with args beginning with: ",
             String::from_utf8_lossy(&cmd_name)
@@ -260,6 +273,50 @@ mod tests {
                 assert_eq!(f, Frame::BulkString(Bytes::from_static(b"value1")));
             }
             _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_lpush_lrange() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // LPUSH mylist a b c
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"LPUSH", b"mylist", b"a", b"b", b"c"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::Integer(3));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // LRANGE mylist 0 -1 -> [c, b, a]
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"LRANGE", b"mylist", b"0", b"-1"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(Frame::Array(items)) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(
+                    items[0],
+                    Frame::BulkString(Bytes::from_static(b"c"))
+                );
+                assert_eq!(
+                    items[1],
+                    Frame::BulkString(Bytes::from_static(b"b"))
+                );
+                assert_eq!(
+                    items[2],
+                    Frame::BulkString(Bytes::from_static(b"a"))
+                );
+            }
+            _ => panic!("Expected Array response"),
         }
     }
 
