@@ -1,5 +1,8 @@
 pub mod connection;
+pub mod hash;
 pub mod key;
+pub mod list;
+pub mod set;
 pub mod string;
 
 use bytes::Bytes;
@@ -88,6 +91,21 @@ pub fn dispatch(
         b"GETSET" => DispatchResult::Response(string::getset(db, cmd_args)),
         b"GETDEL" => DispatchResult::Response(string::getdel(db, cmd_args)),
         b"GETEX" => DispatchResult::Response(string::getex(db, cmd_args)),
+        // Hash commands
+        b"HSET" => DispatchResult::Response(hash::hset(db, cmd_args)),
+        b"HGET" => DispatchResult::Response(hash::hget(db, cmd_args)),
+        b"HDEL" => DispatchResult::Response(hash::hdel(db, cmd_args)),
+        b"HMSET" => DispatchResult::Response(hash::hmset(db, cmd_args)),
+        b"HMGET" => DispatchResult::Response(hash::hmget(db, cmd_args)),
+        b"HGETALL" => DispatchResult::Response(hash::hgetall(db, cmd_args)),
+        b"HEXISTS" => DispatchResult::Response(hash::hexists(db, cmd_args)),
+        b"HLEN" => DispatchResult::Response(hash::hlen(db, cmd_args)),
+        b"HKEYS" => DispatchResult::Response(hash::hkeys(db, cmd_args)),
+        b"HVALS" => DispatchResult::Response(hash::hvals(db, cmd_args)),
+        b"HINCRBY" => DispatchResult::Response(hash::hincrby(db, cmd_args)),
+        b"HINCRBYFLOAT" => DispatchResult::Response(hash::hincrbyfloat(db, cmd_args)),
+        b"HSETNX" => DispatchResult::Response(hash::hsetnx(db, cmd_args)),
+        b"HSCAN" => DispatchResult::Response(hash::hscan(db, cmd_args)),
         _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
             "ERR unknown command '{}', with args beginning with: ",
             String::from_utf8_lossy(&cmd_name)
@@ -208,6 +226,38 @@ mod tests {
         match result {
             DispatchResult::Response(f) => {
                 assert_eq!(f, Frame::BulkString(Bytes::from_static(b"bar")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_hset_hget() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // HSET myhash field1 value1
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"HSET", b"myhash", b"field1", b"value1"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::Integer(1));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // HGET myhash field1
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"HGET", b"myhash", b"field1"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from_static(b"value1")));
             }
             _ => panic!("Expected Response"),
         }
