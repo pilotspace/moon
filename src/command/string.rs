@@ -38,6 +38,7 @@ pub fn get(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get(key) {
         Some(entry) => match &entry.value {
             RedisValue::String(v) => Frame::BulkString(v.clone()),
+            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
     }
@@ -149,6 +150,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     let old_value = if get_old {
         db.get(&key).map(|e| match &e.value {
             RedisValue::String(v) => Frame::BulkString(v.clone()),
+            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         })
     } else {
         None
@@ -224,6 +226,7 @@ pub fn mget(db: &mut Database, args: &[Frame]) -> Frame {
         match db.get(key) {
             Some(entry) => match &entry.value {
                 RedisValue::String(v) => results.push(Frame::BulkString(v.clone())),
+                _ => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),
         }
@@ -339,6 +342,11 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                         }
                     }
                 }
+                _ => {
+                    return Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ))
+                }
             }
         }
         None => (0, None),
@@ -410,6 +418,11 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                         }
                     }
                 }
+                _ => {
+                    return Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ))
+                }
             }
         }
         None => (0.0, None),
@@ -454,6 +467,11 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
             let expiry = entry.expires_at;
             match &entry.value {
                 RedisValue::String(v) => (Some(v.clone()), expiry),
+                _ => {
+                    return Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ))
+                }
             }
         }
         None => (None, None),
@@ -492,6 +510,7 @@ pub fn strlen(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get(key) {
         Some(entry) => match &entry.value {
             RedisValue::String(v) => Frame::Integer(v.len() as i64),
+            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Integer(0),
     }
@@ -600,6 +619,7 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
 
     let old = db.get(&key).map(|e| match &e.value {
         RedisValue::String(v) => Frame::BulkString(v.clone()),
+        _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
     });
 
     // GETSET removes TTL (sets new entry without expiry)
@@ -620,6 +640,7 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
     match db.remove(key) {
         Some(entry) => match entry.value {
             RedisValue::String(v) => Frame::BulkString(v),
+            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
     }
@@ -639,6 +660,11 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
     let value = match db.get(&key) {
         Some(entry) => match &entry.value {
             RedisValue::String(v) => v.clone(),
+            _ => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ))
+            }
         },
         None => return Frame::Null,
     };
@@ -1223,6 +1249,7 @@ mod tests {
         assert!(entry.expires_at.is_some());
         match &entry.value {
             RedisValue::String(v) => assert_eq!(v.as_ref(), b"val"),
+            _ => panic!("unexpected type"),
         }
     }
 

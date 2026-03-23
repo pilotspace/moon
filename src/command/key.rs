@@ -232,9 +232,10 @@ pub fn type_cmd(db: &mut Database, args: &[Frame]) -> Frame {
     };
     match db.get(key) {
         None => Frame::SimpleString(Bytes::from_static(b"none")),
-        Some(entry) => match &entry.value {
-            RedisValue::String(_) => Frame::SimpleString(Bytes::from_static(b"string")),
-        },
+        Some(entry) => {
+            let type_name = entry.value.type_name();
+            Frame::SimpleString(Bytes::from_static(type_name.as_bytes()))
+        }
     }
 }
 
@@ -795,6 +796,7 @@ mod tests {
         let entry = db.get(b"dst").unwrap();
         match &entry.value {
             RedisValue::String(v) => assert_eq!(v.as_ref(), b"srcval"),
+            _ => panic!("unexpected type"),
         }
     }
 
