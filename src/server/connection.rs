@@ -547,6 +547,7 @@ pub async fn handle_connection(
                     // Eviction check + dispatch under single lock
                     let result = {
                         let mut dbs = db.lock();
+                        dbs[selected_db].refresh_now();
                         // Eviction once per write
                         if is_write {
                             let rt = runtime_config.read().unwrap();
@@ -670,6 +671,7 @@ fn execute_transaction(
 ) -> (Frame, Vec<Bytes>) {
     let mut dbs = db.lock();
     let db_count = dbs.len();
+    dbs[*selected_db].refresh_now();
 
     // Check WATCH versions -- if any key's version changed, abort
     for (key, watched_version) in watched_keys {

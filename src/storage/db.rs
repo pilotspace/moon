@@ -18,6 +18,9 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
 pub struct Database {
     data: HashMap<Bytes, Entry>,
     used_memory: usize,
+    /// Cached current time in epoch seconds; set once per batch to avoid
+    /// repeated `SystemTime::now()` syscalls on every command.
+    cached_now: u32,
 }
 
 impl Database {
@@ -26,7 +29,20 @@ impl Database {
         Database {
             data: HashMap::new(),
             used_memory: 0,
+            cached_now: current_secs(),
         }
+    }
+
+    /// Update the cached timestamp. Call once per batch to amortize syscall cost.
+    #[inline]
+    pub fn refresh_now(&mut self) {
+        self.cached_now = current_secs();
+    }
+
+    /// Return the cached current time (epoch seconds).
+    #[inline]
+    pub fn now(&self) -> u32 {
+        self.cached_now
     }
 
     /// Estimated memory usage of all entries in this database.
@@ -44,9 +60,10 @@ impl Database {
             }
             return None;
         }
-        // Touch access for LRU tracking
+        // Touch access for LRU tracking using cached time
+        let now = self.cached_now;
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = current_secs();
+            entry.last_access = now;
         }
         self.data.get(key)
     }
@@ -61,8 +78,9 @@ impl Database {
             }
             return None;
         }
+        let now = self.cached_now;
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = current_secs();
+            entry.last_access = now;
         }
         self.data.get_mut(key)
     }
@@ -179,8 +197,9 @@ impl Database {
 
     /// Touch access time of a key for LRU tracking (for reads).
     pub fn touch_access(&mut self, key: &[u8]) {
+        let now = self.cached_now;
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = current_secs();
+            entry.last_access = now;
         }
     }
 

@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::protocol::Frame;
-use crate::storage::entry::{current_secs, Entry, RedisValue};
+use crate::storage::entry::{Entry, RedisValue};
 use crate::storage::Database;
 
 /// Helper: return ERR wrong number of arguments for a given command.
@@ -199,7 +199,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         value: RedisValue::String(value),
         expires_at: final_expires_at,
         version: 0,
-        last_access: current_secs(),
+        last_access: db.now(),
         access_counter: 5,
     };
     db.set(key, entry);
@@ -368,7 +368,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
         value: RedisValue::String(Bytes::from(new_val.to_string())),
         expires_at: existing_expiry,
         version: 0,
-        last_access: current_secs(),
+        last_access: db.now(),
         access_counter: 5,
     };
     db.set(key.clone(), entry);
@@ -445,7 +445,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
         value: RedisValue::String(Bytes::from(formatted.clone())),
         expires_at: existing_expiry,
         version: 0,
-        last_access: current_secs(),
+        last_access: db.now(),
         access_counter: 5,
     };
     db.set(key.clone(), entry);
@@ -498,7 +498,7 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
         value: RedisValue::String(new_val),
         expires_at: existing_expiry,
         version: 0,
-        last_access: current_secs(),
+        last_access: db.now(),
         access_counter: 5,
     };
     db.set(key, entry);
