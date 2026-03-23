@@ -24,6 +24,7 @@ async fn start_server() -> (u16, CancellationToken) {
         bind: "127.0.0.1".to_string(),
         port,
         databases: 16,
+        requirepass: None,
     };
 
     tokio::spawn(async move {
@@ -33,6 +34,33 @@ async fn start_server() -> (u16, CancellationToken) {
     });
 
     // Give the server a moment to bind
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    (port, token)
+}
+
+/// Start a server with requirepass on a random port.
+async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let token = CancellationToken::new();
+    let server_token = token.clone();
+
+    let config = ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        databases: 16,
+        requirepass: Some(password.to_string()),
+    };
+
+    tokio::spawn(async move {
+        listener::run_with_shutdown(config, server_token)
+            .await
+            .unwrap();
+    });
+
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     (port, token)
@@ -386,6 +414,702 @@ async fn test_select_database() {
         .await
         .unwrap();
     assert_eq!(val, "dbval");
+
+    shutdown.cancel();
+}
+
+// ===== Phase 3: Collection Data Types Integration Tests =====
+
+#[tokio::test]
+async fn test_hash_commands() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // HSET key field1 val1 field2 val2 -> 2 (new fields)
+    let added: i64 = redis::cmd("HSET")
+        .arg("myhash")
+        .arg("name")
+        .arg("Redis")
+        .arg("version")
+        .arg("7")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(added, 2);
+
+    // HGET
+    let val: String = redis::cmd("HGET")
+        .arg("myhash")
+        .arg("name")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "Redis");
+
+    let val: String = redis::cmd("HGET")
+        .arg("myhash")
+        .arg("version")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "7");
+
+    // HGETALL returns flat array [field, val, field, val, ...]
+    let all: Vec<String> = redis::cmd("HGETALL")
+        .arg("myhash")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 4);
+    // Convert to pairs and sort for deterministic check
+    let mut pairs: Vec<(String, String)> = all
+        .chunks(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("name".to_string(), "Redis".to_string()),
+            ("version".to_string(), "7".to_string()),
+        ]
+    );
+
+    // HLEN
+    let len: i64 = redis::cmd("HLEN")
+        .arg("myhash")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(len, 2);
+
+    // HDEL
+    let removed: i64 = redis::cmd("HDEL")
+        .arg("myhash")
+        .arg("version")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    // HLEN after HDEL
+    let len: i64 = redis::cmd("HLEN")
+        .arg("myhash")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(len, 1);
+
+    // HEXISTS
+    let exists: i64 = redis::cmd("HEXISTS")
+        .arg("myhash")
+        .arg("name")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(exists, 1);
+
+    let exists: i64 = redis::cmd("HEXISTS")
+        .arg("myhash")
+        .arg("version")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(exists, 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_list_commands() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // LPUSH mylist a b c -> 3 (Pitfall 5: order is c, b, a)
+    let len: i64 = redis::cmd("LPUSH")
+        .arg("mylist")
+        .arg("a")
+        .arg("b")
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(len, 3);
+
+    // LRANGE 0 -1 should return [c, b, a]
+    let items: Vec<String> = redis::cmd("LRANGE")
+        .arg("mylist")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(items, vec!["c", "b", "a"]);
+
+    // RPUSH adds to end
+    let len: i64 = redis::cmd("RPUSH")
+        .arg("mylist")
+        .arg("d")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(len, 4);
+
+    // LLEN
+    let len: i64 = redis::cmd("LLEN")
+        .arg("mylist")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(len, 4);
+
+    // LPOP
+    let val: String = redis::cmd("LPOP")
+        .arg("mylist")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "c");
+
+    // RPOP
+    let val: String = redis::cmd("RPOP")
+        .arg("mylist")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "d");
+
+    // Remaining: [b, a]
+    let items: Vec<String> = redis::cmd("LRANGE")
+        .arg("mylist")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(items, vec!["b", "a"]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_set_commands() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // SADD myset a b c
+    let added: i64 = redis::cmd("SADD")
+        .arg("myset")
+        .arg("a")
+        .arg("b")
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(added, 3);
+
+    // SCARD
+    let card: i64 = redis::cmd("SCARD")
+        .arg("myset")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(card, 3);
+
+    // SMEMBERS
+    let mut members: Vec<String> = redis::cmd("SMEMBERS")
+        .arg("myset")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    members.sort();
+    assert_eq!(members, vec!["a", "b", "c"]);
+
+    // SISMEMBER
+    let is_member: i64 = redis::cmd("SISMEMBER")
+        .arg("myset")
+        .arg("a")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(is_member, 1);
+
+    let is_member: i64 = redis::cmd("SISMEMBER")
+        .arg("myset")
+        .arg("z")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(is_member, 0);
+
+    // SREM
+    let removed: i64 = redis::cmd("SREM")
+        .arg("myset")
+        .arg("b")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    // SCARD after remove
+    let card: i64 = redis::cmd("SCARD")
+        .arg("myset")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(card, 2);
+
+    // SINTER of two sets
+    let _: i64 = redis::cmd("SADD")
+        .arg("set2")
+        .arg("a")
+        .arg("d")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let mut inter: Vec<String> = redis::cmd("SINTER")
+        .arg("myset")
+        .arg("set2")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    inter.sort();
+    assert_eq!(inter, vec!["a"]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sorted_set_commands() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // ZADD zs 1 a 2 b 3 c
+    let added: i64 = redis::cmd("ZADD")
+        .arg("zs")
+        .arg(1)
+        .arg("a")
+        .arg(2)
+        .arg("b")
+        .arg(3)
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(added, 3);
+
+    // ZRANGE zs 0 -1 returns [a, b, c] ordered by score
+    let members: Vec<String> = redis::cmd("ZRANGE")
+        .arg("zs")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(members, vec!["a", "b", "c"]);
+
+    // ZSCORE
+    let score: String = redis::cmd("ZSCORE")
+        .arg("zs")
+        .arg("b")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(score, "2");
+
+    // ZRANK
+    let rank: i64 = redis::cmd("ZRANK")
+        .arg("zs")
+        .arg("a")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(rank, 0);
+
+    let rank: i64 = redis::cmd("ZRANK")
+        .arg("zs")
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(rank, 2);
+
+    // ZRANGEBYSCORE with -inf +inf
+    let all: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        .arg("zs")
+        .arg("-inf")
+        .arg("+inf")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(all, vec!["a", "b", "c"]);
+
+    // ZCARD
+    let card: i64 = redis::cmd("ZCARD")
+        .arg("zs")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(card, 3);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_type_command_all_types() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // String
+    let _: () = redis::cmd("SET")
+        .arg("s")
+        .arg("val")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let t: String = redis::cmd("TYPE")
+        .arg("s")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(t, "string");
+
+    // Hash
+    let _: i64 = redis::cmd("HSET")
+        .arg("h")
+        .arg("f")
+        .arg("v")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let t: String = redis::cmd("TYPE")
+        .arg("h")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(t, "hash");
+
+    // List
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("l")
+        .arg("v")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let t: String = redis::cmd("TYPE")
+        .arg("l")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(t, "list");
+
+    // Set
+    let _: i64 = redis::cmd("SADD")
+        .arg("st")
+        .arg("v")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let t: String = redis::cmd("TYPE")
+        .arg("st")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(t, "set");
+
+    // Sorted Set
+    let _: i64 = redis::cmd("ZADD")
+        .arg("z")
+        .arg(1)
+        .arg("v")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let t: String = redis::cmd("TYPE")
+        .arg("z")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(t, "zset");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_wrongtype_error() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // Create a string key
+    let _: () = redis::cmd("SET")
+        .arg("strkey")
+        .arg("val")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // HSET on string key -> WRONGTYPE
+    let result: redis::RedisResult<i64> = redis::cmd("HSET")
+        .arg("strkey")
+        .arg("field")
+        .arg("value")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        format!("{}", err).contains("WRONGTYPE"),
+        "Expected WRONGTYPE error, got: {}",
+        err
+    );
+
+    // LPUSH on string key -> WRONGTYPE
+    let result: redis::RedisResult<i64> = redis::cmd("LPUSH")
+        .arg("strkey")
+        .arg("val")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        format!("{}", err).contains("WRONGTYPE"),
+        "Expected WRONGTYPE error, got: {}",
+        err
+    );
+
+    // Create a hash key and try GET on it -> WRONGTYPE
+    let _: i64 = redis::cmd("HSET")
+        .arg("hashkey")
+        .arg("f")
+        .arg("v")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let result: redis::RedisResult<Option<String>> = redis::cmd("GET")
+        .arg("hashkey")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        format!("{}", err).contains("WRONGTYPE"),
+        "Expected WRONGTYPE error, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_scan_basic() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // Create several keys
+    for i in 0..10 {
+        let _: () = redis::cmd("SET")
+            .arg(format!("scankey:{}", i))
+            .arg(format!("val{}", i))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // SCAN until cursor returns 0, collect all keys
+    let mut all_keys: Vec<String> = Vec::new();
+    let mut cursor: i64 = 0;
+    loop {
+        let (next_cursor, keys): (i64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        all_keys.extend(keys);
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    // All 10 keys should be found
+    all_keys.sort();
+    assert_eq!(all_keys.len(), 10);
+    for i in 0..10 {
+        assert!(
+            all_keys.contains(&format!("scankey:{}", i)),
+            "Missing scankey:{}",
+            i
+        );
+    }
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_unlink() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // SET and UNLINK single key
+    let _: () = redis::cmd("SET")
+        .arg("unlinkme")
+        .arg("val")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let removed: i64 = redis::cmd("UNLINK")
+        .arg("unlinkme")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    // Verify gone
+    let val: Option<String> = redis::cmd("GET")
+        .arg("unlinkme")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, None);
+
+    // UNLINK multiple keys
+    let _: () = redis::cmd("SET")
+        .arg("u1")
+        .arg("v1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("u2")
+        .arg("v2")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let removed: i64 = redis::cmd("UNLINK")
+        .arg("u1")
+        .arg("u2")
+        .arg("u3") // non-existent
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(removed, 2);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_auth_required() {
+    let (port, shutdown) = start_server_with_pass("testpass").await;
+
+    // Connect without auth -- use a single (non-multiplexed) connection
+    // so we control the auth flow precisely
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut conn = client.get_tokio_connection().await.unwrap();
+
+    // GET before AUTH -> NOAUTH error
+    let result: redis::RedisResult<Option<String>> = redis::cmd("GET")
+        .arg("anykey")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        format!("{}", err).contains("NOAUTH"),
+        "Expected NOAUTH error, got: {}",
+        err
+    );
+
+    // AUTH with wrong password -> error
+    let result: redis::RedisResult<String> = redis::cmd("AUTH")
+        .arg("wrongpass")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err());
+
+    // AUTH with correct password -> OK
+    let result: String = redis::cmd("AUTH")
+        .arg("testpass")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, "OK");
+
+    // Now GET should work
+    let _: () = redis::cmd("SET")
+        .arg("authkey")
+        .arg("authval")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let val: String = redis::cmd("GET")
+        .arg("authkey")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "authval");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_hscan() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // HSET key with several fields
+    let _: i64 = redis::cmd("HSET")
+        .arg("hscankey")
+        .arg("f1")
+        .arg("v1")
+        .arg("f2")
+        .arg("v2")
+        .arg("f3")
+        .arg("v3")
+        .arg("f4")
+        .arg("v4")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // HSCAN 0, collect all results
+    let mut all_items: Vec<String> = Vec::new();
+    let mut cursor: i64 = 0;
+    loop {
+        let (next_cursor, items): (i64, Vec<String>) = redis::cmd("HSCAN")
+            .arg("hscankey")
+            .arg(cursor)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        all_items.extend(items);
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    // Should have 8 items (4 field-value pairs as flat array)
+    assert_eq!(all_items.len(), 8);
+
+    // Convert to sorted pairs
+    let mut pairs: Vec<(String, String)> = all_items
+        .chunks(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("f1".to_string(), "v1".to_string()),
+            ("f2".to_string(), "v2".to_string()),
+            ("f3".to_string(), "v3".to_string()),
+            ("f4".to_string(), "v4".to_string()),
+        ]
+    );
 
     shutdown.cancel();
 }
