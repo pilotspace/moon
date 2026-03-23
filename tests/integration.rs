@@ -1534,3 +1534,479 @@ async fn test_bgrewriteaof() {
         shutdown.cancel();
     }
 }
+
+// ===== Phase 5: Pub/Sub Integration Tests =====
+
+#[tokio::test]
+async fn test_pubsub_subscribe_and_publish() {
+    use futures::StreamExt;
+
+    let (port, shutdown) = start_server().await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Subscriber connection (PubSub mode)
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("test-channel").await.unwrap();
+
+    // Publisher connection (multiplexed)
+    let mut pub_conn = connect(port).await;
+
+    // Publish a message
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("test-channel")
+        .arg("hello-world")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(receivers, 1, "PUBLISH should return 1 (one subscriber)");
+
+    // Subscriber receives the message
+    let msg: redis::Msg = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pubsub.on_message().next(),
+    )
+    .await
+    .expect("timed out waiting for pubsub message")
+    .expect("stream ended unexpectedly");
+
+    assert_eq!(msg.get_channel_name(), "test-channel");
+    let payload: String = msg.get_payload().unwrap();
+    assert_eq!(payload, "hello-world");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_pubsub_psubscribe() {
+    use futures::StreamExt;
+
+    let (port, shutdown) = start_server().await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Subscriber with pattern
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.psubscribe("news.*").await.unwrap();
+
+    // Publisher
+    let mut pub_conn = connect(port).await;
+
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("news.sports")
+        .arg("goal!")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(receivers, 1);
+
+    // Subscriber receives pmessage
+    let msg: redis::Msg = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pubsub.on_message().next(),
+    )
+    .await
+    .expect("timed out waiting for pubsub message")
+    .expect("stream ended");
+
+    // For pattern subscriptions, get_channel_name returns the actual channel
+    assert_eq!(msg.get_channel_name(), "news.sports");
+    let payload: String = msg.get_payload().unwrap();
+    assert_eq!(payload, "goal!");
+    // Verify it was a pattern match
+    assert!(msg.from_pattern());
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_pubsub_unsubscribe() {
+    let (port, shutdown) = start_server().await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Subscribe then unsubscribe
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("ch1").await.unwrap();
+    pubsub.unsubscribe("ch1").await.unwrap();
+
+    // Publisher
+    let mut pub_conn = connect(port).await;
+
+    // PUBLISH should return 0 (no subscribers)
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("ch1")
+        .arg("msg")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(receivers, 0, "no subscribers after unsubscribe");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_pubsub_multiple_channels() {
+    use futures::StreamExt;
+
+    let (port, shutdown) = start_server().await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("ch1").await.unwrap();
+    pubsub.subscribe("ch2").await.unwrap();
+
+    let mut pub_conn = connect(port).await;
+
+    // Publish to ch1
+    let r: i64 = redis::cmd("PUBLISH")
+        .arg("ch1")
+        .arg("msg1")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(r, 1);
+
+    let msg: redis::Msg = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pubsub.on_message().next(),
+    )
+    .await
+    .expect("timeout")
+    .expect("stream ended");
+    assert_eq!(msg.get_channel_name(), "ch1");
+    let payload: String = msg.get_payload().unwrap();
+    assert_eq!(payload, "msg1");
+
+    // Publish to ch2
+    let r: i64 = redis::cmd("PUBLISH")
+        .arg("ch2")
+        .arg("msg2")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(r, 1);
+
+    let msg: redis::Msg = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pubsub.on_message().next(),
+    )
+    .await
+    .expect("timeout")
+    .expect("stream ended");
+    assert_eq!(msg.get_channel_name(), "ch2");
+    let payload: String = msg.get_payload().unwrap();
+    assert_eq!(payload, "msg2");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_pubsub_publish_returns_subscriber_count() {
+    let (port, shutdown) = start_server().await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Two subscribers on the same channel
+    let mut pubsub1 = client.get_async_pubsub().await.unwrap();
+    pubsub1.subscribe("shared-ch").await.unwrap();
+
+    let mut pubsub2 = client.get_async_pubsub().await.unwrap();
+    pubsub2.subscribe("shared-ch").await.unwrap();
+
+    let mut pub_conn = connect(port).await;
+
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("shared-ch")
+        .arg("hello")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(receivers, 2, "PUBLISH should return 2 (two subscribers)");
+
+    shutdown.cancel();
+}
+
+// ===== Phase 5: Transaction (MULTI/EXEC/DISCARD/WATCH) Integration Tests =====
+
+#[tokio::test]
+async fn test_multi_exec_basic() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect_single(port).await;
+
+    // MULTI
+    let ok: String = redis::cmd("MULTI")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ok, "OK");
+
+    // SET key1 val1 -> QUEUED
+    let queued: String = redis::cmd("SET")
+        .arg("txkey1")
+        .arg("txval1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(queued, "QUEUED");
+
+    // SET key2 val2 -> QUEUED
+    let queued: String = redis::cmd("SET")
+        .arg("txkey2")
+        .arg("txval2")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(queued, "QUEUED");
+
+    // GET key1 -> QUEUED
+    let queued: String = redis::cmd("GET")
+        .arg("txkey1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(queued, "QUEUED");
+
+    // EXEC -> returns array of results
+    let results: redis::Value = redis::cmd("EXEC")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Verify we got an array with 3 results
+    match results {
+        redis::Value::Array(ref items) => {
+            assert_eq!(items.len(), 3, "EXEC should return 3 results");
+            // First two are OK from SET commands
+            let set1: String = redis::FromRedisValue::from_redis_value(&items[0]).unwrap();
+            assert_eq!(set1, "OK");
+            let set2: String = redis::FromRedisValue::from_redis_value(&items[1]).unwrap();
+            assert_eq!(set2, "OK");
+            // Third is the GET result
+            let get_val: String = redis::FromRedisValue::from_redis_value(&items[2]).unwrap();
+            assert_eq!(get_val, "txval1");
+        }
+        _ => panic!("EXEC should return an array, got: {:?}", results),
+    }
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_multi_discard() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect_single(port).await;
+
+    // MULTI
+    let _: String = redis::cmd("MULTI")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // SET key1 val1 -> QUEUED
+    let _: String = redis::cmd("SET")
+        .arg("discardkey")
+        .arg("discardval")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // DISCARD
+    let ok: String = redis::cmd("DISCARD")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ok, "OK");
+
+    // GET key1 -> should be nil (key was never set)
+    let val: Option<String> = redis::cmd("GET")
+        .arg("discardkey")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, None);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_exec_without_multi() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect_single(port).await;
+
+    // EXEC without MULTI -> should return error
+    let result: Result<redis::Value, redis::RedisError> = redis::cmd("EXEC")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err(), "EXEC without MULTI should fail");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("EXEC without MULTI"),
+        "Error should mention EXEC without MULTI, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_discard_without_multi() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect_single(port).await;
+
+    // DISCARD without MULTI -> should return error
+    let result: Result<redis::Value, redis::RedisError> = redis::cmd("DISCARD")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err(), "DISCARD without MULTI should fail");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("DISCARD without MULTI"),
+        "Error should mention DISCARD without MULTI, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_nested_multi() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect_single(port).await;
+
+    // First MULTI
+    let _: String = redis::cmd("MULTI")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Second MULTI -> should return error
+    let result: Result<redis::Value, redis::RedisError> = redis::cmd("MULTI")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err(), "nested MULTI should fail");
+
+    // Clean up: DISCARD the first MULTI
+    let _: String = redis::cmd("DISCARD")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_watch_success() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect_single(port).await;
+
+    // WATCH key1 (key doesn't exist yet, version 0)
+    let ok: String = redis::cmd("WATCH")
+        .arg("watchkey")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ok, "OK");
+
+    // MULTI
+    let _: String = redis::cmd("MULTI")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // SET watchkey "new" -> QUEUED
+    let _: String = redis::cmd("SET")
+        .arg("watchkey")
+        .arg("new")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // EXEC -> should succeed (no interference)
+    let result: redis::Value = redis::cmd("EXEC")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    match result {
+        redis::Value::Array(ref items) => {
+            assert_eq!(items.len(), 1, "EXEC should return 1 result");
+            let set_result: String = redis::FromRedisValue::from_redis_value(&items[0]).unwrap();
+            assert_eq!(set_result, "OK");
+        }
+        _ => panic!("EXEC should return an array, got: {:?}", result),
+    }
+
+    // Verify the key was set
+    let val: String = redis::cmd("GET")
+        .arg("watchkey")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "new");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_watch_abort() {
+    let (port, shutdown) = start_server().await;
+
+    // Two separate non-multiplexed connections
+    let mut conn_a = connect_single(port).await;
+    let mut conn_b = connect_single(port).await;
+
+    // conn_a: SET key1 "initial"
+    let _: () = redis::cmd("SET")
+        .arg("wkey")
+        .arg("initial")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    // conn_a: WATCH wkey
+    let _: String = redis::cmd("WATCH")
+        .arg("wkey")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    // conn_a: MULTI
+    let _: String = redis::cmd("MULTI")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    // conn_b: interfere by modifying the watched key
+    let _: () = redis::cmd("SET")
+        .arg("wkey")
+        .arg("modified")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+
+    // conn_a: queue a SET (will be discarded)
+    let _: String = redis::cmd("SET")
+        .arg("wkey")
+        .arg("from_a")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    // conn_a: EXEC -> should return Null (transaction aborted)
+    let result: redis::Value = redis::cmd("EXEC")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    assert_eq!(result, redis::Value::Nil, "EXEC should return Nil when WATCH detects modification");
+
+    // Verify: the key has conn_b's value
+    let val: String = redis::cmd("GET")
+        .arg("wkey")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    assert_eq!(val, "modified", "conn_b's SET should persist after conn_a's transaction was aborted");
+
+    shutdown.cancel();
+}
