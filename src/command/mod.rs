@@ -119,6 +119,22 @@ pub fn dispatch(
         b"LREM" => DispatchResult::Response(list::lrem(db, cmd_args)),
         b"LTRIM" => DispatchResult::Response(list::ltrim(db, cmd_args)),
         b"LPOS" => DispatchResult::Response(list::lpos(db, cmd_args)),
+        // Set commands
+        b"SADD" => DispatchResult::Response(set::sadd(db, cmd_args)),
+        b"SREM" => DispatchResult::Response(set::srem(db, cmd_args)),
+        b"SMEMBERS" => DispatchResult::Response(set::smembers(db, cmd_args)),
+        b"SCARD" => DispatchResult::Response(set::scard(db, cmd_args)),
+        b"SISMEMBER" => DispatchResult::Response(set::sismember(db, cmd_args)),
+        b"SMISMEMBER" => DispatchResult::Response(set::smismember(db, cmd_args)),
+        b"SINTER" => DispatchResult::Response(set::sinter(db, cmd_args)),
+        b"SUNION" => DispatchResult::Response(set::sunion(db, cmd_args)),
+        b"SDIFF" => DispatchResult::Response(set::sdiff(db, cmd_args)),
+        b"SINTERSTORE" => DispatchResult::Response(set::sinterstore(db, cmd_args)),
+        b"SUNIONSTORE" => DispatchResult::Response(set::sunionstore(db, cmd_args)),
+        b"SDIFFSTORE" => DispatchResult::Response(set::sdiffstore(db, cmd_args)),
+        b"SRANDMEMBER" => DispatchResult::Response(set::srandmember(db, cmd_args)),
+        b"SPOP" => DispatchResult::Response(set::spop(db, cmd_args)),
+        b"SSCAN" => DispatchResult::Response(set::sscan(db, cmd_args)),
         _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
             "ERR unknown command '{}', with args beginning with: ",
             String::from_utf8_lossy(&cmd_name)
@@ -315,6 +331,38 @@ mod tests {
                     items[2],
                     Frame::BulkString(Bytes::from_static(b"a"))
                 );
+            }
+            _ => panic!("Expected Array response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_sadd_smembers() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // SADD myset a b c
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"SADD", b"myset", b"a", b"b", b"c"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::Integer(3));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // SMEMBERS myset
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"SMEMBERS", b"myset"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(Frame::Array(members)) => {
+                assert_eq!(members.len(), 3);
             }
             _ => panic!("Expected Array response"),
         }
