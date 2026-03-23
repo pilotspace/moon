@@ -973,6 +973,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "futures",
+ "itoa",
  "ordered-float",
  "parking_lot",
  "rand",

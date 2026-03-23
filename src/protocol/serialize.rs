@@ -17,22 +17,22 @@ pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
         }
         Frame::Integer(n) => {
             buf.put_u8(b':');
-            let s = n.to_string();
-            buf.put_slice(s.as_bytes());
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(*n).as_bytes());
             buf.put_slice(b"\r\n");
         }
         Frame::BulkString(data) => {
             buf.put_u8(b'$');
-            let len = data.len().to_string();
-            buf.put_slice(len.as_bytes());
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(data.len()).as_bytes());
             buf.put_slice(b"\r\n");
             buf.put_slice(data);
             buf.put_slice(b"\r\n");
         }
         Frame::Array(items) => {
             buf.put_u8(b'*');
-            let len = items.len().to_string();
-            buf.put_slice(len.as_bytes());
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(items.len()).as_bytes());
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize(item, buf);
