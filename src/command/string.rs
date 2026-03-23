@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::protocol::Frame;
-use crate::storage::entry::{Entry, RedisValue};
+use crate::storage::entry::{current_secs, Entry, RedisValue};
 use crate::storage::Database;
 
 /// Helper: return ERR wrong number of arguments for a given command.
@@ -195,13 +195,11 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         None
     };
 
-    let now = Instant::now();
     let entry = Entry {
         value: RedisValue::String(value),
         expires_at: final_expires_at,
-        created_at: now,
         version: 0,
-        last_access: now,
+        last_access: current_secs(),
         access_counter: 5,
     };
     db.set(key, entry);
@@ -366,13 +364,11 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     };
 
     // Store new value preserving existing TTL
-    let now = Instant::now();
     let entry = Entry {
         value: RedisValue::String(Bytes::from(new_val.to_string())),
         expires_at: existing_expiry,
-        created_at: now,
         version: 0,
-        last_access: now,
+        last_access: current_secs(),
         access_counter: 5,
     };
     db.set(key.clone(), entry);
@@ -445,13 +441,11 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
 
     let formatted = format_float(result);
 
-    let now = Instant::now();
     let entry = Entry {
         value: RedisValue::String(Bytes::from(formatted.clone())),
         expires_at: existing_expiry,
-        created_at: now,
         version: 0,
-        last_access: now,
+        last_access: current_secs(),
         access_counter: 5,
     };
     db.set(key.clone(), entry);
@@ -500,13 +494,11 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let new_len = new_val.len() as i64;
-    let now = Instant::now();
     let entry = Entry {
         value: RedisValue::String(new_val),
         expires_at: existing_expiry,
-        created_at: now,
         version: 0,
-        last_access: now,
+        last_access: current_secs(),
         access_counter: 5,
     };
     db.set(key, entry);

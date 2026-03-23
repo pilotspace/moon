@@ -11,7 +11,7 @@ use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
 use crate::storage::db::Database;
-use crate::storage::entry::{Entry, RedisValue};
+use crate::storage::entry::{current_secs, Entry, RedisValue};
 
 // Format constants
 const RDB_MAGIC: &[u8] = b"RUSTREDIS";
@@ -367,13 +367,11 @@ fn read_entry(
         _ => bail!("Unknown type tag: {}", type_tag),
     };
 
-    let now = Instant::now();
     let entry = Entry {
         value,
         expires_at,
-        created_at: now,
         version: 0,
-        last_access: now,
+        last_access: current_secs(),
         access_counter: 5,
     };
 

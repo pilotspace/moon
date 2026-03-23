@@ -83,7 +83,7 @@ pub async fn handle_connection(
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
     let mut command_queue: Vec<Frame> = Vec::new();
-    let mut watched_keys: HashMap<Bytes, u64> = HashMap::new();
+    let mut watched_keys: HashMap<Bytes, u32> = HashMap::new();
 
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
@@ -656,7 +656,7 @@ fn handle_config(
 fn execute_transaction(
     db: &Arc<Mutex<Vec<Database>>>,
     command_queue: &[Frame],
-    watched_keys: &HashMap<Bytes, u64>,
+    watched_keys: &HashMap<Bytes, u32>,
     selected_db: &mut usize,
 ) -> (Frame, Vec<Bytes>) {
     let mut dbs = db.lock().unwrap();
