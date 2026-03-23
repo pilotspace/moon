@@ -53,36 +53,43 @@ impl Database {
     /// Get an entry by key, performing lazy expiration and access tracking.
     ///
     /// Returns `None` if the key does not exist or has expired.
+    /// Optimized: single get_mut for expiry check + LRU touch, then re-borrow as immutable.
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
-        if Self::check_expired(&self.data, key) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-            return None;
-        }
-        // Touch access for LRU tracking using cached time
         let now = self.cached_now;
-        if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = now;
+        // Single mutable lookup: check expiry and touch access
+        let entry = self.data.get_mut(key)?;
+        if let Some(expires_at) = entry.expires_at {
+            if Instant::now() >= expires_at {
+                // Key expired -- remove it
+                let removed = self.data.remove(key).unwrap();
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+                return None;
+            }
         }
+        entry.last_access = now;
+        // Re-borrow as immutable (second lookup, unavoidable without unsafe)
         self.data.get(key)
     }
 
     /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.
     ///
     /// Returns `None` if the key does not exist or has expired.
+    /// Optimized: single get_mut for expiry check + LRU touch + return.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
-        if Self::check_expired(&self.data, key) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            }
-            return None;
-        }
         let now = self.cached_now;
-        if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = now;
+        // Single mutable lookup
+        let entry = self.data.get_mut(key)?;
+        if let Some(expires_at) = entry.expires_at {
+            if Instant::now() >= expires_at {
+                let removed = self.data.remove(key).unwrap();
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+                return None;
+            }
         }
-        self.data.get_mut(key)
+        // Re-fetch after potential borrow issues (entry ref was invalidated by remove path)
+        let entry = self.data.get_mut(key)?;
+        entry.last_access = now;
+        Some(entry)
     }
 
     /// Insert or replace an entry, tracking memory and version.
@@ -107,14 +114,20 @@ impl Database {
     }
 
     /// Check if a key exists, performing lazy expiration.
+    /// Optimized: single lookup via get instead of check_expired + contains_key.
     pub fn exists(&mut self, key: &[u8]) -> bool {
-        if Self::check_expired(&self.data, key) {
-            if let Some(entry) = self.data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+        match self.data.get(key) {
+            None => false,
+            Some(entry) => {
+                if entry.expires_at.is_some_and(|exp| Instant::now() >= exp) {
+                    let removed = self.data.remove(key).unwrap();
+                    self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+                    false
+                } else {
+                    true
+                }
             }
-            return false;
         }
-        self.data.contains_key(key)
     }
 
     /// Number of entries (including potentially expired ones).
