@@ -6,12 +6,18 @@ use std::time::Instant;
 use super::entry::{Entry, RedisValue};
 use crate::protocol::Frame;
 
+/// Estimate per-entry overhead: key length + value memory + struct overhead.
+fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
+    key.len() + entry.value.estimate_memory() + 128
+}
+
 /// An in-memory key-value database with lazy expiration.
 ///
 /// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
 /// a `RedisValue`, optional expiration, and creation timestamp.
 pub struct Database {
     data: HashMap<Bytes, Entry>,
+    used_memory: usize,
 }
 
 impl Database {
@@ -19,45 +25,75 @@ impl Database {
     pub fn new() -> Self {
         Database {
             data: HashMap::new(),
+            used_memory: 0,
         }
     }
 
-    /// Get an entry by key, performing lazy expiration.
+    /// Estimated memory usage of all entries in this database.
+    pub fn estimated_memory(&self) -> usize {
+        self.used_memory
+    }
+
+    /// Get an entry by key, performing lazy expiration and access tracking.
     ///
     /// Returns `None` if the key does not exist or has expired.
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
             return None;
+        }
+        // Touch access for LRU tracking
+        if let Some(entry) = self.data.get_mut(key) {
+            entry.last_access = Instant::now();
         }
         self.data.get(key)
     }
 
-    /// Get a mutable reference to an entry by key, performing lazy expiration.
+    /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.
     ///
     /// Returns `None` if the key does not exist or has expired.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
             return None;
+        }
+        if let Some(entry) = self.data.get_mut(key) {
+            entry.last_access = Instant::now();
         }
         self.data.get_mut(key)
     }
 
-    /// Insert or replace an entry.
-    pub fn set(&mut self, key: Bytes, entry: Entry) {
+    /// Insert or replace an entry, tracking memory and version.
+    pub fn set(&mut self, key: Bytes, mut entry: Entry) {
+        // If key exists, carry forward version+1 and subtract old memory
+        if let Some(old_entry) = self.data.get(&key) {
+            entry.version = old_entry.version + 1;
+            self.used_memory = self.used_memory.saturating_sub(entry_overhead(&key, old_entry));
+        }
+        self.used_memory += entry_overhead(&key, &entry);
         self.data.insert(key, entry);
     }
 
     /// Remove a key and return its entry. No expiry check needed (DEL removes regardless).
     pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
-        self.data.remove(key)
+        if let Some(entry) = self.data.remove(key) {
+            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            Some(entry)
+        } else {
+            None
+        }
     }
 
     /// Check if a key exists, performing lazy expiration.
     pub fn exists(&mut self, key: &[u8]) -> bool {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
             return false;
         }
         self.data.contains_key(key)
@@ -79,7 +115,9 @@ impl Database {
     /// exist (or has already expired).
     pub fn set_expiry(&mut self, key: &[u8], expires_at: Option<Instant>) -> bool {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
             return false;
         }
         match self.data.get_mut(key) {
@@ -127,6 +165,30 @@ impl Database {
         ))
     }
 
+    /// Get the version of a key. Returns 0 if not found. No expiry check (WATCH needs raw version).
+    pub fn get_version(&self, key: &[u8]) -> u64 {
+        self.data.get(key).map(|e| e.version).unwrap_or(0)
+    }
+
+    /// Increment version of a key if it exists.
+    pub fn increment_version(&mut self, key: &[u8]) {
+        if let Some(entry) = self.data.get_mut(key) {
+            entry.version += 1;
+        }
+    }
+
+    /// Touch access time of a key for LRU tracking (for reads).
+    pub fn touch_access(&mut self, key: &[u8]) {
+        if let Some(entry) = self.data.get_mut(key) {
+            entry.last_access = Instant::now();
+        }
+    }
+
+    /// Mutable access to the data map (for eviction to remove keys directly).
+    pub fn data_mut(&mut self) -> &mut HashMap<Bytes, Entry> {
+        &mut self.data
+    }
+
     /// Get or create a hash entry. Returns mutable ref to inner HashMap.
     /// Returns Err(WRONGTYPE) if key exists with wrong type.
     pub fn get_or_create_hash(
@@ -135,11 +197,15 @@ impl Database {
     ) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
         // Expire check
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         if !self.data.contains_key(key) {
-            self.data
-                .insert(Bytes::copy_from_slice(key), Entry::new_hash());
+            let entry = Entry::new_hash();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
         }
         match &mut self.data.get_mut(key).unwrap().value {
             RedisValue::Hash(map) => Ok(map),
@@ -150,7 +216,9 @@ impl Database {
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         match self.data.get(key) {
             None => Ok(None),
@@ -167,11 +235,15 @@ impl Database {
         key: &[u8],
     ) -> Result<&mut VecDeque<Bytes>, Frame> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         if !self.data.contains_key(key) {
-            self.data
-                .insert(Bytes::copy_from_slice(key), Entry::new_list());
+            let entry = Entry::new_list();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
         }
         match &mut self.data.get_mut(key).unwrap().value {
             RedisValue::List(list) => Ok(list),
@@ -182,7 +254,9 @@ impl Database {
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         match self.data.get(key) {
             None => Ok(None),
@@ -199,11 +273,15 @@ impl Database {
         key: &[u8],
     ) -> Result<&mut HashSet<Bytes>, Frame> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         if !self.data.contains_key(key) {
-            self.data
-                .insert(Bytes::copy_from_slice(key), Entry::new_set());
+            let entry = Entry::new_set();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
         }
         match &mut self.data.get_mut(key).unwrap().value {
             RedisValue::Set(set) => Ok(set),
@@ -214,7 +292,9 @@ impl Database {
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         match self.data.get(key) {
             None => Ok(None),
@@ -237,11 +317,15 @@ impl Database {
         Frame,
     > {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         if !self.data.contains_key(key) {
-            self.data
-                .insert(Bytes::copy_from_slice(key), Entry::new_sorted_set());
+            let entry = Entry::new_sorted_set();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
         }
         match &mut self.data.get_mut(key).unwrap().value {
             RedisValue::SortedSet { members, scores } => Ok((members, scores)),
@@ -261,7 +345,9 @@ impl Database {
         Frame,
     > {
         if Self::check_expired(&self.data, key) {
-            self.data.remove(key);
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
         }
         match self.data.get(key) {
             None => Ok(None),
@@ -498,5 +584,52 @@ mod tests {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
         assert_eq!(db.data().len(), 1);
+    }
+
+    #[test]
+    fn test_used_memory_tracking() {
+        let mut db = Database::new();
+        assert_eq!(db.estimated_memory(), 0);
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        assert!(db.estimated_memory() > 0);
+        let mem_after_set = db.estimated_memory();
+        db.remove(b"key");
+        assert_eq!(db.estimated_memory(), 0);
+        // Overwrite should not double-count
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"longer_value"));
+        assert!(db.estimated_memory() > 0);
+        // Should not equal 2x the original
+        assert_ne!(db.estimated_memory(), mem_after_set * 2);
+    }
+
+    #[test]
+    fn test_version_tracking() {
+        let mut db = Database::new();
+        assert_eq!(db.get_version(b"key"), 0);
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
+        assert_eq!(db.get_version(b"key"), 0); // first set, version 0
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
+        assert_eq!(db.get_version(b"key"), 1); // second set, version 0+1=1
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
+        assert_eq!(db.get_version(b"key"), 2);
+    }
+
+    #[test]
+    fn test_increment_version() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v"));
+        assert_eq!(db.get_version(b"key"), 0);
+        db.increment_version(b"key");
+        assert_eq!(db.get_version(b"key"), 1);
+        // non-existent key is a no-op
+        db.increment_version(b"missing");
+    }
+
+    #[test]
+    fn test_data_mut() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        assert_eq!(db.data_mut().len(), 1);
     }
 }

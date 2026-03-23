@@ -43,6 +43,72 @@ pub struct ServerConfig {
     /// AOF filename
     #[arg(long, default_value = "appendonly.aof")]
     pub appendfilename: String,
+
+    /// Maximum memory in bytes (0 = unlimited)
+    #[arg(long, default_value_t = 0)]
+    pub maxmemory: usize,
+
+    /// Eviction policy when maxmemory is reached
+    #[arg(long, default_value = "noeviction")]
+    pub maxmemory_policy: String,
+
+    /// Number of random keys to sample for eviction
+    #[arg(long, default_value_t = 5)]
+    pub maxmemory_samples: usize,
+}
+
+impl ServerConfig {
+    /// Create a RuntimeConfig from this server config, copying mutable parameters.
+    pub fn to_runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            maxmemory: self.maxmemory,
+            maxmemory_policy: self.maxmemory_policy.clone(),
+            maxmemory_samples: self.maxmemory_samples,
+            lfu_log_factor: 10,
+            lfu_decay_time: 1,
+            save: self.save.clone(),
+            appendonly: self.appendonly.clone(),
+            appendfsync: self.appendfsync.clone(),
+        }
+    }
+}
+
+/// Runtime-mutable configuration parameters.
+///
+/// These can be changed via CONFIG SET without server restart.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// Maximum memory in bytes (0 = unlimited).
+    pub maxmemory: usize,
+    /// Eviction policy name (e.g., "noeviction", "allkeys-lru").
+    pub maxmemory_policy: String,
+    /// Number of random keys to sample for eviction.
+    pub maxmemory_samples: usize,
+    /// LFU logarithmic factor for probabilistic counter increment.
+    pub lfu_log_factor: u8,
+    /// LFU decay time in minutes.
+    pub lfu_decay_time: u64,
+    /// Save rules (copied from ServerConfig, mutable via CONFIG SET but no live effect).
+    pub save: Option<String>,
+    /// Appendonly setting (mutable via CONFIG SET but no live effect).
+    pub appendonly: String,
+    /// Appendfsync setting (mutable via CONFIG SET but no live effect).
+    pub appendfsync: String,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            maxmemory: 0,
+            maxmemory_policy: "noeviction".to_string(),
+            maxmemory_samples: 5,
+            lfu_log_factor: 10,
+            lfu_decay_time: 1,
+            save: None,
+            appendonly: "no".to_string(),
+            appendfsync: "everysec".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +178,49 @@ mod tests {
         assert_eq!(config.appendfsync, "always");
         assert_eq!(config.save, Some("3600 1 300 100".to_string()));
         assert_eq!(config.appendfilename, "my.aof");
+    }
+
+    #[test]
+    fn test_maxmemory_defaults() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.maxmemory, 0);
+        assert_eq!(config.maxmemory_policy, "noeviction");
+        assert_eq!(config.maxmemory_samples, 5);
+    }
+
+    #[test]
+    fn test_maxmemory_custom() {
+        let config = ServerConfig::parse_from([
+            "rust-redis",
+            "--maxmemory", "1048576",
+            "--maxmemory-policy", "allkeys-lru",
+            "--maxmemory-samples", "10",
+        ]);
+        assert_eq!(config.maxmemory, 1048576);
+        assert_eq!(config.maxmemory_policy, "allkeys-lru");
+        assert_eq!(config.maxmemory_samples, 10);
+    }
+
+    #[test]
+    fn test_to_runtime_config() {
+        let config = ServerConfig::parse_from([
+            "rust-redis",
+            "--maxmemory", "1024",
+            "--maxmemory-policy", "allkeys-lfu",
+        ]);
+        let rt = config.to_runtime_config();
+        assert_eq!(rt.maxmemory, 1024);
+        assert_eq!(rt.maxmemory_policy, "allkeys-lfu");
+        assert_eq!(rt.maxmemory_samples, 5);
+        assert_eq!(rt.lfu_log_factor, 10);
+        assert_eq!(rt.lfu_decay_time, 1);
+    }
+
+    #[test]
+    fn test_runtime_config_default() {
+        let rt = RuntimeConfig::default();
+        assert_eq!(rt.maxmemory, 0);
+        assert_eq!(rt.maxmemory_policy, "noeviction");
+        assert_eq!(rt.maxmemory_samples, 5);
     }
 }
