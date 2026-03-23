@@ -13,6 +13,9 @@ use crate::persistence::rdb;
 use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
 
+/// Type alias for the per-database RwLock container.
+type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
 use super::connection;
 use super::expiration;
 
@@ -46,24 +49,40 @@ pub async fn run_with_shutdown(
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {}", addr);
 
-    let databases: Vec<Database> = (0..config.databases).map(|_| Database::new()).collect();
-    let db = Arc::new(Mutex::new(databases));
+    let databases: Vec<parking_lot::RwLock<Database>> = (0..config.databases)
+        .map(|_| parking_lot::RwLock::new(Database::new()))
+        .collect();
+    let db: SharedDatabases = Arc::new(databases);
 
     // Startup restore: AOF takes priority over RDB
     let aof_path = PathBuf::from(&config.dir).join(&config.appendfilename);
     let rdb_path = PathBuf::from(&config.dir).join(&config.dbfilename);
 
     if config.appendonly == "yes" && aof_path.exists() {
-        let mut dbs = db.lock();
-        match aof::replay_aof(&mut dbs, &aof_path) {
+        // Lock each db individually for AOF replay
+        let mut dbs_vec: Vec<Database> = db.iter().map(|lock| {
+            let mut guard = lock.write();
+            std::mem::replace(&mut *guard, Database::new())
+        }).collect();
+        match aof::replay_aof(&mut dbs_vec, &aof_path) {
             Ok(n) => info!("AOF loaded: {} commands replayed from {}", n, aof_path.display()),
             Err(e) => error!("AOF load failed: {}. Starting with empty database.", e),
         }
+        // Put databases back
+        for (lock, restored_db) in db.iter().zip(dbs_vec.into_iter()) {
+            *lock.write() = restored_db;
+        }
     } else if rdb_path.exists() {
-        let mut dbs = db.lock();
-        match rdb::load(&mut dbs, &rdb_path) {
+        let mut dbs_vec: Vec<Database> = db.iter().map(|lock| {
+            let mut guard = lock.write();
+            std::mem::replace(&mut *guard, Database::new())
+        }).collect();
+        match rdb::load(&mut dbs_vec, &rdb_path) {
             Ok(count) => info!("RDB loaded: {} keys from {}", count, rdb_path.display()),
             Err(e) => error!("Failed to load RDB: {}. Starting with empty database.", e),
+        }
+        for (lock, restored_db) in db.iter().zip(dbs_vec.into_iter()) {
+            *lock.write() = restored_db;
         }
     }
 

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use rand::seq::IndexedRandom;
@@ -8,12 +7,15 @@ use tracing::info;
 
 use crate::storage::Database;
 
+/// Type alias for the per-database RwLock container.
+type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
 /// Run the active expiration background task.
 ///
 /// Every 100ms, iterates all databases and runs a probabilistic expiration
 /// cycle on each. Shuts down gracefully when the cancellation token fires.
 pub async fn run_active_expiration(
-    db: Arc<Mutex<Vec<Database>>>,
+    db: SharedDatabases,
     shutdown: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -21,9 +23,9 @@ pub async fn run_active_expiration(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let mut dbs = db.lock();
-                for db in dbs.iter_mut() {
-                    expire_cycle(db);
+                for lock in db.iter() {
+                    let mut guard = lock.write();
+                    expire_cycle(&mut *guard);
                 }
             }
             _ = shutdown.cancelled() => {

@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use bytes::Bytes;
 use tracing::{error, info};
@@ -15,6 +14,9 @@ use crate::persistence::rdb;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
+/// Type alias for the per-database RwLock container.
+type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
 /// Global flag indicating whether a background save is in progress.
 pub static SAVE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -25,7 +27,7 @@ pub static SAVE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 ///
 /// Returns an error frame if a save is already in progress.
 pub fn bgsave_start(
-    db: Arc<Mutex<Vec<Database>>>,
+    db: SharedDatabases,
     dir: String,
     dbfilename: String,
 ) -> Frame {
@@ -36,18 +38,18 @@ pub fn bgsave_start(
         ));
     }
 
-    // Clone snapshot under the lock
-    let snapshot: Vec<Vec<(Bytes, crate::storage::entry::Entry)>> = {
-        let dbs = db.lock();
-        dbs.iter()
-            .map(|db| {
-                db.data()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
-            .collect()
-    };
+    // Clone snapshot: lock each db individually with read lock
+    let snapshot: Vec<Vec<(Bytes, crate::storage::entry::Entry)>> = db
+        .iter()
+        .map(|lock| {
+            let guard = lock.read();
+            guard
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .collect();
 
     let path = PathBuf::from(dir).join(dbfilename);
 
@@ -72,7 +74,7 @@ pub fn bgsave_start(
 /// synthetic commands from current database state and replace the AOF file.
 pub fn bgrewriteaof_start(
     aof_tx: &mpsc::Sender<AofMessage>,
-    db: Arc<Mutex<Vec<Database>>>,
+    db: SharedDatabases,
 ) -> Frame {
     match aof_tx.try_send(AofMessage::Rewrite(db)) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(

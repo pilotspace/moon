@@ -20,6 +20,9 @@ use crate::pubsub::subscriber::Subscriber;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::storage::Database;
 
+/// Type alias for the per-database RwLock container.
+type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
 use super::codec::RespCodec;
 
 /// Extract command name (as raw byte slice reference) and args from a Frame::Array.
@@ -68,7 +71,7 @@ fn extract_bytes(frame: &Frame) -> Option<Bytes> {
 /// to 1 per batch cycle.
 pub async fn handle_connection(
     stream: TcpStream,
-    db: Arc<Mutex<Vec<Database>>>,
+    db: SharedDatabases,
     shutdown: CancellationToken,
     requirepass: Option<String>,
     config: Arc<ServerConfig>,
@@ -496,10 +499,10 @@ pub async fn handle_connection(
                                     Bytes::from_static(b"ERR wrong number of arguments for 'watch' command"),
                                 ));
                             } else {
-                                let dbs = db.lock();
+                                let guard = db[selected_db].read();
                                 for arg in cmd_args {
                                     if let Frame::BulkString(key) = arg {
-                                        let version = dbs[selected_db].get_version(key);
+                                        let version = guard.get_version(key);
                                         watched_keys.insert(key.clone(), version);
                                     }
                                 }
@@ -544,21 +547,21 @@ pub async fn handle_connection(
                         None
                     };
 
-                    // Eviction check + dispatch under single lock
+                    // Eviction check + dispatch under per-db write lock
                     let result = {
-                        let mut dbs = db.lock();
-                        dbs[selected_db].refresh_now();
+                        let mut guard = db[selected_db].write();
+                        guard.refresh_now();
                         // Eviction once per write
                         if is_write {
                             let rt = runtime_config.read().unwrap();
-                            if let Err(oom_frame) = try_evict_if_needed(&mut dbs[selected_db], &rt) {
+                            if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                 responses.push(oom_frame);
                                 continue; // Skip this command but process rest of batch
                             }
                         }
-                        let db_count = dbs.len();
-                        dispatch(&mut dbs[selected_db], cmd, cmd_args, &mut selected_db, db_count)
-                    }; // MutexGuard dropped here -- BEFORE any await
+                        let db_count = db.len();
+                        dispatch(&mut *guard, cmd, cmd_args, &mut selected_db, db_count)
+                    }; // RwLockWriteGuard dropped here -- BEFORE any await
 
                     let (response, quit) = match result {
                         DispatchResult::Response(f) => (f, false),
@@ -664,18 +667,18 @@ fn handle_config(
 /// Returns the result Frame (Array of responses, or Null on abort) and a Vec of
 /// AOF byte entries for write commands that succeeded (caller sends them async).
 fn execute_transaction(
-    db: &Arc<Mutex<Vec<Database>>>,
+    db: &SharedDatabases,
     command_queue: &[Frame],
     watched_keys: &HashMap<Bytes, u32>,
     selected_db: &mut usize,
 ) -> (Frame, Vec<Bytes>) {
-    let mut dbs = db.lock();
-    let db_count = dbs.len();
-    dbs[*selected_db].refresh_now();
+    let mut guard = db[*selected_db].write();
+    let db_count = db.len();
+    guard.refresh_now();
 
     // Check WATCH versions -- if any key's version changed, abort
     for (key, watched_version) in watched_keys {
-        let current_version = dbs[*selected_db].get_version(key);
+        let current_version = guard.get_version(key);
         if current_version != *watched_version {
             return (Frame::Null, Vec::new()); // Transaction aborted
         }
@@ -709,7 +712,7 @@ fn execute_transaction(
             None
         };
 
-        let result = dispatch(&mut dbs[*selected_db], cmd, cmd_args, selected_db, db_count);
+        let result = dispatch(&mut *guard, cmd, cmd_args, selected_db, db_count);
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f, // QUIT inside MULTI just returns OK

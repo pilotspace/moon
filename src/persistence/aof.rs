@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::Mutex;
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
@@ -16,6 +15,9 @@ use crate::protocol::{Frame, ParseConfig};
 use crate::protocol::{parse, serialize};
 use crate::storage::db::Database;
 use crate::storage::entry::{current_time_ms, Entry, RedisValue};
+
+/// Type alias for the per-database RwLock container.
+type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,7 +46,7 @@ pub enum AofMessage {
     /// Append serialized RESP command bytes to the AOF file.
     Append(Bytes),
     /// Trigger a full AOF rewrite (compaction) using current database state.
-    Rewrite(Arc<Mutex<Vec<Database>>>),
+    Rewrite(SharedDatabases),
     /// Shut down the AOF writer task gracefully.
     Shutdown,
 }
@@ -358,19 +360,19 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// Rewrite the AOF file with synthetic commands from current database state.
 ///
 /// Writes to a temporary file first, then atomically renames for crash safety.
-pub async fn rewrite_aof(db: Arc<Mutex<Vec<Database>>>, aof_path: &Path) -> anyhow::Result<()> {
-    // Clone database state under lock
-    let snapshot: Vec<Vec<(Bytes, Entry)>> = {
-        let dbs = db.lock();
-        dbs.iter()
-            .map(|db| {
-                db.data()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
-            .collect()
-    };
+pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result<()> {
+    // Clone database state: lock each db individually with read lock
+    let snapshot: Vec<Vec<(Bytes, Entry)>> = db
+        .iter()
+        .map(|lock| {
+            let guard = lock.read();
+            guard
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .collect();
 
     // Reconstruct temporary Database objects for generate_rewrite_commands
     let mut temp_dbs: Vec<Database> = Vec::with_capacity(snapshot.len());

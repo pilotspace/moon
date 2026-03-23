@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
@@ -10,6 +9,9 @@ use tracing::info;
 
 use crate::command::persistence::{bgsave_start, SAVE_IN_PROGRESS};
 use crate::storage::Database;
+
+/// Type alias for the per-database RwLock container.
+type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
 /// Parse save rules from config string.
 ///
@@ -44,7 +46,7 @@ pub fn parse_save_rules(save_arg: &Option<String>) -> Vec<(u64, u64)> {
 ///
 /// Uses the same SAVE_IN_PROGRESS guard as BGSAVE to prevent concurrent saves.
 pub async fn run_auto_save(
-    db: Arc<Mutex<Vec<Database>>>,
+    db: SharedDatabases,
     rules: Vec<(u64, u64)>,
     dir: String,
     dbfilename: String,
