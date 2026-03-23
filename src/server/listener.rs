@@ -7,6 +7,7 @@ use crate::config::ServerConfig;
 use crate::storage::Database;
 
 use super::connection;
+use super::expiration;
 
 /// Run the TCP server accept loop.
 ///
@@ -41,6 +42,11 @@ pub async fn run_with_shutdown(
     let databases: Vec<Database> = (0..config.databases).map(|_| Database::new()).collect();
     let db = Arc::new(Mutex::new(databases));
 
+    // Spawn active expiration background task
+    let exp_db = db.clone();
+    let exp_token = token.child_token();
+    tokio::spawn(expiration::run_active_expiration(exp_db, exp_token));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -49,7 +55,8 @@ pub async fn run_with_shutdown(
                         info!("New connection from {}", addr);
                         let db = db.clone();
                         let conn_token = token.child_token();
-                        tokio::spawn(connection::handle_connection(stream, db, conn_token));
+                        let requirepass = config.requirepass.clone();
+                        tokio::spawn(connection::handle_connection(stream, db, conn_token, requirepass));
                     }
                     Err(e) => {
                         error!("Accept error: {}", e);

@@ -19,6 +19,7 @@ pub async fn handle_connection(
     stream: TcpStream,
     db: Arc<Mutex<Vec<Database>>>,
     shutdown: CancellationToken,
+    requirepass: Option<String>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;

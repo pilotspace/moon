@@ -15,6 +15,10 @@ pub struct ServerConfig {
     /// Number of databases
     #[arg(long, default_value_t = 16)]
     pub databases: usize,
+
+    /// Require clients to authenticate with this password
+    #[arg(long)]
+    pub requirepass: Option<String>,
 }
 
 #[cfg(test)]
