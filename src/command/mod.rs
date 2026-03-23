@@ -65,6 +65,8 @@ pub fn dispatch(
         b"PTTL" => DispatchResult::Response(key::pttl(db, cmd_args)),
         b"PERSIST" => DispatchResult::Response(key::persist(db, cmd_args)),
         b"TYPE" => DispatchResult::Response(key::type_cmd(db, cmd_args)),
+        b"UNLINK" => DispatchResult::Response(key::unlink(db, cmd_args)),
+        b"SCAN" => DispatchResult::Response(key::scan(db, cmd_args)),
         b"KEYS" => DispatchResult::Response(key::keys(db, cmd_args)),
         b"RENAME" => DispatchResult::Response(key::rename(db, cmd_args)),
         b"RENAMENX" => DispatchResult::Response(key::renamenx(db, cmd_args)),

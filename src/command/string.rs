@@ -849,6 +849,17 @@ mod tests {
     }
 
     #[test]
+    fn test_get_wrongtype_on_hash() {
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = get(&mut db, &[bs(b"myhash")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            _ => panic!("Expected WRONGTYPE error"),
+        }
+    }
+
+    #[test]
     fn test_get_missing() {
         let mut db = make_db();
         let result = get(&mut db, &[bs(b"nonexistent")]);

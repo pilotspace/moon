@@ -448,6 +448,163 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(1)
 }
 
+/// Check if a value is large enough to warrant async drop.
+fn should_async_drop(value: &RedisValue) -> bool {
+    match value {
+        RedisValue::Hash(m) => m.len() > 64,
+        RedisValue::List(l) => l.len() > 64,
+        RedisValue::Set(s) => s.len() > 64,
+        RedisValue::SortedSet { members, .. } => members.len() > 64,
+        RedisValue::String(_) => false,
+    }
+}
+
+/// UNLINK key [key ...]
+///
+/// Removes the specified keys. Like DEL but reclaims memory asynchronously
+/// for large collections.
+pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("UNLINK");
+    }
+    let mut count: i64 = 0;
+    for arg in args {
+        if let Some(key) = extract_key(arg) {
+            if let Some(entry) = db.remove(key) {
+                count += 1;
+                if should_async_drop(&entry.value) {
+                    tokio::task::spawn_blocking(move || drop(entry));
+                }
+                // Small values drop normally (entry goes out of scope)
+            }
+        }
+    }
+    Frame::Integer(count)
+}
+
+/// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
+///
+/// Incrementally iterates the key space. Returns a cursor and a batch of keys.
+pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SCAN");
+    }
+
+    // Parse cursor
+    let cursor_str = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SCAN"),
+    };
+    let cursor: usize = match std::str::from_utf8(cursor_str)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(c) => c,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid cursor",
+            ))
+        }
+    };
+
+    // Parse optional arguments
+    let mut match_pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut type_filter: Option<&[u8]> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        let opt = match extract_key(&args[i]) {
+            Some(o) => o,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let opt_upper: Vec<u8> = opt.to_ascii_uppercase();
+        match opt_upper.as_slice() {
+            b"MATCH" => {
+                i += 1;
+                if i < args.len() {
+                    match_pattern = extract_key(&args[i]);
+                }
+            }
+            b"COUNT" => {
+                i += 1;
+                if i < args.len() {
+                    if let Some(c) = parse_int(&args[i]) {
+                        if c > 0 {
+                            count = c as usize;
+                        }
+                    }
+                }
+            }
+            b"TYPE" => {
+                i += 1;
+                if i < args.len() {
+                    type_filter = extract_key(&args[i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Collect all non-expired keys sorted for deterministic iteration
+    let all_keys: Vec<Bytes> = db.keys().cloned().collect();
+    let mut sorted_keys: Vec<Bytes> = Vec::new();
+    for key in all_keys {
+        if db.exists(&key) {
+            sorted_keys.push(key);
+        }
+    }
+    sorted_keys.sort();
+
+    let total = sorted_keys.len();
+    let mut results = Vec::new();
+    let mut pos = cursor;
+
+    // Iterate from cursor position, collect up to `count` matching keys
+    let mut checked = 0;
+    while pos < total && checked < count {
+        let key = &sorted_keys[pos];
+        pos += 1;
+        checked += 1;
+
+        // TYPE filter
+        if let Some(tf) = type_filter {
+            if let Some(entry) = db.get(key) {
+                let tn = entry.value.type_name().as_bytes();
+                if !tf.eq_ignore_ascii_case(tn) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        // MATCH filter
+        if let Some(pattern) = match_pattern {
+            if !glob_match(pattern, key) {
+                continue;
+            }
+        }
+
+        results.push(Frame::BulkString(key.clone()));
+    }
+
+    let next_cursor = if pos >= total {
+        Bytes::from_static(b"0")
+    } else {
+        Bytes::from(pos.to_string())
+    };
+
+    Frame::Array(vec![
+        Frame::BulkString(next_cursor),
+        Frame::Array(results),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +978,162 @@ mod tests {
         // Both keys should still exist
         assert!(db.exists(b"src"));
         assert!(db.exists(b"dst"));
+    }
+
+    // --- UNLINK tests ---
+
+    #[test]
+    fn test_unlink_single() {
+        let mut db = setup_db_with_key(b"foo", b"bar");
+        let result = unlink(&mut db, &[bs(b"foo")]);
+        assert_eq!(result, Frame::Integer(1));
+        assert!(!db.exists(b"foo"));
+    }
+
+    #[test]
+    fn test_unlink_multiple() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"a"), Entry::new_string(Bytes::from_static(b"1")));
+        db.set(Bytes::from_static(b"b"), Entry::new_string(Bytes::from_static(b"2")));
+        db.set(Bytes::from_static(b"c"), Entry::new_string(Bytes::from_static(b"3")));
+        let result = unlink(&mut db, &[bs(b"a"), bs(b"c"), bs(b"missing")]);
+        assert_eq!(result, Frame::Integer(2));
+        assert!(db.exists(b"b"));
+    }
+
+    #[test]
+    fn test_unlink_no_args() {
+        let mut db = Database::new();
+        let result = unlink(&mut db, &[]);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    // --- TYPE tests for collection types ---
+
+    #[test]
+    fn test_type_hash() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"h"), Entry::new_hash());
+        let result = type_cmd(&mut db, &[bs(b"h")]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"hash")));
+    }
+
+    #[test]
+    fn test_type_list() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"l"), Entry::new_list());
+        let result = type_cmd(&mut db, &[bs(b"l")]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"list")));
+    }
+
+    #[test]
+    fn test_type_set() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"s"), Entry::new_set());
+        let result = type_cmd(&mut db, &[bs(b"s")]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"set")));
+    }
+
+    #[test]
+    fn test_type_zset() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"z"), Entry::new_sorted_set());
+        let result = type_cmd(&mut db, &[bs(b"z")]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"zset")));
+    }
+
+    // --- SCAN tests ---
+
+    #[test]
+    fn test_scan_basic() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"key1"), Entry::new_string(Bytes::from_static(b"v1")));
+        db.set(Bytes::from_static(b"key2"), Entry::new_string(Bytes::from_static(b"v2")));
+        db.set(Bytes::from_static(b"key3"), Entry::new_string(Bytes::from_static(b"v3")));
+
+        let result = scan(&mut db, &[bs(b"0")]);
+        match result {
+            Frame::Array(ref arr) => {
+                assert_eq!(arr.len(), 2);
+                // First element is cursor, second is array of keys
+                match &arr[0] {
+                    Frame::BulkString(c) => assert_eq!(c.as_ref(), b"0"), // all returned
+                    _ => panic!("Expected cursor"),
+                }
+                match &arr[1] {
+                    Frame::Array(keys) => assert_eq!(keys.len(), 3),
+                    _ => panic!("Expected keys array"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn test_scan_with_count() {
+        let mut db = Database::new();
+        for i in 0..20 {
+            db.set(
+                Bytes::from(format!("key{:02}", i)),
+                Entry::new_string(Bytes::from_static(b"v")),
+            );
+        }
+
+        let result = scan(&mut db, &[bs(b"0"), bs(b"COUNT"), bs(b"5")]);
+        match result {
+            Frame::Array(ref arr) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    Frame::BulkString(c) => assert_ne!(c.as_ref(), b"0"), // more to go
+                    _ => panic!("Expected cursor"),
+                }
+                match &arr[1] {
+                    Frame::Array(keys) => assert_eq!(keys.len(), 5),
+                    _ => panic!("Expected keys array"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn test_scan_with_match() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"user:1"), Entry::new_string(Bytes::from_static(b"v")));
+        db.set(Bytes::from_static(b"user:2"), Entry::new_string(Bytes::from_static(b"v")));
+        db.set(Bytes::from_static(b"post:1"), Entry::new_string(Bytes::from_static(b"v")));
+
+        let result = scan(&mut db, &[bs(b"0"), bs(b"MATCH"), bs(b"user:*")]);
+        match result {
+            Frame::Array(ref arr) => {
+                match &arr[1] {
+                    Frame::Array(keys) => assert_eq!(keys.len(), 2),
+                    _ => panic!("Expected keys array"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn test_scan_with_type_filter() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"str"), Entry::new_string(Bytes::from_static(b"v")));
+        db.set(Bytes::from_static(b"hash"), Entry::new_hash());
+        db.set(Bytes::from_static(b"list"), Entry::new_list());
+
+        let result = scan(&mut db, &[bs(b"0"), bs(b"TYPE"), bs(b"hash")]);
+        match result {
+            Frame::Array(ref arr) => {
+                match &arr[1] {
+                    Frame::Array(keys) => {
+                        assert_eq!(keys.len(), 1);
+                        assert_eq!(keys[0], Frame::BulkString(Bytes::from_static(b"hash")));
+                    }
+                    _ => panic!("Expected keys array"),
+                }
+            }
+            _ => panic!("Expected array"),
+        }
     }
 }
