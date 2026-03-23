@@ -7,11 +7,9 @@ use super::inline;
 
 /// Attempt to parse one RESP2 frame from the buffer.
 ///
-/// Uses a two-pass check-then-parse pattern:
-/// 1. Check pass: verify a complete frame exists using a read-only Cursor
-/// 2. Parse pass: extract the frame and advance the buffer
-///
-/// On success, advances the buffer past the consumed bytes and returns `Ok(Some(frame))`.
+/// Uses a single-pass approach: validates completeness and extracts frame data
+/// in one traversal of the buffer. On success, advances the buffer past the
+/// consumed bytes and returns `Ok(Some(frame))`.
 /// Returns `Ok(None)` if the buffer doesn't contain a complete frame (need more data).
 /// Returns `Err` if the data violates the RESP2 protocol specification.
 pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, ParseError> {
@@ -25,20 +23,11 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
         _ => return inline::parse_inline(buf),
     }
 
-    // Pass 1: Check if a complete frame exists (peek only, no buffer modification)
     let mut cursor = Cursor::new(&buf[..]);
-    match check(&mut cursor, config, 0) {
-        Ok(()) => {
-            // Frame is complete. Record how many bytes it consumed.
+    match parse_single_frame(&mut cursor, config, 0) {
+        Ok(frame) => {
             let len = cursor.position() as usize;
-
-            // Pass 2: Parse the frame (re-read from start)
-            let mut cursor = Cursor::new(&buf[..]);
-            let frame = parse_frame(&mut cursor)?;
-
-            // Advance the buffer past the consumed bytes
             buf.advance(len);
-
             Ok(Some(frame))
         }
         Err(ParseError::Incomplete) => Ok(None),
@@ -46,13 +35,15 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
     }
 }
 
-/// Check if a complete RESP2 frame exists in the buffer.
-/// Does NOT modify the buffer -- uses Cursor for read-only traversal.
-fn check(
+/// Parse a single RESP2 frame from the cursor in one pass.
+///
+/// Validates completeness and extracts frame data simultaneously.
+/// Returns `Err(ParseError::Incomplete)` if not enough data is available.
+fn parse_single_frame(
     cursor: &mut Cursor<&[u8]>,
     config: &ParseConfig,
     depth: usize,
-) -> Result<(), ParseError> {
+) -> Result<Frame, ParseError> {
     if depth > config.max_array_depth {
         return Err(ParseError::Invalid {
             message: format!(
@@ -63,86 +54,6 @@ fn check(
         });
     }
 
-    if !cursor.has_remaining() {
-        return Err(ParseError::Incomplete);
-    }
-
-    match get_u8(cursor)? {
-        b'+' | b'-' => {
-            // Simple string or error: find \r\n
-            find_crlf(cursor)?;
-            Ok(())
-        }
-        b':' => {
-            // Integer: find \r\n (validates line is complete)
-            find_crlf(cursor)?;
-            Ok(())
-        }
-        b'$' => {
-            // Bulk string: read length, then skip that many bytes + \r\n
-            let len = read_decimal(cursor)?;
-            if len == -1 {
-                // Null bulk string
-                return Ok(());
-            }
-            if len < 0 {
-                return Err(ParseError::Invalid {
-                    message: format!("invalid bulk string length: {}", len),
-                    offset: cursor.position() as usize,
-                });
-            }
-            let len = len as usize;
-            if len > config.max_bulk_string_size {
-                return Err(ParseError::Invalid {
-                    message: format!(
-                        "bulk string size {} exceeds maximum {}",
-                        len, config.max_bulk_string_size
-                    ),
-                    offset: cursor.position() as usize,
-                });
-            }
-            // Skip data + trailing \r\n
-            skip(cursor, len + 2)?;
-            Ok(())
-        }
-        b'*' => {
-            // Array: read count, then check each element
-            let count = read_decimal(cursor)?;
-            if count == -1 {
-                // Null array
-                return Ok(());
-            }
-            if count < 0 {
-                return Err(ParseError::Invalid {
-                    message: format!("invalid array length: {}", count),
-                    offset: cursor.position() as usize,
-                });
-            }
-            let count = count as usize;
-            if count > config.max_array_length {
-                return Err(ParseError::Invalid {
-                    message: format!(
-                        "array length {} exceeds maximum {}",
-                        count, config.max_array_length
-                    ),
-                    offset: cursor.position() as usize,
-                });
-            }
-            for _ in 0..count {
-                check(cursor, config, depth + 1)?;
-            }
-            Ok(())
-        }
-        byte => Err(ParseError::Invalid {
-            message: format!("unknown type byte: 0x{:02x}", byte),
-            offset: cursor.position() as usize - 1,
-        }),
-    }
-}
-
-/// Parse a complete RESP2 frame from the cursor.
-/// Assumes `check()` has already validated that a complete frame exists.
-fn parse_frame(cursor: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
     match get_u8(cursor)? {
         b'+' => {
             let line = find_crlf(cursor)?;
@@ -169,12 +80,31 @@ fn parse_frame(cursor: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
             if len == -1 {
                 return Ok(Frame::Null);
             }
+            if len < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid bulk string length: {}", len),
+                    offset: cursor.position() as usize,
+                });
+            }
             let len = len as usize;
+            if len > config.max_bulk_string_size {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "bulk string size {} exceeds maximum {}",
+                        len, config.max_bulk_string_size
+                    ),
+                    offset: cursor.position() as usize,
+                });
+            }
+            // Check we have len + 2 bytes (\r\n) remaining
             let pos = cursor.position() as usize;
+            let remaining = cursor.get_ref().len() - pos;
+            if remaining < len + 2 {
+                return Err(ParseError::Incomplete);
+            }
             let data = &cursor.get_ref()[pos..pos + len];
             let frame = Frame::BulkString(Bytes::copy_from_slice(data));
-            // Skip past data + \r\n
-            skip(cursor, len + 2)?;
+            cursor.set_position((pos + len + 2) as u64);
             Ok(frame)
         }
         b'*' => {
@@ -182,10 +112,25 @@ fn parse_frame(cursor: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
             if count == -1 {
                 return Ok(Frame::Null);
             }
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid array length: {}", count),
+                    offset: cursor.position() as usize,
+                });
+            }
             let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "array length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
+                    offset: cursor.position() as usize,
+                });
+            }
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(parse_frame(cursor)?);
+                items.push(parse_single_frame(cursor, config, depth + 1)?);
             }
             Ok(Frame::Array(items))
         }
@@ -240,17 +185,6 @@ fn read_decimal(cursor: &mut Cursor<&[u8]>) -> Result<i64, ParseError> {
         message: format!("invalid decimal: {:?}", s),
         offset: cursor.position() as usize,
     })
-}
-
-/// Advance the cursor by `n` bytes, or return Incomplete if not enough data.
-fn skip(cursor: &mut Cursor<&[u8]>, n: usize) -> Result<(), ParseError> {
-    let pos = cursor.position() as usize;
-    let end = cursor.get_ref().len();
-    if pos + n > end {
-        return Err(ParseError::Incomplete);
-    }
-    cursor.set_position((pos + n) as u64);
-    Ok(())
 }
 
 #[cfg(test)]
