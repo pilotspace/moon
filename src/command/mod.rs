@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod key;
 
 use bytes::Bytes;
 
@@ -54,6 +55,15 @@ pub fn dispatch(
         }
         b"COMMAND" => DispatchResult::Response(connection::command(cmd_args)),
         b"INFO" => DispatchResult::Response(connection::info(db, cmd_args)),
+        // Key management commands
+        b"DEL" => DispatchResult::Response(key::del(db, cmd_args)),
+        b"EXISTS" => DispatchResult::Response(key::exists(db, cmd_args)),
+        b"EXPIRE" => DispatchResult::Response(key::expire(db, cmd_args)),
+        b"PEXPIRE" => DispatchResult::Response(key::pexpire(db, cmd_args)),
+        b"TTL" => DispatchResult::Response(key::ttl(db, cmd_args)),
+        b"PTTL" => DispatchResult::Response(key::pttl(db, cmd_args)),
+        b"PERSIST" => DispatchResult::Response(key::persist(db, cmd_args)),
+        b"TYPE" => DispatchResult::Response(key::type_cmd(db, cmd_args)),
         _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
             "ERR unknown command '{}', with args beginning with: ",
             String::from_utf8_lossy(&cmd_name)

@@ -71,6 +71,24 @@ impl Database {
         self.data.keys()
     }
 
+    /// Set or remove expiration on an existing key.
+    ///
+    /// Performs lazy expiry check first. Returns `false` if the key does not
+    /// exist (or has already expired).
+    pub fn set_expiry(&mut self, key: &[u8], expires_at: Option<Instant>) -> bool {
+        if Self::check_expired(&self.data, key) {
+            self.data.remove(key);
+            return false;
+        }
+        match self.data.get_mut(key) {
+            Some(entry) => {
+                entry.expires_at = expires_at;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Count entries that have an expiration set.
     pub fn expires_count(&self) -> usize {
         self.data.values().filter(|e| e.expires_at.is_some()).count()
@@ -81,6 +99,16 @@ impl Database {
         data.get(key)
             .and_then(|e| e.expires_at)
             .is_some_and(|exp| Instant::now() >= exp)
+    }
+
+    /// Convenience: set a string value with no expiry.
+    pub fn set_string(&mut self, key: Bytes, value: Bytes) {
+        self.set(key, Entry::new_string(value));
+    }
+
+    /// Convenience: set a string value with an expiry.
+    pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at: Instant) {
+        self.set(key, Entry::new_string_with_expiry(value, expires_at));
     }
 
     /// Check if a single entry is expired.
