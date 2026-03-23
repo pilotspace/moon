@@ -1125,3 +1125,403 @@ async fn test_hscan() {
 
     shutdown.cancel();
 }
+
+// ===== Phase 4: Persistence Integration Tests =====
+
+/// Issue BGSAVE, retrying if another test's save is still in progress (global AtomicBool).
+async fn bgsave_with_retry(conn: &mut redis::aio::MultiplexedConnection) {
+    for attempt in 0..20 {
+        let result: Result<String, _> = redis::cmd("BGSAVE")
+            .query_async(conn)
+            .await;
+        match result {
+            Ok(msg) => {
+                assert_eq!(msg, "Background saving started");
+                // Wait for save to complete
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                return;
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if attempt == 19 {
+                    panic!("BGSAVE failed after 20 retries");
+                }
+            }
+        }
+    }
+}
+
+/// Start a server with custom persistence config on a random port.
+async fn start_server_with_persistence(
+    appendonly: &str,
+    appendfsync: &str,
+    dir: &std::path::Path,
+) -> (u16, CancellationToken) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let token = CancellationToken::new();
+    let server_token = token.clone();
+
+    let config = ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        databases: 16,
+        requirepass: None,
+        appendonly: appendonly.to_string(),
+        appendfsync: appendfsync.to_string(),
+        save: None,
+        dir: dir.to_string_lossy().to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
+    };
+
+    tokio::spawn(async move {
+        listener::run_with_shutdown(config, server_token)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    (port, token)
+}
+
+#[tokio::test]
+async fn test_bgsave_creates_rdb_file() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path().to_path_buf();
+    let (port, shutdown) = start_server_with_persistence("no", "everysec", &dir).await;
+    let mut conn = connect(port).await;
+
+    // SET several keys
+    let _: () = conn.set("key1", "value1").await.unwrap();
+    let _: () = conn.set("key2", "value2").await.unwrap();
+    let _: i64 = redis::cmd("HSET")
+        .arg("myhash")
+        .arg("f1")
+        .arg("v1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // BGSAVE (retry if another test's save is still in progress)
+    bgsave_with_retry(&mut conn).await;
+
+    // Verify dump.rdb exists
+    let rdb_path = dir.join("dump.rdb");
+    assert!(rdb_path.exists(), "dump.rdb should exist after BGSAVE");
+
+    // Verify file starts with RUSTREDIS magic bytes
+    let data = std::fs::read(&rdb_path).unwrap();
+    assert!(
+        data.starts_with(b"RUSTREDIS"),
+        "RDB file should start with RUSTREDIS magic bytes"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_rdb_restore_on_startup() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path().to_path_buf();
+
+    // --- Server 1: write data and BGSAVE ---
+    {
+        let (port, shutdown) = start_server_with_persistence("no", "everysec", &dir).await;
+        let mut conn = connect(port).await;
+
+        // String
+        let _: () = conn.set("str_key", "str_val").await.unwrap();
+        // Hash
+        let _: i64 = redis::cmd("HSET")
+            .arg("hash_key")
+            .arg("field1")
+            .arg("val1")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        // List
+        let _: i64 = redis::cmd("RPUSH")
+            .arg("list_key")
+            .arg("a")
+            .arg("b")
+            .arg("c")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        // Set
+        let _: i64 = redis::cmd("SADD")
+            .arg("set_key")
+            .arg("x")
+            .arg("y")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        // Sorted Set
+        let _: i64 = redis::cmd("ZADD")
+            .arg("zset_key")
+            .arg(1.5)
+            .arg("alice")
+            .arg(2.5)
+            .arg("bob")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // BGSAVE
+        bgsave_with_retry(&mut conn).await;
+
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // --- Server 2: restart and verify restore ---
+    {
+        let (port, shutdown) = start_server_with_persistence("no", "everysec", &dir).await;
+        let mut conn = connect(port).await;
+
+        // String
+        let val: String = conn.get("str_key").await.unwrap();
+        assert_eq!(val, "str_val");
+
+        // Hash
+        let val: String = redis::cmd("HGET")
+            .arg("hash_key")
+            .arg("field1")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(val, "val1");
+
+        // List
+        let items: Vec<String> = redis::cmd("LRANGE")
+            .arg("list_key")
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(items, vec!["a", "b", "c"]);
+
+        // Set
+        let card: i64 = redis::cmd("SCARD")
+            .arg("set_key")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(card, 2);
+
+        // Sorted Set
+        let members: Vec<String> = redis::cmd("ZRANGE")
+            .arg("zset_key")
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(members, vec!["alice", "bob"]);
+
+        shutdown.cancel();
+    }
+}
+
+#[tokio::test]
+async fn test_aof_logging() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path().to_path_buf();
+
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        let _: () = conn.set("foo", "bar").await.unwrap();
+        let _: i64 = redis::cmd("HSET")
+            .arg("hash")
+            .arg("f")
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: i64 = redis::cmd("LPUSH")
+            .arg("list")
+            .arg("a")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // Give AOF writer time to flush
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Read AOF file and verify it contains RESP-formatted commands
+    let aof_path = dir.join("appendonly.aof");
+    assert!(aof_path.exists(), "appendonly.aof should exist");
+
+    let content = std::fs::read_to_string(&aof_path).unwrap();
+    assert!(
+        content.contains("SET") || content.contains("set"),
+        "AOF should contain SET command"
+    );
+    assert!(
+        content.contains("foo"),
+        "AOF should contain key 'foo'"
+    );
+    assert!(
+        content.contains("HSET") || content.contains("hset"),
+        "AOF should contain HSET command"
+    );
+    assert!(
+        content.contains("LPUSH") || content.contains("lpush"),
+        "AOF should contain LPUSH command"
+    );
+}
+
+#[tokio::test]
+async fn test_aof_restore_on_startup() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path().to_path_buf();
+
+    // --- Server 1: write data with AOF ---
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        let _: () = conn.set("aof_key1", "aof_val1").await.unwrap();
+        let _: () = conn.set("aof_key2", "aof_val2").await.unwrap();
+        let _: i64 = redis::cmd("HSET")
+            .arg("aof_hash")
+            .arg("field")
+            .arg("value")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // --- Server 2: restart with AOF and verify restore ---
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        let val: String = conn.get("aof_key1").await.unwrap();
+        assert_eq!(val, "aof_val1");
+        let val: String = conn.get("aof_key2").await.unwrap();
+        assert_eq!(val, "aof_val2");
+        let val: String = redis::cmd("HGET")
+            .arg("aof_hash")
+            .arg("field")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(val, "value");
+
+        shutdown.cancel();
+    }
+}
+
+#[tokio::test]
+async fn test_aof_priority_over_rdb() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path().to_path_buf();
+
+    // --- Server 1: create both RDB and AOF with different values ---
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        // Set initial value and BGSAVE (RDB snapshot)
+        let _: () = conn.set("key1", "rdb_value").await.unwrap();
+        bgsave_with_retry(&mut conn).await;
+
+        // Overwrite in AOF (but RDB already has "rdb_value")
+        let _: () = conn.set("key1", "aof_value").await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // --- Server 2: restart with AOF enabled -> should use AOF (priority) ---
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        let val: String = conn.get("key1").await.unwrap();
+        assert_eq!(
+            val, "aof_value",
+            "AOF should take priority over RDB on startup"
+        );
+
+        shutdown.cancel();
+    }
+}
+
+#[tokio::test]
+async fn test_bgrewriteaof() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path().to_path_buf();
+
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        // Write key1 many times to bloat the AOF
+        for i in 0..20 {
+            let _: () = conn.set("key1", format!("value_{}", i)).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Record AOF size before rewrite
+        let aof_path = dir.join("appendonly.aof");
+        let size_before = std::fs::metadata(&aof_path).unwrap().len();
+
+        // BGREWRITEAOF
+        let result: String = redis::cmd("BGREWRITEAOF")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(result, "Background append only file rewriting started");
+
+        // Wait for rewrite to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let size_after = std::fs::metadata(&aof_path).unwrap().len();
+        assert!(
+            size_after <= size_before,
+            "AOF should be same size or smaller after rewrite: before={}, after={}",
+            size_before,
+            size_after
+        );
+
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Verify data survives restart after rewrite
+    {
+        let (port, shutdown) =
+            start_server_with_persistence("yes", "always", &dir).await;
+        let mut conn = connect(port).await;
+
+        let val: String = conn.get("key1").await.unwrap();
+        assert_eq!(val, "value_19", "key1 should have final value after rewrite + restart");
+
+        shutdown.cancel();
+    }
+}
