@@ -1,3 +1,5 @@
+pub mod connection;
+
 use bytes::Bytes;
 
 use crate::protocol::Frame;
@@ -13,13 +15,146 @@ pub enum DispatchResult {
 
 /// Dispatch a command frame to the appropriate handler.
 ///
-/// This is a stub that returns ERR for all commands. Task 3 replaces this
-/// with the real dispatch implementation.
+/// Extracts the command name from the first element of a Frame::Array,
+/// converts it to uppercase for case-insensitive matching, and routes
+/// to the appropriate handler function.
 pub fn dispatch(
-    _db: &mut Database,
-    _frame: Frame,
-    _selected_db: &mut usize,
-    _db_count: usize,
+    db: &mut Database,
+    frame: Frame,
+    selected_db: &mut usize,
+    db_count: usize,
 ) -> DispatchResult {
-    DispatchResult::Response(Frame::Error(Bytes::from_static(b"ERR not implemented")))
+    let args = match frame {
+        Frame::Array(args) if !args.is_empty() => args,
+        _ => {
+            return DispatchResult::Response(Frame::Error(Bytes::from_static(
+                b"ERR invalid command format",
+            )))
+        }
+    };
+
+    let cmd_name = match &args[0] {
+        Frame::BulkString(s) => s.to_ascii_uppercase(),
+        Frame::SimpleString(s) => s.to_ascii_uppercase(),
+        _ => {
+            return DispatchResult::Response(Frame::Error(Bytes::from_static(
+                b"ERR invalid command name",
+            )))
+        }
+    };
+
+    let cmd_args = &args[1..];
+
+    match cmd_name.as_slice() {
+        b"PING" => DispatchResult::Response(connection::ping(cmd_args)),
+        b"ECHO" => DispatchResult::Response(connection::echo(cmd_args)),
+        b"QUIT" => DispatchResult::Quit(Frame::SimpleString(Bytes::from_static(b"OK"))),
+        b"SELECT" => {
+            DispatchResult::Response(connection::select(cmd_args, selected_db, db_count))
+        }
+        b"COMMAND" => DispatchResult::Response(connection::command(cmd_args)),
+        b"INFO" => DispatchResult::Response(connection::info(db, cmd_args)),
+        _ => DispatchResult::Response(Frame::Error(Bytes::from(format!(
+            "ERR unknown command '{}', with args beginning with: ",
+            String::from_utf8_lossy(&cmd_name)
+        )))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_command(parts: &[&[u8]]) -> Frame {
+        Frame::Array(
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_dispatch_ping() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let result = dispatch(&mut db, make_command(&[b"PING"]), &mut selected, 16);
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"PONG")))
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_case_insensitive() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let result = dispatch(&mut db, make_command(&[b"ping"]), &mut selected, 16);
+        match result {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"PONG")))
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_quit() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let result = dispatch(&mut db, make_command(&[b"QUIT"]), &mut selected, 16);
+        match result {
+            DispatchResult::Quit(f) => {
+                assert_eq!(f, Frame::SimpleString(Bytes::from_static(b"OK")))
+            }
+            _ => panic!("Expected Quit"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_unknown_command() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let result = dispatch(
+            &mut db,
+            make_command(&[b"FAKECMD"]),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(Frame::Error(s)) => {
+                assert!(s.starts_with(b"ERR unknown command"));
+            }
+            _ => panic!("Expected error response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_invalid_format() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let result = dispatch(
+            &mut db,
+            Frame::SimpleString(Bytes::from_static(b"PING")),
+            &mut selected,
+            16,
+        );
+        match result {
+            DispatchResult::Response(Frame::Error(_)) => {}
+            _ => panic!("Expected error response"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_empty_array() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let result = dispatch(&mut db, Frame::Array(vec![]), &mut selected, 16);
+        match result {
+            DispatchResult::Response(Frame::Error(_)) => {}
+            _ => panic!("Expected error response"),
+        }
+    }
 }
