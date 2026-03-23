@@ -238,6 +238,215 @@ pub fn type_cmd(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// Redis-compatible glob pattern matcher.
+///
+/// Supports: `*` (any sequence), `?` (one byte), `[abc]` (character class),
+/// `[^abc]`/`[!abc]` (negated class), `[a-z]` (range), `\x` (escape).
+fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
+    let mut pi = 0; // pattern index
+    let mut si = 0; // string index
+    let mut star_pi = usize::MAX;
+    let mut star_si = usize::MAX;
+
+    while si < string.len() {
+        if pi < pattern.len() && pattern[pi] == b'\\' {
+            // Escaped character: match literally
+            pi += 1;
+            if pi < pattern.len() && pattern[pi] == string[si] {
+                pi += 1;
+                si += 1;
+                continue;
+            }
+            // Backslash at end of pattern or mismatch -- try star backtrack
+        } else if pi < pattern.len() && pattern[pi] == b'?' {
+            pi += 1;
+            si += 1;
+            continue;
+        } else if pi < pattern.len() && pattern[pi] == b'[' {
+            // Character class
+            if let Some((matched, new_pi)) = match_char_class(&pattern[pi..], string[si]) {
+                if matched {
+                    pi += new_pi;
+                    si += 1;
+                    continue;
+                }
+            }
+            // Class didn't match -- try star backtrack
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = pi;
+            star_si = si;
+            pi += 1;
+            continue;
+        } else if pi < pattern.len() && pattern[pi] == string[si] {
+            pi += 1;
+            si += 1;
+            continue;
+        }
+
+        // Mismatch: backtrack to last * if possible
+        if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_si += 1;
+            si = star_si;
+            continue;
+        }
+
+        return false;
+    }
+
+    // Consume trailing *s in pattern
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
+}
+
+/// Match a character class `[...]` at the start of `pattern`.
+/// Returns `Some((matched, bytes_consumed))` or `None` if malformed.
+fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
+    if pattern.is_empty() || pattern[0] != b'[' {
+        return None;
+    }
+    let mut i = 1;
+    let negated = if i < pattern.len() && (pattern[i] == b'^' || pattern[i] == b'!') {
+        i += 1;
+        true
+    } else {
+        false
+    };
+
+    let mut matched = false;
+    while i < pattern.len() && pattern[i] != b']' {
+        let start = pattern[i];
+        if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
+            // Range: a-z
+            let end = pattern[i + 2];
+            let (lo, hi) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            if ch >= lo && ch <= hi {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if ch == start {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+
+    if i >= pattern.len() {
+        return None; // No closing bracket
+    }
+
+    // i is at ']'
+    Some((matched ^ negated, i + 1))
+}
+
+/// KEYS pattern
+///
+/// Returns all keys matching the given glob-style pattern.
+/// Expired keys are excluded (lazy expiry check on each key).
+pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("KEYS");
+    }
+    let pattern = match extract_key(&args[0]) {
+        Some(p) => p,
+        None => return err_wrong_args("KEYS"),
+    };
+
+    // Collect all keys first (need to release immutable borrow before calling db.get)
+    let all_keys: Vec<Bytes> = db.keys().cloned().collect();
+
+    let mut result = Vec::new();
+    for key in all_keys {
+        // Trigger lazy expiry by calling exists
+        if db.exists(&key) && glob_match(pattern, &key) {
+            result.push(Frame::BulkString(key));
+        }
+    }
+
+    Frame::Array(result)
+}
+
+/// RENAME key newkey
+///
+/// Renames key to newkey. Returns an error when key does not exist.
+/// If source and destination are the same, returns OK without deleting.
+/// Overwrites destination if it exists. Preserves TTL.
+pub fn rename(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("RENAME");
+    }
+    let src = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("RENAME"),
+    };
+    let dst = match extract_key(&args[1]) {
+        Some(k) => k,
+        None => return err_wrong_args("RENAME"),
+    };
+
+    // Check if source exists (with lazy expiry)
+    if !db.exists(src) {
+        return Frame::Error(Bytes::from_static(b"ERR no such key"));
+    }
+
+    // Same key: no-op (Pitfall 5)
+    if src == dst {
+        return Frame::SimpleString(Bytes::from_static(b"OK"));
+    }
+
+    // Remove source, set as destination (preserves entire Entry including TTL)
+    let entry = db.remove(src).unwrap();
+    db.set(Bytes::copy_from_slice(dst), entry);
+
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// RENAMENX key newkey
+///
+/// Renames key to newkey only if newkey does not exist.
+/// Returns 1 if renamed, 0 if newkey already exists.
+pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("RENAMENX");
+    }
+    let src = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("RENAMENX"),
+    };
+    let dst = match extract_key(&args[1]) {
+        Some(k) => k,
+        None => return err_wrong_args("RENAMENX"),
+    };
+
+    // Check if source exists
+    if !db.exists(src) {
+        return Frame::Error(Bytes::from_static(b"ERR no such key"));
+    }
+
+    // Same key: destination "exists", return 0
+    if src == dst {
+        return Frame::Integer(0);
+    }
+
+    // Check if destination exists
+    if db.exists(dst) {
+        return Frame::Integer(0);
+    }
+
+    let entry = db.remove(src).unwrap();
+    db.set(Bytes::copy_from_slice(dst), entry);
+
+    Frame::Integer(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +637,187 @@ mod tests {
         let mut db = Database::new();
         let result = type_cmd(&mut db, &[bs(b"foo")]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"none")));
+    }
+
+    // --- Glob matcher tests ---
+
+    #[test]
+    fn test_glob_star() {
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"*", b""));
+        assert!(glob_match(b"*", b"hello world"));
+    }
+
+    #[test]
+    fn test_glob_question() {
+        assert!(glob_match(b"h?llo", b"hello"));
+        assert!(glob_match(b"h?llo", b"hallo"));
+        assert!(glob_match(b"h?llo", b"hxllo"));
+        assert!(!glob_match(b"h?llo", b"hllo"));
+    }
+
+    #[test]
+    fn test_glob_star_prefix() {
+        assert!(glob_match(b"h*llo", b"hllo"));
+        assert!(glob_match(b"h*llo", b"heeeello"));
+        assert!(glob_match(b"h*llo", b"hello"));
+        assert!(!glob_match(b"h*llo", b"hllox"));
+    }
+
+    #[test]
+    fn test_glob_char_class() {
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hallo"));
+        assert!(!glob_match(b"h[ae]llo", b"hillo"));
+    }
+
+    #[test]
+    fn test_glob_negated_class() {
+        assert!(glob_match(b"h[^e]llo", b"hallo"));
+        assert!(glob_match(b"h[^e]llo", b"hbllo"));
+        assert!(!glob_match(b"h[^e]llo", b"hello"));
+        // Also test ! syntax
+        assert!(glob_match(b"h[!e]llo", b"hallo"));
+        assert!(!glob_match(b"h[!e]llo", b"hello"));
+    }
+
+    #[test]
+    fn test_glob_range() {
+        assert!(glob_match(b"h[a-b]llo", b"hallo"));
+        assert!(glob_match(b"h[a-b]llo", b"hbllo"));
+        assert!(!glob_match(b"h[a-b]llo", b"hcllo"));
+    }
+
+    #[test]
+    fn test_glob_escaped() {
+        assert!(glob_match(b"h\\*llo", b"h*llo"));
+        assert!(!glob_match(b"h\\*llo", b"hello"));
+        assert!(!glob_match(b"h\\*llo", b"heeeello"));
+    }
+
+    // --- KEYS tests ---
+
+    #[test]
+    fn test_keys_all() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"foo"), Entry::new_string(Bytes::from_static(b"1")));
+        db.set(Bytes::from_static(b"bar"), Entry::new_string(Bytes::from_static(b"2")));
+        db.set(Bytes::from_static(b"baz"), Entry::new_string(Bytes::from_static(b"3")));
+        let result = keys(&mut db, &[bs(b"*")]);
+        match result {
+            Frame::Array(arr) => assert_eq!(arr.len(), 3),
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn test_keys_pattern() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"hello"), Entry::new_string(Bytes::from_static(b"1")));
+        db.set(Bytes::from_static(b"hallo"), Entry::new_string(Bytes::from_static(b"2")));
+        db.set(Bytes::from_static(b"world"), Entry::new_string(Bytes::from_static(b"3")));
+        let result = keys(&mut db, &[bs(b"h?llo")]);
+        match result {
+            Frame::Array(arr) => assert_eq!(arr.len(), 2),
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn test_keys_expired_excluded() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"alive"),
+            Entry::new_string(Bytes::from_static(b"1")),
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        db.set(
+            Bytes::from_static(b"dead"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past),
+        );
+        let result = keys(&mut db, &[bs(b"*")]);
+        match result {
+            Frame::Array(arr) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], Frame::BulkString(Bytes::from_static(b"alive")));
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    // --- RENAME tests ---
+
+    #[test]
+    fn test_rename_basic() {
+        let mut db = setup_db_with_key(b"old", b"value");
+        let result = rename(&mut db, &[bs(b"old"), bs(b"new")]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert!(!db.exists(b"old"));
+        assert!(db.exists(b"new"));
+    }
+
+    #[test]
+    fn test_rename_same_key() {
+        let mut db = setup_db_with_key(b"foo", b"bar");
+        let result = rename(&mut db, &[bs(b"foo"), bs(b"foo")]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+        // Key should still exist (no-op, not deleted)
+        assert!(db.exists(b"foo"));
+    }
+
+    #[test]
+    fn test_rename_missing_source() {
+        let mut db = Database::new();
+        let result = rename(&mut db, &[bs(b"missing"), bs(b"new")]);
+        assert!(matches!(result, Frame::Error(ref s) if s.as_ref() == b"ERR no such key"));
+    }
+
+    #[test]
+    fn test_rename_preserves_ttl() {
+        let future = Instant::now() + Duration::from_secs(3600);
+        let mut db = setup_db_with_expiry(b"old", b"value", future);
+        rename(&mut db, &[bs(b"old"), bs(b"new")]);
+        // TTL should be preserved on new key
+        let t = ttl(&mut db, &[bs(b"new")]);
+        match t {
+            Frame::Integer(n) => assert!(n > 0, "TTL should be positive, got {}", n),
+            _ => panic!("Expected positive TTL"),
+        }
+    }
+
+    #[test]
+    fn test_rename_overwrites_dest() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"src"), Entry::new_string(Bytes::from_static(b"srcval")));
+        db.set(Bytes::from_static(b"dst"), Entry::new_string(Bytes::from_static(b"dstval")));
+        rename(&mut db, &[bs(b"src"), bs(b"dst")]);
+        assert!(!db.exists(b"src"));
+        let entry = db.get(b"dst").unwrap();
+        match &entry.value {
+            RedisValue::String(v) => assert_eq!(v.as_ref(), b"srcval"),
+        }
+    }
+
+    // --- RENAMENX tests ---
+
+    #[test]
+    fn test_renamenx_success() {
+        let mut db = setup_db_with_key(b"old", b"value");
+        let result = renamenx(&mut db, &[bs(b"old"), bs(b"new")]);
+        assert_eq!(result, Frame::Integer(1));
+        assert!(!db.exists(b"old"));
+        assert!(db.exists(b"new"));
+    }
+
+    #[test]
+    fn test_renamenx_dest_exists() {
+        let mut db = Database::new();
+        db.set(Bytes::from_static(b"src"), Entry::new_string(Bytes::from_static(b"1")));
+        db.set(Bytes::from_static(b"dst"), Entry::new_string(Bytes::from_static(b"2")));
+        let result = renamenx(&mut db, &[bs(b"src"), bs(b"dst")]);
+        assert_eq!(result, Frame::Integer(0));
+        // Both keys should still exist
+        assert!(db.exists(b"src"));
+        assert!(db.exists(b"dst"));
     }
 }
