@@ -46,4 +46,17 @@ mod tests {
         assert_eq!(config.bind, "0.0.0.0");
         assert_eq!(config.databases, 4);
     }
+
+    #[test]
+    fn test_requirepass() {
+        let config =
+            ServerConfig::parse_from(["rust-redis", "--requirepass", "mysecret"]);
+        assert_eq!(config.requirepass, Some("mysecret".to_string()));
+    }
+
+    #[test]
+    fn test_requirepass_default_none() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.requirepass, None);
+    }
 }

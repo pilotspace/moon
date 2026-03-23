@@ -131,6 +131,45 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     Frame::BulkString(Bytes::from(sections))
 }
 
+/// AUTH command handler.
+///
+/// Authenticates the client with the configured password.
+/// Returns OK on success, WRONGPASS on mismatch, or ERR if no password is configured.
+pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
+    if args.len() != 1 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'AUTH' command",
+        ));
+    }
+
+    let password = match requirepass {
+        Some(p) => p,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR Client sent AUTH, but no password is set",
+            ));
+        }
+    };
+
+    let provided = match &args[0] {
+        Frame::BulkString(s) => s,
+        Frame::SimpleString(s) => s,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid password type",
+            ));
+        }
+    };
+
+    if provided.as_ref() == password.as_bytes() {
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else {
+        Frame::Error(Bytes::from_static(
+            b"WRONGPASS invalid username-password pair or user is disabled.",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +299,42 @@ mod tests {
             }
             _ => panic!("Expected BulkString"),
         }
+    }
+
+    #[test]
+    fn test_auth_correct_password() {
+        let pass = Some("secret123".to_string());
+        let result = auth(
+            &[Frame::BulkString(Bytes::from_static(b"secret123"))],
+            &pass,
+        );
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_auth_wrong_password() {
+        let pass = Some("secret123".to_string());
+        let result = auth(
+            &[Frame::BulkString(Bytes::from_static(b"wrong"))],
+            &pass,
+        );
+        assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
+    }
+
+    #[test]
+    fn test_auth_no_password_configured() {
+        let pass: Option<String> = None;
+        let result = auth(
+            &[Frame::BulkString(Bytes::from_static(b"anything"))],
+            &pass,
+        );
+        assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR Client sent AUTH")));
+    }
+
+    #[test]
+    fn test_auth_wrong_arity() {
+        let pass = Some("secret".to_string());
+        let result = auth(&[], &pass);
+        assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR wrong number")));
     }
 }
