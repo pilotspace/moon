@@ -103,7 +103,7 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
     let keys: Vec<Bytes> = if volatile_only {
         db.data()
             .iter()
-            .filter(|(_, e)| e.expires_at.is_some())
+            .filter(|(_, e)| e.has_expiry())
             .map(|(k, _)| k.clone())
             .collect()
     } else {
@@ -123,15 +123,16 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
 
     for key in sampled {
         if let Some(entry) = db.data().get(key) {
+            let la = entry.last_access();
             match oldest_access {
                 None => {
                     oldest_key = Some(key.clone());
-                    oldest_access = Some(entry.last_access);
+                    oldest_access = Some(la);
                 }
                 Some(ref oldest) => {
-                    if entry.last_access < *oldest {
+                    if la < *oldest {
                         oldest_key = Some(key.clone());
-                        oldest_access = Some(entry.last_access);
+                        oldest_access = Some(la);
                     }
                 }
             }
@@ -156,7 +157,7 @@ fn evict_one_lfu(
     let keys: Vec<Bytes> = if volatile_only {
         db.data()
             .iter()
-            .filter(|(_, e)| e.expires_at.is_some())
+            .filter(|(_, e)| e.has_expiry())
             .map(|(k, _)| k.clone())
             .collect()
     } else {
@@ -178,22 +179,23 @@ fn evict_one_lfu(
     for key in sampled {
         if let Some(entry) = db.data().get(key) {
             let effective_counter =
-                lfu_decay(entry.access_counter, entry.last_access, lfu_decay_time);
+                lfu_decay(entry.access_counter(), entry.last_access(), lfu_decay_time);
 
+            let la = entry.last_access();
             let should_evict = match lowest_counter {
                 None => true,
                 Some(lowest) => {
                     effective_counter < lowest
                         || (effective_counter == lowest
                             && oldest_access_for_tie
-                                .map_or(true, |t| entry.last_access < t))
+                                .map_or(true, |t| la < t))
                 }
             };
 
             if should_evict {
                 evict_key = Some(key.clone());
                 lowest_counter = Some(effective_counter);
-                oldest_access_for_tie = Some(entry.last_access);
+                oldest_access_for_tie = Some(la);
             }
         }
     }
@@ -211,7 +213,7 @@ fn evict_one_random(db: &mut Database, volatile_only: bool) -> bool {
     let keys: Vec<Bytes> = if volatile_only {
         db.data()
             .iter()
-            .filter(|(_, e)| e.expires_at.is_some())
+            .filter(|(_, e)| e.has_expiry())
             .map(|(k, _)| k.clone())
             .collect()
     } else {
@@ -236,7 +238,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
     let keys: Vec<Bytes> = db
         .data()
         .iter()
-        .filter(|(_, e)| e.expires_at.is_some())
+        .filter(|(_, e)| e.has_expiry())
         .map(|(k, _)| k.clone())
         .collect();
 
@@ -249,18 +251,19 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
     let sampled: Vec<&Bytes> = keys.choose_multiple(&mut rng, sample_size).collect();
 
     let mut evict_key: Option<Bytes> = None;
-    let mut soonest_expiry = None;
+    let mut soonest_expiry: Option<u64> = None;
 
     for key in sampled {
         if let Some(entry) = db.data().get(key) {
-            if let Some(expires_at) = entry.expires_at {
+            if entry.has_expiry() {
+                let exp = entry.expires_at_ms;
                 let should_evict = match soonest_expiry {
                     None => true,
-                    Some(ref soonest) => expires_at < *soonest,
+                    Some(soonest) => exp < soonest,
                 };
                 if should_evict {
                     evict_key = Some(key.clone());
-                    soonest_expiry = Some(expires_at);
+                    soonest_expiry = Some(exp);
                 }
             }
         }
@@ -277,8 +280,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::{current_secs, Entry};
-    use std::time::{Duration, Instant};
+    use crate::storage::entry::{current_secs, current_time_ms, Entry};
 
     fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
         RuntimeConfig {
@@ -346,15 +348,15 @@ mod tests {
         let mut db = Database::new();
         // Create entries with different last_access times
         let mut entry1 = Entry::new_string(Bytes::from_static(b"val1"));
-        entry1.last_access = current_secs() - 100; // oldest
+        entry1.set_last_access(current_secs() - 100); // oldest
         db.set(Bytes::from_static(b"old"), entry1);
 
         let mut entry2 = Entry::new_string(Bytes::from_static(b"val2"));
-        entry2.last_access = current_secs() - 50;
+        entry2.set_last_access(current_secs() - 50);
         db.set(Bytes::from_static(b"medium"), entry2);
 
         let mut entry3 = Entry::new_string(Bytes::from_static(b"val3"));
-        entry3.last_access = current_secs(); // newest
+        entry3.set_last_access(current_secs()); // newest
         db.set(Bytes::from_static(b"new"), entry3);
 
         // Set maxmemory to allow only 2 entries (roughly)
@@ -390,11 +392,11 @@ mod tests {
         // Persistent key (no TTL)
         db.set_string(Bytes::from_static(b"persistent"), Bytes::from_static(b"value"));
         // Volatile key (has TTL)
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future_ms = current_time_ms() + 3_600_000;
         db.set_string_with_expiry(
             Bytes::from_static(b"volatile"),
             Bytes::from_static(b"value"),
-            future,
+            future_ms,
         );
 
         // With only 1 volatile key, volatile-random should evict it
@@ -407,16 +409,16 @@ mod tests {
     #[test]
     fn test_volatile_ttl_evicts_soonest() {
         let mut db = Database::new();
-        let now = Instant::now();
+        let now_ms = current_time_ms();
         db.set_string_with_expiry(
             Bytes::from_static(b"soon"),
             Bytes::from_static(b"v"),
-            now + Duration::from_secs(10),
+            now_ms + 10_000,
         );
         db.set_string_with_expiry(
             Bytes::from_static(b"later"),
             Bytes::from_static(b"v"),
-            now + Duration::from_secs(3600),
+            now_ms + 3_600_000,
         );
 
         let result = evict_one_volatile_ttl(&mut db, 5);

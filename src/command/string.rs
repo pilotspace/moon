@@ -1,8 +1,7 @@
 use bytes::Bytes;
-use std::time::{Duration, Instant, SystemTime};
 
 use crate::protocol::Frame;
-use crate::storage::entry::{Entry, RedisValue};
+use crate::storage::entry::{current_time_ms, Entry, RedisValue};
 use crate::storage::Database;
 
 /// Helper: return ERR wrong number of arguments for a given command.
@@ -58,8 +57,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SET"),
     };
 
-    let mut expiry: Option<Duration> = None;
-    let mut expiry_instant: Option<Instant> = None;
+    let mut expires_at_ms: u64 = 0;
     let mut nx = false;
     let mut xx = false;
     let mut keepttl = false;
@@ -80,7 +78,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[i]) {
-                Some(secs) => expiry = Some(Duration::from_secs(secs as u64)),
+                Some(secs) => expires_at_ms = current_time_ms() + (secs as u64) * 1000,
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
@@ -93,7 +91,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[i]) {
-                Some(ms) => expiry = Some(Duration::from_millis(ms as u64)),
+                Some(ms) => expires_at_ms = current_time_ms() + ms as u64,
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
@@ -107,7 +105,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[i]) {
                 Some(ts) => {
-                    expiry_instant = Some(unix_secs_to_instant(ts as u64));
+                    expires_at_ms = (ts as u64) * 1000;
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -122,7 +120,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[i]) {
                 Some(ts_ms) => {
-                    expiry_instant = Some(unix_millis_to_instant(ts_ms as u64));
+                    expires_at_ms = ts_ms as u64;
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -182,24 +180,24 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // Determine final expiry
-    let final_expires_at = if let Some(inst) = expiry_instant {
-        Some(inst)
-    } else if let Some(dur) = expiry {
-        Some(Instant::now() + dur)
+    let final_expires_at_ms = if expires_at_ms > 0 {
+        expires_at_ms
     } else if keepttl {
         // Preserve existing TTL
-        db.get(&key).and_then(|e| e.expires_at)
+        db.get(&key).map(|e| e.expires_at_ms).unwrap_or(0)
     } else {
-        None
+        0
     };
 
     let entry = Entry {
         value: RedisValue::String(value),
-        expires_at: final_expires_at,
-        version: 0,
-        last_access: db.now(),
-        access_counter: 5,
+        expires_at_ms: final_expires_at_ms,
+        metadata: 0,
     };
+    // Set last_access from db cached time (version will be set by db.set)
+    let mut entry = entry;
+    entry.set_last_access(db.now());
+    entry.set_access_counter(5);
     db.set(key, entry);
 
     if get_old {
@@ -320,9 +318,9 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     // Get current value and existing expiry
-    let (current, existing_expiry) = match db.get(key) {
+    let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at;
+            let expiry = entry.expires_at_ms;
             match &entry.value {
                 RedisValue::String(v) => {
                     let s = match std::str::from_utf8(v) {
@@ -349,7 +347,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                 }
             }
         }
-        None => (0, None),
+        None => (0, 0),
     };
 
     let new_val = match current.checked_add(delta) {
@@ -362,13 +360,13 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     };
 
     // Store new value preserving existing TTL
-    let entry = Entry {
+    let mut entry = Entry {
         value: RedisValue::String(Bytes::from(new_val.to_string())),
-        expires_at: existing_expiry,
-        version: 0,
-        last_access: db.now(),
-        access_counter: 5,
+        expires_at_ms: existing_expiry_ms,
+        metadata: 0,
     };
+    entry.set_last_access(db.now());
+    entry.set_access_counter(5);
     db.set(key.clone(), entry);
 
     Frame::Integer(new_val)
@@ -398,9 +396,9 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // Get current value and existing expiry
-    let (current, existing_expiry) = match db.get(key) {
+    let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at;
+            let expiry = entry.expires_at_ms;
             match &entry.value {
                 RedisValue::String(v) => {
                     let s = match std::str::from_utf8(v) {
@@ -427,7 +425,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (0.0, None),
+        None => (0.0, 0),
     };
 
     let result = current + increment;
@@ -439,13 +437,13 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
 
     let formatted = format_float(result);
 
-    let entry = Entry {
+    let mut entry = Entry {
         value: RedisValue::String(Bytes::from(formatted.clone())),
-        expires_at: existing_expiry,
-        version: 0,
-        last_access: db.now(),
-        access_counter: 5,
+        expires_at_ms: existing_expiry_ms,
+        metadata: 0,
     };
+    entry.set_last_access(db.now());
+    entry.set_access_counter(5);
     db.set(key.clone(), entry);
 
     Frame::BulkString(Bytes::from(formatted))
@@ -466,9 +464,9 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Check if key exists, get existing data + expiry
-    let (existing_data, existing_expiry) = match db.get(&key) {
+    let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
-            let expiry = entry.expires_at;
+            let expiry = entry.expires_at_ms;
             match &entry.value {
                 RedisValue::String(v) => (Some(v.clone()), expiry),
                 _ => {
@@ -478,7 +476,7 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (None, None),
+        None => (None, 0),
     };
 
     let new_val = match existing_data {
@@ -492,13 +490,13 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let new_len = new_val.len() as i64;
-    let entry = Entry {
+    let mut entry = Entry {
         value: RedisValue::String(new_val),
-        expires_at: existing_expiry,
-        version: 0,
-        last_access: db.now(),
-        access_counter: 5,
+        expires_at_ms: existing_expiry_ms,
+        metadata: 0,
     };
+    entry.set_last_access(db.now());
+    entry.set_access_counter(5);
     db.set(key, entry);
 
     Frame::Integer(new_len)
@@ -570,7 +568,7 @@ pub fn setex(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("SETEX"),
     };
-    db.set_string_with_expiry(key, value, Instant::now() + Duration::from_secs(seconds as u64));
+    db.set_string_with_expiry(key, value, current_time_ms() + (seconds as u64) * 1000);
     ok()
 }
 
@@ -601,11 +599,7 @@ pub fn psetex(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("PSETEX"),
     };
-    db.set_string_with_expiry(
-        key,
-        value,
-        Instant::now() + Duration::from_millis(millis as u64),
-    );
+    db.set_string_with_expiry(key, value, current_time_ms() + millis as u64);
     ok()
 }
 
@@ -683,7 +677,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
         };
         if opt.eq_ignore_ascii_case(b"PERSIST") {
             if let Some(entry) = db.get_mut(&key) {
-                entry.expires_at = None;
+                entry.expires_at_ms = 0;
             }
         } else if opt.eq_ignore_ascii_case(b"EX") {
             if args.len() < 3 {
@@ -692,8 +686,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(secs) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at =
-                            Some(Instant::now() + Duration::from_secs(secs as u64));
+                        entry.expires_at_ms = current_time_ms() + (secs as u64) * 1000;
                     }
                 }
                 None => {
@@ -709,8 +702,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ms) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at =
-                            Some(Instant::now() + Duration::from_millis(ms as u64));
+                        entry.expires_at_ms = current_time_ms() + ms as u64;
                     }
                 }
                 None => {
@@ -726,7 +718,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ts) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at = Some(unix_secs_to_instant(ts as u64));
+                        entry.expires_at_ms = (ts as u64) * 1000;
                     }
                 }
                 None => {
@@ -742,7 +734,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ts_ms) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at = Some(unix_millis_to_instant(ts_ms as u64));
+                        entry.expires_at_ms = ts_ms as u64;
                     }
                 }
                 None => {
@@ -797,38 +789,10 @@ fn format_float(val: f64) -> String {
     }
 }
 
-/// Convert unix timestamp (seconds) to Instant.
-fn unix_secs_to_instant(ts: u64) -> Instant {
-    let target = SystemTime::UNIX_EPOCH + Duration::from_secs(ts);
-    let now_sys = SystemTime::now();
-    let now_inst = Instant::now();
-    match target.duration_since(now_sys) {
-        Ok(remaining) => now_inst + remaining,
-        Err(e) => {
-            // Target is in the past
-            let elapsed = e.duration();
-            now_inst.checked_sub(elapsed).unwrap_or(now_inst)
-        }
-    }
-}
-
-/// Convert unix timestamp (milliseconds) to Instant.
-fn unix_millis_to_instant(ts_ms: u64) -> Instant {
-    let target = SystemTime::UNIX_EPOCH + Duration::from_millis(ts_ms);
-    let now_sys = SystemTime::now();
-    let now_inst = Instant::now();
-    match target.duration_since(now_sys) {
-        Ok(remaining) => now_inst + remaining,
-        Err(e) => {
-            let elapsed = e.duration();
-            now_inst.checked_sub(elapsed).unwrap_or(now_inst)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::entry::current_time_ms;
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
@@ -924,7 +888,7 @@ mod tests {
         let result = set(&mut db, &[bs(b"key"), bs(b"val"), bs(b"EX"), bs(b"10")]);
         assert_eq!(result, ok());
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
     }
 
     #[test]
@@ -936,7 +900,7 @@ mod tests {
         );
         assert_eq!(result, ok());
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
     }
 
     #[test]
@@ -961,12 +925,12 @@ mod tests {
         let mut db = make_db();
         // Set key with expiry
         set(&mut db, &[bs(b"key"), bs(b"val"), bs(b"EX"), bs(b"100")]);
-        let exp1 = db.get(b"key").unwrap().expires_at;
-        assert!(exp1.is_some());
+        let exp1 = db.get(b"key").unwrap().expires_at_ms;
+        assert!(exp1 > 0);
         // Set with KEEPTTL
         set(&mut db, &[bs(b"key"), bs(b"newval"), bs(b"KEEPTTL")]);
-        let exp2 = db.get(b"key").unwrap().expires_at;
-        assert!(exp2.is_some());
+        let exp2 = db.get(b"key").unwrap().expires_at_ms;
+        assert!(exp2 > 0);
     }
 
     #[test]
@@ -974,7 +938,7 @@ mod tests {
         let mut db = make_db();
         let result = set(&mut db, &[bs(b"key"), bs(b"val"), bs(b"ex"), bs(b"10")]);
         assert_eq!(result, ok());
-        assert!(db.get(b"key").unwrap().expires_at.is_some());
+        assert!(db.get(b"key").unwrap().has_expiry());
     }
 
     // --- MGET/MSET tests ---
@@ -1107,15 +1071,15 @@ mod tests {
     #[test]
     fn test_incr_preserves_ttl() {
         let mut db = make_db();
-        let exp = Instant::now() + Duration::from_secs(100);
+        let exp_ms = current_time_ms() + 100_000;
         db.set(
             Bytes::from_static(b"counter"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"5"), exp),
+            Entry::new_string_with_expiry(Bytes::from_static(b"5"), exp_ms),
         );
         let result = incr(&mut db, &[bs(b"counter")]);
         assert_eq!(result, Frame::Integer(6));
         let entry = db.get(b"counter").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
     }
 
     // --- INCRBYFLOAT tests ---
@@ -1198,14 +1162,14 @@ mod tests {
     #[test]
     fn test_append_preserves_ttl() {
         let mut db = make_db();
-        let exp = Instant::now() + Duration::from_secs(100);
+        let exp_ms = current_time_ms() + 100_000;
         db.set(
             Bytes::from_static(b"key"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp),
+            Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms),
         );
         append(&mut db, &[bs(b"key"), bs(b" world")]);
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
     }
 
     // --- STRLEN tests ---
@@ -1258,7 +1222,7 @@ mod tests {
         let result = setex(&mut db, &[bs(b"key"), bs(b"10"), bs(b"val")]);
         assert_eq!(result, ok());
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
         match &entry.value {
             RedisValue::String(v) => assert_eq!(v.as_ref(), b"val"),
             _ => panic!("unexpected type"),
@@ -1282,7 +1246,7 @@ mod tests {
         let result = psetex(&mut db, &[bs(b"key"), bs(b"10000"), bs(b"val")]);
         assert_eq!(result, ok());
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
     }
 
     #[test]
@@ -1320,14 +1284,14 @@ mod tests {
     #[test]
     fn test_getset_removes_ttl() {
         let mut db = make_db();
-        let exp = Instant::now() + Duration::from_secs(100);
+        let exp_ms = current_time_ms() + 100_000;
         db.set(
             Bytes::from_static(b"key"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"old"), exp),
+            Entry::new_string_with_expiry(Bytes::from_static(b"old"), exp_ms),
         );
         getset(&mut db, &[bs(b"key"), bs(b"new")]);
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_none());
+        assert!(!entry.has_expiry());
     }
 
     // --- GETDEL tests ---
@@ -1368,15 +1332,15 @@ mod tests {
     #[test]
     fn test_getex_persist() {
         let mut db = make_db();
-        let exp = Instant::now() + Duration::from_secs(100);
+        let exp_ms = current_time_ms() + 100_000;
         db.set(
             Bytes::from_static(b"key"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), exp),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), exp_ms),
         );
         let result = getex(&mut db, &[bs(b"key"), bs(b"PERSIST")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_none());
+        assert!(!entry.has_expiry());
     }
 
     #[test]
@@ -1386,6 +1350,6 @@ mod tests {
         let result = getex(&mut db, &[bs(b"key"), bs(b"EX"), bs(b"10")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
         let entry = db.get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
     }
 }

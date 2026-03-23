@@ -1,9 +1,8 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Instant;
 
-use super::entry::{current_secs, Entry, RedisValue};
+use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
 use crate::protocol::Frame;
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
@@ -21,6 +20,8 @@ pub struct Database {
     /// Cached current time in epoch seconds; set once per batch to avoid
     /// repeated `SystemTime::now()` syscalls on every command.
     cached_now: u32,
+    /// Cached current time in unix millis for expiry checks.
+    cached_now_ms: u64,
 }
 
 impl Database {
@@ -30,6 +31,7 @@ impl Database {
             data: HashMap::new(),
             used_memory: 0,
             cached_now: current_secs(),
+            cached_now_ms: current_time_ms(),
         }
     }
 
@@ -37,12 +39,19 @@ impl Database {
     #[inline]
     pub fn refresh_now(&mut self) {
         self.cached_now = current_secs();
+        self.cached_now_ms = current_time_ms();
     }
 
     /// Return the cached current time (epoch seconds).
     #[inline]
     pub fn now(&self) -> u32 {
         self.cached_now
+    }
+
+    /// Return the cached current time (unix millis).
+    #[inline]
+    pub fn now_ms(&self) -> u64 {
+        self.cached_now_ms
     }
 
     /// Estimated memory usage of all entries in this database.
@@ -56,17 +65,16 @@ impl Database {
     /// Optimized: single get_mut for expiry check + LRU touch, then re-borrow as immutable.
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
         let now = self.cached_now;
+        let now_ms = self.cached_now_ms;
         // Single mutable lookup: check expiry and touch access
         let entry = self.data.get_mut(key)?;
-        if let Some(expires_at) = entry.expires_at {
-            if Instant::now() >= expires_at {
-                // Key expired -- remove it
-                let removed = self.data.remove(key).unwrap();
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
-                return None;
-            }
+        if entry.is_expired_at(now_ms) {
+            // Key expired -- remove it
+            let removed = self.data.remove(key).unwrap();
+            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+            return None;
         }
-        entry.last_access = now;
+        entry.set_last_access(now);
         // Re-borrow as immutable (second lookup, unavoidable without unsafe)
         self.data.get(key)
     }
@@ -77,18 +85,17 @@ impl Database {
     /// Optimized: single get_mut for expiry check + LRU touch + return.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         let now = self.cached_now;
+        let now_ms = self.cached_now_ms;
         // Single mutable lookup
         let entry = self.data.get_mut(key)?;
-        if let Some(expires_at) = entry.expires_at {
-            if Instant::now() >= expires_at {
-                let removed = self.data.remove(key).unwrap();
-                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
-                return None;
-            }
+        if entry.is_expired_at(now_ms) {
+            let removed = self.data.remove(key).unwrap();
+            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+            return None;
         }
         // Re-fetch after potential borrow issues (entry ref was invalidated by remove path)
         let entry = self.data.get_mut(key)?;
-        entry.last_access = now;
+        entry.set_last_access(now);
         Some(entry)
     }
 
@@ -96,7 +103,8 @@ impl Database {
     pub fn set(&mut self, key: Bytes, mut entry: Entry) {
         // If key exists, carry forward version+1 and subtract old memory
         if let Some(old_entry) = self.data.get(&key) {
-            entry.version = old_entry.version + 1;
+            let new_version = old_entry.version() + 1;
+            entry.set_version(new_version);
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(&key, old_entry));
         }
         self.used_memory += entry_overhead(&key, &entry);
@@ -116,10 +124,11 @@ impl Database {
     /// Check if a key exists, performing lazy expiration.
     /// Optimized: single lookup via get instead of check_expired + contains_key.
     pub fn exists(&mut self, key: &[u8]) -> bool {
+        let now_ms = self.cached_now_ms;
         match self.data.get(key) {
             None => false,
             Some(entry) => {
-                if entry.expires_at.is_some_and(|exp| Instant::now() >= exp) {
+                if entry.is_expired_at(now_ms) {
                     let removed = self.data.remove(key).unwrap();
                     self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
                     false
@@ -143,9 +152,10 @@ impl Database {
     /// Set or remove expiration on an existing key.
     ///
     /// Performs lazy expiry check first. Returns `false` if the key does not
-    /// exist (or has already expired).
-    pub fn set_expiry(&mut self, key: &[u8], expires_at: Option<Instant>) -> bool {
-        if Self::check_expired(&self.data, key) {
+    /// exist (or has already expired). Pass 0 to remove expiry.
+    pub fn set_expiry(&mut self, key: &[u8], expires_at_ms: u64) -> bool {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -153,7 +163,7 @@ impl Database {
         }
         match self.data.get_mut(key) {
             Some(entry) => {
-                entry.expires_at = expires_at;
+                entry.expires_at_ms = expires_at_ms;
                 true
             }
             None => false,
@@ -162,14 +172,13 @@ impl Database {
 
     /// Count entries that have an expiration set.
     pub fn expires_count(&self) -> usize {
-        self.data.values().filter(|e| e.expires_at.is_some()).count()
+        self.data.values().filter(|e| e.has_expiry()).count()
     }
 
     /// Check if an entry is expired without requiring &mut self.
-    fn check_expired(data: &HashMap<Bytes, Entry>, key: &[u8]) -> bool {
+    fn check_expired(data: &HashMap<Bytes, Entry>, key: &[u8], now_ms: u64) -> bool {
         data.get(key)
-            .and_then(|e| e.expires_at)
-            .is_some_and(|exp| Instant::now() >= exp)
+            .is_some_and(|e| e.is_expired_at(now_ms))
     }
 
     /// Convenience: set a string value with no expiry.
@@ -177,16 +186,14 @@ impl Database {
         self.set(key, Entry::new_string(value));
     }
 
-    /// Convenience: set a string value with an expiry.
-    pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at: Instant) {
-        self.set(key, Entry::new_string_with_expiry(value, expires_at));
+    /// Convenience: set a string value with an expiry (unix millis).
+    pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at_ms: u64) {
+        self.set(key, Entry::new_string_with_expiry(value, expires_at_ms));
     }
 
     /// Check if a single entry is expired.
     fn is_expired(entry: &Entry) -> bool {
-        entry
-            .expires_at
-            .is_some_and(|exp| Instant::now() >= exp)
+        entry.is_expired_at(current_time_ms())
     }
 
     /// WRONGTYPE error frame.
@@ -198,13 +205,13 @@ impl Database {
 
     /// Get the version of a key. Returns 0 if not found. No expiry check (WATCH needs raw version).
     pub fn get_version(&self, key: &[u8]) -> u32 {
-        self.data.get(key).map(|e| e.version).unwrap_or(0)
+        self.data.get(key).map(|e| e.version()).unwrap_or(0)
     }
 
     /// Increment version of a key if it exists.
     pub fn increment_version(&mut self, key: &[u8]) {
         if let Some(entry) = self.data.get_mut(key) {
-            entry.version += 1;
+            entry.increment_version();
         }
     }
 
@@ -212,7 +219,7 @@ impl Database {
     pub fn touch_access(&mut self, key: &[u8]) {
         let now = self.cached_now;
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = now;
+            entry.set_last_access(now);
         }
     }
 
@@ -227,8 +234,9 @@ impl Database {
         &mut self,
         key: &[u8],
     ) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
+        let now_ms = self.cached_now_ms;
         // Expire check
-        if Self::check_expired(&self.data, key) {
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -247,7 +255,8 @@ impl Database {
 
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -266,7 +275,8 @@ impl Database {
         &mut self,
         key: &[u8],
     ) -> Result<&mut VecDeque<Bytes>, Frame> {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -285,7 +295,8 @@ impl Database {
 
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -304,7 +315,8 @@ impl Database {
         &mut self,
         key: &[u8],
     ) -> Result<&mut HashSet<Bytes>, Frame> {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -323,7 +335,8 @@ impl Database {
 
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -348,7 +361,8 @@ impl Database {
         ),
         Frame,
     > {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -376,7 +390,8 @@ impl Database {
         )>,
         Frame,
     > {
-        if Self::check_expired(&self.data, key) {
+        let now_ms = self.cached_now_ms;
+        if Self::check_expired(&self.data, key, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -394,17 +409,17 @@ impl Database {
     pub fn keys_with_expiry(&self) -> Vec<Bytes> {
         self.data
             .iter()
-            .filter(|(_, e)| e.expires_at.is_some())
+            .filter(|(_, e)| e.has_expiry())
             .map(|(k, _)| k.clone())
             .collect()
     }
 
     /// Check if a key exists and its expiry is in the past.
     pub fn is_key_expired(&self, key: &[u8]) -> bool {
+        let now_ms = current_time_ms();
         self.data
             .get(key)
-            .and_then(|e| e.expires_at)
-            .is_some_and(|exp| Instant::now() >= exp)
+            .is_some_and(|e| e.is_expired_at(now_ms))
     }
 
     /// Read-only access to the data map (for SCAN iteration).
@@ -423,7 +438,6 @@ impl Default for Database {
 mod tests {
     use super::*;
     use ordered_float::OrderedFloat;
-    use std::time::Duration;
 
     #[test]
     fn test_set_and_get() {
@@ -461,10 +475,10 @@ mod tests {
     fn test_lazy_expiry() {
         let mut db = Database::new();
         // Set key with an expiry in the past
-        let past = Instant::now() - Duration::from_secs(1);
+        let past_ms = current_time_ms() - 1000;
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
         // get should return None and remove the key
         assert!(db.get(b"expired").is_none());
@@ -474,10 +488,10 @@ mod tests {
     #[test]
     fn test_exists_with_expiry() {
         let mut db = Database::new();
-        let past = Instant::now() - Duration::from_secs(1);
+        let past_ms = current_time_ms() - 1000;
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
         assert!(!db.exists(b"expired"));
     }
@@ -489,10 +503,10 @@ mod tests {
             Bytes::from_static(b"k1"),
             Entry::new_string(Bytes::from_static(b"v1")),
         );
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future_ms = current_time_ms() + 3_600_000;
         db.set(
             Bytes::from_static(b"k2"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
         );
         assert_eq!(db.len(), 2);
         assert_eq!(db.expires_count(), 1);
@@ -500,12 +514,12 @@ mod tests {
 
     #[test]
     fn test_is_expired() {
-        let past = Instant::now() - Duration::from_secs(1);
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past);
+        let past_ms = current_time_ms() - 1000;
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms);
         assert!(Database::is_expired(&entry));
 
-        let future = Instant::now() + Duration::from_secs(3600);
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future);
+        let future_ms = current_time_ms() + 3_600_000;
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms);
         assert!(!Database::is_expired(&entry));
 
         let entry = Entry::new_string(Bytes::from_static(b"v"));
@@ -588,11 +602,11 @@ mod tests {
     fn test_keys_with_expiry() {
         let mut db = Database::new();
         db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future_ms = current_time_ms() + 3_600_000;
         db.set_string_with_expiry(
             Bytes::from_static(b"k2"),
             Bytes::from_static(b"v2"),
-            future,
+            future_ms,
         );
         let keys = db.keys_with_expiry();
         assert_eq!(keys.len(), 1);
@@ -602,10 +616,10 @@ mod tests {
     #[test]
     fn test_is_key_expired() {
         let mut db = Database::new();
-        let past = Instant::now() - Duration::from_secs(1);
+        let past_ms = current_time_ms() - 1000;
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
         );
         assert!(db.is_key_expired(b"expired"));
         assert!(!db.is_key_expired(b"missing"));

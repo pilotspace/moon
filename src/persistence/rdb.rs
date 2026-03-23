@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use bytes::Bytes;
@@ -11,7 +10,7 @@ use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
 use crate::storage::db::Database;
-use crate::storage::entry::{current_secs, Entry, RedisValue};
+use crate::storage::entry::{current_secs, current_time_ms, Entry, RedisValue};
 
 // Format constants
 const RDB_MAGIC: &[u8] = b"RUSTREDIS";
@@ -40,13 +39,15 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
     buf.write_all(RDB_MAGIC)?;
     buf.write_all(&[RDB_VERSION])?;
 
+    let now_ms = current_time_ms();
+
     // Databases
     for (db_idx, db) in databases.iter().enumerate() {
         let data = db.data();
         // Collect non-expired entries
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !is_expired(entry))
+            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -55,11 +56,8 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
         buf.write_all(&[DB_SELECTOR])?;
         buf.write_all(&[db_idx as u8])?;
 
-        let now_instant = Instant::now();
-        let now_system = SystemTime::now();
-
         for (key, entry) in live {
-            write_entry(&mut buf, key, entry, now_instant, now_system)?;
+            write_entry(&mut buf, key, entry)?;
         }
     }
 
@@ -90,12 +88,11 @@ pub fn save_from_snapshot(snapshot: &[Vec<(Bytes, Entry)>], path: &Path) -> anyh
     buf.write_all(RDB_MAGIC)?;
     buf.write_all(&[RDB_VERSION])?;
 
-    let now_instant = Instant::now();
-    let now_system = SystemTime::now();
+    let now_ms = current_time_ms();
 
     for (db_idx, entries) in snapshot.iter().enumerate() {
         // Filter expired and skip empty
-        let live: Vec<_> = entries.iter().filter(|(_, e)| !is_expired(e)).collect();
+        let live: Vec<_> = entries.iter().filter(|(_, e)| !e.is_expired_at(now_ms)).collect();
         if live.is_empty() {
             continue;
         }
@@ -104,7 +101,7 @@ pub fn save_from_snapshot(snapshot: &[Vec<(Bytes, Entry)>], path: &Path) -> anyh
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key, entry, now_instant, now_system)?;
+            write_entry(&mut buf, key, entry)?;
         }
     }
 
@@ -169,11 +166,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
         bail!("Unsupported RDB version: {}", version[0]);
     }
 
-    let now_instant = Instant::now();
-    let now_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now_ms = current_time_ms();
 
     let mut total_keys = 0usize;
     let mut current_db: usize = 0;
@@ -193,12 +186,10 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
                 }
             }
             type_tag => {
-                let (key, entry) = read_entry(&mut cursor, type_tag, now_instant, now_unix_ms)?;
+                let (key, entry) = read_entry(&mut cursor, type_tag)?;
                 // Skip entries whose TTL is already in the past
-                if let Some(exp) = entry.expires_at {
-                    if Instant::now() >= exp {
-                        continue;
-                    }
+                if entry.has_expiry() && entry.is_expired_at(now_ms) {
+                    continue;
                 }
                 if current_db < databases.len() {
                     databases[current_db].set(key, entry);
@@ -211,18 +202,10 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
     Ok(total_keys)
 }
 
-fn is_expired(entry: &Entry) -> bool {
-    entry
-        .expires_at
-        .is_some_and(|exp| Instant::now() >= exp)
-}
-
 fn write_entry(
     buf: &mut Vec<u8>,
     key: &Bytes,
     entry: &Entry,
-    now_instant: Instant,
-    now_system: SystemTime,
 ) -> anyhow::Result<()> {
     // Type tag
     let type_tag = match &entry.value {
@@ -237,22 +220,11 @@ fn write_entry(
     // Key
     write_bytes(buf, key)?;
 
-    // TTL as unix millis (0 = no expiry)
-    let ttl_ms: i64 = match entry.expires_at {
-        Some(exp) => {
-            if exp > now_instant {
-                let remaining = exp - now_instant;
-                let unix_ms = now_system
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64
-                    + remaining.as_millis() as i64;
-                unix_ms
-            } else {
-                0 // expired, will be skipped by caller but handle defensively
-            }
-        }
-        None => 0,
+    // TTL as unix millis (0 = no expiry) -- expires_at_ms IS already millis
+    let ttl_ms: i64 = if entry.has_expiry() {
+        entry.expires_at_ms as i64
+    } else {
+        0
     };
     buf.write_all(&ttl_ms.to_le_bytes())?;
 
@@ -295,8 +267,6 @@ fn write_entry(
 fn read_entry(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
-    now_instant: Instant,
-    now_unix_ms: i64,
 ) -> anyhow::Result<(Bytes, Entry)> {
     // Key
     let key = read_bytes(cursor)?;
@@ -306,16 +276,11 @@ fn read_entry(
     cursor.read_exact(&mut ttl_buf)?;
     let ttl_ms = i64::from_le_bytes(ttl_buf);
 
-    let expires_at = if ttl_ms > 0 {
-        let remaining_ms = ttl_ms - now_unix_ms;
-        if remaining_ms > 0 {
-            Some(now_instant + Duration::from_millis(remaining_ms as u64))
-        } else {
-            // Expired - we still parse, caller checks
-            Some(now_instant - Duration::from_millis(1))
-        }
+    // expires_at_ms: if ttl_ms > 0 it's already absolute unix millis
+    let expires_at_ms = if ttl_ms > 0 {
+        ttl_ms as u64
     } else {
-        None
+        0
     };
 
     // Value
@@ -369,11 +334,13 @@ fn read_entry(
 
     let entry = Entry {
         value,
-        expires_at,
-        version: 0,
-        last_access: current_secs(),
-        access_counter: 5,
+        expires_at_ms,
+        metadata: 0,
     };
+    // Set last_access and access_counter via methods
+    let mut entry = entry;
+    entry.set_last_access(current_secs());
+    entry.set_access_counter(5);
 
     Ok((key, entry))
 }
@@ -400,7 +367,6 @@ fn read_u32(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     /// Helper: create a temp path for RDB testing.
@@ -426,18 +392,18 @@ mod tests {
             RedisValue::String(v) => assert_eq!(v.as_ref(), b"world"),
             _ => panic!("Expected string"),
         }
-        assert!(entry.expires_at.is_none());
+        assert!(!entry.has_expiry());
     }
 
     #[test]
     fn test_round_trip_string_with_ttl() {
         let (_dir, path) = rdb_path();
         let mut dbs = vec![Database::new()];
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future_ms = current_time_ms() + 3_600_000;
         dbs[0].set_string_with_expiry(
             Bytes::from_static(b"key"),
             Bytes::from_static(b"val"),
-            future,
+            future_ms,
         );
 
         save(&dbs, &path).unwrap();
@@ -446,10 +412,11 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
+        assert!(entry.has_expiry());
         // TTL should be approximately 3600 seconds in the future (allow 5s tolerance)
-        let remaining = entry.expires_at.unwrap().duration_since(Instant::now());
-        assert!(remaining.as_secs() > 3590 && remaining.as_secs() <= 3600);
+        let now_ms = current_time_ms();
+        let remaining_secs = (entry.expires_at_ms - now_ms) / 1000;
+        assert!(remaining_secs > 3590 && remaining_secs <= 3600);
     }
 
     #[test]
@@ -571,11 +538,11 @@ mod tests {
         // String
         dbs[0].set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
         // String with TTL
-        let future = Instant::now() + Duration::from_secs(600);
+        let future_ms = current_time_ms() + 600_000;
         dbs[0].set_string_with_expiry(
             Bytes::from_static(b"str_ttl"),
             Bytes::from_static(b"expiring"),
-            future,
+            future_ms,
         );
         // Hash
         {
@@ -607,7 +574,7 @@ mod tests {
 
         // Verify each type
         assert!(matches!(loaded[0].get(b"str").unwrap().value, RedisValue::String(_)));
-        assert!(loaded[0].get(b"str_ttl").unwrap().expires_at.is_some());
+        assert!(loaded[0].get(b"str_ttl").unwrap().has_expiry());
         assert!(matches!(loaded[0].get(b"h").unwrap().value, RedisValue::Hash(_)));
         assert!(matches!(loaded[0].get(b"l").unwrap().value, RedisValue::List(_)));
         assert!(matches!(loaded[0].get(b"s").unwrap().value, RedisValue::Set(_)));
@@ -622,10 +589,10 @@ mod tests {
         // Live key
         dbs[0].set_string(Bytes::from_static(b"live"), Bytes::from_static(b"yes"));
         // Expired key
-        let past = Instant::now() - Duration::from_secs(1);
+        let past_ms = current_time_ms() - 1000;
         dbs[0].set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past),
+            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
         );
 
         save(&dbs, &path).unwrap();

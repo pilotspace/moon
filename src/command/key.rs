@@ -1,8 +1,7 @@
 use bytes::Bytes;
-use std::time::{Duration, Instant};
 
 use crate::protocol::Frame;
-use crate::storage::entry::RedisValue;
+use crate::storage::entry::{current_time_ms, RedisValue};
 use crate::storage::Database;
 
 /// Helper: build an ERR frame for wrong number of arguments.
@@ -94,8 +93,8 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
             b"ERR invalid expire time in 'EXPIRE' command",
         ));
     }
-    let expires_at = Instant::now() + Duration::from_secs(seconds as u64);
-    if db.set_expiry(key, Some(expires_at)) {
+    let expires_at_ms = current_time_ms() + (seconds as u64) * 1000;
+    if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
         Frame::Integer(0)
@@ -126,8 +125,8 @@ pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
             b"ERR invalid expire time in 'PEXPIRE' command",
         ));
     }
-    let expires_at = Instant::now() + Duration::from_millis(millis as u64);
-    if db.set_expiry(key, Some(expires_at)) {
+    let expires_at_ms = current_time_ms() + millis as u64;
+    if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
         Frame::Integer(0)
@@ -148,18 +147,19 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
     };
     match db.get(key) {
         None => Frame::Integer(-2),
-        Some(entry) => match entry.expires_at {
-            None => Frame::Integer(-1),
-            Some(exp) => {
-                let now = Instant::now();
-                if now >= exp {
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                let now_ms = current_time_ms();
+                if now_ms >= entry.expires_at_ms {
                     // Edge case: expired between get and now
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer((exp - now).as_secs() as i64)
+                    Frame::Integer(((entry.expires_at_ms - now_ms) / 1000) as i64)
                 }
             }
-        },
+        }
     }
 }
 
@@ -176,17 +176,18 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
     };
     match db.get(key) {
         None => Frame::Integer(-2),
-        Some(entry) => match entry.expires_at {
-            None => Frame::Integer(-1),
-            Some(exp) => {
-                let now = Instant::now();
-                if now >= exp {
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                let now_ms = current_time_ms();
+                if now_ms >= entry.expires_at_ms {
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer((exp - now).as_millis() as i64)
+                    Frame::Integer((entry.expires_at_ms - now_ms) as i64)
                 }
             }
-        },
+        }
     }
 }
 
@@ -206,13 +207,13 @@ pub fn persist(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get(key) {
         None => Frame::Integer(0),
         Some(entry) => {
-            if entry.expires_at.is_none() {
+            if !entry.has_expiry() {
                 return Frame::Integer(0);
             }
             // Key exists and has TTL -- remove it
             // We need to re-borrow mutably, so use set_expiry
             drop(entry);
-            db.set_expiry(key, None);
+            db.set_expiry(key, 0);
             Frame::Integer(1)
         }
     }
@@ -602,7 +603,7 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::Entry;
+    use crate::storage::entry::{current_time_ms, Entry};
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
@@ -617,11 +618,11 @@ mod tests {
         db
     }
 
-    fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at: Instant) -> Database {
+    fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at_ms: u64) -> Database {
         let mut db = Database::new();
         db.set(
             Bytes::copy_from_slice(key),
-            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at),
+            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
         );
         db
     }
@@ -752,7 +753,7 @@ mod tests {
         let mut db = setup_db_with_expiry(
             b"foo",
             b"bar",
-            Instant::now() + Duration::from_secs(3600),
+            current_time_ms() + 3_600_000,
         );
         // Verify TTL exists
         let t = ttl(&mut db, &[bs(b"foo")]);
@@ -882,10 +883,10 @@ mod tests {
             Bytes::from_static(b"alive"),
             Entry::new_string(Bytes::from_static(b"1")),
         );
-        let past = Instant::now() - Duration::from_secs(1);
+        let past_ms = current_time_ms() - 1000;
         db.set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past),
+            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms),
         );
         let result = keys(&mut db, &[bs(b"*")]);
         match result {
@@ -926,8 +927,8 @@ mod tests {
 
     #[test]
     fn test_rename_preserves_ttl() {
-        let future = Instant::now() + Duration::from_secs(3600);
-        let mut db = setup_db_with_expiry(b"old", b"value", future);
+        let future_ms = current_time_ms() + 3_600_000;
+        let mut db = setup_db_with_expiry(b"old", b"value", future_ms);
         rename(&mut db, &[bs(b"old"), bs(b"new")]);
         // TTL should be preserved on new key
         let t = ttl(&mut db, &[bs(b"new")]);

@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Instant;
+use parking_lot::Mutex;
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
@@ -15,7 +15,7 @@ use crate::command::{dispatch, DispatchResult};
 use crate::protocol::{Frame, ParseConfig};
 use crate::protocol::{parse, serialize};
 use crate::storage::db::Database;
-use crate::storage::entry::{Entry, RedisValue};
+use crate::storage::entry::{current_time_ms, Entry, RedisValue};
 
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -251,7 +251,7 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
 /// Produces commands for all 5 data types plus PEXPIRE for keys with TTL.
 pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
     let mut buf = BytesMut::new();
-    let now = Instant::now();
+    let now_ms = current_time_ms();
 
     for (db_idx, db) in databases.iter().enumerate() {
         let data = db.data();
@@ -270,7 +270,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
         for (key, entry) in data {
             // Skip expired entries
-            if entry.expires_at.is_some_and(|exp| now >= exp) {
+            if entry.is_expired_at(now_ms) {
                 continue;
             }
 
@@ -340,16 +340,14 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
             }
 
             // Generate PEXPIRE for keys with TTL
-            if let Some(exp) = entry.expires_at {
-                if exp > now {
-                    let remaining_ms = (exp - now).as_millis();
-                    let pexpire_frame = Frame::Array(vec![
-                        Frame::BulkString(Bytes::from_static(b"PEXPIRE")),
-                        Frame::BulkString(key.clone()),
-                        Frame::BulkString(Bytes::from(remaining_ms.to_string())),
-                    ]);
-                    serialize::serialize(&pexpire_frame, &mut buf);
-                }
+            if entry.has_expiry() && entry.expires_at_ms > now_ms {
+                let remaining_ms = entry.expires_at_ms - now_ms;
+                let pexpire_frame = Frame::Array(vec![
+                    Frame::BulkString(Bytes::from_static(b"PEXPIRE")),
+                    Frame::BulkString(key.clone()),
+                    Frame::BulkString(Bytes::from(remaining_ms.to_string())),
+                ]);
+                serialize::serialize(&pexpire_frame, &mut buf);
             }
         }
     }
@@ -399,7 +397,6 @@ pub async fn rewrite_aof(db: Arc<Mutex<Vec<Database>>>, aof_path: &Path) -> anyh
 mod tests {
     use super::*;
     use ordered_float::OrderedFloat;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     fn make_command(parts: &[&[u8]]) -> Frame {
@@ -552,9 +549,9 @@ mod tests {
         assert_eq!(count, 2);
 
         let entry = dbs[0].get(b"mykey").unwrap();
-        assert!(entry.expires_at.is_some());
-        let remaining = entry.expires_at.unwrap().duration_since(Instant::now());
-        assert!(remaining.as_secs() >= 50); // Allow some tolerance
+        assert!(entry.has_expiry());
+        let remaining_secs = (entry.expires_at_ms - current_time_ms()) / 1000;
+        assert!(remaining_secs >= 50); // Allow some tolerance
     }
 
     #[test]
@@ -669,11 +666,11 @@ mod tests {
     #[test]
     fn test_generate_rewrite_commands_with_ttl() {
         let mut dbs = vec![Database::new()];
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future_ms = current_time_ms() + 3_600_000;
         dbs[0].set_string_with_expiry(
             Bytes::from_static(b"key"),
             Bytes::from_static(b"val"),
-            future,
+            future_ms,
         );
 
         let commands = generate_rewrite_commands(&dbs);
@@ -688,9 +685,9 @@ mod tests {
         assert_eq!(count, 2); // SET + PEXPIRE
 
         let entry = loaded_dbs[0].get(b"key").unwrap();
-        assert!(entry.expires_at.is_some());
-        let remaining = entry.expires_at.unwrap().duration_since(Instant::now());
-        assert!(remaining.as_secs() > 3500);
+        assert!(entry.has_expiry());
+        let remaining_secs = (entry.expires_at_ms - current_time_ms()) / 1000;
+        assert!(remaining_secs > 3500);
     }
 
     #[test]

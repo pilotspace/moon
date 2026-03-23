@@ -72,24 +72,24 @@ fn expire_cycle(db: &mut Database) {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use crate::storage::Entry;
+    use crate::storage::entry::{current_time_ms, Entry};
 
     #[test]
     fn test_expire_cycle_removes_expired_keys() {
         let mut db = Database::new();
-        let past = Instant::now() - Duration::from_secs(1);
+        let past_ms = current_time_ms() - 1000;
 
         // Add 10 expired keys
         for i in 0..10 {
             let key = Bytes::from(format!("expired_{}", i));
-            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), past));
+            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms));
         }
 
         // Add 5 non-expired keys
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future_ms = current_time_ms() + 3_600_000;
         for i in 0..5 {
             let key = Bytes::from(format!("alive_{}", i));
-            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), future));
+            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms));
         }
 
         // Add 3 keys without expiry
