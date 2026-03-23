@@ -1,8 +1,205 @@
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 use super::frame::Frame;
 
 /// Serialize a Frame into RESP2 wire format, appending to the buffer.
-pub fn serialize(_frame: &Frame, _buf: &mut BytesMut) {
-    todo!()
+pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
+    match frame {
+        Frame::SimpleString(s) => {
+            buf.put_u8(b'+');
+            buf.put_slice(s);
+            buf.put_slice(b"\r\n");
+        }
+        Frame::Error(s) => {
+            buf.put_u8(b'-');
+            buf.put_slice(s);
+            buf.put_slice(b"\r\n");
+        }
+        Frame::Integer(n) => {
+            buf.put_u8(b':');
+            let s = n.to_string();
+            buf.put_slice(s.as_bytes());
+            buf.put_slice(b"\r\n");
+        }
+        Frame::BulkString(data) => {
+            buf.put_u8(b'$');
+            let len = data.len().to_string();
+            buf.put_slice(len.as_bytes());
+            buf.put_slice(b"\r\n");
+            buf.put_slice(data);
+            buf.put_slice(b"\r\n");
+        }
+        Frame::Array(items) => {
+            buf.put_u8(b'*');
+            let len = items.len().to_string();
+            buf.put_slice(len.as_bytes());
+            buf.put_slice(b"\r\n");
+            for item in items {
+                serialize(item, buf);
+            }
+        }
+        Frame::Null => {
+            buf.put_slice(b"$-1\r\n");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    use super::super::frame::ParseConfig;
+    use super::super::parse;
+
+    fn serialize_frame(frame: &Frame) -> BytesMut {
+        let mut buf = BytesMut::new();
+        serialize(frame, &mut buf);
+        buf
+    }
+
+    // === Direct serialization tests ===
+
+    #[test]
+    fn test_serialize_simple_string() {
+        let buf = serialize_frame(&Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(&buf[..], b"+OK\r\n");
+    }
+
+    #[test]
+    fn test_serialize_error() {
+        let buf = serialize_frame(&Frame::Error(Bytes::from_static(b"ERR bad")));
+        assert_eq!(&buf[..], b"-ERR bad\r\n");
+    }
+
+    #[test]
+    fn test_serialize_integer_positive() {
+        let buf = serialize_frame(&Frame::Integer(42));
+        assert_eq!(&buf[..], b":42\r\n");
+    }
+
+    #[test]
+    fn test_serialize_integer_negative() {
+        let buf = serialize_frame(&Frame::Integer(-1));
+        assert_eq!(&buf[..], b":-1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_integer_zero() {
+        let buf = serialize_frame(&Frame::Integer(0));
+        assert_eq!(&buf[..], b":0\r\n");
+    }
+
+    #[test]
+    fn test_serialize_bulk_string() {
+        let buf = serialize_frame(&Frame::BulkString(Bytes::from_static(b"hello")));
+        assert_eq!(&buf[..], b"$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_serialize_empty_bulk_string() {
+        let buf = serialize_frame(&Frame::BulkString(Bytes::new()));
+        assert_eq!(&buf[..], b"$0\r\n\r\n");
+    }
+
+    #[test]
+    fn test_serialize_null() {
+        let buf = serialize_frame(&Frame::Null);
+        assert_eq!(&buf[..], b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_empty_array() {
+        let buf = serialize_frame(&Frame::Array(vec![]));
+        assert_eq!(&buf[..], b"*0\r\n");
+    }
+
+    #[test]
+    fn test_serialize_array_of_bulk_strings() {
+        let frame = Frame::Array(vec![
+            Frame::BulkString(Bytes::from_static(b"foo")),
+            Frame::BulkString(Bytes::from_static(b"bar")),
+        ]);
+        let buf = serialize_frame(&frame);
+        assert_eq!(&buf[..], b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    }
+
+    #[test]
+    fn test_serialize_nested_array() {
+        let frame = Frame::Array(vec![Frame::Array(vec![Frame::Integer(1)])]);
+        let buf = serialize_frame(&frame);
+        assert_eq!(&buf[..], b"*1\r\n*1\r\n:1\r\n");
+    }
+
+    // === Round-trip tests ===
+
+    fn round_trip(frame: &Frame) {
+        let mut buf = BytesMut::new();
+        serialize(frame, &mut buf);
+        let parsed = parse::parse(&mut buf, &ParseConfig::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(&parsed, frame);
+    }
+
+    #[test]
+    fn test_round_trip_simple_string() {
+        round_trip(&Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_round_trip_error() {
+        round_trip(&Frame::Error(Bytes::from_static(b"ERR something went wrong")));
+    }
+
+    #[test]
+    fn test_round_trip_integer() {
+        round_trip(&Frame::Integer(42));
+        round_trip(&Frame::Integer(-100));
+        round_trip(&Frame::Integer(0));
+        round_trip(&Frame::Integer(i64::MAX));
+        round_trip(&Frame::Integer(i64::MIN));
+    }
+
+    #[test]
+    fn test_round_trip_bulk_string() {
+        round_trip(&Frame::BulkString(Bytes::from_static(b"hello world")));
+        round_trip(&Frame::BulkString(Bytes::new())); // empty
+        round_trip(&Frame::BulkString(Bytes::from_static(b"\r\n\r\n"))); // binary data
+    }
+
+    #[test]
+    fn test_round_trip_null() {
+        round_trip(&Frame::Null);
+    }
+
+    #[test]
+    fn test_round_trip_array() {
+        round_trip(&Frame::Array(vec![])); // empty
+        round_trip(&Frame::Array(vec![
+            Frame::BulkString(Bytes::from_static(b"SET")),
+            Frame::BulkString(Bytes::from_static(b"key")),
+            Frame::BulkString(Bytes::from_static(b"value")),
+        ]));
+    }
+
+    #[test]
+    fn test_round_trip_nested_array() {
+        round_trip(&Frame::Array(vec![
+            Frame::Array(vec![Frame::Integer(1), Frame::Integer(2)]),
+            Frame::Array(vec![Frame::Integer(3), Frame::Integer(4)]),
+        ]));
+    }
+
+    #[test]
+    fn test_round_trip_mixed_array_with_null() {
+        round_trip(&Frame::Array(vec![
+            Frame::BulkString(Bytes::from_static(b"hello")),
+            Frame::Null,
+            Frame::Integer(42),
+            Frame::SimpleString(Bytes::from_static(b"OK")),
+            Frame::Error(Bytes::from_static(b"ERR")),
+            Frame::Array(vec![Frame::Null, Frame::Integer(-1)]),
+        ]));
+    }
 }
