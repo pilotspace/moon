@@ -12,7 +12,44 @@ use super::frame::{Frame, ParseError};
 /// `Ok(None)` if the buffer doesn't contain a complete line (no `\r\n` found),
 /// or `Ok(None)` for empty/whitespace-only lines (after advancing past the CRLF).
 pub fn parse_inline(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    todo!("implement inline parser")
+    // Find the CRLF terminator
+    let crlf_pos = match find_crlf_position(&buf[..]) {
+        Some(pos) => pos,
+        None => return Ok(None), // Incomplete -- need more data
+    };
+
+    // Extract line content before CRLF
+    let line = &buf[..crlf_pos];
+
+    // Split by whitespace (spaces and tabs), filtering empty slices
+    let args: Vec<Frame> = line
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|s| !s.is_empty())
+        .map(|token| Frame::BulkString(Bytes::copy_from_slice(token)))
+        .collect();
+
+    // Advance buffer past line + CRLF
+    buf.advance(crlf_pos + 2);
+
+    // Empty/whitespace-only lines produce no frame
+    if args.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(Frame::Array(args)))
+}
+
+/// Search for a `\r\n` pair in the buffer, returning the position of `\r`.
+fn find_crlf_position(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 {
+        return None;
+    }
+    for i in 0..buf.len() - 1 {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

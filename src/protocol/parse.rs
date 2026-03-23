@@ -3,6 +3,7 @@ use std::io::Cursor;
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::frame::{Frame, ParseConfig, ParseError};
+use super::inline;
 
 /// Attempt to parse one RESP2 frame from the buffer.
 ///
@@ -14,6 +15,16 @@ use super::frame::{Frame, ParseConfig, ParseError};
 /// Returns `Ok(None)` if the buffer doesn't contain a complete frame (need more data).
 /// Returns `Err` if the data violates the RESP2 protocol specification.
 pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, ParseError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+
+    // Dispatch: RESP-prefixed bytes go to RESP parser, everything else is inline
+    match buf[0] {
+        b'+' | b'-' | b':' | b'$' | b'*' => { /* fall through to RESP parsing below */ }
+        _ => return inline::parse_inline(buf),
+    }
+
     // Pass 1: Check if a complete frame exists (peek only, no buffer modification)
     let mut cursor = Cursor::new(&buf[..]);
     match check(&mut cursor, config, 0) {
@@ -423,12 +434,13 @@ mod tests {
     // === Invalid data tests ===
 
     #[test]
-    fn test_parse_invalid_type_byte() {
-        let result = parse_bytes(b"!foo\r\n");
-        match result {
-            Err(ParseError::Invalid { offset, .. }) => assert_eq!(offset, 0),
-            other => panic!("expected Invalid error, got: {:?}", other),
-        }
+    fn test_parse_non_resp_prefix_routes_to_inline() {
+        // Non-RESP prefix bytes (like '!') are now routed to the inline parser
+        let result = parse_bytes(b"!foo\r\n").unwrap().unwrap();
+        assert_eq!(
+            result,
+            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"!foo"))])
+        );
     }
 
     #[test]
@@ -482,5 +494,31 @@ mod tests {
         assert_eq!(frame2, Frame::Integer(42));
 
         assert!(buf.is_empty());
+    }
+
+    // === Inline dispatch integration tests ===
+
+    #[test]
+    fn test_parse_inline_ping_via_dispatch() {
+        let result = parse_bytes(b"PING\r\n").unwrap().unwrap();
+        assert_eq!(
+            result,
+            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+        );
+    }
+
+    #[test]
+    fn test_parse_resp_simple_string_not_inline() {
+        let result = parse_bytes(b"+OK\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_parse_resp_array_not_inline() {
+        let result = parse_bytes(b"*1\r\n$4\r\nPING\r\n").unwrap().unwrap();
+        assert_eq!(
+            result,
+            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+        );
     }
 }
