@@ -19,6 +19,30 @@ pub struct ServerConfig {
     /// Require clients to authenticate with this password
     #[arg(long)]
     pub requirepass: Option<String>,
+
+    /// Enable append-only file persistence (yes/no)
+    #[arg(long, default_value = "no")]
+    pub appendonly: String,
+
+    /// AOF fsync policy (always/everysec/no)
+    #[arg(long, default_value = "everysec")]
+    pub appendfsync: String,
+
+    /// RDB auto-save rules (e.g., "3600 1 300 100")
+    #[arg(long)]
+    pub save: Option<String>,
+
+    /// Directory for persistence files
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+
+    /// RDB snapshot filename
+    #[arg(long, default_value = "dump.rdb")]
+    pub dbfilename: String,
+
+    /// AOF filename
+    #[arg(long, default_value = "appendonly.aof")]
+    pub appendfilename: String,
 }
 
 #[cfg(test)]
@@ -58,5 +82,35 @@ mod tests {
     fn test_requirepass_default_none() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
         assert_eq!(config.requirepass, None);
+    }
+
+    #[test]
+    fn test_persistence_defaults() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.appendonly, "no");
+        assert_eq!(config.appendfsync, "everysec");
+        assert_eq!(config.save, None);
+        assert_eq!(config.dir, ".");
+        assert_eq!(config.dbfilename, "dump.rdb");
+        assert_eq!(config.appendfilename, "appendonly.aof");
+    }
+
+    #[test]
+    fn test_persistence_custom_values() {
+        let config = ServerConfig::parse_from([
+            "rust-redis",
+            "--dir", "/data",
+            "--dbfilename", "my.rdb",
+            "--appendonly", "yes",
+            "--appendfsync", "always",
+            "--save", "3600 1 300 100",
+            "--appendfilename", "my.aof",
+        ]);
+        assert_eq!(config.dir, "/data");
+        assert_eq!(config.dbfilename, "my.rdb");
+        assert_eq!(config.appendonly, "yes");
+        assert_eq!(config.appendfsync, "always");
+        assert_eq!(config.save, Some("3600 1 300 100".to_string()));
+        assert_eq!(config.appendfilename, "my.aof");
     }
 }

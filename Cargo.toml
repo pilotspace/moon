@@ -16,10 +16,12 @@ anyhow = "1"
 futures = "0.3"
 ordered-float = "5"
 rand = "0.9"
+crc32fast = "1"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 redis = { version = "0.27", features = ["tokio-comp"] }
+tempfile = "3"
 
 [[bench]]
 name = "resp_parsing"
