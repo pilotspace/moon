@@ -2010,3 +2010,330 @@ async fn test_watch_abort() {
 
     shutdown.cancel();
 }
+
+// ===== Phase 5: CONFIG and Eviction Integration Tests =====
+
+/// Start a server with specific maxmemory and eviction policy settings.
+async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, CancellationToken) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let token = CancellationToken::new();
+    let server_token = token.clone();
+
+    let config = ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        databases: 16,
+        requirepass: None,
+        appendonly: "no".to_string(),
+        appendfsync: "everysec".to_string(),
+        save: None,
+        dir: ".".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
+        maxmemory,
+        maxmemory_policy: policy.to_string(),
+        maxmemory_samples: 5,
+    };
+
+    tokio::spawn(async move {
+        listener::run_with_shutdown(config, server_token)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    (port, token)
+}
+
+#[tokio::test]
+async fn test_config_get_maxmemory() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // CONFIG GET maxmemory -- default is 0
+    let result: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("maxmemory")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, vec!["maxmemory".to_string(), "0".to_string()]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_config_set_maxmemory() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // CONFIG SET maxmemory 1048576 (1MB)
+    let ok: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory")
+        .arg("1048576")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ok, "OK");
+
+    // CONFIG GET maxmemory -- should now be 1048576
+    let result: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("maxmemory")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, vec!["maxmemory".to_string(), "1048576".to_string()]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_config_get_glob_pattern() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // CONFIG GET "maxmemory*" -- should match maxmemory, maxmemory-policy, maxmemory-samples
+    let result: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("maxmemory*")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    // Should have 3 param-value pairs = 6 elements
+    assert_eq!(result.len(), 6, "Expected 3 maxmemory params, got: {:?}", result);
+    // Verify all expected param names are present
+    assert!(result.contains(&"maxmemory".to_string()));
+    assert!(result.contains(&"maxmemory-policy".to_string()));
+    assert!(result.contains(&"maxmemory-samples".to_string()));
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_config_set_maxmemory_policy() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // CONFIG SET maxmemory-policy allkeys-lru
+    let ok: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg("allkeys-lru")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ok, "OK");
+
+    // CONFIG GET maxmemory-policy
+    let result: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("maxmemory-policy")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, vec!["maxmemory-policy".to_string(), "allkeys-lru".to_string()]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_eviction_noeviction_rejects_writes() {
+    // Start server with very small maxmemory and noeviction policy.
+    // Eviction check happens BEFORE each write, so we need the memory to already
+    // exceed maxmemory before the rejected write is attempted.
+    // Entry overhead = key.len() + value.len() + 128
+    // Use maxmemory=400, write two entries to push over, then the third should fail.
+    let (port, shutdown) = start_server_with_maxmemory(400, "noeviction").await;
+    let mut conn = connect(port).await;
+
+    // First SET: overhead = 4 + 100 + 128 = 232 bytes (under 400)
+    let val = "x".repeat(100);
+    let result: Result<(), redis::RedisError> = redis::cmd("SET")
+        .arg("key1")
+        .arg(&val)
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_ok(), "First SET should succeed (232 < 400)");
+
+    // Second SET: overhead = 4 + 100 + 128 = 232 bytes, total = 464 (over 400)
+    // But eviction check runs BEFORE this write, when memory is 232 (under 400),
+    // so this SET will still succeed, pushing memory to 464
+    let val2 = "x".repeat(100);
+    let result: Result<(), redis::RedisError> = redis::cmd("SET")
+        .arg("key2")
+        .arg(&val2)
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_ok(), "Second SET should succeed (pre-check sees 232 < 400)");
+
+    // Third SET: eviction check runs BEFORE this write, memory is 464 > 400,
+    // noeviction policy means OOM error
+    let result: Result<(), redis::RedisError> = redis::cmd("SET")
+        .arg("key3")
+        .arg("val")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_err(), "Third SET should fail with OOM when memory (464) > maxmemory (400)");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("OOM"),
+        "Error should contain OOM, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_eviction_allkeys_lru() {
+    // Use a generous initial maxmemory so we can insert keys, then lower it via CONFIG SET
+    // to trigger eviction on the next write. This avoids the pre-check timing issue.
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // Set allkeys-lru policy
+    let _: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg("allkeys-lru")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Set several keys with moderate values
+    // Each entry ~= key_len + 200 + 128 overhead
+    let val = "x".repeat(200);
+    for i in 0..5 {
+        let key = format!("lrukey{}", i);
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg(&val)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Verify all 5 keys exist
+    let mut before_count = 0i64;
+    for i in 0..5 {
+        let key = format!("lrukey{}", i);
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        before_count += exists;
+    }
+    assert_eq!(before_count, 5, "All 5 keys should exist before eviction");
+
+    // Now lower maxmemory to a small value to force eviction on next write
+    // 5 entries * ~335 bytes each = ~1675 bytes total. Set limit to 500.
+    let _: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory")
+        .arg("500")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // This write triggers eviction check: memory (~1675) > maxmemory (500)
+    let result: Result<(), redis::RedisError> = redis::cmd("SET")
+        .arg("lru_trigger")
+        .arg("val")
+        .query_async(&mut conn)
+        .await;
+    assert!(result.is_ok(), "SET should succeed with allkeys-lru (eviction frees space)");
+
+    // Count how many of the original keys survived
+    let mut after_count = 0i64;
+    for i in 0..5 {
+        let key = format!("lrukey{}", i);
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        after_count += exists;
+    }
+
+    // At least one key should have been evicted
+    assert!(
+        after_count < before_count,
+        "Some keys should have been evicted by LRU: before={}, after={}",
+        before_count,
+        after_count
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_eviction_config_set_triggers_eviction() {
+    // Start server with no maxmemory limit
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // Fill up some data
+    let val = "x".repeat(200);
+    for i in 0..10 {
+        let key = format!("evictkey{}", i);
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg(&val)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // CONFIG SET maxmemory-policy to allkeys-lru
+    let _: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg("allkeys-lru")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // CONFIG SET maxmemory to a small value (triggers eviction on next write)
+    let _: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory")
+        .arg("500")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Do one more write to trigger eviction check
+    let _: () = redis::cmd("SET")
+        .arg("trigger")
+        .arg("val")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Count surviving keys
+    let mut surviving = 0i64;
+    for i in 0..10 {
+        let key = format!("evictkey{}", i);
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        surviving += exists;
+    }
+
+    assert!(
+        surviving < 10,
+        "Some keys should have been evicted after CONFIG SET maxmemory, surviving: {}",
+        surviving
+    );
+
+    shutdown.cancel();
+}
