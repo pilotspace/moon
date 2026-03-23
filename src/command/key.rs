@@ -243,7 +243,7 @@ pub fn type_cmd(db: &mut Database, args: &[Frame]) -> Frame {
 ///
 /// Supports: `*` (any sequence), `?` (one byte), `[abc]` (character class),
 /// `[^abc]`/`[!abc]` (negated class), `[a-z]` (range), `\x` (escape).
-fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
+pub(crate) fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
     let mut pi = 0; // pattern index
     let mut si = 0; // string index
     let mut star_pi = usize::MAX;
