@@ -13,13 +13,6 @@ use super::connection;
 /// Binds to the configured address, spawns a task per connection, and shuts down
 /// gracefully on Ctrl+C (SIGINT).
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
-    let addr = format!("{}:{}", config.bind, config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Listening on {}", addr);
-
-    let databases: Vec<Database> = (0..config.databases).map(|_| Database::new()).collect();
-    let db = Arc::new(Mutex::new(databases));
-
     let token = CancellationToken::new();
     let shutdown_token = token.clone();
 
@@ -28,6 +21,25 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         info!("Shutdown signal received");
         shutdown_token.cancel();
     });
+
+    run_with_shutdown(config, token).await
+}
+
+/// Run the TCP server accept loop with an externally-provided shutdown token.
+///
+/// This is the core server loop, factored out from `run()` for testability.
+/// Tests can create their own `CancellationToken` and cancel it to shut down
+/// the server cleanly.
+pub async fn run_with_shutdown(
+    config: ServerConfig,
+    token: CancellationToken,
+) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", config.bind, config.port);
+    let listener = TcpListener::bind(&addr).await?;
+    info!("Listening on {}", addr);
+
+    let databases: Vec<Database> = (0..config.databases).map(|_| Database::new()).collect();
+    let db = Arc::new(Mutex::new(databases));
 
     loop {
         tokio::select! {
