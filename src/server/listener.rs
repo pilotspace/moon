@@ -1,14 +1,15 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::config::ServerConfig;
+use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
 use crate::persistence::rdb;
+use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
 
 use super::connection;
@@ -109,6 +110,12 @@ pub async fn run_with_shutdown(
     let exp_token = token.child_token();
     tokio::spawn(expiration::run_active_expiration(exp_db, exp_token));
 
+    // Create shared Pub/Sub registry
+    let pubsub_registry = Arc::new(Mutex::new(PubSubRegistry::new()));
+
+    // Create shared runtime config (mutable via CONFIG SET)
+    let runtime_config = Arc::new(RwLock::new(config.to_runtime_config()));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -121,9 +128,11 @@ pub async fn run_with_shutdown(
                         let config = config.clone();
                         let aof_tx = aof_tx.clone();
                         let change_counter = Some(change_counter.clone());
+                        let pubsub = pubsub_registry.clone();
+                        let rt_config = runtime_config.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
-                            aof_tx, change_counter,
+                            aof_tx, change_counter, pubsub, rt_config,
                         ));
                     }
                     Err(e) => {

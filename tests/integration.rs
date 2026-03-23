@@ -31,6 +31,9 @@ async fn start_server() -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
+        maxmemory: 0,
+        maxmemory_policy: "noeviction".to_string(),
+        maxmemory_samples: 5,
     };
 
     tokio::spawn(async move {
@@ -65,6 +68,9 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
+        maxmemory: 0,
+        maxmemory_policy: "noeviction".to_string(),
+        maxmemory_samples: 5,
     };
 
     tokio::spawn(async move {
@@ -1175,6 +1181,9 @@ async fn start_server_with_persistence(
         dir: dir.to_string_lossy().to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
+        maxmemory: 0,
+        maxmemory_policy: "noeviction".to_string(),
+        maxmemory_samples: 5,
     };
 
     tokio::spawn(async move {
