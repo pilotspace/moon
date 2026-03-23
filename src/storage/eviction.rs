@@ -277,7 +277,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::Entry;
+    use crate::storage::entry::{current_secs, Entry};
     use std::time::{Duration, Instant};
 
     fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
@@ -346,15 +346,15 @@ mod tests {
         let mut db = Database::new();
         // Create entries with different last_access times
         let mut entry1 = Entry::new_string(Bytes::from_static(b"val1"));
-        entry1.last_access = Instant::now() - Duration::from_secs(100); // oldest
+        entry1.last_access = current_secs() - 100; // oldest
         db.set(Bytes::from_static(b"old"), entry1);
 
         let mut entry2 = Entry::new_string(Bytes::from_static(b"val2"));
-        entry2.last_access = Instant::now() - Duration::from_secs(50);
+        entry2.last_access = current_secs() - 50;
         db.set(Bytes::from_static(b"medium"), entry2);
 
         let mut entry3 = Entry::new_string(Bytes::from_static(b"val3"));
-        entry3.last_access = Instant::now(); // newest
+        entry3.last_access = current_secs(); // newest
         db.set(Bytes::from_static(b"new"), entry3);
 
         // Set maxmemory to allow only 2 entries (roughly)

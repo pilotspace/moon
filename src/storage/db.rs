@@ -3,7 +3,7 @@ use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use super::entry::{Entry, RedisValue};
+use super::entry::{current_secs, Entry, RedisValue};
 use crate::protocol::Frame;
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
@@ -46,7 +46,7 @@ impl Database {
         }
         // Touch access for LRU tracking
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = Instant::now();
+            entry.last_access = current_secs();
         }
         self.data.get(key)
     }
@@ -62,7 +62,7 @@ impl Database {
             return None;
         }
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = Instant::now();
+            entry.last_access = current_secs();
         }
         self.data.get_mut(key)
     }
@@ -166,7 +166,7 @@ impl Database {
     }
 
     /// Get the version of a key. Returns 0 if not found. No expiry check (WATCH needs raw version).
-    pub fn get_version(&self, key: &[u8]) -> u64 {
+    pub fn get_version(&self, key: &[u8]) -> u32 {
         self.data.get(key).map(|e| e.version).unwrap_or(0)
     }
 
@@ -180,7 +180,7 @@ impl Database {
     /// Touch access time of a key for LRU tracking (for reads).
     pub fn touch_access(&mut self, key: &[u8]) {
         if let Some(entry) = self.data.get_mut(key) {
-            entry.last_access = Instant::now();
+            entry.last_access = current_secs();
         }
     }
 

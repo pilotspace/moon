@@ -2,7 +2,17 @@ use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Return the current time as seconds since the Unix epoch, truncated to u32.
+/// Wraps around in the year 2106 -- acceptable for LRU/LFU relative comparisons.
+#[inline]
+pub fn current_secs() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
+}
 
 /// The type of value stored in a Redis key.
 #[derive(Debug, Clone)]
@@ -72,11 +82,13 @@ pub fn lfu_log_incr(counter: u8, lfu_log_factor: u8) -> u8 {
 }
 
 /// Time-based decay for LFU counter.
-pub fn lfu_decay(counter: u8, last_access: Instant, lfu_decay_time: u64) -> u8 {
+pub fn lfu_decay(counter: u8, last_access: u32, lfu_decay_time: u64) -> u8 {
     if lfu_decay_time == 0 {
         return counter;
     }
-    let elapsed_min = last_access.elapsed().as_secs() / 60;
+    let now = current_secs();
+    let elapsed_secs = now.wrapping_sub(last_access) as u64;
+    let elapsed_min = elapsed_secs / 60;
     let decay = (elapsed_min / lfu_decay_time) as u8;
     counter.saturating_sub(decay)
 }
@@ -86,11 +98,10 @@ pub fn lfu_decay(counter: u8, last_access: Instant, lfu_decay_time: u64) -> u8 {
 pub struct Entry {
     pub value: RedisValue,
     pub expires_at: Option<Instant>,
-    pub created_at: Instant,
     /// Monotonically increasing version for WATCH support.
-    pub version: u64,
-    /// Last access time for LRU eviction.
-    pub last_access: Instant,
+    pub version: u32,
+    /// Last access time for LRU eviction (unix seconds, u32).
+    pub last_access: u32,
     /// LFU access counter (Morris counter, initialized to LFU_INIT_VAL).
     pub access_counter: u8,
 }
@@ -98,93 +109,81 @@ pub struct Entry {
 impl Entry {
     /// Create a new string entry with no expiration.
     pub fn new_string(value: Bytes) -> Entry {
-        let now = Instant::now();
         Entry {
             value: RedisValue::String(value),
             expires_at: None,
-            created_at: now,
             version: 0,
-            last_access: now,
+            last_access: current_secs(),
             access_counter: LFU_INIT_VAL,
         }
     }
 
     /// Create a new string entry with an expiration time.
     pub fn new_string_with_expiry(value: Bytes, expires_at: Instant) -> Entry {
-        let now = Instant::now();
         Entry {
             value: RedisValue::String(value),
             expires_at: Some(expires_at),
-            created_at: now,
             version: 0,
-            last_access: now,
+            last_access: current_secs(),
             access_counter: LFU_INIT_VAL,
         }
     }
 
     /// Create a new hash entry with an empty HashMap.
     pub fn new_hash() -> Entry {
-        let now = Instant::now();
         Entry {
             value: RedisValue::Hash(HashMap::new()),
             expires_at: None,
-            created_at: now,
             version: 0,
-            last_access: now,
+            last_access: current_secs(),
             access_counter: LFU_INIT_VAL,
         }
     }
 
     /// Create a new list entry with an empty VecDeque.
     pub fn new_list() -> Entry {
-        let now = Instant::now();
         Entry {
             value: RedisValue::List(VecDeque::new()),
             expires_at: None,
-            created_at: now,
             version: 0,
-            last_access: now,
+            last_access: current_secs(),
             access_counter: LFU_INIT_VAL,
         }
     }
 
     /// Create a new set entry with an empty HashSet.
     pub fn new_set() -> Entry {
-        let now = Instant::now();
         Entry {
             value: RedisValue::Set(HashSet::new()),
             expires_at: None,
-            created_at: now,
             version: 0,
-            last_access: now,
+            last_access: current_secs(),
             access_counter: LFU_INIT_VAL,
         }
     }
 
     /// Create a new sorted set entry with empty members and scores.
     pub fn new_sorted_set() -> Entry {
-        let now = Instant::now();
         Entry {
             value: RedisValue::SortedSet {
                 members: HashMap::new(),
                 scores: BTreeMap::new(),
             },
             expires_at: None,
-            created_at: now,
             version: 0,
-            last_access: now,
+            last_access: current_secs(),
             access_counter: LFU_INIT_VAL,
         }
     }
 
     /// Update last_access for LRU tracking.
     pub fn touch_lru(&mut self) {
-        self.last_access = Instant::now();
+        self.last_access = current_secs();
     }
 
     /// Update last_access and probabilistically increment LFU counter.
     pub fn touch_lfu(&mut self, lfu_log_factor: u8) {
-        self.last_access = Instant::now();
+        self.last_access = current_secs();
         self.access_counter = lfu_log_incr(self.access_counter, lfu_log_factor);
     }
 }
@@ -285,21 +284,20 @@ mod tests {
 
     #[test]
     fn test_lfu_decay_zero_time() {
-        assert_eq!(lfu_decay(100, Instant::now(), 0), 100);
+        assert_eq!(lfu_decay(100, current_secs(), 0), 100);
     }
 
     #[test]
     fn test_lfu_decay_recent() {
         // Just accessed, no decay expected
-        assert_eq!(lfu_decay(100, Instant::now(), 1), 100);
+        assert_eq!(lfu_decay(100, current_secs(), 1), 100);
     }
 
     #[test]
     fn test_touch_lru() {
         let mut entry = Entry::new_string(Bytes::from_static(b"test"));
         let before = entry.last_access;
-        std::thread::sleep(std::time::Duration::from_millis(1));
         entry.touch_lru();
-        assert!(entry.last_access > before);
+        assert!(entry.last_access >= before);
     }
 }
