@@ -71,6 +71,7 @@ impl Shard {
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
         aof_tx: Option<mpsc::Sender<crate::persistence::aof::AofMessage>>,
+        bind_addr: Option<String>,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -94,13 +95,38 @@ impl Shard {
             }
         };
 
+        // Wire multishot accept: create per-shard SO_REUSEPORT listener socket
+        #[cfg(target_os = "linux")]
+        let mut uring_listener_fd: Option<std::os::fd::RawFd> = None;
+        #[cfg(target_os = "linux")]
+        if let Some(ref mut d) = uring_state {
+            if let Some(ref addr) = bind_addr {
+                match Self::create_reuseport_listener(addr) {
+                    Ok(listener_fd) => {
+                        if let Err(e) = d.submit_multishot_accept(listener_fd) {
+                            tracing::warn!("Shard {}: multishot accept failed: {}, using conn_rx", self.id, e);
+                        } else {
+                            info!("Shard {}: multishot accept armed on fd {}", self.id, listener_fd);
+                            uring_listener_fd = Some(listener_fd);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx", self.id, e);
+                    }
+                }
+            }
+        }
+
         // Track per-connection parse state for io_uring path (Linux only).
         #[cfg(target_os = "linux")]
         let mut uring_parse_bufs: std::collections::HashMap<u32, bytes::BytesMut> =
             std::collections::HashMap::new();
 
         #[cfg(not(target_os = "linux"))]
-        info!("Shard {} started", self.id);
+        {
+            let _ = &bind_addr; // Suppress unused warning on non-Linux
+            info!("Shard {} started", self.id);
+        }
 
         // Wrap databases and pubsub_registry in Rc<RefCell> for sharing with spawned
         // connection tasks. Safe: single-threaded runtime guarantees no concurrent access.
@@ -193,6 +219,7 @@ impl Shard {
                                 driver,
                                 &databases,
                                 &mut uring_parse_bufs,
+                                uring_listener_fd,
                             );
                         }
                     }
@@ -209,6 +236,12 @@ impl Shard {
                     break;
                 }
             }
+        }
+
+        // Close per-shard SO_REUSEPORT listener fd if created (Linux only).
+        #[cfg(target_os = "linux")]
+        if let Some(lfd) = uring_listener_fd {
+            unsafe { libc::close(lfd); }
         }
 
         // Restore databases and pubsub_registry back to self for cleanup.
@@ -360,6 +393,7 @@ impl Shard {
         driver: &mut UringDriver,
         databases: &Rc<RefCell<Vec<Database>>>,
         parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
+        uring_listener_fd: Option<std::os::fd::RawFd>,
     ) {
         match event {
             IoEvent::Recv { conn_id, data } => {
@@ -432,8 +466,10 @@ impl Shard {
                 let _ = driver.register_connection(raw_fd);
             }
             IoEvent::AcceptError { .. } => {
-                // Transient accept error; multishot may need re-submission
-                // (handled by listener in current architecture)
+                // Multishot accept cancelled on error -- re-submit
+                if let Some(lfd) = uring_listener_fd {
+                    let _ = driver.submit_multishot_accept(lfd);
+                }
             }
             IoEvent::SendComplete { .. } => {
                 // Send completed successfully, nothing to do
@@ -446,6 +482,90 @@ impl Shard {
                 // Handled by the spsc_interval tick (already draining SPSC)
             }
         }
+    }
+
+    /// Create an SO_REUSEPORT TCP listener socket for per-shard multishot accept.
+    ///
+    /// Each shard binds to the same address with SO_REUSEPORT, allowing the kernel
+    /// to distribute incoming connections across shard threads without a shared listener.
+    #[cfg(target_os = "linux")]
+    fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
+        use std::net::SocketAddr;
+        let sock_addr: SocketAddr = addr.parse().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+        })?;
+
+        // Create TCP socket
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Set SO_REUSEPORT + SO_REUSEADDR
+        let optval: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        // Bind
+        match sock_addr {
+            SocketAddr::V4(v4) => {
+                let sa = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                let ret = unsafe {
+                    libc::bind(
+                        fd,
+                        &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                };
+                if ret < 0 {
+                    unsafe { libc::close(fd); }
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            SocketAddr::V6(_) => {
+                unsafe { libc::close(fd); }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "IPv6 not yet supported for SO_REUSEPORT listener",
+                ));
+            }
+        }
+
+        // Listen with backlog 1024
+        let ret = unsafe { libc::listen(fd, 1024) };
+        if ret < 0 {
+            unsafe { libc::close(fd); }
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(fd)
     }
 
     /// Extract command name and args from a Frame (static helper for SPSC dispatch).
@@ -615,6 +735,7 @@ mod tests {
             &mut driver,
             &databases,
             &mut parse_bufs,
+            None,
         );
 
         assert!(!parse_bufs.contains_key(&42), "parse buffer should be removed on disconnect");
@@ -640,6 +761,7 @@ mod tests {
             &mut driver,
             &databases,
             &mut parse_bufs,
+            None,
         );
     }
 }

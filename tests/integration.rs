@@ -2411,7 +2411,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                     );
 
                     rt.block_on(local.run_until(
-                        shard.run(conn_rx, consumers, producers, shard_cancel, None),
+                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None),
                     ));
                 })
                 .expect("failed to spawn shard thread");

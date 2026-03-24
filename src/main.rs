@@ -70,6 +70,9 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
+    let bind_addr = format!("{}:{}", config.bind, config.port);
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
     for id in 0..num_shards {
@@ -79,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         let shard_config = config.clone();
         let shard_cancel = cancel_token.clone();
         let shard_aof_tx = aof_tx.clone();
+        let shard_bind_addr = bind_addr.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -95,7 +99,14 @@ fn main() -> anyhow::Result<()> {
                     shard_config.to_runtime_config(),
                 );
 
-                rt.block_on(shard.run(conn_rx, consumers, producers, shard_cancel, shard_aof_tx));
+                rt.block_on(shard.run(
+                    conn_rx,
+                    consumers,
+                    producers,
+                    shard_cancel,
+                    shard_aof_tx,
+                    Some(shard_bind_addr),
+                ));
             })
             .expect("failed to spawn shard thread");
 
