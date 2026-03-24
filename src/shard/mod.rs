@@ -22,9 +22,13 @@ use crate::persistence::wal::WalWriter;
 use crate::command::connection as conn_cmd;
 use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
+use crate::replication::backlog::ReplicationBacklog;
+use crate::replication::state::ReplicationState;
 use crate::server::connection::handle_connection_sharded;
 use crate::storage::Database;
 use crate::tracking::TrackingTable;
+
+use std::sync::{Arc, RwLock};
 
 #[cfg(target_os = "linux")]
 use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
@@ -228,6 +232,22 @@ impl Shard {
             None
         };
 
+        // Per-shard replication backlog (in-memory, 1MB capacity, for partial resync).
+        // IMPORTANT: monotonic offsets here are independent of WAL file size.
+        let backlog_capacity = 1024 * 1024; // 1MB per shard
+        let mut repl_backlog: Option<ReplicationBacklog> =
+            Some(ReplicationBacklog::new(backlog_capacity));
+
+        // Per-shard replica sender channels: (replica_id, Sender<Bytes>).
+        // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
+        let mut replica_txs: Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)> = Vec::new();
+
+        // Shared ReplicationState (None until replication is configured via REPLICAOF).
+        // Set via ShardMessage::RegisterReplica which carries it from the connection layer.
+        // NOTE: In this plan, repl_state is always None; it is wired by Plan 03.
+        // The fan-out code handles None gracefully (no-op for offset tracking).
+        let repl_state: Option<Arc<RwLock<ReplicationState>>> = None;
+
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = *snapshot_trigger_rx.borrow();
 
@@ -317,6 +337,10 @@ impl Shard {
                         &mut pending_snapshot,
                         &mut snapshot_state,
                         &mut wal_writer,
+                        &mut repl_backlog,
+                        &mut replica_txs,
+                        &repl_state,
+                        shard_id,
                     );
 
                     // Handle pending SnapshotBegin from SPSC
@@ -458,6 +482,10 @@ impl Shard {
         pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
+        repl_backlog: &mut Option<ReplicationBacklog>,
+        replica_txs: &mut Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)>,
+        repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+        shard_id: usize,
     ) {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
@@ -475,6 +503,10 @@ impl Shard {
                             pending_snapshot,
                             snapshot_state,
                             wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
                         );
                     }
                     None => break,
@@ -498,6 +530,10 @@ impl Shard {
         pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
+        repl_backlog: &mut Option<ReplicationBacklog>,
+        replica_txs: &mut Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)>,
+        repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+        shard_id: usize,
     ) {
         match msg {
             ShardMessage::Execute {
@@ -532,12 +568,12 @@ impl Shard {
                         DispatchResult::Quit(f) => f,
                     };
 
-                    // WAL append for successful write commands
+                    // WAL append + replication fan-out for successful write commands
                     if aof::is_write_command(cmd) && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        if let Some(wal) = wal_writer.as_mut() {
-                            let serialized = aof::serialize_command(&command);
-                            wal.append(&serialized);
-                        }
+                        let serialized = aof::serialize_command(&command);
+                        Self::wal_append_and_fanout(
+                            &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
+                        );
                     }
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
@@ -609,12 +645,12 @@ impl Shard {
                         DispatchResult::Quit(f) => f,
                     };
 
-                    // WAL append for successful write commands
+                    // WAL append + replication fan-out for successful write commands
                     if aof::is_write_command(cmd) && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        if let Some(wal) = wal_writer.as_mut() {
-                            let serialized = aof::serialize_command(cmd_frame);
-                            wal.append(&serialized);
-                        }
+                        let serialized = aof::serialize_command(cmd_frame);
+                        Self::wal_append_and_fanout(
+                            &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
+                        );
                     }
 
                     results.push(frame);
@@ -654,11 +690,11 @@ impl Shard {
             ShardMessage::Shutdown => {
                 info!("Received shutdown via SPSC");
             }
-            ShardMessage::RegisterReplica { .. } => {
-                // Handled in Task 2 with full fan-out wiring
+            ShardMessage::RegisterReplica { replica_id, tx } => {
+                replica_txs.push((replica_id, tx));
             }
-            ShardMessage::UnregisterReplica { .. } => {
-                // Handled in Task 2 with full fan-out wiring
+            ShardMessage::UnregisterReplica { replica_id } => {
+                replica_txs.retain(|(id, _)| *id != replica_id);
             }
             ShardMessage::NewConnection(_) => {
                 // NewConnection is handled via conn_rx, not SPSC
@@ -926,6 +962,42 @@ impl Shard {
         Ok(fd)
     }
 
+    /// Append WAL bytes, update the replication backlog, advance the monotonic shard offset,
+    /// and fan-out to all connected replica sender channels (non-blocking try_send).
+    ///
+    /// CRITICAL: shard_offset in ReplicationState is SEPARATE from WalWriter::bytes_written.
+    /// WalWriter::bytes_written resets on snapshot truncation; shard_offset NEVER resets.
+    fn wal_append_and_fanout(
+        data: &[u8],
+        wal_writer: &mut Option<WalWriter>,
+        repl_backlog: &mut Option<ReplicationBacklog>,
+        replica_txs: &[(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)],
+        repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+        shard_id: usize,
+    ) {
+        // 1. WAL append (disk durability, unchanged behavior)
+        if let Some(w) = wal_writer {
+            w.append(data);
+        }
+        // 2. Replication backlog (in-memory circular buffer for partial resync)
+        if let Some(backlog) = repl_backlog {
+            backlog.append(data);
+        }
+        // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
+        if let Some(rs) = repl_state {
+            if let Ok(rs) = rs.try_read() {
+                rs.increment_shard_offset(shard_id, data.len() as u64);
+            }
+        }
+        // 4. Fan-out to replica sender tasks (non-blocking: lagging replicas are skipped)
+        if !replica_txs.is_empty() {
+            let bytes = bytes::Bytes::copy_from_slice(data);
+            for (_id, tx) in replica_txs {
+                let _ = tx.try_send(bytes.clone());
+            }
+        }
+    }
+
     /// Extract command name and args from a Frame (static helper for SPSC dispatch).
     fn extract_command_static(frame: &crate::protocol::Frame) -> Option<(&[u8], &[crate::protocol::Frame])> {
         match frame {
@@ -1001,7 +1073,7 @@ mod tests {
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w);
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -1039,7 +1111,7 @@ mod tests {
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w);
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0);
     }
 
     #[test]

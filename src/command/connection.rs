@@ -191,6 +191,77 @@ pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
     }
 }
 
+/// Action to take after REPLICAOF command is parsed.
+pub enum ReplicaofAction {
+    /// Connect to master and start replication.
+    StartReplication { host: String, port: u16 },
+    /// Promote to master: copy repl_id to repl_id2, generate new repl_id.
+    PromoteToMaster,
+    /// Already master, REPLICAOF NO ONE is a no-op.
+    NoOp,
+}
+
+/// REPLICAOF host port -- initiate replication from master at host:port.
+/// REPLICAOF NO ONE -- promote this replica to master.
+///
+/// Returns (response_frame, optional action for the caller to execute).
+pub fn replicaof(args: &[Frame]) -> (Frame, Option<ReplicaofAction>) {
+    if args.len() != 2 {
+        return (
+            Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'REPLICAOF' command",
+            )),
+            None,
+        );
+    }
+    let host = match extract_bytes_ref(&args[0]) {
+        Some(h) => String::from_utf8_lossy(h).to_string(),
+        None => return (Frame::Error(Bytes::from_static(b"ERR invalid host")), None),
+    };
+    let port_str = match extract_bytes_ref(&args[1]) {
+        Some(p) => String::from_utf8_lossy(p).to_string(),
+        None => return (Frame::Error(Bytes::from_static(b"ERR invalid port")), None),
+    };
+
+    // REPLICAOF NO ONE -- promote to master
+    if host.eq_ignore_ascii_case("NO") && port_str.eq_ignore_ascii_case("ONE") {
+        return (
+            Frame::SimpleString(Bytes::from_static(b"OK")),
+            Some(ReplicaofAction::PromoteToMaster),
+        );
+    }
+
+    let port: u16 = match port_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )),
+                None,
+            )
+        }
+    };
+
+    (
+        Frame::SimpleString(Bytes::from_static(b"OK")),
+        Some(ReplicaofAction::StartReplication { host, port }),
+    )
+}
+
+/// REPLCONF -- replication configuration handshake.
+/// Responds OK to: listening-port <port>, capa eof, capa psync2, getack *.
+/// Used during the PSYNC2 handshake sequence.
+pub fn replconf(args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'REPLCONF' command",
+        ));
+    }
+    // Accept all known REPLCONF subcommands with OK.
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
 /// Extract a byte slice reference from a Frame argument (zero-alloc).
 fn extract_bytes_ref(frame: &Frame) -> Option<&[u8]> {
     match frame {
@@ -629,5 +700,84 @@ mod tests {
     fn test_client_id_returns_integer() {
         let result = client_id(42);
         assert_eq!(result, Frame::Integer(42));
+    }
+
+    // === REPLICAOF command tests ===
+
+    #[test]
+    fn test_replicaof_start_replication() {
+        let (resp, action) = replicaof(&[
+            Frame::BulkString(Bytes::from_static(b"127.0.0.1")),
+            Frame::BulkString(Bytes::from_static(b"6379")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert!(matches!(
+            action,
+            Some(ReplicaofAction::StartReplication { ref host, port })
+            if host == "127.0.0.1" && port == 6379
+        ));
+    }
+
+    #[test]
+    fn test_replicaof_no_one() {
+        let (resp, action) = replicaof(&[
+            Frame::BulkString(Bytes::from_static(b"NO")),
+            Frame::BulkString(Bytes::from_static(b"ONE")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert!(matches!(action, Some(ReplicaofAction::PromoteToMaster)));
+    }
+
+    #[test]
+    fn test_replicaof_no_one_case_insensitive() {
+        let (resp, action) = replicaof(&[
+            Frame::BulkString(Bytes::from_static(b"no")),
+            Frame::BulkString(Bytes::from_static(b"one")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert!(matches!(action, Some(ReplicaofAction::PromoteToMaster)));
+    }
+
+    #[test]
+    fn test_replicaof_wrong_arity() {
+        let (resp, action) = replicaof(&[Frame::BulkString(Bytes::from_static(b"host"))]);
+        assert!(matches!(resp, Frame::Error(_)));
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_replicaof_invalid_port() {
+        let (resp, action) = replicaof(&[
+            Frame::BulkString(Bytes::from_static(b"localhost")),
+            Frame::BulkString(Bytes::from_static(b"notaport")),
+        ]);
+        assert!(matches!(resp, Frame::Error(_)));
+        assert!(action.is_none());
+    }
+
+    // === REPLCONF command tests ===
+
+    #[test]
+    fn test_replconf_listening_port() {
+        let resp = replconf(&[
+            Frame::BulkString(Bytes::from_static(b"listening-port")),
+            Frame::BulkString(Bytes::from_static(b"6380")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_replconf_capa() {
+        let resp = replconf(&[
+            Frame::BulkString(Bytes::from_static(b"capa")),
+            Frame::BulkString(Bytes::from_static(b"psync2")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_replconf_empty_args() {
+        let resp = replconf(&[]);
+        assert!(matches!(resp, Frame::Error(_)));
     }
 }
