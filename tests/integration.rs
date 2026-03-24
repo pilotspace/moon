@@ -3626,3 +3626,305 @@ async fn cluster_nodes() {
 
     shutdown.cancel();
 }
+
+// ============================================================
+// Phase 21: Lua Scripting Engine
+// ============================================================
+
+#[tokio::test]
+async fn test_eval_basic() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let result: String = redis::cmd("EVAL")
+        .arg("return KEYS[1]")
+        .arg(1)
+        .arg("mykey")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(result, "mykey");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_eval_argv() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let result: String = redis::cmd("EVAL")
+        .arg("return ARGV[1]")
+        .arg(0)
+        .arg("hello")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(result, "hello");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_evalsha() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    // SCRIPT LOAD returns SHA1
+    let sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg("return KEYS[1]")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(sha.len(), 40);
+
+    // EVALSHA with that SHA1 should return the same result
+    let result: String = redis::cmd("EVALSHA")
+        .arg(&sha)
+        .arg(1)
+        .arg("testkey")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(result, "testkey");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_evalsha_noscript() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let result = redis::cmd("EVALSHA")
+        .arg("0000000000000000000000000000000000000000")
+        .arg(0)
+        .query_async::<String>(&mut con)
+        .await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("NOSCRIPT") || err_msg.contains("NoScript"),
+        "expected NOSCRIPT, got: {err_msg}"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_script_load() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg("return 42")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(sha.len(), 40);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_script_exists() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg("return 1")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let results: Vec<i64> = redis::cmd("SCRIPT")
+        .arg("EXISTS")
+        .arg(&sha)
+        .arg("0000000000000000000000000000000000000000")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(results, vec![1, 0]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_script_flush() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg("return 1")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let _: String = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let results: Vec<i64> = redis::cmd("SCRIPT")
+        .arg("EXISTS")
+        .arg(&sha)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(results, vec![0]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sandbox_restrictions() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    // load() should be sandboxed
+    let result = redis::cmd("EVAL")
+        .arg("return load('return 1')()")
+        .arg(0)
+        .query_async::<redis::Value>(&mut con)
+        .await;
+    assert!(result.is_err(), "load() should be sandboxed");
+
+    // dofile should be sandboxed
+    let result2 = redis::cmd("EVAL")
+        .arg("return dofile('/tmp/x')")
+        .arg(0)
+        .query_async::<redis::Value>(&mut con)
+        .await;
+    assert!(result2.is_err(), "dofile() should be sandboxed");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sandbox_allowed() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let result: String = redis::cmd("EVAL")
+        .arg("return string.upper('hello')")
+        .arg(0)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(result, "HELLO");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_redis_call() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let result: String = redis::cmd("EVAL")
+        .arg("redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])")
+        .arg(1)
+        .arg("lua_test_key")
+        .arg("lua_test_value")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(result, "lua_test_value");
+
+    // Verify the key was actually set in the database
+    let direct: String = redis::cmd("GET")
+        .arg("lua_test_key")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(direct, "lua_test_value");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_redis_pcall() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    // Call an invalid command -- pcall catches it as {err=...} table
+    let result: String = redis::cmd("EVAL")
+        .arg("local r = redis.pcall('NOTACOMMAND'); if r.err then return 'caught' else return 'uncaught' end")
+        .arg(0)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(result, "caught");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_script_timeout() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    let result = redis::cmd("EVAL")
+        .arg("local i = 0; while true do i = i + 1 end")
+        .arg(0)
+        .query_async::<redis::Value>(&mut con)
+        .await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("BUSY") || err_msg.contains("timeout") || err_msg.contains("script"),
+        "expected timeout error, got: {err_msg}"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_eval_return_types() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut con = connect(port).await;
+
+    // Integer return
+    let n: i64 = redis::cmd("EVAL")
+        .arg("return 42")
+        .arg(0)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(n, 42);
+
+    // Float truncated to integer (Redis behavior)
+    let f: i64 = redis::cmd("EVAL")
+        .arg("return 3.99")
+        .arg(0)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(f, 3);
+
+    // Nil returns as null/nil
+    let nil_result: redis::Value = redis::cmd("EVAL")
+        .arg("return nil")
+        .arg(0)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(matches!(nil_result, redis::Value::Nil));
+
+    // Table returns as array
+    let arr: Vec<i64> = redis::cmd("EVAL")
+        .arg("return {1, 2, 3}")
+        .arg(0)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(arr, vec![1, 2, 3]);
+
+    shutdown.cancel();
+}
