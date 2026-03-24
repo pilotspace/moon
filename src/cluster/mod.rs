@@ -3,6 +3,7 @@
 //! ClusterState is wrapped in Option<Arc<RwLock<ClusterState>>> everywhere.
 //! When None, all cluster routing is skipped with zero overhead.
 
+pub mod gossip;
 pub mod slots;
 
 use std::collections::HashMap;
