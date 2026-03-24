@@ -3055,6 +3055,126 @@ async fn blpop_multi_key_first_nonempty() {
 }
 
 #[tokio::test]
+async fn blpop_cross_shard_wakeup() {
+    // 4 shards: high probability keys land on different shards
+    let (port, shutdown) = start_sharded_server(4).await;
+
+    let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut con1 = client1.get_tokio_connection().await.unwrap();
+    let mut con2 = connect(port).await;
+
+    // BLPOP blocks on two keys; push to the second key from another connection
+    let blpop_handle = tokio::spawn(async move {
+        let result: (String, String) = redis::cmd("BLPOP")
+            .arg("xshard_a1")
+            .arg("xshard_b2")
+            .arg(5)
+            .query_async(&mut con1)
+            .await
+            .unwrap();
+        result
+    });
+
+    // Wait for registration to propagate
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Push to second key (may be on a different shard)
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("xshard_b2")
+        .arg("woke")
+        .query_async(&mut con2)
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        blpop_handle,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(result.0, "xshard_b2");
+    assert_eq!(result.1, "woke");
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn blpop_cross_shard_timeout() {
+    let (port, shutdown) = start_sharded_server(4).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut conn = client.get_tokio_connection().await.unwrap();
+
+    let start = std::time::Instant::now();
+    let result: Option<(String, String)> = redis::cmd("BLPOP")
+        .arg("timeout_a")
+        .arg("timeout_b")
+        .arg("0.3")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(result.is_none(), "Expected nil on timeout");
+    assert!(
+        elapsed.as_millis() >= 250,
+        "Timed out too early: {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed.as_millis() < 1500,
+        "Timed out too late: {}ms",
+        elapsed.as_millis()
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn blpop_multi_key_all_local_regression() {
+    // 1 shard = all keys local (regression guard for multi-key path)
+    let (port, shutdown) = start_sharded_server(1).await;
+
+    let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut con1 = client1.get_tokio_connection().await.unwrap();
+    let mut con2 = connect(port).await;
+
+    let blpop_handle = tokio::spawn(async move {
+        let result: (String, String) = redis::cmd("BLPOP")
+            .arg("localA")
+            .arg("localB")
+            .arg("localC")
+            .arg(5)
+            .query_async(&mut con1)
+            .await
+            .unwrap();
+        result
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Push to middle key
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("localB")
+        .arg("found_it")
+        .query_async(&mut con2)
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        blpop_handle,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(result.0, "localB");
+    assert_eq!(result.1, "found_it");
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn lmove_basic() {
     let (port, shutdown) = start_sharded_server(1).await;
     let mut conn = connect(port).await;

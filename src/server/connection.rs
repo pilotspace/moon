@@ -51,7 +51,7 @@ fn extract_command(frame: &Frame) -> Option<(&[u8], &[Frame])> {
 }
 
 /// Extract a Bytes value from a Frame argument.
-fn extract_bytes(frame: &Frame) -> Option<Bytes> {
+pub(crate) fn extract_bytes(frame: &Frame) -> Option<Bytes> {
     match frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
         _ => None,
@@ -1810,7 +1810,7 @@ async fn handle_blocking_command(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     shutdown: &CancellationToken,
 ) -> Frame {
-    use futures::stream::{FuturesUnordered, StreamExt as FutStreamExt};
+    use futures::stream::FuturesUnordered;
 
     // Parse timeout (last argument for all blocking commands)
     let timeout_secs = match parse_blocking_timeout(cmd, args) {
@@ -1919,6 +1919,7 @@ async fn handle_blocking_command(
                 reg.register(selected_db, key.clone(), entry);
             } else {
                 // Remote registration via SPSC
+                let target_idx = ChannelMesh::target_index(shard_id, target);
                 let msg = ShardMessage::BlockRegister {
                     db_index: selected_db,
                     key: key.clone(),
@@ -1926,7 +1927,7 @@ async fn handle_blocking_command(
                     cmd: blocked_cmd_factory(),
                     reply_tx: tx,
                 };
-                let _ = producers[target].try_push(msg);
+                let _ = producers[target_idx].try_push(msg);
                 if !registered_remote_shards.contains(&target) {
                     registered_remote_shards.push(target);
                 }
@@ -1934,40 +1935,59 @@ async fn handle_blocking_command(
         }
     } // borrows dropped -- CRITICAL before await
 
-    // Await first result from any key/shard
+    // Await first successful result from any key/shard.
+    // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
+    // returning the successful Ok. We must skip Err/None results and keep polling.
     let frame = if let Some(dl) = deadline {
-        tokio::select! {
-            result = receivers.next() => {
-                match result {
-                    Some(Ok(Some(frame))) => frame,
-                    _ => Frame::Null,
+        let sleep = tokio::time::sleep_until(dl);
+        tokio::pin!(sleep);
+        let mut result_frame = Frame::Null;
+        loop {
+            tokio::select! {
+                result = receivers.next() => {
+                    match result {
+                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
+                        Some(Err(_)) => continue, // sender dropped (cleanup race), try next
+                        None => break, // all receivers exhausted
+                    }
+                }
+                _ = &mut sleep => break,
+                _ = shutdown.cancelled() => {
+                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
+                    break;
                 }
             }
-            _ = tokio::time::sleep_until(dl) => Frame::Null,
-            _ = shutdown.cancelled() => {
-                Frame::Error(Bytes::from_static(b"ERR server shutting down"))
-            }
         }
+        result_frame
     } else {
-        tokio::select! {
-            result = receivers.next() => {
-                match result {
-                    Some(Ok(Some(frame))) => frame,
-                    _ => Frame::Null,
+        let mut result_frame = Frame::Null;
+        loop {
+            tokio::select! {
+                result = receivers.next() => {
+                    match result {
+                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
+                        Some(Err(_)) => continue,
+                        None => break,
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
+                    break;
                 }
             }
-            _ = shutdown.cancelled() => {
-                Frame::Error(Bytes::from_static(b"ERR server shutting down"))
-            }
         }
+        result_frame
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
     blocking_registry.borrow_mut().remove_wait(wait_id);
     if !registered_remote_shards.is_empty() {
         let mut producers = dispatch_tx.borrow_mut();
-        for shard_idx in &registered_remote_shards {
-            let _ = producers[*shard_idx].try_push(ShardMessage::BlockCancel { wait_id });
+        for &remote_shard in &registered_remote_shards {
+            let target_idx = ChannelMesh::target_index(shard_id, remote_shard);
+            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
         }
     }
     // Drop remaining receivers; remote senders get Err on send -- harmless

@@ -540,6 +540,29 @@ impl Shard {
                         }
                     }
 
+                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        if cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        {
+                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
+                                let mut reg = blocking_registry.borrow_mut();
+                                crate::blocking::wakeup::try_wake_list_waiter(
+                                    &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                );
+                            }
+                        }
+                        if cmd.eq_ignore_ascii_case(b"ZADD") {
+                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
+                                let mut reg = blocking_registry.borrow_mut();
+                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                    &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                );
+                            }
+                        }
+                    }
+
                     frame
                 };
                 let _ = reply_tx.send(response);
@@ -606,10 +629,15 @@ impl Shard {
                 };
                 let mut reg = blocking_registry.borrow_mut();
                 reg.register(db_index, key.clone(), entry);
-                // Check if data is already available (race: data arrived before registration)
+                // Check if data is already available (race: data arrived before registration).
+                // Only attempt wakeup if the key exists -- try_wake_list_waiter
+                // destroys the waiter even when no data is available (sends None = timeout).
                 let mut dbs = databases.borrow_mut();
-                crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut dbs[db_index], db_index, &key);
-                crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut dbs[db_index], db_index, &key);
+                if dbs[db_index].exists(&key) {
+                    let db = &mut dbs[db_index];
+                    crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, db_index, &key);
+                    crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, db_index, &key);
+                }
             }
             ShardMessage::BlockCancel { wait_id } => {
                 blocking_registry.borrow_mut().remove_wait(wait_id);
@@ -957,7 +985,7 @@ mod tests {
         let mut pending_snap = None;
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
-        let blocking = Rc::new(RefCell::new(BlockingRegistry::new()));
+        let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
@@ -995,7 +1023,7 @@ mod tests {
         let mut pending_snap = None;
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
-        let blocking = Rc::new(RefCell::new(BlockingRegistry::new()));
+        let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w);
     }
 
