@@ -7,6 +7,7 @@ pub mod list;
 pub mod persistence;
 pub mod set;
 pub mod sorted_set;
+pub mod stream;
 pub mod string;
 
 use bytes::Bytes;
@@ -137,6 +138,14 @@ pub fn dispatch(
     if cmd.eq_ignore_ascii_case(b"ZLEXCOUNT") { return DispatchResult::Response(sorted_set::zlexcount(db, args)); }
     if cmd.eq_ignore_ascii_case(b"ZUNIONSTORE") { return DispatchResult::Response(sorted_set::zunionstore(db, args)); }
     if cmd.eq_ignore_ascii_case(b"ZINTERSTORE") { return DispatchResult::Response(sorted_set::zinterstore(db, args)); }
+    // Stream commands
+    if cmd.eq_ignore_ascii_case(b"XADD") { return DispatchResult::Response(stream::xadd(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XLEN") { return DispatchResult::Response(stream::xlen(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XRANGE") { return DispatchResult::Response(stream::xrange(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XREVRANGE") { return DispatchResult::Response(stream::xrevrange(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XTRIM") { return DispatchResult::Response(stream::xtrim(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XDEL") { return DispatchResult::Response(stream::xdel(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XREAD") { return DispatchResult::Response(stream::xread(db, args)); }
 
     DispatchResult::Response(Frame::Error(Bytes::from(format!(
         "ERR unknown command '{}', with args beginning with: ",

@@ -947,4 +947,48 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(loaded[0].len(), 0);
     }
+
+    #[test]
+    fn test_round_trip_stream() {
+        let (_dir, path) = rdb_path();
+        let mut dbs = vec![Database::new()];
+        {
+            let stream = dbs[0].get_or_create_stream(b"mystream").unwrap();
+            stream.add(
+                StreamId { ms: 1000, seq: 0 },
+                vec![
+                    (Bytes::from_static(b"name"), Bytes::from_static(b"alice")),
+                    (Bytes::from_static(b"age"), Bytes::from_static(b"30")),
+                ],
+            );
+            stream.add(
+                StreamId { ms: 1001, seq: 0 },
+                vec![
+                    (Bytes::from_static(b"name"), Bytes::from_static(b"bob")),
+                    (Bytes::from_static(b"age"), Bytes::from_static(b"25")),
+                ],
+            );
+        }
+
+        save(&dbs, &path).unwrap();
+
+        let mut loaded = vec![Database::new()];
+        let count = load(&mut loaded, &path).unwrap();
+        assert_eq!(count, 1);
+
+        let entry = loaded[0].get(b"mystream").unwrap();
+        assert_eq!(entry.value.type_name(), "stream");
+        match entry.value.as_redis_value() {
+            RedisValueRef::Stream(stream) => {
+                assert_eq!(stream.entries.len(), 2);
+                assert_eq!(stream.length, 2);
+                assert_eq!(stream.last_id, StreamId { ms: 1001, seq: 0 });
+                let fields = stream.entries.get(&StreamId { ms: 1000, seq: 0 }).unwrap();
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0.as_ref(), b"name");
+                assert_eq!(fields[0].1.as_ref(), b"alice");
+            }
+            _ => panic!("Expected Stream"),
+        }
+    }
 }
