@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+
+use crate::storage::bptree::BPTree;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
@@ -46,30 +48,30 @@ fn format_score(score: f64) -> String {
 /// Add or update a member in the sorted set. Returns true if the member is new.
 fn zadd_member(
     members: &mut HashMap<Bytes, f64>,
-    scores: &mut BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+    scores: &mut BPTree,
     member: Bytes,
     score: f64,
 ) -> bool {
     // Remove old entry if exists (MUST remove from both)
     let is_new = if let Some(old_score) = members.remove(&member) {
-        scores.remove(&(OrderedFloat(old_score), member.clone()));
+        scores.remove(OrderedFloat(old_score), &member);
         false
     } else {
         true
     };
     members.insert(member.clone(), score);
-    scores.insert((OrderedFloat(score), member), ());
+    scores.insert(OrderedFloat(score), member);
     is_new
 }
 
 /// Remove a member from the sorted set. Returns true if the member existed.
 fn zrem_member(
     members: &mut HashMap<Bytes, f64>,
-    scores: &mut BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+    scores: &mut BPTree,
     member: &[u8],
 ) -> bool {
     if let Some(score) = members.remove(member) {
-        scores.remove(&(OrderedFloat(score), Bytes::copy_from_slice(member)));
+        scores.remove(OrderedFloat(score), member);
         true
     } else {
         false
@@ -450,9 +452,10 @@ pub fn zrank(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some((members, scores))) => {
             match members.get(member) {
                 Some(score) => {
-                    let target = (OrderedFloat(*score), member.clone());
-                    let rank = scores.range(..target).count();
-                    Frame::Integer(rank as i64)
+                    match scores.rank(OrderedFloat(*score), member) {
+                        Some(rank) => Frame::Integer(rank as i64),
+                        None => Frame::Null,
+                    }
                 }
                 None => Frame::Null,
             }
@@ -480,11 +483,10 @@ pub fn zrevrank(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some((members, scores))) => {
             match members.get(member) {
                 Some(score) => {
-                    let target = (OrderedFloat(*score), member.clone());
-                    let forward_rank = scores.range(..target).count();
-                    let total = scores.len();
-                    let rev_rank = total - 1 - forward_rank;
-                    Frame::Integer(rev_rank as i64)
+                    match scores.rev_rank(OrderedFloat(*score), member) {
+                        Some(rev_rank) => Frame::Integer(rev_rank as i64),
+                        None => Frame::Null,
+                    }
                 }
                 None => Frame::Null,
             }
@@ -524,10 +526,10 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut result = Vec::new();
     for _ in 0..count {
-        let first = scores.keys().next().cloned();
+        let first = scores.iter().next().map(|(s, m)| (s, m.clone()));
         match first {
             Some((score, member)) => {
-                scores.remove(&(score, member.clone()));
+                scores.remove(score, &member);
                 members.remove(&member);
                 result.push(Frame::BulkString(member));
                 result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
@@ -574,10 +576,10 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut result = Vec::new();
     for _ in 0..count {
-        let last = scores.keys().next_back().cloned();
+        let last = scores.iter_rev().next().map(|(s, m)| (s, m.clone()));
         match last {
             Some((score, member)) => {
-                scores.remove(&(score, member.clone()));
+                scores.remove(score, &member);
                 members.remove(&member);
                 result.push(Frame::BulkString(member));
                 result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
@@ -822,7 +824,7 @@ pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
 }
 
 fn zrange_by_rank(
-    scores: &BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+    scores: &BPTree,
     min_arg: &[u8],
     max_arg: &[u8],
     rev: bool,
@@ -853,23 +855,22 @@ fn zrange_by_rank(
     let mut result = Vec::new();
 
     if rev {
-        let entries: Vec<_> = scores.iter().rev().collect();
-        for idx in start..=stop {
-            if let Some(((score, member), _)) = entries.get(idx as usize) {
-                result.push(Frame::BulkString(member.clone()));
-                if withscores {
-                    result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
-                }
+        // Reverse: rank 0 = highest score
+        let rev_start = (total - 1 - stop) as usize;
+        let rev_stop = (total - 1 - start) as usize;
+        let entries = scores.range_by_rank(rev_start, rev_stop);
+        for (score, member) in entries.into_iter().rev() {
+            result.push(Frame::BulkString(member.clone()));
+            if withscores {
+                result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
             }
         }
     } else {
-        let entries: Vec<_> = scores.iter().collect();
-        for idx in start..=stop {
-            if let Some(((score, member), _)) = entries.get(idx as usize) {
-                result.push(Frame::BulkString(member.clone()));
-                if withscores {
-                    result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
-                }
+        let entries = scores.range_by_rank(start as usize, stop as usize);
+        for (score, member) in entries {
+            result.push(Frame::BulkString(member.clone()));
+            if withscores {
+                result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
             }
         }
     }
@@ -879,7 +880,7 @@ fn zrange_by_rank(
 
 fn zrange_by_score(
     members: &HashMap<Bytes, f64>,
-    scores: &BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+    scores: &BPTree,
     min_arg: &[u8],
     max_arg: &[u8],
     rev: bool,
@@ -912,9 +913,18 @@ fn zrange_by_score(
 
     let _ = members; // not directly needed; scores has all data
 
-    // Collect matching entries
+    // Use BPTree range to get entries in the score range, then apply bound filtering
+    let range_min = OrderedFloat(min_bound.value());
+    let range_max = OrderedFloat(max_bound.value());
+    // Ensure min <= max for BPTree range call
+    let (range_lo, range_hi) = if range_min <= range_max {
+        (range_min, range_max)
+    } else {
+        (range_max, range_min)
+    };
+
     let mut entries: Vec<(f64, &Bytes)> = Vec::new();
-    for ((score, member), _) in scores.iter() {
+    for (score, member) in scores.range(range_lo, range_hi) {
         let s = score.0;
         if min_bound.includes(s) && max_bound.includes_upper(s) {
             entries.push((s, member));
@@ -946,7 +956,7 @@ fn zrange_by_score(
 }
 
 fn zrange_by_lex(
-    scores: &BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+    scores: &BPTree,
     min_arg: &[u8],
     max_arg: &[u8],
     rev: bool,
@@ -978,7 +988,7 @@ fn zrange_by_lex(
     };
 
     let mut entries: Vec<&Bytes> = Vec::new();
-    for ((_, member), _) in scores.iter() {
+    for (_, member) in scores.iter() {
         if lex_in_range(member, &min_bound, &max_bound) {
             entries.push(member);
         }
@@ -1206,8 +1216,10 @@ pub fn zcount(db: &mut Database, args: &[Frame]) -> Frame {
 
     match db.get_sorted_set(key) {
         Ok(Some((_members, scores))) => {
+            let range_min = OrderedFloat(min_bound.value());
+            let range_max = OrderedFloat(max_bound.value());
             let count = scores
-                .keys()
+                .range(range_min, range_max)
                 .filter(|(score, _)| min_bound.includes(score.0) && max_bound.includes_upper(score.0))
                 .count();
             Frame::Integer(count as i64)
@@ -1247,7 +1259,7 @@ pub fn zlexcount(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get_sorted_set(key) {
         Ok(Some((_members, scores))) => {
             let count = scores
-                .keys()
+                .iter()
                 .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
                 .count();
             Frame::Integer(count as i64)
@@ -1483,9 +1495,10 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_sorted_set_if_alive(key, now_ms) {
         Ok(Some((members, scores))) => match members.get(member) {
             Some(score) => {
-                let target = (OrderedFloat(*score), member.clone());
-                let rank = scores.range(..target).count();
-                Frame::Integer(rank as i64)
+                match scores.rank(OrderedFloat(*score), member) {
+                    Some(rank) => Frame::Integer(rank as i64),
+                    None => Frame::Null,
+                }
             }
             None => Frame::Null,
         },
@@ -1502,10 +1515,10 @@ pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_sorted_set_if_alive(key, now_ms) {
         Ok(Some((members, scores))) => match members.get(member) {
             Some(score) => {
-                let target = (OrderedFloat(*score), member.clone());
-                let forward_rank = scores.range(..target).count();
-                let total = scores.len();
-                Frame::Integer((total - 1 - forward_rank) as i64)
+                match scores.rev_rank(OrderedFloat(*score), member) {
+                    Some(rev_rank) => Frame::Integer(rev_rank as i64),
+                    None => Frame::Null,
+                }
             }
             None => Frame::Null,
         },
@@ -1644,7 +1657,9 @@ pub fn zcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let max_bound = match parse_score_bound(max_bytes) { Ok(b) => b, Err(e) => return e };
     match db.get_sorted_set_if_alive(key, now_ms) {
         Ok(Some((_members, scores))) => {
-            let count = scores.keys().filter(|(score, _)| min_bound.includes(score.0) && max_bound.includes_upper(score.0)).count();
+            let range_min = OrderedFloat(min_bound.value());
+            let range_max = OrderedFloat(max_bound.value());
+            let count = scores.range(range_min, range_max).filter(|(score, _)| min_bound.includes(score.0) && max_bound.includes_upper(score.0)).count();
             Frame::Integer(count as i64)
         }
         Ok(None) => Frame::Integer(0),
@@ -1662,7 +1677,7 @@ pub fn zlexcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let max_bound = match parse_lex_bound(max_bytes) { Ok(b) => b, Err(e) => return e };
     match db.get_sorted_set_if_alive(key, now_ms) {
         Ok(Some((_members, scores))) => {
-            let count = scores.keys().filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound)).count();
+            let count = scores.iter().filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound)).count();
             Frame::Integer(count as i64)
         }
         Ok(None) => Frame::Integer(0),
@@ -2143,9 +2158,9 @@ mod tests {
         let (members, scores) = db.get_sorted_set(b"zs").unwrap().unwrap();
         assert_eq!(members.len(), scores.len());
 
-        // Verify all members in HashMap have matching entries in BTreeMap
+        // Verify all members in HashMap have matching entries in BPTree
         for (member, score) in members.iter() {
-            assert!(scores.contains_key(&(OrderedFloat(*score), member.clone())));
+            assert!(scores.contains(OrderedFloat(*score), member));
         }
     }
 

@@ -480,9 +480,9 @@ mod tests {
         }
         // Sorted set
         {
-            let (members, scores) = dbs[0].get_or_create_sorted_set(b"z").unwrap();
+            let (members, tree) = dbs[0].get_or_create_sorted_set(b"z").unwrap();
             members.insert(Bytes::from_static(b"a"), 1.0);
-            scores.insert((OrderedFloat(1.0), Bytes::from_static(b"a")), ());
+            tree.insert(OrderedFloat(1.0), Bytes::from_static(b"a"));
         }
 
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();

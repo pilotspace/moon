@@ -9,6 +9,7 @@ use bytes::Bytes;
 use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
+use crate::storage::bptree::BPTree;
 use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_secs, current_time_ms, Entry, RedisValue};
@@ -428,16 +429,16 @@ pub(crate) fn read_entry(
         TYPE_SORTED_SET => {
             let count = read_u32(cursor)? as usize;
             let mut members = HashMap::with_capacity(count);
-            let mut scores = BTreeMap::new();
+            let mut tree = BPTree::new();
             for _ in 0..count {
                 let member = read_bytes(cursor)?;
                 let mut score_buf = [0u8; 8];
                 cursor.read_exact(&mut score_buf)?;
                 let score = f64::from_le_bytes(score_buf);
                 members.insert(member.clone(), score);
-                scores.insert((OrderedFloat(score), member), ());
+                tree.insert(OrderedFloat(score), member);
             }
-            RedisValue::SortedSet { members, scores }
+            RedisValue::SortedSetBPTree { tree, members }
         }
         _ => bail!("Unknown type tag: {}", type_tag),
     };
@@ -623,11 +624,11 @@ mod tests {
         let (_dir, path) = rdb_path();
         let mut dbs = vec![Database::new()];
         {
-            let (members, scores) = dbs[0].get_or_create_sorted_set(b"myzset").unwrap();
+            let (members, tree) = dbs[0].get_or_create_sorted_set(b"myzset").unwrap();
             members.insert(Bytes::from_static(b"alice"), 1.5);
-            scores.insert((OrderedFloat(1.5), Bytes::from_static(b"alice")), ());
+            tree.insert(OrderedFloat(1.5), Bytes::copy_from_slice(b"alice"));
             members.insert(Bytes::from_static(b"bob"), 2.7);
-            scores.insert((OrderedFloat(2.7), Bytes::from_static(b"bob")), ());
+            tree.insert(OrderedFloat(2.7), Bytes::copy_from_slice(b"bob"));
         }
 
         save(&dbs, &path).unwrap();
@@ -637,11 +638,11 @@ mod tests {
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myzset").unwrap();
         match entry.value.as_redis_value() {
-            RedisValueRef::SortedSet { members, scores } => {
+            RedisValueRef::SortedSetBPTree { members, tree } => {
                 assert_eq!(members.len(), 2);
                 assert_eq!(*members.get(&Bytes::from_static(b"alice")).unwrap(), 1.5);
                 assert_eq!(*members.get(&Bytes::from_static(b"bob")).unwrap(), 2.7);
-                assert_eq!(scores.len(), 2);
+                assert_eq!(tree.len(), 2);
             }
             _ => panic!("Expected sorted set"),
         }
@@ -680,7 +681,7 @@ mod tests {
         {
             let (members, scores) = dbs[0].get_or_create_sorted_set(b"z").unwrap();
             members.insert(Bytes::from_static(b"a"), 1.0);
-            scores.insert((OrderedFloat(1.0), Bytes::from_static(b"a")), ());
+            scores.insert(OrderedFloat(1.0), Bytes::from_static(b"a"));
         }
 
         save(&dbs, &path).unwrap();

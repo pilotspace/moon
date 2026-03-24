@@ -3,9 +3,10 @@ use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use super::bptree::BPTree;
-use super::compact_value::RedisValueRef;
+use super::compact_value::{CompactValue, RedisValueRef};
 use super::dashtable::DashTable;
 use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
+use super::intset::Intset;
 use crate::protocol::Frame;
 
 /// Maximum number of entries in a listpack before upgrading to full encoding.
@@ -446,6 +447,56 @@ impl Database {
         }
     }
 
+    /// Get or create an intset entry. Creates a new SetIntset if the key doesn't exist.
+    /// Returns Err if the key exists but holds a non-set type.
+    /// Returns Ok(None) if the key exists but is not an intset (caller should use get_or_create_set).
+    /// Returns Ok(Some(&mut Intset)) if the key holds or was created as an intset.
+    pub fn get_or_create_intset(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&mut Intset>, Frame> {
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        if !self.data.contains_key(key) {
+            let entry = Entry::new_set_intset();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SetIntset(is)) => Ok(Some(is)),
+            Some(RedisValue::Set(_)) | Some(RedisValue::SetListpack(_)) => Ok(None),
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
+    /// Upgrade an intset entry to a full HashSet and return mutable ref.
+    /// Panics if the key doesn't exist or isn't a SetIntset.
+    pub fn upgrade_intset_to_set(
+        &mut self,
+        key: &[u8],
+    ) -> &mut HashSet<Bytes> {
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SetIntset(is)) => {
+                let set = is.to_hash_set();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+            }
+            _ => {}
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::Set(set)) => set,
+            _ => unreachable!("upgrade_intset_to_set: expected Set after upgrade"),
+        }
+    }
+
     /// Get or create a sorted set entry. Returns mutable refs to both inner structures.
     ///
     /// New keys start with SortedSetBPTree encoding. Legacy SortedSet (BTreeMap)
@@ -456,7 +507,7 @@ impl Database {
     ) -> Result<
         (
             &mut HashMap<Bytes, f64>,
-            &mut BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+            &mut BPTree,
         ),
         Frame,
     > {
@@ -468,14 +519,27 @@ impl Database {
             }
         }
         if !self.data.contains_key(key) {
-            let entry = Entry::new_sorted_set();
+            let entry = Entry::new_sorted_set_bptree();
             let k = Bytes::copy_from_slice(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
+        // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
         let entry = self.data.get_mut(key).unwrap();
+        if let Some(RedisValue::SortedSet { members, scores }) = entry.value.as_redis_value_mut() {
+            let mut tree = BPTree::new();
+            let new_members = std::mem::take(members);
+            let old_scores = std::mem::take(scores);
+            for ((score, member), ()) in old_scores {
+                tree.insert(score, member);
+            }
+            entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
+                tree,
+                members: new_members,
+            });
+        }
         match entry.value.as_redis_value_mut() {
-            Some(RedisValue::SortedSet { members, scores }) => Ok((members, scores)),
+            Some(RedisValue::SortedSetBPTree { members, tree }) => Ok((members, tree)),
             _ => Err(Self::wrongtype_error()),
         }
     }
@@ -487,7 +551,7 @@ impl Database {
     ) -> Result<
         Option<(
             &HashMap<Bytes, f64>,
-            &BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+            &BPTree,
         )>,
         Frame,
     > {
@@ -498,10 +562,29 @@ impl Database {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
         }
+        // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
+        if let Some(entry) = self.data.get(key) {
+            if matches!(entry.value.as_redis_value(), RedisValueRef::SortedSet { .. }) {
+                let entry = self.data.get_mut(key).unwrap();
+                if let Some(RedisValue::SortedSet { members, scores }) = entry.value.as_redis_value_mut() {
+                    let mut tree = BPTree::new();
+                    let new_members = std::mem::take(members);
+                    let old_scores = std::mem::take(scores);
+                    for ((score, member), ()) in old_scores {
+                        tree.insert(score, member);
+                    }
+                    entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
+                        tree,
+                        members: new_members,
+                    });
+                }
+            }
+        }
         match self.data.get(key) {
             None => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::SortedSet { members, scores } => Ok(Some((members, scores))),
+                RedisValueRef::SortedSetBPTree { tree, members } => Ok(Some((members, tree))),
+                RedisValueRef::SortedSet { .. } => unreachable!("should have been upgraded"),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -620,7 +703,7 @@ impl Database {
     ) -> Result<
         Option<(
             &HashMap<Bytes, f64>,
-            &BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
+            &BPTree,
         )>,
         Frame,
     > {
@@ -629,8 +712,8 @@ impl Database {
             None => Ok(None),
             Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
-                RedisValueRef::SortedSet { members, scores } => Ok(Some((members, scores))),
-                RedisValueRef::SortedSetBPTree { .. }
+                RedisValueRef::SortedSetBPTree { tree, members } => Ok(Some((members, tree))),
+                RedisValueRef::SortedSet { .. }
                 | RedisValueRef::SortedSetListpack(_) => Ok(None),
                 _ => Err(Self::wrongtype_error()),
             },
@@ -800,7 +883,7 @@ mod tests {
         let mut db = Database::new();
         let (members, scores) = db.get_or_create_sorted_set(b"myzset").unwrap();
         members.insert(Bytes::from_static(b"a"), 1.0);
-        scores.insert((OrderedFloat(1.0), Bytes::from_static(b"a")), ());
+        scores.insert(OrderedFloat(1.0), Bytes::from_static(b"a"));
         let (members, scores) = db.get_sorted_set(b"myzset").unwrap().unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(scores.len(), 1);
