@@ -79,6 +79,18 @@ pub enum ShardMessage {
     UnregisterReplica {
         replica_id: u64,
     },
+    /// Return keys in a specific hash slot (for CLUSTER GETKEYSINSLOT).
+    GetKeysInSlot {
+        db_index: usize,
+        slot: u16,
+        count: usize,
+        reply_tx: tokio::sync::oneshot::Sender<Vec<bytes::Bytes>>,
+    },
+    /// Notify shard of slot ownership changes (no-op placeholder for future per-shard caching).
+    SlotOwnershipUpdate {
+        add_slots: Vec<u16>,
+        remove_slots: Vec<u16>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }

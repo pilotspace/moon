@@ -694,6 +694,27 @@ impl Shard {
             ShardMessage::BlockCancel { wait_id } => {
                 blocking_registry.borrow_mut().remove_wait(wait_id);
             }
+            ShardMessage::GetKeysInSlot {
+                db_index,
+                slot,
+                count,
+                reply_tx,
+            } => {
+                let keys = crate::cluster::migration::handle_get_keys_in_slot(
+                    &databases.borrow(),
+                    db_index,
+                    slot,
+                    count,
+                );
+                let _ = reply_tx.send(keys);
+            }
+            ShardMessage::SlotOwnershipUpdate {
+                add_slots: _,
+                remove_slots: _,
+            } => {
+                // Slot ownership is tracked in ClusterState, not per-shard.
+                // This message is a no-op notification for future per-shard slot caching.
+            }
             ShardMessage::Shutdown => {
                 info!("Received shutdown via SPSC");
             }

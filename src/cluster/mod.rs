@@ -5,7 +5,9 @@
 
 pub mod bus;
 pub mod command;
+pub mod failover;
 pub mod gossip;
+pub mod migration;
 pub mod slots;
 
 use std::collections::HashMap;
