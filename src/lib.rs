@@ -1,5 +1,6 @@
 pub mod command;
 pub mod config;
+pub mod io;
 pub mod persistence;
 pub mod protocol;
 pub mod pubsub;
