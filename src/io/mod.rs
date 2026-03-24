@@ -88,4 +88,49 @@ mod tests {
         assert_eq!(EVENT_TIMEOUT, 4);
         assert_eq!(EVENT_WAKEUP, 5);
     }
+
+    #[test]
+    fn test_event_constants_unique() {
+        let constants = [EVENT_ACCEPT, EVENT_RECV, EVENT_SEND, EVENT_TIMEOUT, EVENT_WAKEUP];
+        for i in 0..constants.len() {
+            for j in (i + 1)..constants.len() {
+                assert_ne!(
+                    constants[i], constants[j],
+                    "EVENT constants must be unique: index {} and {} both = {}",
+                    i, j, constants[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_all_event_types() {
+        // Verify roundtrip for each event type constant
+        for &et in &[EVENT_ACCEPT, EVENT_RECV, EVENT_SEND, EVENT_TIMEOUT, EVENT_WAKEUP] {
+            let encoded = encode_user_data(et, 100, 200);
+            let (dec_et, dec_cid, dec_aux) = decode_user_data(encoded);
+            assert_eq!(dec_et, et, "event type roundtrip failed for {}", et);
+            assert_eq!(dec_cid, 100);
+            assert_eq!(dec_aux, 200);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_max_aux() {
+        let encoded = encode_user_data(EVENT_ACCEPT, 1, u32::MAX);
+        let (et, cid, aux) = decode_user_data(encoded);
+        assert_eq!(et, EVENT_ACCEPT);
+        assert_eq!(cid, 1);
+        assert_eq!(aux, u32::MAX);
+    }
+
+    #[test]
+    fn test_encode_decode_max_event_type() {
+        // Event type is u8, max = 255
+        let encoded = encode_user_data(u8::MAX, 0, 0);
+        let (et, cid, aux) = decode_user_data(encoded);
+        assert_eq!(et, u8::MAX);
+        assert_eq!(cid, 0);
+        assert_eq!(aux, 0);
+    }
 }

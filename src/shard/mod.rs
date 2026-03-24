@@ -555,4 +555,91 @@ mod tests {
 
         Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub);
     }
+
+    #[test]
+    fn test_extract_command_static_ping() {
+        let frame = Frame::Array(vec![
+            Frame::BulkString(Bytes::from_static(b"PING")),
+        ]);
+        let (cmd, args) = Shard::extract_command_static(&frame).unwrap();
+        assert_eq!(cmd, b"PING");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_extract_command_static_with_args() {
+        let frame = Frame::Array(vec![
+            Frame::BulkString(Bytes::from_static(b"SET")),
+            Frame::BulkString(Bytes::from_static(b"key")),
+            Frame::BulkString(Bytes::from_static(b"value")),
+        ]);
+        let (cmd, args) = Shard::extract_command_static(&frame).unwrap();
+        assert_eq!(cmd, b"SET");
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_command_static_invalid() {
+        // Non-array frame
+        let frame = Frame::SimpleString(Bytes::from_static(b"PING"));
+        assert!(Shard::extract_command_static(&frame).is_none());
+
+        // Empty array
+        let frame = Frame::Array(vec![]);
+        assert!(Shard::extract_command_static(&frame).is_none());
+
+        // Array with non-string first element
+        let frame = Frame::Array(vec![Frame::Integer(42)]);
+        assert!(Shard::extract_command_static(&frame).is_none());
+    }
+
+    /// Linux-only: verify handle_uring_event processes Disconnect correctly.
+    /// This test only compiles and runs on Linux CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_handle_uring_event_disconnect() {
+        use crate::io::{IoEvent, UringConfig, UringDriver};
+
+        let config = RuntimeConfig::default();
+        let mut shard = Shard::new(0, 1, 1, config);
+        let databases = Rc::new(RefCell::new(std::mem::take(&mut shard.databases)));
+        let mut parse_bufs = std::collections::HashMap::new();
+        parse_bufs.insert(42u32, bytes::BytesMut::from(&b"partial"[..]));
+
+        let mut driver = UringDriver::new(UringConfig::default()).unwrap();
+        driver.init().unwrap();
+
+        // Process disconnect event -- should clean up parse buffer
+        Shard::handle_uring_event(
+            IoEvent::Disconnect { conn_id: 42 },
+            &mut driver,
+            &databases,
+            &mut parse_bufs,
+        );
+
+        assert!(!parse_bufs.contains_key(&42), "parse buffer should be removed on disconnect");
+    }
+
+    /// Linux-only: verify handle_uring_event processes SendComplete as no-op.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_handle_uring_event_send_complete() {
+        use crate::io::{IoEvent, UringConfig, UringDriver};
+
+        let config = RuntimeConfig::default();
+        let mut shard = Shard::new(0, 1, 1, config);
+        let databases = Rc::new(RefCell::new(std::mem::take(&mut shard.databases)));
+        let mut parse_bufs = std::collections::HashMap::new();
+
+        let mut driver = UringDriver::new(UringConfig::default()).unwrap();
+        driver.init().unwrap();
+
+        // SendComplete should be a no-op (no panic)
+        Shard::handle_uring_event(
+            IoEvent::SendComplete { conn_id: 1 },
+            &mut driver,
+            &databases,
+            &mut parse_bufs,
+        );
+    }
 }
