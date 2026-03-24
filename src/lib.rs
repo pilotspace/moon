@@ -7,6 +7,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod pubsub;
 pub mod replication;
+pub mod scripting;
 pub mod server;
 pub mod shard;
 pub mod storage;
