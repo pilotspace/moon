@@ -5,6 +5,7 @@ pub mod io;
 pub mod persistence;
 pub mod protocol;
 pub mod pubsub;
+pub mod replication;
 pub mod server;
 pub mod shard;
 pub mod storage;
