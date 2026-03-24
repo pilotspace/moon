@@ -561,6 +561,14 @@ impl Shard {
                                 );
                             }
                         }
+                        if cmd.eq_ignore_ascii_case(b"XADD") {
+                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
+                                let mut reg = blocking_registry.borrow_mut();
+                                crate::blocking::wakeup::try_wake_stream_waiter(
+                                    &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                );
+                            }
+                        }
                     }
 
                     frame
@@ -637,6 +645,7 @@ impl Shard {
                     let db = &mut dbs[db_index];
                     crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, db_index, &key);
                     crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, db_index, &key);
+                    crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, db, db_index, &key);
                 }
             }
             ShardMessage::BlockCancel { wait_id } => {

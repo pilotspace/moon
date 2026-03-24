@@ -131,6 +131,88 @@ pub fn try_wake_zset_waiter(
     false
 }
 
+/// Called after XADD successfully adds an entry to a stream key.
+/// Pops the first waiter (FIFO) and checks if the stream has entries > last_seen_id.
+/// For XRead: delivers entries from stream.range(last_seen_id+1.., count).
+/// For XReadGroup with >: delivers via stream.read_group_new().
+/// Returns true if a blocked client was woken.
+pub fn try_wake_stream_waiter(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    key: &Bytes,
+) -> bool {
+    use crate::command::stream::format_entry;
+    use crate::storage::stream::StreamId;
+
+    while registry.has_waiters(db_index, key) {
+        let waiter = match registry.pop_front(db_index, key) {
+            Some(w) => w,
+            None => return false,
+        };
+        let wait_id = waiter.wait_id;
+
+        let result = match &waiter.cmd {
+            BlockedCommand::XRead { streams, count } => {
+                // Find this key's last_seen_id in the streams list
+                let last_seen = streams.iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, id)| *id);
+                if let Some(last_id) = last_seen {
+                    if let Ok(Some(stream)) = db.get_stream(key) {
+                        let start = if last_id.seq == u64::MAX {
+                            StreamId { ms: last_id.ms.saturating_add(1), seq: 0 }
+                        } else {
+                            StreamId { ms: last_id.ms, seq: last_id.seq.saturating_add(1) }
+                        };
+                        let entries = stream.range(start, StreamId::MAX, *count);
+                        if !entries.is_empty() {
+                            let entry_frames: Vec<crate::protocol::Frame> = entries.iter()
+                                .map(|(id, fields)| format_entry(*id, fields))
+                                .collect();
+                            Some(crate::protocol::Frame::Array(vec![
+                                crate::protocol::Frame::Array(vec![
+                                    crate::protocol::Frame::BulkString(key.clone()),
+                                    crate::protocol::Frame::Array(entry_frames),
+                                ])
+                            ]))
+                        } else { None }
+                    } else { None }
+                } else { None }
+            }
+            BlockedCommand::XReadGroup { group, consumer, count, noack, .. } => {
+                if let Ok(Some(stream)) = db.get_stream_mut(key) {
+                    match stream.read_group_new(group, consumer, *count, *noack) {
+                        Ok(entries) if !entries.is_empty() => {
+                            let entry_frames: Vec<crate::protocol::Frame> = entries.iter()
+                                .map(|(id, fields)| format_entry(*id, fields))
+                                .collect();
+                            Some(crate::protocol::Frame::Array(vec![
+                                crate::protocol::Frame::Array(vec![
+                                    crate::protocol::Frame::BulkString(key.clone()),
+                                    crate::protocol::Frame::Array(entry_frames),
+                                ])
+                            ]))
+                        }
+                        _ => None,
+                    }
+                } else { None }
+            }
+            _ => None, // List/zset commands don't watch stream keys
+        };
+
+        // Clean up all other key registrations for this wait_id
+        registry.remove_wait(wait_id);
+
+        if let Some(frame) = result {
+            let _ = waiter.reply_tx.send(Some(frame));
+            return true;
+        }
+        let _ = waiter.reply_tx.send(None);
+    }
+    false
+}
+
 /// Format a float score the same way Redis does (integer if whole, otherwise full precision).
 fn format_score(score: f64) -> String {
     if score == score.floor() && score.abs() < i64::MAX as f64 {

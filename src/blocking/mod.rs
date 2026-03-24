@@ -24,6 +24,18 @@ pub enum BlockedCommand {
     },
     BZPopMin,
     BZPopMax,
+    XRead {
+        /// (key, last_seen_id) pairs -- read entries > last_seen_id from each stream.
+        streams: Vec<(Bytes, crate::storage::stream::StreamId)>,
+        count: Option<usize>,
+    },
+    XReadGroup {
+        group: Bytes,
+        consumer: Bytes,
+        streams: Vec<(Bytes, crate::storage::stream::StreamId)>,
+        count: Option<usize>,
+        noack: bool,
+    },
 }
 
 /// A single blocked client waiting for data on a key.
