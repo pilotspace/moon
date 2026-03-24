@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use crate::config::{RuntimeConfig, ServerConfig};
+use crate::config::ServerConfig;
 use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
 use crate::persistence::rdb;
 use crate::pubsub::PubSubRegistry;
@@ -166,6 +166,57 @@ pub async fn run_with_shutdown(
                 if let Some(ref tx) = aof_tx {
                     let _ = tx.send(AofMessage::Shutdown).await;
                 }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the sharded accept loop. Listener distributes connections to shard threads.
+///
+/// The listener runs on its own current_thread runtime (the main thread).
+/// It does NOT own any database state -- all data lives in shard threads.
+pub async fn run_sharded(
+    config: ServerConfig,
+    conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", config.bind, config.port);
+    let listener = TcpListener::bind(&addr).await?;
+    let num_shards = conn_txs.len();
+    info!("Listening on {} ({} shards)", addr, num_shards);
+
+    let mut next_shard: usize = 0;
+
+    // Ctrl+C handler
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Shutdown signal received");
+        shutdown_signal.cancel();
+    });
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        debug!("New connection from {} -> shard {}", addr, next_shard);
+                        let tx = &conn_txs[next_shard];
+                        if tx.send(stream).await.is_err() {
+                            error!("Failed to send connection to shard {}", next_shard);
+                        }
+                        next_shard = (next_shard + 1) % num_shards;
+                    }
+                    Err(e) => {
+                        error!("Accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                info!("Listener shutting down");
                 break;
             }
         }

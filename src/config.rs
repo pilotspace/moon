@@ -55,6 +55,10 @@ pub struct ServerConfig {
     /// Number of random keys to sample for eviction
     #[arg(long, default_value_t = 5)]
     pub maxmemory_samples: usize,
+
+    /// Number of shards (0 = auto-detect from CPU count)
+    #[arg(long, default_value_t = 0)]
+    pub shards: usize,
 }
 
 impl ServerConfig {

@@ -36,6 +36,14 @@ pub async fn run_active_expiration(
     }
 }
 
+/// Public entry point for per-shard active expiry.
+///
+/// Shards call this directly on their owned databases without going through
+/// the `SharedDatabases` wrapper (no Arc/RwLock needed in shared-nothing mode).
+pub fn expire_cycle_direct(db: &mut Database) {
+    expire_cycle(db);
+}
+
 /// Run one probabilistic expiration cycle on a single database.
 ///
 /// Samples up to 20 random keys that have an expiry set. If more than 25%
