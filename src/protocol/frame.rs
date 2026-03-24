@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use ordered_float::OrderedFloat;
 use thiserror::Error;
 
 /// Default maximum size for bulk strings (512 MB).
@@ -10,12 +11,13 @@ pub const DEFAULT_MAX_ARRAY_DEPTH: usize = 8;
 /// Default maximum number of elements in an array.
 pub const DEFAULT_MAX_ARRAY_LENGTH: usize = 1024 * 1024;
 
-/// A RESP2 protocol frame.
+/// A RESP2/RESP3 protocol frame.
 ///
 /// All string payloads use `Bytes` for zero-copy semantics.
 /// No lifetime parameters -- Bytes is reference-counted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Frame {
+    // === RESP2 variants ===
     /// `+<string>\r\n` -- Non-binary status reply
     SimpleString(Bytes),
     /// `-<error>\r\n` -- Error reply
@@ -26,8 +28,59 @@ pub enum Frame {
     BulkString(Bytes),
     /// `*<count>\r\n<elements...>` -- Ordered collection of frames
     Array(Vec<Frame>),
-    /// `$-1\r\n` or `*-1\r\n` -- Null value
+    /// `$-1\r\n` (RESP2) or `_\r\n` (RESP3) -- Null value
     Null,
+
+    // === RESP3 variants ===
+    /// `%<count>\r\n<key><value>...` -- Key-value map
+    Map(Vec<(Frame, Frame)>),
+    /// `~<count>\r\n<elements...>` -- Unordered set of frames
+    Set(Vec<Frame>),
+    /// `,<double>\r\n` -- IEEE 754 double-precision float
+    Double(f64),
+    /// `#t\r\n` or `#f\r\n` -- Boolean value
+    Boolean(bool),
+    /// `=<len>\r\n<enc>:<data>\r\n` -- Verbatim string with encoding hint
+    VerbatimString {
+        /// 3-byte encoding hint (e.g. "txt", "mkd")
+        encoding: Bytes,
+        /// The string data
+        data: Bytes,
+    },
+    /// `(<number>\r\n` -- Arbitrary precision integer as bytes
+    BigNumber(Bytes),
+    /// `><count>\r\n<elements...>` -- Push data (server-initiated)
+    Push(Vec<Frame>),
+}
+
+impl PartialEq for Frame {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::SimpleString(a), Self::SimpleString(b)) => a == b,
+            (Self::Error(a), Self::Error(b)) => a == b,
+            (Self::Integer(a), Self::Integer(b)) => a == b,
+            (Self::BulkString(a), Self::BulkString(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Null, Self::Null) => true,
+            (Self::Map(a), Self::Map(b)) => a == b,
+            (Self::Set(a), Self::Set(b)) => a == b,
+            (Self::Double(a), Self::Double(b)) => OrderedFloat(*a) == OrderedFloat(*b),
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (
+                Self::VerbatimString {
+                    encoding: ae,
+                    data: ad,
+                },
+                Self::VerbatimString {
+                    encoding: be,
+                    data: bd,
+                },
+            ) => ae == be && ad == bd,
+            (Self::BigNumber(a), Self::BigNumber(b)) => a == b,
+            (Self::Push(a), Self::Push(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Errors that can occur when parsing RESP2 frames.

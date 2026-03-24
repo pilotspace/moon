@@ -17,9 +17,11 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
         return Ok(None);
     }
 
-    // Dispatch: RESP-prefixed bytes go to RESP parser, everything else is inline
+    // Dispatch: RESP2/RESP3 prefixed bytes go to RESP parser, everything else is inline
     match buf[0] {
-        b'+' | b'-' | b':' | b'$' | b'*' => { /* fall through to RESP parsing below */ }
+        b'+' | b'-' | b':' | b'$' | b'*' // RESP2
+        | b'%' | b'~' | b',' | b'#' | b'_' | b'=' | b'(' | b'>' // RESP3
+        => { /* fall through to RESP parsing below */ }
         _ => return inline::parse_inline(buf),
     }
 
@@ -180,6 +182,178 @@ fn parse_single_frame(
                 items.push(parse_single_frame(buf, pos, config, depth + 1)?);
             }
             Ok(Frame::Array(items))
+        }
+        // === RESP3 types ===
+        b'_' => {
+            // RESP3 Null: `_\r\n`
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            *pos = crlf + 2;
+            Ok(Frame::Null)
+        }
+        b'#' => {
+            // RESP3 Boolean: `#t\r\n` or `#f\r\n`
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            let val = match line {
+                b"t" => true,
+                b"f" => false,
+                _ => {
+                    return Err(ParseError::Invalid {
+                        message: format!(
+                            "invalid boolean value: {:?}",
+                            String::from_utf8_lossy(line)
+                        ),
+                        offset: *pos,
+                    });
+                }
+            };
+            *pos = crlf + 2;
+            Ok(Frame::Boolean(val))
+        }
+        b',' => {
+            // RESP3 Double: `,<double>\r\n`
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
+                message: "invalid UTF-8 in double".into(),
+                offset: *pos,
+            })?;
+            let val = if s.eq_ignore_ascii_case("inf") {
+                f64::INFINITY
+            } else if s.eq_ignore_ascii_case("-inf") {
+                f64::NEG_INFINITY
+            } else if s.eq_ignore_ascii_case("nan") {
+                f64::NAN
+            } else {
+                s.parse::<f64>().map_err(|_| ParseError::Invalid {
+                    message: format!("invalid double: {:?}", s),
+                    offset: *pos,
+                })?
+            };
+            *pos = crlf + 2;
+            Ok(Frame::Double(val))
+        }
+        b'(' => {
+            // RESP3 BigNumber: `(<number>\r\n`
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            *pos = crlf + 2;
+            Ok(Frame::BigNumber(Bytes::copy_from_slice(line)))
+        }
+        b'=' => {
+            // RESP3 VerbatimString: `=<len>\r\n<enc>:<data>\r\n`
+            let len = read_decimal(buf, pos)?;
+            if len < 4 {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "verbatim string length {} too short (minimum 4 for encoding + colon)",
+                        len
+                    ),
+                    offset: *pos,
+                });
+            }
+            let len = len as usize;
+            if len > config.max_bulk_string_size {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "verbatim string size {} exceeds maximum {}",
+                        len, config.max_bulk_string_size
+                    ),
+                    offset: *pos,
+                });
+            }
+            let remaining = buf.len() - *pos;
+            if remaining < len + 2 {
+                return Err(ParseError::Incomplete);
+            }
+            let payload = &buf[*pos..*pos + len];
+            if payload[3] != b':' {
+                return Err(ParseError::Invalid {
+                    message: "verbatim string missing ':' after 3-byte encoding".into(),
+                    offset: *pos + 3,
+                });
+            }
+            let encoding = Bytes::copy_from_slice(&payload[..3]);
+            let data = Bytes::copy_from_slice(&payload[4..]);
+            *pos += len + 2;
+            Ok(Frame::VerbatimString { encoding, data })
+        }
+        b'%' => {
+            // RESP3 Map: `%<count>\r\n<key><value>...`
+            let count = read_decimal(buf, pos)?;
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid map length: {}", count),
+                    offset: *pos,
+                });
+            }
+            let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "map length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
+                    offset: *pos,
+                });
+            }
+            let mut pairs = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key = parse_single_frame(buf, pos, config, depth + 1)?;
+                let value = parse_single_frame(buf, pos, config, depth + 1)?;
+                pairs.push((key, value));
+            }
+            Ok(Frame::Map(pairs))
+        }
+        b'~' => {
+            // RESP3 Set: `~<count>\r\n<elements...>`
+            let count = read_decimal(buf, pos)?;
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid set length: {}", count),
+                    offset: *pos,
+                });
+            }
+            let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "set length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
+                    offset: *pos,
+                });
+            }
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(parse_single_frame(buf, pos, config, depth + 1)?);
+            }
+            Ok(Frame::Set(items))
+        }
+        b'>' => {
+            // RESP3 Push: `><count>\r\n<elements...>`
+            let count = read_decimal(buf, pos)?;
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid push length: {}", count),
+                    offset: *pos,
+                });
+            }
+            let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "push length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
+                    offset: *pos,
+                });
+            }
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(parse_single_frame(buf, pos, config, depth + 1)?);
+            }
+            Ok(Frame::Push(items))
         }
         byte => Err(ParseError::Invalid {
             message: format!("unknown type byte: 0x{:02x}", byte),
@@ -455,5 +629,140 @@ mod tests {
             result,
             Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
+    }
+
+    // === RESP3 parse tests ===
+
+    #[test]
+    fn test_parse_resp3_null() {
+        let result = parse_bytes(b"_\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Null);
+    }
+
+    #[test]
+    fn test_parse_resp3_boolean_true() {
+        let result = parse_bytes(b"#t\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Boolean(true));
+    }
+
+    #[test]
+    fn test_parse_resp3_boolean_false() {
+        let result = parse_bytes(b"#f\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Boolean(false));
+    }
+
+    #[test]
+    fn test_parse_resp3_double() {
+        let result = parse_bytes(b",1.23\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Double(1.23));
+    }
+
+    #[test]
+    fn test_parse_resp3_double_inf() {
+        let result = parse_bytes(b",inf\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Double(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_parse_resp3_double_neg_inf() {
+        let result = parse_bytes(b",-inf\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Double(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_parse_resp3_big_number() {
+        let result = parse_bytes(b"(3492890328409238509324850943850943825024385\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            Frame::BigNumber(Bytes::from_static(
+                b"3492890328409238509324850943850943825024385"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_resp3_verbatim_string() {
+        let result = parse_bytes(b"=15\r\ntxt:Some string\r\n").unwrap().unwrap();
+        assert_eq!(
+            result,
+            Frame::VerbatimString {
+                encoding: Bytes::from_static(b"txt"),
+                data: Bytes::from_static(b"Some string"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_resp3_map() {
+        let result = parse_bytes(b"%2\r\n+key1\r\n:1\r\n+key2\r\n:2\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            Frame::Map(vec![
+                (
+                    Frame::SimpleString(Bytes::from_static(b"key1")),
+                    Frame::Integer(1)
+                ),
+                (
+                    Frame::SimpleString(Bytes::from_static(b"key2")),
+                    Frame::Integer(2)
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_resp3_set() {
+        let result = parse_bytes(b"~3\r\n+a\r\n+b\r\n+c\r\n").unwrap().unwrap();
+        assert_eq!(
+            result,
+            Frame::Set(vec![
+                Frame::SimpleString(Bytes::from_static(b"a")),
+                Frame::SimpleString(Bytes::from_static(b"b")),
+                Frame::SimpleString(Bytes::from_static(b"c")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_resp3_push() {
+        let result = parse_bytes(b">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            Frame::Push(vec![
+                Frame::BulkString(Bytes::from_static(b"invalidate")),
+                Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"foo"))]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_resp3_incomplete_boolean() {
+        let (result, _) = parse_bytes_with_buf(b"#t");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_resp3_incomplete_map() {
+        let (result, _) = parse_bytes_with_buf(b"%2\r\n+key1\r\n");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_resp3_incomplete_double() {
+        let (result, _) = parse_bytes_with_buf(b",1.23");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_resp3_boolean_invalid() {
+        // #foo is not a valid boolean, should error (not route to inline)
+        let result = parse_bytes(b"#foo\r\n");
+        assert!(result.is_err());
     }
 }

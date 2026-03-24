@@ -41,6 +41,72 @@ pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
         Frame::Null => {
             buf.put_slice(b"$-1\r\n");
         }
+        // RESP3 types downgraded to RESP2 format
+        Frame::Map(entries) => {
+            // Downgrade: flat array [k1, v1, k2, v2, ...]
+            buf.put_u8(b'*');
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(entries.len() * 2).as_bytes());
+            buf.put_slice(b"\r\n");
+            for (key, value) in entries {
+                serialize(key, buf);
+                serialize(value, buf);
+            }
+        }
+        Frame::Set(items) | Frame::Push(items) => {
+            // Downgrade: serialize as Array
+            buf.put_u8(b'*');
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(items.len()).as_bytes());
+            buf.put_slice(b"\r\n");
+            for item in items {
+                serialize(item, buf);
+            }
+        }
+        Frame::Double(f) => {
+            // Downgrade: BulkString of formatted float
+            let s = if f.is_infinite() {
+                if f.is_sign_positive() {
+                    "inf".to_string()
+                } else {
+                    "-inf".to_string()
+                }
+            } else if f.is_nan() {
+                "nan".to_string()
+            } else {
+                format!("{}", f)
+            };
+            buf.put_u8(b'$');
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(s.len()).as_bytes());
+            buf.put_slice(b"\r\n");
+            buf.put_slice(s.as_bytes());
+            buf.put_slice(b"\r\n");
+        }
+        Frame::Boolean(b) => {
+            // Downgrade: Integer 1 or 0
+            buf.put_u8(b':');
+            buf.put_slice(if *b { b"1" } else { b"0" });
+            buf.put_slice(b"\r\n");
+        }
+        Frame::VerbatimString { data, .. } => {
+            // Downgrade: BulkString of data (drop encoding hint)
+            buf.put_u8(b'$');
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(data.len()).as_bytes());
+            buf.put_slice(b"\r\n");
+            buf.put_slice(data);
+            buf.put_slice(b"\r\n");
+        }
+        Frame::BigNumber(n) => {
+            // Downgrade: BulkString of number bytes
+            buf.put_u8(b'$');
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.put_slice(itoa_buf.format(n.len()).as_bytes());
+            buf.put_slice(b"\r\n");
+            buf.put_slice(n);
+            buf.put_slice(b"\r\n");
+        }
     }
 }
 
