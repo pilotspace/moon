@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::command::persistence::{bgsave_start, SAVE_IN_PROGRESS};
+use crate::command::persistence::{bgsave_start, SAVE_IN_PROGRESS, SNAPSHOT_EPOCH};
 use crate::storage::Database;
 
 /// Type alias for the per-database RwLock container.
@@ -70,6 +70,47 @@ pub async fn run_auto_save(
                 if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
                     info!("Auto-save triggered: {} changes in {}s", changes, elapsed);
                     let _ = bgsave_start(db.clone(), dir.clone(), dbfilename.clone());
+                    change_counter.store(0, Ordering::Relaxed);
+                    last_save = Instant::now();
+                }
+            }
+            _ = cancel.cancelled() => {
+                info!("Auto-save task shutting down");
+                break;
+            }
+        }
+    }
+}
+
+/// Background auto-save task for sharded mode.
+///
+/// Instead of calling `bgsave_start` (which clones data under locks), this bumps
+/// the snapshot epoch via a `tokio::sync::watch::Sender<u64>`. Each shard's event
+/// loop subscribes to the watch channel and initiates a cooperative snapshot when
+/// the epoch changes.
+pub async fn run_auto_save_sharded(
+    rules: Vec<(u64, u64)>,
+    change_counter: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    snapshot_trigger: tokio::sync::watch::Sender<u64>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut last_save = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let elapsed = last_save.elapsed().as_secs();
+                let changes = change_counter.load(Ordering::Relaxed);
+
+                let should_save = rules.iter().any(|&(secs, threshold)| {
+                    elapsed >= secs && changes >= threshold
+                });
+
+                if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+                    let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+                    info!("Auto-save triggered: {} changes in {}s, epoch {}", changes, elapsed, epoch);
+                    let _ = snapshot_trigger.send(epoch);
                     change_counter.store(0, Ordering::Relaxed);
                     last_save = Instant::now();
                 }

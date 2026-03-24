@@ -114,6 +114,11 @@ fn main() -> anyhow::Result<()> {
                     shard_config.to_runtime_config(),
                 );
 
+                // Restore shard state from per-shard snapshot + WAL
+                if let Some(ref dir) = shard_persistence_dir {
+                    shard.restore_from_persistence(dir);
+                }
+
                 rt.block_on(shard.run(
                     conn_rx,
                     consumers,
@@ -136,8 +141,27 @@ fn main() -> anyhow::Result<()> {
         .build()
         .expect("failed to build listener runtime");
 
+    // Set up change counter for auto-save
+    let change_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let listener_cancel = cancel_token.clone();
     listener_rt.block_on(async {
+        // Set up auto-save timer if save rules are configured (sharded mode)
+        if config.save.is_some() {
+            let rules = rust_redis::persistence::auto_save::parse_save_rules(&config.save);
+            if !rules.is_empty() {
+                let auto_save_token = cancel_token.child_token();
+                let auto_save_counter = change_counter.clone();
+                tokio::spawn(rust_redis::persistence::auto_save::run_auto_save_sharded(
+                    rules,
+                    auto_save_counter,
+                    auto_save_token,
+                    snapshot_trigger_tx,
+                ));
+                info!("Auto-save timer started (sharded mode)");
+            }
+        }
+
         if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel).await {
             tracing::error!("Listener error: {}", e);
         }

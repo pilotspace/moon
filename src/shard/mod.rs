@@ -71,6 +71,49 @@ impl Shard {
         }
     }
 
+    /// Restore shard state from per-shard snapshot and WAL files at startup.
+    ///
+    /// Loads the per-shard RRDSHARD snapshot file first (if it exists), then replays
+    /// the per-shard WAL for any commands written after the last snapshot.
+    /// Returns total keys loaded (snapshot + WAL replay).
+    pub fn restore_from_persistence(&mut self, persistence_dir: &str) -> usize {
+        use crate::persistence::snapshot::shard_snapshot_load;
+        use crate::persistence::wal;
+
+        let dir = std::path::Path::new(persistence_dir);
+        let mut total_keys = 0;
+
+        // Load per-shard snapshot
+        let snap_path = dir.join(format!("shard-{}.rrdshard", self.id));
+        if snap_path.exists() {
+            match shard_snapshot_load(&mut self.databases, &snap_path) {
+                Ok(n) => {
+                    info!("Shard {}: loaded {} keys from snapshot", self.id, n);
+                    total_keys += n;
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: snapshot load failed: {}", self.id, e);
+                }
+            }
+        }
+
+        // Replay per-shard WAL
+        let wal_file = wal::wal_path(dir, self.id);
+        if wal_file.exists() {
+            match wal::replay_wal(&mut self.databases, &wal_file) {
+                Ok(n) => {
+                    info!("Shard {}: replayed {} WAL commands", self.id, n);
+                    total_keys += n;
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: WAL replay failed: {}", self.id, e);
+                }
+            }
+        }
+
+        total_keys
+    }
+
     /// Run the shard event loop on its dedicated current_thread runtime.
     ///
     /// Wraps shard databases, pubsub registry, and SPSC producers in `Rc<RefCell<...>>`

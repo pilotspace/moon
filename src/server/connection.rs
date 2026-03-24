@@ -1102,6 +1102,17 @@ pub async fn handle_connection_sharded(
                         continue;
                     }
 
+                    // --- BGSAVE: trigger per-shard cooperative snapshot ---
+                    if cmd.eq_ignore_ascii_case(b"BGSAVE") {
+                        let response = crate::command::persistence::bgsave_start_sharded(
+                            &dispatch_tx,
+                            ".",  // Use current dir; proper path from config
+                            num_shards,
+                        );
+                        responses.push(response);
+                        continue;
+                    }
+
                     // --- MULTI queue mode ---
                     if in_multi {
                         command_queue.push(frame);

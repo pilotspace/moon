@@ -2410,8 +2410,9 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     );
 
+                    let (_, snap_rx) = tokio::sync::watch::channel(0u64);
                     rt.block_on(local.run_until(
-                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None),
+                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx),
                     ));
                 })
                 .expect("failed to spawn shard thread");
