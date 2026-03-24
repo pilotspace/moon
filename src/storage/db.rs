@@ -7,6 +7,7 @@ use super::compact_value::{CompactValue, RedisValueRef};
 use super::dashtable::DashTable;
 use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
 use super::intset::Intset;
+use super::stream::Stream as StreamData;
 use crate::protocol::Frame;
 
 /// Maximum number of entries in a listpack before upgrading to full encoding.
@@ -886,6 +887,66 @@ impl Database {
             self.remove(key);
         }
         Some(result)
+    }
+
+    /// Get or create a stream at the given key. Returns WRONGTYPE if key holds another type.
+    pub fn get_or_create_stream(&mut self, key: &[u8]) -> Result<&mut StreamData, Frame> {
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        if !self.data.contains_key(key) {
+            let entry = Entry::new_stream();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::Stream(s)) => Ok(s.as_mut()),
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
+    /// Get a read-only reference to a stream. Returns Ok(None) if key doesn't exist.
+    /// Returns WRONGTYPE error if key holds another type.
+    pub fn get_stream(&mut self, key: &[u8]) -> Result<Option<&StreamData>, Frame> {
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::Stream(s) => Ok(Some(s)),
+                _ => Err(Self::wrongtype_error()),
+            },
+        }
+    }
+
+    /// Get a mutable reference to an existing stream. Returns Ok(None) if key doesn't exist.
+    pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        match self.data.get_mut(key) {
+            None => Ok(None),
+            Some(entry) => match entry.value.as_redis_value_mut() {
+                Some(RedisValue::Stream(s)) => Ok(Some(s.as_mut())),
+                Some(_) => Err(Self::wrongtype_error()),
+                None => Err(Self::wrongtype_error()),
+            },
+        }
     }
 }
 

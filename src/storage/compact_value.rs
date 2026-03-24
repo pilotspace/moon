@@ -18,6 +18,7 @@ use super::bptree::BPTree;
 use super::entry::RedisValue;
 use super::intset::Intset;
 use super::listpack::Listpack;
+use super::stream::Stream as StreamData;
 
 // ---- Constants ----
 
@@ -35,6 +36,7 @@ const HEAP_TAG_HASH: usize = 1;
 const HEAP_TAG_LIST: usize = 2;
 const HEAP_TAG_SET: usize = 3;
 const HEAP_TAG_ZSET: usize = 4;
+const HEAP_TAG_STREAM: usize = 5;
 const HEAP_TAG_MASK: usize = 0x7;
 
 /// Borrowed view of a CompactValue, for zero-copy read access.
@@ -57,6 +59,7 @@ pub enum RedisValueRef<'a> {
         members: &'a HashMap<Bytes, f64>,
     },
     SortedSetListpack(&'a Listpack),
+    Stream(&'a StreamData),
 }
 
 impl<'a> RedisValueRef<'a> {
@@ -85,6 +88,7 @@ impl<'a> RedisValueRef<'a> {
             RedisValueRef::SortedSet { .. } => "skiplist",
             RedisValueRef::SortedSetBPTree { .. } => "skiplist",
             RedisValueRef::SortedSetListpack(_) => "listpack",
+            RedisValueRef::Stream(_) => "stream",
         }
     }
 }
@@ -142,6 +146,7 @@ impl CompactValue {
             RedisValue::SortedSet { .. }
             | RedisValue::SortedSetBPTree { .. }
             | RedisValue::SortedSetListpack(_) => (HEAP_TAG_ZSET, 0),
+            RedisValue::Stream(_) => (HEAP_TAG_STREAM, 0),
         };
 
         // Get prefix bytes for strings
@@ -210,6 +215,7 @@ impl CompactValue {
                     RedisValueRef::SortedSetBPTree { tree, members }
                 }
                 RedisValue::SortedSetListpack(lp) => RedisValueRef::SortedSetListpack(lp),
+                RedisValue::Stream(s) => RedisValueRef::Stream(s),
             }
         }
     }
@@ -283,6 +289,7 @@ impl CompactValue {
                 HEAP_TAG_LIST => "list",
                 HEAP_TAG_SET => "set",
                 HEAP_TAG_ZSET => "zset",
+                HEAP_TAG_STREAM => "stream",
                 _ => "unknown",
             }
         }

@@ -415,6 +415,20 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }
+                RedisValueRef::Stream(stream) => {
+                    for (id, fields) in &stream.entries {
+                        let mut args = vec![
+                            Frame::BulkString(Bytes::from_static(b"XADD")),
+                            Frame::BulkString(key.clone()),
+                            Frame::BulkString(id.to_bytes()),
+                        ];
+                        for (field, value) in fields {
+                            args.push(Frame::BulkString(field.clone()));
+                            args.push(Frame::BulkString(value.clone()));
+                        }
+                        serialize::serialize(&Frame::Array(args), &mut buf);
+                    }
+                }
             }
 
             // Generate PEXPIRE for keys with TTL

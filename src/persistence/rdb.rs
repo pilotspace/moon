@@ -13,6 +13,7 @@ use crate::storage::bptree::BPTree;
 use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_secs, current_time_ms, Entry, RedisValue};
+use crate::storage::stream::{Stream as StreamData, StreamId};
 
 // Format constants
 const RDB_MAGIC: &[u8] = b"RUSTREDIS";
@@ -24,6 +25,7 @@ pub(crate) const TYPE_HASH: u8 = 1;
 pub(crate) const TYPE_LIST: u8 = 2;
 pub(crate) const TYPE_SET: u8 = 3;
 pub(crate) const TYPE_SORTED_SET: u8 = 4;
+pub(crate) const TYPE_STREAM: u8 = 5;
 
 // Control bytes
 const DB_SELECTOR: u8 = 0xFE;
@@ -273,6 +275,7 @@ pub(crate) fn write_entry(
         RedisValueRef::SortedSet { .. }
         | RedisValueRef::SortedSetBPTree { .. }
         | RedisValueRef::SortedSetListpack(_) => TYPE_SORTED_SET,
+        RedisValueRef::Stream(_) => TYPE_STREAM,
     };
     buf.write_all(&[type_tag])?;
 
@@ -370,6 +373,49 @@ pub(crate) fn write_entry(
             let count_bytes = count.to_le_bytes();
             buf[count_pos..count_pos + 4].copy_from_slice(&count_bytes);
         }
+        RedisValueRef::Stream(stream) => {
+            // Entry count + last_id
+            buf.write_all(&(stream.entries.len() as u64).to_le_bytes())?;
+            buf.write_all(&stream.last_id.ms.to_le_bytes())?;
+            buf.write_all(&stream.last_id.seq.to_le_bytes())?;
+            // Entries
+            for (id, fields) in &stream.entries {
+                buf.write_all(&id.ms.to_le_bytes())?;
+                buf.write_all(&id.seq.to_le_bytes())?;
+                buf.write_all(&(fields.len() as u32).to_le_bytes())?;
+                for (field, value) in fields {
+                    write_bytes(buf, field)?;
+                    write_bytes(buf, value)?;
+                }
+            }
+            // Consumer groups
+            buf.write_all(&(stream.groups.len() as u32).to_le_bytes())?;
+            for (group_name, group) in &stream.groups {
+                write_bytes(buf, group_name)?;
+                buf.write_all(&group.last_delivered_id.ms.to_le_bytes())?;
+                buf.write_all(&group.last_delivered_id.seq.to_le_bytes())?;
+                // PEL
+                buf.write_all(&(group.pel.len() as u32).to_le_bytes())?;
+                for (id, pe) in &group.pel {
+                    buf.write_all(&id.ms.to_le_bytes())?;
+                    buf.write_all(&id.seq.to_le_bytes())?;
+                    write_bytes(buf, &pe.consumer)?;
+                    buf.write_all(&pe.delivery_time.to_le_bytes())?;
+                    buf.write_all(&pe.delivery_count.to_le_bytes())?;
+                }
+                // Consumers
+                buf.write_all(&(group.consumers.len() as u32).to_le_bytes())?;
+                for (cname, consumer) in &group.consumers {
+                    write_bytes(buf, cname)?;
+                    buf.write_all(&consumer.seen_time.to_le_bytes())?;
+                    buf.write_all(&(consumer.pending.len() as u32).to_le_bytes())?;
+                    for (id, _) in &consumer.pending {
+                        buf.write_all(&id.ms.to_le_bytes())?;
+                        buf.write_all(&id.seq.to_le_bytes())?;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -439,6 +485,123 @@ pub(crate) fn read_entry(
                 tree.insert(OrderedFloat(score), member);
             }
             RedisValue::SortedSetBPTree { tree, members }
+        }
+        TYPE_STREAM => {
+            let mut entry_count_buf = [0u8; 8];
+            cursor.read_exact(&mut entry_count_buf)?;
+            let entry_count = u64::from_le_bytes(entry_count_buf) as usize;
+
+            let mut last_id_ms_buf = [0u8; 8];
+            let mut last_id_seq_buf = [0u8; 8];
+            cursor.read_exact(&mut last_id_ms_buf)?;
+            cursor.read_exact(&mut last_id_seq_buf)?;
+            let last_id = StreamId {
+                ms: u64::from_le_bytes(last_id_ms_buf),
+                seq: u64::from_le_bytes(last_id_seq_buf),
+            };
+
+            let mut stream = StreamData::new();
+            stream.last_id = last_id;
+
+            for _ in 0..entry_count {
+                let mut ms_buf = [0u8; 8];
+                let mut seq_buf = [0u8; 8];
+                cursor.read_exact(&mut ms_buf)?;
+                cursor.read_exact(&mut seq_buf)?;
+                let id = StreamId {
+                    ms: u64::from_le_bytes(ms_buf),
+                    seq: u64::from_le_bytes(seq_buf),
+                };
+                let field_count = read_u32(cursor)? as usize;
+                let mut fields = Vec::with_capacity(field_count);
+                for _ in 0..field_count {
+                    let field = read_bytes(cursor)?;
+                    let value = read_bytes(cursor)?;
+                    fields.push((field, value));
+                }
+                stream.entries.insert(id, fields);
+                stream.length += 1;
+            }
+
+            // Consumer groups
+            let group_count = read_u32(cursor)? as usize;
+            for _ in 0..group_count {
+                let group_name = read_bytes(cursor)?;
+                let mut gld_ms = [0u8; 8];
+                let mut gld_seq = [0u8; 8];
+                cursor.read_exact(&mut gld_ms)?;
+                cursor.read_exact(&mut gld_seq)?;
+                let last_delivered_id = StreamId {
+                    ms: u64::from_le_bytes(gld_ms),
+                    seq: u64::from_le_bytes(gld_seq),
+                };
+
+                let pel_count = read_u32(cursor)? as usize;
+                let mut pel = BTreeMap::new();
+                for _ in 0..pel_count {
+                    let mut pid_ms = [0u8; 8];
+                    let mut pid_seq = [0u8; 8];
+                    cursor.read_exact(&mut pid_ms)?;
+                    cursor.read_exact(&mut pid_seq)?;
+                    let pid = StreamId {
+                        ms: u64::from_le_bytes(pid_ms),
+                        seq: u64::from_le_bytes(pid_seq),
+                    };
+                    let consumer_name = read_bytes(cursor)?;
+                    let mut dt_buf = [0u8; 8];
+                    let mut dc_buf = [0u8; 8];
+                    cursor.read_exact(&mut dt_buf)?;
+                    cursor.read_exact(&mut dc_buf)?;
+                    pel.insert(pid, crate::storage::stream::PendingEntry {
+                        consumer: consumer_name,
+                        delivery_time: u64::from_le_bytes(dt_buf),
+                        delivery_count: u64::from_le_bytes(dc_buf),
+                    });
+                }
+
+                let consumer_count = read_u32(cursor)? as usize;
+                let mut consumers = HashMap::new();
+                for _ in 0..consumer_count {
+                    let cname = read_bytes(cursor)?;
+                    let mut st_buf = [0u8; 8];
+                    cursor.read_exact(&mut st_buf)?;
+                    let seen_time = u64::from_le_bytes(st_buf);
+                    let pending_count = read_u32(cursor)? as usize;
+                    let mut pending = BTreeMap::new();
+                    for _ in 0..pending_count {
+                        let mut cid_ms = [0u8; 8];
+                        let mut cid_seq = [0u8; 8];
+                        cursor.read_exact(&mut cid_ms)?;
+                        cursor.read_exact(&mut cid_seq)?;
+                        pending.insert(
+                            StreamId {
+                                ms: u64::from_le_bytes(cid_ms),
+                                seq: u64::from_le_bytes(cid_seq),
+                            },
+                            (),
+                        );
+                    }
+                    consumers.insert(
+                        cname.clone(),
+                        crate::storage::stream::Consumer {
+                            name: cname,
+                            pending,
+                            seen_time,
+                        },
+                    );
+                }
+
+                stream.groups.insert(
+                    group_name,
+                    crate::storage::stream::ConsumerGroup {
+                        last_delivered_id,
+                        pel,
+                        consumers,
+                    },
+                );
+            }
+
+            RedisValue::Stream(Box::new(stream))
         }
         _ => bail!("Unknown type tag: {}", type_tag),
     };

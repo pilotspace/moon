@@ -6,6 +6,8 @@ pub mod entry;
 pub mod eviction;
 pub mod intset;
 pub mod listpack;
+pub mod stream;
 
 pub use db::Database;
 pub use entry::{Entry, RedisValue};
+pub use stream::Stream;

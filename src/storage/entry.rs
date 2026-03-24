@@ -8,6 +8,7 @@ use super::bptree::BPTree;
 use super::compact_value::{CompactValue, RedisValueRef};
 use super::intset::Intset;
 use super::listpack::Listpack;
+use super::stream::Stream as StreamData;
 
 /// Return the current time as seconds since the Unix epoch, truncated to u32.
 /// Wraps around in the year 2106 -- acceptable for LRU/LFU relative comparisons.
@@ -50,6 +51,7 @@ pub enum RedisValue {
         members: HashMap<Bytes, f64>,
     },
     SortedSetListpack(Listpack),
+    Stream(Box<StreamData>),
 }
 
 impl RedisValue {
@@ -63,6 +65,7 @@ impl RedisValue {
             RedisValue::SortedSet { .. }
             | RedisValue::SortedSetBPTree { .. }
             | RedisValue::SortedSetListpack(_) => "zset",
+            RedisValue::Stream(_) => "stream",
         }
     }
 
@@ -91,6 +94,7 @@ impl RedisValue {
             RedisValue::SortedSet { .. } => "skiplist",
             RedisValue::SortedSetBPTree { .. } => "skiplist",
             RedisValue::SortedSetListpack(_) => "listpack",
+            RedisValue::Stream(_) => "stream",
         }
     }
 
@@ -128,6 +132,7 @@ impl RedisValue {
                     .sum();
                 tree_mem + member_mem
             }
+            RedisValue::Stream(s) => s.estimate_memory(),
         }
     }
 }
@@ -417,6 +422,15 @@ impl CompactEntry {
     pub fn new_sorted_set_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SortedSetListpack(Listpack::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new stream entry.
+    pub fn new_stream() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::Stream(Box::new(StreamData::new()))),
             ttl_delta: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }
