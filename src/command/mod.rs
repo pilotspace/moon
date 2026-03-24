@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod client;
 pub mod config;
 pub mod connection;
@@ -9,6 +10,8 @@ pub mod set;
 pub mod sorted_set;
 pub mod stream;
 pub mod string;
+// NOTE: ACL is an intercepted command handled at the connection level (like AUTH/BGSAVE),
+// not dispatched through the dispatch() function below.
 
 use bytes::Bytes;
 

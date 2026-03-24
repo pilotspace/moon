@@ -181,6 +181,13 @@ impl AclTable {
         }
     }
 
+    /// Create an empty table with no users (used by ACL LOAD).
+    pub fn new_empty() -> Self {
+        AclTable {
+            users: HashMap::new(),
+        }
+    }
+
     /// Bootstrap from ServerConfig. Creates the default user from requirepass (or nopass).
     pub fn load_or_default(config: &ServerConfig) -> Self {
         let mut table = AclTable::new();
