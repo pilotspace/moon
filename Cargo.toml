@@ -28,6 +28,8 @@ crc32fast = "1"
 parking_lot = "0.12"
 itoa = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+ringbuf = "0.4"
+core_affinity = "0.8"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
