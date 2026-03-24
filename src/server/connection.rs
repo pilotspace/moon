@@ -1,4 +1,5 @@
 use bumpalo::Bump;
+use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -606,6 +607,18 @@ pub async fn handle_connection(
                 // under ONE exclusive write lock. Minimizes lock transitions while
                 // enabling read parallelism across connections.
                 if !dispatchable.is_empty() && !should_quit {
+                    // Arena-backed scratch: collect write-command response indices for
+                    // post-dispatch AOF batching. Rebuilt each batch cycle and
+                    // bulk-deallocated by arena.reset() after the batch completes.
+                    let mut write_indices: BumpVec<usize> = BumpVec::new_in(&arena);
+                    for item in &dispatchable {
+                        if item.2 { // is_write
+                            write_indices.push(item.0); // resp_idx
+                        }
+                    }
+                    // write_indices consumed here; drop before any await
+                    drop(write_indices);
+
                     let db_count = db.len();
                     let mut i = 0;
                     while i < dispatchable.len() {

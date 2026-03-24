@@ -10,7 +10,7 @@ categories = ["database", "network-programming"]
 
 [dependencies]
 atoi = "2.0"
-bumpalo = "3.20"
+bumpalo = { version = "3.20", features = ["collections"] }
 bytes = "1.10"
 memchr = "2.8"
 thiserror = "2.0"
