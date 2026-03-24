@@ -1,3 +1,4 @@
+use bumpalo::Bump;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -94,6 +95,11 @@ pub async fn handle_connection(
     let mut in_multi: bool = false;
     let mut command_queue: Vec<Frame> = Vec::new();
     let mut watched_keys: HashMap<Bytes, u32> = HashMap::new();
+
+    // Per-connection arena for batch processing temporaries.
+    // Primary use in Phase 8: scratch buffer during inline token assembly.
+    // Phase 9+ will leverage this for per-request temporaries.
+    let mut arena = Bump::with_capacity(4096); // 4KB initial capacity
 
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
@@ -686,6 +692,8 @@ pub async fn handle_connection(
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+
+                arena.reset(); // O(1) bulk deallocation of batch temporaries
 
                 if break_outer || should_quit {
                     break;
