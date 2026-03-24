@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
+use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 use crate::storage::Database;
 
 /// Helper: return ERR wrong number of arguments for a given command.
@@ -50,6 +51,34 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("LPUSH"),
     };
+
+    let has_large_element = args[1..].iter().any(|a| {
+        extract_bytes(a)
+            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
+            .unwrap_or(false)
+    });
+
+    if !has_large_element {
+        match db.get_or_create_list_listpack(key) {
+            Ok(Some(lp)) => {
+                for arg in &args[1..] {
+                    let val = match extract_bytes(arg) {
+                        Some(v) => v,
+                        None => return err_wrong_args("LPUSH"),
+                    };
+                    lp.push_front(val);
+                }
+                let len = lp.len();
+                if len > LISTPACK_MAX_ENTRIES {
+                    db.upgrade_list_listpack_to_list(key);
+                }
+                return Frame::Integer(len as i64);
+            }
+            Ok(None) => {}
+            Err(e) => return e,
+        }
+    }
+
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
@@ -73,6 +102,34 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("RPUSH"),
     };
+
+    let has_large_element = args[1..].iter().any(|a| {
+        extract_bytes(a)
+            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
+            .unwrap_or(false)
+    });
+
+    if !has_large_element {
+        match db.get_or_create_list_listpack(key) {
+            Ok(Some(lp)) => {
+                for arg in &args[1..] {
+                    let val = match extract_bytes(arg) {
+                        Some(v) => v,
+                        None => return err_wrong_args("RPUSH"),
+                    };
+                    lp.push_back(val);
+                }
+                let len = lp.len();
+                if len > LISTPACK_MAX_ENTRIES {
+                    db.upgrade_list_listpack_to_list(key);
+                }
+                return Frame::Integer(len as i64);
+            }
+            Ok(None) => {}
+            Err(e) => return e,
+        }
+    }
+
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,

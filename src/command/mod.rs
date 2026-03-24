@@ -456,8 +456,45 @@ mod tests {
     fn test_object_encoding_hash() {
         let mut db = Database::new();
         let mut selected = 0usize;
+        // Small hash should start as listpack
         let args = make_args(&[b"myhash", b"f", b"v"]);
         dispatch(&mut db, b"HSET", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"myhash"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("listpack")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_list() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // Small list should start as listpack
+        let args = make_args(&[b"mylist", b"a"]);
+        dispatch(&mut db, b"LPUSH", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"mylist"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("listpack")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_hash_upgrade() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // Add 129 fields to trigger upgrade from listpack to hashtable
+        for i in 0..129 {
+            let field = format!("f{}", i);
+            let value = format!("v{}", i);
+            let args = make_args(&[b"myhash", field.as_bytes(), value.as_bytes()]);
+            dispatch(&mut db, b"HSET", &args, &mut selected, 16);
+        }
         let args = make_args(&[b"ENCODING", b"myhash"]);
         match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
             DispatchResult::Response(f) => {
@@ -468,11 +505,15 @@ mod tests {
     }
 
     #[test]
-    fn test_object_encoding_list() {
+    fn test_object_encoding_list_upgrade() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        let args = make_args(&[b"mylist", b"a"]);
-        dispatch(&mut db, b"LPUSH", &args, &mut selected, 16);
+        // Add 129 elements to trigger upgrade from listpack to linkedlist
+        for i in 0..129 {
+            let val = format!("v{}", i);
+            let args = make_args(&[b"mylist", val.as_bytes()]);
+            dispatch(&mut db, b"LPUSH", &args, &mut selected, 16);
+        }
         let args = make_args(&[b"ENCODING", b"mylist"]);
         match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
             DispatchResult::Response(f) => {

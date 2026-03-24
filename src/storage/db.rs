@@ -10,10 +10,9 @@ use super::intset::Intset;
 use crate::protocol::Frame;
 
 /// Maximum number of entries in a listpack before upgrading to full encoding.
-const LISTPACK_MAX_ENTRIES: usize = 128;
+pub const LISTPACK_MAX_ENTRIES: usize = 128;
 /// Maximum element size in bytes before upgrading a listpack to full encoding.
-#[allow(dead_code)]
-const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
+pub const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
 /// Maximum number of entries in an intset before upgrading to full encoding.
 #[allow(dead_code)]
 const INTSET_MAX_ENTRIES: usize = 512;
@@ -494,6 +493,106 @@ impl Database {
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Set(set)) => set,
             _ => unreachable!("upgrade_intset_to_set: expected Set after upgrade"),
+        }
+    }
+
+    /// Get or create a hash entry as listpack. Creates new keys as HashListpack.
+    /// Returns Ok(Some(&mut Listpack)) if the key is a HashListpack.
+    /// Returns Ok(None) if the key already holds a full Hash (caller should fall through).
+    /// Returns Err(WRONGTYPE) if the key holds a non-hash type.
+    pub fn get_or_create_hash_listpack(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&mut super::listpack::Listpack>, Frame> {
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        if !self.data.contains_key(key) {
+            let entry = Entry::new_hash_listpack();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::HashListpack(lp)) => Ok(Some(lp)),
+            Some(RedisValue::Hash(_)) => Ok(None),
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
+    /// Upgrade a HashListpack to full Hash. Returns mutable ref to the HashMap.
+    /// Panics if the key doesn't exist or isn't a HashListpack.
+    pub fn upgrade_hash_listpack_to_hash(
+        &mut self,
+        key: &[u8],
+    ) -> &mut HashMap<Bytes, Bytes> {
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::HashListpack(lp)) => {
+                let map = lp.to_hash_map();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
+            }
+            _ => {}
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::Hash(map)) => map,
+            _ => unreachable!("upgrade_hash_listpack_to_hash: expected Hash after upgrade"),
+        }
+    }
+
+    /// Get or create a list entry as listpack. Creates new keys as ListListpack.
+    /// Returns Ok(Some(&mut Listpack)) if the key is a ListListpack.
+    /// Returns Ok(None) if the key already holds a full List (caller should fall through).
+    /// Returns Err(WRONGTYPE) if the key holds a non-list type.
+    pub fn get_or_create_list_listpack(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&mut super::listpack::Listpack>, Frame> {
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
+            if let Some(entry) = self.data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        if !self.data.contains_key(key) {
+            let entry = Entry::new_list_listpack();
+            let k = Bytes::copy_from_slice(key);
+            self.used_memory += entry_overhead(key, &entry);
+            self.data.insert(k, entry);
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::ListListpack(lp)) => Ok(Some(lp)),
+            Some(RedisValue::List(_)) => Ok(None),
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
+    /// Upgrade a ListListpack to full List. Returns mutable ref to the VecDeque.
+    /// Panics if the key doesn't exist or isn't a ListListpack.
+    pub fn upgrade_list_listpack_to_list(
+        &mut self,
+        key: &[u8],
+    ) -> &mut VecDeque<Bytes> {
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::ListListpack(lp)) => {
+                let list = lp.to_vec_deque();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::List(list);
+            }
+            _ => {}
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::List(list)) => list,
+            _ => unreachable!("upgrade_list_listpack_to_list: expected List after upgrade"),
         }
     }
 

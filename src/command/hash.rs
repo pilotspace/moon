@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
+use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 use crate::storage::Database;
 
 /// Helper: return ERR wrong number of arguments for a given command.
@@ -37,6 +38,62 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HSET"),
     };
+
+    // Check if any field or value exceeds LISTPACK_MAX_ELEMENT_SIZE
+    let has_large_element = args[1..].iter().any(|a| {
+        extract_bytes(a)
+            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
+            .unwrap_or(false)
+    });
+
+    if !has_large_element {
+        // Try listpack path for small hashes
+        match db.get_or_create_hash_listpack(key) {
+            Ok(Some(lp)) => {
+                let mut count = 0i64;
+                let mut i = 1;
+                while i < args.len() {
+                    let field = match extract_bytes(&args[i]) {
+                        Some(f) => f,
+                        None => return err_wrong_args("HSET"),
+                    };
+                    let value = match extract_bytes(&args[i + 1]) {
+                        Some(v) => v,
+                        None => return err_wrong_args("HSET"),
+                    };
+                    // Search for existing field in listpack pairs
+                    let mut found = false;
+                    let mut idx = 0;
+                    for (f, _v) in lp.iter_pairs() {
+                        if f.as_bytes() == field.as_ref() {
+                            // Replace value at idx*2+1
+                            lp.replace_at(idx * 2 + 1, value);
+                            found = true;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    if !found {
+                        lp.push_back(field);
+                        lp.push_back(value);
+                        count += 1;
+                    }
+                    i += 2;
+                }
+                // Check threshold: lp.len()/2 fields > LISTPACK_MAX_ENTRIES
+                if lp.len() / 2 > LISTPACK_MAX_ENTRIES {
+                    db.upgrade_hash_listpack_to_hash(key);
+                }
+                return Frame::Integer(count);
+            }
+            Ok(None) => {
+                // Already a full HashMap -- fall through to standard path
+            }
+            Err(e) => return e,
+        }
+    }
+
+    // Full HashMap path (large elements or already upgraded)
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -127,6 +184,53 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HMSET"),
     };
+
+    // Check if any field or value exceeds LISTPACK_MAX_ELEMENT_SIZE
+    let has_large_element = args[1..].iter().any(|a| {
+        extract_bytes(a)
+            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
+            .unwrap_or(false)
+    });
+
+    if !has_large_element {
+        match db.get_or_create_hash_listpack(key) {
+            Ok(Some(lp)) => {
+                let mut i = 1;
+                while i < args.len() {
+                    let field = match extract_bytes(&args[i]) {
+                        Some(f) => f,
+                        None => return err_wrong_args("HMSET"),
+                    };
+                    let value = match extract_bytes(&args[i + 1]) {
+                        Some(v) => v,
+                        None => return err_wrong_args("HMSET"),
+                    };
+                    let mut found = false;
+                    let mut idx = 0;
+                    for (f, _v) in lp.iter_pairs() {
+                        if f.as_bytes() == field.as_ref() {
+                            lp.replace_at(idx * 2 + 1, value);
+                            found = true;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    if !found {
+                        lp.push_back(field);
+                        lp.push_back(value);
+                    }
+                    i += 2;
+                }
+                if lp.len() / 2 > LISTPACK_MAX_ENTRIES {
+                    db.upgrade_hash_listpack_to_hash(key);
+                }
+                return ok();
+            }
+            Ok(None) => {}
+            Err(e) => return e,
+        }
+    }
+
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
