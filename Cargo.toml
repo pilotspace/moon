@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "entry_memory"
 harness = false
+
+[[bench]]
+name = "bptree_memory"
+harness = false

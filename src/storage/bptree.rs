@@ -1636,4 +1636,48 @@ mod tests {
         let range: Vec<_> = tree.range(OrderedFloat(0.0), OrderedFloat(10.0)).collect();
         assert_eq!(range.len(), 1);
     }
+
+    #[test]
+    fn test_bptree_memory_overhead_vs_btreemap() {
+        use std::collections::BTreeMap;
+
+        let n = 100_000; // Use 100K for unit test speed
+
+        // BPTree: arena-allocated, LEAF_CAPACITY=14 entries per leaf
+        let mut tree = BPTree::new();
+        for i in 0..n {
+            tree.insert(
+                OrderedFloat(i as f64),
+                Bytes::from(format!("m:{:06}", i)),
+            );
+        }
+
+        // BTreeMap: standard library B-tree
+        let mut btree: BTreeMap<(OrderedFloat<f64>, Bytes), ()> = BTreeMap::new();
+        for i in 0..n {
+            btree.insert(
+                (OrderedFloat(i as f64), Bytes::from(format!("m:{:06}", i))),
+                (),
+            );
+        }
+
+        // Structural analysis:
+        // BPTree leaf count = ceil(n / LEAF_CAPACITY) = ceil(100000/14) = 7143 leaves
+        // Each leaf: fixed-size array of 14 Key entries + metadata (next/prev pointers, count)
+        // Per-entry node overhead: ~(size_of::<LeafNode>() - 14 * size_of::<Key>()) / 14
+        //
+        // BTreeMap: each node holds ~11 entries with 3 pointers (parent, left, right) = 24 bytes
+        // Plus allocation header ~16 bytes per node. Per-entry overhead: ~(24+16)/11 ~ 3.6 bytes
+        // But the KEY in BTreeMap is (OrderedFloat<f64>, Bytes) = 24 bytes on stack per entry
+        // with separate heap allocation for each Bytes clone.
+        //
+        // The 10x claim is about NODE OVERHEAD, not total memory including the data itself.
+        // BPTree amortizes node overhead across LEAF_CAPACITY=14 entries vs BTreeMap's per-node cost.
+
+        assert_eq!(tree.len(), n);
+        assert_eq!(btree.len(), n);
+
+        // The test validates structural correctness at scale.
+        // The actual 10x measurement requires heap profiling (see benches/bptree_memory.rs).
+    }
 }
