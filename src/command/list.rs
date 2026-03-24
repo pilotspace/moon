@@ -1451,4 +1451,79 @@ mod tests {
         let result = lpush(&mut db, &[bs(b"mykey"), bs(b"a")]);
         assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"WRONGTYPE")));
     }
+
+    // --- LMOVE tests ---
+
+    #[test]
+    fn test_lmove_left_left() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"src", &[b"a", b"b", b"c"]);
+        let result = lmove(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"LEFT"), bs(b"LEFT")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"a")));
+        // src should be [b, c], dst should be [a]
+        let src_list = db.get_list(b"src").unwrap().unwrap();
+        assert_eq!(src_list.len(), 2);
+        let dst_list = db.get_list(b"dst").unwrap().unwrap();
+        assert_eq!(dst_list.len(), 1);
+        assert_eq!(dst_list[0], Bytes::from_static(b"a"));
+    }
+
+    #[test]
+    fn test_lmove_right_right() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"src", &[b"a", b"b", b"c"]);
+        let result = lmove(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"RIGHT"), bs(b"RIGHT")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"c")));
+    }
+
+    #[test]
+    fn test_lmove_empty_source() {
+        let mut db = Database::new();
+        let result = lmove(&mut db, &[bs(b"nosrc"), bs(b"dst"), bs(b"LEFT"), bs(b"RIGHT")]);
+        assert_eq!(result, Frame::Null);
+    }
+
+    #[test]
+    fn test_lmove_same_key() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"a", b"b", b"c"]);
+        // Rotate: pop right, push left -> c moves to front
+        let result = lmove(&mut db, &[bs(b"mylist"), bs(b"mylist"), bs(b"RIGHT"), bs(b"LEFT")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"c")));
+        let list = db.get_list(b"mylist").unwrap().unwrap();
+        assert_eq!(list[0], Bytes::from_static(b"c"));
+        assert_eq!(list[1], Bytes::from_static(b"a"));
+        assert_eq!(list[2], Bytes::from_static(b"b"));
+    }
+
+    #[test]
+    fn test_lmove_wrongtype_source() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        let result = lmove(&mut db, &[bs(b"str"), bs(b"dst"), bs(b"LEFT"), bs(b"LEFT")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"WRONGTYPE")));
+    }
+
+    #[test]
+    fn test_lmove_wrongtype_destination() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"src", &[b"a"]);
+        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        let result = lmove(&mut db, &[bs(b"src"), bs(b"str"), bs(b"LEFT"), bs(b"LEFT")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"WRONGTYPE")));
+    }
+
+    #[test]
+    fn test_lmove_wrong_args() {
+        let mut db = Database::new();
+        let result = lmove(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"LEFT")]);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_lmove_invalid_direction() {
+        let mut db = Database::new();
+        let result = lmove(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"UP"), bs(b"LEFT")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"ERR syntax")));
+    }
 }
