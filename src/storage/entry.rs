@@ -4,7 +4,10 @@ use rand::Rng;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::bptree::BPTree;
 use super::compact_value::{CompactValue, RedisValueRef};
+use super::intset::Intset;
+use super::listpack::Listpack;
 
 /// Return the current time as seconds since the Unix epoch, truncated to u32.
 /// Wraps around in the year 2106 -- acceptable for LRU/LFU relative comparisons.
@@ -29,6 +32,7 @@ pub fn current_time_ms() -> u64 {
 #[derive(Debug, Clone)]
 pub enum RedisValue {
     String(Bytes),
+    // Full-size variants (existing)
     Hash(HashMap<Bytes, Bytes>),
     List(VecDeque<Bytes>),
     Set(HashSet<Bytes>),
@@ -36,6 +40,16 @@ pub enum RedisValue {
         members: HashMap<Bytes, f64>,
         scores: BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
     },
+    // Compact variants (new)
+    HashListpack(Listpack),
+    ListListpack(Listpack),
+    SetListpack(Listpack),
+    SetIntset(Intset),
+    SortedSetBPTree {
+        tree: BPTree,
+        members: HashMap<Bytes, f64>,
+    },
+    SortedSetListpack(Listpack),
 }
 
 impl RedisValue {
@@ -43,10 +57,40 @@ impl RedisValue {
     pub fn type_name(&self) -> &'static str {
         match self {
             RedisValue::String(_) => "string",
-            RedisValue::Hash(_) => "hash",
-            RedisValue::List(_) => "list",
-            RedisValue::Set(_) => "set",
-            RedisValue::SortedSet { .. } => "zset",
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) => "hash",
+            RedisValue::List(_) | RedisValue::ListListpack(_) => "list",
+            RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => "set",
+            RedisValue::SortedSet { .. }
+            | RedisValue::SortedSetBPTree { .. }
+            | RedisValue::SortedSetListpack(_) => "zset",
+        }
+    }
+
+    /// Return the encoding name for OBJECT ENCODING command.
+    pub fn encoding_name(&self) -> &'static str {
+        match self {
+            RedisValue::String(s) => {
+                if s.len() <= 20
+                    && std::str::from_utf8(s)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .is_some()
+                {
+                    "int"
+                } else {
+                    "embstr"
+                }
+            }
+            RedisValue::Hash(_) => "hashtable",
+            RedisValue::HashListpack(_) => "listpack",
+            RedisValue::List(_) => "linkedlist",
+            RedisValue::ListListpack(_) => "listpack",
+            RedisValue::Set(_) => "hashtable",
+            RedisValue::SetListpack(_) => "listpack",
+            RedisValue::SetIntset(_) => "intset",
+            RedisValue::SortedSet { .. } => "skiplist",
+            RedisValue::SortedSetBPTree { .. } => "skiplist",
+            RedisValue::SortedSetListpack(_) => "listpack",
         }
     }
 
@@ -70,6 +114,20 @@ impl RedisValue {
                 .iter()
                 .map(|(member, _)| member.len() + 80)
                 .sum(),
+            RedisValue::HashListpack(lp)
+            | RedisValue::ListListpack(lp)
+            | RedisValue::SetListpack(lp)
+            | RedisValue::SortedSetListpack(lp) => lp.estimate_memory(),
+            RedisValue::SetIntset(is) => is.estimate_memory(),
+            RedisValue::SortedSetBPTree { tree, members } => {
+                // BPTree nodes + member HashMap
+                let tree_mem = tree.len() * 80; // approximate per-entry overhead
+                let member_mem: usize = members
+                    .iter()
+                    .map(|(member, _)| member.len() + 40)
+                    .sum();
+                tree_mem + member_mem
+            }
         }
     }
 }
@@ -302,6 +360,63 @@ impl CompactEntry {
                 members: HashMap::new(),
                 scores: BTreeMap::new(),
             }),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new hash entry using compact listpack encoding.
+    pub fn new_hash_listpack() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::HashListpack(Listpack::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new list entry using compact listpack encoding.
+    pub fn new_list_listpack() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::ListListpack(Listpack::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new set entry using compact listpack encoding.
+    pub fn new_set_listpack() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::SetListpack(Listpack::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new set entry using compact intset encoding.
+    pub fn new_set_intset() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::SetIntset(Intset::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new sorted set entry using B+ tree encoding.
+    pub fn new_sorted_set_bptree() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
+                tree: BPTree::new(),
+                members: HashMap::new(),
+            }),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        }
+    }
+
+    /// Create a new sorted set entry using compact listpack encoding.
+    pub fn new_sorted_set_listpack() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::SortedSetListpack(Listpack::new())),
             ttl_delta: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }

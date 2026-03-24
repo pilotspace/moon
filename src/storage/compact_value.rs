@@ -14,7 +14,10 @@ use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
+use super::bptree::BPTree;
 use super::entry::RedisValue;
+use super::intset::Intset;
+use super::listpack::Listpack;
 
 // ---- Constants ----
 
@@ -44,6 +47,16 @@ pub enum RedisValueRef<'a> {
         members: &'a HashMap<Bytes, f64>,
         scores: &'a BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
     },
+    // Compact variants
+    HashListpack(&'a Listpack),
+    ListListpack(&'a Listpack),
+    SetListpack(&'a Listpack),
+    SetIntset(&'a Intset),
+    SortedSetBPTree {
+        tree: &'a BPTree,
+        members: &'a HashMap<Bytes, f64>,
+    },
+    SortedSetListpack(&'a Listpack),
 }
 
 /// A 16-byte compact value representation with SSO for small strings
@@ -91,10 +104,14 @@ impl CompactValue {
         // Heap path: box the value, extract raw pointer, tag it
         let (heap_tag, str_len) = match &value {
             RedisValue::String(s) => (HEAP_TAG_STRING, s.len()),
-            RedisValue::Hash(_) => (HEAP_TAG_HASH, 0),
-            RedisValue::List(_) => (HEAP_TAG_LIST, 0),
-            RedisValue::Set(_) => (HEAP_TAG_SET, 0),
-            RedisValue::SortedSet { .. } => (HEAP_TAG_ZSET, 0),
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) => (HEAP_TAG_HASH, 0),
+            RedisValue::List(_) | RedisValue::ListListpack(_) => (HEAP_TAG_LIST, 0),
+            RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => {
+                (HEAP_TAG_SET, 0)
+            }
+            RedisValue::SortedSet { .. }
+            | RedisValue::SortedSetBPTree { .. }
+            | RedisValue::SortedSetListpack(_) => (HEAP_TAG_ZSET, 0),
         };
 
         // Get prefix bytes for strings
@@ -155,6 +172,14 @@ impl CompactValue {
                 RedisValue::SortedSet { members, scores } => {
                     RedisValueRef::SortedSet { members, scores }
                 }
+                RedisValue::HashListpack(lp) => RedisValueRef::HashListpack(lp),
+                RedisValue::ListListpack(lp) => RedisValueRef::ListListpack(lp),
+                RedisValue::SetListpack(lp) => RedisValueRef::SetListpack(lp),
+                RedisValue::SetIntset(is) => RedisValueRef::SetIntset(is),
+                RedisValue::SortedSetBPTree { tree, members } => {
+                    RedisValueRef::SortedSetBPTree { tree, members }
+                }
+                RedisValue::SortedSetListpack(lp) => RedisValueRef::SortedSetListpack(lp),
             }
         }
     }

@@ -461,7 +461,14 @@ fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
         RedisValueRef::List(l) => l.len() > 64,
         RedisValueRef::Set(s) => s.len() > 64,
         RedisValueRef::SortedSet { members, .. } => members.len() > 64,
+        RedisValueRef::SortedSetBPTree { members, .. } => members.len() > 64,
         RedisValueRef::String(_) => false,
+        // Compact encodings are always small, no async drop needed
+        RedisValueRef::HashListpack(_)
+        | RedisValueRef::ListListpack(_)
+        | RedisValueRef::SetListpack(_)
+        | RedisValueRef::SetIntset(_)
+        | RedisValueRef::SortedSetListpack(_) => false,
     }
 }
 

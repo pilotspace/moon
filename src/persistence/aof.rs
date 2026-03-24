@@ -301,6 +301,21 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }
+                RedisValueRef::HashListpack(lp) => {
+                    let map = lp.to_hash_map();
+                    if map.is_empty() {
+                        continue;
+                    }
+                    let mut args = vec![
+                        Frame::BulkString(Bytes::from_static(b"HSET")),
+                        Frame::BulkString(key.clone()),
+                    ];
+                    for (field, val) in &map {
+                        args.push(Frame::BulkString(field.clone()));
+                        args.push(Frame::BulkString(val.clone()));
+                    }
+                    serialize::serialize(&Frame::Array(args), &mut buf);
+                }
                 RedisValueRef::List(list) => {
                     if list.is_empty() {
                         continue;
@@ -310,6 +325,20 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         Frame::BulkString(key.clone()),
                     ];
                     for elem in list.iter() {
+                        args.push(Frame::BulkString(elem.clone()));
+                    }
+                    serialize::serialize(&Frame::Array(args), &mut buf);
+                }
+                RedisValueRef::ListListpack(lp) => {
+                    let list = lp.to_vec_deque();
+                    if list.is_empty() {
+                        continue;
+                    }
+                    let mut args = vec![
+                        Frame::BulkString(Bytes::from_static(b"RPUSH")),
+                        Frame::BulkString(key.clone()),
+                    ];
+                    for elem in &list {
                         args.push(Frame::BulkString(elem.clone()));
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
@@ -327,7 +356,36 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }
-                RedisValueRef::SortedSet { members, .. } => {
+                RedisValueRef::SetListpack(lp) => {
+                    let set = lp.to_hash_set();
+                    if set.is_empty() {
+                        continue;
+                    }
+                    let mut args = vec![
+                        Frame::BulkString(Bytes::from_static(b"SADD")),
+                        Frame::BulkString(key.clone()),
+                    ];
+                    for member in &set {
+                        args.push(Frame::BulkString(member.clone()));
+                    }
+                    serialize::serialize(&Frame::Array(args), &mut buf);
+                }
+                RedisValueRef::SetIntset(is) => {
+                    let set = is.to_hash_set();
+                    if set.is_empty() {
+                        continue;
+                    }
+                    let mut args = vec![
+                        Frame::BulkString(Bytes::from_static(b"SADD")),
+                        Frame::BulkString(key.clone()),
+                    ];
+                    for member in &set {
+                        args.push(Frame::BulkString(member.clone()));
+                    }
+                    serialize::serialize(&Frame::Array(args), &mut buf);
+                }
+                RedisValueRef::SortedSet { members, .. }
+                | RedisValueRef::SortedSetBPTree { members, .. } => {
                     if members.is_empty() {
                         continue;
                     }
@@ -338,6 +396,22 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for (member, score) in members.iter() {
                         args.push(Frame::BulkString(Bytes::from(score.to_string())));
                         args.push(Frame::BulkString(member.clone()));
+                    }
+                    serialize::serialize(&Frame::Array(args), &mut buf);
+                }
+                RedisValueRef::SortedSetListpack(lp) => {
+                    let pairs: Vec<_> = lp.iter_pairs().collect();
+                    if pairs.is_empty() {
+                        continue;
+                    }
+                    let mut args = vec![
+                        Frame::BulkString(Bytes::from_static(b"ZADD")),
+                        Frame::BulkString(key.clone()),
+                    ];
+                    for (member_entry, score_entry) in &pairs {
+                        let score_bytes = score_entry.as_bytes();
+                        args.push(Frame::BulkString(Bytes::from(score_bytes)));
+                        args.push(Frame::BulkString(Bytes::from(member_entry.as_bytes())));
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }

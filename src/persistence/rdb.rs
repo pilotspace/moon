@@ -261,13 +261,17 @@ pub(crate) fn write_entry(
     entry: &Entry,
     base_ts: u32,
 ) -> anyhow::Result<()> {
-    // Type tag
+    // Type tag -- compact variants serialize as the same type as their full-size counterparts
     let type_tag = match entry.value.as_redis_value() {
         RedisValueRef::String(_) => TYPE_STRING,
-        RedisValueRef::Hash(_) => TYPE_HASH,
-        RedisValueRef::List(_) => TYPE_LIST,
-        RedisValueRef::Set(_) => TYPE_SET,
-        RedisValueRef::SortedSet { .. } => TYPE_SORTED_SET,
+        RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => TYPE_HASH,
+        RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => TYPE_LIST,
+        RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => {
+            TYPE_SET
+        }
+        RedisValueRef::SortedSet { .. }
+        | RedisValueRef::SortedSetBPTree { .. }
+        | RedisValueRef::SortedSetListpack(_) => TYPE_SORTED_SET,
     };
     buf.write_all(&[type_tag])?;
 
@@ -282,7 +286,7 @@ pub(crate) fn write_entry(
     };
     buf.write_all(&ttl_ms.to_le_bytes())?;
 
-    // Value data
+    // Value data -- compact variants expand to element-level format for persistence
     match entry.value.as_redis_value() {
         RedisValueRef::String(s) => {
             write_bytes(buf, s)?;
@@ -294,9 +298,24 @@ pub(crate) fn write_entry(
                 write_bytes(buf, val)?;
             }
         }
+        RedisValueRef::HashListpack(lp) => {
+            let map = lp.to_hash_map();
+            buf.write_all(&(map.len() as u32).to_le_bytes())?;
+            for (field, val) in &map {
+                write_bytes(buf, field)?;
+                write_bytes(buf, val)?;
+            }
+        }
         RedisValueRef::List(list) => {
             buf.write_all(&(list.len() as u32).to_le_bytes())?;
             for elem in list.iter() {
+                write_bytes(buf, elem)?;
+            }
+        }
+        RedisValueRef::ListListpack(lp) => {
+            let list = lp.to_vec_deque();
+            buf.write_all(&(list.len() as u32).to_le_bytes())?;
+            for elem in &list {
                 write_bytes(buf, elem)?;
             }
         }
@@ -306,12 +325,49 @@ pub(crate) fn write_entry(
                 write_bytes(buf, member)?;
             }
         }
-        RedisValueRef::SortedSet { members, .. } => {
+        RedisValueRef::SetListpack(lp) => {
+            let set = lp.to_hash_set();
+            buf.write_all(&(set.len() as u32).to_le_bytes())?;
+            for member in &set {
+                write_bytes(buf, member)?;
+            }
+        }
+        RedisValueRef::SetIntset(is) => {
+            let set = is.to_hash_set();
+            buf.write_all(&(set.len() as u32).to_le_bytes())?;
+            for member in &set {
+                write_bytes(buf, member)?;
+            }
+        }
+        RedisValueRef::SortedSet { members, .. }
+        | RedisValueRef::SortedSetBPTree { members, .. } => {
             buf.write_all(&(members.len() as u32).to_le_bytes())?;
             for (member, score) in members.iter() {
                 write_bytes(buf, member)?;
                 buf.write_all(&score.to_le_bytes())?;
             }
+        }
+        RedisValueRef::SortedSetListpack(lp) => {
+            // Listpack stores sorted set as [member, score, member, score, ...]
+            let mut count: u32 = 0;
+            let pairs: Vec<_> = lp.iter_pairs().collect();
+            // Write count placeholder, then entries
+            let count_pos = buf.len();
+            buf.write_all(&0u32.to_le_bytes())?;
+            for (member_entry, score_entry) in &pairs {
+                let member_bytes = member_entry.as_bytes();
+                let score_bytes = score_entry.as_bytes();
+                let score: f64 = std::str::from_utf8(&score_bytes)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                write_bytes(buf, &member_bytes)?;
+                buf.write_all(&score.to_le_bytes())?;
+                count += 1;
+            }
+            // Patch count
+            let count_bytes = count.to_le_bytes();
+            buf[count_pos..count_pos + 4].copy_from_slice(&count_bytes);
         }
     }
 
