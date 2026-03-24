@@ -103,6 +103,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atoi"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -968,12 +977,15 @@ name = "rust-redis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atoi",
+ "bumpalo",
  "bytes",
  "clap",
  "crc32fast",
  "criterion",
  "futures",
  "itoa",
+ "memchr",
  "ordered-float",
  "parking_lot",
  "rand",

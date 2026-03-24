@@ -9,7 +9,10 @@ keywords = ["redis", "database", "cache", "server"]
 categories = ["database", "network-programming"]
 
 [dependencies]
+atoi = "2.0"
+bumpalo = "3.20"
 bytes = "1.10"
+memchr = "2.8"
 thiserror = "2.0"
 tikv-jemallocator = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs"] }
