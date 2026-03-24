@@ -204,6 +204,57 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
     Ok(total_keys)
 }
 
+/// Distribute keys from loaded databases to the correct per-shard databases.
+///
+/// After loading an RDB file into temporary databases, this function routes each key
+/// to its target shard based on `key_to_shard()`. Called during bootstrap BEFORE
+/// shard threads start, so no cross-shard dispatch is needed.
+///
+/// `shard_dbs[shard_id][db_index]` is the database layout.
+pub fn distribute_loaded_to_shards(
+    loaded_dbs: Vec<Database>,
+    num_shards: usize,
+    shard_dbs: &mut [Vec<Database>],
+) {
+    use crate::shard::dispatch::key_to_shard;
+
+    for (db_idx, db) in loaded_dbs.into_iter().enumerate() {
+        for (key, entry) in db.data().iter() {
+            let target_shard = key_to_shard(key, num_shards);
+            if target_shard < shard_dbs.len() && db_idx < shard_dbs[target_shard].len() {
+                shard_dbs[target_shard][db_idx].set(key.clone(), entry.clone());
+            }
+        }
+    }
+}
+
+/// Merge per-shard snapshots into a single snapshot suitable for `save_from_snapshot()`.
+///
+/// Each shard provides `Vec<(Vec<(Bytes, Entry)>, u32)>` -- one entry per database.
+/// This function merges all shards' data for each database index into a combined snapshot.
+pub fn merge_shard_snapshots(
+    shard_snapshots: Vec<Vec<(Vec<(Bytes, Entry)>, u32)>>,
+    num_databases: usize,
+) -> Vec<(Vec<(Bytes, Entry)>, u32)> {
+    let mut merged: Vec<(Vec<(Bytes, Entry)>, u32)> = (0..num_databases)
+        .map(|_| (Vec::new(), 0u32))
+        .collect();
+
+    for shard_snap in shard_snapshots {
+        for (db_idx, (entries, base_ts)) in shard_snap.into_iter().enumerate() {
+            if db_idx < merged.len() {
+                // Use the base_ts from the first shard that provides data for this db
+                if merged[db_idx].0.is_empty() {
+                    merged[db_idx].1 = base_ts;
+                }
+                merged[db_idx].0.extend(entries);
+            }
+        }
+    }
+
+    merged
+}
+
 fn write_entry(
     buf: &mut Vec<u8>,
     key: &Bytes,

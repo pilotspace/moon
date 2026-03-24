@@ -241,6 +241,23 @@ impl Shard {
             ShardMessage::PubSubFanOut { channel, message } => {
                 pubsub_registry.publish(&channel, &message);
             }
+            ShardMessage::SnapshotRequest { reply_tx } => {
+                // Clone all databases in this shard for RDB snapshot.
+                // NOTE: Phase 11 snapshots are NOT point-in-time across shards.
+                // Keys modified between per-shard snapshot requests may be inconsistent.
+                // Phase 14 implements true consistent snapshots via compartmentalized persistence.
+                let snapshot: Vec<(Vec<(bytes::Bytes, crate::storage::entry::Entry)>, u32)> = {
+                    let dbs = databases.borrow();
+                    dbs.iter().map(|db| {
+                        let base_ts = db.base_timestamp();
+                        let entries: Vec<(bytes::Bytes, crate::storage::entry::Entry)> = db.data().iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        (entries, base_ts)
+                    }).collect()
+                };
+                let _ = reply_tx.send(snapshot);
+            }
             ShardMessage::Shutdown => {
                 info!("Received shutdown via SPSC");
             }

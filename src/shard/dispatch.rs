@@ -47,6 +47,11 @@ pub enum ShardMessage {
     },
     /// Publish a message to local subscribers on this shard.
     PubSubFanOut { channel: Bytes, message: Bytes },
+    /// Request this shard to clone its database state for RDB snapshot.
+    /// Reply contains per-database data: Vec<(entries, base_ts)> for each database in this shard.
+    SnapshotRequest {
+        reply_tx: tokio::sync::oneshot::Sender<Vec<(Vec<(Bytes, crate::storage::entry::Entry)>, u32)>>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }
