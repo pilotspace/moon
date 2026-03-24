@@ -2,10 +2,14 @@ use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use parking_lot::Mutex;
+use ringbuf::traits::Producer;
+use ringbuf::HeapProd;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -19,6 +23,8 @@ use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::{self, PubSubRegistry};
 use crate::pubsub::subscriber::Subscriber;
+use crate::shard::dispatch::{key_to_shard, ShardMessage};
+use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::storage::Database;
 
@@ -837,4 +843,403 @@ fn execute_transaction(
     }
 
     (Frame::Array(results), aof_entries)
+}
+
+// ============================================================================
+// Sharded connection handler (thread-per-core shared-nothing architecture)
+// ============================================================================
+
+/// Extract the primary key from a parsed command for shard routing.
+///
+/// Returns `None` for keyless commands (PING, DBSIZE, SELECT, etc.)
+/// which should execute locally on the connection's shard.
+fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
+    // Keyless commands: execute locally
+    if cmd.eq_ignore_ascii_case(b"PING")
+        || cmd.eq_ignore_ascii_case(b"ECHO")
+        || cmd.eq_ignore_ascii_case(b"SELECT")
+        || cmd.eq_ignore_ascii_case(b"QUIT")
+        || cmd.eq_ignore_ascii_case(b"INFO")
+        || cmd.eq_ignore_ascii_case(b"COMMAND")
+        || cmd.eq_ignore_ascii_case(b"DBSIZE")
+        || cmd.eq_ignore_ascii_case(b"KEYS")
+        || cmd.eq_ignore_ascii_case(b"SCAN")
+    {
+        return None;
+    }
+    if args.is_empty() {
+        return None;
+    }
+    match &args[0] {
+        Frame::BulkString(key) => Some(key),
+        _ => None,
+    }
+}
+
+/// Check if a command is a multi-key command requiring VLL coordination.
+///
+/// These commands operate on multiple keys that may live on different shards.
+/// Single-arg DEL/UNLINK/EXISTS are NOT multi-key (handled as single-key fast path).
+fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
+    if cmd.eq_ignore_ascii_case(b"MGET") || cmd.eq_ignore_ascii_case(b"MSET") {
+        return true;
+    }
+    // DEL, UNLINK, EXISTS with multiple keys
+    if args.len() > 1
+        && (cmd.eq_ignore_ascii_case(b"DEL")
+            || cmd.eq_ignore_ascii_case(b"UNLINK")
+            || cmd.eq_ignore_ascii_case(b"EXISTS"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Handle a single client connection on a sharded (thread-per-core) runtime.
+///
+/// Runs within a shard's single-threaded Tokio runtime. Has direct mutable access
+/// to the shard's databases via `Rc<RefCell<Vec<Database>>>` (safe: cooperative
+/// single-threaded scheduling means no concurrent borrows).
+///
+/// Routing logic:
+/// - **Keyless commands** (PING, ECHO, SELECT, etc.): execute locally, zero overhead.
+/// - **Single-key, local shard**: execute directly on borrowed database -- ZERO cross-shard overhead.
+/// - **Single-key, remote shard**: dispatch via SPSC `ShardMessage::Execute`, await oneshot reply.
+/// - **Multi-key commands** (MGET, MSET, multi-DEL): delegate to VLL coordinator.
+///
+/// Connection-level commands (AUTH, SUBSCRIBE, MULTI/EXEC) are handled at the
+/// connection level same as the non-sharded handler.
+pub async fn handle_connection_sharded(
+    stream: TcpStream,
+    databases: Rc<RefCell<Vec<Database>>>,
+    shard_id: usize,
+    num_shards: usize,
+    dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    shutdown: CancellationToken,
+    requirepass: Option<String>,
+) {
+    let mut framed = Framed::new(stream, RespCodec::default());
+    let mut selected_db: usize = 0;
+    let mut authenticated = requirepass.is_none();
+
+    // Transaction (MULTI/EXEC) connection-local state
+    let mut in_multi: bool = false;
+    let mut command_queue: Vec<Frame> = Vec::new();
+
+    loop {
+        tokio::select! {
+            first_result = framed.next() => {
+                let first_frame = match first_result {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(_)) => break,
+                    None => break,
+                };
+
+                // Collect batch: first frame + all immediately available frames
+                let mut batch = vec![first_frame];
+                const MAX_BATCH: usize = 1024;
+                while batch.len() < MAX_BATCH {
+                    match framed.next().now_or_never() {
+                        Some(Some(Ok(frame))) => batch.push(frame),
+                        _ => break,
+                    }
+                }
+
+                let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
+                let mut should_quit = false;
+
+                for frame in batch {
+                    // --- AUTH gate ---
+                    if !authenticated {
+                        match extract_command(&frame) {
+                            Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
+                                let response = conn_cmd::auth(cmd_args, &requirepass);
+                                if response == Frame::SimpleString(Bytes::from_static(b"OK")) {
+                                    authenticated = true;
+                                }
+                                responses.push(response);
+                                continue;
+                            }
+                            Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                should_quit = true;
+                                break;
+                            }
+                            _ => {
+                                responses.push(Frame::Error(
+                                    Bytes::from_static(b"NOAUTH Authentication required.")
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+
+                    let (cmd, cmd_args) = match extract_command(&frame) {
+                        Some(pair) => pair,
+                        None => {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR invalid command format",
+                            )));
+                            continue;
+                        }
+                    };
+
+                    // --- QUIT ---
+                    if cmd.eq_ignore_ascii_case(b"QUIT") {
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        should_quit = true;
+                        break;
+                    }
+
+                    // --- MULTI ---
+                    if cmd.eq_ignore_ascii_case(b"MULTI") {
+                        if in_multi {
+                            responses.push(Frame::Error(
+                                Bytes::from_static(b"ERR MULTI calls can not be nested"),
+                            ));
+                        } else {
+                            in_multi = true;
+                            command_queue.clear();
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        }
+                        continue;
+                    }
+
+                    // --- EXEC ---
+                    if cmd.eq_ignore_ascii_case(b"EXEC") {
+                        if !in_multi {
+                            responses.push(Frame::Error(
+                                Bytes::from_static(b"ERR EXEC without MULTI"),
+                            ));
+                        } else {
+                            in_multi = false;
+                            // Execute transaction locally (same-shard restriction)
+                            let result = execute_transaction_sharded(
+                                &databases,
+                                &command_queue,
+                                selected_db,
+                            );
+                            command_queue.clear();
+                            responses.push(result);
+                        }
+                        continue;
+                    }
+
+                    // --- DISCARD ---
+                    if cmd.eq_ignore_ascii_case(b"DISCARD") {
+                        if !in_multi {
+                            responses.push(Frame::Error(
+                                Bytes::from_static(b"ERR DISCARD without MULTI"),
+                            ));
+                        } else {
+                            in_multi = false;
+                            command_queue.clear();
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        }
+                        continue;
+                    }
+
+                    // --- PUBLISH: local delivery + cross-shard fan-out ---
+                    if cmd.eq_ignore_ascii_case(b"PUBLISH") {
+                        if cmd_args.len() != 2 {
+                            responses.push(Frame::Error(
+                                Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
+                            ));
+                        } else {
+                            let channel = extract_bytes(&cmd_args[0]);
+                            let message = extract_bytes(&cmd_args[1]);
+                            match (channel, message) {
+                                (Some(ch), Some(msg)) => {
+                                    // Publish to local shard's subscribers
+                                    let local_count = pubsub_registry.borrow_mut().publish(&ch, &msg);
+                                    // Fan out to all other shards via SPSC
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    for target in 0..num_shards {
+                                        if target == shard_id {
+                                            continue;
+                                        }
+                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                        let fanout_msg = ShardMessage::PubSubFanOut {
+                                            channel: ch.clone(),
+                                            message: msg.clone(),
+                                        };
+                                        let _ = producers[idx].try_push(fanout_msg); // best-effort
+                                    }
+                                    drop(producers);
+                                    responses.push(Frame::Integer(local_count));
+                                }
+                                _ => responses.push(Frame::Error(
+                                    Bytes::from_static(b"ERR invalid channel or message"),
+                                )),
+                            }
+                        }
+                        continue;
+                    }
+
+                    // --- SUBSCRIBE / PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE ---
+                    // In the sharded path, subscriptions operate on the local shard's
+                    // PubSubRegistry. No cross-shard needed for subscribe/unsubscribe
+                    // because the subscriber's connection lives on this shard.
+                    // TODO: Full subscriber mode support (Plan 06+ or future enhancement).
+                    // For now, handle basic subscribe/unsubscribe responses.
+                    if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                        // Stub: subscriber mode in sharded handler is deferred
+                        responses.push(Frame::Error(
+                            Bytes::from_static(b"ERR SUBSCRIBE not yet supported in sharded mode"),
+                        ));
+                        continue;
+                    }
+                    if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                        responses.push(Frame::Error(
+                            Bytes::from_static(b"ERR UNSUBSCRIBE not yet supported in sharded mode"),
+                        ));
+                        continue;
+                    }
+
+                    // --- MULTI queue mode ---
+                    if in_multi {
+                        command_queue.push(frame);
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                        continue;
+                    }
+
+                    // --- Multi-key commands: VLL coordinator ---
+                    if is_multi_key_command(cmd, cmd_args) {
+                        let response = crate::shard::coordinator::coordinate_multi_key(
+                            cmd,
+                            cmd_args,
+                            shard_id,
+                            num_shards,
+                            selected_db,
+                            &databases,
+                            &dispatch_tx,
+                        ).await;
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- Routing: keyless, local, or remote ---
+                    let target_shard = extract_primary_key(cmd, cmd_args)
+                        .map(|key| key_to_shard(key, num_shards));
+
+                    let is_local = match target_shard {
+                        None => true,
+                        Some(s) if s == shard_id => true,
+                        _ => false,
+                    };
+
+                    if is_local {
+                        // LOCAL FAST PATH: zero cross-shard overhead
+                        let mut dbs = databases.borrow_mut();
+                        let db_count = dbs.len();
+                        dbs[selected_db].refresh_now();
+                        let result = dispatch(
+                            &mut dbs[selected_db],
+                            cmd,
+                            cmd_args,
+                            &mut selected_db,
+                            db_count,
+                        );
+                        let response = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => {
+                                should_quit = true;
+                                f
+                            }
+                        };
+                        responses.push(response);
+                    } else if let Some(target) = target_shard {
+                        // REMOTE DISPATCH: send via SPSC, await oneshot reply
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let msg = ShardMessage::Execute {
+                            db_index: selected_db,
+                            command: frame.clone(),
+                            reply_tx,
+                        };
+                        let target_idx = ChannelMesh::target_index(shard_id, target);
+                        {
+                            // Spin-retry on full ring buffer (rare in practice)
+                            let mut pending = msg;
+                            loop {
+                                let push_result = {
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    producers[target_idx].try_push(pending)
+                                }; // borrow dropped here before yield
+                                match push_result {
+                                    Ok(()) => break,
+                                    Err(val) => {
+                                        pending = val;
+                                        tokio::task::yield_now().await;
+                                    }
+                                }
+                            }
+                        }
+                        // Await the reply from the target shard
+                        match reply_rx.await {
+                            Ok(response) => responses.push(response),
+                            Err(_) => responses.push(Frame::Error(
+                                Bytes::from_static(b"ERR cross-shard dispatch failed"),
+                            )),
+                        }
+                    }
+                }
+
+                // Write all responses
+                for response in responses {
+                    if framed.send(response).await.is_err() {
+                        return;
+                    }
+                }
+
+                if should_quit {
+                    break;
+                }
+            }
+            _ = shutdown.cancelled() => {
+                let _ = framed.send(Frame::Error(
+                    Bytes::from_static(b"ERR server shutting down")
+                )).await;
+                break;
+            }
+        }
+    }
+}
+
+/// Execute a queued transaction on the local shard (sharded path).
+///
+/// Transactions in the shared-nothing architecture are restricted to local-shard
+/// keys only. Cross-shard transactions require distributed coordination (future work).
+fn execute_transaction_sharded(
+    databases: &Rc<RefCell<Vec<Database>>>,
+    command_queue: &[Frame],
+    selected_db: usize,
+) -> Frame {
+    let mut dbs = databases.borrow_mut();
+    let db_count = dbs.len();
+    dbs[selected_db].refresh_now();
+
+    let mut results = Vec::with_capacity(command_queue.len());
+    let mut selected = selected_db;
+
+    for cmd_frame in command_queue {
+        let (cmd, cmd_args) = match extract_command(cmd_frame) {
+            Some(pair) => pair,
+            None => {
+                results.push(Frame::Error(Bytes::from_static(
+                    b"ERR invalid command format",
+                )));
+                continue;
+            }
+        };
+
+        let result = dispatch(&mut dbs[selected], cmd, cmd_args, &mut selected, db_count);
+        let response = match result {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => f,
+        };
+        results.push(response);
+    }
+
+    Frame::Array(results)
 }

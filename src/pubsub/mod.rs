@@ -22,6 +22,7 @@ pub fn next_subscriber_id() -> u64 {
 /// Manages exact-channel subscribers and glob-pattern subscribers.
 /// Publishing fans out messages to all matching subscribers; slow
 /// subscribers whose channels are full are automatically removed.
+#[derive(Default)]
 pub struct PubSubRegistry {
     channels: HashMap<Bytes, Vec<Subscriber>>,
     patterns: Vec<(Bytes, Vec<Subscriber>)>,
