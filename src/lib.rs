@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod blocking;
 pub mod cluster;
 pub mod command;

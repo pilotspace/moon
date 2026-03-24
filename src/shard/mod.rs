@@ -1121,7 +1121,8 @@ mod tests {
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0);
+        let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -1159,7 +1160,8 @@ mod tests {
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0);
+        let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache);
     }
 
     #[test]
