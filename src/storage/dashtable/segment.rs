@@ -59,18 +59,45 @@ pub enum InsertResult<K, V> {
 
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.
 ///
-/// Memory layout:
-/// - `ctrl`: 4 aligned groups of 16 control bytes (64 bytes total)
-/// - `keys`: 60 MaybeUninit key slots
-/// - `values`: 60 MaybeUninit value slots
-/// - `count`: number of occupied (FULL) slots
-/// - `depth`: local depth for extendible hashing (log2 of split count)
+/// Memory layout (cache-line optimized):
+/// - Cache line 0: `ctrl` -- 4 aligned groups of 16 control bytes (64 bytes total, hot read path)
+/// - Cache line 1: `count` + `depth` (read-mostly metadata, 8 bytes)
+/// - Remaining: `keys` + `values` arrays (accessed only on H2 match)
+///
+/// The `align(64)` ensures the ctrl array starts on a cache-line boundary,
+/// preventing false sharing between segments owned by different shards.
+#[repr(C, align(64))]
 pub struct Segment<K, V> {
-    ctrl: [Group; NUM_GROUPS],
-    keys: [MaybeUninit<K>; TOTAL_SLOTS],
-    values: [MaybeUninit<V>; TOTAL_SLOTS],
+    // --- Cache line 0: control bytes (hot, read on every lookup) ---
+    ctrl: [Group; NUM_GROUPS],    // 64 bytes exactly = 1 cache line
+    // --- Cache line 1+: metadata ---
     count: u32,
     depth: u32,
+    // --- Remaining cache lines: key/value data (accessed only on H2 hit) ---
+    keys: [MaybeUninit<K>; TOTAL_SLOTS],
+    values: [MaybeUninit<V>; TOTAL_SLOTS],
+}
+
+// Compile-time assertion: Segment must be cache-line aligned (64 bytes minimum).
+const _: () = {
+    assert!(std::mem::align_of::<Segment<u64, u64>>() >= 64);
+};
+
+/// Prefetch the key data at the given slot index into L1 cache.
+///
+/// On x86_64: uses `_mm_prefetch` with `_MM_HINT_T0` (all cache levels).
+/// On other architectures (aarch64/macOS): no-op.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn prefetch_ptr(ptr: *const u8) {
+    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prefetch_ptr(_ptr: *const u8) {
+    // No-op on non-x86_64 (macOS aarch64, etc.)
 }
 
 impl<K, V> Segment<K, V> {
@@ -91,10 +118,10 @@ impl<K, V> Segment<K, V> {
 
         Segment {
             ctrl,
-            keys,
-            values,
             count: 0,
             depth,
+            keys,
+            values,
         }
     }
 
@@ -194,6 +221,14 @@ impl<K, V> Segment<K, V> {
         #[cfg(not(target_arch = "x86_64"))]
         let mask_a = self.ctrl[group_a].match_h2(h2);
 
+        // Prefetch key data for the first H2 match to hide memory latency
+        if let Some(first_pos) = mask_a.lowest_set_bit() {
+            let prefetch_slot = base_a + first_pos;
+            if prefetch_slot < TOTAL_SLOTS {
+                unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+            }
+        }
+
         for pos in mask_a {
             let slot = base_a + pos;
             if slot < TOTAL_SLOTS {
@@ -214,6 +249,14 @@ impl<K, V> Segment<K, V> {
             let mask_b = unsafe { self.ctrl[group_b].match_h2(h2) };
             #[cfg(not(target_arch = "x86_64"))]
             let mask_b = self.ctrl[group_b].match_h2(h2);
+
+            // Prefetch key data for the first H2 match in group_b
+            if let Some(first_pos) = mask_b.lowest_set_bit() {
+                let prefetch_slot = base_b + first_pos;
+                if prefetch_slot < TOTAL_SLOTS {
+                    unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+                }
+            }
 
             for pos in mask_b {
                 let slot = base_b + pos;
