@@ -292,6 +292,7 @@ mod tests {
             save: None,
             appendonly: "no".to_string(),
             appendfsync: "everysec".to_string(),
+            aclfile: None,
         }
     }
 

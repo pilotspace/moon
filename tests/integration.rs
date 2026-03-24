@@ -40,6 +40,7 @@ async fn start_server() -> (u16, CancellationToken) {
         shards: 0,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
+        aclfile: None,
     };
 
     tokio::spawn(async move {
@@ -80,6 +81,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         shards: 0,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
+        aclfile: None,
     };
 
     tokio::spawn(async move {
@@ -1196,6 +1198,7 @@ async fn start_server_with_persistence(
         shards: 0,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
+        aclfile: None,
     };
 
     tokio::spawn(async move {
@@ -2051,6 +2054,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         shards: 0,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
+        aclfile: None,
     };
 
     tokio::spawn(async move {
@@ -2385,6 +2389,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         shards: num_shards,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
+        aclfile: None,
     };
 
     let cancel = token.clone();
@@ -3411,6 +3416,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         shards: 1,
         cluster_enabled: true,
         cluster_node_timeout: 15000,
+        aclfile: None,
     };
 
     std::thread::spawn(move || {

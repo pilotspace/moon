@@ -60,6 +60,10 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 0)]
     pub shards: usize,
 
+    /// Path to ACL file (Redis-compatible format)
+    #[arg(long)]
+    pub aclfile: Option<String>,
+
     /// Enable cluster mode
     #[arg(long, default_value_t = false)]
     pub cluster_enabled: bool,
@@ -81,6 +85,7 @@ impl ServerConfig {
             save: self.save.clone(),
             appendonly: self.appendonly.clone(),
             appendfsync: self.appendfsync.clone(),
+            aclfile: self.aclfile.clone(),
         }
     }
 }
@@ -106,6 +111,8 @@ pub struct RuntimeConfig {
     pub appendonly: String,
     /// Appendfsync setting (mutable via CONFIG SET but no live effect).
     pub appendfsync: String,
+    /// ACL file path (mutable via CONFIG SET).
+    pub aclfile: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -119,6 +126,7 @@ impl Default for RuntimeConfig {
             save: None,
             appendonly: "no".to_string(),
             appendfsync: "everysec".to_string(),
+            aclfile: None,
         }
     }
 }
@@ -246,5 +254,24 @@ mod tests {
     fn test_shards_custom() {
         let config = ServerConfig::parse_from(["rust-redis", "--shards", "4"]);
         assert_eq!(config.shards, 4);
+    }
+
+    #[test]
+    fn test_aclfile_default_none() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.aclfile, None);
+    }
+
+    #[test]
+    fn test_aclfile_custom() {
+        let config = ServerConfig::parse_from(["rust-redis", "--aclfile", "/tmp/test.acl"]);
+        assert_eq!(config.aclfile, Some("/tmp/test.acl".to_string()));
+    }
+
+    #[test]
+    fn test_to_runtime_config_aclfile() {
+        let config = ServerConfig::parse_from(["rust-redis", "--aclfile", "/data/users.acl"]);
+        let rt = config.to_runtime_config();
+        assert_eq!(rt.aclfile, Some("/data/users.acl".to_string()));
     }
 }
