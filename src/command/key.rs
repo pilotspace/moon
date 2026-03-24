@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
-use crate::storage::entry::{current_time_ms, RedisValue};
+use crate::storage::entry::current_time_ms;
 use crate::storage::Database;
 
 /// Helper: build an ERR frame for wrong number of arguments.
@@ -145,6 +145,7 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
+    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -152,11 +153,12 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now_ms = current_time_ms();
-                if now_ms >= entry.expires_at_ms {
+                let exp_ms = entry.expires_at_ms(base_ts);
+                if now_ms >= exp_ms {
                     // Edge case: expired between get and now
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer(((entry.expires_at_ms - now_ms) / 1000) as i64)
+                    Frame::Integer(((exp_ms - now_ms) / 1000) as i64)
                 }
             }
         }
@@ -174,6 +176,7 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
+    let base_ts = db.base_timestamp();
     match db.get(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -181,10 +184,11 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now_ms = current_time_ms();
-                if now_ms >= entry.expires_at_ms {
+                let exp_ms = entry.expires_at_ms(base_ts);
+                if now_ms >= exp_ms {
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer((entry.expires_at_ms - now_ms) as i64)
+                    Frame::Integer((exp_ms - now_ms) as i64)
                 }
             }
         }
@@ -450,13 +454,14 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
 }
 
 /// Check if a value is large enough to warrant async drop.
-fn should_async_drop(value: &RedisValue) -> bool {
-    match value {
-        RedisValue::Hash(m) => m.len() > 64,
-        RedisValue::List(l) => l.len() > 64,
-        RedisValue::Set(s) => s.len() > 64,
-        RedisValue::SortedSet { members, .. } => members.len() > 64,
-        RedisValue::String(_) => false,
+fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
+    use crate::storage::compact_value::RedisValueRef;
+    match entry.value.as_redis_value() {
+        RedisValueRef::Hash(m) => m.len() > 64,
+        RedisValueRef::List(l) => l.len() > 64,
+        RedisValueRef::Set(s) => s.len() > 64,
+        RedisValueRef::SortedSet { members, .. } => members.len() > 64,
+        RedisValueRef::String(_) => false,
     }
 }
 
@@ -473,7 +478,7 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
         if let Some(key) = extract_key(arg) {
             if let Some(entry) = db.remove(key) {
                 count += 1;
-                if should_async_drop(&entry.value) {
+                if should_async_drop(&entry) {
                     tokio::task::spawn_blocking(move || drop(entry));
                 }
                 // Small values drop normally (entry goes out of scope)
@@ -629,6 +634,7 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
+    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -636,10 +642,11 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now = current_time_ms();
-                if now >= entry.expires_at_ms {
+                let exp_ms = entry.expires_at_ms(base_ts);
+                if now >= exp_ms {
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer(((entry.expires_at_ms - now) / 1000) as i64)
+                    Frame::Integer(((exp_ms - now) / 1000) as i64)
                 }
             }
         }
@@ -655,6 +662,7 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
+    let base_ts = db.base_timestamp();
     match db.get_if_alive(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
@@ -662,10 +670,11 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 Frame::Integer(-1)
             } else {
                 let now = current_time_ms();
-                if now >= entry.expires_at_ms {
+                let exp_ms = entry.expires_at_ms(base_ts);
+                if now >= exp_ms {
                     Frame::Integer(-2)
                 } else {
-                    Frame::Integer((entry.expires_at_ms - now) as i64)
+                    Frame::Integer((exp_ms - now) as i64)
                 }
             }
         }
@@ -836,9 +845,10 @@ mod tests {
 
     fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at_ms: u64) -> Database {
         let mut db = Database::new();
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::copy_from_slice(key),
-            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
+            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms, base_ts),
         );
         db
     }
@@ -1100,9 +1110,10 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"1")),
         );
         let past_ms = current_time_ms() - 1000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms, base_ts),
         );
         let result = keys(&mut db, &[bs(b"*")]);
         match result {
@@ -1162,10 +1173,7 @@ mod tests {
         rename(&mut db, &[bs(b"src"), bs(b"dst")]);
         assert!(!db.exists(b"src"));
         let entry = db.get(b"dst").unwrap();
-        match &entry.value {
-            RedisValue::String(v) => assert_eq!(v.as_ref(), b"srcval"),
-            _ => panic!("unexpected type"),
-        }
+        assert_eq!(entry.value.as_bytes().unwrap(), b"srcval");
     }
 
     // --- RENAMENX tests ---

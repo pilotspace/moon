@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
+use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_time_ms, Entry, RedisValue};
 use crate::storage::Database;
 
@@ -35,9 +36,9 @@ pub fn get(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GET"),
     };
     match db.get(key) {
-        Some(entry) => match &entry.value {
-            RedisValue::String(v) => Frame::BulkString(v.clone()),
-            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
     }
@@ -144,9 +145,9 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Get old value if needed
     let old_value = if get_old {
-        db.get(&key).map(|e| match &e.value {
-            RedisValue::String(v) => Frame::BulkString(v.clone()),
-            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        db.get(&key).map(|e| match e.value.as_bytes() {
+            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         })
     } else {
         None
@@ -180,22 +181,22 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // Determine final expiry
+    let base_ts = db.base_timestamp();
     let final_expires_at_ms = if expires_at_ms > 0 {
         expires_at_ms
     } else if keepttl {
         // Preserve existing TTL
-        db.get(&key).map(|e| e.expires_at_ms).unwrap_or(0)
+        db.get(&key).map(|e| e.expires_at_ms(base_ts)).unwrap_or(0)
     } else {
         0
     };
 
-    let entry = Entry {
-        value: RedisValue::String(value),
-        expires_at_ms: final_expires_at_ms,
-        metadata: 0,
+    let mut entry = if final_expires_at_ms > 0 {
+        Entry::new_string_with_expiry(value, final_expires_at_ms, base_ts)
+    } else {
+        Entry::new_string(value)
     };
     // Set last_access from db cached time (version will be set by db.set)
-    let mut entry = entry;
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
     db.set(key, entry);
@@ -222,9 +223,9 @@ pub fn mget(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
         match db.get(key) {
-            Some(entry) => match &entry.value {
-                RedisValue::String(v) => results.push(Frame::BulkString(v.clone())),
-                _ => results.push(Frame::Null),
+            Some(entry) => match entry.value.as_bytes() {
+                Some(v) => results.push(Frame::BulkString(Bytes::copy_from_slice(v))),
+                None => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),
         }
@@ -317,12 +318,13 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
+    let base_ts = db.base_timestamp();
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms;
-            match &entry.value {
-                RedisValue::String(v) => {
+            let expiry = entry.expires_at_ms(base_ts);
+            match entry.value.as_bytes() {
+                Some(v) => {
                     let s = match std::str::from_utf8(v) {
                         Ok(s) => s,
                         Err(_) => {
@@ -340,7 +342,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                         }
                     }
                 }
-                _ => {
+                None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -360,10 +362,10 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     };
 
     // Store new value preserving existing TTL
-    let mut entry = Entry {
-        value: RedisValue::String(Bytes::from(new_val.to_string())),
-        expires_at_ms: existing_expiry_ms,
-        metadata: 0,
+    let mut entry = if existing_expiry_ms > 0 {
+        Entry::new_string_with_expiry(Bytes::from(new_val.to_string()), existing_expiry_ms, base_ts)
+    } else {
+        Entry::new_string(Bytes::from(new_val.to_string()))
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
@@ -395,12 +397,13 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
         ));
     }
 
+    let base_ts = db.base_timestamp();
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms;
-            match &entry.value {
-                RedisValue::String(v) => {
+            let expiry = entry.expires_at_ms(base_ts);
+            match entry.value.as_bytes() {
+                Some(v) => {
                     let s = match std::str::from_utf8(v) {
                         Ok(s) => s,
                         Err(_) => {
@@ -418,7 +421,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                         }
                     }
                 }
-                _ => {
+                None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -437,10 +440,10 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
 
     let formatted = format_float(result);
 
-    let mut entry = Entry {
-        value: RedisValue::String(Bytes::from(formatted.clone())),
-        expires_at_ms: existing_expiry_ms,
-        metadata: 0,
+    let mut entry = if existing_expiry_ms > 0 {
+        Entry::new_string_with_expiry(Bytes::from(formatted.clone()), existing_expiry_ms, base_ts)
+    } else {
+        Entry::new_string(Bytes::from(formatted.clone()))
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
@@ -463,13 +466,14 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("APPEND"),
     };
 
+    let base_ts = db.base_timestamp();
     // Check if key exists, get existing data + expiry
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms;
-            match &entry.value {
-                RedisValue::String(v) => (Some(v.clone()), expiry),
-                _ => {
+            let expiry = entry.expires_at_ms(base_ts);
+            match entry.value.as_bytes() {
+                Some(v) => (Some(Bytes::copy_from_slice(v)), expiry),
+                None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -490,10 +494,10 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let new_len = new_val.len() as i64;
-    let mut entry = Entry {
-        value: RedisValue::String(new_val),
-        expires_at_ms: existing_expiry_ms,
-        metadata: 0,
+    let mut entry = if existing_expiry_ms > 0 {
+        Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+    } else {
+        Entry::new_string(new_val)
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
@@ -512,9 +516,9 @@ pub fn strlen(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("STRLEN"),
     };
     match db.get(key) {
-        Some(entry) => match &entry.value {
-            RedisValue::String(v) => Frame::Integer(v.len() as i64),
-            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => Frame::Integer(v.len() as i64),
+            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Integer(0),
     }
@@ -617,9 +621,9 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GETSET"),
     };
 
-    let old = db.get(&key).map(|e| match &e.value {
-        RedisValue::String(v) => Frame::BulkString(v.clone()),
-        _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+    let old = db.get(&key).map(|e| match e.value.as_bytes() {
+        Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+        None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
     });
 
     // GETSET removes TTL (sets new entry without expiry)
@@ -638,9 +642,9 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GETDEL"),
     };
     match db.remove(key) {
-        Some(entry) => match entry.value {
-            RedisValue::String(v) => Frame::BulkString(v),
-            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
     }
@@ -658,9 +662,9 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
 
     // First, get value (returns None if key doesn't exist or expired)
     let value = match db.get(&key) {
-        Some(entry) => match &entry.value {
-            RedisValue::String(v) => v.clone(),
-            _ => {
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => Bytes::copy_from_slice(v),
+            None => {
                 return Frame::Error(Bytes::from_static(
                     b"WRONGTYPE Operation against a key holding the wrong kind of value",
                 ))
@@ -671,13 +675,14 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Parse options using zero-alloc case-insensitive comparison
     if args.len() > 1 {
+        let base_ts = db.base_timestamp();
         let opt = match extract_bytes(&args[1]) {
             Some(b) => b.as_ref(),
             None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
         };
         if opt.eq_ignore_ascii_case(b"PERSIST") {
             if let Some(entry) = db.get_mut(&key) {
-                entry.expires_at_ms = 0;
+                entry.set_expires_at_ms(base_ts, 0);
             }
         } else if opt.eq_ignore_ascii_case(b"EX") {
             if args.len() < 3 {
@@ -686,7 +691,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(secs) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at_ms = current_time_ms() + (secs as u64) * 1000;
+                        entry.set_expires_at_ms(base_ts, current_time_ms() + (secs as u64) * 1000);
                     }
                 }
                 None => {
@@ -702,7 +707,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ms) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at_ms = current_time_ms() + ms as u64;
+                        entry.set_expires_at_ms(base_ts, current_time_ms() + ms as u64);
                     }
                 }
                 None => {
@@ -718,7 +723,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ts) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at_ms = (ts as u64) * 1000;
+                        entry.set_expires_at_ms(base_ts, (ts as u64) * 1000);
                     }
                 }
                 None => {
@@ -734,7 +739,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             match parse_positive_i64(&args[2]) {
                 Some(ts_ms) => {
                     if let Some(entry) = db.get_mut(&key) {
-                        entry.expires_at_ms = ts_ms as u64;
+                        entry.set_expires_at_ms(base_ts, ts_ms as u64);
                     }
                 }
                 None => {
@@ -803,9 +808,9 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("GET"),
     };
     match db.get_if_alive(key, now_ms) {
-        Some(entry) => match &entry.value {
-            RedisValue::String(v) => Frame::BulkString(v.clone()),
-            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
     }
@@ -826,9 +831,9 @@ pub fn mget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             }
         };
         match db.get_if_alive(key, now_ms) {
-            Some(entry) => match &entry.value {
-                RedisValue::String(v) => results.push(Frame::BulkString(v.clone())),
-                _ => results.push(Frame::Null),
+            Some(entry) => match entry.value.as_bytes() {
+                Some(v) => results.push(Frame::BulkString(Bytes::copy_from_slice(v))),
+                None => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),
         }
@@ -846,9 +851,9 @@ pub fn strlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("STRLEN"),
     };
     match db.get_if_alive(key, now_ms) {
-        Some(entry) => match &entry.value {
-            RedisValue::String(v) => Frame::Integer(v.len() as i64),
-            _ => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => Frame::Integer(v.len() as i64),
+            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Integer(0),
     }
@@ -990,12 +995,10 @@ mod tests {
         let mut db = make_db();
         // Set key with expiry
         set(&mut db, &[bs(b"key"), bs(b"val"), bs(b"EX"), bs(b"100")]);
-        let exp1 = db.get(b"key").unwrap().expires_at_ms;
-        assert!(exp1 > 0);
+        assert!(db.get(b"key").unwrap().has_expiry());
         // Set with KEEPTTL
         set(&mut db, &[bs(b"key"), bs(b"newval"), bs(b"KEEPTTL")]);
-        let exp2 = db.get(b"key").unwrap().expires_at_ms;
-        assert!(exp2 > 0);
+        assert!(db.get(b"key").unwrap().has_expiry());
     }
 
     #[test]
@@ -1137,9 +1140,10 @@ mod tests {
     fn test_incr_preserves_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"counter"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"5"), exp_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"5"), exp_ms, base_ts),
         );
         let result = incr(&mut db, &[bs(b"counter")]);
         assert_eq!(result, Frame::Integer(6));
@@ -1228,9 +1232,10 @@ mod tests {
     fn test_append_preserves_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"key"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms, base_ts),
         );
         append(&mut db, &[bs(b"key"), bs(b" world")]);
         let entry = db.get(b"key").unwrap();
@@ -1288,10 +1293,7 @@ mod tests {
         assert_eq!(result, ok());
         let entry = db.get(b"key").unwrap();
         assert!(entry.has_expiry());
-        match &entry.value {
-            RedisValue::String(v) => assert_eq!(v.as_ref(), b"val"),
-            _ => panic!("unexpected type"),
-        }
+        assert_eq!(entry.value.as_bytes().unwrap(), b"val");
     }
 
     #[test]
@@ -1350,9 +1352,10 @@ mod tests {
     fn test_getset_removes_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"key"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"old"), exp_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"old"), exp_ms, base_ts),
         );
         getset(&mut db, &[bs(b"key"), bs(b"new")]);
         let entry = db.get(b"key").unwrap();
@@ -1398,9 +1401,10 @@ mod tests {
     fn test_getex_persist() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"key"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), exp_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), exp_ms, base_ts),
         );
         let result = getex(&mut db, &[bs(b"key"), bs(b"PERSIST")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));

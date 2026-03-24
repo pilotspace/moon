@@ -80,18 +80,19 @@ mod tests {
     fn test_expire_cycle_removes_expired_keys() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
+        let base_ts = db.base_timestamp();
 
         // Add 10 expired keys
         for i in 0..10 {
             let key = Bytes::from(format!("expired_{}", i));
-            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms));
+            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts));
         }
 
         // Add 5 non-expired keys
         let future_ms = current_time_ms() + 3_600_000;
         for i in 0..5 {
             let key = Bytes::from(format!("alive_{}", i));
-            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms));
+            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms, base_ts));
         }
 
         // Add 3 keys without expiry

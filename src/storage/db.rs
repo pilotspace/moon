@@ -2,6 +2,7 @@ use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use super::compact_value::RedisValueRef;
 use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
 use crate::protocol::Frame;
 
@@ -13,7 +14,7 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
 /// An in-memory key-value database with lazy expiration.
 ///
 /// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
-/// a `RedisValue`, optional expiration, and creation timestamp.
+/// a `CompactValue`, optional expiration (TTL delta), and packed metadata.
 pub struct Database {
     data: HashMap<Bytes, Entry>,
     used_memory: usize,
@@ -22,6 +23,10 @@ pub struct Database {
     cached_now: u32,
     /// Cached current time in unix millis for expiry checks.
     cached_now_ms: u64,
+    /// Base timestamp (epoch seconds) for TTL delta computation.
+    /// Set once at database creation time and never changed, ensuring
+    /// TTL deltas remain stable across the database lifetime.
+    base_timestamp: u32,
 }
 
 impl Database {
@@ -32,14 +37,22 @@ impl Database {
             used_memory: 0,
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
+            base_timestamp: current_secs(),
         }
     }
 
     /// Update the cached timestamp. Call once per batch to amortize syscall cost.
+    /// Does NOT update base_timestamp (it stays fixed for TTL delta stability).
     #[inline]
     pub fn refresh_now(&mut self) {
         self.cached_now = current_secs();
         self.cached_now_ms = current_time_ms();
+    }
+
+    /// Return the base timestamp for TTL delta computation.
+    #[inline]
+    pub fn base_timestamp(&self) -> u32 {
+        self.base_timestamp
     }
 
     /// Return the cached current time (epoch seconds).
@@ -66,9 +79,10 @@ impl Database {
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
         // Single mutable lookup: check expiry and touch access
         let entry = self.data.get_mut(key)?;
-        if entry.is_expired_at(now_ms) {
+        if entry.is_expired_at(base_ts, now_ms) {
             // Key expired -- remove it
             let removed = self.data.remove(key).unwrap();
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
@@ -86,9 +100,10 @@ impl Database {
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
         // Single mutable lookup
         let entry = self.data.get_mut(key)?;
-        if entry.is_expired_at(now_ms) {
+        if entry.is_expired_at(base_ts, now_ms) {
             let removed = self.data.remove(key).unwrap();
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
             return None;
@@ -125,10 +140,11 @@ impl Database {
     /// Optimized: single lookup via get instead of check_expired + contains_key.
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => false,
             Some(entry) => {
-                if entry.is_expired_at(now_ms) {
+                if entry.is_expired_at(base_ts, now_ms) {
                     let removed = self.data.remove(key).unwrap();
                     self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
                     false
@@ -155,7 +171,8 @@ impl Database {
     /// exist (or has already expired). Pass 0 to remove expiry.
     pub fn set_expiry(&mut self, key: &[u8], expires_at_ms: u64) -> bool {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -163,7 +180,7 @@ impl Database {
         }
         match self.data.get_mut(key) {
             Some(entry) => {
-                entry.expires_at_ms = expires_at_ms;
+                entry.set_expires_at_ms(base_ts, expires_at_ms);
                 true
             }
             None => false,
@@ -176,9 +193,9 @@ impl Database {
     }
 
     /// Check if an entry is expired without requiring &mut self.
-    fn check_expired(data: &HashMap<Bytes, Entry>, key: &[u8], now_ms: u64) -> bool {
+    fn check_expired(data: &HashMap<Bytes, Entry>, key: &[u8], base_ts: u32, now_ms: u64) -> bool {
         data.get(key)
-            .is_some_and(|e| e.is_expired_at(now_ms))
+            .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
     }
 
     /// Convenience: set a string value with no expiry.
@@ -188,12 +205,13 @@ impl Database {
 
     /// Convenience: set a string value with an expiry (unix millis).
     pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at_ms: u64) {
-        self.set(key, Entry::new_string_with_expiry(value, expires_at_ms));
+        let base_ts = self.base_timestamp;
+        self.set(key, Entry::new_string_with_expiry(value, expires_at_ms, base_ts));
     }
 
     /// Check if a single entry is expired.
-    fn is_expired(entry: &Entry) -> bool {
-        entry.is_expired_at(current_time_ms())
+    fn is_expired(entry: &Entry, base_ts: u32) -> bool {
+        entry.is_expired_at(base_ts, current_time_ms())
     }
 
     /// WRONGTYPE error frame.
@@ -235,8 +253,9 @@ impl Database {
         key: &[u8],
     ) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
         // Expire check
-        if Self::check_expired(&self.data, key, now_ms) {
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -247,8 +266,9 @@ impl Database {
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
-        match &mut self.data.get_mut(key).unwrap().value {
-            RedisValue::Hash(map) => Ok(map),
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::Hash(map)) => Ok(map),
             _ => Err(Self::wrongtype_error()),
         }
     }
@@ -256,15 +276,16 @@ impl Database {
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
         }
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::Hash(map) => Ok(Some(map)),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::Hash(map) => Ok(Some(map)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -276,7 +297,8 @@ impl Database {
         key: &[u8],
     ) -> Result<&mut VecDeque<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -287,8 +309,9 @@ impl Database {
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
-        match &mut self.data.get_mut(key).unwrap().value {
-            RedisValue::List(list) => Ok(list),
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::List(list)) => Ok(list),
             _ => Err(Self::wrongtype_error()),
         }
     }
@@ -296,15 +319,16 @@ impl Database {
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
         }
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::List(list) => Ok(Some(list)),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::List(list) => Ok(Some(list)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -316,7 +340,8 @@ impl Database {
         key: &[u8],
     ) -> Result<&mut HashSet<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -327,8 +352,9 @@ impl Database {
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
-        match &mut self.data.get_mut(key).unwrap().value {
-            RedisValue::Set(set) => Ok(set),
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::Set(set)) => Ok(set),
             _ => Err(Self::wrongtype_error()),
         }
     }
@@ -336,15 +362,16 @@ impl Database {
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
         }
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::Set(set) => Ok(Some(set)),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::Set(set) => Ok(Some(set)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -362,7 +389,8 @@ impl Database {
         Frame,
     > {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
@@ -373,8 +401,9 @@ impl Database {
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
-        match &mut self.data.get_mut(key).unwrap().value {
-            RedisValue::SortedSet { members, scores } => Ok((members, scores)),
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SortedSet { members, scores }) => Ok((members, scores)),
             _ => Err(Self::wrongtype_error()),
         }
     }
@@ -391,15 +420,16 @@ impl Database {
         Frame,
     > {
         let now_ms = self.cached_now_ms;
-        if Self::check_expired(&self.data, key, now_ms) {
+        let base_ts = self.base_timestamp;
+        if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             }
         }
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::SortedSet { members, scores } => Ok(Some((members, scores))),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::SortedSet { members, scores } => Ok(Some((members, scores))),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -417,9 +447,10 @@ impl Database {
     /// Check if a key exists and its expiry is in the past.
     pub fn is_key_expired(&self, key: &[u8]) -> bool {
         let now_ms = current_time_ms();
+        let base_ts = self.base_timestamp;
         self.data
             .get(key)
-            .is_some_and(|e| e.is_expired_at(now_ms))
+            .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
     }
 
     /// Read-only access to the data map (for SCAN iteration).
@@ -434,8 +465,9 @@ impl Database {
     /// Read-only get: checks expiry, returns None if expired, but does NOT
     /// remove expired keys or touch LRU. Used with RwLock read path.
     pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
+        let base_ts = self.base_timestamp;
         let entry = self.data.get(key)?;
-        if entry.is_expired_at(now_ms) {
+        if entry.is_expired_at(base_ts, now_ms) {
             return None;
         }
         Some(entry)
@@ -443,9 +475,10 @@ impl Database {
 
     /// Read-only existence check: returns false if expired.
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        let base_ts = self.base_timestamp;
         self.data
             .get(key)
-            .map(|e| !e.is_expired_at(now_ms))
+            .map(|e| !e.is_expired_at(base_ts, now_ms))
             .unwrap_or(false)
     }
 
@@ -455,11 +488,12 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
+        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::Hash(map) => Ok(Some(map)),
+            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::Hash(map) => Ok(Some(map)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -471,11 +505,12 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<&VecDeque<Bytes>>, Frame> {
+        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::List(list) => Ok(Some(list)),
+            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::List(list) => Ok(Some(list)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -487,11 +522,12 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<&HashSet<Bytes>>, Frame> {
+        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::Set(set) => Ok(Some(set)),
+            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::Set(set) => Ok(Some(set)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -509,11 +545,12 @@ impl Database {
         )>,
         Frame,
     > {
+        let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
-            Some(entry) if entry.is_expired_at(now_ms) => Ok(None),
-            Some(entry) => match &entry.value {
-                RedisValue::SortedSet { members, scores } => Ok(Some((members, scores))),
+            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::SortedSet { members, scores } => Ok(Some((members, scores))),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -539,8 +576,8 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"value1")),
         );
         let entry = db.get(b"key1").unwrap();
-        match &entry.value {
-            RedisValue::String(v) => assert_eq!(v.as_ref(), b"value1"),
+        match entry.value.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"value1"),
             _ => panic!("unexpected type"),
         }
     }
@@ -568,9 +605,10 @@ mod tests {
         let mut db = Database::new();
         // Set key with an expiry in the past
         let past_ms = current_time_ms() - 1000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms, base_ts),
         );
         // get should return None and remove the key
         assert!(db.get(b"expired").is_none());
@@ -581,9 +619,10 @@ mod tests {
     fn test_exists_with_expiry() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms, base_ts),
         );
         assert!(!db.exists(b"expired"));
     }
@@ -596,9 +635,10 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"v1")),
         );
         let future_ms = current_time_ms() + 3_600_000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"k2"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms, base_ts),
         );
         assert_eq!(db.len(), 2);
         assert_eq!(db.expires_count(), 1);
@@ -606,16 +646,17 @@ mod tests {
 
     #[test]
     fn test_is_expired() {
+        let base_ts = current_secs();
         let past_ms = current_time_ms() - 1000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms);
-        assert!(Database::is_expired(&entry));
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts);
+        assert!(Database::is_expired(&entry, base_ts));
 
         let future_ms = current_time_ms() + 3_600_000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms);
-        assert!(!Database::is_expired(&entry));
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms, base_ts);
+        assert!(!Database::is_expired(&entry, base_ts));
 
         let entry = Entry::new_string(Bytes::from_static(b"v"));
-        assert!(!Database::is_expired(&entry));
+        assert!(!Database::is_expired(&entry, base_ts));
     }
 
     #[test]
@@ -626,10 +667,10 @@ mod tests {
             Entry::new_string(Bytes::from_static(b"old")),
         );
         let entry = db.get_mut(b"key").unwrap();
-        entry.value = RedisValue::String(Bytes::from_static(b"new"));
+        entry.set_string_value(Bytes::from_static(b"new"));
         let entry = db.get(b"key").unwrap();
-        match &entry.value {
-            RedisValue::String(v) => assert_eq!(v.as_ref(), b"new"),
+        match entry.value.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"new"),
             _ => panic!("unexpected type"),
         }
     }
@@ -709,9 +750,10 @@ mod tests {
     fn test_is_key_expired() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
+        let base_ts = db.base_timestamp();
         db.set(
             Bytes::from_static(b"expired"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts),
         );
         assert!(db.is_key_expired(b"expired"));
         assert!(!db.is_key_expired(b"missing"));

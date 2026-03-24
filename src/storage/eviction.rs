@@ -256,7 +256,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
     for key in sampled {
         if let Some(entry) = db.data().get(key) {
             if entry.has_expiry() {
-                let exp = entry.expires_at_ms;
+                let exp = entry.expires_at_ms(db.base_timestamp());
                 let should_evict = match soonest_expiry {
                     None => true,
                     Some(soonest) => exp < soonest,

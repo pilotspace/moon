@@ -10,6 +10,7 @@ use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
 use crate::storage::db::Database;
+use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_secs, current_time_ms, Entry, RedisValue};
 
 // Format constants
@@ -43,11 +44,12 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
 
     // Databases
     for (db_idx, db) in databases.iter().enumerate() {
+        let base_ts = db.base_timestamp();
         let data = db.data();
         // Collect non-expired entries
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
+            .filter(|(_, entry)| !entry.is_expired_at(base_ts, now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -57,7 +59,7 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key, entry)?;
+            write_entry(&mut buf, key, entry, base_ts)?;
         }
     }
 
@@ -80,8 +82,8 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
 
 /// Save from pre-cloned snapshot data (used by BGSAVE to avoid holding the lock).
 ///
-/// Each element in `snapshot` is a Vec of (key, entry) pairs for a database index.
-pub fn save_from_snapshot(snapshot: &[Vec<(Bytes, Entry)>], path: &Path) -> anyhow::Result<()> {
+/// Each element in `snapshot` is a Vec of (key, entry, base_ts) for a database index.
+pub fn save_from_snapshot(snapshot: &[(Vec<(Bytes, Entry)>, u32)], path: &Path) -> anyhow::Result<()> {
     let mut buf = Vec::new();
 
     // Header
@@ -90,9 +92,9 @@ pub fn save_from_snapshot(snapshot: &[Vec<(Bytes, Entry)>], path: &Path) -> anyh
 
     let now_ms = current_time_ms();
 
-    for (db_idx, entries) in snapshot.iter().enumerate() {
+    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
         // Filter expired and skip empty
-        let live: Vec<_> = entries.iter().filter(|(_, e)| !e.is_expired_at(now_ms)).collect();
+        let live: Vec<_> = entries.iter().filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms)).collect();
         if live.is_empty() {
             continue;
         }
@@ -101,7 +103,7 @@ pub fn save_from_snapshot(snapshot: &[Vec<(Bytes, Entry)>], path: &Path) -> anyh
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key, entry)?;
+            write_entry(&mut buf, key, entry, *base_ts)?;
         }
     }
 
@@ -188,7 +190,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
             type_tag => {
                 let (key, entry) = read_entry(&mut cursor, type_tag)?;
                 // Skip entries whose TTL is already in the past
-                if entry.has_expiry() && entry.is_expired_at(now_ms) {
+                if entry.has_expiry() && entry.is_expired_at(current_secs(), now_ms) {
                     continue;
                 }
                 if current_db < databases.len() {
@@ -206,55 +208,56 @@ fn write_entry(
     buf: &mut Vec<u8>,
     key: &Bytes,
     entry: &Entry,
+    base_ts: u32,
 ) -> anyhow::Result<()> {
     // Type tag
-    let type_tag = match &entry.value {
-        RedisValue::String(_) => TYPE_STRING,
-        RedisValue::Hash(_) => TYPE_HASH,
-        RedisValue::List(_) => TYPE_LIST,
-        RedisValue::Set(_) => TYPE_SET,
-        RedisValue::SortedSet { .. } => TYPE_SORTED_SET,
+    let type_tag = match entry.value.as_redis_value() {
+        RedisValueRef::String(_) => TYPE_STRING,
+        RedisValueRef::Hash(_) => TYPE_HASH,
+        RedisValueRef::List(_) => TYPE_LIST,
+        RedisValueRef::Set(_) => TYPE_SET,
+        RedisValueRef::SortedSet { .. } => TYPE_SORTED_SET,
     };
     buf.write_all(&[type_tag])?;
 
     // Key
     write_bytes(buf, key)?;
 
-    // TTL as unix millis (0 = no expiry) -- expires_at_ms IS already millis
+    // TTL as unix millis (0 = no expiry)
     let ttl_ms: i64 = if entry.has_expiry() {
-        entry.expires_at_ms as i64
+        entry.expires_at_ms(base_ts) as i64
     } else {
         0
     };
     buf.write_all(&ttl_ms.to_le_bytes())?;
 
     // Value data
-    match &entry.value {
-        RedisValue::String(s) => {
+    match entry.value.as_redis_value() {
+        RedisValueRef::String(s) => {
             write_bytes(buf, s)?;
         }
-        RedisValue::Hash(map) => {
+        RedisValueRef::Hash(map) => {
             buf.write_all(&(map.len() as u32).to_le_bytes())?;
-            for (field, val) in map {
+            for (field, val) in map.iter() {
                 write_bytes(buf, field)?;
                 write_bytes(buf, val)?;
             }
         }
-        RedisValue::List(list) => {
+        RedisValueRef::List(list) => {
             buf.write_all(&(list.len() as u32).to_le_bytes())?;
-            for elem in list {
+            for elem in list.iter() {
                 write_bytes(buf, elem)?;
             }
         }
-        RedisValue::Set(set) => {
+        RedisValueRef::Set(set) => {
             buf.write_all(&(set.len() as u32).to_le_bytes())?;
-            for member in set {
+            for member in set.iter() {
                 write_bytes(buf, member)?;
             }
         }
-        RedisValue::SortedSet { members, .. } => {
+        RedisValueRef::SortedSet { members, .. } => {
             buf.write_all(&(members.len() as u32).to_le_bytes())?;
-            for (member, score) in members {
+            for (member, score) in members.iter() {
                 write_bytes(buf, member)?;
                 buf.write_all(&score.to_le_bytes())?;
             }
@@ -332,13 +335,18 @@ fn read_entry(
         _ => bail!("Unknown type tag: {}", type_tag),
     };
 
-    let entry = Entry {
-        value,
-        expires_at_ms,
-        metadata: 0,
+    // Use current_secs() as base_ts for loaded entries (matches Database::new())
+    let base_ts = current_secs();
+    let mut entry = if expires_at_ms > 0 {
+        Entry::new_string(Bytes::new()) // placeholder, we'll replace value below
+    } else {
+        Entry::new_string(Bytes::new())
     };
-    // Set last_access and access_counter via methods
-    let mut entry = entry;
+    // Replace value with the correct one via CompactValue
+    entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
+    if expires_at_ms > 0 {
+        entry.set_expires_at_ms(base_ts, expires_at_ms);
+    }
     entry.set_last_access(current_secs());
     entry.set_access_counter(5);
 
@@ -367,6 +375,7 @@ fn read_u32(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::compact_value::RedisValueRef;
     use tempfile::tempdir;
 
     /// Helper: create a temp path for RDB testing.
@@ -388,8 +397,8 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"hello").unwrap();
-        match &entry.value {
-            RedisValue::String(v) => assert_eq!(v.as_ref(), b"world"),
+        match entry.value.as_redis_value() {
+            RedisValueRef::String(v) => assert_eq!(v, b"world"),
             _ => panic!("Expected string"),
         }
         assert!(!entry.has_expiry());
@@ -411,12 +420,13 @@ mod tests {
         let mut loaded = vec![Database::new()];
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
+        let base_ts = loaded[0].base_timestamp();
         let entry = loaded[0].get(b"key").unwrap();
         assert!(entry.has_expiry());
         // TTL should be approximately 3600 seconds in the future (allow 5s tolerance)
         let now_ms = current_time_ms();
-        let remaining_secs = (entry.expires_at_ms - now_ms) / 1000;
-        assert!(remaining_secs > 3590 && remaining_secs <= 3600);
+        let remaining_secs = (entry.expires_at_ms(base_ts) - now_ms) / 1000;
+        assert!(remaining_secs > 3580 && remaining_secs <= 3600);
     }
 
     #[test]
@@ -435,8 +445,8 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myhash").unwrap();
-        match &entry.value {
-            RedisValue::Hash(map) => {
+        match entry.value.as_redis_value() {
+            RedisValueRef::Hash(map) => {
                 assert_eq!(map.len(), 2);
                 assert_eq!(map.get(&Bytes::from_static(b"f1")).unwrap().as_ref(), b"v1");
                 assert_eq!(map.get(&Bytes::from_static(b"f2")).unwrap().as_ref(), b"v2");
@@ -462,8 +472,8 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"mylist").unwrap();
-        match &entry.value {
-            RedisValue::List(list) => {
+        match entry.value.as_redis_value() {
+            RedisValueRef::List(list) => {
                 assert_eq!(list.len(), 3);
                 assert_eq!(list[0].as_ref(), b"a");
                 assert_eq!(list[1].as_ref(), b"b");
@@ -490,8 +500,8 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myset").unwrap();
-        match &entry.value {
-            RedisValue::Set(set) => {
+        match entry.value.as_redis_value() {
+            RedisValueRef::Set(set) => {
                 assert_eq!(set.len(), 3);
                 assert!(set.contains(&Bytes::from_static(b"x")));
                 assert!(set.contains(&Bytes::from_static(b"y")));
@@ -519,8 +529,8 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myzset").unwrap();
-        match &entry.value {
-            RedisValue::SortedSet { members, scores } => {
+        match entry.value.as_redis_value() {
+            RedisValueRef::SortedSet { members, scores } => {
                 assert_eq!(members.len(), 2);
                 assert_eq!(*members.get(&Bytes::from_static(b"alice")).unwrap(), 1.5);
                 assert_eq!(*members.get(&Bytes::from_static(b"bob")).unwrap(), 2.7);
@@ -573,12 +583,12 @@ mod tests {
         assert_eq!(count, 6);
 
         // Verify each type
-        assert!(matches!(loaded[0].get(b"str").unwrap().value, RedisValue::String(_)));
+        assert_eq!(loaded[0].get(b"str").unwrap().value.type_name(), "string");
         assert!(loaded[0].get(b"str_ttl").unwrap().has_expiry());
-        assert!(matches!(loaded[0].get(b"h").unwrap().value, RedisValue::Hash(_)));
-        assert!(matches!(loaded[0].get(b"l").unwrap().value, RedisValue::List(_)));
-        assert!(matches!(loaded[0].get(b"s").unwrap().value, RedisValue::Set(_)));
-        assert!(matches!(loaded[0].get(b"z").unwrap().value, RedisValue::SortedSet { .. }));
+        assert_eq!(loaded[0].get(b"h").unwrap().value.type_name(), "hash");
+        assert_eq!(loaded[0].get(b"l").unwrap().value.type_name(), "list");
+        assert_eq!(loaded[0].get(b"s").unwrap().value.type_name(), "set");
+        assert_eq!(loaded[0].get(b"z").unwrap().value.type_name(), "zset");
     }
 
     #[test]
@@ -590,9 +600,10 @@ mod tests {
         dbs[0].set_string(Bytes::from_static(b"live"), Bytes::from_static(b"yes"));
         // Expired key
         let past_ms = current_time_ms() - 1000;
+        let base_ts = dbs[0].base_timestamp();
         dbs[0].set(
             Bytes::from_static(b"dead"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
+            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms, base_ts),
         );
 
         save(&dbs, &path).unwrap();

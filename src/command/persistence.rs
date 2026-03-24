@@ -39,15 +39,18 @@ pub fn bgsave_start(
     }
 
     // Clone snapshot: lock each db individually with read lock
-    let snapshot: Vec<Vec<(Bytes, crate::storage::entry::Entry)>> = db
+    // Include base_timestamp for TTL delta resolution during serialization
+    let snapshot: Vec<(Vec<(Bytes, crate::storage::entry::Entry)>, u32)> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            guard
+            let base_ts = guard.base_timestamp();
+            let entries = guard
                 .data()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+                .collect();
+            (entries, base_ts)
         })
         .collect();
 

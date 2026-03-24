@@ -14,6 +14,7 @@ use crate::command::{dispatch, DispatchResult};
 use crate::protocol::{Frame, ParseConfig};
 use crate::protocol::{parse, serialize};
 use crate::storage::db::Database;
+use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_time_ms, Entry, RedisValue};
 
 /// Type alias for the per-database RwLock container.
@@ -256,6 +257,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
     let now_ms = current_time_ms();
 
     for (db_idx, db) in databases.iter().enumerate() {
+        let base_ts = db.base_timestamp();
         let data = db.data();
         if data.is_empty() {
             continue;
@@ -272,20 +274,20 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
         for (key, entry) in data {
             // Skip expired entries
-            if entry.is_expired_at(now_ms) {
+            if entry.is_expired_at(base_ts, now_ms) {
                 continue;
             }
 
-            match &entry.value {
-                RedisValue::String(val) => {
+            match entry.value.as_redis_value() {
+                RedisValueRef::String(val) => {
                     let frame = Frame::Array(vec![
                         Frame::BulkString(Bytes::from_static(b"SET")),
                         Frame::BulkString(key.clone()),
-                        Frame::BulkString(val.clone()),
+                        Frame::BulkString(Bytes::copy_from_slice(val)),
                     ]);
                     serialize::serialize(&frame, &mut buf);
                 }
-                RedisValue::Hash(map) => {
+                RedisValueRef::Hash(map) => {
                     if map.is_empty() {
                         continue;
                     }
@@ -293,13 +295,13 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         Frame::BulkString(Bytes::from_static(b"HSET")),
                         Frame::BulkString(key.clone()),
                     ];
-                    for (field, val) in map {
+                    for (field, val) in map.iter() {
                         args.push(Frame::BulkString(field.clone()));
                         args.push(Frame::BulkString(val.clone()));
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }
-                RedisValue::List(list) => {
+                RedisValueRef::List(list) => {
                     if list.is_empty() {
                         continue;
                     }
@@ -307,12 +309,12 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         Frame::BulkString(Bytes::from_static(b"RPUSH")),
                         Frame::BulkString(key.clone()),
                     ];
-                    for elem in list {
+                    for elem in list.iter() {
                         args.push(Frame::BulkString(elem.clone()));
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }
-                RedisValue::Set(set) => {
+                RedisValueRef::Set(set) => {
                     if set.is_empty() {
                         continue;
                     }
@@ -320,12 +322,12 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         Frame::BulkString(Bytes::from_static(b"SADD")),
                         Frame::BulkString(key.clone()),
                     ];
-                    for member in set {
+                    for member in set.iter() {
                         args.push(Frame::BulkString(member.clone()));
                     }
                     serialize::serialize(&Frame::Array(args), &mut buf);
                 }
-                RedisValue::SortedSet { members, .. } => {
+                RedisValueRef::SortedSet { members, .. } => {
                     if members.is_empty() {
                         continue;
                     }
@@ -333,7 +335,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         Frame::BulkString(Bytes::from_static(b"ZADD")),
                         Frame::BulkString(key.clone()),
                     ];
-                    for (member, score) in members {
+                    for (member, score) in members.iter() {
                         args.push(Frame::BulkString(Bytes::from(score.to_string())));
                         args.push(Frame::BulkString(member.clone()));
                     }
@@ -342,14 +344,17 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
             }
 
             // Generate PEXPIRE for keys with TTL
-            if entry.has_expiry() && entry.expires_at_ms > now_ms {
-                let remaining_ms = entry.expires_at_ms - now_ms;
-                let pexpire_frame = Frame::Array(vec![
-                    Frame::BulkString(Bytes::from_static(b"PEXPIRE")),
-                    Frame::BulkString(key.clone()),
-                    Frame::BulkString(Bytes::from(remaining_ms.to_string())),
-                ]);
-                serialize::serialize(&pexpire_frame, &mut buf);
+            if entry.has_expiry() {
+                let exp_ms = entry.expires_at_ms(base_ts);
+                if exp_ms > now_ms {
+                    let remaining_ms = exp_ms - now_ms;
+                    let pexpire_frame = Frame::Array(vec![
+                        Frame::BulkString(Bytes::from_static(b"PEXPIRE")),
+                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(Bytes::from(remaining_ms.to_string())),
+                    ]);
+                    serialize::serialize(&pexpire_frame, &mut buf);
+                }
             }
         }
     }
@@ -362,21 +367,23 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// Writes to a temporary file first, then atomically renames for crash safety.
 pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result<()> {
     // Clone database state: lock each db individually with read lock
-    let snapshot: Vec<Vec<(Bytes, Entry)>> = db
+    let snapshot: Vec<(Vec<(Bytes, Entry)>, u32)> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            guard
+            let base_ts = guard.base_timestamp();
+            let entries = guard
                 .data()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+                .collect();
+            (entries, base_ts)
         })
         .collect();
 
     // Reconstruct temporary Database objects for generate_rewrite_commands
     let mut temp_dbs: Vec<Database> = Vec::with_capacity(snapshot.len());
-    for entries in &snapshot {
+    for (entries, _base_ts) in &snapshot {
         let mut db = Database::new();
         for (key, entry) in entries {
             db.set(key.clone(), entry.clone());
@@ -494,9 +501,9 @@ mod tests {
         assert_eq!(count, 2);
 
         let entry = dbs[0].get(b"k1").unwrap();
-        assert!(matches!(&entry.value, RedisValue::String(v) if v.as_ref() == b"v1"));
+        assert_eq!(entry.value.as_bytes().unwrap(), b"v1");
         let entry = dbs[0].get(b"k2").unwrap();
-        assert!(matches!(&entry.value, RedisValue::String(v) if v.as_ref() == b"v2"));
+        assert_eq!(entry.value.as_bytes().unwrap(), b"v2");
     }
 
     #[test]
@@ -550,9 +557,10 @@ mod tests {
         let count = replay_aof(&mut dbs, &aof_path).unwrap();
         assert_eq!(count, 2);
 
+        let base_ts = dbs[0].base_timestamp();
         let entry = dbs[0].get(b"mykey").unwrap();
         assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms - current_time_ms()) / 1000;
+        let remaining_secs = (entry.expires_at_ms(base_ts) - current_time_ms()) / 1000;
         assert!(remaining_secs >= 50); // Allow some tolerance
     }
 
@@ -658,7 +666,7 @@ mod tests {
         assert!(count >= 5, "Expected at least 5 commands, got {}", count);
 
         // Verify each type restored
-        assert!(matches!(loaded_dbs[0].get(b"str").unwrap().value, RedisValue::String(_)));
+        assert_eq!(loaded_dbs[0].get(b"str").unwrap().value.type_name(), "string");
         assert!(loaded_dbs[0].get_hash(b"h").unwrap().is_some());
         assert!(loaded_dbs[0].get_list(b"l").unwrap().is_some());
         assert!(loaded_dbs[0].get_set(b"s").unwrap().is_some());
@@ -686,9 +694,10 @@ mod tests {
         let count = replay_aof(&mut loaded_dbs, &aof_path).unwrap();
         assert_eq!(count, 2); // SET + PEXPIRE
 
+        let base_ts = loaded_dbs[0].base_timestamp();
         let entry = loaded_dbs[0].get(b"key").unwrap();
         assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms - current_time_ms()) / 1000;
+        let remaining_secs = (entry.expires_at_ms(base_ts) - current_time_ms()) / 1000;
         assert!(remaining_secs > 3500);
     }
 
@@ -713,8 +722,8 @@ mod tests {
         replay_aof(&mut loaded, &aof_path).unwrap();
 
         // Check strings
-        assert!(matches!(loaded[0].get(b"a").unwrap().value, RedisValue::String(ref v) if v.as_ref() == b"1"));
-        assert!(matches!(loaded[0].get(b"b").unwrap().value, RedisValue::String(ref v) if v.as_ref() == b"2"));
+        assert_eq!(loaded[0].get(b"a").unwrap().value.as_bytes().unwrap(), b"1");
+        assert_eq!(loaded[0].get(b"b").unwrap().value.as_bytes().unwrap(), b"2");
 
         // Check list order preserved
         let list = loaded[0].get_list(b"mylist").unwrap().unwrap();
