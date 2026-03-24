@@ -1,3 +1,5 @@
+use memchr::{memchr, memchr2};
+
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::frame::{Frame, ParseError};
@@ -21,12 +23,31 @@ pub fn parse_inline(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
     // Extract line content before CRLF
     let line = &buf[..crlf_pos];
 
-    // Split by whitespace (spaces and tabs), filtering empty slices
-    let args: Vec<Frame> = line
-        .split(|&b| b == b' ' || b == b'\t')
-        .filter(|s| !s.is_empty())
-        .map(|token| Frame::BulkString(Bytes::copy_from_slice(token)))
-        .collect();
+    // Split by whitespace (spaces and tabs) using SIMD, filtering empty slices
+    let mut args: Vec<Frame> = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        // Skip whitespace
+        while start < line.len() && (line[start] == b' ' || line[start] == b'\t') {
+            start += 1;
+        }
+        if start >= line.len() {
+            break;
+        }
+        // Find next whitespace using SIMD
+        match memchr2(b' ', b'\t', &line[start..]) {
+            Some(pos) => {
+                args.push(Frame::BulkString(Bytes::copy_from_slice(
+                    &line[start..start + pos],
+                )));
+                start += pos + 1;
+            }
+            None => {
+                args.push(Frame::BulkString(Bytes::copy_from_slice(&line[start..])));
+                break;
+            }
+        }
+    }
 
     // Advance buffer past line + CRLF
     buf.advance(crlf_pos + 2);
@@ -39,17 +60,28 @@ pub fn parse_inline(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
     Ok(Some(Frame::Array(args)))
 }
 
-/// Search for a `\r\n` pair in the buffer, returning the position of `\r`.
+/// SIMD-accelerated CRLF position finder. Returns position of \r.
+#[inline]
 fn find_crlf_position(buf: &[u8]) -> Option<usize> {
     if buf.len() < 2 {
         return None;
     }
-    for i in 0..buf.len() - 1 {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            return Some(i);
+    let mut search_from = 0;
+    loop {
+        match memchr(b'\r', &buf[search_from..]) {
+            Some(rel_pos) => {
+                let abs_pos = search_from + rel_pos;
+                if abs_pos + 1 < buf.len() && buf[abs_pos + 1] == b'\n' {
+                    return Some(abs_pos);
+                }
+                search_from = abs_pos + 1;
+                if search_from >= buf.len() {
+                    return None;
+                }
+            }
+            None => return None,
         }
     }
-    None
 }
 
 #[cfg(test)]
