@@ -91,6 +91,52 @@ fn bench_roundtrip(c: &mut Criterion) {
     });
 }
 
+fn bench_parse_pipeline_32(c: &mut Criterion) {
+    let config = ParseConfig::default();
+    // Build a 32-command pipeline: *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n x32
+    let single_cmd = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    let mut pipeline_data = Vec::with_capacity(single_cmd.len() * 32);
+    for _ in 0..32 {
+        pipeline_data.extend_from_slice(single_cmd);
+    }
+
+    c.bench_function("parse_pipeline_32cmd", |b| {
+        b.iter(|| {
+            let mut buf = BytesMut::from(&pipeline_data[..]);
+            let mut count = 0;
+            while let Ok(Some(frame)) = parse(black_box(&mut buf), &config) {
+                black_box(&frame);
+                count += 1;
+            }
+            assert_eq!(count, 32);
+        })
+    });
+}
+
+fn bench_parse_get_single(c: &mut Criterion) {
+    let config = ParseConfig::default();
+    let input = b"*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n";
+    c.bench_function("parse_get_single", |b| {
+        b.iter(|| {
+            let mut buf = BytesMut::from(&input[..]);
+            let frame = parse(black_box(&mut buf), &config).unwrap().unwrap();
+            black_box(frame);
+        })
+    });
+}
+
+fn bench_parse_set_single(c: &mut Criterion) {
+    let config = ParseConfig::default();
+    let input = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    c.bench_function("parse_set_single", |b| {
+        b.iter(|| {
+            let mut buf = BytesMut::from(&input[..]);
+            let frame = parse(black_box(&mut buf), &config).unwrap().unwrap();
+            black_box(frame);
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_parse_simple_string,
@@ -100,5 +146,8 @@ criterion_group!(
     bench_parse_inline,
     bench_serialize_array,
     bench_roundtrip,
+    bench_parse_pipeline_32,
+    bench_parse_get_single,
+    bench_parse_set_single,
 );
 criterion_main!(benches);
