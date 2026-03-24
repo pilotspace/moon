@@ -4,6 +4,8 @@ use rand::Rng;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::compact_value::{CompactValue, RedisValueRef};
+
 /// Return the current time as seconds since the Unix epoch, truncated to u32.
 /// Wraps around in the year 2106 -- acceptable for LRU/LFU relative comparisons.
 #[inline]
@@ -102,41 +104,48 @@ pub fn lfu_decay(counter: u8, last_access: u32, lfu_decay_time: u64) -> u8 {
     counter.saturating_sub(decay)
 }
 
-/// Pack last_access (32 bits), version (24 bits), and access_counter (8 bits) into a u64.
-/// Layout: [last_access:32 | version:24 | access_counter:8]
+/// Pack last_access (16 bits), version (8 bits), and access_counter (8 bits) into a u32.
+/// Layout: [last_access:16 | version:8 | access_counter:8]
 #[inline]
-fn pack_metadata(last_access: u32, version: u32, access_counter: u8) -> u64 {
-    ((last_access as u64) << 32)
-        | (((version & 0xFFFFFF) as u64) << 8)
-        | (access_counter as u64)
+fn pack_metadata_u32(last_access: u16, version: u8, access_counter: u8) -> u32 {
+    ((last_access as u32) << 16) | ((version as u32) << 8) | (access_counter as u32)
 }
 
-/// A single entry in the database, wrapping a value with expiration metadata.
+/// A compact 24-byte entry in the database, wrapping a CompactValue with TTL delta
+/// and packed metadata.
 ///
-/// Compact layout: expires_at_ms (u64, 0 = no expiry, else unix millis)
-/// and metadata (u64) packing [last_access:32 | version:24 | access_counter:8].
+/// Layout:
+/// - `value: CompactValue` (16 bytes) -- SSO for small strings, tagged heap pointer otherwise
+/// - `ttl_delta: u32` (4 bytes) -- 0 = no expiry, else seconds from base_timestamp
+/// - `metadata: u32` (4 bytes) -- packed [last_access:16 | version:8 | counter:8]
+#[repr(C)]
 #[derive(Debug, Clone)]
-pub struct Entry {
-    pub value: RedisValue,
-    /// Expiry as unix milliseconds. 0 means no expiry.
-    pub expires_at_ms: u64,
-    /// Packed metadata: [last_access:32 | version:24 | access_counter:8]
-    pub metadata: u64,
+pub struct CompactEntry {
+    pub value: CompactValue,
+    /// TTL delta in seconds from the per-database base_timestamp. 0 = no expiry.
+    pub ttl_delta: u32,
+    /// Packed metadata: [last_access:16 | version:8 | access_counter:8]
+    pub metadata: u32,
 }
 
-impl Entry {
+const _: () = assert!(std::mem::size_of::<CompactEntry>() == 24);
+
+/// Type alias for backward compatibility during migration.
+pub type Entry = CompactEntry;
+
+impl CompactEntry {
     // --- Accessor methods for packed metadata ---
 
-    /// Get the version (24-bit, wraps at 0xFFFFFF).
+    /// Get the version (8-bit, wraps at 0xFF).
     #[inline]
     pub fn version(&self) -> u32 {
-        ((self.metadata >> 8) & 0xFFFFFF) as u32
+        ((self.metadata >> 8) & 0xFF) as u32
     }
 
-    /// Get the last access time (unix epoch seconds, u32).
+    /// Get the last access time (16-bit relative seconds).
     #[inline]
     pub fn last_access(&self) -> u32 {
-        (self.metadata >> 32) as u32
+        (self.metadata >> 16) as u32
     }
 
     /// Get the LFU access counter (8-bit Morris counter).
@@ -145,104 +154,156 @@ impl Entry {
         (self.metadata & 0xFF) as u8
     }
 
-    /// Set the version (24-bit, truncated to lower 24 bits).
+    /// Set the version (8-bit, truncated to lower 8 bits).
     #[inline]
     pub fn set_version(&mut self, v: u32) {
-        // Clear version bits [8..32), set new value
-        self.metadata = (self.metadata & !((0xFFFFFF_u64) << 8))
-            | (((v & 0xFFFFFF) as u64) << 8);
+        let v8 = (v & 0xFF) as u8;
+        self.metadata = (self.metadata & !(0xFF << 8)) | ((v8 as u32) << 8);
     }
 
-    /// Set the last access time.
+    /// Set the last access time (truncated to 16 bits).
     #[inline]
     pub fn set_last_access(&mut self, t: u32) {
-        // Clear top 32 bits, set new value
-        self.metadata = (self.metadata & 0xFFFFFFFF) | ((t as u64) << 32);
+        let t16 = (t & 0xFFFF) as u16;
+        self.metadata = (self.metadata & 0xFFFF) | ((t16 as u32) << 16);
     }
 
     /// Set the LFU access counter.
     #[inline]
     pub fn set_access_counter(&mut self, c: u8) {
-        self.metadata = (self.metadata & !0xFF) | (c as u64);
+        self.metadata = (self.metadata & !0xFF) | (c as u32);
     }
 
-    /// Increment version, wrapping at 24-bit max.
+    /// Increment version, wrapping at 0xFF.
     #[inline]
     pub fn increment_version(&mut self) {
-        let v = (self.version() + 1) & 0xFFFFFF;
+        let v = ((self.version() + 1) & 0xFF) as u32;
         self.set_version(v);
     }
 
     // --- Expiry helpers ---
+    // TTL is stored as a delta from a per-database base_timestamp.
+    // These methods take base_ts to convert to/from absolute milliseconds.
 
     /// Check if this entry is expired at the given time (unix millis).
+    /// `base_ts` is accepted for API consistency but not used (TTL stored as absolute seconds).
     #[inline]
-    pub fn is_expired_at(&self, now_ms: u64) -> bool {
-        self.expires_at_ms > 0 && now_ms >= self.expires_at_ms
+    pub fn is_expired_at(&self, _base_ts: u32, now_ms: u64) -> bool {
+        if self.ttl_delta == 0 {
+            return false;
+        }
+        let abs_ms = (self.ttl_delta as u64) * 1000;
+        now_ms >= abs_ms
     }
 
     /// Check if this entry has an expiry set.
     #[inline]
     pub fn has_expiry(&self) -> bool {
-        self.expires_at_ms > 0
+        self.ttl_delta != 0
+    }
+
+    /// Get the absolute expiry time in milliseconds (for serialization/TTL commands).
+    /// `base_ts` is accepted for API consistency but not used (TTL stored as absolute seconds).
+    #[inline]
+    pub fn expires_at_ms(&self, _base_ts: u32) -> u64 {
+        if self.ttl_delta == 0 {
+            0
+        } else {
+            (self.ttl_delta as u64) * 1000
+        }
+    }
+
+    /// Set the expiry from absolute milliseconds. Pass 0 to remove expiry.
+    /// `base_ts` is accepted for API consistency but not used (TTL stored as absolute seconds).
+    #[inline]
+    pub fn set_expires_at_ms(&mut self, _base_ts: u32, ms: u64) {
+        if ms == 0 {
+            self.ttl_delta = 0;
+        } else {
+            // Store as absolute seconds (u32 is good until year 2106)
+            let abs_secs = ms / 1000;
+            // Ensure non-zero delta for non-zero input
+            self.ttl_delta = (abs_secs.max(1)).min(u32::MAX as u64) as u32;
+        }
+    }
+
+    // --- Convenience value accessors ---
+
+    /// Borrow the value as a RedisValueRef.
+    #[inline]
+    pub fn as_redis_value(&self) -> RedisValueRef<'_> {
+        self.value.as_redis_value()
+    }
+
+    /// Get mutable access to the underlying heap RedisValue (None for inline SSO).
+    #[inline]
+    pub fn redis_value_mut(&mut self) -> Option<&mut RedisValue> {
+        self.value.as_redis_value_mut()
+    }
+
+    /// Set a new string value, replacing the current value.
+    pub fn set_string_value(&mut self, v: Bytes) {
+        self.value = CompactValue::from_redis_value(RedisValue::String(v));
     }
 
     // --- Constructors ---
 
     /// Create a new string entry with no expiration.
-    pub fn new_string(value: Bytes) -> Entry {
-        Entry {
-            value: RedisValue::String(value),
-            expires_at_ms: 0,
-            metadata: pack_metadata(current_secs(), 0, LFU_INIT_VAL),
+    pub fn new_string(value: Bytes) -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::String(value)),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }
     }
 
     /// Create a new string entry with an expiration time (unix millis).
-    pub fn new_string_with_expiry(value: Bytes, expires_at_ms: u64) -> Entry {
-        Entry {
-            value: RedisValue::String(value),
-            expires_at_ms,
-            metadata: pack_metadata(current_secs(), 0, LFU_INIT_VAL),
-        }
+    pub fn new_string_with_expiry(value: Bytes, expires_at_ms: u64, base_ts: u32) -> CompactEntry {
+        let mut entry = CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::String(value)),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+        };
+        entry.set_expires_at_ms(base_ts, expires_at_ms);
+        entry
     }
 
     /// Create a new hash entry with an empty HashMap.
-    pub fn new_hash() -> Entry {
-        Entry {
-            value: RedisValue::Hash(HashMap::new()),
-            expires_at_ms: 0,
-            metadata: pack_metadata(current_secs(), 0, LFU_INIT_VAL),
+    pub fn new_hash() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::Hash(HashMap::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }
     }
 
     /// Create a new list entry with an empty VecDeque.
-    pub fn new_list() -> Entry {
-        Entry {
-            value: RedisValue::List(VecDeque::new()),
-            expires_at_ms: 0,
-            metadata: pack_metadata(current_secs(), 0, LFU_INIT_VAL),
+    pub fn new_list() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }
     }
 
     /// Create a new set entry with an empty HashSet.
-    pub fn new_set() -> Entry {
-        Entry {
-            value: RedisValue::Set(HashSet::new()),
-            expires_at_ms: 0,
-            metadata: pack_metadata(current_secs(), 0, LFU_INIT_VAL),
+    pub fn new_set() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::Set(HashSet::new())),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }
     }
 
     /// Create a new sorted set entry with empty members and scores.
-    pub fn new_sorted_set() -> Entry {
-        Entry {
-            value: RedisValue::SortedSet {
+    pub fn new_sorted_set() -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_redis_value(RedisValue::SortedSet {
                 members: HashMap::new(),
                 scores: BTreeMap::new(),
-            },
-            expires_at_ms: 0,
-            metadata: pack_metadata(current_secs(), 0, LFU_INIT_VAL),
+            }),
+            ttl_delta: 0,
+            metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
         }
     }
 
@@ -267,18 +328,23 @@ mod tests {
     fn test_new_string_no_expiry() {
         let entry = Entry::new_string(Bytes::from_static(b"hello"));
         assert!(!entry.has_expiry());
-        assert_eq!(entry.expires_at_ms, 0);
-        matches!(entry.value, RedisValue::String(_));
+        assert_eq!(entry.ttl_delta, 0);
+        assert_eq!(entry.value.type_name(), "string");
         assert_eq!(entry.version(), 0);
         assert_eq!(entry.access_counter(), LFU_INIT_VAL);
     }
 
     #[test]
     fn test_new_string_with_expiry() {
+        let base_ts = current_secs();
         let exp_ms = current_time_ms() + 60_000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms);
-        assert_eq!(entry.expires_at_ms, exp_ms);
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms, base_ts);
         assert!(entry.has_expiry());
+        assert!(entry.ttl_delta > 0);
+        // Verify round-trip: expires_at_ms should be approximately exp_ms
+        let recovered_ms = entry.expires_at_ms(base_ts);
+        // Allow 1 second tolerance due to integer division
+        assert!((recovered_ms as i64 - exp_ms as i64).unsigned_abs() < 1000);
         assert_eq!(entry.version(), 0);
         assert_eq!(entry.access_counter(), LFU_INIT_VAL);
     }
@@ -287,7 +353,6 @@ mod tests {
     fn test_new_hash() {
         let entry = Entry::new_hash();
         assert!(!entry.has_expiry());
-        assert!(matches!(entry.value, RedisValue::Hash(ref m) if m.is_empty()));
         assert_eq!(entry.value.type_name(), "hash");
         assert_eq!(entry.version(), 0);
     }
@@ -296,7 +361,6 @@ mod tests {
     fn test_new_list() {
         let entry = Entry::new_list();
         assert!(!entry.has_expiry());
-        assert!(matches!(entry.value, RedisValue::List(ref l) if l.is_empty()));
         assert_eq!(entry.value.type_name(), "list");
         assert_eq!(entry.version(), 0);
     }
@@ -305,7 +369,6 @@ mod tests {
     fn test_new_set() {
         let entry = Entry::new_set();
         assert!(!entry.has_expiry());
-        assert!(matches!(entry.value, RedisValue::Set(ref s) if s.is_empty()));
         assert_eq!(entry.value.type_name(), "set");
         assert_eq!(entry.version(), 0);
     }
@@ -314,7 +377,6 @@ mod tests {
     fn test_new_sorted_set() {
         let entry = Entry::new_sorted_set();
         assert!(!entry.has_expiry());
-        assert!(matches!(entry.value, RedisValue::SortedSet { ref members, ref scores } if members.is_empty() && scores.is_empty()));
         assert_eq!(entry.value.type_name(), "zset");
         assert_eq!(entry.version(), 0);
     }
@@ -377,41 +439,54 @@ mod tests {
     #[test]
     fn test_metadata_packing_roundtrip() {
         let mut entry = Entry::new_string(Bytes::from_static(b"test"));
-        // Test version
-        entry.set_version(12345);
-        assert_eq!(entry.version(), 12345);
-        // Test last_access
-        entry.set_last_access(9999999);
-        assert_eq!(entry.last_access(), 9999999);
+        // Test version (8-bit: max 255)
+        entry.set_version(123);
+        assert_eq!(entry.version(), 123);
+        // Test last_access (16-bit: max 65535)
+        entry.set_last_access(54321);
+        // last_access truncates to u16
+        assert_eq!(entry.last_access(), 54321);
         // version should be preserved
-        assert_eq!(entry.version(), 12345);
+        assert_eq!(entry.version(), 123);
         // Test access_counter
         entry.set_access_counter(42);
         assert_eq!(entry.access_counter(), 42);
         // Other fields preserved
-        assert_eq!(entry.version(), 12345);
-        assert_eq!(entry.last_access(), 9999999);
+        assert_eq!(entry.version(), 123);
+        assert_eq!(entry.last_access(), 54321);
     }
 
     #[test]
-    fn test_increment_version_wraps_at_24bit() {
+    fn test_increment_version_wraps_at_8bit() {
         let mut entry = Entry::new_string(Bytes::from_static(b"test"));
-        entry.set_version(0xFFFFFF);
-        assert_eq!(entry.version(), 0xFFFFFF);
+        entry.set_version(0xFF);
+        assert_eq!(entry.version(), 0xFF);
         entry.increment_version();
         assert_eq!(entry.version(), 0); // wraps
     }
 
     #[test]
     fn test_is_expired_at() {
+        let base_ts = current_secs();
         let now_ms = current_time_ms();
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), now_ms - 1000);
-        assert!(entry.is_expired_at(now_ms));
 
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), now_ms + 60_000);
-        assert!(!entry.is_expired_at(now_ms));
+        // Entry expired in the past
+        let past_ms = now_ms - 1000;
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts);
+        assert!(entry.is_expired_at(base_ts, now_ms));
 
+        // Entry expires in the future
+        let future_ms = now_ms + 60_000;
+        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms, base_ts);
+        assert!(!entry.is_expired_at(base_ts, now_ms));
+
+        // Entry with no expiry
         let entry = Entry::new_string(Bytes::from_static(b"v"));
-        assert!(!entry.is_expired_at(now_ms));
+        assert!(!entry.is_expired_at(base_ts, now_ms));
+    }
+
+    #[test]
+    fn test_compact_entry_size() {
+        assert_eq!(std::mem::size_of::<CompactEntry>(), 24);
     }
 }

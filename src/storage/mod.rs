@@ -1,3 +1,4 @@
+pub mod compact_value;
 pub mod db;
 pub mod entry;
 pub mod eviction;
