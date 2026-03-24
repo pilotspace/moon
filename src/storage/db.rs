@@ -2,10 +2,20 @@ use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use super::bptree::BPTree;
 use super::compact_value::RedisValueRef;
 use super::dashtable::DashTable;
 use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
 use crate::protocol::Frame;
+
+/// Maximum number of entries in a listpack before upgrading to full encoding.
+const LISTPACK_MAX_ENTRIES: usize = 128;
+/// Maximum element size in bytes before upgrading a listpack to full encoding.
+#[allow(dead_code)]
+const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
+/// Maximum number of entries in an intset before upgrading to full encoding.
+#[allow(dead_code)]
+const INTSET_MAX_ENTRIES: usize = 512;
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
@@ -249,6 +259,9 @@ impl Database {
 
     /// Get or create a hash entry. Returns mutable ref to inner HashMap.
     /// Returns Err(WRONGTYPE) if key exists with wrong type.
+    ///
+    /// New keys start with compact listpack encoding and are upgraded to
+    /// full HashMap on first mutable access (eager upgrade).
     pub fn get_or_create_hash(
         &mut self,
         key: &[u8],
@@ -268,6 +281,11 @@ impl Database {
             self.data.insert(k, entry);
         }
         let entry = self.data.get_mut(key).unwrap();
+        // Upgrade compact listpack to full HashMap if needed
+        if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
+            let map = lp.to_hash_map();
+            *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Hash(map)) => Ok(map),
             _ => Err(Self::wrongtype_error()),
@@ -275,12 +293,20 @@ impl Database {
     }
 
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
+    /// Upgrades compact encoding to full HashMap if found.
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        // Upgrade compact encoding if present
+        if let Some(entry) = self.data.get_mut(key) {
+            if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
+                let map = lp.to_hash_map();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
             }
         }
         match self.data.get(key) {
@@ -293,6 +319,7 @@ impl Database {
     }
 
     /// Get or create a list entry. Returns mutable ref to inner VecDeque.
+    /// New keys start with full encoding. Upgrades compact listpack on access.
     pub fn get_or_create_list(
         &mut self,
         key: &[u8],
@@ -311,6 +338,11 @@ impl Database {
             self.data.insert(k, entry);
         }
         let entry = self.data.get_mut(key).unwrap();
+        // Upgrade compact listpack to full VecDeque if needed
+        if let Some(RedisValue::ListListpack(lp)) = entry.value.as_redis_value_mut() {
+            let list = lp.to_vec_deque();
+            *entry.value.as_redis_value_mut().unwrap() = RedisValue::List(list);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::List(list)) => Ok(list),
             _ => Err(Self::wrongtype_error()),
@@ -318,12 +350,20 @@ impl Database {
     }
 
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
+    /// Upgrades compact encoding to full VecDeque if found.
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        // Upgrade compact encoding if present
+        if let Some(entry) = self.data.get_mut(key) {
+            if let Some(RedisValue::ListListpack(lp)) = entry.value.as_redis_value_mut() {
+                let list = lp.to_vec_deque();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::List(list);
             }
         }
         match self.data.get(key) {
@@ -336,6 +376,7 @@ impl Database {
     }
 
     /// Get or create a set entry. Returns mutable ref to inner HashSet.
+    /// New keys start with full encoding. Upgrades compact encodings on access.
     pub fn get_or_create_set(
         &mut self,
         key: &[u8],
@@ -354,6 +395,18 @@ impl Database {
             self.data.insert(k, entry);
         }
         let entry = self.data.get_mut(key).unwrap();
+        // Upgrade compact encodings to full HashSet
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SetListpack(lp)) => {
+                let set = lp.to_hash_set();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+            }
+            Some(RedisValue::SetIntset(is)) => {
+                let set = is.to_hash_set();
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+            }
+            _ => {}
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Set(set)) => Ok(set),
             _ => Err(Self::wrongtype_error()),
@@ -361,12 +414,27 @@ impl Database {
     }
 
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
+    /// Upgrades compact encodings to full HashSet if found.
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
             if let Some(entry) = self.data.remove(key) {
                 self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            }
+        }
+        // Upgrade compact encodings if present
+        if let Some(entry) = self.data.get_mut(key) {
+            match entry.value.as_redis_value_mut() {
+                Some(RedisValue::SetListpack(lp)) => {
+                    let set = lp.to_hash_set();
+                    *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+                }
+                Some(RedisValue::SetIntset(is)) => {
+                    let set = is.to_hash_set();
+                    *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+                }
+                _ => {}
             }
         }
         match self.data.get(key) {
@@ -379,6 +447,9 @@ impl Database {
     }
 
     /// Get or create a sorted set entry. Returns mutable refs to both inner structures.
+    ///
+    /// New keys start with SortedSetBPTree encoding. Legacy SortedSet (BTreeMap)
+    /// entries are upgraded to SortedSetBPTree on access for backward compatibility.
     pub fn get_or_create_sorted_set(
         &mut self,
         key: &[u8],
@@ -484,6 +555,7 @@ impl Database {
     }
 
     /// Read-only hash access. Returns None if key missing or expired, Err if wrong type.
+    /// Compact encodings return None (caller falls through to mutable upgrade path).
     pub fn get_hash_if_alive(
         &self,
         key: &[u8],
@@ -495,12 +567,14 @@ impl Database {
             Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(map)),
+                RedisValueRef::HashListpack(_) => Ok(None),
                 _ => Err(Self::wrongtype_error()),
             },
         }
     }
 
     /// Read-only list access. Returns None if key missing or expired, Err if wrong type.
+    /// Compact encodings return None (caller falls through to mutable upgrade path).
     pub fn get_list_if_alive(
         &self,
         key: &[u8],
@@ -512,12 +586,14 @@ impl Database {
             Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::List(list) => Ok(Some(list)),
+                RedisValueRef::ListListpack(_) => Ok(None),
                 _ => Err(Self::wrongtype_error()),
             },
         }
     }
 
     /// Read-only set access. Returns None if key missing or expired, Err if wrong type.
+    /// Compact encodings return None (caller falls through to mutable upgrade path).
     pub fn get_set_if_alive(
         &self,
         key: &[u8],
@@ -529,12 +605,14 @@ impl Database {
             Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Set(set) => Ok(Some(set)),
+                RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => Ok(None),
                 _ => Err(Self::wrongtype_error()),
             },
         }
     }
 
     /// Read-only sorted set access. Returns None if key missing or expired, Err if wrong type.
+    /// Compact encodings return None (caller falls through to mutable upgrade path).
     pub fn get_sorted_set_if_alive(
         &self,
         key: &[u8],
@@ -552,6 +630,8 @@ impl Database {
             Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::SortedSet { members, scores } => Ok(Some((members, scores))),
+                RedisValueRef::SortedSetBPTree { .. }
+                | RedisValueRef::SortedSetListpack(_) => Ok(None),
                 _ => Err(Self::wrongtype_error()),
             },
         }
