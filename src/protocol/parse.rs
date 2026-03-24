@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -23,11 +23,10 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
         _ => return inline::parse_inline(buf),
     }
 
-    let mut cursor = Cursor::new(&buf[..]);
-    match parse_single_frame(&mut cursor, config, 0) {
+    let mut pos = 0;
+    match parse_single_frame(&buf[..], &mut pos, config, 0) {
         Ok(frame) => {
-            let len = cursor.position() as usize;
-            buf.advance(len);
+            buf.advance(pos);
             Ok(Some(frame))
         }
         Err(ParseError::Incomplete) => Ok(None),
@@ -35,12 +34,53 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
     }
 }
 
-/// Parse a single RESP2 frame from the cursor in one pass.
+/// SIMD-accelerated CRLF finder. Returns absolute position of \r in buf.
+/// Returns None if no complete \r\n found starting from `start`.
+#[inline]
+fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
+    if start >= buf.len() {
+        return None;
+    }
+    let mut search_from = start;
+    loop {
+        match memchr(b'\r', &buf[search_from..]) {
+            Some(rel_pos) => {
+                let abs_pos = search_from + rel_pos;
+                if abs_pos + 1 < buf.len() && buf[abs_pos + 1] == b'\n' {
+                    return Some(abs_pos);
+                }
+                // Bare \r without \n -- skip past it and continue
+                search_from = abs_pos + 1;
+                if search_from >= buf.len() {
+                    return None;
+                }
+            }
+            None => return None,
+        }
+    }
+}
+
+/// Read a CRLF-terminated decimal integer from buf at position pos.
+/// Advances pos past the CRLF.
+#[inline]
+fn read_decimal(buf: &[u8], pos: &mut usize) -> Result<i64, ParseError> {
+    let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+    let line = &buf[*pos..crlf];
+    let n = atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+        message: format!("invalid decimal: {:?}", String::from_utf8_lossy(line)),
+        offset: *pos,
+    })?;
+    *pos = crlf + 2;
+    Ok(n)
+}
+
+/// Parse a single RESP2 frame from buf using direct index tracking.
 ///
 /// Validates completeness and extracts frame data simultaneously.
 /// Returns `Err(ParseError::Incomplete)` if not enough data is available.
 fn parse_single_frame(
-    cursor: &mut Cursor<&[u8]>,
+    buf: &[u8],
+    pos: &mut usize,
     config: &ParseConfig,
     depth: usize,
 ) -> Result<Frame, ParseError> {
@@ -50,40 +90,47 @@ fn parse_single_frame(
                 "array nesting depth {} exceeds maximum {}",
                 depth, config.max_array_depth
             ),
-            offset: cursor.position() as usize,
+            offset: *pos,
         });
     }
+    if *pos >= buf.len() {
+        return Err(ParseError::Incomplete);
+    }
+    let type_byte = buf[*pos];
+    *pos += 1;
 
-    match get_u8(cursor)? {
+    match type_byte {
         b'+' => {
-            let line = find_crlf(cursor)?;
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            *pos = crlf + 2;
             Ok(Frame::SimpleString(Bytes::copy_from_slice(line)))
         }
         b'-' => {
-            let line = find_crlf(cursor)?;
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            *pos = crlf + 2;
             Ok(Frame::Error(Bytes::copy_from_slice(line)))
         }
         b':' => {
-            let line = find_crlf(cursor)?;
-            let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
-                message: "invalid UTF-8 in integer".into(),
-                offset: cursor.position() as usize,
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            let n = atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+                message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
+                offset: *pos,
             })?;
-            let n: i64 = s.parse().map_err(|_| ParseError::Invalid {
-                message: format!("invalid integer: {:?}", s),
-                offset: cursor.position() as usize,
-            })?;
+            *pos = crlf + 2;
             Ok(Frame::Integer(n))
         }
         b'$' => {
-            let len = read_decimal(cursor)?;
+            let len = read_decimal(buf, pos)?;
             if len == -1 {
                 return Ok(Frame::Null);
             }
             if len < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid bulk string length: {}", len),
-                    offset: cursor.position() as usize,
+                    offset: *pos,
                 });
             }
             let len = len as usize;
@@ -93,29 +140,29 @@ fn parse_single_frame(
                         "bulk string size {} exceeds maximum {}",
                         len, config.max_bulk_string_size
                     ),
-                    offset: cursor.position() as usize,
+                    offset: *pos,
                 });
             }
-            // Check we have len + 2 bytes (\r\n) remaining
-            let pos = cursor.position() as usize;
-            let remaining = cursor.get_ref().len() - pos;
+            // CRITICAL: Do NOT scan for CRLF inside bulk string data (Pitfall 6).
+            // The length tells us exactly where the terminator is.
+            let remaining = buf.len() - *pos;
             if remaining < len + 2 {
                 return Err(ParseError::Incomplete);
             }
-            let data = &cursor.get_ref()[pos..pos + len];
+            let data = &buf[*pos..*pos + len];
             let frame = Frame::BulkString(Bytes::copy_from_slice(data));
-            cursor.set_position((pos + len + 2) as u64);
+            *pos += len + 2; // skip data + \r\n
             Ok(frame)
         }
         b'*' => {
-            let count = read_decimal(cursor)?;
+            let count = read_decimal(buf, pos)?;
             if count == -1 {
                 return Ok(Frame::Null);
             }
             if count < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid array length: {}", count),
-                    offset: cursor.position() as usize,
+                    offset: *pos,
                 });
             }
             let count = count as usize;
@@ -125,66 +172,20 @@ fn parse_single_frame(
                         "array length {} exceeds maximum {}",
                         count, config.max_array_length
                     ),
-                    offset: cursor.position() as usize,
+                    offset: *pos,
                 });
             }
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(parse_single_frame(cursor, config, depth + 1)?);
+                items.push(parse_single_frame(buf, pos, config, depth + 1)?);
             }
             Ok(Frame::Array(items))
         }
         byte => Err(ParseError::Invalid {
             message: format!("unknown type byte: 0x{:02x}", byte),
-            offset: cursor.position() as usize - 1,
+            offset: *pos - 1,
         }),
     }
-}
-
-/// Read a single byte from the cursor, or return Incomplete.
-fn get_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8, ParseError> {
-    if !cursor.has_remaining() {
-        return Err(ParseError::Incomplete);
-    }
-    Ok(cursor.get_u8())
-}
-
-/// Find the next CRLF sequence in the cursor.
-/// Returns the bytes before the CRLF (the line content) and advances the cursor past the CRLF.
-/// Returns Incomplete if no CRLF is found.
-fn find_crlf<'a>(cursor: &mut Cursor<&'a [u8]>) -> Result<&'a [u8], ParseError> {
-    let start = cursor.position() as usize;
-    let buf = cursor.get_ref();
-    let end = buf.len();
-
-    // Search for \r\n starting from current position
-    if start >= end {
-        return Err(ParseError::Incomplete);
-    }
-
-    for i in start..end.saturating_sub(1) {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            // Found CRLF at position i
-            let line = &buf[start..i];
-            cursor.set_position((i + 2) as u64);
-            return Ok(line);
-        }
-    }
-
-    Err(ParseError::Incomplete)
-}
-
-/// Read a CRLF-terminated decimal integer from the cursor.
-fn read_decimal(cursor: &mut Cursor<&[u8]>) -> Result<i64, ParseError> {
-    let line = find_crlf(cursor)?;
-    let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
-        message: "invalid UTF-8 in decimal".into(),
-        offset: cursor.position() as usize,
-    })?;
-    s.parse::<i64>().map_err(|_| ParseError::Invalid {
-        message: format!("invalid decimal: {:?}", s),
-        offset: cursor.position() as usize,
-    })
 }
 
 #[cfg(test)]
