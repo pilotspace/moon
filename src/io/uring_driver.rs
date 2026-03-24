@@ -309,6 +309,19 @@ impl UringDriver {
         Ok(n)
     }
 
+    /// Submit pending SQEs without waiting for completions (non-blocking).
+    ///
+    /// Used in the hybrid Tokio+io_uring path where the shard event loop
+    /// polls io_uring completions on a timer rather than blocking.
+    pub fn submit_and_wait_nonblocking(&mut self) -> std::io::Result<usize> {
+        if self.pending_sqes == 0 {
+            return Ok(0);
+        }
+        let n = self.ring.submit()?;
+        self.pending_sqes = 0;
+        Ok(n)
+    }
+
     /// Drain all completed CQEs, returning events for the caller to process.
     ///
     /// The caller (shard event loop) handles command dispatch based on event type.
