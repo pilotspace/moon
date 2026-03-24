@@ -227,4 +227,16 @@ mod tests {
         assert_eq!(rt.maxmemory_policy, "noeviction");
         assert_eq!(rt.maxmemory_samples, 5);
     }
+
+    #[test]
+    fn test_shards_default() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.shards, 0); // auto-detect
+    }
+
+    #[test]
+    fn test_shards_custom() {
+        let config = ServerConfig::parse_from(["rust-redis", "--shards", "4"]);
+        assert_eq!(config.shards, 4);
+    }
 }
