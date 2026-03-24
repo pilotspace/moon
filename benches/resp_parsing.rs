@@ -91,6 +91,123 @@ fn bench_roundtrip(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Naive byte-by-byte RESP parser for benchmark comparison.
+// Implements the same logic as the optimized parser but without memchr/atoi.
+// This serves as a reference baseline to demonstrate SIMD/memchr speedup.
+//
+// NOTE: Naive parser skips Frame construction; actual pre-optimization parser
+// was slower than this reference because it also allocated Bytes/Vec for each
+// frame. Any speedup shown by the optimized parser over this naive one
+// understates the real benefit.
+// ---------------------------------------------------------------------------
+
+fn naive_find_crlf(buf: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn naive_parse_integer(buf: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(buf).ok()?;
+    s.parse::<i64>().ok()
+}
+
+/// Parse one RESP frame naively (byte-by-byte). Returns true if a frame was parsed.
+fn naive_parse_one(buf: &[u8], pos: &mut usize) -> bool {
+    if *pos >= buf.len() {
+        return false;
+    }
+    match buf[*pos] {
+        b'+' | b'-' => {
+            // Simple string / Error: find CRLF
+            if let Some(crlf) = naive_find_crlf(buf, *pos + 1) {
+                *pos = crlf + 2;
+                true
+            } else {
+                false
+            }
+        }
+        b':' => {
+            // Integer: find CRLF, parse integer
+            if let Some(crlf) = naive_find_crlf(buf, *pos + 1) {
+                let _ = naive_parse_integer(&buf[*pos + 1..crlf]);
+                *pos = crlf + 2;
+                true
+            } else {
+                false
+            }
+        }
+        b'$' => {
+            // Bulk string: parse length, skip data
+            if let Some(crlf) = naive_find_crlf(buf, *pos + 1) {
+                if let Some(len) = naive_parse_integer(&buf[*pos + 1..crlf]) {
+                    if len < 0 {
+                        *pos = crlf + 2;
+                        return true;
+                    }
+                    let data_start = crlf + 2;
+                    let data_end = data_start + len as usize;
+                    if data_end + 2 <= buf.len() {
+                        *pos = data_end + 2;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        b'*' => {
+            // Array: parse count, then parse each element
+            if let Some(crlf) = naive_find_crlf(buf, *pos + 1) {
+                if let Some(count) = naive_parse_integer(&buf[*pos + 1..crlf]) {
+                    *pos = crlf + 2;
+                    for _ in 0..count {
+                        if !naive_parse_one(buf, pos) {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn bench_parse_pipeline_32_naive(c: &mut Criterion) {
+    let single_cmd = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    let mut pipeline_data = Vec::with_capacity(single_cmd.len() * 32);
+    for _ in 0..32 {
+        pipeline_data.extend_from_slice(single_cmd);
+    }
+
+    c.bench_function("parse_pipeline_32cmd_naive", |b| {
+        b.iter(|| {
+            let buf = black_box(&pipeline_data[..]);
+            let mut pos = 0;
+            let mut count = 0;
+            while naive_parse_one(buf, &mut pos) {
+                count += 1;
+            }
+            assert_eq!(count, 32);
+        })
+    });
+}
+
 fn bench_parse_pipeline_32(c: &mut Criterion) {
     let config = ParseConfig::default();
     // Build a 32-command pipeline: *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n x32
@@ -147,6 +264,7 @@ criterion_group!(
     bench_serialize_array,
     bench_roundtrip,
     bench_parse_pipeline_32,
+    bench_parse_pipeline_32_naive,
     bench_parse_get_single,
     bench_parse_set_single,
 );
