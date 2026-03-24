@@ -3948,3 +3948,675 @@ async fn test_eval_return_types() {
 
     shutdown.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// ACL integration tests (Phase 22-03)
+// ---------------------------------------------------------------------------
+
+/// Start a server with an aclfile configured (for ACL SAVE/LOAD tests).
+async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let token = CancellationToken::new();
+    let server_token = token.clone();
+
+    let config = ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        databases: 16,
+        requirepass: None,
+        appendonly: "no".to_string(),
+        appendfsync: "everysec".to_string(),
+        save: None,
+        dir: ".".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
+        maxmemory: 0,
+        maxmemory_policy: "noeviction".to_string(),
+        maxmemory_samples: 5,
+        shards: 0,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
+        aclfile: Some(acl_path.to_string()),
+    };
+
+    tokio::spawn(async move {
+        listener::run_with_shutdown(config, server_token)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    (port, token)
+}
+
+/// ACL-01 + ACL-02: SETUSER creates user, GETUSER returns user info
+#[tokio::test]
+async fn test_acl_setuser_and_getuser() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // ACL SETUSER alice on >secret ~* +@all
+    let r: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("alice")
+        .arg("on")
+        .arg(">secret")
+        .arg("~*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // ACL GETUSER alice -- returns array with username, flags, etc.
+    let r: redis::Value = redis::cmd("ACL")
+        .arg("GETUSER")
+        .arg("alice")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Flatten to string for inspection
+    let s = format!("{:?}", r);
+    assert!(s.contains("alice"), "GETUSER should contain username alice, got: {}", s);
+    assert!(s.contains("on"), "GETUSER flags should contain 'on', got: {}", s);
+
+    shutdown.cancel();
+}
+
+/// ACL-02: LIST shows users, DELUSER removes them
+#[tokio::test]
+async fn test_acl_list_and_deluser() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create alice
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("alice")
+        .arg("on")
+        .arg(">secret")
+        .arg("~*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // ACL LIST should include alice
+    let list: Vec<String> = redis::cmd("ACL")
+        .arg("LIST")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(
+        list.iter().any(|l| l.contains("alice")),
+        "ACL LIST should contain alice, got: {:?}",
+        list
+    );
+
+    // ACL DELUSER alice -> 1
+    let count: i64 = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg("alice")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // After delete, AUTH alice secret should fail with WRONGPASS
+    let r: redis::RedisResult<String> = redis::cmd("AUTH")
+        .arg("alice")
+        .arg("secret")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("WRONGPASS"),
+        "Expected WRONGPASS after delete, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+/// ACL-02: WHOAMI returns correct username after AUTH
+#[tokio::test]
+async fn test_acl_whoami() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Default user: WHOAMI -> "default"
+    let who: String = redis::cmd("ACL")
+        .arg("WHOAMI")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(who, "default");
+
+    // Create alice, AUTH as alice, WHOAMI -> "alice"
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("alice")
+        .arg("on")
+        .arg(">secret")
+        .arg("~*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let _: String = redis::cmd("AUTH")
+        .arg("alice")
+        .arg("secret")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let who: String = redis::cmd("ACL")
+        .arg("WHOAMI")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(who, "alice");
+
+    shutdown.cancel();
+}
+
+/// ACL-03: Two-argument AUTH with correct and incorrect passwords
+#[tokio::test]
+async fn test_acl_auth_two_arg() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create alice
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("alice")
+        .arg("on")
+        .arg(">secret")
+        .arg("~*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // AUTH alice secret -> OK
+    let r: String = redis::cmd("AUTH")
+        .arg("alice")
+        .arg("secret")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // AUTH alice wrongpass -> WRONGPASS
+    let r: redis::RedisResult<String> = redis::cmd("AUTH")
+        .arg("alice")
+        .arg("wrongpass")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(err.contains("WRONGPASS"), "Expected WRONGPASS, got: {}", err);
+
+    // AUTH nonexistent pass -> WRONGPASS
+    let r: redis::RedisResult<String> = redis::cmd("AUTH")
+        .arg("nonexistent")
+        .arg("pass")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("WRONGPASS"),
+        "Expected WRONGPASS for nonexistent user, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+/// ACL-04: Default user backward compat with requirepass
+#[tokio::test]
+async fn test_acl_default_user_compat() {
+    let (port, shutdown) = start_server_with_pass("mysecret").await;
+    let mut con = connect_single(port).await;
+
+    // 1-arg AUTH mysecret -> OK
+    let r: String = redis::cmd("AUTH")
+        .arg("mysecret")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // 2-arg AUTH default mysecret -> OK
+    let r: String = redis::cmd("AUTH")
+        .arg("default")
+        .arg("mysecret")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // AUTH wrongpass -> WRONGPASS
+    let r: redis::RedisResult<String> = redis::cmd("AUTH")
+        .arg("wrongpass")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(err.contains("WRONGPASS"), "Expected WRONGPASS, got: {}", err);
+
+    shutdown.cancel();
+}
+
+/// ACL-05: NOPERM for denied commands (user with restricted command permissions)
+#[tokio::test]
+async fn test_acl_noperm_denied_write() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create bob with +@all -@write (can read, cannot write)
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("bob")
+        .arg("on")
+        .arg(">bobpass")
+        .arg("~*")
+        .arg("+@all")
+        .arg("-@write")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // AUTH as bob
+    let _: String = redis::cmd("AUTH")
+        .arg("bob")
+        .arg("bobpass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // GET should work (returns nil since key doesn't exist)
+    let r: redis::RedisResult<Option<String>> = redis::cmd("GET")
+        .arg("somekey")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_ok(), "GET should be allowed for bob, got: {:?}", r);
+
+    // SET should fail with NOPERM
+    let r: redis::RedisResult<String> = redis::cmd("SET")
+        .arg("somekey")
+        .arg("value")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("NOPERM"),
+        "Expected NOPERM error for SET, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+/// ACL-06: Key pattern restriction - single key
+#[tokio::test]
+async fn test_acl_key_pattern_single() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create user restricted with ~cache:* key pattern
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("restricted")
+        .arg("on")
+        .arg(">pass")
+        .arg("~cache:*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // AUTH as restricted
+    let _: String = redis::cmd("AUTH")
+        .arg("restricted")
+        .arg("pass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // SET cache:foo bar -> OK
+    let r: String = redis::cmd("SET")
+        .arg("cache:foo")
+        .arg("bar")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // GET cache:foo -> OK
+    let r: String = redis::cmd("GET")
+        .arg("cache:foo")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "bar");
+
+    // SET other:key bar -> NOPERM
+    let r: redis::RedisResult<String> = redis::cmd("SET")
+        .arg("other:key")
+        .arg("bar")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("NOPERM"),
+        "Expected NOPERM for key outside pattern, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+/// ACL-06: Key pattern restriction - MSET with mixed keys
+#[tokio::test]
+async fn test_acl_key_pattern_mset() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create user restricted with ~cache:* key pattern
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("restricted")
+        .arg("on")
+        .arg(">pass")
+        .arg("~cache:*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // AUTH as restricted
+    let _: String = redis::cmd("AUTH")
+        .arg("restricted")
+        .arg("pass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // MSET cache:a 1 other:b 2 -> NOPERM (other:b fails)
+    let r: redis::RedisResult<String> = redis::cmd("MSET")
+        .arg("cache:a")
+        .arg("1")
+        .arg("other:b")
+        .arg("2")
+        .query_async(&mut con)
+        .await;
+    assert!(r.is_err());
+    let err = format!("{}", r.unwrap_err());
+    assert!(
+        err.contains("NOPERM"),
+        "Expected NOPERM for MSET with mixed keys, got: {}",
+        err
+    );
+
+    shutdown.cancel();
+}
+
+/// ACL-07: ACL LOG records denied commands
+#[tokio::test]
+async fn test_acl_log_records_denial() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create bob with -@write
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("bob")
+        .arg("on")
+        .arg(">bobpass")
+        .arg("~*")
+        .arg("+@all")
+        .arg("-@write")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // AUTH as bob
+    let _: String = redis::cmd("AUTH")
+        .arg("bob")
+        .arg("bobpass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Attempt denied SET
+    let _: redis::RedisResult<String> = redis::cmd("SET")
+        .arg("bob_key")
+        .arg("val")
+        .query_async(&mut con)
+        .await;
+
+    // ACL LOG (on same connection -- log is per-connection)
+    let log: Vec<redis::Value> = redis::cmd("ACL")
+        .arg("LOG")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    assert!(
+        !log.is_empty(),
+        "ACL LOG should have at least one entry after denial"
+    );
+
+    // Check the entry contains reason, username, object
+    let entry = format!("{:?}", log[0]);
+    assert!(
+        entry.contains("command"),
+        "ACL LOG entry should contain reason='command', got: {}",
+        entry
+    );
+    assert!(
+        entry.contains("bob"),
+        "ACL LOG entry should contain username='bob', got: {}",
+        entry
+    );
+
+    shutdown.cancel();
+}
+
+/// ACL-07: ACL LOG RESET clears log; ACL LOG count limits entries
+#[tokio::test]
+async fn test_acl_log_reset_and_count() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // Create bob with -@write
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("bob")
+        .arg("on")
+        .arg(">bobpass")
+        .arg("~*")
+        .arg("+@all")
+        .arg("-@write")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // AUTH as bob
+    let _: String = redis::cmd("AUTH")
+        .arg("bob")
+        .arg("bobpass")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Trigger two denials
+    let _: redis::RedisResult<String> = redis::cmd("SET")
+        .arg("k1")
+        .arg("v1")
+        .query_async(&mut con)
+        .await;
+    let _: redis::RedisResult<String> = redis::cmd("SET")
+        .arg("k2")
+        .arg("v2")
+        .query_async(&mut con)
+        .await;
+
+    // ACL LOG 1 -> at most 1 entry
+    let log: Vec<redis::Value> = redis::cmd("ACL")
+        .arg("LOG")
+        .arg("1")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 1, "ACL LOG 1 should return exactly 1 entry");
+
+    // ACL LOG RESET -> OK
+    let r: String = redis::cmd("ACL")
+        .arg("LOG")
+        .arg("RESET")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // ACL LOG should now be empty
+    let log: Vec<redis::Value> = redis::cmd("ACL")
+        .arg("LOG")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(log.is_empty(), "ACL LOG should be empty after RESET, got {} entries", log.len());
+
+    shutdown.cancel();
+}
+
+/// ACL-08: SAVE writes ACL file, LOAD reloads it, users survive round-trip
+#[tokio::test]
+async fn test_acl_save_load() {
+    let acl_path = std::env::temp_dir()
+        .join(format!("test_acl_{}.acl", std::process::id()))
+        .to_string_lossy()
+        .to_string();
+
+    // Clean up any previous file
+    let _ = std::fs::remove_file(&acl_path);
+
+    let (port, shutdown) = start_server_with_aclfile(&acl_path).await;
+    let mut con = connect_single(port).await;
+
+    // Create persisted_user
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("persisted_user")
+        .arg("on")
+        .arg(">pass")
+        .arg("~*")
+        .arg("+@all")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // ACL SAVE -> OK
+    let r: String = redis::cmd("ACL")
+        .arg("SAVE")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // Verify file exists and contains the user
+    let content = std::fs::read_to_string(&acl_path).unwrap();
+    assert!(
+        content.contains("persisted_user"),
+        "ACL file should contain persisted_user, got: {}",
+        content
+    );
+    assert!(
+        content.contains("user "),
+        "ACL file should start lines with 'user ', got: {}",
+        content
+    );
+
+    // ACL LOAD -> OK (reload from file)
+    let r: String = redis::cmd("ACL")
+        .arg("LOAD")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(r, "OK");
+
+    // After LOAD, persisted_user should still exist
+    let user: redis::Value = redis::cmd("ACL")
+        .arg("GETUSER")
+        .arg("persisted_user")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(user, redis::Value::Nil),
+        "persisted_user should exist after ACL LOAD"
+    );
+
+    // Clean up
+    let _ = std::fs::remove_file(&acl_path);
+    shutdown.cancel();
+}
+
+/// ACL CAT smoke test: categories list and per-category commands
+#[tokio::test]
+async fn test_acl_cat() {
+    let (port, shutdown) = start_server().await;
+    let mut con = connect_single(port).await;
+
+    // ACL CAT -> list of category names
+    let cats: Vec<String> = redis::cmd("ACL")
+        .arg("CAT")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(
+        !cats.is_empty(),
+        "ACL CAT should return non-empty list of categories"
+    );
+    assert!(
+        cats.iter().any(|c| c == "string"),
+        "ACL CAT should include 'string' category, got: {:?}",
+        cats
+    );
+
+    // ACL CAT @string -> list containing "get", "set", etc.
+    let cmds: Vec<String> = redis::cmd("ACL")
+        .arg("CAT")
+        .arg("@string")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(
+        !cmds.is_empty(),
+        "ACL CAT @string should return non-empty list"
+    );
+    assert!(
+        cmds.iter().any(|c| c == "get"),
+        "ACL CAT @string should contain 'get', got: {:?}",
+        cmds
+    );
+    assert!(
+        cmds.iter().any(|c| c == "set"),
+        "ACL CAT @string should contain 'set', got: {:?}",
+        cmds
+    );
+
+    shutdown.cancel();
+}
