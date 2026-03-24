@@ -1,6 +1,7 @@
 pub mod coordinator;
 pub mod dispatch;
 pub mod mesh;
+pub mod numa;
 
 use std::cell::RefCell;
 use std::rc::Rc;

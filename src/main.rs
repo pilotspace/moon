@@ -1,4 +1,8 @@
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(feature = "jemalloc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -87,6 +91,9 @@ fn main() -> anyhow::Result<()> {
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
             .spawn(move || {
+                // Pin shard thread to core BEFORE any allocations (NUMA locality)
+                rust_redis::shard::numa::pin_to_core(id);
+
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
