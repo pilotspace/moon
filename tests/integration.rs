@@ -2426,8 +2426,14 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                     );
 
                     let (_, snap_rx) = tokio::sync::watch::channel(0u64);
+                    let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
+                        rust_redis::acl::AclTable::load_or_default(&shard_config),
+                    ));
+                    let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
+                        shard_config.to_runtime_config(),
+                    ));
                     rt.block_on(local.run_until(
-                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0),
+                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0, acl_t, rt_cfg),
                     ));
                 })
                 .expect("failed to spawn shard thread");
@@ -3462,6 +3468,12 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                     );
 
                     let (_, snap_rx) = tokio::sync::watch::channel(0u64);
+                    let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
+                        rust_redis::acl::AclTable::load_or_default(&shard_config),
+                    ));
+                    let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
+                        shard_config.to_runtime_config(),
+                    ));
                     rt.block_on(local.run_until(shard.run(
                         conn_rx,
                         consumers,
@@ -3474,6 +3486,8 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         None,
                         shard_cs,
                         shard_config.port,
+                        acl_t,
+                        rt_cfg,
                     )));
                 })
                 .expect("failed to spawn shard thread");

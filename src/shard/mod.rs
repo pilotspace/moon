@@ -143,6 +143,8 @@ impl Shard {
         repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
+        acl_table: Arc<RwLock<crate::acl::AclTable>>,
+        runtime_config: Arc<RwLock<RuntimeConfig>>,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -313,6 +315,8 @@ impl Shard {
                             let cp = config_port;
                             let lua = lua_rc.clone();
                             let sc = script_cache_rc.clone();
+                            let acl = acl_table.clone();
+                            let rtcfg = runtime_config.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -332,6 +336,8 @@ impl Shard {
                                     lua,
                                     sc,
                                     cp,
+                                    acl,
+                                    rtcfg,
                                 ).await;
                             });
                         }

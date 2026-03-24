@@ -191,6 +191,214 @@ pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
     }
 }
 
+/// AUTH command handler -- ACL-aware.
+/// Handles 1-arg form (AUTH password -> authenticate as "default") and
+/// 2-arg form (AUTH username password -> authenticate as named user).
+/// Returns (response_frame, Option<authenticated_username>).
+pub fn auth_acl(
+    args: &[Frame],
+    acl_table: &std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>>,
+) -> (Frame, Option<String>) {
+    match args.len() {
+        1 => {
+            let password = match extract_bytes_ref(&args[0]) {
+                Some(p) => String::from_utf8_lossy(p).to_string(),
+                None => return (Frame::Error(Bytes::from_static(b"ERR invalid password")), None),
+            };
+            match acl_table.read().unwrap().authenticate("default", &password) {
+                Some(username) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(username)),
+                None => (
+                    Frame::Error(Bytes::from_static(
+                        b"WRONGPASS invalid username-password pair or user is disabled.",
+                    )),
+                    None,
+                ),
+            }
+        }
+        2 => {
+            let username = match extract_bytes_ref(&args[0]) {
+                Some(u) => String::from_utf8_lossy(u).to_string(),
+                None => return (Frame::Error(Bytes::from_static(b"ERR invalid username")), None),
+            };
+            let password = match extract_bytes_ref(&args[1]) {
+                Some(p) => String::from_utf8_lossy(p).to_string(),
+                None => return (Frame::Error(Bytes::from_static(b"ERR invalid password")), None),
+            };
+            match acl_table.read().unwrap().authenticate(&username, &password) {
+                Some(uname) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(uname)),
+                None => (
+                    Frame::Error(Bytes::from_static(
+                        b"WRONGPASS invalid username-password pair or user is disabled.",
+                    )),
+                    None,
+                ),
+            }
+        }
+        _ => (
+            Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'AUTH' command",
+            )),
+            None,
+        ),
+    }
+}
+
+/// HELLO command handler -- ACL-aware variant.
+///
+/// Like hello() but uses acl_table for AUTH option instead of requirepass.
+/// Returns (response_frame, new_protocol_version, new_client_name, authenticated_username)
+pub fn hello_acl(
+    args: &[Frame],
+    current_proto: u8,
+    client_id: u64,
+    acl_table: &std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>>,
+    authenticated: &mut bool,
+) -> (Frame, u8, Option<Bytes>, Option<String>) {
+    let mut proto = current_proto;
+    let mut client_name: Option<Bytes> = None;
+    let mut auth_user: Option<String> = None;
+    let mut i = 0;
+
+    // Parse optional protover
+    if i < args.len() {
+        if let Some(ver_bytes) = extract_bytes_ref(&args[i]) {
+            if let Ok(ver_str) = std::str::from_utf8(ver_bytes) {
+                if let Ok(ver) = ver_str.parse::<u8>() {
+                    if ver != 2 && ver != 3 {
+                        return (
+                            Frame::Error(Bytes::from_static(
+                                b"NOPROTO unsupported protocol version",
+                            )),
+                            current_proto,
+                            None,
+                            None,
+                        );
+                    }
+                    proto = ver;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    // Parse optional AUTH and SETNAME
+    while i < args.len() {
+        if let Some(keyword) = extract_bytes_ref(&args[i]) {
+            if keyword.eq_ignore_ascii_case(b"AUTH") {
+                if i + 2 >= args.len() {
+                    return (
+                        Frame::Error(Bytes::from_static(
+                            b"ERR Syntax error in HELLO option 'auth'",
+                        )),
+                        current_proto,
+                        None,
+                        None,
+                    );
+                }
+                // AUTH username password
+                let username = match extract_bytes_ref(&args[i + 1]) {
+                    Some(u) => String::from_utf8_lossy(u).to_string(),
+                    None => {
+                        return (
+                            Frame::Error(Bytes::from_static(b"ERR invalid username")),
+                            current_proto,
+                            None,
+                            None,
+                        )
+                    }
+                };
+                let password = match extract_bytes_ref(&args[i + 2]) {
+                    Some(p) => String::from_utf8_lossy(p).to_string(),
+                    None => {
+                        return (
+                            Frame::Error(Bytes::from_static(b"ERR invalid password")),
+                            current_proto,
+                            None,
+                            None,
+                        )
+                    }
+                };
+                match acl_table.read().unwrap().authenticate(&username, &password) {
+                    Some(uname) => {
+                        *authenticated = true;
+                        auth_user = Some(uname);
+                    }
+                    None => {
+                        return (
+                            Frame::Error(Bytes::from_static(
+                                b"WRONGPASS invalid username-password pair or user is disabled.",
+                            )),
+                            current_proto,
+                            None,
+                            None,
+                        );
+                    }
+                }
+                i += 3;
+            } else if keyword.eq_ignore_ascii_case(b"SETNAME") {
+                if i + 1 >= args.len() {
+                    return (
+                        Frame::Error(Bytes::from_static(
+                            b"ERR Syntax error in HELLO option 'setname'",
+                        )),
+                        current_proto,
+                        None,
+                        None,
+                    );
+                }
+                client_name = extract_bytes_owned(&args[i + 1]);
+                i += 2;
+            } else {
+                return (
+                    Frame::Error(Bytes::from(format!(
+                        "ERR Unrecognized HELLO option: {:?}",
+                        String::from_utf8_lossy(keyword)
+                    ))),
+                    current_proto,
+                    None,
+                    None,
+                );
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Build response Map
+    let response = Frame::Map(vec![
+        (
+            Frame::BulkString(Bytes::from_static(b"server")),
+            Frame::BulkString(Bytes::from_static(b"rustredis")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"version")),
+            Frame::BulkString(Bytes::from_static(b"0.1.0")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"proto")),
+            Frame::Integer(proto as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"id")),
+            Frame::Integer(client_id as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"mode")),
+            Frame::BulkString(Bytes::from_static(b"standalone")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"role")),
+            Frame::BulkString(Bytes::from_static(b"master")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"modules")),
+            Frame::Array(vec![]),
+        ),
+    ]);
+
+    (response, proto, client_name, auth_user)
+}
+
 /// Action to take after REPLICAOF command is parsed.
 pub enum ReplicaofAction {
     /// Connect to master and start replication.
@@ -779,5 +987,174 @@ mod tests {
     fn test_replconf_empty_args() {
         let resp = replconf(&[]);
         assert!(matches!(resp, Frame::Error(_)));
+    }
+
+    // === auth_acl tests ===
+
+    fn make_acl_table() -> std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>> {
+        use crate::acl::{AclTable, AclUser};
+        let mut table = AclTable::new();
+        table.set_user("default".to_string(), AclUser::new_default_nopass());
+        std::sync::Arc::new(std::sync::RwLock::new(table))
+    }
+
+    fn make_acl_table_with_password() -> std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>> {
+        use crate::acl::{AclTable, AclUser};
+        let mut table = AclTable::new();
+        table.set_user("default".to_string(), AclUser::new_default_with_password("secret"));
+        std::sync::Arc::new(std::sync::RwLock::new(table))
+    }
+
+    #[test]
+    fn test_auth_acl_1arg_nopass() {
+        let table = make_acl_table();
+        let (resp, user) = auth_acl(
+            &[Frame::BulkString(Bytes::from_static(b"anypass"))],
+            &table,
+        );
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(user, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_auth_acl_1arg_wrong_password() {
+        let table = make_acl_table_with_password();
+        let (resp, user) = auth_acl(
+            &[Frame::BulkString(Bytes::from_static(b"wrong"))],
+            &table,
+        );
+        assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_auth_acl_1arg_correct_password() {
+        let table = make_acl_table_with_password();
+        let (resp, user) = auth_acl(
+            &[Frame::BulkString(Bytes::from_static(b"secret"))],
+            &table,
+        );
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(user, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_auth_acl_2arg_named_user() {
+        let table = make_acl_table();
+        // Create alice with password
+        {
+            let mut t = table.write().unwrap();
+            t.apply_setuser("alice", &["on", ">alicepass", "~*", "+@all"]);
+        }
+        let (resp, user) = auth_acl(
+            &[
+                Frame::BulkString(Bytes::from_static(b"alice")),
+                Frame::BulkString(Bytes::from_static(b"alicepass")),
+            ],
+            &table,
+        );
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(user, Some("alice".to_string()));
+    }
+
+    #[test]
+    fn test_auth_acl_2arg_wrong_password() {
+        let table = make_acl_table();
+        {
+            let mut t = table.write().unwrap();
+            t.apply_setuser("alice", &["on", ">alicepass", "~*", "+@all"]);
+        }
+        let (resp, user) = auth_acl(
+            &[
+                Frame::BulkString(Bytes::from_static(b"alice")),
+                Frame::BulkString(Bytes::from_static(b"wrong")),
+            ],
+            &table,
+        );
+        assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_auth_acl_disabled_user() {
+        let table = make_acl_table();
+        {
+            let mut t = table.write().unwrap();
+            t.apply_setuser("alice", &["off", ">alicepass"]);
+        }
+        let (resp, user) = auth_acl(
+            &[
+                Frame::BulkString(Bytes::from_static(b"alice")),
+                Frame::BulkString(Bytes::from_static(b"alicepass")),
+            ],
+            &table,
+        );
+        assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_auth_acl_wrong_arity() {
+        let table = make_acl_table();
+        let (resp, user) = auth_acl(&[], &table);
+        assert!(matches!(resp, Frame::Error(_)));
+        assert!(user.is_none());
+    }
+
+    // === hello_acl tests ===
+
+    #[test]
+    fn test_hello_acl_no_args() {
+        let table = make_acl_table();
+        let mut auth = true;
+        let (resp, proto, name, user) = hello_acl(&[], 2, 1, &table, &mut auth);
+        assert!(matches!(resp, Frame::Map(_)));
+        assert_eq!(proto, 2);
+        assert!(name.is_none());
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_hello_acl_with_auth_success() {
+        let table = make_acl_table_with_password();
+        let mut auth = false;
+        let (resp, proto, _, user) = hello_acl(
+            &[
+                Frame::BulkString(Bytes::from_static(b"3")),
+                Frame::BulkString(Bytes::from_static(b"AUTH")),
+                Frame::BulkString(Bytes::from_static(b"default")),
+                Frame::BulkString(Bytes::from_static(b"secret")),
+            ],
+            2,
+            1,
+            &table,
+            &mut auth,
+        );
+        assert_eq!(proto, 3);
+        assert!(matches!(resp, Frame::Map(_)));
+        assert!(auth);
+        assert_eq!(user, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_hello_acl_with_auth_failure() {
+        let table = make_acl_table_with_password();
+        let mut auth = false;
+        let (resp, proto, _, user) = hello_acl(
+            &[
+                Frame::BulkString(Bytes::from_static(b"3")),
+                Frame::BulkString(Bytes::from_static(b"AUTH")),
+                Frame::BulkString(Bytes::from_static(b"default")),
+                Frame::BulkString(Bytes::from_static(b"wrong")),
+            ],
+            2,
+            1,
+            &table,
+            &mut auth,
+        );
+        assert_eq!(proto, 2); // unchanged
+        assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
+        assert!(!auth);
+        assert!(user.is_none());
     }
 }

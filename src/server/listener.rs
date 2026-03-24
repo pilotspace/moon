@@ -151,6 +151,12 @@ pub async fn run_with_shutdown(
         repl_id2,
     )));
 
+    // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
+    let acl_table: Arc<RwLock<crate::acl::AclTable>> = {
+        let table = crate::acl::AclTable::load_or_default(&config);
+        Arc::new(RwLock::new(table))
+    };
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -168,10 +174,11 @@ pub async fn run_with_shutdown(
                         let tracking = tracking_table.clone();
                         let cid = conn_cmd::next_client_id();
                         let rs = repl_state.clone();
+                        let acl = acl_table.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
                             aof_tx, change_counter, pubsub, rt_config,
-                            tracking, cid, Some(rs),
+                            tracking, cid, Some(rs), acl,
                         ));
                     }
                     Err(e) => {

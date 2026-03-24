@@ -105,10 +105,18 @@ pub async fn handle_connection(
     tracking_table: Arc<Mutex<TrackingTable>>,
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    acl_table: Arc<RwLock<crate::acl::AclTable>>,
 ) {
+    // Capture peer address before Framed wraps the stream (stream is moved)
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
+    let mut current_user: String = "default".to_string();
+    let mut acl_log = crate::acl::AclLog::new(128);
 
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
@@ -241,11 +249,11 @@ pub async fn handle_connection(
                                     }
                                     _ if cmd.eq_ignore_ascii_case(b"HELLO") => {
                                         // HELLO allowed in subscriber mode (Redis 7+)
-                                        let (response, new_proto, new_name) = conn_cmd::hello(
+                                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                                             cmd_args,
                                             framed.codec().protocol_version(),
                                             client_id,
-                                            &requirepass,
+                                            &acl_table,
                                             &mut authenticated,
                                         );
                                         if !matches!(&response, Frame::Error(_)) {
@@ -253,6 +261,9 @@ pub async fn handle_connection(
                                         }
                                         if let Some(name) = new_name {
                                             client_name = Some(name);
+                                        }
+                                        if let Some(uname) = opt_user {
+                                            current_user = uname;
                                         }
                                         let _ = framed.send(response).await;
                                     }
@@ -344,20 +355,33 @@ pub async fn handle_connection(
                     if !authenticated {
                         match extract_command(&frame) {
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
-                                let response = conn_cmd::auth(cmd_args, &requirepass);
-                                if response == Frame::SimpleString(Bytes::from_static(b"OK")) {
+                                let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                                if let Some(uname) = opt_user {
                                     authenticated = true;
+                                    current_user = uname;
+                                } else {
+                                    // Log failed auth attempt
+                                    acl_log.push(crate::acl::AclLogEntry {
+                                        reason: "auth".to_string(),
+                                        object: "AUTH".to_string(),
+                                        username: current_user.clone(),
+                                        client_addr: peer_addr.clone(),
+                                        timestamp_ms: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64,
+                                    });
                                 }
                                 responses.push(response);
                                 continue;
                             }
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
                                 // HELLO allowed when unauthenticated (can carry AUTH)
-                                let (response, new_proto, new_name) = conn_cmd::hello(
+                                let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                                     cmd_args,
                                     framed.codec().protocol_version(),
                                     client_id,
-                                    &requirepass,
+                                    &acl_table,
                                     &mut authenticated,
                                 );
                                 // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
@@ -366,6 +390,9 @@ pub async fn handle_connection(
                                 }
                                 if let Some(name) = new_name {
                                     client_name = Some(name);
+                                }
+                                if let Some(uname) = opt_user {
+                                    current_user = uname;
                                 }
                                 responses.push(response);
                                 continue;
@@ -388,16 +415,20 @@ pub async fn handle_connection(
                     if let Some((cmd, cmd_args)) = extract_command(&frame) {
                         // AUTH when already authenticated
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
-                            responses.push(conn_cmd::auth(cmd_args, &requirepass));
+                            let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                            if let Some(uname) = opt_user {
+                                current_user = uname;
+                            }
+                            responses.push(response);
                             continue;
                         }
-                        // HELLO -- protocol negotiation
+                        // HELLO -- protocol negotiation (ACL-aware)
                         if cmd.eq_ignore_ascii_case(b"HELLO") {
-                            let (response, new_proto, new_name) = conn_cmd::hello(
+                            let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                                 cmd_args,
                                 framed.codec().protocol_version(),
                                 client_id,
-                                &requirepass,
+                                &acl_table,
                                 &mut authenticated,
                             );
                             // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
@@ -407,6 +438,22 @@ pub async fn handle_connection(
                             if let Some(name) = new_name {
                                 client_name = Some(name);
                             }
+                            if let Some(uname) = opt_user {
+                                current_user = uname;
+                            }
+                            responses.push(response);
+                            continue;
+                        }
+                        // ACL command -- intercepted at connection level
+                        if cmd.eq_ignore_ascii_case(b"ACL") {
+                            let response = crate::command::acl::handle_acl(
+                                cmd_args,
+                                &acl_table,
+                                &mut acl_log,
+                                &current_user,
+                                &peer_addr,
+                                &runtime_config,
+                            );
                             responses.push(response);
                             continue;
                         }
@@ -832,6 +879,28 @@ pub async fn handle_connection(
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             continue;
                         }
+
+                        // === ACL permission check (NOPERM gate) ===
+                        // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled via continue above.
+                        // All remaining commands must pass through the permission gate.
+                        if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
+                            &current_user, cmd, cmd_args,
+                        ) {
+                            acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!(
+                                "NOPERM {}", deny_reason
+                            ))));
+                            continue;
+                        }
                     }
 
                     // --- MULTI queue mode ---
@@ -1251,10 +1320,19 @@ pub async fn handle_connection_sharded(
     lua: std::rc::Rc<mlua::Lua>,
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
+    acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
 ) {
+    // Capture peer address before Framed wraps the stream
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
+    let mut current_user: String = "default".to_string();
+    let mut acl_log = crate::acl::AclLog::new(128);
 
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
@@ -1301,19 +1379,31 @@ pub async fn handle_connection_sharded(
                     if !authenticated {
                         match extract_command(&frame) {
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
-                                let response = conn_cmd::auth(cmd_args, &requirepass);
-                                if response == Frame::SimpleString(Bytes::from_static(b"OK")) {
+                                let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                                if let Some(uname) = opt_user {
                                     authenticated = true;
+                                    current_user = uname;
+                                } else {
+                                    acl_log.push(crate::acl::AclLogEntry {
+                                        reason: "auth".to_string(),
+                                        object: "AUTH".to_string(),
+                                        username: current_user.clone(),
+                                        client_addr: peer_addr.clone(),
+                                        timestamp_ms: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64,
+                                    });
                                 }
                                 responses.push(response);
                                 continue;
                             }
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
-                                let (response, new_proto, new_name) = conn_cmd::hello(
+                                let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                                     cmd_args,
                                     framed.codec().protocol_version(),
                                     client_id,
-                                    &requirepass,
+                                    &acl_table,
                                     &mut authenticated,
                                 );
                                 if !matches!(&response, Frame::Error(_)) {
@@ -1321,6 +1411,9 @@ pub async fn handle_connection_sharded(
                                 }
                                 if let Some(name) = new_name {
                                     client_name = Some(name);
+                                }
+                                if let Some(uname) = opt_user {
+                                    current_user = uname;
                                 }
                                 responses.push(response);
                                 continue;
@@ -1487,13 +1580,23 @@ pub async fn handle_connection_sharded(
                         }
                     }
 
-                    // --- HELLO (protocol negotiation) ---
+                    // --- AUTH (already authenticated) ---
+                    if cmd.eq_ignore_ascii_case(b"AUTH") {
+                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                        if let Some(uname) = opt_user {
+                            current_user = uname;
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- HELLO (protocol negotiation, ACL-aware) ---
                     if cmd.eq_ignore_ascii_case(b"HELLO") {
-                        let (response, new_proto, new_name) = conn_cmd::hello(
+                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                             cmd_args,
                             framed.codec().protocol_version(),
                             client_id,
-                            &requirepass,
+                            &acl_table,
                             &mut authenticated,
                         );
                         if !matches!(&response, Frame::Error(_)) {
@@ -1502,6 +1605,23 @@ pub async fn handle_connection_sharded(
                         if let Some(name) = new_name {
                             client_name = Some(name);
                         }
+                        if let Some(uname) = opt_user {
+                            current_user = uname;
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- ACL command (intercepted at connection level) ---
+                    if cmd.eq_ignore_ascii_case(b"ACL") {
+                        let response = crate::command::acl::handle_acl(
+                            cmd_args,
+                            &acl_table,
+                            &mut acl_log,
+                            &current_user,
+                            &peer_addr,
+                            &runtime_config,
+                        );
                         responses.push(response);
                         continue;
                     }
@@ -1834,6 +1954,27 @@ pub async fn handle_connection_sharded(
                             num_shards,
                         );
                         responses.push(response);
+                        continue;
+                    }
+
+                    // === ACL permission check (NOPERM gate) ===
+                    // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled via continue above.
+                    if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
+                        &current_user, cmd, cmd_args,
+                    ) {
+                        acl_log.push(crate::acl::AclLogEntry {
+                            reason: "command".to_string(),
+                            object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                            username: current_user.clone(),
+                            client_addr: peer_addr.clone(),
+                            timestamp_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        });
+                        responses.push(Frame::Error(Bytes::from(format!(
+                            "NOPERM {}", deny_reason
+                        ))));
                         continue;
                     }
 

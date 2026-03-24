@@ -111,6 +111,17 @@ fn main() -> anyhow::Result<()> {
             None
         };
 
+    // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
+    let acl_table: std::sync::Arc<std::sync::RwLock<rust_redis::acl::AclTable>> = {
+        let table = rust_redis::acl::AclTable::load_or_default(&config);
+        std::sync::Arc::new(std::sync::RwLock::new(table))
+    };
+
+    // Build shared runtime config for sharded handlers
+    let runtime_config_shared: std::sync::Arc<std::sync::RwLock<rust_redis::config::RuntimeConfig>> = {
+        std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config()))
+    };
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
     let config_port = config.port;
@@ -126,6 +137,8 @@ fn main() -> anyhow::Result<()> {
         let shard_snap_rx = snapshot_trigger_rx.clone();
         let shard_repl_state = repl_state.clone();
         let shard_cluster_state = cluster_state.clone();
+        let shard_acl_table = acl_table.clone();
+        let shard_runtime_config = runtime_config_shared.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -162,6 +175,8 @@ fn main() -> anyhow::Result<()> {
                     Some(shard_repl_state),
                     shard_cluster_state,
                     config_port,
+                    shard_acl_table,
+                    shard_runtime_config,
                 ));
             })
             .expect("failed to spawn shard thread");
