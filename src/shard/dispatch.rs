@@ -91,6 +91,12 @@ pub enum ShardMessage {
         add_slots: Vec<u16>,
         remove_slots: Vec<u16>,
     },
+    /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
+    /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
+    ScriptLoad {
+        sha1: String,
+        script: bytes::Bytes,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }

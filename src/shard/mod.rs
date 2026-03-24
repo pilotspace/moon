@@ -215,6 +215,11 @@ impl Shard {
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
         let num_shards = self.num_shards;
 
+        // Initialize per-shard Lua VM (created inside run() because Lua is !Send -- Pitfall 1)
+        let lua_rc: Rc<mlua::Lua> = crate::scripting::setup_lua_vm()
+            .expect("Lua VM initialization failed");
+        let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
+
         // Per-shard snapshot state (None when no snapshot is active)
         let mut snapshot_state: Option<SnapshotState> = None;
         let mut snapshot_reply_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>> = None;
@@ -306,6 +311,8 @@ impl Shard {
                             let rs = repl_state.clone();
                             let cs = cluster_state.clone();
                             let cp = config_port;
+                            let lua = lua_rc.clone();
+                            let sc = script_cache_rc.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -322,6 +329,8 @@ impl Shard {
                                     cid,
                                     rs,
                                     cs,
+                                    lua,
+                                    sc,
                                     cp,
                                 ).await;
                             });
@@ -348,6 +357,7 @@ impl Shard {
                         &mut replica_txs,
                         &repl_state,
                         shard_id,
+                        &script_cache_rc,
                     );
 
                     // Handle pending SnapshotBegin from SPSC
@@ -493,6 +503,7 @@ impl Shard {
         replica_txs: &mut Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)>,
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
+        script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     ) {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
@@ -514,6 +525,7 @@ impl Shard {
                             replica_txs,
                             repl_state,
                             shard_id,
+                            script_cache,
                         );
                     }
                     None => break,
@@ -541,6 +553,7 @@ impl Shard {
         replica_txs: &mut Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)>,
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
+        script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     ) {
         match msg {
             ShardMessage::Execute {
@@ -666,6 +679,13 @@ impl Shard {
             }
             ShardMessage::PubSubFanOut { channel, message } => {
                 pubsub_registry.publish(&channel, &message);
+            }
+            ShardMessage::ScriptLoad { sha1, script } => {
+                // Fan-out: cache this script on this shard so EVALSHA works locally
+                let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
+                if computed == sha1 {
+                    script_cache.borrow_mut().load(script);
+                }
             }
             ShardMessage::SnapshotBegin { epoch, snapshot_dir, reply_tx } => {
                 // Defer to main event loop where we have mutable access to snapshot_state

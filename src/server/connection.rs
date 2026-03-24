@@ -1248,6 +1248,8 @@ pub async fn handle_connection_sharded(
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
     cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    lua: std::rc::Rc<mlua::Lua>,
+    script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
@@ -1377,6 +1379,63 @@ pub async fn handle_connection_sharded(
                                 b"ERR This instance has cluster support disabled",
                             )));
                         }
+                        continue;
+                    }
+
+                    // --- Lua scripting: EVAL / EVALSHA ---
+                    if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
+                        let response = {
+                            let mut dbs = databases.borrow_mut();
+                            let db_count = dbs.len();
+                            let db = &mut dbs[selected_db];
+                            if cmd.eq_ignore_ascii_case(b"EVAL") {
+                                crate::scripting::handle_eval(
+                                    &lua,
+                                    &script_cache,
+                                    cmd_args,
+                                    db,
+                                    shard_id,
+                                    num_shards,
+                                    selected_db,
+                                    db_count,
+                                )
+                            } else {
+                                crate::scripting::handle_evalsha(
+                                    &lua,
+                                    &script_cache,
+                                    cmd_args,
+                                    db,
+                                    shard_id,
+                                    num_shards,
+                                    selected_db,
+                                    db_count,
+                                )
+                            }
+                        };
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- SCRIPT subcommands: LOAD, EXISTS, FLUSH ---
+                    if cmd.eq_ignore_ascii_case(b"SCRIPT") {
+                        let (response, fanout) = crate::scripting::handle_script_subcommand(&script_cache, cmd_args);
+                        // SCRIPT LOAD: fan-out the script to all OTHER shards via SPSC mesh
+                        if let Some((sha1, script_bytes)) = fanout {
+                            let mut producers = dispatch_tx.borrow_mut();
+                            for target in 0..num_shards {
+                                if target == shard_id {
+                                    continue;
+                                }
+                                let idx = ChannelMesh::target_index(shard_id, target);
+                                let msg = ShardMessage::ScriptLoad {
+                                    sha1: sha1.clone(),
+                                    script: script_bytes.clone(),
+                                };
+                                let _ = producers[idx].try_push(msg);
+                            }
+                            drop(producers);
+                        }
+                        responses.push(response);
                         continue;
                     }
 
