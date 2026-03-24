@@ -928,6 +928,10 @@ pub async fn handle_connection_sharded(
     let mut in_multi: bool = false;
     let mut command_queue: Vec<Frame> = Vec::new();
 
+    // Per-connection arena for batch processing temporaries.
+    // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
+    let mut arena = Bump::with_capacity(4096);
+
     loop {
         tokio::select! {
             first_result = framed.next() => {
@@ -947,7 +951,7 @@ pub async fn handle_connection_sharded(
                     }
                 }
 
-                let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
+                let mut responses: BumpVec<Frame> = BumpVec::with_capacity_in(batch.len(), &arena);
                 let mut should_quit = false;
 
                 for frame in batch {
@@ -1249,12 +1253,19 @@ pub async fn handle_connection_sharded(
                     }
                 }
 
+                // Drain BumpVec into owned Vec before await points (Send safety),
+                // then drop arena-backed storage so arena.reset() can reclaim.
+                let send_responses: Vec<Frame> = responses.into_iter().collect();
+
                 // Write all responses
-                for response in responses {
+                for response in send_responses {
                     if framed.send(response).await.is_err() {
+                        arena.reset(); // O(1) bulk deallocation of batch temporaries
                         return;
                     }
                 }
+
+                arena.reset(); // O(1) bulk deallocation of batch temporaries
 
                 if should_quit {
                     break;
