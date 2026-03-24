@@ -146,6 +146,13 @@ pub fn dispatch(
     if cmd.eq_ignore_ascii_case(b"XTRIM") { return DispatchResult::Response(stream::xtrim(db, args)); }
     if cmd.eq_ignore_ascii_case(b"XDEL") { return DispatchResult::Response(stream::xdel(db, args)); }
     if cmd.eq_ignore_ascii_case(b"XREAD") { return DispatchResult::Response(stream::xread(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XGROUP") { return DispatchResult::Response(stream::xgroup(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XREADGROUP") { return DispatchResult::Response(stream::xreadgroup(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XACK") { return DispatchResult::Response(stream::xack(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XPENDING") { return DispatchResult::Response(stream::xpending(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XCLAIM") { return DispatchResult::Response(stream::xclaim(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XAUTOCLAIM") { return DispatchResult::Response(stream::xautoclaim(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"XINFO") { return DispatchResult::Response(stream::xinfo(db, args)); }
 
     DispatchResult::Response(Frame::Error(Bytes::from(format!(
         "ERR unknown command '{}', with args beginning with: ",
