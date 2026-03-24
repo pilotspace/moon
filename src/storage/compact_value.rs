@@ -59,6 +59,36 @@ pub enum RedisValueRef<'a> {
     SortedSetListpack(&'a Listpack),
 }
 
+impl<'a> RedisValueRef<'a> {
+    /// Return the encoding name for OBJECT ENCODING command.
+    pub fn encoding_name(&self) -> &'static str {
+        match self {
+            RedisValueRef::String(s) => {
+                if s.len() <= 20
+                    && std::str::from_utf8(s)
+                        .ok()
+                        .and_then(|ss| ss.parse::<i64>().ok())
+                        .is_some()
+                {
+                    "int"
+                } else {
+                    "embstr"
+                }
+            }
+            RedisValueRef::Hash(_) => "hashtable",
+            RedisValueRef::HashListpack(_) => "listpack",
+            RedisValueRef::List(_) => "linkedlist",
+            RedisValueRef::ListListpack(_) => "listpack",
+            RedisValueRef::Set(_) => "hashtable",
+            RedisValueRef::SetListpack(_) => "listpack",
+            RedisValueRef::SetIntset(_) => "intset",
+            RedisValueRef::SortedSet { .. } => "skiplist",
+            RedisValueRef::SortedSetBPTree { .. } => "skiplist",
+            RedisValueRef::SortedSetListpack(_) => "listpack",
+        }
+    }
+}
+
 /// A 16-byte compact value representation with SSO for small strings
 /// and tagged heap pointers for larger values and collection types.
 #[repr(C)]

@@ -53,6 +53,7 @@ pub fn dispatch(
     if cmd.eq_ignore_ascii_case(b"KEYS") { return DispatchResult::Response(key::keys(db, args)); }
     if cmd.eq_ignore_ascii_case(b"RENAME") { return DispatchResult::Response(key::rename(db, args)); }
     if cmd.eq_ignore_ascii_case(b"RENAMENX") { return DispatchResult::Response(key::renamenx(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"OBJECT") { return DispatchResult::Response(key::object(db, args)); }
     // String commands
     if cmd.eq_ignore_ascii_case(b"GET") { return DispatchResult::Response(string::get(db, args)); }
     if cmd.eq_ignore_ascii_case(b"SET") { return DispatchResult::Response(string::set(db, args)); }
@@ -416,6 +417,213 @@ mod tests {
                 assert_eq!(members.len(), 3);
             }
             _ => panic!("Expected Array response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_string() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // Set a string value
+        let args = make_args(&[b"mykey", b"hello"]);
+        dispatch(&mut db, b"SET", &args, &mut selected, 16);
+        // OBJECT ENCODING mykey
+        let args = make_args(&[b"ENCODING", b"mykey"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("embstr")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_int() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"mykey", b"42"]);
+        dispatch(&mut db, b"SET", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"mykey"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("int")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_hash() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"myhash", b"f", b"v"]);
+        dispatch(&mut db, b"HSET", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"myhash"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("hashtable")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_list() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"mylist", b"a"]);
+        dispatch(&mut db, b"LPUSH", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"mylist"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("linkedlist")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_set_intset() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // SADD with integer-only members should create intset
+        let args = make_args(&[b"myset", b"1", b"2", b"3"]);
+        dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"myset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("intset")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_set_hashtable() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // SADD with non-integer members should create hashtable
+        let args = make_args(&[b"myset", b"hello", b"world"]);
+        dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"myset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("hashtable")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_missing_key() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"ENCODING", b"nokey"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::Null);
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_sadd_intset_upgrade_on_non_integer() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // First create intset with integers
+        let args = make_args(&[b"myset", b"1", b"2", b"3"]);
+        dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        // Verify it's intset
+        let args = make_args(&[b"ENCODING", b"myset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("intset")));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // Add non-integer member -- should upgrade to hashtable
+        let args = make_args(&[b"myset", b"hello"]);
+        dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        // Verify it's now hashtable
+        let args = make_args(&[b"ENCODING", b"myset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("hashtable")));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // Verify all 4 members are present
+        let args = make_args(&[b"myset"]);
+        match dispatch(&mut db, b"SCARD", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::Integer(4));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_sadd_intset_add_more_integers() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // Create intset
+        let args = make_args(&[b"myset", b"1", b"2"]);
+        dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        // Add more integers -- should stay intset
+        let args = make_args(&[b"myset", b"3", b"4"]);
+        match dispatch(&mut db, b"SADD", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::Integer(2));
+            }
+            _ => panic!("Expected Response"),
+        }
+        // Verify still intset
+        let args = make_args(&[b"ENCODING", b"myset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("intset")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_sorted_set() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"myzset", b"1", b"a"]);
+        dispatch(&mut db, b"ZADD", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"myzset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("skiplist")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_help() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"HELP"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(Frame::Array(items)) => {
+                assert!(items.len() >= 2);
+            }
+            _ => panic!("Expected Array response"),
+        }
+    }
+
+    #[test]
+    fn test_object_unknown_subcommand() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = make_args(&[b"BADCMD"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(Frame::Error(_)) => {}
+            _ => panic!("Expected Error response"),
         }
     }
 }

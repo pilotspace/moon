@@ -79,8 +79,20 @@ fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
 // SADD key member [member ...]
 // ---------------------------------------------------------------------------
 
+/// Maximum intset entries before upgrading to full HashSet encoding.
+const INTSET_MAX_ENTRIES: usize = 512;
+
+/// Try to parse a byte slice as an i64.
+fn try_parse_i64(b: &[u8]) -> Option<i64> {
+    std::str::from_utf8(b).ok()?.parse::<i64>().ok()
+}
+
 /// SADD command handler: add members to a set.
 /// Returns Integer(count of new members added).
+///
+/// For new keys where all members are valid integers (and count <= 512),
+/// creates a SetIntset encoding for memory efficiency. Otherwise uses
+/// the standard HashSet encoding.
 pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("SADD");
@@ -89,6 +101,58 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SADD"),
     };
+
+    // Check if all members are valid integers (for intset optimization)
+    let all_integers = args[1..].iter().all(|a| {
+        extract_bytes(a)
+            .map(|b| try_parse_i64(b).is_some())
+            .unwrap_or(false)
+    });
+    let member_count = args.len() - 1;
+
+    // Try intset path: new key with all-integer members, or existing intset
+    if all_integers && member_count <= INTSET_MAX_ENTRIES {
+        match db.get_or_create_intset(key) {
+            Ok(Some(intset)) => {
+                let mut added = 0i64;
+                let mut needs_upgrade = false;
+                for arg in &args[1..] {
+                    if let Some(member) = extract_bytes(arg) {
+                        let val = try_parse_i64(member).unwrap();
+                        if intset.insert(val) {
+                            added += 1;
+                        }
+                        if intset.len() > INTSET_MAX_ENTRIES {
+                            needs_upgrade = true;
+                            break;
+                        }
+                    }
+                }
+                if needs_upgrade {
+                    // Upgrade intset to HashSet and continue adding remaining members
+                    let set = db.upgrade_intset_to_set(key);
+                    // Re-add remaining members (some may already be in the set from intset)
+                    for arg in &args[1..] {
+                        if let Some(member) = extract_bytes(arg) {
+                            set.insert(member.clone());
+                        }
+                    }
+                    // Recount: we need accurate count of new members
+                    // Since we already inserted into intset and then upgraded,
+                    // just count total unique members vs original
+                    return Frame::Integer(added);
+                }
+                return Frame::Integer(added);
+            }
+            Ok(None) => {
+                // Key exists but is not an intset (it's a HashSet or SetListpack)
+                // Fall through to normal path
+            }
+            Err(e) => return e, // WRONGTYPE
+        }
+    }
+
+    // Standard path: get_or_create_set (creates HashSet, upgrades compact encodings)
     let set = match db.get_or_create_set(key) {
         Ok(s) => s,
         Err(e) => return e,

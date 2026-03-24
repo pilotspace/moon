@@ -244,6 +244,48 @@ pub fn type_cmd(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// OBJECT subcommand [arguments]
+///
+/// Inspect the internals of Redis objects. Currently supports:
+/// - OBJECT ENCODING key: returns the internal encoding used for the value
+/// - OBJECT HELP: returns help text
+pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("OBJECT");
+    }
+    let subcommand = match extract_key(&args[0]) {
+        Some(s) => s,
+        None => return err_wrong_args("OBJECT"),
+    };
+    if subcommand.eq_ignore_ascii_case(b"ENCODING") {
+        if args.len() != 2 {
+            return err_wrong_args("OBJECT");
+        }
+        let key = match extract_key(&args[1]) {
+            Some(k) => k,
+            None => return err_wrong_args("OBJECT"),
+        };
+        match db.get(key) {
+            Some(entry) => {
+                let encoding = entry.value.as_redis_value().encoding_name();
+                Frame::BulkString(Bytes::from(encoding))
+            }
+            None => Frame::Null,
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"HELP") {
+        Frame::Array(vec![
+            Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
+            Frame::BulkString(Bytes::from_static(b"  Return the encoding of the object stored at <key>.")),
+            Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
+            Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
+        ])
+    } else {
+        Frame::Error(Bytes::from_static(
+            b"ERR unknown OBJECT subcommand",
+        ))
+    }
+}
+
 /// Redis-compatible glob pattern matcher.
 ///
 /// Supports: `*` (any sequence), `?` (one byte), `[abc]` (character class),
