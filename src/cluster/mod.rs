@@ -4,6 +4,7 @@
 //! When None, all cluster routing is skipped with zero overhead.
 
 pub mod bus;
+pub mod command;
 pub mod gossip;
 pub mod slots;
 
