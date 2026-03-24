@@ -1124,6 +1124,7 @@ pub async fn handle_connection_sharded(
     aof_tx: Option<mpsc::Sender<AofMessage>>,
     tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
+    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -1243,6 +1244,98 @@ pub async fn handle_connection_sharded(
                         }
                         responses.push(response);
                         continue;
+                    }
+
+                    // --- REPLICAOF / SLAVEOF ---
+                    if cmd.eq_ignore_ascii_case(b"REPLICAOF")
+                        || cmd.eq_ignore_ascii_case(b"SLAVEOF")
+                    {
+                        use crate::command::connection::{replicaof, ReplicaofAction};
+                        let (resp, action) = replicaof(cmd_args);
+                        if let Some(action) = action {
+                            if let Some(ref rs) = repl_state {
+                                match action {
+                                    ReplicaofAction::StartReplication { host, port } => {
+                                        if let Ok(mut rs_guard) = rs.write() {
+                                            rs_guard.role = crate::replication::state::ReplicationRole::Replica {
+                                                host: host.clone(),
+                                                port,
+                                                state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
+                                            };
+                                        }
+                                        let rs_clone = Arc::clone(rs);
+                                        let cfg = crate::replication::replica::ReplicaTaskConfig {
+                                            master_host: host,
+                                            master_port: port,
+                                            repl_state: rs_clone,
+                                            num_shards,
+                                            persistence_dir: None, // wired in Plan 04
+                                            listening_port: 0,     // wired in Plan 04
+                                        };
+                                        tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
+                                    }
+                                    ReplicaofAction::PromoteToMaster => {
+                                        use crate::replication::state::generate_repl_id;
+                                        if let Ok(mut rs_guard) = rs.write() {
+                                            rs_guard.repl_id2 = rs_guard.repl_id.clone();
+                                            rs_guard.repl_id = generate_repl_id();
+                                            rs_guard.role = crate::replication::state::ReplicationRole::Master;
+                                        }
+                                    }
+                                    ReplicaofAction::NoOp => {}
+                                }
+                            }
+                        }
+                        responses.push(resp);
+                        continue;
+                    }
+
+                    // --- REPLCONF ---
+                    if cmd.eq_ignore_ascii_case(b"REPLCONF") {
+                        let resp = crate::command::connection::replconf(cmd_args);
+                        responses.push(resp);
+                        continue;
+                    }
+
+                    // --- INFO (with replication section) ---
+                    if cmd.eq_ignore_ascii_case(b"INFO") {
+                        let dbs = databases.borrow();
+                        let response_text = {
+                            let resp_frame = conn_cmd::info_readonly(&dbs[selected_db], cmd_args);
+                            match resp_frame {
+                                Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+                                _ => String::new(),
+                            }
+                        };
+                        drop(dbs);
+                        let mut response_text = response_text;
+                        // Append replication section if repl_state available
+                        if let Some(ref rs) = repl_state {
+                            if let Ok(rs_guard) = rs.try_read() {
+                                response_text.push_str(
+                                    &crate::replication::handshake::build_info_replication(&rs_guard),
+                                );
+                            }
+                        }
+                        responses.push(Frame::BulkString(Bytes::from(response_text)));
+                        continue;
+                    }
+
+                    // --- READONLY enforcement: reject writes on replicas ---
+                    if let Some(ref rs) = repl_state {
+                        if let Ok(rs_guard) = rs.try_read() {
+                            if matches!(
+                                rs_guard.role,
+                                crate::replication::state::ReplicationRole::Replica { .. }
+                            ) {
+                                if crate::persistence::aof::is_write_command(cmd) {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"READONLY You can't write against a read only replica.",
+                                    )));
+                                    continue;
+                                }
+                            }
+                        }
                     }
 
                     // --- CLIENT subcommands (ID, SETNAME, GETNAME, TRACKING) ---

@@ -316,6 +316,7 @@ impl Shard {
                                     aof,
                                     trk,
                                     cid,
+                                    None, // repl_state: wired in Plan 04
                                 ).await;
                             });
                         }
