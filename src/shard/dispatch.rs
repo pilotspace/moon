@@ -67,6 +67,18 @@ pub enum ShardMessage {
     BlockCancel {
         wait_id: u64,
     },
+    /// Register a connected replica's per-shard sender channel with this shard.
+    /// Called once per shard per replica when a new replica connection is established.
+    /// The shard adds `tx` to its replica_txs list for WAL fan-out.
+    RegisterReplica {
+        replica_id: u64,
+        tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    },
+    /// Remove a replica's sender channel from this shard's fan-out list.
+    /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
+    UnregisterReplica {
+        replica_id: u64,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }

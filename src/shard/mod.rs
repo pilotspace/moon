@@ -654,6 +654,12 @@ impl Shard {
             ShardMessage::Shutdown => {
                 info!("Received shutdown via SPSC");
             }
+            ShardMessage::RegisterReplica { .. } => {
+                // Handled in Task 2 with full fan-out wiring
+            }
+            ShardMessage::UnregisterReplica { .. } => {
+                // Handled in Task 2 with full fan-out wiring
+            }
             ShardMessage::NewConnection(_) => {
                 // NewConnection is handled via conn_rx, not SPSC
             }
