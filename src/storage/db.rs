@@ -3,6 +3,7 @@ use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use super::compact_value::RedisValueRef;
+use super::dashtable::DashTable;
 use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
 use crate::protocol::Frame;
 
@@ -16,7 +17,7 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
 /// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
 /// a `CompactValue`, optional expiration (TTL delta), and packed metadata.
 pub struct Database {
-    data: HashMap<Bytes, Entry>,
+    data: DashTable<Bytes, Entry>,
     used_memory: usize,
     /// Cached current time in epoch seconds; set once per batch to avoid
     /// repeated `SystemTime::now()` syscalls on every command.
@@ -33,7 +34,7 @@ impl Database {
     /// Create a new empty database.
     pub fn new() -> Self {
         Database {
-            data: HashMap::new(),
+            data: DashTable::new(),
             used_memory: 0,
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
@@ -193,7 +194,7 @@ impl Database {
     }
 
     /// Check if an entry is expired without requiring &mut self.
-    fn check_expired(data: &HashMap<Bytes, Entry>, key: &[u8], base_ts: u32, now_ms: u64) -> bool {
+    fn check_expired(data: &DashTable<Bytes, Entry>, key: &[u8], base_ts: u32, now_ms: u64) -> bool {
         data.get(key)
             .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
     }
@@ -242,7 +243,7 @@ impl Database {
     }
 
     /// Mutable access to the data map (for eviction to remove keys directly).
-    pub fn data_mut(&mut self) -> &mut HashMap<Bytes, Entry> {
+    pub fn data_mut(&mut self) -> &mut DashTable<Bytes, Entry> {
         &mut self.data
     }
 
@@ -454,7 +455,7 @@ impl Database {
     }
 
     /// Read-only access to the data map (for SCAN iteration).
-    pub fn data(&self) -> &HashMap<Bytes, Entry> {
+    pub fn data(&self) -> &DashTable<Bytes, Entry> {
         &self.data
     }
 

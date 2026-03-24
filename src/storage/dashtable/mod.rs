@@ -266,6 +266,15 @@ impl<V> DashTable<Bytes, V> {
     }
 }
 
+impl<'a, V> IntoIterator for &'a DashTable<Bytes, V> {
+    type Item = (&'a Bytes, &'a V);
+    type IntoIter = Iter<'a, Bytes, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
