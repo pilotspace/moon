@@ -18,11 +18,11 @@ const RDB_MAGIC: &[u8] = b"RUSTREDIS";
 const RDB_VERSION: u8 = 1;
 
 // Type tags
-const TYPE_STRING: u8 = 0;
-const TYPE_HASH: u8 = 1;
-const TYPE_LIST: u8 = 2;
-const TYPE_SET: u8 = 3;
-const TYPE_SORTED_SET: u8 = 4;
+pub(crate) const TYPE_STRING: u8 = 0;
+pub(crate) const TYPE_HASH: u8 = 1;
+pub(crate) const TYPE_LIST: u8 = 2;
+pub(crate) const TYPE_SET: u8 = 3;
+pub(crate) const TYPE_SORTED_SET: u8 = 4;
 
 // Control bytes
 const DB_SELECTOR: u8 = 0xFE;
@@ -255,7 +255,7 @@ pub fn merge_shard_snapshots(
     merged
 }
 
-fn write_entry(
+pub(crate) fn write_entry(
     buf: &mut Vec<u8>,
     key: &Bytes,
     entry: &Entry,
@@ -318,7 +318,7 @@ fn write_entry(
     Ok(())
 }
 
-fn read_entry(
+pub(crate) fn read_entry(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
 ) -> anyhow::Result<(Bytes, Entry)> {
@@ -404,20 +404,20 @@ fn read_entry(
     Ok((key, entry))
 }
 
-fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> anyhow::Result<()> {
     buf.write_all(&(data.len() as u32).to_le_bytes())?;
     buf.write_all(data)?;
     Ok(())
 }
 
-fn read_bytes(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<Bytes> {
+pub(crate) fn read_bytes(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<Bytes> {
     let len = read_u32(cursor)? as usize;
     let mut data = vec![0u8; len];
     cursor.read_exact(&mut data)?;
     Ok(Bytes::from(data))
 }
 
-fn read_u32(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u32> {
+pub(crate) fn read_u32(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u32> {
     let mut buf = [0u8; 4];
     cursor.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
