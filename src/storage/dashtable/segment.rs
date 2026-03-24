@@ -176,6 +176,19 @@ impl<K, V> Segment<K, V> {
         Self::is_full_ctrl(byte)
     }
 
+    /// Iterate over all occupied (key, value) pairs in this segment.
+    /// Returns references to initialized keys and values.
+    pub fn iter_occupied(&self) -> impl Iterator<Item = (&K, &V)> {
+        (0..TOTAL_SLOTS).filter_map(move |slot| {
+            if Self::is_full_ctrl(self.ctrl_byte(slot)) {
+                // SAFETY: slot is FULL, so key and value are initialized.
+                Some(unsafe { (self.keys[slot].assume_init_ref(), self.values[slot].assume_init_ref()) })
+            } else {
+                None
+            }
+        })
+    }
+
     /// Get an immutable reference to the key at the given slot.
     ///
     /// # Safety

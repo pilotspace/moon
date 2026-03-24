@@ -30,7 +30,7 @@ use segment::{h2, home_buckets, InsertResult, Segment, TOTAL_SLOTS};
 
 /// Compute the xxh64 hash of a byte slice.
 #[inline]
-fn hash_key(key: &[u8]) -> u64 {
+pub fn hash_key(key: &[u8]) -> u64 {
     xxhash_rust::xxh64::xxh64(key, 0)
 }
 
@@ -108,6 +108,30 @@ impl<V> DashTable<Bytes, V> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Return the number of unique segments in the segment store.
+    #[inline]
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Return an immutable reference to a segment by storage index.
+    ///
+    /// # Panics
+    /// Panics if `idx >= segment_count()`.
+    #[inline]
+    pub fn segment(&self, idx: usize) -> &Segment<Bytes, V> {
+        &self.segments[idx]
+    }
+
+    /// Determine which segment storage index a key hash maps to.
+    ///
+    /// Uses the directory indirection: hash -> directory index -> segment store index.
+    #[inline]
+    pub fn segment_index_for_hash(&self, hash: u64) -> usize {
+        let dir_idx = segment_index(hash, self.depth);
+        self.directory[dir_idx]
     }
 
     /// Look up a key and return an immutable reference to its value.
@@ -548,6 +572,83 @@ mod tests {
                 table.get(format!("dd_{:06}", i).as_bytes()).is_some(),
                 "Missing dd_{:06}",
                 i
+            );
+        }
+    }
+
+    #[test]
+    fn test_segment_iter_occupied() {
+        use segment::Segment;
+
+        let mut seg: Segment<Bytes, String> = Segment::new(0);
+        // Insert 5 entries using the segment's insert method
+        for i in 0..5 {
+            let key = Bytes::from(format!("seg_key_{}", i));
+            let val = format!("seg_val_{}", i);
+            let hash = hash_key(&key);
+            let h2_val = segment::h2(hash);
+            let (ba, bb) = segment::home_buckets(hash);
+            seg.insert(h2_val, key, val, ba, bb);
+        }
+
+        let occupied: Vec<_> = seg.iter_occupied().collect();
+        assert_eq!(occupied.len(), 5, "iter_occupied should yield exactly 5 pairs");
+
+        // Verify all keys are present
+        let keys: Vec<String> = occupied
+            .iter()
+            .map(|(k, _)| String::from_utf8_lossy(k).to_string())
+            .collect();
+        for i in 0..5 {
+            let expected_key = format!("seg_key_{}", i);
+            assert!(
+                keys.contains(&expected_key),
+                "Missing key: {}",
+                expected_key
+            );
+        }
+    }
+
+    #[test]
+    fn test_segment_count_grows_after_split() {
+        let mut table: DashTable<Bytes, String> = DashTable::new();
+        assert_eq!(table.segment_count(), 1);
+
+        for i in 0..100 {
+            table.insert(Bytes::from(format!("sc_{:04}", i)), test_value(i));
+        }
+
+        assert!(
+            table.segment_count() > 1,
+            "segment_count should grow after splits, got {}",
+            table.segment_count()
+        );
+    }
+
+    #[test]
+    fn test_segment_index_for_hash_matches_get() {
+        let mut table: DashTable<Bytes, String> = DashTable::new();
+        for i in 0..50 {
+            table.insert(Bytes::from(format!("si_{:04}", i)), test_value(i));
+        }
+
+        // For each key, verify segment_index_for_hash points to the segment containing it
+        for i in 0..50 {
+            let key = format!("si_{:04}", i);
+            let hash = hash_key(key.as_bytes());
+            let seg_idx = table.segment_index_for_hash(hash);
+            let seg = table.segment(seg_idx);
+
+            // The segment should contain this key in its iter_occupied
+            let found = seg
+                .iter_occupied()
+                .any(|(k, _)| k.as_ref() == key.as_bytes());
+            assert!(
+                found,
+                "Key {} not found in segment {} (segment_count={})",
+                key,
+                seg_idx,
+                table.segment_count()
             );
         }
     }
