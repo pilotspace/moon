@@ -1118,6 +1118,7 @@ pub async fn handle_connection_sharded(
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
     aof_tx: Option<mpsc::Sender<AofMessage>>,
@@ -1371,6 +1372,47 @@ pub async fn handle_connection_sharded(
                         continue;
                     }
 
+                    // --- BLOCKING COMMANDS (BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX) ---
+                    if cmd.eq_ignore_ascii_case(b"BLPOP")
+                        || cmd.eq_ignore_ascii_case(b"BRPOP")
+                        || cmd.eq_ignore_ascii_case(b"BLMOVE")
+                        || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
+                        || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
+                    {
+                        // Inside MULTI: queue as non-blocking variant
+                        if in_multi {
+                            let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
+                            command_queue.push(nb_frame);
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                            continue;
+                        }
+
+                        // Flush accumulated responses before entering blocking mode.
+                        let send_responses: Vec<Frame> = responses.into_iter().collect();
+                        for response in send_responses {
+                            if framed.send(response).await.is_err() {
+                                arena.reset();
+                                return;
+                            }
+                        }
+
+                        let blocking_response = handle_blocking_command(
+                            cmd,
+                            cmd_args,
+                            selected_db,
+                            &databases,
+                            &blocking_registry,
+                            &shutdown,
+                        ).await;
+                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, framed.codec().protocol_version());
+
+                        // Re-initialize responses for the blocking command's result
+                        responses = BumpVec::with_capacity_in(1, &arena);
+                        responses.push(blocking_response);
+                        // Break out of batch -- blocking command ends the pipeline
+                        break;
+                    }
+
                     // --- PUBLISH: local delivery + cross-shard fan-out ---
                     if cmd.eq_ignore_ascii_case(b"PUBLISH") {
                         if cmd_args.len() != 2 {
@@ -1535,6 +1577,29 @@ pub async fn handle_connection_sharded(
                                 f
                             }
                         };
+                        // Post-dispatch wakeup hooks for producer commands
+                        if !matches!(response, Frame::Error(_)) {
+                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                    );
+                                }
+                            }
+                            if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                    );
+                                }
+                            }
+                        }
+                        drop(dbs); // drop before any subsequent await
                         // Log successful write commands to AOF
                         if let Some(bytes) = aof_bytes {
                             if !matches!(response, Frame::Error(_)) {
@@ -1683,4 +1748,341 @@ fn execute_transaction_sharded(
     }
 
     Frame::Array(results)
+}
+
+/// Convert a blocking command to its non-blocking equivalent for MULTI/EXEC.
+/// BLPOP key [key ...] timeout -> LPOP key (first key only)
+/// BRPOP key [key ...] timeout -> RPOP key
+/// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout -> LMOVE src dst LEFT|RIGHT LEFT|RIGHT
+/// BZPOPMIN key [key ...] timeout -> ZPOPMIN key
+/// BZPOPMAX key [key ...] timeout -> ZPOPMAX key
+fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
+    let mut new_args = Vec::new();
+    if cmd.eq_ignore_ascii_case(b"BLPOP") {
+        new_args.push(Frame::BulkString(Bytes::from_static(b"LPOP")));
+        if let Some(first_key) = args.first() {
+            new_args.push(first_key.clone());
+        }
+    } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
+        new_args.push(Frame::BulkString(Bytes::from_static(b"RPOP")));
+        if let Some(first_key) = args.first() {
+            new_args.push(first_key.clone());
+        }
+    } else if cmd.eq_ignore_ascii_case(b"BLMOVE") {
+        new_args.push(Frame::BulkString(Bytes::from_static(b"LMOVE")));
+        // src dst LEFT|RIGHT LEFT|RIGHT (skip timeout which is last arg)
+        for arg in args.iter().take(4) {
+            new_args.push(arg.clone());
+        }
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
+        new_args.push(Frame::BulkString(Bytes::from_static(b"ZPOPMIN")));
+        if let Some(first_key) = args.first() {
+            new_args.push(first_key.clone());
+        }
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
+        new_args.push(Frame::BulkString(Bytes::from_static(b"ZPOPMAX")));
+        if let Some(first_key) = args.first() {
+            new_args.push(first_key.clone());
+        }
+    }
+    Frame::Array(new_args)
+}
+
+/// Handle a blocking command (BLPOP/BRPOP/BLMOVE/BZPOPMIN/BZPOPMAX).
+///
+/// 1. Non-blocking fast path: check if data is immediately available.
+/// 2. If not, register in blocking registry and await oneshot with timeout.
+///
+/// CRITICAL: Database borrow MUST be dropped before any .await point.
+async fn handle_blocking_command(
+    cmd: &[u8],
+    args: &[Frame],
+    selected_db: usize,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    shutdown: &CancellationToken,
+) -> Frame {
+    // Parse timeout (last argument for all blocking commands)
+    let timeout_secs = match parse_blocking_timeout(cmd, args) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    // Parse keys and command-specific args
+    let (keys, blocked_cmd_factory) = match parse_blocking_args(cmd, args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // --- Non-blocking fast path: try to get data immediately ---
+    {
+        let mut dbs = databases.borrow_mut();
+        let db = &mut dbs[selected_db];
+        for key in &keys {
+            let result = try_immediate_pop(cmd, db, key, args);
+            if let Some(frame) = result {
+                return frame;
+            }
+        }
+    } // dbs borrow dropped here -- CRITICAL before await
+
+    // --- Blocking path: register and wait ---
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Option<Frame>>();
+    let deadline = if timeout_secs > 0.0 {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
+    } else {
+        None // 0 = block forever
+    };
+
+    let wait_id = {
+        let mut reg = blocking_registry.borrow_mut();
+        let wait_id = reg.next_wait_id();
+        // Register on first key only (multi-key cross-shard is Plan 03)
+        let blocked_cmd = blocked_cmd_factory();
+        let entry = crate::blocking::WaitEntry {
+            wait_id,
+            cmd: blocked_cmd,
+            reply_tx,
+            deadline,
+        };
+        reg.register(selected_db, keys[0].clone(), entry);
+        wait_id
+    }; // reg borrow dropped
+
+    // Wait for wakeup or timeout
+    if let Some(dl) = deadline {
+        tokio::select! {
+            res = reply_rx => {
+                match res {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) | Err(_) => Frame::Null, // timeout or canceled
+                }
+            }
+            _ = tokio::time::sleep_until(dl) => {
+                // Timeout: clean up registration
+                blocking_registry.borrow_mut().remove_wait(wait_id);
+                Frame::Null
+            }
+            _ = shutdown.cancelled() => {
+                blocking_registry.borrow_mut().remove_wait(wait_id);
+                Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+            }
+        }
+    } else {
+        // Block forever (0 timeout)
+        tokio::select! {
+            res = reply_rx => {
+                match res {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) | Err(_) => Frame::Null,
+                }
+            }
+            _ = shutdown.cancelled() => {
+                blocking_registry.borrow_mut().remove_wait(wait_id);
+                Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+            }
+        }
+    }
+}
+
+/// Parse timeout from the last argument of a blocking command.
+/// Returns seconds as f64. 0 = block forever.
+fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, Frame> {
+    if args.is_empty() {
+        return Err(Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{}' command",
+            String::from_utf8_lossy(cmd).to_lowercase()
+        ))));
+    }
+    let timeout_frame = args.last().unwrap();
+    let timeout_bytes = match timeout_frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => b,
+        _ => return Err(Frame::Error(Bytes::from_static(b"ERR timeout is not a float or out of range"))),
+    };
+    let timeout_str = std::str::from_utf8(timeout_bytes)
+        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")))?;
+    let timeout: f64 = timeout_str.parse()
+        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")))?;
+    if timeout < 0.0 {
+        return Err(Frame::Error(Bytes::from_static(b"ERR timeout is negative")));
+    }
+    Ok(timeout)
+}
+
+/// Parse keys and build a BlockedCommand factory from blocking command args.
+fn parse_blocking_args(
+    cmd: &[u8],
+    args: &[Frame],
+) -> Result<(Vec<Bytes>, Box<dyn Fn() -> crate::blocking::BlockedCommand>), Frame> {
+    if cmd.eq_ignore_ascii_case(b"BLPOP") {
+        // BLPOP key [key ...] timeout
+        if args.len() < 2 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'blpop' command",
+            )));
+        }
+        let keys: Vec<Bytes> = args[..args.len() - 1]
+            .iter()
+            .filter_map(|f| extract_bytes(f))
+            .collect();
+        if keys.is_empty() {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'blpop' command",
+            )));
+        }
+        Ok((keys, Box::new(|| crate::blocking::BlockedCommand::BLPop)))
+    } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
+        if args.len() < 2 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'brpop' command",
+            )));
+        }
+        let keys: Vec<Bytes> = args[..args.len() - 1]
+            .iter()
+            .filter_map(|f| extract_bytes(f))
+            .collect();
+        if keys.is_empty() {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'brpop' command",
+            )));
+        }
+        Ok((keys, Box::new(|| crate::blocking::BlockedCommand::BRPop)))
+    } else if cmd.eq_ignore_ascii_case(b"BLMOVE") {
+        // BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout
+        if args.len() != 5 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'blmove' command",
+            )));
+        }
+        let source = extract_bytes(&args[0]).ok_or_else(|| {
+            Frame::Error(Bytes::from_static(b"ERR invalid source key"))
+        })?;
+        let destination = extract_bytes(&args[1]).ok_or_else(|| {
+            Frame::Error(Bytes::from_static(b"ERR invalid destination key"))
+        })?;
+        let wherefrom_bytes = extract_bytes(&args[2]).ok_or_else(|| {
+            Frame::Error(Bytes::from_static(b"ERR syntax error"))
+        })?;
+        let whereto_bytes = extract_bytes(&args[3]).ok_or_else(|| {
+            Frame::Error(Bytes::from_static(b"ERR syntax error"))
+        })?;
+        let wherefrom = if wherefrom_bytes.eq_ignore_ascii_case(b"LEFT") {
+            crate::blocking::Direction::Left
+        } else if wherefrom_bytes.eq_ignore_ascii_case(b"RIGHT") {
+            crate::blocking::Direction::Right
+        } else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        };
+        let whereto = if whereto_bytes.eq_ignore_ascii_case(b"LEFT") {
+            crate::blocking::Direction::Left
+        } else if whereto_bytes.eq_ignore_ascii_case(b"RIGHT") {
+            crate::blocking::Direction::Right
+        } else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        };
+        Ok((
+            vec![source],
+            Box::new(move || crate::blocking::BlockedCommand::BLMove {
+                destination: destination.clone(),
+                wherefrom,
+                whereto,
+            }),
+        ))
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
+        if args.len() < 2 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'bzpopmin' command",
+            )));
+        }
+        let keys: Vec<Bytes> = args[..args.len() - 1]
+            .iter()
+            .filter_map(|f| extract_bytes(f))
+            .collect();
+        if keys.is_empty() {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'bzpopmin' command",
+            )));
+        }
+        Ok((keys, Box::new(|| crate::blocking::BlockedCommand::BZPopMin)))
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
+        if args.len() < 2 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'bzpopmax' command",
+            )));
+        }
+        let keys: Vec<Bytes> = args[..args.len() - 1]
+            .iter()
+            .filter_map(|f| extract_bytes(f))
+            .collect();
+        if keys.is_empty() {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'bzpopmax' command",
+            )));
+        }
+        Ok((keys, Box::new(|| crate::blocking::BlockedCommand::BZPopMax)))
+    } else {
+        Err(Frame::Error(Bytes::from_static(b"ERR unknown blocking command")))
+    }
+}
+
+/// Try to pop data immediately (non-blocking fast path).
+fn try_immediate_pop(cmd: &[u8], db: &mut Database, key: &Bytes, args: &[Frame]) -> Option<Frame> {
+    if cmd.eq_ignore_ascii_case(b"BLPOP") {
+        db.list_pop_front(key).map(|v| Frame::Array(vec![
+            Frame::BulkString(key.clone()),
+            Frame::BulkString(v),
+        ]))
+    } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
+        db.list_pop_back(key).map(|v| Frame::Array(vec![
+            Frame::BulkString(key.clone()),
+            Frame::BulkString(v),
+        ]))
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
+        db.zset_pop_min(key).map(|(member, score)| Frame::Array(vec![
+            Frame::BulkString(key.clone()),
+            Frame::BulkString(member),
+            Frame::BulkString(Bytes::from(format_blocking_score(score))),
+        ]))
+    } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
+        db.zset_pop_max(key).map(|(member, score)| Frame::Array(vec![
+            Frame::BulkString(key.clone()),
+            Frame::BulkString(member),
+            Frame::BulkString(Bytes::from(format_blocking_score(score))),
+        ]))
+    } else if cmd.eq_ignore_ascii_case(b"BLMOVE") {
+        // BLMOVE: try immediate LMOVE
+        // args: [source, destination, wherefrom, whereto, timeout]
+        use crate::blocking::Direction;
+        let dest = extract_bytes(&args[1])?;
+        let wherefrom = if extract_bytes(&args[2])?.eq_ignore_ascii_case(b"LEFT") {
+            Direction::Left
+        } else {
+            Direction::Right
+        };
+        let whereto = if extract_bytes(&args[3])?.eq_ignore_ascii_case(b"LEFT") {
+            Direction::Left
+        } else {
+            Direction::Right
+        };
+        let val = match wherefrom {
+            Direction::Left => db.list_pop_front(key),
+            Direction::Right => db.list_pop_back(key),
+        }?;
+        match whereto {
+            Direction::Left => db.list_push_front(&dest, val.clone()),
+            Direction::Right => db.list_push_back(&dest, val.clone()),
+        }
+        Some(Frame::BulkString(val))
+    } else {
+        None
+    }
+}
+
+/// Format a float score the same way Redis does (integer if whole, otherwise full precision).
+fn format_blocking_score(score: f64) -> String {
+    if score == score.floor() && score.abs() < i64::MAX as f64 {
+        format!("{}", score as i64)
+    } else {
+        format!("{}", score)
+    }
 }

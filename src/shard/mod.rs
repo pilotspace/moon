@@ -20,6 +20,7 @@ use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
 use crate::command::connection as conn_cmd;
+use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
 use crate::server::connection::handle_connection_sharded;
 use crate::storage::Database;
@@ -203,6 +204,7 @@ impl Shard {
         let dispatch_tx = Rc::new(RefCell::new(producers));
         let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
+        let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new()));
 
         let shard_id = self.id;
         let num_shards = self.num_shards;
@@ -234,6 +236,8 @@ impl Shard {
         // SPSC drain interval -- check for cross-shard messages every 1ms.
         // On Linux with io_uring, this also polls for io_uring completions.
         let mut spsc_interval = tokio::time::interval(Duration::from_millis(1));
+        // Blocking command timeout scanner -- expire timed-out blocked clients every 10ms.
+        let mut block_timeout_interval = tokio::time::interval(Duration::from_millis(10));
 
         loop {
             tokio::select! {
@@ -274,6 +278,7 @@ impl Shard {
                             let dbs = databases.clone();
                             let dtx = dispatch_tx.clone();
                             let psr = pubsub_rc.clone();
+                            let blk = blocking_rc.clone();
                             let sd = shutdown.clone();
                             let aof = aof_tx.clone();
                             let trk = tracking_rc.clone();
@@ -286,6 +291,7 @@ impl Shard {
                                     num_shards,
                                     dtx,
                                     psr,
+                                    blk,
                                     sd,
                                     None, // requirepass: TODO wire from shard config
                                     aof,
@@ -308,6 +314,7 @@ impl Shard {
                         &databases,
                         &mut consumers,
                         &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc,
                         &mut pending_snapshot,
                         &mut snapshot_state,
                         &mut wal_writer,
@@ -393,6 +400,11 @@ impl Shard {
                         }
                     }
                 }
+                // Expire timed-out blocked clients every 10ms
+                _ = block_timeout_interval.tick() => {
+                    let now = tokio::time::Instant::now();
+                    blocking_rc.borrow_mut().expire_timed_out(now);
+                }
                 // Cooperative active expiry
                 _ = expiry_interval.tick() => {
                     let mut dbs = databases.borrow_mut();
@@ -443,6 +455,7 @@ impl Shard {
         databases: &Rc<RefCell<Vec<Database>>>,
         consumers: &mut [HeapCons<ShardMessage>],
         pubsub_registry: &mut PubSubRegistry,
+        blocking_registry: &Rc<RefCell<BlockingRegistry>>,
         pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
@@ -458,6 +471,7 @@ impl Shard {
                         Self::handle_shard_message_shared(
                             databases,
                             pubsub_registry,
+                            blocking_registry,
                             msg,
                             pending_snapshot,
                             snapshot_state,
@@ -480,6 +494,7 @@ impl Shard {
     fn handle_shard_message_shared(
         databases: &Rc<RefCell<Vec<Database>>>,
         pubsub_registry: &mut PubSubRegistry,
+        blocking_registry: &Rc<RefCell<BlockingRegistry>>,
         msg: ShardMessage,
         pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
         snapshot_state: &mut Option<SnapshotState>,
@@ -582,6 +597,23 @@ impl Shard {
             ShardMessage::SnapshotBegin { epoch, snapshot_dir, reply_tx } => {
                 // Defer to main event loop where we have mutable access to snapshot_state
                 *pending_snapshot = Some((epoch, snapshot_dir, reply_tx));
+            }
+            ShardMessage::BlockRegister { db_index, key, wait_id, cmd, reply_tx } => {
+                let entry = crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd,
+                    reply_tx,
+                    deadline: None, // Remote registrations don't manage timeout locally
+                };
+                let mut reg = blocking_registry.borrow_mut();
+                reg.register(db_index, key.clone(), entry);
+                // Check if data is already available (race: data arrived before registration)
+                let mut dbs = databases.borrow_mut();
+                crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut dbs[db_index], db_index, &key);
+                crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut dbs[db_index], db_index, &key);
+            }
+            ShardMessage::BlockCancel { wait_id } => {
+                blocking_registry.borrow_mut().remove_wait(wait_id);
             }
             ShardMessage::Shutdown => {
                 info!("Received shutdown via SPSC");
@@ -926,7 +958,8 @@ mod tests {
         let mut pending_snap = None;
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &mut pending_snap, &mut snap_state, &mut wal_w);
+        let blocking = Rc::new(RefCell::new(BlockingRegistry::new()));
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -963,7 +996,8 @@ mod tests {
         let mut pending_snap = None;
         let mut snap_state = None;
         let mut wal_w: Option<WalWriter> = None;
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &mut pending_snap, &mut snap_state, &mut wal_w);
+        let blocking = Rc::new(RefCell::new(BlockingRegistry::new()));
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w);
     }
 
     #[test]

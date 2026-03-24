@@ -55,6 +55,18 @@ pub enum ShardMessage {
         snapshot_dir: std::path::PathBuf,
         reply_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Register a blocked client waiting for data on a key (cross-shard).
+    BlockRegister {
+        db_index: usize,
+        key: Bytes,
+        wait_id: u64,
+        cmd: crate::blocking::BlockedCommand,
+        reply_tx: tokio::sync::oneshot::Sender<Option<crate::protocol::Frame>>,
+    },
+    /// Cancel a blocked client registration (woken by another shard or timed out).
+    BlockCancel {
+        wait_id: u64,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }
