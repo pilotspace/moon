@@ -470,6 +470,44 @@ impl UringDriver {
 }
 
 // ---------------------------------------------------------------------------
+// WritevGuard: RAII wrapper for writev scatter-gather lifetime management
+// ---------------------------------------------------------------------------
+
+/// Owns the iovec array and header buffer for a writev submission.
+/// Must live until the corresponding SendComplete CQE.
+pub struct WritevGuard {
+    pub iovecs: [libc::iovec; 3],
+    pub header_buf: [u8; 32],
+    /// Hold a reference to the value bytes to prevent deallocation.
+    /// This is a Bytes handle from DashTable (cheap clone via Arc).
+    pub _value_hold: bytes::Bytes,
+}
+
+impl UringDriver {
+    /// Submit writev for a BulkString response using scatter-gather.
+    /// Returns a WritevGuard that the caller must keep alive until SendComplete.
+    pub fn submit_writev_bulkstring(
+        &mut self,
+        conn_id: u32,
+        value: bytes::Bytes,
+    ) -> std::io::Result<WritevGuard> {
+        let mut guard = WritevGuard {
+            iovecs: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; 3],
+            header_buf: [0u8; 32],
+            _value_hold: value,
+        };
+        let (iovecs, _count) =
+            build_get_response_iovecs(guard._value_hold.as_ref(), &mut guard.header_buf);
+        guard.iovecs = iovecs;
+        self.submit_writev(conn_id, guard.iovecs.as_ptr(), 3)?;
+        Ok(guard)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IoEvent: CQE routing enum for the shard event loop
 // ---------------------------------------------------------------------------
 

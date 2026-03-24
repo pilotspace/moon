@@ -20,7 +20,7 @@ use crate::server::connection::handle_connection_sharded;
 use crate::storage::Database;
 
 #[cfg(target_os = "linux")]
-use crate::io::{IoEvent, UringConfig, UringDriver};
+use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
 
 use self::dispatch::ShardMessage;
 
@@ -40,6 +40,18 @@ pub struct Shard {
     pub runtime_config: RuntimeConfig,
     /// Per-shard Pub/Sub registry -- no global Mutex, fully owned by shard thread.
     pub pubsub_registry: PubSubRegistry,
+}
+
+/// In-flight send buffer variants for proper RAII lifetime management (Linux only).
+///
+/// Keeps buffers alive until the corresponding io_uring SendComplete CQE arrives,
+/// replacing the previous std::mem::forget memory leak.
+#[cfg(target_os = "linux")]
+enum InFlightSend {
+    /// Serialized response buffer for non-BulkString frames.
+    Buf(bytes::BytesMut),
+    /// Scatter-gather writev guard for BulkString (zero-copy GET) responses.
+    Writev(WritevGuard),
 }
 
 impl Shard {
@@ -120,6 +132,12 @@ impl Shard {
         // Track per-connection parse state for io_uring path (Linux only).
         #[cfg(target_os = "linux")]
         let mut uring_parse_bufs: std::collections::HashMap<u32, bytes::BytesMut> =
+            std::collections::HashMap::new();
+
+        // Track in-flight send buffers for proper RAII cleanup (Linux only).
+        // Replaces the previous std::mem::forget leak.
+        #[cfg(target_os = "linux")]
+        let mut inflight_sends: std::collections::HashMap<u32, Vec<InFlightSend>> =
             std::collections::HashMap::new();
 
         #[cfg(not(target_os = "linux"))]
@@ -219,6 +237,7 @@ impl Shard {
                                 driver,
                                 &databases,
                                 &mut uring_parse_bufs,
+                                &mut inflight_sends,
                                 uring_listener_fd,
                             );
                         }
@@ -393,6 +412,7 @@ impl Shard {
         driver: &mut UringDriver,
         databases: &Rc<RefCell<Vec<Database>>>,
         parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
+        inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
         uring_listener_fd: Option<std::os::fd::RawFd>,
     ) {
         match event {
@@ -413,11 +433,9 @@ impl Shard {
                                 let (cmd, args) = match Self::extract_command_static(&frame) {
                                     Some(pair) => pair,
                                     None => {
-                                        // Return error frame
-                                        let err = crate::protocol::Frame::Error(
+                                        crate::protocol::Frame::Error(
                                             bytes::Bytes::from_static(b"ERR invalid command"),
-                                        );
-                                        err
+                                        )
                                     }
                                 };
                                 dbs[0].refresh_now();
@@ -431,17 +449,50 @@ impl Shard {
                                 }
                             };
 
-                            // Serialize response and send via io_uring
-                            let mut resp_buf = bytes::BytesMut::new();
-                            crate::protocol::serialize(&response, &mut resp_buf);
-                            let len = resp_buf.len() as u32;
-                            let ptr = resp_buf.as_ptr();
-                            let _ = driver.submit_send(conn_id, ptr, len);
-                            // resp_buf must live until send CQE. In this synchronous
-                            // processing model within the 1ms tick, CQEs are drained
-                            // before the next poll. For production safety, leak the
-                            // buffer (small, typically < 1KB per response).
-                            std::mem::forget(resp_buf);
+                            // Send response via io_uring with proper buffer lifetime management.
+                            // BulkString responses use writev scatter-gather (zero-copy from DashTable).
+                            // All other responses use submit_send with tracked InFlightSend::Buf.
+                            match response {
+                                crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
+                                    // Zero-copy path: scatter-gather via writev
+                                    match driver.submit_writev_bulkstring(conn_id, value.clone()) {
+                                        Ok(guard) => {
+                                            inflight_sends
+                                                .entry(conn_id)
+                                                .or_default()
+                                                .push(InFlightSend::Writev(guard));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "writev failed for conn {}: {}, falling back to send",
+                                                conn_id, e
+                                            );
+                                            // Fallback to regular send
+                                            let mut resp_buf = bytes::BytesMut::new();
+                                            crate::protocol::serialize(&response, &mut resp_buf);
+                                            let len = resp_buf.len() as u32;
+                                            let ptr = resp_buf.as_ptr();
+                                            let _ = driver.submit_send(conn_id, ptr, len);
+                                            inflight_sends
+                                                .entry(conn_id)
+                                                .or_default()
+                                                .push(InFlightSend::Buf(resp_buf));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Standard path: serialize + send (buffer tracked, no leak)
+                                    let mut resp_buf = bytes::BytesMut::new();
+                                    crate::protocol::serialize(&response, &mut resp_buf);
+                                    let len = resp_buf.len() as u32;
+                                    let ptr = resp_buf.as_ptr();
+                                    let _ = driver.submit_send(conn_id, ptr, len);
+                                    inflight_sends
+                                        .entry(conn_id)
+                                        .or_default()
+                                        .push(InFlightSend::Buf(resp_buf));
+                                }
+                            }
                         }
                         Ok(None) => break, // Need more data
                         Err(crate::protocol::ParseError::Incomplete) => break,
@@ -449,6 +500,7 @@ impl Shard {
                             // Protocol error: close connection
                             let _ = driver.close_connection(conn_id);
                             parse_bufs.remove(&conn_id);
+                            inflight_sends.remove(&conn_id);
                             break;
                         }
                     }
@@ -457,6 +509,7 @@ impl Shard {
             IoEvent::Disconnect { conn_id } => {
                 let _ = driver.close_connection(conn_id);
                 parse_bufs.remove(&conn_id);
+                inflight_sends.remove(&conn_id);
             }
             IoEvent::RecvNeedsRearm { conn_id } => {
                 let _ = driver.rearm_recv(conn_id);
@@ -471,12 +524,21 @@ impl Shard {
                     let _ = driver.submit_multishot_accept(lfd);
                 }
             }
-            IoEvent::SendComplete { .. } => {
-                // Send completed successfully, nothing to do
+            IoEvent::SendComplete { conn_id } => {
+                // Drop the oldest in-flight send buffer (FIFO order matches CQE order)
+                if let Some(sends) = inflight_sends.get_mut(&conn_id) {
+                    if !sends.is_empty() {
+                        sends.remove(0);
+                    }
+                    if sends.is_empty() {
+                        inflight_sends.remove(&conn_id);
+                    }
+                }
             }
             IoEvent::SendError { conn_id, .. } => {
                 let _ = driver.close_connection(conn_id);
                 parse_bufs.remove(&conn_id);
+                inflight_sends.remove(&conn_id);
             }
             IoEvent::Timeout | IoEvent::Wakeup => {
                 // Handled by the spsc_interval tick (already draining SPSC)
@@ -725,16 +787,18 @@ mod tests {
         let databases = Rc::new(RefCell::new(std::mem::take(&mut shard.databases)));
         let mut parse_bufs = std::collections::HashMap::new();
         parse_bufs.insert(42u32, bytes::BytesMut::from(&b"partial"[..]));
+        let mut inflight_sends = std::collections::HashMap::new();
 
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
-        // Process disconnect event -- should clean up parse buffer
+        // Process disconnect event -- should clean up parse buffer and inflight sends
         Shard::handle_uring_event(
             IoEvent::Disconnect { conn_id: 42 },
             &mut driver,
             &databases,
             &mut parse_bufs,
+            &mut inflight_sends,
             None,
         );
 
@@ -751,16 +815,18 @@ mod tests {
         let mut shard = Shard::new(0, 1, 1, config);
         let databases = Rc::new(RefCell::new(std::mem::take(&mut shard.databases)));
         let mut parse_bufs = std::collections::HashMap::new();
+        let mut inflight_sends = std::collections::HashMap::new();
 
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
-        // SendComplete should be a no-op (no panic)
+        // SendComplete should clean up oldest in-flight send (no panic if empty)
         Shard::handle_uring_event(
             IoEvent::SendComplete { conn_id: 1 },
             &mut driver,
             &databases,
             &mut parse_bufs,
+            &mut inflight_sends,
             None,
         );
     }

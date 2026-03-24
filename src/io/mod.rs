@@ -11,7 +11,7 @@ pub mod buf_ring;
 pub mod uring_driver;
 
 #[cfg(target_os = "linux")]
-pub use uring_driver::{build_get_response_iovecs, IoEvent, UringConfig, UringDriver};
+pub use uring_driver::{build_get_response_iovecs, IoEvent, UringConfig, UringDriver, WritevGuard};
 
 // Event type constants for io_uring user_data encoding.
 pub const EVENT_ACCEPT: u8 = 1;
