@@ -59,6 +59,14 @@ pub struct ServerConfig {
     /// Number of shards (0 = auto-detect from CPU count)
     #[arg(long, default_value_t = 0)]
     pub shards: usize,
+
+    /// Enable cluster mode
+    #[arg(long, default_value_t = false)]
+    pub cluster_enabled: bool,
+
+    /// Cluster node timeout in milliseconds (PFAIL detection threshold)
+    #[arg(long, default_value_t = 15000)]
+    pub cluster_node_timeout: u64,
 }
 
 impl ServerConfig {
