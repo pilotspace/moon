@@ -918,6 +918,7 @@ pub async fn handle_connection_sharded(
     pubsub_registry: Rc<RefCell<PubSubRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
+    aof_tx: Option<mpsc::Sender<AofMessage>>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -1129,6 +1130,14 @@ pub async fn handle_connection_sharded(
                         _ => false,
                     };
 
+                    // Pre-serialize write commands for AOF logging (before dispatch)
+                    let is_write = aof::is_write_command(cmd);
+                    let aof_bytes = if is_write && aof_tx.is_some() {
+                        Some(aof::serialize_command(&frame))
+                    } else {
+                        None
+                    };
+
                     if is_local {
                         // LOCAL FAST PATH: zero cross-shard overhead
                         let mut dbs = databases.borrow_mut();
@@ -1148,6 +1157,14 @@ pub async fn handle_connection_sharded(
                                 f
                             }
                         };
+                        // Log successful write commands to AOF
+                        if let Some(bytes) = aof_bytes {
+                            if !matches!(response, Frame::Error(_)) {
+                                if let Some(ref tx) = aof_tx {
+                                    let _ = tx.try_send(AofMessage::Append(bytes));
+                                }
+                            }
+                        }
                         responses.push(response);
                     } else if let Some(target) = target_shard {
                         // REMOTE DISPATCH: send via SPSC, await oneshot reply
@@ -1177,7 +1194,17 @@ pub async fn handle_connection_sharded(
                         }
                         // Await the reply from the target shard
                         match reply_rx.await {
-                            Ok(response) => responses.push(response),
+                            Ok(response) => {
+                                // Log successful write commands to AOF
+                                if let Some(bytes) = aof_bytes {
+                                    if !matches!(response, Frame::Error(_)) {
+                                        if let Some(ref tx) = aof_tx {
+                                            let _ = tx.try_send(AofMessage::Append(bytes));
+                                        }
+                                    }
+                                }
+                                responses.push(response);
+                            }
                             Err(_) => responses.push(Frame::Error(
                                 Bytes::from_static(b"ERR cross-shard dispatch failed"),
                             )),

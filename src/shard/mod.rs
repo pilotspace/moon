@@ -67,6 +67,7 @@ impl Shard {
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
+        aof_tx: Option<mpsc::Sender<crate::persistence::aof::AofMessage>>,
     ) {
         info!("Shard {} started", self.id);
 
@@ -93,6 +94,7 @@ impl Shard {
                             let dtx = dispatch_tx.clone();
                             let psr = pubsub_rc.clone();
                             let sd = shutdown.clone();
+                            let aof = aof_tx.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -103,6 +105,7 @@ impl Shard {
                                     psr,
                                     sd,
                                     None, // requirepass: TODO wire from shard config
+                                    aof,
                                 ).await;
                             });
                         }
