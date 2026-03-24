@@ -140,6 +140,7 @@ impl Shard {
         bind_addr: Option<String>,
         persistence_dir: Option<String>,
         mut snapshot_trigger_rx: tokio::sync::watch::Receiver<u64>,
+        repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -242,11 +243,9 @@ impl Shard {
         // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
         let mut replica_txs: Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)> = Vec::new();
 
-        // Shared ReplicationState (None until replication is configured via REPLICAOF).
-        // Set via ShardMessage::RegisterReplica which carries it from the connection layer.
-        // NOTE: In this plan, repl_state is always None; it is wired by Plan 03.
-        // The fan-out code handles None gracefully (no-op for offset tracking).
-        let repl_state: Option<Arc<RwLock<ReplicationState>>> = None;
+        // Shared ReplicationState injected from server startup.
+        // When Some, enables WAL fan-out offset tracking and replica connection handling.
+        let repl_state: Option<Arc<RwLock<ReplicationState>>> = repl_state_ext;
 
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = *snapshot_trigger_rx.borrow();
@@ -302,6 +301,7 @@ impl Shard {
                             let aof = aof_tx.clone();
                             let trk = tracking_rc.clone();
                             let cid = conn_cmd::next_client_id();
+                            let rs = repl_state.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -316,7 +316,7 @@ impl Shard {
                                     aof,
                                     trk,
                                     cid,
-                                    None, // repl_state: wired in Plan 04
+                                    rs,
                                 ).await;
                             });
                         }

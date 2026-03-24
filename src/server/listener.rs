@@ -141,6 +141,16 @@ pub async fn run_with_shutdown(
     // Create shared tracking table for client-side caching invalidation
     let tracking_table = Arc::new(Mutex::new(TrackingTable::new()));
 
+    // Create replication state -- load persisted repl_id or generate new one.
+    let (repl_id, repl_id2) = crate::replication::state::load_replication_state(
+        std::path::Path::new(&config.dir),
+    );
+    let repl_state = Arc::new(RwLock::new(crate::replication::state::ReplicationState::new(
+        1, // non-sharded mode uses 1 shard
+        repl_id,
+        repl_id2,
+    )));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -157,10 +167,11 @@ pub async fn run_with_shutdown(
                         let rt_config = runtime_config.clone();
                         let tracking = tracking_table.clone();
                         let cid = conn_cmd::next_client_id();
+                        let rs = repl_state.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
                             aof_tx, change_counter, pubsub, rt_config,
-                            tracking, cid,
+                            tracking, cid, Some(rs),
                         ));
                     }
                     Err(e) => {

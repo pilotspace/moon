@@ -83,6 +83,14 @@ fn main() -> anyhow::Result<()> {
     // Persistence directory for per-shard WAL and snapshots
     let persistence_dir = Some(config.dir.clone());
 
+    // Create replication state -- load persisted repl_id or generate new one.
+    let (repl_id, repl_id2) = rust_redis::replication::state::load_replication_state(
+        std::path::Path::new(&config.dir),
+    );
+    let repl_state = std::sync::Arc::new(std::sync::RwLock::new(
+        rust_redis::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
+    ));
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
     for id in 0..num_shards {
@@ -95,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         let shard_bind_addr = bind_addr.clone();
         let shard_persistence_dir = persistence_dir.clone();
         let shard_snap_rx = snapshot_trigger_rx.clone();
+        let shard_repl_state = repl_state.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -128,6 +137,7 @@ fn main() -> anyhow::Result<()> {
                     Some(shard_bind_addr),
                     shard_persistence_dir,
                     shard_snap_rx,
+                    Some(shard_repl_state),
                 ));
             })
             .expect("failed to spawn shard thread");
