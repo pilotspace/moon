@@ -101,6 +101,7 @@ pub fn dispatch(
     if cmd.eq_ignore_ascii_case(b"LREM") { return DispatchResult::Response(list::lrem(db, args)); }
     if cmd.eq_ignore_ascii_case(b"LTRIM") { return DispatchResult::Response(list::ltrim(db, args)); }
     if cmd.eq_ignore_ascii_case(b"LPOS") { return DispatchResult::Response(list::lpos(db, args)); }
+    if cmd.eq_ignore_ascii_case(b"LMOVE") { return DispatchResult::Response(list::lmove(db, args)); }
     // Set commands
     if cmd.eq_ignore_ascii_case(b"SADD") { return DispatchResult::Response(set::sadd(db, args)); }
     if cmd.eq_ignore_ascii_case(b"SREM") { return DispatchResult::Response(set::srem(db, args)); }

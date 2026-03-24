@@ -818,6 +818,75 @@ impl Database {
             },
         }
     }
+
+    // ---- Low-level helpers for blocking wakeup hooks ----
+
+    /// Pop the front element from a list. Returns None if key missing/empty/wrong type.
+    /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
+    pub fn list_pop_front(&mut self, key: &[u8]) -> Option<Bytes> {
+        let list = self.get_or_create_list(key).ok()?;
+        let val = list.pop_front()?;
+        if list.is_empty() {
+            self.remove(key);
+        }
+        Some(val)
+    }
+
+    /// Pop the back element from a list. Returns None if key missing/empty/wrong type.
+    /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
+    pub fn list_pop_back(&mut self, key: &[u8]) -> Option<Bytes> {
+        let list = self.get_or_create_list(key).ok()?;
+        let val = list.pop_back()?;
+        if list.is_empty() {
+            self.remove(key);
+        }
+        Some(val)
+    }
+
+    /// Push an element to the front of a list. Creates the list if it does not exist.
+    pub fn list_push_front(&mut self, key: &[u8], value: Bytes) {
+        // get_or_create_list creates the key if missing
+        if let Ok(list) = self.get_or_create_list(key) {
+            list.push_front(value);
+        }
+    }
+
+    /// Push an element to the back of a list. Creates the list if it does not exist.
+    pub fn list_push_back(&mut self, key: &[u8], value: Bytes) {
+        if let Ok(list) = self.get_or_create_list(key) {
+            list.push_back(value);
+        }
+    }
+
+    /// Pop the minimum element from a sorted set. Returns (member, score) or None.
+    /// Removes the key if the sorted set becomes empty.
+    pub fn zset_pop_min(&mut self, key: &[u8]) -> Option<(Bytes, f64)> {
+        let (members, tree) = self.get_or_create_sorted_set(key).ok()?;
+        let first = tree.iter().next().map(|(s, m)| (s, m.clone()))?;
+        let (score, member) = first;
+        tree.remove(score, &member);
+        members.remove(&member);
+        let result = (member, score.0);
+        if members.is_empty() {
+            self.remove(key);
+        }
+        Some(result)
+    }
+
+    /// Pop the maximum element from a sorted set. Returns (member, score) or None.
+    /// Removes the key if the sorted set becomes empty.
+    pub fn zset_pop_max(&mut self, key: &[u8]) -> Option<(Bytes, f64)> {
+        let (members, tree) = self.get_or_create_sorted_set(key).ok()?;
+        let last = tree.iter_rev().next().map(|(s, m)| (s, m.clone()))?;
+        let (score, member) = last;
+        tree.remove(score, &member);
+        members.remove(&member);
+        let result = (member, score.0);
+        if members.is_empty() {
+            self.remove(key);
+        }
+        Some(result)
+    }
 }
 
 impl Default for Database {

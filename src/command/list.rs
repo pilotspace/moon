@@ -974,6 +974,78 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 }
 
+/// Parse a direction argument (LEFT or RIGHT).
+fn parse_direction(frame: &Frame) -> Result<crate::blocking::Direction, Frame> {
+    let b = extract_bytes(frame).ok_or_else(|| err_wrong_args("LMOVE"))?;
+    if b.eq_ignore_ascii_case(b"LEFT") {
+        Ok(crate::blocking::Direction::Left)
+    } else if b.eq_ignore_ascii_case(b"RIGHT") {
+        Ok(crate::blocking::Direction::Right)
+    } else {
+        Err(Frame::Error(Bytes::from_static(b"ERR syntax error")))
+    }
+}
+
+/// LMOVE source destination LEFT|RIGHT LEFT|RIGHT
+/// Atomically pops from source and pushes to destination.
+/// Returns the moved element, or Null if source is empty.
+pub fn lmove(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 4 {
+        return err_wrong_args("LMOVE");
+    }
+    let source = match extract_bytes(&args[0]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("LMOVE"),
+    };
+    let destination = match extract_bytes(&args[1]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("LMOVE"),
+    };
+    let wherefrom = match parse_direction(&args[2]) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let whereto = match parse_direction(&args[3]) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+
+    use crate::blocking::Direction;
+
+    // Type check: source must be a list or not exist
+    match db.get_list(&source) {
+        Ok(None) => return Frame::Null, // source empty or missing
+        Err(e) => return e,             // WRONGTYPE
+        Ok(Some(_)) => {}
+    }
+
+    // If destination exists, type check it too (unless same as source)
+    if source != destination {
+        match db.get_list(&destination) {
+            Ok(_) => {}     // exists as list or missing -- both OK
+            Err(e) => return e, // WRONGTYPE
+        }
+    }
+
+    // Pop from source
+    let value = match wherefrom {
+        Direction::Left => db.list_pop_front(&source),
+        Direction::Right => db.list_pop_back(&source),
+    };
+    let value = match value {
+        Some(v) => v,
+        None => return Frame::Null,
+    };
+
+    // Push to destination
+    match whereto {
+        Direction::Left => db.list_push_front(&destination, value.clone()),
+        Direction::Right => db.list_push_back(&destination, value.clone()),
+    }
+
+    Frame::BulkString(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
