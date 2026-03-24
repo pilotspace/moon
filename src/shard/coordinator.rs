@@ -365,6 +365,229 @@ async fn coordinate_multi_del_or_exists(
     Frame::Integer(total_count)
 }
 
+/// Coordinate KEYS across all shards.
+///
+/// Dispatches KEYS command to every shard, collects and merges results.
+pub async fn coordinate_keys(
+    args: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+) -> Frame {
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'keys' command",
+        ));
+    }
+
+    let mut all_keys: Vec<Frame> = Vec::new();
+    let mut pending_rxs: Vec<tokio::sync::oneshot::Receiver<Frame>> = Vec::new();
+
+    // Execute locally on this shard
+    {
+        let mut dbs = databases.borrow_mut();
+        dbs[db_index].refresh_now();
+        let db_count = dbs.len();
+        let mut selected = db_index;
+        let result = cmd_dispatch(&mut dbs[db_index], b"KEYS", args, &mut selected, db_count);
+        if let DispatchResult::Response(Frame::Array(keys)) = result {
+            all_keys.extend(keys);
+        }
+    }
+
+    // Dispatch to all remote shards
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd_frame = {
+            let mut parts = vec![Frame::BulkString(Bytes::from_static(b"KEYS"))];
+            for a in args {
+                parts.push(a.clone());
+            }
+            Frame::Array(parts)
+        };
+        let msg = ShardMessage::Execute {
+            db_index,
+            command: cmd_frame,
+            reply_tx: tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target, msg).await;
+        pending_rxs.push(rx);
+    }
+
+    // Collect remote results
+    for rx in pending_rxs {
+        if let Ok(frame) = rx.await {
+            if let Frame::Array(keys) = frame {
+                all_keys.extend(keys);
+            }
+        }
+    }
+
+    Frame::Array(all_keys)
+}
+
+/// Coordinate SCAN across all shards.
+///
+/// Cursor encoding: upper 16 bits = shard index, lower 48 bits = per-shard cursor.
+/// This allows SCAN to iterate through all shards sequentially.
+pub async fn coordinate_scan(
+    args: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+) -> Frame {
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'scan' command",
+        ));
+    }
+
+    // Parse the composite cursor from the first arg
+    let cursor_val: i64 = match &args[0] {
+        Frame::BulkString(b) | Frame::SimpleString(b) => {
+            std::str::from_utf8(b)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        }
+        Frame::Integer(n) => *n,
+        _ => 0,
+    };
+    let cursor_u64 = cursor_val as u64;
+
+    // Decode: upper 16 bits = shard index, lower 48 bits = per-shard cursor
+    let current_shard = ((cursor_u64 >> 48) & 0xFFFF) as usize;
+    let shard_cursor = (cursor_u64 & 0x0000_FFFF_FFFF_FFFF) as i64;
+
+    // Determine the target shard (may differ from my_shard)
+    let target_shard_id = current_shard.min(num_shards - 1);
+
+    // Build the SCAN command with the per-shard cursor
+    let mut scan_args = vec![Frame::BulkString(Bytes::from(shard_cursor.to_string()))];
+    // Forward remaining args (COUNT, MATCH, etc.)
+    for a in &args[1..] {
+        scan_args.push(a.clone());
+    }
+
+    // Execute SCAN on the target shard
+    let scan_result = if target_shard_id == my_shard {
+        let mut dbs = databases.borrow_mut();
+        dbs[db_index].refresh_now();
+        let db_count = dbs.len();
+        let mut selected = db_index;
+        let result = cmd_dispatch(&mut dbs[db_index], b"SCAN", &scan_args, &mut selected, db_count);
+        match result {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => f,
+        }
+    } else {
+        // Remote dispatch
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut parts = vec![Frame::BulkString(Bytes::from_static(b"SCAN"))];
+        parts.extend(scan_args);
+        let cmd_frame = Frame::Array(parts);
+        let msg = ShardMessage::Execute {
+            db_index,
+            command: cmd_frame,
+            reply_tx: tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target_shard_id, msg).await;
+        match rx.await {
+            Ok(f) => f,
+            Err(_) => Frame::Error(Bytes::from_static(b"ERR cross-shard scan failed")),
+        }
+    };
+
+    // Parse the SCAN response: [cursor, [keys...]]
+    match scan_result {
+        Frame::Array(parts) if parts.len() == 2 => {
+            let next_shard_cursor: i64 = match &parts[0] {
+                Frame::BulkString(b) => std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+                Frame::Integer(n) => *n,
+                _ => 0,
+            };
+
+            let keys = parts[1].clone();
+
+            // Compute next composite cursor
+            let next_composite = if next_shard_cursor == 0 {
+                // This shard is done, move to the next shard
+                let next_shard = target_shard_id + 1;
+                if next_shard >= num_shards {
+                    // All shards done
+                    0u64
+                } else {
+                    // Start of next shard (cursor 0)
+                    (next_shard as u64) << 48
+                }
+            } else {
+                // Continue on current shard
+                ((target_shard_id as u64) << 48) | (next_shard_cursor as u64 & 0x0000_FFFF_FFFF_FFFF)
+            };
+
+            Frame::Array(vec![
+                Frame::BulkString(Bytes::from(next_composite.to_string())),
+                keys,
+            ])
+        }
+        other => other,
+    }
+}
+
+/// Coordinate DBSIZE across all shards.
+///
+/// Returns the sum of keys across all shards.
+pub async fn coordinate_dbsize(
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+) -> Frame {
+    let mut total: i64 = 0;
+    let mut pending_rxs: Vec<tokio::sync::oneshot::Receiver<Frame>> = Vec::new();
+
+    // Local shard
+    {
+        let dbs = databases.borrow();
+        total += dbs[db_index].len() as i64;
+    }
+
+    // Remote shards
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd_frame = Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"DBSIZE"))]);
+        let msg = ShardMessage::Execute {
+            db_index,
+            command: cmd_frame,
+            reply_tx: tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target, msg).await;
+        pending_rxs.push(rx);
+    }
+
+    for rx in pending_rxs {
+        if let Ok(Frame::Integer(n)) = rx.await {
+            total += n;
+        }
+    }
+
+    Frame::Integer(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

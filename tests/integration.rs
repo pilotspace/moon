@@ -5,10 +5,13 @@
 
 use redis::AsyncCommands;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use rust_redis::config::ServerConfig;
 use rust_redis::server::listener;
+use rust_redis::shard::mesh::{ChannelMesh, CHANNEL_BUFFER_SIZE};
+use rust_redis::shard::Shard;
 
 /// Start a server on a random port and return the port + shutdown token.
 async fn start_server() -> (u16, CancellationToken) {
@@ -34,6 +37,7 @@ async fn start_server() -> (u16, CancellationToken) {
         maxmemory: 0,
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
+        shards: 0,
     };
 
     tokio::spawn(async move {
@@ -71,6 +75,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         maxmemory: 0,
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
+        shards: 0,
     };
 
     tokio::spawn(async move {
@@ -1184,6 +1189,7 @@ async fn start_server_with_persistence(
         maxmemory: 0,
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
+        shards: 0,
     };
 
     tokio::spawn(async move {
@@ -2036,6 +2042,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         maxmemory,
         maxmemory_policy: policy.to_string(),
         maxmemory_samples: 5,
+        shards: 0,
     };
 
     tokio::spawn(async move {
@@ -2334,6 +2341,563 @@ async fn test_eviction_config_set_triggers_eviction() {
         "Some keys should have been evicted after CONFIG SET maxmemory, surviving: {}",
         surviving
     );
+
+    shutdown.cancel();
+}
+
+// ===== Phase 11: Sharded Architecture Integration Tests =====
+
+/// Start a sharded server with N shard threads on a random port.
+///
+/// Mirrors the main.rs bootstrap: creates ChannelMesh, spawns shard threads
+/// (each with its own current_thread runtime), and runs the listener on a
+/// dedicated thread. Returns the port and a CancellationToken for shutdown.
+async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
+    // Bind to port 0 to get an OS-assigned port, then drop the listener
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let token = CancellationToken::new();
+
+    let config = ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        databases: 16,
+        requirepass: None,
+        appendonly: "no".to_string(),
+        appendfsync: "everysec".to_string(),
+        save: None,
+        dir: ".".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
+        maxmemory: 0,
+        maxmemory_policy: "noeviction".to_string(),
+        maxmemory_samples: 5,
+        shards: num_shards,
+    };
+
+    let cancel = token.clone();
+
+    // Build the channel mesh and spawn shards on std threads (like main.rs)
+    std::thread::spawn(move || {
+        let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
+        let conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>> =
+            (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
+
+        // Spawn shard threads
+        let mut shard_handles = Vec::with_capacity(num_shards);
+        for id in 0..num_shards {
+            let producers = mesh.take_producers(id);
+            let consumers = mesh.take_consumers(id);
+            let conn_rx = mesh.take_conn_rx(id);
+            let shard_config = config.clone();
+            let shard_cancel = cancel.clone();
+
+            let handle = std::thread::Builder::new()
+                .name(format!("test-shard-{}", id))
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build shard runtime");
+
+                    let local = tokio::task::LocalSet::new();
+                    let mut shard = Shard::new(
+                        id,
+                        num_shards,
+                        shard_config.databases,
+                        shard_config.to_runtime_config(),
+                    );
+
+                    rt.block_on(local.run_until(
+                        shard.run(conn_rx, consumers, producers, shard_cancel, None),
+                    ));
+                })
+                .expect("failed to spawn shard thread");
+            shard_handles.push(handle);
+        }
+
+        // Run listener on this thread
+        let listener_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build listener runtime");
+
+        let listener_cancel = cancel.clone();
+        listener_rt.block_on(async {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel).await {
+                eprintln!("Listener error: {}", e);
+            }
+        });
+
+        cancel.cancel();
+        for handle in shard_handles {
+            let _ = handle.join();
+        }
+    });
+
+    // Give the server a moment to bind and start shards
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    (port, token)
+}
+
+#[tokio::test]
+async fn test_sharded_ping_pong() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let result: String = redis::cmd("PING").query_async(&mut conn).await.unwrap();
+    assert_eq!(result, "PONG");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_set_get_across_shards() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // SET 100 random keys -- they will naturally distribute across 2 shards
+    for i in 0..100 {
+        let key = format!("shard_key_{}", i);
+        let val = format!("shard_val_{}", i);
+        let _: () = conn.set(&key, &val).await.unwrap();
+    }
+
+    // GET all of them back and verify correctness
+    for i in 0..100 {
+        let key = format!("shard_key_{}", i);
+        let expected = format!("shard_val_{}", i);
+        let val: String = conn.get(&key).await.unwrap();
+        assert_eq!(val, expected, "Mismatch for key {}", key);
+    }
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_mget_cross_shard() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // SET keys that will hash to different shards (no hash tags)
+    let _: () = conn.set("alpha", "1").await.unwrap();
+    let _: () = conn.set("beta", "2").await.unwrap();
+    let _: () = conn.set("gamma", "3").await.unwrap();
+    let _: () = conn.set("delta", "4").await.unwrap();
+
+    // MGET all of them in one command -- exercises cross-shard multi-key coordinator
+    let result: Vec<Option<String>> = redis::cmd("MGET")
+        .arg("alpha")
+        .arg("beta")
+        .arg("gamma")
+        .arg("delta")
+        .arg("missing")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result,
+        vec![
+            Some("1".to_string()),
+            Some("2".to_string()),
+            Some("3".to_string()),
+            Some("4".to_string()),
+            None,
+        ]
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_mset_cross_shard() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // MSET keys that will hash to different shards
+    let _: () = redis::cmd("MSET")
+        .arg("ms_a").arg("v1")
+        .arg("ms_b").arg("v2")
+        .arg("ms_c").arg("v3")
+        .arg("ms_d").arg("v4")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // GET each key individually
+    let v1: String = conn.get("ms_a").await.unwrap();
+    let v2: String = conn.get("ms_b").await.unwrap();
+    let v3: String = conn.get("ms_c").await.unwrap();
+    let v4: String = conn.get("ms_d").await.unwrap();
+    assert_eq!(v1, "v1");
+    assert_eq!(v2, "v2");
+    assert_eq!(v3, "v3");
+    assert_eq!(v4, "v4");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_hash_tag_co_location() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // Hash tags: {user:1}.name and {user:1}.email should be on the same shard
+    let _: () = conn.set("{user:1}.name", "Alice").await.unwrap();
+    let _: () = conn.set("{user:1}.email", "alice@example.com").await.unwrap();
+
+    // MGET both -- should work efficiently (same shard)
+    let result: Vec<String> = redis::cmd("MGET")
+        .arg("{user:1}.name")
+        .arg("{user:1}.email")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, vec!["Alice", "alice@example.com"]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_del_multi_cross_shard() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // SET 10 keys distributed across shards
+    for i in 0..10 {
+        let key = format!("deltest_{}", i);
+        let _: () = conn.set(&key, "val").await.unwrap();
+    }
+
+    // Verify they exist
+    for i in 0..10 {
+        let key = format!("deltest_{}", i);
+        let exists: i64 = conn.exists(&key).await.unwrap();
+        assert_eq!(exists, 1, "Key {} should exist before DEL", key);
+    }
+
+    // DEL all 10 keys in one command -- exercises multi-key cross-shard DEL
+    let mut cmd = redis::cmd("DEL");
+    for i in 0..10 {
+        cmd.arg(format!("deltest_{}", i));
+    }
+    let deleted: i64 = cmd.query_async(&mut conn).await.unwrap();
+    assert_eq!(deleted, 10);
+
+    // Verify all removed
+    for i in 0..10 {
+        let key = format!("deltest_{}", i);
+        let exists: i64 = conn.exists(&key).await.unwrap();
+        assert_eq!(exists, 0, "Key {} should be gone after DEL", key);
+    }
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_keys_pattern_all_shards() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // Insert keys with prefix "kptest:" distributed across shards
+    for i in 0..20 {
+        let key = format!("kptest:{}", i);
+        let _: () = conn.set(&key, "val").await.unwrap();
+    }
+
+    // Also insert some keys with a different prefix
+    let _: () = conn.set("other:1", "val").await.unwrap();
+    let _: () = conn.set("other:2", "val").await.unwrap();
+
+    // KEYS "kptest:*" should return all 20 keys across all shards
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg("kptest:*")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    keys.sort();
+    assert_eq!(keys.len(), 20, "KEYS should find all 20 kptest: keys across shards");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_scan_all_shards() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // Insert 50 keys distributed across shards
+    for i in 0..50 {
+        let key = format!("scantest_{}", i);
+        let _: () = conn.set(&key, "val").await.unwrap();
+    }
+
+    // SCAN until cursor returns 0, collect all keys
+    let mut all_keys: Vec<String> = Vec::new();
+    let mut cursor: i64 = 0;
+    let mut iterations = 0;
+    loop {
+        let (next_cursor, keys): (i64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        all_keys.extend(keys);
+        cursor = next_cursor;
+        iterations += 1;
+        if cursor == 0 || iterations > 200 {
+            break;
+        }
+    }
+
+    // All 50 keys should be found
+    all_keys.sort();
+    all_keys.dedup();
+    assert_eq!(
+        all_keys.len(),
+        50,
+        "SCAN should find all 50 keys across shards, found: {}",
+        all_keys.len()
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_concurrent_clients() {
+    let (port, shutdown) = start_sharded_server(2).await;
+
+    // Spawn 10 concurrent clients, each doing SET/GET on unique keys
+    let mut handles = Vec::new();
+    for i in 0..10u32 {
+        let handle = tokio::spawn(async move {
+            let mut conn = connect(port).await;
+            for j in 0..10u32 {
+                let key = format!("client_{}_{}", i, j);
+                let val = format!("value_{}_{}", i, j);
+                let _: () = conn.set(&key, &val).await.unwrap();
+                let result: String = conn.get(&key).await.unwrap();
+                assert_eq!(result, val);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Verify total key count
+    let mut conn = connect(port).await;
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("client_*")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 100, "All 100 keys from concurrent clients should exist");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pipeline() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let (set_result, get_result): (String, String) = redis::pipe()
+        .cmd("SET")
+        .arg("shpipe_key")
+        .arg("shpipe_val")
+        .cmd("GET")
+        .arg("shpipe_key")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    assert_eq!(set_result, "OK");
+    assert_eq!(get_result, "shpipe_val");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_incr_decr() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let v: i64 = conn.incr("sh_counter", 1).await.unwrap();
+    assert_eq!(v, 1);
+    let v: i64 = conn.incr("sh_counter", 5).await.unwrap();
+    assert_eq!(v, 6);
+    let v: i64 = conn.decr("sh_counter", 2).await.unwrap();
+    assert_eq!(v, 4);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_hash_commands() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let added: i64 = redis::cmd("HSET")
+        .arg("sh_hash")
+        .arg("name")
+        .arg("Redis")
+        .arg("version")
+        .arg("7")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(added, 2);
+
+    let val: String = redis::cmd("HGET")
+        .arg("sh_hash")
+        .arg("name")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(val, "Redis");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_list_commands() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let len: i64 = redis::cmd("LPUSH")
+        .arg("sh_list")
+        .arg("a")
+        .arg("b")
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(len, 3);
+
+    let items: Vec<String> = redis::cmd("LRANGE")
+        .arg("sh_list")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(items, vec!["c", "b", "a"]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_set_commands() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let added: i64 = redis::cmd("SADD")
+        .arg("sh_set")
+        .arg("x")
+        .arg("y")
+        .arg("z")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(added, 3);
+
+    let card: i64 = redis::cmd("SCARD")
+        .arg("sh_set")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(card, 3);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_sorted_set_commands() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let added: i64 = redis::cmd("ZADD")
+        .arg("sh_zs")
+        .arg(1)
+        .arg("a")
+        .arg(2)
+        .arg("b")
+        .arg(3)
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(added, 3);
+
+    let members: Vec<String> = redis::cmd("ZRANGE")
+        .arg("sh_zs")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(members, vec!["a", "b", "c"]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_expire_ttl() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    let _: () = conn.set("sh_ttl", "val").await.unwrap();
+    let set: bool = conn.expire("sh_ttl", 100).await.unwrap();
+    assert!(set);
+
+    let ttl: i64 = conn.ttl("sh_ttl").await.unwrap();
+    assert!(ttl > 0 && ttl <= 100, "TTL was {}", ttl);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_transaction_same_shard() {
+    let (port, shutdown) = start_sharded_server(2).await;
+    let mut conn = connect(port).await;
+
+    // Use hash tags to co-locate keys on the same shard.
+    // Verify that SET + GET of co-located keys works consistently.
+    let _: () = conn.set("{txn}.a", "1").await.unwrap();
+    let _: () = conn.set("{txn}.b", "2").await.unwrap();
+
+    // MGET both co-located keys -- both on same shard
+    let result: Vec<String> = redis::cmd("MGET")
+        .arg("{txn}.a")
+        .arg("{txn}.b")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, vec!["1", "2"]);
+
+    // Test MULTI/EXEC via pipe().atomic() with hash-tagged keys
+    let result: (String, String) = redis::pipe()
+        .atomic()
+        .cmd("SET").arg("{txn}.c").arg("3")
+        .cmd("SET").arg("{txn}.d").arg("4")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result.0, "OK");
+    assert_eq!(result.1, "OK");
+
+    // Verify both keys set
+    let c: String = conn.get("{txn}.c").await.unwrap();
+    let d: String = conn.get("{txn}.d").await.unwrap();
+    assert_eq!(c, "3");
+    assert_eq!(d, "4");
 
     shutdown.cancel();
 }
