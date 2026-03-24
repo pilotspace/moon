@@ -571,7 +571,7 @@ mod tests {
         match entry.value.as_redis_value() {
             RedisValueRef::String(s) => {
                 // The snapshot should have the OLD value from COW, not "NEW_VALUE"
-                assert_ne!(s.as_ref(), b"NEW_VALUE", "COW should have captured old value");
+                assert_ne!(s.as_ref() as &[u8], b"NEW_VALUE", "COW should have captured old value");
             }
             _ => panic!("Expected string"),
         }
