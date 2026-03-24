@@ -36,6 +36,8 @@ async fn start_server() -> (u16, CancellationToken) {
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
     };
 
     tokio::spawn(async move {

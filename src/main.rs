@@ -91,8 +91,29 @@ fn main() -> anyhow::Result<()> {
         rust_redis::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
     ));
 
+    // Cluster mode initialization
+    let cluster_state: Option<std::sync::Arc<std::sync::RwLock<rust_redis::cluster::ClusterState>>> =
+        if config.cluster_enabled {
+            rust_redis::cluster::CLUSTER_ENABLED
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
+                .parse()
+                .expect("invalid bind address");
+            let node_id = rust_redis::replication::state::generate_repl_id();
+            let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
+            let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
+            info!(
+                "Cluster mode enabled, node ID: {}",
+                cs.read().unwrap().node_id
+            );
+            Some(cs)
+        } else {
+            None
+        };
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
+    let config_port = config.port;
     for id in 0..num_shards {
         let producers = mesh.take_producers(id);
         let consumers = mesh.take_consumers(id);
@@ -104,6 +125,7 @@ fn main() -> anyhow::Result<()> {
         let shard_persistence_dir = persistence_dir.clone();
         let shard_snap_rx = snapshot_trigger_rx.clone();
         let shard_repl_state = repl_state.clone();
+        let shard_cluster_state = cluster_state.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -138,6 +160,8 @@ fn main() -> anyhow::Result<()> {
                     shard_persistence_dir,
                     shard_snap_rx,
                     Some(shard_repl_state),
+                    shard_cluster_state,
+                    config_port,
                 ));
             })
             .expect("failed to spawn shard thread");
@@ -170,6 +194,45 @@ fn main() -> anyhow::Result<()> {
                 ));
                 info!("Auto-save timer started (sharded mode)");
             }
+        }
+
+        // Start cluster bus and gossip ticker when cluster mode is enabled
+        if let Some(ref cs) = cluster_state {
+            let cluster_port = (config.port as u32 + 10000) as u16;
+            let cs_clone = cs.clone();
+            let bus_cancel = cancel_token.child_token();
+            let bind2 = config.bind.clone();
+            let self_addr: std::net::SocketAddr =
+                format!("{}:{}", config.bind, config.port).parse().unwrap();
+            tokio::spawn(async move {
+                if let Err(e) = rust_redis::cluster::bus::run_cluster_bus(
+                    &bind2,
+                    cluster_port,
+                    self_addr,
+                    cs_clone,
+                    bus_cancel,
+                )
+                .await
+                {
+                    tracing::error!("Cluster bus error: {}", e);
+                }
+            });
+
+            let cs_gossip = cs.clone();
+            let gossip_cancel = cancel_token.child_token();
+            let node_timeout = config.cluster_node_timeout;
+            let self_addr2: std::net::SocketAddr =
+                format!("{}:{}", config.bind, config.port).parse().unwrap();
+            tokio::spawn(async move {
+                rust_redis::cluster::gossip::run_gossip_ticker(
+                    self_addr2,
+                    cs_gossip,
+                    node_timeout,
+                    gossip_cancel,
+                )
+                .await;
+            });
+            info!("Cluster bus and gossip ticker started");
         }
 
         if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel).await {

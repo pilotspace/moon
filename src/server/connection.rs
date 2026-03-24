@@ -1166,6 +1166,28 @@ fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
         || cmd.eq_ignore_ascii_case(b"DBSIZE")
         || cmd.eq_ignore_ascii_case(b"KEYS")
         || cmd.eq_ignore_ascii_case(b"SCAN")
+        || cmd.eq_ignore_ascii_case(b"CLUSTER")
+        || cmd.eq_ignore_ascii_case(b"ASKING")
+        || cmd.eq_ignore_ascii_case(b"AUTH")
+        || cmd.eq_ignore_ascii_case(b"CONFIG")
+        || cmd.eq_ignore_ascii_case(b"HELLO")
+        || cmd.eq_ignore_ascii_case(b"CLIENT")
+        || cmd.eq_ignore_ascii_case(b"WAIT")
+        || cmd.eq_ignore_ascii_case(b"REPLCONF")
+        || cmd.eq_ignore_ascii_case(b"PSYNC")
+        || cmd.eq_ignore_ascii_case(b"BGSAVE")
+        || cmd.eq_ignore_ascii_case(b"BGREWRITEAOF")
+        || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"PUBLISH")
+        || cmd.eq_ignore_ascii_case(b"MULTI")
+        || cmd.eq_ignore_ascii_case(b"EXEC")
+        || cmd.eq_ignore_ascii_case(b"DISCARD")
+        || cmd.eq_ignore_ascii_case(b"DEBUG")
+        || cmd.eq_ignore_ascii_case(b"REPLICAOF")
+        || cmd.eq_ignore_ascii_case(b"SLAVEOF")
     {
         return None;
     }
@@ -1225,6 +1247,8 @@ pub async fn handle_connection_sharded(
     tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    config_port: u16,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -1240,6 +1264,9 @@ pub async fn handle_connection_sharded(
 
     // RESP3/HELLO connection-local state
     let mut client_name: Option<Bytes> = None;
+
+    // Cluster ASKING flag: set by ASKING command, cleared unconditionally before routing check.
+    let mut asking: bool = false;
 
     // Per-connection arena for batch processing temporaries.
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
@@ -1325,6 +1352,80 @@ pub async fn handle_connection_sharded(
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         should_quit = true;
                         break;
+                    }
+
+                    // --- ASKING: set per-connection flag for next command ---
+                    if cmd.eq_ignore_ascii_case(b"ASKING") {
+                        asking = true;
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        continue;
+                    }
+
+                    // --- CLUSTER subcommands ---
+                    if cmd.eq_ignore_ascii_case(b"CLUSTER") {
+                        if let Some(ref cs) = cluster_state {
+                            let self_addr: std::net::SocketAddr =
+                                format!("127.0.0.1:{}", config_port)
+                                    .parse()
+                                    .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
+                            let resp = crate::cluster::command::handle_cluster_command(
+                                cmd_args, cs, self_addr,
+                            );
+                            responses.push(resp);
+                        } else {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR This instance has cluster support disabled",
+                            )));
+                        }
+                        continue;
+                    }
+
+                    // --- Cluster slot routing (pre-dispatch) ---
+                    // Only active when cluster_enabled() is true AND cluster_state is Some.
+                    // AtomicBool outer check avoids RwLock acquisition on non-cluster path.
+                    if crate::cluster::cluster_enabled() {
+                        if let Some(ref cs) = cluster_state {
+                            // Capture and clear ASKING flag unconditionally before routing check
+                            let was_asking = asking;
+                            asking = false;
+
+                            let maybe_key = extract_primary_key(cmd, cmd_args);
+                            if let Some(key) = maybe_key {
+                                let slot = crate::cluster::slots::slot_for_key(key);
+                                let route = cs.read().unwrap().route_slot(slot, was_asking);
+                                match route {
+                                    crate::cluster::SlotRoute::Local => {} // proceed
+                                    other => {
+                                        let err_frame = other.into_error_frame(slot);
+                                        responses.push(err_frame);
+                                        continue;
+                                    }
+                                }
+
+                                // CROSSSLOT check for multi-key commands
+                                if is_multi_key_command(cmd, cmd_args) {
+                                    let first_slot = slot;
+                                    let mut cross_slot = false;
+                                    for arg in cmd_args.iter().skip(1) {
+                                        if let Some(k) = match arg {
+                                            Frame::BulkString(b) => Some(b.as_ref()),
+                                            _ => None,
+                                        } {
+                                            if crate::cluster::slots::slot_for_key(k) != first_slot {
+                                                cross_slot = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if cross_slot {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"CROSSSLOT Keys in request don't hash to the same slot",
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // --- HELLO (protocol negotiation) ---

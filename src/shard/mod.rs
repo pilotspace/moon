@@ -141,6 +141,8 @@ impl Shard {
         persistence_dir: Option<String>,
         mut snapshot_trigger_rx: tokio::sync::watch::Receiver<u64>,
         repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
+        cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
+        config_port: u16,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -302,6 +304,8 @@ impl Shard {
                             let trk = tracking_rc.clone();
                             let cid = conn_cmd::next_client_id();
                             let rs = repl_state.clone();
+                            let cs = cluster_state.clone();
+                            let cp = config_port;
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -317,6 +321,8 @@ impl Shard {
                                     trk,
                                     cid,
                                     rs,
+                                    cs,
+                                    cp,
                                 ).await;
                             });
                         }

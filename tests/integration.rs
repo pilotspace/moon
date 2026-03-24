@@ -38,6 +38,8 @@ async fn start_server() -> (u16, CancellationToken) {
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
     };
 
     tokio::spawn(async move {
@@ -76,6 +78,8 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
     };
 
     tokio::spawn(async move {
@@ -1190,6 +1194,8 @@ async fn start_server_with_persistence(
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
     };
 
     tokio::spawn(async move {
@@ -2043,6 +2049,8 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         maxmemory_policy: policy.to_string(),
         maxmemory_samples: 5,
         shards: 0,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
     };
 
     tokio::spawn(async move {
@@ -2375,6 +2383,8 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: num_shards,
+        cluster_enabled: false,
+        cluster_node_timeout: 15000,
     };
 
     let cancel = token.clone();
@@ -2412,7 +2422,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
 
                     let (_, snap_rx) = tokio::sync::watch::channel(0u64);
                     rt.block_on(local.run_until(
-                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx),
+                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0),
                     ));
                 })
                 .expect("failed to spawn shard thread");
