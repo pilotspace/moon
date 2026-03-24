@@ -14,7 +14,8 @@ bumpalo = { version = "3.20", features = ["collections"] }
 bytes = "1.10"
 memchr = "2.8"
 thiserror = "2.0"
-tikv-jemallocator = "0.6"
+mimalloc = { version = "0.1", default-features = false }
+crossbeam-utils = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 clap = { version = "4", features = ["derive"] }
@@ -31,6 +32,12 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ringbuf = "0.4"
 core_affinity = "0.8"
 once_cell = "1"
+
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
