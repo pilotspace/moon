@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
-use crate::command::{dispatch, DispatchResult};
+use crate::command::{dispatch, dispatch_read, DispatchResult};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
@@ -595,37 +595,79 @@ pub async fn handle_connection(
                     }
                 }
 
-                // === Phase 2: Execute ALL dispatchable frames under ONE write lock ===
+                // === Phase 2: Execute dispatchable frames with read/write lock batching ===
+                // Group consecutive reads under ONE shared read lock, consecutive writes
+                // under ONE exclusive write lock. Minimizes lock transitions while
+                // enabling read parallelism across connections.
                 if !dispatchable.is_empty() && !should_quit {
-                    let mut guard = db[selected_db].write();
-                    guard.refresh_now();
                     let db_count = db.len();
-                    for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable {
-                        if is_write {
-                            let rt = runtime_config.read().unwrap();
-                            if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
-                                responses[resp_idx] = oom_frame;
-                                continue;
-                            }
+                    let mut i = 0;
+                    while i < dispatchable.len() {
+                        // Determine if this run starts with a read or write
+                        let run_is_read = !dispatchable[i].2; // .2 is is_write
+
+                        // Find end of consecutive same-type commands
+                        let run_start = i;
+                        while i < dispatchable.len() && (!dispatchable[i].2) == run_is_read {
+                            i += 1;
                         }
-                        let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
-                        let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
-                        let (response, quit) = match result {
-                            DispatchResult::Response(f) => (f, false),
-                            DispatchResult::Quit(f) => (f, true),
-                        };
-                        if let Some(bytes) = aof_bytes {
-                            if !matches!(&response, Frame::Error(_)) {
-                                aof_entries.push(bytes);
+
+                        if run_is_read {
+                            // === Read run: shared read lock ===
+                            let guard = db[selected_db].read();
+                            let now_ms = crate::storage::entry::current_time_ms();
+                            for j in run_start..i {
+                                let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
+                                let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
+                                let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut selected_db, db_count);
+                                let (response, quit) = match result {
+                                    DispatchResult::Response(f) => (f, false),
+                                    DispatchResult::Quit(f) => (f, true),
+                                };
+                                responses[resp_idx] = response;
+                                if quit {
+                                    should_quit = true;
+                                    break;
+                                }
                             }
+                            // read guard dropped here
+                        } else {
+                            // === Write run: exclusive write lock ===
+                            let mut guard = db[selected_db].write();
+                            guard.refresh_now();
+                            for j in run_start..i {
+                                let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
+                                let rt = runtime_config.read().unwrap();
+                                if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
+                                    responses[resp_idx] = oom_frame;
+                                    continue;
+                                }
+                                drop(rt);
+                                let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
+                                let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                                let (response, quit) = match result {
+                                    DispatchResult::Response(f) => (f, false),
+                                    DispatchResult::Quit(f) => (f, true),
+                                };
+                                if let Some(bytes) = aof_bytes {
+                                    if !matches!(&response, Frame::Error(_)) {
+                                        aof_entries.push(bytes.clone());
+                                    }
+                                }
+                                responses[resp_idx] = response;
+                                if quit {
+                                    should_quit = true;
+                                    break;
+                                }
+                            }
+                            // write guard dropped here
                         }
-                        responses[resp_idx] = response;
-                        if quit {
-                            should_quit = true;
+
+                        if should_quit {
                             break;
                         }
                     }
-                } // lock dropped here -- BEFORE any await
+                } // all locks dropped here -- BEFORE any await
 
                 // --- Write all responses OUTSIDE the lock ---
                 for response in responses {

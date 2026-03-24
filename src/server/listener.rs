@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
@@ -141,7 +141,7 @@ pub async fn run_with_shutdown(
             result = listener.accept() => {
                 match result {
                     Ok((stream, addr)) => {
-                        info!("New connection from {}", addr);
+                        debug!("New connection from {}", addr);
                         let db = db.clone();
                         let conn_token = token.child_token();
                         let requirepass = config.requirepass.clone();
