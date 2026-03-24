@@ -3382,3 +3382,247 @@ async fn blmove_basic() {
 
     shutdown.cancel();
 }
+
+// --- Cluster Integration Tests ---
+
+/// Start a cluster-enabled sharded server on a random port.
+async fn start_cluster_server() -> (u16, CancellationToken) {
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+
+    let config = ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        databases: 16,
+        requirepass: None,
+        appendonly: "no".to_string(),
+        appendfsync: "everysec".to_string(),
+        save: None,
+        dir: ".".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendfilename: "appendonly.aof".to_string(),
+        maxmemory: 0,
+        maxmemory_policy: "noeviction".to_string(),
+        maxmemory_samples: 5,
+        shards: 1,
+        cluster_enabled: true,
+        cluster_node_timeout: 15000,
+    };
+
+    std::thread::spawn(move || {
+        let num_shards = 1;
+        let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
+        let conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>> =
+            (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
+
+        // Initialize cluster state
+        rust_redis::cluster::CLUSTER_ENABLED
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let self_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", config.port).parse().unwrap();
+        let node_id = rust_redis::replication::state::generate_repl_id();
+        let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
+        let cluster_state =
+            Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
+
+        // Spawn shard threads
+        let mut shard_handles = Vec::with_capacity(num_shards);
+        for id in 0..num_shards {
+            let producers = mesh.take_producers(id);
+            let consumers = mesh.take_consumers(id);
+            let conn_rx = mesh.take_conn_rx(id);
+            let shard_config = config.clone();
+            let shard_cancel = cancel.clone();
+            let shard_cs = cluster_state.clone();
+
+            let handle = std::thread::Builder::new()
+                .name(format!("test-cluster-shard-{}", id))
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build shard runtime");
+
+                    let local = tokio::task::LocalSet::new();
+                    let mut shard = Shard::new(
+                        id,
+                        num_shards,
+                        shard_config.databases,
+                        shard_config.to_runtime_config(),
+                    );
+
+                    let (_, snap_rx) = tokio::sync::watch::channel(0u64);
+                    rt.block_on(local.run_until(shard.run(
+                        conn_rx,
+                        consumers,
+                        producers,
+                        shard_cancel,
+                        None,
+                        None,
+                        None,
+                        snap_rx,
+                        None,
+                        shard_cs,
+                        shard_config.port,
+                    )));
+                })
+                .expect("failed to spawn shard thread");
+            shard_handles.push(handle);
+        }
+
+        // Run listener on this thread
+        let listener_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build listener runtime");
+
+        let listener_cancel = cancel.clone();
+        listener_rt.block_on(async {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel).await {
+                eprintln!("Listener error: {}", e);
+            }
+        });
+
+        cancel.cancel();
+        for handle in shard_handles {
+            let _ = handle.join();
+        }
+    });
+
+    // Give the server time to bind and start shards
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    (port, token)
+}
+
+/// CLUSTER-06: CLUSTER INFO returns cluster_enabled:1 when started with --cluster-enabled.
+#[tokio::test]
+async fn cluster_info() {
+    let (port, shutdown) = start_cluster_server().await;
+    let mut con = connect(port).await;
+
+    let info: String = redis::cmd("CLUSTER")
+        .arg("INFO")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(
+        info.contains("cluster_enabled:1"),
+        "expected cluster_enabled:1 in: {}",
+        info
+    );
+    assert!(
+        info.contains("cluster_state:ok"),
+        "expected cluster_state:ok in: {}",
+        info
+    );
+
+    shutdown.cancel();
+}
+
+/// CLUSTER-07: CLUSTER MYID returns a 40-char hex string.
+#[tokio::test]
+async fn cluster_myid() {
+    let (port, shutdown) = start_cluster_server().await;
+    let mut con = connect(port).await;
+
+    let myid: String = redis::cmd("CLUSTER")
+        .arg("MYID")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(myid.len(), 40, "node ID should be 40 chars, got: {}", myid);
+    assert!(
+        myid.chars().all(|c| c.is_ascii_hexdigit()),
+        "node ID not hex: {}",
+        myid
+    );
+
+    shutdown.cancel();
+}
+
+/// CLUSTER-08: ADDSLOTS + SET/GET routes locally.
+#[tokio::test]
+async fn cluster_addslots() {
+    let (port, shutdown) = start_cluster_server().await;
+    let mut con = connect(port).await;
+
+    // Assign all 16384 slots to ourselves for full local routing
+    for chunk_start in (0u16..16384).step_by(100) {
+        let chunk_end = (chunk_start + 100).min(16384);
+        let mut cmd = redis::cmd("CLUSTER");
+        cmd.arg("ADDSLOTS");
+        for s in chunk_start..chunk_end {
+            cmd.arg(s);
+        }
+        let _: () = cmd.query_async(&mut con).await.unwrap();
+    }
+
+    // SET "foo" should succeed (slot 12182 is local)
+    let _: () = redis::cmd("SET")
+        .arg("foo")
+        .arg("bar")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    let val: String = redis::cmd("GET")
+        .arg("foo")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(val, "bar");
+
+    shutdown.cancel();
+}
+
+/// CLUSTER-09: CLUSTER KEYSLOT returns correct slot.
+#[tokio::test]
+async fn cluster_keyslot() {
+    let (port, shutdown) = start_cluster_server().await;
+    let mut con = connect(port).await;
+
+    let slot: i64 = redis::cmd("CLUSTER")
+        .arg("KEYSLOT")
+        .arg("foo")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(slot, 12182, "CLUSTER KEYSLOT foo should return 12182");
+
+    shutdown.cancel();
+}
+
+/// CLUSTER-13: CLUSTER NODES output has correct fields.
+#[tokio::test]
+async fn cluster_nodes() {
+    let (port, shutdown) = start_cluster_server().await;
+    let mut con = connect(port).await;
+
+    let nodes_output: String = redis::cmd("CLUSTER")
+        .arg("NODES")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    assert!(
+        !nodes_output.trim().is_empty(),
+        "CLUSTER NODES should not be empty"
+    );
+    for line in nodes_output.trim().lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            fields.len() >= 9,
+            "CLUSTER NODES line should have >= 9 fields, got {}: {}",
+            fields.len(),
+            line
+        );
+        // First field is 40-char hex node ID
+        assert_eq!(fields[0].len(), 40, "node ID not 40 chars: {}", fields[0]);
+    }
+
+    shutdown.cancel();
+}
