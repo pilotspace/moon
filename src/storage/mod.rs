@@ -1,4 +1,5 @@
 pub mod compact_value;
+pub mod dashtable;
 pub mod db;
 pub mod entry;
 pub mod eviction;
