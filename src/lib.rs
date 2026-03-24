@@ -1,4 +1,5 @@
 pub mod blocking;
+pub mod cluster;
 pub mod command;
 pub mod config;
 pub mod io;
