@@ -36,3 +36,7 @@ tempfile = "3"
 [[bench]]
 name = "resp_parsing"
 harness = false
+
+[[bench]]
+name = "entry_memory"
+harness = false
