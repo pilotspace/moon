@@ -365,20 +365,262 @@ extract_p999() {
 }
 
 # ===========================================================================
-# Stub Functions (implemented in Plan 02 and Plan 03)
+# Memory Overhead Measurement
 # ===========================================================================
 
-# Memory overhead comparison: our server vs Redis with identical datasets.
-# Uses INFO MEMORY, per-key overhead calculation, fragmentation ratio.
-run_memory_suite() { log "Memory suite: not yet implemented (Plan 02)"; }
+measure_memory_overhead() {
+    # Measures per-key overhead using INFO MEMORY used_memory (allocator-tracked).
+    # MUST use used_memory, not RSS (RSS includes TCP buffers, FD tables, OS overhead).
+    # Source: CONTEXT.md Memory benchmarks
+    local port=$1 label=$2 num_keys=$3
 
-# Snapshot spike measurement: peak RSS during BGSAVE vs steady-state RSS.
-# Target: < 5% memory spike during snapshot.
-run_snapshot_suite() { log "Snapshot suite: not yet implemented (Plan 02)"; }
+    # Baseline memory before loading any keys
+    local baseline
+    baseline=$(redis-cli -p "$port" INFO MEMORY 2>/dev/null \
+        | awk -F: '/^used_memory:/{gsub(/[[:space:]]/, "", $2); print $2}')
 
-# Open-loop rate-limited testing for coordinated-omission-aware latency curves.
-# Uses memtier --rate-limiting at 10%, 25%, 50%, 75%, 90% of peak throughput.
-run_open_loop_suite() { log "Open-loop suite: not yet implemented (Plan 02)"; }
+    log "  Memory baseline ($label): ${baseline} bytes"
+
+    # Load num_keys keys with DATA_SIZE values using sequential pattern
+    memtier_benchmark -s "$SERVER_HOST" -p "$port" \
+        -t 1 -c 1 \
+        --ratio=1:0 \
+        --key-pattern=P:P \
+        --key-maximum="$num_keys" \
+        -d "$DATA_SIZE" \
+        -n allkeys \
+        --hide-histogram \
+        &>/dev/null || true
+
+    local loaded
+    loaded=$(redis-cli -p "$port" INFO MEMORY 2>/dev/null \
+        | awk -F: '/^used_memory:/{gsub(/[[:space:]]/, "", $2); print $2}')
+
+    log "  Memory loaded ($label): ${loaded} bytes"
+
+    if [[ -n "$baseline" ]] && [[ -n "$loaded" ]] && [[ "$loaded" -gt "$baseline" ]]; then
+        local overhead=$(( (loaded - baseline) / num_keys ))
+        log "  Per-key overhead ($label): ${overhead} bytes (target: <=24 bytes)"
+        echo "${label},${baseline},${loaded},${num_keys},${overhead}" \
+            >> "$RESULTS_DIR/memory_overhead.csv"
+        echo "$overhead"  # return value for callers
+    else
+        log "  WARNING: Could not compute per-key overhead (baseline=$baseline loaded=$loaded)"
+        echo "N/A"
+    fi
+
+    # Clean up keys loaded by this function (Pitfall 7: FLUSHALL between runs)
+    redis-cli -p "$port" FLUSHALL &>/dev/null || true
+}
+
+run_memory_suite() {
+    log "=== Memory overhead suite ==="
+    local mem_keys=${KEY_MAX}
+    # Cap at 100K for smoke test
+    [[ "$SMOKE_TEST" == "true" ]] && mem_keys=10000
+
+    echo "label,baseline_bytes,loaded_bytes,num_keys,per_key_overhead_bytes" \
+        > "$RESULTS_DIR/memory_overhead.csv"
+
+    if [[ "$RUN_RUST" == "true" ]]; then
+        start_rust_server "$PORT_RUST"
+        measure_memory_overhead "$PORT_RUST" "rust-redis" "$mem_keys"
+        stop_rust_server
+    fi
+
+    if [[ "$RUN_REDIS" == "true" ]] && command -v redis-server &>/dev/null; then
+        start_redis_server "$PORT_REDIS"
+        measure_memory_overhead "$PORT_REDIS" "redis-7x" "$mem_keys"
+        stop_redis_server
+    fi
+}
+
+# ===========================================================================
+# Snapshot RSS Spike Measurement
+# ===========================================================================
+
+measure_snapshot_spike() {
+    # Measures peak RSS increase during async snapshot (BGSAVE).
+    # Uses RSS (not used_memory) here because we want to capture the full
+    # system-visible memory pressure during snapshot, not just allocator usage.
+    local port=$1 pid=$2 label=$3
+
+    # Steady-state RSS before snapshot
+    local steady_rss
+    steady_rss=$(get_rss "$pid")
+    log "  Steady-state RSS ($label): ${steady_rss} KB"
+
+    # Record LASTSAVE time before triggering snapshot
+    local before_save
+    before_save=$(redis-cli -p "$port" LASTSAVE 2>/dev/null || echo "0")
+
+    # Trigger async snapshot
+    redis-cli -p "$port" BGSAVE &>/dev/null || true
+    log "  BGSAVE triggered ($label)"
+
+    # Poll RSS every 100ms until snapshot completes (LASTSAVE changes)
+    local peak_rss=$steady_rss
+    local poll_count=0
+    local max_polls=300  # 30 second timeout
+    while [[ $poll_count -lt $max_polls ]]; do
+        sleep 0.1
+        poll_count=$((poll_count + 1))
+        local current_rss
+        current_rss=$(get_rss "$pid")
+        (( current_rss > peak_rss )) && peak_rss=$current_rss
+
+        local current_save
+        current_save=$(redis-cli -p "$port" LASTSAVE 2>/dev/null || echo "0")
+        if [[ "$current_save" != "$before_save" ]]; then
+            log "  Snapshot complete after ${poll_count} polls"
+            break
+        fi
+    done
+
+    if [[ "$steady_rss" -gt 0 ]]; then
+        # Use awk for floating point percentage calculation
+        local spike_pct
+        spike_pct=$(awk "BEGIN {printf \"%.2f\", ($peak_rss - $steady_rss) * 100.0 / $steady_rss}")
+        log "  Snapshot RSS spike ($label): ${spike_pct}% (target: <5%)"
+        echo "${label},${steady_rss},${peak_rss},${spike_pct}" \
+            >> "$RESULTS_DIR/snapshot_spike.csv"
+    else
+        log "  WARNING: Could not measure snapshot spike (steady_rss=$steady_rss)"
+    fi
+}
+
+run_snapshot_suite() {
+    log "=== Snapshot spike suite ==="
+    echo "label,steady_rss_kb,peak_rss_kb,spike_pct" \
+        > "$RESULTS_DIR/snapshot_spike.csv"
+
+    # Load enough keys to make snapshot non-trivial
+    local snap_keys=${KEY_MAX}
+    [[ "$SMOKE_TEST" == "true" ]] && snap_keys=10000
+
+    if [[ "$RUN_RUST" == "true" ]]; then
+        start_rust_server "$PORT_RUST"
+        # Pre-load keys
+        memtier_benchmark -s "$SERVER_HOST" -p "$PORT_RUST" \
+            -t 1 -c 1 --ratio=1:0 --key-pattern=P:P \
+            --key-maximum="$snap_keys" -d "$DATA_SIZE" -n allkeys \
+            --hide-histogram &>/dev/null || true
+        measure_snapshot_spike "$PORT_RUST" "$RUST_PID" "rust-redis"
+        stop_rust_server
+    fi
+
+    if [[ "$RUN_REDIS" == "true" ]] && command -v redis-server &>/dev/null; then
+        start_redis_server "$PORT_REDIS"
+        memtier_benchmark -s "$SERVER_HOST" -p "$PORT_REDIS" \
+            -t 1 -c 1 --ratio=1:0 --key-pattern=P:P \
+            --key-maximum="$snap_keys" -d "$DATA_SIZE" -n allkeys \
+            --hide-histogram &>/dev/null || true
+        measure_snapshot_spike "$PORT_REDIS" "$REDIS_PID" "redis-7x"
+        stop_redis_server
+    fi
+}
+
+# ===========================================================================
+# Open-Loop (Coordinated-Omission-Aware) Rate-Limited Tests
+# ===========================================================================
+
+run_open_loop() {
+    # Runs a single rate-limited memtier test at a fixed ops/sec per connection.
+    # rate = ops/sec per connection (total throughput = rate * threads * clients)
+    # Source: CONTEXT.md Open-loop testing
+    local port=$1 label=$2 rate=$3
+    local outfile="$RESULTS_DIR/${label}_openloop_${rate}rps.txt"
+    log "  Open-loop ($label): rate-limiting=${rate} ops/sec/conn"
+    memtier_benchmark -s "$SERVER_HOST" -p "$port" \
+        -t "$THREADS" -c 50 \
+        --ratio=1:10 \
+        --key-pattern=Z:Z \
+        --key-maximum="$KEY_MAX" \
+        -d "$DATA_SIZE" \
+        --test-time="$TEST_TIME" \
+        --rate-limiting="$rate" \
+        --print-percentiles 50,90,95,99,99.9,99.99 \
+        --hdr-file-prefix="$RESULTS_DIR/${label}_openloop_${rate}rps_hdr" \
+        > "$outfile" 2>&1
+    local ops p99
+    ops=$(extract_ops_sec "$outfile")
+    p99=$(extract_p99 "$outfile")
+    log "  Open-loop result: ${ops} ops/sec, p99=${p99}ms at rate=${rate}/conn"
+    echo "${label},${rate},${ops},${p99}" >> "$RESULTS_DIR/open_loop_results.csv"
+}
+
+run_open_loop_suite() {
+    log "=== Open-loop rate-limited suite (coordinated-omission-aware) ==="
+    # Coordinated omission: use closed-loop throughput as peak denominator.
+    # Then test at 10/25/50/75/90% of peak to produce the throughput-latency curve.
+    # WARNING: if rate > peak throughput, memtier reverts to closed-loop behavior.
+    # Source: 23-RESEARCH.md Pitfall 4
+
+    echo "label,rate_per_conn,actual_ops_sec,p99_ms" > "$RESULTS_DIR/open_loop_results.csv"
+
+    # Determine peak ops/sec from prior closed-loop results (if available)
+    # Falls back to a conservative default if no prior run exists
+    local peak_ops=0
+    local closed_loop_file
+    # Look for the highest-throughput closed-loop result (50 clients, pipeline 1)
+    closed_loop_file=$(ls "$RESULTS_DIR"/rust-redis_c50_p1.txt 2>/dev/null | head -1 || true)
+    if [[ -n "$closed_loop_file" ]] && [[ -f "$closed_loop_file" ]]; then
+        peak_ops=$(extract_ops_sec "$closed_loop_file" | grep -E '^[0-9]+' || echo 0)
+    fi
+
+    # If no prior results, use a conservative default for rate calculation
+    # On dev hardware (12-core Mac): ~130K ops/sec typical
+    # On 64-core Linux target: ~5M ops/sec
+    if [[ "$peak_ops" -eq 0 ]] || [[ "$peak_ops" == "N/A" ]]; then
+        log "  No closed-loop results found. Using conservative peak estimate of 100000 ops/sec."
+        log "  Run full suite first for accurate open-loop targets."
+        peak_ops=100000
+    fi
+
+    log "  Using peak ops/sec = ${peak_ops} as denominator"
+
+    # Calculate per-connection rates (rate-limiting applies per connection)
+    # Total connections = THREADS * 50 clients
+    local total_conns=$(( THREADS * 50 ))
+    local rate_10pct=$(( peak_ops / 10 / total_conns + 1 ))
+    local rate_25pct=$(( peak_ops / 4  / total_conns + 1 ))
+    local rate_50pct=$(( peak_ops / 2  / total_conns + 1 ))
+    local rate_75pct=$(( peak_ops * 3 / 4 / total_conns + 1 ))
+    local rate_90pct=$(( peak_ops * 9 / 10 / total_conns + 1 ))
+
+    log "  Per-connection rates: 10%=${rate_10pct} 25%=${rate_25pct} 50%=${rate_50pct} 75%=${rate_75pct} 90%=${rate_90pct}"
+
+    # Smoke test: only run the 50% rate point to validate script correctness
+    if [[ "$SMOKE_TEST" == "true" ]]; then
+        log "  SMOKE TEST: running only 50% rate point"
+        if [[ "$RUN_RUST" == "true" ]]; then
+            start_rust_server "$PORT_RUST"
+            run_prepopulate "$PORT_RUST" "rust-redis-openloop"
+            run_open_loop "$PORT_RUST" "rust-redis" "$rate_50pct"
+            stop_rust_server
+        fi
+        return 0
+    fi
+
+    # Full suite: all 5 rate points
+    if [[ "$RUN_RUST" == "true" ]]; then
+        start_rust_server "$PORT_RUST"
+        run_prepopulate "$PORT_RUST" "rust-redis"
+        for rate in "$rate_10pct" "$rate_25pct" "$rate_50pct" "$rate_75pct" "$rate_90pct"; do
+            run_open_loop "$PORT_RUST" "rust-redis" "$rate"
+        done
+        stop_rust_server
+    fi
+
+    if [[ "$RUN_REDIS" == "true" ]] && command -v redis-server &>/dev/null; then
+        start_redis_server "$PORT_REDIS"
+        run_prepopulate "$PORT_REDIS" "redis-7x"
+        for rate in "$rate_10pct" "$rate_25pct" "$rate_50pct" "$rate_75pct" "$rate_90pct"; do
+            run_open_loop "$PORT_REDIS" "redis-7x" "$rate"
+        done
+        stop_redis_server
+    fi
+}
 
 # Generate BENCHMARK-v2.md from raw result files.
 # Includes methodology, throughput tables, latency tables, memory comparison.
