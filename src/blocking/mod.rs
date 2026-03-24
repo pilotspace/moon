@@ -46,23 +46,30 @@ pub struct BlockingRegistry {
     waiters: HashMap<(usize, Bytes), VecDeque<WaitEntry>>,
     /// wait_id -> list of (db_index, key) for cross-key cleanup on wakeup/timeout.
     wait_keys: HashMap<u64, Vec<(usize, Bytes)>>,
-    /// Monotonically increasing wait_id counter.
+    /// Monotonically increasing wait_id counter (lower 48 bits).
     next_id: u64,
+    /// Shard ID encoded in upper 16 bits of wait_id for global uniqueness.
+    shard_id: usize,
 }
 
 impl BlockingRegistry {
-    /// Create a new empty registry.
-    pub fn new() -> Self {
+    /// Create a new empty registry with shard_id for globally unique wait_ids.
+    ///
+    /// Wait IDs encode `(shard_id << 48) | counter` so IDs from different shards
+    /// never collide, enabling cross-shard BlockCancel to target the correct registry.
+    pub fn new(shard_id: usize) -> Self {
         BlockingRegistry {
             waiters: HashMap::new(),
             wait_keys: HashMap::new(),
             next_id: 0,
+            shard_id,
         }
     }
 
     /// Returns and increments the next wait_id.
+    /// Upper 16 bits encode shard_id, lower 48 bits are a per-shard counter.
     pub fn next_wait_id(&mut self) -> u64 {
-        let id = self.next_id;
+        let id = ((self.shard_id as u64) << 48) | self.next_id;
         self.next_id += 1;
         id
     }
@@ -166,7 +173,7 @@ impl BlockingRegistry {
 
 impl Default for BlockingRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -176,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_register_and_pop_front() {
-        let mut reg = BlockingRegistry::new();
+        let mut reg = BlockingRegistry::new(0);
         let id = reg.next_wait_id();
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let entry = WaitEntry {
@@ -197,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_fifo_order() {
-        let mut reg = BlockingRegistry::new();
+        let mut reg = BlockingRegistry::new(0);
         let key = Bytes::from_static(b"mylist");
 
         let id1 = reg.next_wait_id();
@@ -226,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_remove_wait_cross_key() {
-        let mut reg = BlockingRegistry::new();
+        let mut reg = BlockingRegistry::new(0);
         let id = reg.next_wait_id();
         let key1 = Bytes::from_static(b"list1");
         let key2 = Bytes::from_static(b"list2");
@@ -257,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_has_waiters_empty() {
-        let reg = BlockingRegistry::new();
+        let reg = BlockingRegistry::new(0);
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"nokey")));
     }
 }

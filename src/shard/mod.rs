@@ -204,9 +204,8 @@ impl Shard {
         let dispatch_tx = Rc::new(RefCell::new(producers));
         let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
-        let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new()));
-
         let shard_id = self.id;
+        let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
         let num_shards = self.num_shards;
 
         // Per-shard snapshot state (None when no snapshot is active)

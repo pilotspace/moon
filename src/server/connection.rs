@@ -1402,6 +1402,9 @@ pub async fn handle_connection_sharded(
                             selected_db,
                             &databases,
                             &blocking_registry,
+                            shard_id,
+                            num_shards,
+                            &dispatch_tx,
                             &shutdown,
                         ).await;
                         let blocking_response = apply_resp3_conversion(cmd, blocking_response, framed.codec().protocol_version());
@@ -1791,17 +1794,24 @@ fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
 /// Handle a blocking command (BLPOP/BRPOP/BLMOVE/BZPOPMIN/BZPOPMAX).
 ///
 /// 1. Non-blocking fast path: check if data is immediately available.
-/// 2. If not, register in blocking registry and await oneshot with timeout.
+/// 2. Single-key fast path: one oneshot, one local registration (zero overhead).
+/// 3. Multi-key coordinator: FuturesUnordered across local + remote shards,
+///    first-wakeup-wins, BlockCancel cleanup on completion/timeout/shutdown.
 ///
-/// CRITICAL: Database borrow MUST be dropped before any .await point.
+/// CRITICAL: RefCell borrows MUST be dropped before any .await point.
 async fn handle_blocking_command(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    shard_id: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     shutdown: &CancellationToken,
 ) -> Frame {
+    use futures::stream::{FuturesUnordered, StreamExt as FutStreamExt};
+
     // Parse timeout (last argument for all blocking commands)
     let timeout_secs = match parse_blocking_timeout(cmd, args) {
         Ok(t) => t,
@@ -1826,63 +1836,144 @@ async fn handle_blocking_command(
         }
     } // dbs borrow dropped here -- CRITICAL before await
 
-    // --- Blocking path: register and wait ---
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Option<Frame>>();
     let deadline = if timeout_secs > 0.0 {
         Some(tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
     } else {
         None // 0 = block forever
     };
 
-    let wait_id = {
-        let mut reg = blocking_registry.borrow_mut();
-        let wait_id = reg.next_wait_id();
-        // Register on first key only (multi-key cross-shard is Plan 03)
-        let blocked_cmd = blocked_cmd_factory();
-        let entry = crate::blocking::WaitEntry {
-            wait_id,
-            cmd: blocked_cmd,
-            reply_tx,
-            deadline,
-        };
-        reg.register(selected_db, keys[0].clone(), entry);
-        wait_id
-    }; // reg borrow dropped
+    // --- Single-key fast path: one registration, direct await (zero overhead) ---
+    if keys.len() == 1 {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Option<Frame>>();
+        let wait_id = {
+            let mut reg = blocking_registry.borrow_mut();
+            let wait_id = reg.next_wait_id();
+            let entry = crate::blocking::WaitEntry {
+                wait_id,
+                cmd: blocked_cmd_factory(),
+                reply_tx,
+                deadline,
+            };
+            reg.register(selected_db, keys[0].clone(), entry);
+            wait_id
+        }; // reg borrow dropped
 
-    // Wait for wakeup or timeout
-    if let Some(dl) = deadline {
-        tokio::select! {
-            res = reply_rx => {
-                match res {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) | Err(_) => Frame::Null, // timeout or canceled
+        return if let Some(dl) = deadline {
+            tokio::select! {
+                res = reply_rx => {
+                    match res {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) | Err(_) => Frame::Null,
+                    }
+                }
+                _ = tokio::time::sleep_until(dl) => {
+                    blocking_registry.borrow_mut().remove_wait(wait_id);
+                    Frame::Null
+                }
+                _ = shutdown.cancelled() => {
+                    blocking_registry.borrow_mut().remove_wait(wait_id);
+                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
                 }
             }
-            _ = tokio::time::sleep_until(dl) => {
-                // Timeout: clean up registration
-                blocking_registry.borrow_mut().remove_wait(wait_id);
-                Frame::Null
+        } else {
+            tokio::select! {
+                res = reply_rx => {
+                    match res {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) | Err(_) => Frame::Null,
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    blocking_registry.borrow_mut().remove_wait(wait_id);
+                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                }
             }
+        };
+    }
+
+    // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
+    // Uses FuturesUnordered for first-wakeup-wins semantics.
+    let wait_id;
+    let mut receivers: FuturesUnordered<tokio::sync::oneshot::Receiver<Option<Frame>>> =
+        FuturesUnordered::new();
+    let mut registered_remote_shards: Vec<usize> = Vec::new();
+
+    {
+        let mut reg = blocking_registry.borrow_mut();
+        let mut producers = dispatch_tx.borrow_mut();
+        wait_id = reg.next_wait_id();
+
+        for key in &keys {
+            let target = key_to_shard(key, num_shards);
+            let (tx, rx) = tokio::sync::oneshot::channel::<Option<Frame>>();
+            receivers.push(rx);
+
+            if target == shard_id {
+                // Local registration
+                let entry = crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx: tx,
+                    deadline,
+                };
+                reg.register(selected_db, key.clone(), entry);
+            } else {
+                // Remote registration via SPSC
+                let msg = ShardMessage::BlockRegister {
+                    db_index: selected_db,
+                    key: key.clone(),
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx: tx,
+                };
+                let _ = producers[target].try_push(msg);
+                if !registered_remote_shards.contains(&target) {
+                    registered_remote_shards.push(target);
+                }
+            }
+        }
+    } // borrows dropped -- CRITICAL before await
+
+    // Await first result from any key/shard
+    let frame = if let Some(dl) = deadline {
+        tokio::select! {
+            result = receivers.next() => {
+                match result {
+                    Some(Ok(Some(frame))) => frame,
+                    _ => Frame::Null,
+                }
+            }
+            _ = tokio::time::sleep_until(dl) => Frame::Null,
             _ = shutdown.cancelled() => {
-                blocking_registry.borrow_mut().remove_wait(wait_id);
                 Frame::Error(Bytes::from_static(b"ERR server shutting down"))
             }
         }
     } else {
-        // Block forever (0 timeout)
         tokio::select! {
-            res = reply_rx => {
-                match res {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) | Err(_) => Frame::Null,
+            result = receivers.next() => {
+                match result {
+                    Some(Ok(Some(frame))) => frame,
+                    _ => Frame::Null,
                 }
             }
             _ = shutdown.cancelled() => {
-                blocking_registry.borrow_mut().remove_wait(wait_id);
                 Frame::Error(Bytes::from_static(b"ERR server shutting down"))
             }
         }
+    };
+
+    // Cleanup: cancel all remaining registrations (local + remote)
+    blocking_registry.borrow_mut().remove_wait(wait_id);
+    if !registered_remote_shards.is_empty() {
+        let mut producers = dispatch_tx.borrow_mut();
+        for shard_idx in &registered_remote_shards {
+            let _ = producers[*shard_idx].try_push(ShardMessage::BlockCancel { wait_id });
+        }
     }
+    // Drop remaining receivers; remote senders get Err on send -- harmless
+    drop(receivers);
+
+    frame
 }
 
 /// Parse timeout from the last argument of a blocking command.
