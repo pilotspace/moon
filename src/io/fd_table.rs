@@ -4,6 +4,8 @@
 //! New connections get a slot; closed connections free their slot.
 //! This module is only compiled on Linux (cfg-gated in mod.rs).
 
+use io_uring::IoUring;
+
 /// Registered file descriptor table for io_uring fixed-file operations.
 pub struct FdTable {
     fds: Vec<i32>,
@@ -54,6 +56,44 @@ impl FdTable {
     /// Whether the table is full.
     pub fn is_full(&self) -> bool {
         self.free_slots.is_empty()
+    }
+
+    /// Register the FD table with io_uring. Call once after ring creation.
+    /// After this, use `types::Fixed(idx)` instead of `types::Fd(raw_fd)` in SQEs.
+    pub fn register_with_ring(&self, ring: &IoUring) -> std::io::Result<()> {
+        ring.submitter().register_files(&self.fds)?;
+        Ok(())
+    }
+
+    /// Update a single slot in the registered file table (after insert or remove).
+    /// `idx` is the fixed-fd index; the fd value at that index is pushed to the kernel.
+    pub fn update_registration(&self, ring: &IoUring, idx: u32) -> std::io::Result<()> {
+        let fd = self.fds[idx as usize];
+        ring.submitter()
+            .register_files_update(idx, &[fd])
+            .map(|_| ())
+    }
+
+    /// Insert fd and update kernel registration in one call.
+    pub fn insert_and_register(
+        &mut self,
+        fd: i32,
+        ring: &IoUring,
+    ) -> std::io::Result<Option<u32>> {
+        match self.insert(fd) {
+            Some(idx) => {
+                self.update_registration(ring, idx)?;
+                Ok(Some(idx))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove fd and update kernel registration in one call.
+    pub fn remove_and_register(&mut self, idx: u32, ring: &IoUring) -> std::io::Result<i32> {
+        let fd = self.remove(idx);
+        self.update_registration(ring, idx)?;
+        Ok(fd)
     }
 }
 
