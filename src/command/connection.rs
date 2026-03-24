@@ -1,7 +1,22 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
+
+/// Global monotonic client ID counter.
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a unique client connection ID.
+pub fn next_client_id() -> u64 {
+    NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// CLIENT ID command: return the connection's unique ID.
+pub fn client_id(id: u64) -> Frame {
+    Frame::Integer(id as i64)
+}
 
 /// PING command handler.
 ///
@@ -176,6 +191,143 @@ pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
     }
 }
 
+/// Extract a byte slice reference from a Frame argument (zero-alloc).
+fn extract_bytes_ref(frame: &Frame) -> Option<&[u8]> {
+    match frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.as_ref()),
+        _ => None,
+    }
+}
+
+/// Extract an owned Bytes from a Frame argument.
+fn extract_bytes_owned(frame: &Frame) -> Option<Bytes> {
+    match frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
+        _ => None,
+    }
+}
+
+/// HELLO command handler.
+///
+/// HELLO [protover [AUTH username password] [SETNAME clientname]]
+/// Returns server info Map. Sets protocol_version if protover given.
+/// Returns (response_frame, new_protocol_version, new_client_name)
+pub fn hello(
+    args: &[Frame],
+    current_proto: u8,
+    client_id: u64,
+    requirepass: &Option<String>,
+    authenticated: &mut bool,
+) -> (Frame, u8, Option<Bytes>) {
+    let mut proto = current_proto;
+    let mut client_name: Option<Bytes> = None;
+    let mut i = 0;
+
+    // Parse optional protover
+    if i < args.len() {
+        if let Some(ver_bytes) = extract_bytes_ref(&args[i]) {
+            if let Ok(ver_str) = std::str::from_utf8(ver_bytes) {
+                if let Ok(ver) = ver_str.parse::<u8>() {
+                    if ver != 2 && ver != 3 {
+                        return (
+                            Frame::Error(Bytes::from_static(
+                                b"NOPROTO unsupported protocol version",
+                            )),
+                            current_proto,
+                            None,
+                        );
+                    }
+                    proto = ver;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    // Parse optional AUTH and SETNAME (can appear in any order after protover)
+    while i < args.len() {
+        if let Some(keyword) = extract_bytes_ref(&args[i]) {
+            if keyword.eq_ignore_ascii_case(b"AUTH") {
+                // Need username and password (2 more args)
+                if i + 2 >= args.len() {
+                    return (
+                        Frame::Error(Bytes::from_static(
+                            b"ERR Syntax error in HELLO option 'auth'",
+                        )),
+                        current_proto,
+                        None,
+                    );
+                }
+                // username is args[i+1] (we ignore it -- single-user mode)
+                // password is args[i+2]
+                let auth_result = auth(&[args[i + 2].clone()], requirepass);
+                if matches!(&auth_result, Frame::Error(_)) {
+                    return (auth_result, current_proto, None); // Auth failed, don't change proto
+                }
+                *authenticated = true;
+                i += 3;
+            } else if keyword.eq_ignore_ascii_case(b"SETNAME") {
+                if i + 1 >= args.len() {
+                    return (
+                        Frame::Error(Bytes::from_static(
+                            b"ERR Syntax error in HELLO option 'setname'",
+                        )),
+                        current_proto,
+                        None,
+                    );
+                }
+                client_name = extract_bytes_owned(&args[i + 1]);
+                i += 2;
+            } else {
+                return (
+                    Frame::Error(Bytes::from(format!(
+                        "ERR Unrecognized HELLO option: {:?}",
+                        String::from_utf8_lossy(keyword)
+                    ))),
+                    current_proto,
+                    None,
+                );
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Build response Map
+    let response = Frame::Map(vec![
+        (
+            Frame::BulkString(Bytes::from_static(b"server")),
+            Frame::BulkString(Bytes::from_static(b"rustredis")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"version")),
+            Frame::BulkString(Bytes::from_static(b"0.1.0")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"proto")),
+            Frame::Integer(proto as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"id")),
+            Frame::Integer(client_id as i64),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"mode")),
+            Frame::BulkString(Bytes::from_static(b"standalone")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"role")),
+            Frame::BulkString(Bytes::from_static(b"master")),
+        ),
+        (
+            Frame::BulkString(Bytes::from_static(b"modules")),
+            Frame::Array(vec![]),
+        ),
+    ]);
+
+    (response, proto, client_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +494,140 @@ mod tests {
         let pass = Some("secret".to_string());
         let result = auth(&[], &pass);
         assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR wrong number")));
+    }
+
+    // === HELLO command tests ===
+
+    fn get_proto_from_hello_response(frame: &Frame) -> Option<i64> {
+        if let Frame::Map(entries) = frame {
+            for (k, v) in entries {
+                if let Frame::BulkString(key) = k {
+                    if key.as_ref() == b"proto" {
+                        if let Frame::Integer(n) = v {
+                            return Some(*n);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_hello_no_args_returns_current_proto() {
+        let mut auth = true;
+        let (resp, proto, name) = hello(&[], 2, 1, &None, &mut auth);
+        assert!(matches!(resp, Frame::Map(_)));
+        assert_eq!(get_proto_from_hello_response(&resp), Some(2));
+        assert_eq!(proto, 2);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_hello_upgrade_to_resp3() {
+        let mut auth = true;
+        let (resp, proto, _) = hello(
+            &[Frame::BulkString(Bytes::from_static(b"3"))],
+            2,
+            1,
+            &None,
+            &mut auth,
+        );
+        assert_eq!(proto, 3);
+        assert_eq!(get_proto_from_hello_response(&resp), Some(3));
+    }
+
+    #[test]
+    fn test_hello_downgrade_to_resp2() {
+        let mut auth = true;
+        let (resp, proto, _) = hello(
+            &[Frame::BulkString(Bytes::from_static(b"2"))],
+            3,
+            1,
+            &None,
+            &mut auth,
+        );
+        assert_eq!(proto, 2);
+        assert_eq!(get_proto_from_hello_response(&resp), Some(2));
+    }
+
+    #[test]
+    fn test_hello_with_auth_success() {
+        let pass = Some("secret".to_string());
+        let mut auth = false;
+        let (resp, proto, _) = hello(
+            &[
+                Frame::BulkString(Bytes::from_static(b"3")),
+                Frame::BulkString(Bytes::from_static(b"AUTH")),
+                Frame::BulkString(Bytes::from_static(b"default")),
+                Frame::BulkString(Bytes::from_static(b"secret")),
+            ],
+            2,
+            1,
+            &pass,
+            &mut auth,
+        );
+        assert_eq!(proto, 3);
+        assert!(matches!(resp, Frame::Map(_)));
+        assert!(auth); // authenticated
+    }
+
+    #[test]
+    fn test_hello_with_auth_failure() {
+        let pass = Some("secret".to_string());
+        let mut auth = false;
+        let (resp, proto, _) = hello(
+            &[
+                Frame::BulkString(Bytes::from_static(b"3")),
+                Frame::BulkString(Bytes::from_static(b"AUTH")),
+                Frame::BulkString(Bytes::from_static(b"default")),
+                Frame::BulkString(Bytes::from_static(b"wrong")),
+            ],
+            2,
+            1,
+            &pass,
+            &mut auth,
+        );
+        // Auth failed: proto stays at current, response is error
+        assert_eq!(proto, 2);
+        assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
+        assert!(!auth); // not authenticated
+    }
+
+    #[test]
+    fn test_hello_with_setname() {
+        let mut auth = true;
+        let (_, _, name) = hello(
+            &[
+                Frame::BulkString(Bytes::from_static(b"3")),
+                Frame::BulkString(Bytes::from_static(b"SETNAME")),
+                Frame::BulkString(Bytes::from_static(b"myclient")),
+            ],
+            2,
+            1,
+            &None,
+            &mut auth,
+        );
+        assert_eq!(name, Some(Bytes::from_static(b"myclient")));
+    }
+
+    #[test]
+    fn test_hello_noproto() {
+        let mut auth = true;
+        let (resp, proto, _) = hello(
+            &[Frame::BulkString(Bytes::from_static(b"4"))],
+            2,
+            1,
+            &None,
+            &mut auth,
+        );
+        assert_eq!(proto, 2); // unchanged
+        assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"NOPROTO")));
+    }
+
+    #[test]
+    fn test_client_id_returns_integer() {
+        let result = client_id(42);
+        assert_eq!(result, Frame::Integer(42));
     }
 }

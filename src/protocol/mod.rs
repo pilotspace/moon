@@ -1,6 +1,7 @@
 mod frame;
 pub mod inline;
 pub mod parse;
+pub mod resp3;
 pub mod serialize;
 
 pub use frame::{Frame, ParseConfig, ParseError};
