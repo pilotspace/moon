@@ -48,14 +48,13 @@ pub fn h2(hash: u64) -> u8 {
 }
 
 /// Result of an insert operation on a segment.
-pub enum InsertResult<V> {
+pub enum InsertResult<K, V> {
     /// Key was new; entry was inserted successfully.
     Inserted,
     /// Key already existed; the old value is returned.
     Replaced(V),
-    /// Segment is full; the key and value are returned for caller to handle split.
-    /// Segment is full; caller must split and retry.
-    NeedsSplit,
+    /// Segment is full; key and value returned so caller can split and retry.
+    NeedsSplit(K, V),
 }
 
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.
@@ -142,6 +141,39 @@ impl<K, V> Segment<K, V> {
     #[inline]
     fn is_full_ctrl(byte: u8) -> bool {
         byte & 0x80 == 0 // H2 values are 0x00..0x7F (bit 7 clear)
+    }
+
+    /// Public version of is_full_ctrl for use by iterators.
+    #[inline]
+    pub fn is_full_ctrl_pub(byte: u8) -> bool {
+        Self::is_full_ctrl(byte)
+    }
+
+    /// Get an immutable reference to the key at the given slot.
+    ///
+    /// # Safety
+    /// Caller must ensure the slot is FULL (control byte in 0x00..0x7F).
+    #[inline]
+    pub unsafe fn key_ref(&self, slot: usize) -> &K {
+        unsafe { self.keys[slot].assume_init_ref() }
+    }
+
+    /// Get an immutable reference to the value at the given slot.
+    ///
+    /// # Safety
+    /// Caller must ensure the slot is FULL (control byte in 0x00..0x7F).
+    #[inline]
+    pub unsafe fn value_ref(&self, slot: usize) -> &V {
+        unsafe { self.values[slot].assume_init_ref() }
+    }
+
+    /// Get a mutable reference to the value at the given slot.
+    ///
+    /// # Safety
+    /// Caller must ensure the slot is FULL (control byte in 0x00..0x7F).
+    #[inline]
+    pub unsafe fn value_mut(&mut self, slot: usize) -> &mut V {
+        unsafe { self.values[slot].assume_init_mut() }
     }
 
     /// Find the slot index of a key matching (h2, key) in the given home buckets.
@@ -286,7 +318,7 @@ impl<K, V> Segment<K, V> {
         value: V,
         bucket_a: usize,
         bucket_b: usize,
-    ) -> InsertResult<V>
+    ) -> InsertResult<K, V>
     where
         K: Eq,
     {
@@ -302,7 +334,7 @@ impl<K, V> Segment<K, V> {
 
         // Check if segment is full before trying to insert
         if self.is_full() {
-            return InsertResult::NeedsSplit;
+            return InsertResult::NeedsSplit(key, value);
         }
 
         // Find first EMPTY or DELETED slot in bucket_a's group
@@ -341,7 +373,7 @@ impl<K, V> Segment<K, V> {
         }
 
         // Truly full (shouldn't happen since we checked is_full above, but be safe)
-        InsertResult::NeedsSplit
+        InsertResult::NeedsSplit(key, value)
     }
 
     /// Find a free slot within the given group index.
@@ -655,7 +687,7 @@ mod tests {
             match seg.insert(h2_val, k, i as u32, ba, bb) {
                 InsertResult::Inserted => inserted += 1,
                 InsertResult::Replaced(_) => {}
-                InsertResult::NeedsSplit => break,
+                InsertResult::NeedsSplit(_, _) => break,
             }
         }
         assert!(inserted > 0);
@@ -697,7 +729,7 @@ mod tests {
             match seg.insert(h2_val, k, i as u32, ba, bb) {
                 InsertResult::Inserted => count += 1,
                 InsertResult::Replaced(_) => {}
-                InsertResult::NeedsSplit => break,
+                InsertResult::NeedsSplit(_, _) => break,
             }
         }
         assert!(count > 0);
@@ -814,11 +846,11 @@ mod tests {
         hash
     }
 
-    fn insert_result_name<V>(_r: &InsertResult<V>) -> &'static str {
+    fn insert_result_name<K, V>(_r: &InsertResult<K, V>) -> &'static str {
         match _r {
             InsertResult::Inserted => "Inserted",
             InsertResult::Replaced(_) => "Replaced",
-            InsertResult::NeedsSplit => "NeedsSplit",
+            InsertResult::NeedsSplit(_, _) => "NeedsSplit",
         }
     }
 }
