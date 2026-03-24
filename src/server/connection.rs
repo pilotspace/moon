@@ -27,6 +27,7 @@ use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::storage::Database;
+use crate::tracking::{TrackingState, TrackingTable};
 
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
@@ -55,6 +56,20 @@ fn extract_bytes(frame: &Frame) -> Option<Bytes> {
         Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
         _ => None,
     }
+}
+
+/// Apply RESP3 response type conversion based on command name and protocol version.
+/// Uppercases the command name into a stack buffer for O(1) lookup.
+#[inline]
+fn apply_resp3_conversion(cmd: &[u8], response: Frame, proto: u8) -> Frame {
+    if proto < 3 {
+        return response;
+    }
+    let mut cmd_upper_buf = [0u8; 32];
+    let cmd_upper_len = cmd.len().min(32);
+    cmd_upper_buf[..cmd_upper_len].copy_from_slice(&cmd[..cmd_upper_len]);
+    cmd_upper_buf[..cmd_upper_len].make_ascii_uppercase();
+    crate::protocol::resp3::maybe_convert_resp3(&cmd_upper_buf[..cmd_upper_len], response, proto)
 }
 
 /// Handle a single client connection.
@@ -87,6 +102,8 @@ pub async fn handle_connection(
     change_counter: Option<Arc<AtomicU64>>,
     pubsub_registry: Arc<Mutex<PubSubRegistry>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    tracking_table: Arc<Mutex<TrackingTable>>,
+    client_id: u64,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -97,6 +114,13 @@ pub async fn handle_connection(
     let mut pubsub_rx: Option<mpsc::Receiver<Frame>> = None;
     let mut pubsub_tx: Option<mpsc::Sender<Frame>> = None;
     let mut subscriber_id: u64 = 0;
+
+    // Client tracking state
+    let mut tracking_state = TrackingState::default();
+    let mut tracking_rx: Option<mpsc::Receiver<Frame>> = None;
+
+    // RESP3/HELLO connection-local state
+    let mut client_name: Option<Bytes> = None;
 
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
@@ -214,6 +238,23 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
+                                    _ if cmd.eq_ignore_ascii_case(b"HELLO") => {
+                                        // HELLO allowed in subscriber mode (Redis 7+)
+                                        let (response, new_proto, new_name) = conn_cmd::hello(
+                                            cmd_args,
+                                            framed.codec().protocol_version(),
+                                            client_id,
+                                            &requirepass,
+                                            &mut authenticated,
+                                        );
+                                        if !matches!(&response, Frame::Error(_)) {
+                                            framed.codec_mut().set_protocol_version(new_proto);
+                                        }
+                                        if let Some(name) = new_name {
+                                            client_name = Some(name);
+                                        }
+                                        let _ = framed.send(response).await;
+                                    }
                                     _ if cmd.eq_ignore_ascii_case(b"PING") => {
                                         // In subscriber mode, PING returns Array per Redis spec
                                         let _ = framed.send(Frame::Array(vec![
@@ -228,7 +269,7 @@ pub async fn handle_connection(
                                     _ => {
                                         let cmd_str = String::from_utf8_lossy(cmd);
                                         let _ = framed.send(Frame::Error(Bytes::from(format!(
-                                            "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+                                            "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / HELLO are allowed in this context",
                                             cmd_str.to_lowercase()
                                         )))).await;
                                     }
@@ -309,6 +350,25 @@ pub async fn handle_connection(
                                 responses.push(response);
                                 continue;
                             }
+                            Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
+                                // HELLO allowed when unauthenticated (can carry AUTH)
+                                let (response, new_proto, new_name) = conn_cmd::hello(
+                                    cmd_args,
+                                    framed.codec().protocol_version(),
+                                    client_id,
+                                    &requirepass,
+                                    &mut authenticated,
+                                );
+                                // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
+                                if !matches!(&response, Frame::Error(_)) {
+                                    framed.codec_mut().set_protocol_version(new_proto);
+                                }
+                                if let Some(name) = new_name {
+                                    client_name = Some(name);
+                                }
+                                responses.push(response);
+                                continue;
+                            }
                             Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 should_quit = true;
@@ -328,6 +388,103 @@ pub async fn handle_connection(
                         // AUTH when already authenticated
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
                             responses.push(conn_cmd::auth(cmd_args, &requirepass));
+                            continue;
+                        }
+                        // HELLO -- protocol negotiation
+                        if cmd.eq_ignore_ascii_case(b"HELLO") {
+                            let (response, new_proto, new_name) = conn_cmd::hello(
+                                cmd_args,
+                                framed.codec().protocol_version(),
+                                client_id,
+                                &requirepass,
+                                &mut authenticated,
+                            );
+                            // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
+                            if !matches!(&response, Frame::Error(_)) {
+                                framed.codec_mut().set_protocol_version(new_proto);
+                            }
+                            if let Some(name) = new_name {
+                                client_name = Some(name);
+                            }
+                            responses.push(response);
+                            continue;
+                        }
+                        // CLIENT subcommands (ID, SETNAME, GETNAME, TRACKING)
+                        if cmd.eq_ignore_ascii_case(b"CLIENT") {
+                            if let Some(sub) = cmd_args.first() {
+                                if let Some(sub_bytes) = extract_bytes(sub) {
+                                    if sub_bytes.eq_ignore_ascii_case(b"ID") {
+                                        responses.push(conn_cmd::client_id(client_id));
+                                        continue;
+                                    }
+                                    if sub_bytes.eq_ignore_ascii_case(b"SETNAME") {
+                                        if cmd_args.len() != 2 {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
+                                            )));
+                                        } else {
+                                            client_name = extract_bytes(&cmd_args[1]);
+                                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        }
+                                        continue;
+                                    }
+                                    if sub_bytes.eq_ignore_ascii_case(b"GETNAME") {
+                                        responses.push(match &client_name {
+                                            Some(name) => Frame::BulkString(name.clone()),
+                                            None => Frame::Null,
+                                        });
+                                        continue;
+                                    }
+                                    if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+                                        match crate::command::client::parse_tracking_args(cmd_args) {
+                                            Ok(config_parsed) => {
+                                                if config_parsed.enable {
+                                                    tracking_state.enabled = true;
+                                                    tracking_state.bcast = config_parsed.bcast;
+                                                    tracking_state.noloop = config_parsed.noloop;
+                                                    tracking_state.optin = config_parsed.optin;
+                                                    tracking_state.optout = config_parsed.optout;
+
+                                                    if tracking_rx.is_none() {
+                                                        let (tx, rx) = mpsc::channel::<Frame>(256);
+                                                        tracking_state.invalidation_tx = Some(tx.clone());
+                                                        tracking_rx = Some(rx);
+
+                                                        let mut table = tracking_table.lock();
+                                                        table.register_client(client_id, tx);
+                                                        if let Some(target) = config_parsed.redirect {
+                                                            table.set_redirect(client_id, target);
+                                                        }
+                                                        for prefix in &config_parsed.prefixes {
+                                                            table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
+                                                        }
+                                                    }
+                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                                } else {
+                                                    tracking_state = TrackingState::default();
+                                                    tracking_table.lock().untrack_all(client_id);
+                                                    tracking_rx = None;
+                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                                }
+                                                continue;
+                                            }
+                                            Err(err_frame) => {
+                                                responses.push(err_frame);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // Unknown CLIENT subcommand
+                                    responses.push(Frame::Error(Bytes::from(format!(
+                                        "ERR unknown subcommand '{}'",
+                                        String::from_utf8_lossy(&sub_bytes)
+                                    ))));
+                                    continue;
+                                }
+                            }
+                            responses.push(Frame::Error(
+                                Bytes::from_static(b"ERR wrong number of arguments for 'client' command"),
+                            ));
                             continue;
                         }
                         // BGSAVE -- handle outside lock
@@ -355,6 +512,7 @@ pub async fn handle_connection(
                             responses.push(handle_config(cmd_args, &runtime_config, &config));
                             continue;
                         }
+
                         // SUBSCRIBE / PSUBSCRIBE: enter subscriber mode
                         // Flush accumulated responses first, then handle subscribe and break batch
                         if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
@@ -382,6 +540,8 @@ pub async fn handle_connection(
                                             aof_entries.push(bytes);
                                         }
                                     }
+                                    // Apply RESP3 response conversion if needed
+                                    let response = apply_resp3_conversion(d_cmd, response, framed.codec().protocol_version());
                                     responses[resp_idx] = response;
                                     if quit {
                                         should_quit = true;
@@ -641,6 +801,7 @@ pub async fn handle_connection(
                             // === Read run: shared read lock ===
                             let guard = db[selected_db].read();
                             let now_ms = crate::storage::entry::current_time_ms();
+                            let proto = framed.codec().protocol_version();
                             for j in run_start..i {
                                 let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
@@ -649,6 +810,14 @@ pub async fn handle_connection(
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
                                 };
+                                // Track key on read for client-side caching invalidation
+                                if tracking_state.enabled && !tracking_state.bcast {
+                                    if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
+                                        tracking_table.lock().track_key(client_id, &key, tracking_state.noloop);
+                                    }
+                                }
+                                // Apply RESP3 response conversion if needed
+                                let response = apply_resp3_conversion(d_cmd, response, proto);
                                 responses[resp_idx] = response;
                                 if quit {
                                     should_quit = true;
@@ -676,9 +845,23 @@ pub async fn handle_connection(
                                 };
                                 if let Some(bytes) = aof_bytes {
                                     if !matches!(&response, Frame::Error(_)) {
+                                // Invalidate tracked key on successful write
+                                if !matches!(&response, Frame::Error(_)) {
+                                    if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
+                                        let senders = tracking_table.lock().invalidate_key(&key, client_id);
+                                        if !senders.is_empty() {
+                                            let push = crate::tracking::invalidation::invalidation_push(&[key]);
+                                            for tx in senders {
+                                                let _ = tx.try_send(push.clone());
+                                            }
+                                        }
+                                    }
+                                }
                                         aof_entries.push(bytes.clone());
                                     }
                                 }
+                                // Apply RESP3 response conversion if needed
+                                let response = apply_resp3_conversion(d_cmd, response, framed.codec().protocol_version());
                                 responses[resp_idx] = response;
                                 if quit {
                                     should_quit = true;
@@ -718,6 +901,20 @@ pub async fn handle_connection(
                     break;
                 }
             }
+            // Deliver tracking invalidation Push frames to client
+            msg = async {
+                if let Some(ref mut rx) = tracking_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some(push_frame) = msg {
+                    if framed.send(push_frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
             _ = shutdown.cancelled() => {
                 let _ = framed.send(Frame::Error(
                     Bytes::from_static(b"ERR server shutting down")
@@ -732,6 +929,11 @@ pub async fn handle_connection(
         let mut registry = pubsub_registry.lock();
         registry.unsubscribe_all(subscriber_id);
         registry.punsubscribe_all(subscriber_id);
+    }
+
+    // Cleanup: remove tracking state on disconnect
+    if tracking_state.enabled {
+        tracking_table.lock().untrack_all(client_id);
     }
 }
 
@@ -919,6 +1121,8 @@ pub async fn handle_connection_sharded(
     shutdown: CancellationToken,
     requirepass: Option<String>,
     aof_tx: Option<mpsc::Sender<AofMessage>>,
+    tracking_table: Rc<RefCell<TrackingTable>>,
+    client_id: u64,
 ) {
     let mut framed = Framed::new(stream, RespCodec::default());
     let mut selected_db: usize = 0;
@@ -927,6 +1131,13 @@ pub async fn handle_connection_sharded(
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
     let mut command_queue: Vec<Frame> = Vec::new();
+
+    // Client tracking state
+    let mut tracking_state = TrackingState::default();
+    let mut tracking_rx: Option<mpsc::Receiver<Frame>> = None;
+
+    // RESP3/HELLO connection-local state
+    let mut client_name: Option<Bytes> = None;
 
     // Per-connection arena for batch processing temporaries.
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
@@ -966,6 +1177,23 @@ pub async fn handle_connection_sharded(
                                 responses.push(response);
                                 continue;
                             }
+                            Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
+                                let (response, new_proto, new_name) = conn_cmd::hello(
+                                    cmd_args,
+                                    framed.codec().protocol_version(),
+                                    client_id,
+                                    &requirepass,
+                                    &mut authenticated,
+                                );
+                                if !matches!(&response, Frame::Error(_)) {
+                                    framed.codec_mut().set_protocol_version(new_proto);
+                                }
+                                if let Some(name) = new_name {
+                                    client_name = Some(name);
+                                }
+                                responses.push(response);
+                                continue;
+                            }
                             Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 should_quit = true;
@@ -995,6 +1223,104 @@ pub async fn handle_connection_sharded(
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         should_quit = true;
                         break;
+                    }
+
+                    // --- HELLO (protocol negotiation) ---
+                    if cmd.eq_ignore_ascii_case(b"HELLO") {
+                        let (response, new_proto, new_name) = conn_cmd::hello(
+                            cmd_args,
+                            framed.codec().protocol_version(),
+                            client_id,
+                            &requirepass,
+                            &mut authenticated,
+                        );
+                        if !matches!(&response, Frame::Error(_)) {
+                            framed.codec_mut().set_protocol_version(new_proto);
+                        }
+                        if let Some(name) = new_name {
+                            client_name = Some(name);
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- CLIENT subcommands (ID, SETNAME, GETNAME, TRACKING) ---
+                    if cmd.eq_ignore_ascii_case(b"CLIENT") {
+                        if let Some(sub) = cmd_args.first() {
+                            if let Some(sub_bytes) = extract_bytes(sub) {
+                                if sub_bytes.eq_ignore_ascii_case(b"ID") {
+                                    responses.push(conn_cmd::client_id(client_id));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"SETNAME") {
+                                    if cmd_args.len() != 2 {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
+                                        )));
+                                    } else {
+                                        client_name = extract_bytes(&cmd_args[1]);
+                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    }
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"GETNAME") {
+                                    responses.push(match &client_name {
+                                        Some(name) => Frame::BulkString(name.clone()),
+                                        None => Frame::Null,
+                                    });
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+                                    match crate::command::client::parse_tracking_args(cmd_args) {
+                                        Ok(config_parsed) => {
+                                            if config_parsed.enable {
+                                                tracking_state.enabled = true;
+                                                tracking_state.bcast = config_parsed.bcast;
+                                                tracking_state.noloop = config_parsed.noloop;
+                                                tracking_state.optin = config_parsed.optin;
+                                                tracking_state.optout = config_parsed.optout;
+
+                                                if tracking_rx.is_none() {
+                                                    let (tx, rx) = mpsc::channel::<Frame>(256);
+                                                    tracking_state.invalidation_tx = Some(tx.clone());
+                                                    tracking_rx = Some(rx);
+
+                                                    let mut table = tracking_table.borrow_mut();
+                                                    table.register_client(client_id, tx);
+                                                    if let Some(target) = config_parsed.redirect {
+                                                        table.set_redirect(client_id, target);
+                                                    }
+                                                    for prefix in &config_parsed.prefixes {
+                                                        table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
+                                                    }
+                                                }
+                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                            } else {
+                                                tracking_state = TrackingState::default();
+                                                tracking_table.borrow_mut().untrack_all(client_id);
+                                                tracking_rx = None;
+                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                            }
+                                            continue;
+                                        }
+                                        Err(err_frame) => {
+                                            responses.push(err_frame);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Unknown CLIENT subcommand
+                                responses.push(Frame::Error(Bytes::from(format!(
+                                    "ERR unknown subcommand '{}'",
+                                    String::from_utf8_lossy(&sub_bytes)
+                                ))));
+                                continue;
+                            }
+                        }
+                        responses.push(Frame::Error(
+                            Bytes::from_static(b"ERR wrong number of arguments for 'client' command"),
+                        ));
+                        continue;
                     }
 
                     // --- MULTI ---
@@ -1217,6 +1543,28 @@ pub async fn handle_connection_sharded(
                                 }
                             }
                         }
+                        // Track key on read / invalidate tracked key on write
+                        if tracking_state.enabled {
+                            if is_write {
+                                if !matches!(response, Frame::Error(_)) {
+                                    if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                        let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                                        if !senders.is_empty() {
+                                            let push = crate::tracking::invalidation::invalidation_push(&[key]);
+                                            for tx in senders {
+                                                let _ = tx.try_send(push.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if !tracking_state.bcast {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
+                                }
+                            }
+                        }
+                        // Apply RESP3 response conversion if needed
+                        let response = apply_resp3_conversion(cmd, response, framed.codec().protocol_version());
                         responses.push(response);
                     } else if let Some(target) = target_shard {
                         // REMOTE DISPATCH: send via SPSC, await oneshot reply
@@ -1255,6 +1603,8 @@ pub async fn handle_connection_sharded(
                                         }
                                     }
                                 }
+                                // Apply RESP3 response conversion if needed
+                                let response = apply_resp3_conversion(cmd, response, framed.codec().protocol_version());
                                 responses.push(response);
                             }
                             Err(_) => responses.push(Frame::Error(
@@ -1289,6 +1639,11 @@ pub async fn handle_connection_sharded(
                 break;
             }
         }
+    }
+
+    // Cleanup: remove tracking state on disconnect
+    if tracking_state.enabled {
+        tracking_table.borrow_mut().untrack_all(client_id);
     }
 }
 

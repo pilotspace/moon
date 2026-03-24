@@ -7,11 +7,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+use crate::command::connection as conn_cmd;
 use crate::config::ServerConfig;
 use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
 use crate::persistence::rdb;
 use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
+use crate::tracking::TrackingTable;
 
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
@@ -136,6 +138,9 @@ pub async fn run_with_shutdown(
     // Create shared runtime config (mutable via CONFIG SET)
     let runtime_config = Arc::new(RwLock::new(config.to_runtime_config()));
 
+    // Create shared tracking table for client-side caching invalidation
+    let tracking_table = Arc::new(Mutex::new(TrackingTable::new()));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -150,9 +155,12 @@ pub async fn run_with_shutdown(
                         let change_counter = Some(change_counter.clone());
                         let pubsub = pubsub_registry.clone();
                         let rt_config = runtime_config.clone();
+                        let tracking = tracking_table.clone();
+                        let cid = conn_cmd::next_client_id();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
                             aof_tx, change_counter, pubsub, rt_config,
+                            tracking, cid,
                         ));
                     }
                     Err(e) => {

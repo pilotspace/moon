@@ -19,9 +19,11 @@ use crate::config::RuntimeConfig;
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
+use crate::command::connection as conn_cmd;
 use crate::pubsub::PubSubRegistry;
 use crate::server::connection::handle_connection_sharded;
 use crate::storage::Database;
+use crate::tracking::TrackingTable;
 
 #[cfg(target_os = "linux")]
 use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
@@ -200,6 +202,7 @@ impl Shard {
         let databases = Rc::new(RefCell::new(std::mem::take(&mut self.databases)));
         let dispatch_tx = Rc::new(RefCell::new(producers));
         let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
+        let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
 
         let shard_id = self.id;
         let num_shards = self.num_shards;
@@ -273,6 +276,8 @@ impl Shard {
                             let psr = pubsub_rc.clone();
                             let sd = shutdown.clone();
                             let aof = aof_tx.clone();
+                            let trk = tracking_rc.clone();
+                            let cid = conn_cmd::next_client_id();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -284,6 +289,8 @@ impl Shard {
                                     sd,
                                     None, // requirepass: TODO wire from shard config
                                     aof,
+                                    trk,
+                                    cid,
                                 ).await;
                             });
                         }
