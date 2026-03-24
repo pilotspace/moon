@@ -2902,3 +2902,353 @@ async fn test_sharded_transaction_same_shard() {
 
     shutdown.cancel();
 }
+
+// =============================================================================
+// Blocking commands (Phase 17)
+// =============================================================================
+
+#[tokio::test]
+async fn blpop_immediate() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    // Push data first
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("mylist")
+        .arg("hello")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // BLPOP should return immediately since data exists
+    let result: (String, String) = redis::cmd("BLPOP")
+        .arg("mylist")
+        .arg(1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result.0, "mylist");
+    assert_eq!(result.1, "hello");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn brpop_immediate() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    // Push multiple values
+    let _: i64 = redis::cmd("RPUSH")
+        .arg("mylist")
+        .arg("first")
+        .arg("second")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // BRPOP pops from tail
+    let result: (String, String) = redis::cmd("BRPOP")
+        .arg("mylist")
+        .arg(1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result.0, "mylist");
+    assert_eq!(result.1, "second");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn blpop_blocks_then_wakes() {
+    let (port, shutdown) = start_sharded_server(1).await;
+
+    // Use non-multiplexed connection for blocking
+    let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut con1 = client1.get_tokio_connection().await.unwrap();
+
+    let mut con2 = connect(port).await;
+
+    let start = std::time::Instant::now();
+
+    // Task A: BLPOP (blocks)
+    let handle = tokio::spawn(async move {
+        let result: (String, String) = redis::cmd("BLPOP")
+            .arg("blocklist")
+            .arg(5)
+            .query_async(&mut con1)
+            .await
+            .unwrap();
+        result
+    });
+
+    // Task B: wait then push
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("blocklist")
+        .arg("wakeup")
+        .query_async(&mut con2)
+        .await
+        .unwrap();
+
+    let result = handle.await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(result.0, "blocklist");
+    assert_eq!(result.1, "wakeup");
+    // Should have taken ~200ms (not 5s)
+    assert!(elapsed.as_millis() < 2000, "took too long: {:?}", elapsed);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn blpop_timeout() {
+    let (port, shutdown) = start_sharded_server(1).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut conn = client.get_tokio_connection().await.unwrap();
+
+    let start = std::time::Instant::now();
+    // BLPOP on empty key with short timeout
+    let result: Option<(String, String)> = redis::cmd("BLPOP")
+        .arg("emptylist")
+        .arg("0.2")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(result.is_none(), "expected nil on timeout, got {:?}", result);
+    // Should have taken ~200ms
+    assert!(elapsed.as_millis() >= 150, "returned too quickly: {:?}", elapsed);
+    assert!(elapsed.as_millis() < 1000, "took too long: {:?}", elapsed);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn blpop_multi_key_first_nonempty() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    // Only push to key2, not key1
+    let _: i64 = redis::cmd("LPUSH")
+        .arg("key2")
+        .arg("found")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // BLPOP checks keys in order -- key1 is empty, key2 has data
+    let result: (String, String) = redis::cmd("BLPOP")
+        .arg("key1")
+        .arg("key2")
+        .arg("0.5")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result.0, "key2");
+    assert_eq!(result.1, "found");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn lmove_basic() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    // RPUSH source a b c
+    let _: i64 = redis::cmd("RPUSH")
+        .arg("source")
+        .arg("a")
+        .arg("b")
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // LMOVE source dest LEFT RIGHT -> moves "a" to dest
+    let result: String = redis::cmd("LMOVE")
+        .arg("source")
+        .arg("dest")
+        .arg("LEFT")
+        .arg("RIGHT")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, "a");
+
+    // dest should have [a]
+    let dest_vals: Vec<String> = redis::cmd("LRANGE")
+        .arg("dest")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(dest_vals, vec!["a"]);
+
+    // LMOVE source dest RIGHT LEFT -> moves "c" to front of dest
+    let result2: String = redis::cmd("LMOVE")
+        .arg("source")
+        .arg("dest")
+        .arg("RIGHT")
+        .arg("LEFT")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result2, "c");
+
+    let dest_vals2: Vec<String> = redis::cmd("LRANGE")
+        .arg("dest")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(dest_vals2, vec!["c", "a"]);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn bzpopmin_immediate() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    // ZADD key 1.0 "a" 2.0 "b"
+    let _: i64 = redis::cmd("ZADD")
+        .arg("myzset")
+        .arg(1.0f64)
+        .arg("a")
+        .arg(2.0f64)
+        .arg("b")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // BZPOPMIN returns the minimum
+    let result: (String, String, String) = redis::cmd("BZPOPMIN")
+        .arg("myzset")
+        .arg("0.1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result.0, "myzset");
+    assert_eq!(result.1, "a");
+    assert_eq!(result.2, "1");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn bzpopmin_blocks_then_wakes() {
+    let (port, shutdown) = start_sharded_server(1).await;
+
+    let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+    let mut con1 = client1.get_tokio_connection().await.unwrap();
+
+    let mut con2 = connect(port).await;
+
+    let start = std::time::Instant::now();
+
+    // Task A: BZPOPMIN (blocks)
+    let handle = tokio::spawn(async move {
+        let result: (String, String, String) = redis::cmd("BZPOPMIN")
+            .arg("blockzset")
+            .arg(5)
+            .query_async(&mut con1)
+            .await
+            .unwrap();
+        result
+    });
+
+    // Task B: wait then ZADD
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _: i64 = redis::cmd("ZADD")
+        .arg("blockzset")
+        .arg(3.5f64)
+        .arg("member1")
+        .query_async(&mut con2)
+        .await
+        .unwrap();
+
+    let result = handle.await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(result.0, "blockzset");
+    assert_eq!(result.1, "member1");
+    // Should have taken ~200ms, not 5s
+    assert!(elapsed.as_millis() < 2000, "took too long: {:?}", elapsed);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn bzpopmax_immediate() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    let _: i64 = redis::cmd("ZADD")
+        .arg("myzset2")
+        .arg(1.0f64)
+        .arg("a")
+        .arg(2.0f64)
+        .arg("b")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let result: (String, String, String) = redis::cmd("BZPOPMAX")
+        .arg("myzset2")
+        .arg("0.1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result.0, "myzset2");
+    assert_eq!(result.1, "b");
+    assert_eq!(result.2, "2");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn blmove_basic() {
+    let (port, shutdown) = start_sharded_server(1).await;
+    let mut conn = connect(port).await;
+
+    // RPUSH source a b c
+    let _: i64 = redis::cmd("RPUSH")
+        .arg("blmsrc")
+        .arg("a")
+        .arg("b")
+        .arg("c")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // BLMOVE source dest LEFT RIGHT 1.0 -> moves "a"
+    let result: String = redis::cmd("BLMOVE")
+        .arg("blmsrc")
+        .arg("blmdest")
+        .arg("LEFT")
+        .arg("RIGHT")
+        .arg("1.0")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(result, "a");
+
+    // dest should have [a]
+    let dest_vals: Vec<String> = redis::cmd("LRANGE")
+        .arg("blmdest")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(dest_vals, vec!["a"]);
+
+    shutdown.cancel();
+}
