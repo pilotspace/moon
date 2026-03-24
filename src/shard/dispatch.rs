@@ -47,10 +47,13 @@ pub enum ShardMessage {
     },
     /// Publish a message to local subscribers on this shard.
     PubSubFanOut { channel: Bytes, message: Bytes },
-    /// Request this shard to clone its database state for RDB snapshot.
-    /// Reply contains per-database data: Vec<(entries, base_ts)> for each database in this shard.
-    SnapshotRequest {
-        reply_tx: tokio::sync::oneshot::Sender<Vec<(Vec<(Bytes, crate::storage::entry::Entry)>, u32)>>,
+    /// Begin a cooperative snapshot at the given epoch.
+    /// Shard creates SnapshotState and advances one segment per tick.
+    /// Sends reply when snapshot is complete.
+    SnapshotBegin {
+        epoch: u64,
+        snapshot_dir: std::path::PathBuf,
+        reply_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Graceful shutdown signal.
     Shutdown,

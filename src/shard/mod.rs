@@ -16,6 +16,9 @@ use tracing::info;
 
 use crate::command::{dispatch as cmd_dispatch, DispatchResult};
 use crate::config::RuntimeConfig;
+use crate::persistence::aof;
+use crate::persistence::snapshot::SnapshotState;
+use crate::persistence::wal::WalWriter;
 use crate::pubsub::PubSubRegistry;
 use crate::server::connection::handle_connection_sharded;
 use crate::storage::Database;
@@ -85,6 +88,8 @@ impl Shard {
         shutdown: CancellationToken,
         aof_tx: Option<mpsc::Sender<crate::persistence::aof::AofMessage>>,
         bind_addr: Option<String>,
+        persistence_dir: Option<String>,
+        mut snapshot_trigger_rx: tokio::sync::watch::Receiver<u64>,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -156,6 +161,29 @@ impl Shard {
         let shard_id = self.id;
         let num_shards = self.num_shards;
 
+        // Per-shard snapshot state (None when no snapshot is active)
+        let mut snapshot_state: Option<SnapshotState> = None;
+        let mut snapshot_reply_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>> = None;
+
+        // Per-shard WAL writer (created if persistence dir is configured)
+        let mut wal_writer: Option<WalWriter> = if let Some(ref dir) = persistence_dir {
+            match WalWriter::new(shard_id, std::path::Path::new(dir)) {
+                Ok(w) => {
+                    info!("Shard {}: WAL writer initialized", shard_id);
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Track last seen snapshot epoch to detect watch channel triggers
+        let mut last_snapshot_epoch = *snapshot_trigger_rx.borrow();
+
         let mut expiry_interval = tokio::time::interval(Duration::from_millis(100));
         // SPSC drain interval -- check for cross-shard messages every 1ms.
         // On Linux with io_uring, this also polls for io_uring completions.
@@ -224,7 +252,78 @@ impl Shard {
                 }
                 // Drain SPSC consumers and poll io_uring completions (Linux)
                 _ = spsc_interval.tick() => {
-                    Self::drain_spsc_shared(&databases, &mut consumers, &mut *pubsub_rc.borrow_mut());
+                    // Drain SPSC, collecting SnapshotBegin messages for deferred handling
+                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)> = None;
+                    Self::drain_spsc_shared(
+                        &databases,
+                        &mut consumers,
+                        &mut *pubsub_rc.borrow_mut(),
+                        &mut pending_snapshot,
+                        &mut snapshot_state,
+                        &mut wal_writer,
+                    );
+
+                    // Handle pending SnapshotBegin from SPSC
+                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
+                        if snapshot_state.is_some() {
+                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
+                        } else {
+                            let dbs = databases.borrow();
+                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
+                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
+                            snapshot_reply_tx = Some(reply_tx);
+                            drop(dbs);
+                        }
+                    }
+
+                    // Check watch channel for auto-save snapshot triggers
+                    if snapshot_trigger_rx.has_changed().unwrap_or(false) {
+                        let new_epoch = *snapshot_trigger_rx.borrow_and_update();
+                        if new_epoch > last_snapshot_epoch && snapshot_state.is_none() {
+                            last_snapshot_epoch = new_epoch;
+                            if let Some(ref dir) = persistence_dir {
+                                let snap_path = std::path::PathBuf::from(dir)
+                                    .join(format!("shard-{}.rrdshard", shard_id));
+                                let dbs = databases.borrow();
+                                snapshot_state = Some(SnapshotState::new(
+                                    shard_id as u16, new_epoch, &dbs, snap_path,
+                                ));
+                                drop(dbs);
+                                // No reply_tx for auto-save triggered snapshots
+                            }
+                        }
+                    }
+
+                    // Advance snapshot one segment per tick (cooperative)
+                    if let Some(ref mut snap) = snapshot_state {
+                        let dbs = databases.borrow();
+                        let done = snap.advance_one_segment(&dbs);
+                        drop(dbs);
+                        if done {
+                            let epoch = snap.epoch;
+                            if let Err(e) = snap.finalize() {
+                                tracing::error!("Shard {}: snapshot finalize failed: {}", shard_id, e);
+                                if let Some(tx) = snapshot_reply_tx.take() {
+                                    let _ = tx.send(Err(format!("finalize failed: {}", e)));
+                                }
+                            } else {
+                                info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
+                                // Truncate WAL after successful snapshot
+                                if let Some(ref mut wal) = wal_writer {
+                                    let _ = wal.truncate_after_snapshot(epoch);
+                                }
+                                if let Some(tx) = snapshot_reply_tx.take() {
+                                    let _ = tx.send(Ok(()));
+                                }
+                            }
+                            snapshot_state = None;
+                        }
+                    }
+
+                    // Flush WAL on 1ms tick
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.flush_if_needed();
+                    }
 
                     // On Linux: poll io_uring for completions (non-blocking)
                     #[cfg(target_os = "linux")]
@@ -253,6 +352,10 @@ impl Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    // Flush and shutdown WAL writer
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.shutdown();
+                    }
                     break;
                 }
             }
@@ -282,10 +385,17 @@ impl Shard {
     }
 
     /// Drain all SPSC consumer channels, processing cross-shard messages.
+    ///
+    /// SnapshotBegin messages are collected into `pending_snapshot` for deferred handling
+    /// (the caller has mutable access to snapshot_state). COW intercepts and WAL appends
+    /// happen inline for Execute/MultiExecute write commands.
     fn drain_spsc_shared(
         databases: &Rc<RefCell<Vec<Database>>>,
         consumers: &mut [HeapCons<ShardMessage>],
         pubsub_registry: &mut PubSubRegistry,
+        pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        snapshot_state: &mut Option<SnapshotState>,
+        wal_writer: &mut Option<WalWriter>,
     ) {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
@@ -295,7 +405,14 @@ impl Shard {
                 match consumer.try_pop() {
                     Some(msg) => {
                         drained += 1;
-                        Self::handle_shard_message_shared(databases, pubsub_registry, msg);
+                        Self::handle_shard_message_shared(
+                            databases,
+                            pubsub_registry,
+                            msg,
+                            pending_snapshot,
+                            snapshot_state,
+                            wal_writer,
+                        );
                     }
                     None => break,
                 }
@@ -307,10 +424,16 @@ impl Shard {
     }
 
     /// Process a single cross-shard message using shared database access.
+    ///
+    /// Performs COW intercept for write commands when a snapshot is active,
+    /// and appends write commands to the per-shard WAL writer.
     fn handle_shard_message_shared(
         databases: &Rc<RefCell<Vec<Database>>>,
         pubsub_registry: &mut PubSubRegistry,
         msg: ShardMessage,
+        pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        snapshot_state: &mut Option<SnapshotState>,
+        wal_writer: &mut Option<WalWriter>,
     ) {
         match msg {
             ShardMessage::Execute {
@@ -332,12 +455,28 @@ impl Shard {
                             return;
                         }
                     };
+
+                    // COW intercept: capture old value before write if snapshot is active
+                    if aof::is_write_command(cmd) {
+                        Self::cow_intercept(snapshot_state, &dbs, db_idx, &command);
+                    }
+
                     let mut selected = db_idx;
                     let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
-                    match result {
+                    let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
+                    };
+
+                    // WAL append for successful write commands
+                    if aof::is_write_command(cmd) && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        if let Some(wal) = wal_writer.as_mut() {
+                            let serialized = aof::serialize_command(&command);
+                            wal.append(&serialized);
+                        }
                     }
+
+                    frame
                 };
                 let _ = reply_tx.send(response);
             }
@@ -361,6 +500,12 @@ impl Shard {
                             continue;
                         }
                     };
+
+                    // COW intercept for each write command in the batch
+                    if aof::is_write_command(cmd) {
+                        Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
+                    }
+
                     let mut selected = db_idx;
                     let result =
                         cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
@@ -368,6 +513,15 @@ impl Shard {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
                     };
+
+                    // WAL append for successful write commands
+                    if aof::is_write_command(cmd) && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        if let Some(wal) = wal_writer.as_mut() {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal.append(&serialized);
+                        }
+                    }
+
                     results.push(frame);
                 }
                 let _ = reply_tx.send(results);
@@ -375,28 +529,45 @@ impl Shard {
             ShardMessage::PubSubFanOut { channel, message } => {
                 pubsub_registry.publish(&channel, &message);
             }
-            ShardMessage::SnapshotRequest { reply_tx } => {
-                // Clone all databases in this shard for RDB snapshot.
-                // NOTE: Phase 11 snapshots are NOT point-in-time across shards.
-                // Keys modified between per-shard snapshot requests may be inconsistent.
-                // Phase 14 implements true consistent snapshots via compartmentalized persistence.
-                let snapshot: Vec<(Vec<(bytes::Bytes, crate::storage::entry::Entry)>, u32)> = {
-                    let dbs = databases.borrow();
-                    dbs.iter().map(|db| {
-                        let base_ts = db.base_timestamp();
-                        let entries: Vec<(bytes::Bytes, crate::storage::entry::Entry)> = db.data().iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        (entries, base_ts)
-                    }).collect()
-                };
-                let _ = reply_tx.send(snapshot);
+            ShardMessage::SnapshotBegin { epoch, snapshot_dir, reply_tx } => {
+                // Defer to main event loop where we have mutable access to snapshot_state
+                *pending_snapshot = Some((epoch, snapshot_dir, reply_tx));
             }
             ShardMessage::Shutdown => {
                 info!("Received shutdown via SPSC");
             }
             ShardMessage::NewConnection(_) => {
                 // NewConnection is handled via conn_rx, not SPSC
+            }
+        }
+    }
+
+    /// COW intercept: capture old value for a key being written if its segment is pending.
+    ///
+    /// Called before cmd_dispatch to preserve snapshot consistency. Only clones the old entry
+    /// if the key's segment is actually pending serialization (fast bool check in hot path).
+    fn cow_intercept(
+        snapshot: &mut Option<SnapshotState>,
+        dbs: &[Database],
+        db_index: usize,
+        command: &crate::protocol::Frame,
+    ) {
+        let Some(snap) = snapshot else { return };
+        // Extract the primary key from the command (args[1] for Array commands)
+        let key = match command {
+            crate::protocol::Frame::Array(args) if args.len() >= 2 => {
+                match &args[1] {
+                    crate::protocol::Frame::BulkString(k) => k,
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        let hash = crate::storage::dashtable::hash_key(key);
+        let seg_idx = dbs[db_index].data().segment_index_for_hash(hash);
+        if snap.is_segment_pending(db_index, seg_idx) {
+            if let Some(old_entry) = dbs[db_index].data().get(key) {
+                snap.capture_cow(db_index, seg_idx, key.clone(), old_entry.clone());
             }
         }
     }
@@ -702,7 +873,10 @@ mod tests {
         .ok()
         .expect("push should succeed");
 
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub);
+        let mut pending_snap = None;
+        let mut snap_state = None;
+        let mut wal_w: Option<WalWriter> = None;
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &mut pending_snap, &mut snap_state, &mut wal_w);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -736,7 +910,10 @@ mod tests {
             .unwrap();
         }
 
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub);
+        let mut pending_snap = None;
+        let mut snap_state = None;
+        let mut wal_w: Option<WalWriter> = None;
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &mut pending_snap, &mut snap_state, &mut wal_w);
     }
 
     #[test]

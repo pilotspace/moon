@@ -77,6 +77,12 @@ fn main() -> anyhow::Result<()> {
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
+    // Create watch channel for snapshot triggers (auto-save and BGSAVE)
+    let (snapshot_trigger_tx, snapshot_trigger_rx) = tokio::sync::watch::channel(0u64);
+
+    // Persistence directory for per-shard WAL and snapshots
+    let persistence_dir = Some(config.dir.clone());
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
     for id in 0..num_shards {
@@ -87,6 +93,8 @@ fn main() -> anyhow::Result<()> {
         let shard_cancel = cancel_token.clone();
         let shard_aof_tx = aof_tx.clone();
         let shard_bind_addr = bind_addr.clone();
+        let shard_persistence_dir = persistence_dir.clone();
+        let shard_snap_rx = snapshot_trigger_rx.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -113,6 +121,8 @@ fn main() -> anyhow::Result<()> {
                     shard_cancel,
                     shard_aof_tx,
                     Some(shard_bind_addr),
+                    shard_persistence_dir,
+                    shard_snap_rx,
                 ));
             })
             .expect("failed to spawn shard thread");
