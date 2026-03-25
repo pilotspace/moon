@@ -2326,6 +2326,23 @@ pub async fn handle_connection_sharded(
                     return;
                 }
 
+                // Shrink write_buf if it grew beyond 64KB (e.g., large pipeline response)
+                // to prevent permanent per-connection memory bloat.
+                if write_buf.capacity() > 65536 {
+                    write_buf = BytesMut::with_capacity(8192);
+                }
+
+                // Shrink read_buf if it grew beyond 64KB (e.g., huge pipeline request)
+                // to reclaim memory after occasional large bursts.
+                if read_buf.capacity() > 65536 {
+                    // Preserve any unparsed trailing data
+                    let remaining = read_buf.split();
+                    read_buf = BytesMut::with_capacity(8192);
+                    if !remaining.is_empty() {
+                        read_buf.extend_from_slice(&remaining);
+                    }
+                }
+
                 if should_quit {
                     break;
                 }
