@@ -182,7 +182,7 @@ async fn coordinate_mget(
 
     // Await all remote results
     for (indices, rx) in pending_rxs {
-        match rx.await {
+        match rx.recv().await {
             Ok(frames) => {
                 for (idx, frame) in indices.into_iter().zip(frames) {
                     results[idx] = Some(frame);
@@ -289,7 +289,7 @@ async fn coordinate_mset(
     }
 
     for rx in pending_rxs {
-        let _ = rx.await;
+        let _ = rx.recv().await;
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
@@ -371,7 +371,7 @@ async fn coordinate_multi_del_or_exists(
     }
 
     for rx in pending_rxs {
-        if let Ok(frames) = rx.await {
+        if let Ok(frames) = rx.recv().await {
             for frame in frames {
                 if let Frame::Integer(n) = frame {
                     total_count += n;
@@ -440,7 +440,7 @@ pub async fn coordinate_keys(
 
     // Collect remote results
     for rx in pending_rxs {
-        if let Ok(frame) = rx.await {
+        if let Ok(frame) = rx.recv().await {
             if let Frame::Array(keys) = frame {
                 all_keys.extend(keys);
             }
@@ -519,7 +519,7 @@ pub async fn coordinate_scan(
             reply_tx: tx,
         };
         spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
-        match rx.await {
+        match rx.recv().await {
             Ok(f) => f,
             Err(_) => Frame::Error(Bytes::from_static(b"ERR cross-shard scan failed")),
         }
@@ -601,7 +601,7 @@ pub async fn coordinate_dbsize(
     }
 
     for rx in pending_rxs {
-        if let Ok(Frame::Integer(n)) = rx.await {
+        if let Ok(Frame::Integer(n)) = rx.recv().await {
             total += n;
         }
     }

@@ -3061,7 +3061,7 @@ pub async fn handle_connection_sharded_monoio(
                         }
                     }
                 }
-                let response = rx.await.unwrap_or(
+                let response = rx.recv().await.unwrap_or(
                     Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed")),
                 );
 

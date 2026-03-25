@@ -171,7 +171,8 @@ pub fn dispatch(
         (6, b'a') => { // APPEND
             if cmd.eq_ignore_ascii_case(b"APPEND") { return resp(string::append(db, args)); }
         }
-        (6, b'd') => { // DECRBY
+        (6, b'd') => { // DBSIZE DECRBY
+            if cmd.eq_ignore_ascii_case(b"DBSIZE") { return resp(key::dbsize(db, args)); }
             if cmd.eq_ignore_ascii_case(b"DECRBY") { return resp(string::decrby(db, args)); }
         }
         (6, b'e') => { // EXISTS EXPIRE

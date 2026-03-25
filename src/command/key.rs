@@ -396,6 +396,13 @@ fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
     Some((matched ^ negated, i + 1))
 }
 
+/// DBSIZE
+///
+/// Returns the number of keys in the currently selected database.
+pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
+    Frame::Integer(db.len() as i64)
+}
+
 /// KEYS pattern
 ///
 /// Returns all keys matching the given glob-style pattern.
