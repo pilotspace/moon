@@ -2097,8 +2097,14 @@ pub async fn handle_connection_sharded(
                         _ => false,
                     };
 
-                    // Pre-serialize write commands for AOF logging (before dispatch)
-                    let is_write = aof::is_write_command(cmd);
+                    // Pre-serialize write commands for AOF logging (before dispatch).
+                    // Skip the is_write_command string comparison entirely when neither
+                    // AOF persistence nor client tracking needs the write classification.
+                    let is_write = if aof_tx.is_some() || tracking_state.enabled {
+                        aof::is_write_command(cmd)
+                    } else {
+                        false
+                    };
                     let aof_bytes = if is_write && aof_tx.is_some() {
                         Some(aof::serialize_command(&frame))
                     } else {
