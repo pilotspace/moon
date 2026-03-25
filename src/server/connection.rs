@@ -2225,16 +2225,18 @@ pub async fn handle_connection_sharded(
                 // Drain BumpVec into owned Vec before await points (Send safety),
                 // then drop arena-backed storage so arena.reset() can reclaim.
                 let send_responses: Vec<Frame> = responses.into_iter().collect();
+                arena.reset(); // O(1) bulk deallocation of batch temporaries
 
-                // Write all responses
+                // Write all responses using feed()+flush() to batch into a single
+                // syscall instead of send() per frame (which flushes each time).
                 for response in send_responses {
-                    if framed.send(response).await.is_err() {
-                        arena.reset(); // O(1) bulk deallocation of batch temporaries
+                    if framed.feed(response).await.is_err() {
                         return;
                     }
                 }
-
-                arena.reset(); // O(1) bulk deallocation of batch temporaries
+                if framed.flush().await.is_err() {
+                    return;
+                }
 
                 if should_quit {
                     break;
