@@ -48,6 +48,12 @@ struct ConnState {
     recv_active: bool,
 }
 
+/// Default number of pre-registered send buffers per shard.
+const DEFAULT_SEND_BUF_POOL_SIZE: u16 = 256;
+
+/// Default size of each registered send buffer (8KB, enough for most RESP responses).
+const DEFAULT_SEND_BUF_SIZE: usize = 8192;
+
 /// Configuration for UringDriver.
 pub struct UringConfig {
     /// io_uring SQ size (CQ will be 2x). Default: 256.
@@ -56,6 +62,8 @@ pub struct UringConfig {
     pub max_connections: usize,
     /// Provided buffer ring configuration.
     pub buf_ring: BufRingConfig,
+    /// Number of pre-registered send buffers. Default: 256 (= 2MB per shard).
+    pub send_buf_pool_size: u16,
 }
 
 impl Default for UringConfig {
@@ -64,7 +72,120 @@ impl Default for UringConfig {
             ring_size: DEFAULT_RING_SIZE,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             buf_ring: BufRingConfig::default(),
+            send_buf_pool_size: DEFAULT_SEND_BUF_POOL_SIZE,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SendBufPool: pre-registered send buffer pool for WRITE_FIXED
+// ---------------------------------------------------------------------------
+
+/// Pool of pre-allocated buffers registered with io_uring for WRITE_FIXED.
+///
+/// Eliminates per-response `get_user_pages()` kernel overhead by using
+/// `IORING_REGISTER_BUFFERS` once at init. Each send uses `IORING_OP_WRITE_FIXED`
+/// with a buffer index, avoiding the per-I/O page pinning cost.
+///
+/// LIFO free-list for cache-hot buffer reuse. When exhausted, callers fall back
+/// to the heap-allocated `submit_send` path.
+pub struct SendBufPool {
+    /// The actual buffer storage. Each Vec<u8> is a fixed-size buffer.
+    /// Indices correspond to the registered buffer indices.
+    buffers: Vec<Vec<u8>>,
+    /// Stack of free buffer indices (LIFO for cache locality).
+    free_list: Vec<u16>,
+    /// Total number of buffers in the pool.
+    buf_count: u16,
+    /// Per-buffer capacity in bytes.
+    buf_size: usize,
+}
+
+impl SendBufPool {
+    /// Create a new send buffer pool with `count` buffers of `size` bytes each.
+    fn new(count: u16, size: usize) -> Self {
+        let mut buffers = Vec::with_capacity(count as usize);
+        let mut free_list = Vec::with_capacity(count as usize);
+
+        for i in 0..count {
+            let mut buf = Vec::with_capacity(size);
+            // Set length to capacity so the entire buffer is valid memory
+            // that can be registered with the kernel.
+            unsafe { buf.set_len(size) };
+            buffers.push(buf);
+            free_list.push(i);
+        }
+
+        Self {
+            buffers,
+            free_list,
+            buf_count: count,
+            buf_size: size,
+        }
+    }
+
+    /// Build the iovec array for `register_buffers()`.
+    fn build_iovecs(&self) -> Vec<libc::iovec> {
+        self.buffers
+            .iter()
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            })
+            .collect()
+    }
+
+    /// Allocate a buffer from the pool.
+    ///
+    /// Returns `Some((index, slice))` where `index` is the registered buffer index
+    /// and `slice` is a mutable reference to write response data into.
+    /// Returns `None` if the pool is exhausted (caller should fall back to heap).
+    #[inline]
+    pub fn alloc(&mut self) -> Option<(u16, &mut [u8])> {
+        let idx = self.free_list.pop()?;
+        Some((idx, &mut self.buffers[idx as usize][..self.buf_size]))
+    }
+
+    /// Reclaim a buffer back to the pool after SendComplete CQE.
+    #[inline]
+    pub fn reclaim(&mut self, idx: u16) {
+        debug_assert!(
+            (idx as usize) < self.buffers.len(),
+            "send buf index {} out of range {}",
+            idx,
+            self.buffers.len()
+        );
+        self.free_list.push(idx);
+    }
+
+    /// Check if the pool is exhausted (no free buffers available).
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.free_list.is_empty()
+    }
+
+    /// Number of free buffers available.
+    #[inline]
+    pub fn free_count(&self) -> usize {
+        self.free_list.len()
+    }
+
+    /// Total number of buffers in the pool.
+    #[inline]
+    pub fn total_count(&self) -> u16 {
+        self.buf_count
+    }
+
+    /// Per-buffer size.
+    #[inline]
+    pub fn buf_size(&self) -> usize {
+        self.buf_size
+    }
+
+    /// Get a pointer and the buffer for a given index (for building SQEs).
+    #[inline]
+    fn buf_ptr(&self, idx: u16) -> *const u8 {
+        self.buffers[idx as usize].as_ptr()
     }
 }
 
@@ -82,6 +203,7 @@ pub struct UringDriver {
     ring: IoUring,
     fd_table: FdTable,
     buf_ring: BufRingManager,
+    send_buf_pool: SendBufPool,
     connections: HashMap<u32, ConnState>,
     next_conn_id: u32,
     config: UringConfig,
@@ -103,11 +225,13 @@ impl UringDriver {
 
         let fd_table = FdTable::new(config.max_connections);
         let buf_ring = BufRingManager::new(config.buf_ring.clone());
+        let send_buf_pool = SendBufPool::new(config.send_buf_pool_size, DEFAULT_SEND_BUF_SIZE);
 
         Ok(Self {
             ring,
             fd_table,
             buf_ring,
+            send_buf_pool,
             connections: HashMap::new(),
             next_conn_id: 0,
             config,
@@ -121,6 +245,16 @@ impl UringDriver {
     pub fn init(&mut self) -> std::io::Result<()> {
         self.fd_table.register_with_ring(&self.ring)?;
         self.buf_ring.setup_ring(&self.ring)?;
+
+        // Register send buffers with the kernel (IORING_REGISTER_BUFFERS).
+        // This pins pages once at init so WRITE_FIXED skips get_user_pages() per I/O.
+        let iovecs = self.send_buf_pool.build_iovecs();
+        if !iovecs.is_empty() {
+            unsafe {
+                self.ring.submitter().register_buffers(&iovecs)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -266,6 +400,68 @@ impl UringDriver {
         }
         self.pending_sqes += 1;
         Ok(())
+    }
+
+    /// Submit a send using a pre-registered fixed buffer (IORING_OP_WRITE_FIXED).
+    ///
+    /// Skips per-I/O `get_user_pages()` because the buffer was pre-registered.
+    /// The `buf_idx` identifies the registered buffer; `len` is the number of
+    /// valid bytes to write. The caller must have written data into the buffer
+    /// via `alloc_send_buf()` before calling this.
+    ///
+    /// The `buf_idx` is encoded in the user_data aux field so `SendComplete`
+    /// can reclaim the buffer.
+    pub fn submit_send_fixed(
+        &mut self,
+        conn_id: u32,
+        buf_idx: u16,
+        len: u32,
+    ) -> std::io::Result<()> {
+        let conn = self.connections.get(&conn_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "connection not found")
+        })?;
+
+        let ptr = self.send_buf_pool.buf_ptr(buf_idx);
+        let entry = opcode::WriteFixed::new(
+            types::Fixed(conn.fixed_fd_idx),
+            ptr,
+            len,
+            buf_idx,
+        )
+        .build()
+        .user_data(encode_user_data(EVENT_SEND, conn_id, buf_idx as u32));
+
+        unsafe {
+            self.ring.submission().push(&entry).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "SQ full: cannot submit send_fixed",
+                )
+            })?;
+        }
+        self.pending_sqes += 1;
+        Ok(())
+    }
+
+    /// Allocate a send buffer from the pre-registered pool.
+    ///
+    /// Returns `Some((buf_idx, buf_slice))` on success, `None` if pool exhausted.
+    /// Caller writes response data into `buf_slice`, then calls `submit_send_fixed`.
+    #[inline]
+    pub fn alloc_send_buf(&mut self) -> Option<(u16, &mut [u8])> {
+        self.send_buf_pool.alloc()
+    }
+
+    /// Reclaim a send buffer back to the pool after SendComplete CQE.
+    #[inline]
+    pub fn reclaim_send_buf(&mut self, buf_idx: u16) {
+        self.send_buf_pool.reclaim(buf_idx);
+    }
+
+    /// Check if the send buffer pool is exhausted.
+    #[inline]
+    pub fn send_buf_pool_exhausted(&self) -> bool {
+        self.send_buf_pool.is_exhausted()
     }
 
     /// Submit a timeout for periodic tasks (expiry cycle, SPSC drain).
