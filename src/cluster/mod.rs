@@ -58,6 +58,9 @@ pub struct ClusterNode {
     /// Slot ownership bitmap: bit i set means this node owns slot i.
     /// 16384 bits = 2048 bytes.
     pub slots: Box<[u8; 2048]>,
+    /// Maps reporter_node_id -> report_time_ms. Tracks which masters have
+    /// reported this node as PFAIL via gossip.
+    pub pfail_reports: HashMap<String, u64>,
 }
 
 impl ClusterNode {
@@ -77,6 +80,7 @@ impl ClusterNode {
             ping_sent_ms: 0,
             pong_recv_ms: 0,
             slots: Box::new([0u8; 2048]),
+            pfail_reports: HashMap::new(),
         }
     }
 
@@ -140,6 +144,16 @@ impl SlotRoute {
     }
 }
 
+// --- FailoverState ---------------------------------------------------------------
+
+/// Tracks the progress of a failover election for this replica.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FailoverState {
+    None,
+    WaitingDelay { start_ms: u64, delay_ms: u64 },
+    WaitingVotes { epoch: u64, votes_received: u32, votes_needed: u32 },
+}
+
 // --- ClusterState ----------------------------------------------------------------
 
 /// Full cluster state for this node.
@@ -167,6 +181,8 @@ pub struct ClusterState {
     pub messages_received: u64,
     /// Epoch of the last vote cast during failover (prevents double-voting).
     pub last_vote_epoch: u64,
+    /// Current failover election state (only relevant for replicas).
+    pub failover_state: FailoverState,
 }
 
 impl ClusterState {
@@ -181,6 +197,7 @@ impl ClusterState {
             messages_sent: 0,
             messages_received: 0,
             last_vote_epoch: 0,
+            failover_state: FailoverState::None,
         };
         let self_node = ClusterNode::new(node_id.clone(), self_addr, NodeFlags::Master, 0);
         state.nodes.insert(node_id, self_node);
@@ -245,6 +262,12 @@ impl ClusterState {
     /// How many slots total are assigned to any node in this cluster.
     pub fn assigned_slot_count(&self) -> usize {
         self.nodes.values().map(|n| n.slot_count()).sum()
+    }
+
+    /// Quorum: strict majority of masters required for consensus decisions.
+    pub fn quorum(&self) -> u32 {
+        let masters = self.master_count() as u32;
+        masters / 2 + 1
     }
 
     /// How many distinct master nodes are in the cluster.

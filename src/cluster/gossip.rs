@@ -294,6 +294,32 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
     }
 
     state.messages_received += 1;
+
+    // Process gossip sections for PFAIL/FAIL reports.
+    // When a peer reports another node as PFAIL (flags=2) or FAIL (flags=3),
+    // record the reporter in the target node's pfail_reports.
+    for section in &msg.gossip_sections {
+        let section_flags = section.flags;
+        if section_flags == 2 || section_flags == 3 {
+            let target_node_id = std::str::from_utf8(&section.node_id)
+                .unwrap_or("")
+                .trim_end_matches('\0')
+                .to_string();
+            if target_node_id.is_empty() || target_node_id == state.node_id {
+                continue;
+            }
+            let reporter_id = node_id_str.clone();
+            let now = now_ms();
+
+            // Insert the report
+            if let Some(target) = state.nodes.get_mut(&target_node_id) {
+                target.pfail_reports.insert(reporter_id, now);
+            }
+
+            // Check if majority consensus reached for PFAIL->FAIL
+            crate::cluster::failover::try_mark_fail_with_consensus(state, &target_node_id);
+        }
+    }
 }
 
 /// Check for PFAIL -> FAIL transitions based on ping timeout.
