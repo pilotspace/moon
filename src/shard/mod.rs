@@ -24,7 +24,8 @@ use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
-use crate::runtime::{TokioTimer, traits::{RuntimeTimer, RuntimeInterval}};
+use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
+#[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
 use crate::storage::Database;
 use crate::tracking::TrackingTable;
@@ -136,7 +137,7 @@ impl Shard {
     /// Runs cooperative active expiry. Shuts down gracefully on cancellation.
     pub async fn run(
         &mut self,
-        conn_rx: channel::MpscReceiver<tokio::net::TcpStream>,
+        conn_rx: channel::MpscReceiver<crate::runtime::TcpStream>,
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
@@ -276,19 +277,20 @@ impl Shard {
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
 
-        let mut expiry_interval = TokioTimer::interval(Duration::from_millis(100));
+        let mut expiry_interval = TimerImpl::interval(Duration::from_millis(100));
         // Periodic timer for WAL flush, snapshot advance, io_uring poll (1ms).
         // SPSC drain now uses event-driven Notify instead of polling.
-        let mut periodic_interval = TokioTimer::interval(Duration::from_millis(1));
+        let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
         // Blocking command timeout scanner -- expire timed-out blocked clients every 10ms.
-        let mut block_timeout_interval = TokioTimer::interval(Duration::from_millis(10));
+        let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
         // WAL fsync interval -- sync to disk every 1 second (everysec policy).
         // write_all() happens on every 1ms tick; fsync is deferred to this interval.
-        let mut wal_sync_interval = TokioTimer::interval(Duration::from_secs(1));
+        let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
         // Local reference to this shard's SPSC Notify (for the select! arm).
         let spsc_notify_local = spsc_notify;
 
         loop {
+            #[cfg(feature = "runtime-tokio")]
             tokio::select! {
                 // Accept new connections from listener
                 stream = conn_rx.recv_async() => {
@@ -529,6 +531,20 @@ impl Shard {
                     }
                     break;
                 }
+            }
+
+            // Monoio runtime: event loop stub. Monoio's I/O model (AsyncReadRent/
+            // AsyncWriteRent with buffer ownership transfer) requires fundamentally
+            // different connection handling. This stub compiles and shuts down cleanly.
+            #[cfg(feature = "runtime-monoio")]
+            {
+                // Wait for shutdown signal
+                shutdown.cancelled().await;
+                info!("Shard {} shutting down (monoio)", self.id);
+                if let Some(ref mut wal) = wal_writer {
+                    let _ = wal.shutdown();
+                }
+                break;
             }
         }
 

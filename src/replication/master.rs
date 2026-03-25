@@ -292,6 +292,8 @@ pub async fn wait_for_replicas(
         }
         #[cfg(feature = "runtime-tokio")]
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        #[cfg(feature = "runtime-monoio")]
+        monoio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

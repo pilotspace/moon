@@ -33,7 +33,7 @@ use std::time::Instant;
 use bytes::BytesMut;
 use tracing::{info, warn};
 
-use crate::runtime::{TokioFileIo, traits::FileIo};
+use crate::runtime::{FileIoImpl, traits::FileIo};
 use crate::storage::db::Database;
 
 /// WAL v2 format constants
@@ -79,7 +79,7 @@ impl WalWriter {
     /// Writes v2 header on fresh files.
     pub fn new(shard_id: usize, dir: &Path) -> std::io::Result<Self> {
         let file_path = wal_path(dir, shard_id);
-        let file = TokioFileIo::open_append(&file_path)?;
+        let file = FileIoImpl::open_append(&file_path)?;
 
         let write_offset = file.metadata()?.len();
         let header_written = write_offset > 0;
@@ -264,7 +264,7 @@ impl WalWriter {
         }
 
         // Open a fresh WAL file
-        let file = TokioFileIo::open_append(&self.file_path)?;
+        let file = FileIoImpl::open_append(&self.file_path)?;
         self.file = Some(file);
 
         // Reset counters

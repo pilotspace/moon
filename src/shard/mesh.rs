@@ -34,8 +34,8 @@ pub struct ChannelMesh {
     /// consumers[receiver_shard] = Vec of consumers, one per other shard.
     consumers: Vec<Vec<HeapCons<ShardMessage>>>,
     /// Connection channels: listener sends TcpStream to each shard.
-    conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>>,
-    conn_rxs: Vec<Option<channel::MpscReceiver<tokio::net::TcpStream>>>,
+    conn_txs: Vec<channel::MpscSender<crate::runtime::TcpStream>>,
+    conn_rxs: Vec<Option<channel::MpscReceiver<crate::runtime::TcpStream>>>,
     /// Per-shard Notify instances for event-driven SPSC wake.
     /// Producers call `notify_one()` after pushing to wake the target shard immediately.
     spsc_notifiers: Vec<Arc<channel::Notify>>,
@@ -116,7 +116,7 @@ impl ChannelMesh {
     /// Take the connection receiver for a specific shard (call once during setup).
     ///
     /// Panics if called more than once for the same shard.
-    pub fn take_conn_rx(&mut self, shard_id: usize) -> channel::MpscReceiver<tokio::net::TcpStream> {
+    pub fn take_conn_rx(&mut self, shard_id: usize) -> channel::MpscReceiver<crate::runtime::TcpStream> {
         self.conn_rxs[shard_id]
             .take()
             .expect("conn_rx already taken")
@@ -125,7 +125,7 @@ impl ChannelMesh {
     /// Get a clone of the connection sender for a specific shard.
     ///
     /// The listener uses this to distribute new connections to shards.
-    pub fn conn_tx(&self, shard_id: usize) -> channel::MpscSender<tokio::net::TcpStream> {
+    pub fn conn_tx(&self, shard_id: usize) -> channel::MpscSender<crate::runtime::TcpStream> {
         self.conn_txs[shard_id].clone()
     }
 
@@ -280,7 +280,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
 
             // Connect and send the stream
-            let connect = tokio::net::TcpStream::connect(addr);
+            let connect = crate::runtime::TcpStream::connect(addr);
             let accept = listener.accept();
             let (client_res, accept_res) = tokio::join!(connect, accept);
             let client = client_res.unwrap();

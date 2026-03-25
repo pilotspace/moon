@@ -22,7 +22,7 @@ use crate::cluster::ClusterState;
 /// Shared vote sender: set by gossip ticker when election starts, cleared when election ends.
 /// Bus handler forwards FailoverAuthAck votes through this channel.
 pub type SharedVoteTx =
-    Arc<tokio::sync::Mutex<Option<crate::runtime::channel::MpscSender<String>>>>;
+    Arc<parking_lot::Mutex<Option<crate::runtime::channel::MpscSender<String>>>>;
 
 /// Run the cluster bus listener loop.
 ///
@@ -164,7 +164,7 @@ async fn handle_cluster_peer(
                     .trim_end_matches('\0')
                     .to_string();
                 debug!("Received failover ACK from {}", sender_id);
-                if let Some(tx) = vote_tx.lock().await.as_ref() {
+                if let Some(tx) = vote_tx.lock().as_ref() {
                     let _ = tx.send(sender_id);
                 }
             }

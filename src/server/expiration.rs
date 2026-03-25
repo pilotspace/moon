@@ -1,19 +1,23 @@
+#[cfg(feature = "runtime-tokio")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::seq::IndexedRandom;
 use crate::runtime::cancel::CancellationToken;
+#[cfg(feature = "runtime-tokio")]
 use tracing::info;
 
 use crate::storage::Database;
 
 /// Type alias for the per-database RwLock container.
+#[cfg(feature = "runtime-tokio")]
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
 /// Run the active expiration background task.
 ///
 /// Every 100ms, iterates all databases and runs a probabilistic expiration
 /// cycle on each. Shuts down gracefully when the cancellation token fires.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_active_expiration(
     db: SharedDatabases,
     shutdown: CancellationToken,

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use rust_redis::config::ServerConfig;
 use rust_redis::persistence::aof::{self, AofMessage, FsyncPolicy};
-use rust_redis::runtime::{TokioRuntimeFactory, traits::RuntimeFactory};
+use rust_redis::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
 use rust_redis::server;
 use rust_redis::shard::mesh::{ChannelMesh, CHANNEL_BUFFER_SIZE};
 use rust_redis::shard::Shard;
@@ -62,11 +62,10 @@ fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("aof-writer".to_string())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build AOF writer runtime");
-                rt.block_on(aof::aof_writer_task(rx, aof_file_path, fsync, aof_token));
+                RuntimeFactoryImpl::block_on_local(
+                    "aof-writer".to_string(),
+                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token),
+                );
             })
             .expect("failed to spawn AOF writer thread");
         info!("AOF enabled with fsync policy: {:?}", FsyncPolicy::from_str(&config.appendfsync));
@@ -170,7 +169,7 @@ fn main() -> anyhow::Result<()> {
                     shard.restore_from_persistence(dir);
                 }
 
-                TokioRuntimeFactory::block_on_local(
+                RuntimeFactoryImpl::block_on_local(
                     format!("shard-{}", id),
                     async move {
                         shard.run(
@@ -198,88 +197,108 @@ fn main() -> anyhow::Result<()> {
         shard_handles.push(handle);
     }
 
-    // Run the sharded listener on the main thread with its own current_thread runtime
-    let listener_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build listener runtime");
-
     // Set up change counter for auto-save
     let change_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let listener_cancel = cancel_token.clone();
-    listener_rt.block_on(async {
-        // Set up auto-save timer if save rules are configured (sharded mode)
-        if config.save.is_some() {
-            let rules = rust_redis::persistence::auto_save::parse_save_rules(&config.save);
-            if !rules.is_empty() {
-                let auto_save_token = cancel_token.child_token();
-                let auto_save_counter = change_counter.clone();
-                tokio::spawn(rust_redis::persistence::auto_save::run_auto_save_sharded(
-                    rules,
-                    auto_save_counter,
-                    auto_save_token,
-                    snapshot_trigger_tx,
-                ));
-                info!("Auto-save timer started (sharded mode)");
-            }
-        }
 
-        // Start cluster bus and gossip ticker when cluster mode is enabled
-        if let Some(ref cs) = cluster_state {
-            let cluster_port = (config.port as u32 + 10000) as u16;
-            let cs_clone = cs.clone();
-            let bus_cancel = cancel_token.child_token();
-            let bind2 = config.bind.clone();
-            let self_addr: std::net::SocketAddr =
-                format!("{}:{}", config.bind, config.port).parse().unwrap();
+    // Run the sharded listener on the main thread.
+    // Under tokio: uses current_thread runtime with tokio::spawn for background tasks.
+    // Under monoio: uses monoio RuntimeFactory with simplified startup (cluster/gossip
+    //   not yet supported under monoio).
+    #[cfg(feature = "runtime-tokio")]
+    {
+        let listener_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build listener runtime");
 
-            // Shared vote channel: gossip ticker sets sender when election starts,
-            // bus handler forwards FailoverAuthAck votes through it.
-            let failover_vote_tx: rust_redis::cluster::bus::SharedVoteTx =
-                std::sync::Arc::new(tokio::sync::Mutex::new(None));
-
-            let bus_vote_tx = failover_vote_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = rust_redis::cluster::bus::run_cluster_bus(
-                    &bind2,
-                    cluster_port,
-                    self_addr,
-                    cs_clone,
-                    bus_cancel,
-                    bus_vote_tx,
-                )
-                .await
-                {
-                    tracing::error!("Cluster bus error: {}", e);
+        listener_rt.block_on(async {
+            // Set up auto-save timer if save rules are configured (sharded mode)
+            if config.save.is_some() {
+                let rules = rust_redis::persistence::auto_save::parse_save_rules(&config.save);
+                if !rules.is_empty() {
+                    let auto_save_token = cancel_token.child_token();
+                    let auto_save_counter = change_counter.clone();
+                    tokio::spawn(rust_redis::persistence::auto_save::run_auto_save_sharded(
+                        rules,
+                        auto_save_counter,
+                        auto_save_token,
+                        snapshot_trigger_tx,
+                    ));
+                    info!("Auto-save timer started (sharded mode)");
                 }
-            });
+            }
 
-            let cs_gossip = cs.clone();
-            let gossip_cancel = cancel_token.child_token();
-            let node_timeout = config.cluster_node_timeout;
-            let self_addr2: std::net::SocketAddr =
-                format!("{}:{}", config.bind, config.port).parse().unwrap();
-            let gossip_vote_tx = failover_vote_tx.clone();
-            let gossip_repl_state = repl_state.clone();
-            tokio::spawn(async move {
-                rust_redis::cluster::gossip::run_gossip_ticker(
-                    self_addr2,
-                    cs_gossip,
-                    node_timeout,
-                    gossip_cancel,
-                    gossip_vote_tx,
-                    gossip_repl_state,
-                )
-                .await;
-            });
-            info!("Cluster bus and gossip ticker started");
-        }
+            // Start cluster bus and gossip ticker when cluster mode is enabled
+            if let Some(ref cs) = cluster_state {
+                let cluster_port = (config.port as u32 + 10000) as u16;
+                let cs_clone = cs.clone();
+                let bus_cancel = cancel_token.child_token();
+                let bind2 = config.bind.clone();
+                let self_addr: std::net::SocketAddr =
+                    format!("{}:{}", config.bind, config.port).parse().unwrap();
 
-        if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel).await {
-            tracing::error!("Listener error: {}", e);
-        }
-    });
+                // Shared vote channel: gossip ticker sets sender when election starts,
+                // bus handler forwards FailoverAuthAck votes through it.
+                let failover_vote_tx: rust_redis::cluster::bus::SharedVoteTx =
+                    std::sync::Arc::new(parking_lot::Mutex::new(None));
+
+                let bus_vote_tx = failover_vote_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = rust_redis::cluster::bus::run_cluster_bus(
+                        &bind2,
+                        cluster_port,
+                        self_addr,
+                        cs_clone,
+                        bus_cancel,
+                        bus_vote_tx,
+                    )
+                    .await
+                    {
+                        tracing::error!("Cluster bus error: {}", e);
+                    }
+                });
+
+                let cs_gossip = cs.clone();
+                let gossip_cancel = cancel_token.child_token();
+                let node_timeout = config.cluster_node_timeout;
+                let self_addr2: std::net::SocketAddr =
+                    format!("{}:{}", config.bind, config.port).parse().unwrap();
+                let gossip_vote_tx = failover_vote_tx.clone();
+                let gossip_repl_state = repl_state.clone();
+                tokio::spawn(async move {
+                    rust_redis::cluster::gossip::run_gossip_ticker(
+                        self_addr2,
+                        cs_gossip,
+                        node_timeout,
+                        gossip_cancel,
+                        gossip_vote_tx,
+                        gossip_repl_state,
+                    )
+                    .await;
+                });
+                info!("Cluster bus and gossip ticker started");
+            }
+
+            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel).await {
+                tracing::error!("Listener error: {}", e);
+            }
+        });
+    }
+
+    #[cfg(feature = "runtime-monoio")]
+    {
+        // Monoio listener: simplified startup. Cluster bus and gossip not yet
+        // supported under monoio. The listener waits for shutdown.
+        RuntimeFactoryImpl::block_on_local(
+            "listener".to_string(),
+            async move {
+                info!("Monoio listener started (stub -- awaiting shutdown)");
+                listener_cancel.cancelled().await;
+            },
+        );
+    }
 
     // After listener exits, send AOF shutdown and cancel all shards
     if let Some(ref tx) = aof_tx {

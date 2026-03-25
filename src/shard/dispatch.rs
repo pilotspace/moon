@@ -33,7 +33,7 @@ pub fn extract_hash_tag(key: &[u8]) -> Option<&[u8]> {
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
     /// New TCP connection assigned to this shard by the listener.
-    NewConnection(tokio::net::TcpStream),
+    NewConnection(crate::runtime::TcpStream),
     /// Execute a single-key command on this shard, send result back.
     /// The command is wrapped in Arc to avoid deep-cloning the Frame::Array
     /// when dispatching across shards (only an Arc refcount bump instead of

@@ -2,29 +2,39 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use parking_lot::Mutex;
-use tokio::net::TcpListener;
+use crate::runtime::TcpListener;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use tracing::{debug, error, info};
 
+#[cfg(feature = "runtime-tokio")]
 use crate::command::connection as conn_cmd;
 use crate::config::ServerConfig;
+#[cfg(feature = "runtime-tokio")]
 use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
+#[cfg(feature = "runtime-tokio")]
 use crate::persistence::rdb;
+#[cfg(feature = "runtime-tokio")]
 use crate::pubsub::PubSubRegistry;
+#[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
+#[cfg(feature = "runtime-tokio")]
 use crate::tracking::TrackingTable;
 
 /// Type alias for the per-database RwLock container.
+#[cfg(feature = "runtime-tokio")]
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
+#[cfg(feature = "runtime-tokio")]
 use super::connection;
+#[cfg(feature = "runtime-tokio")]
 use super::expiration;
 
 /// Run the TCP server accept loop.
 ///
 /// Binds to the configured address, spawns a task per connection, and shuts down
 /// gracefully on Ctrl+C (SIGINT).
+#[cfg(feature = "runtime-tokio")]
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let token = CancellationToken::new();
     let shutdown_token = token.clone();
@@ -43,6 +53,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 /// This is the core server loop, factored out from `run()` for testability.
 /// Tests can create their own `CancellationToken` and cancel it to shut down
 /// the server cleanly.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_with_shutdown(
     config: ServerConfig,
     token: CancellationToken,
@@ -204,9 +215,10 @@ pub async fn run_with_shutdown(
 ///
 /// The listener runs on its own current_thread runtime (the main thread).
 /// It does NOT own any database state -- all data lives in shard threads.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_sharded(
     config: ServerConfig,
-    conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>>,
+    conn_txs: Vec<channel::MpscSender<crate::runtime::TcpStream>>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);

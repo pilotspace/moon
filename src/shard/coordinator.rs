@@ -78,7 +78,11 @@ async fn spsc_send(
             Ok(()) => return,
             Err(val) => {
                 pending = val;
+                // Yield to other tasks to avoid busy-spinning on full SPSC buffer.
+                #[cfg(feature = "runtime-tokio")]
                 tokio::task::yield_now().await;
+                #[cfg(feature = "runtime-monoio")]
+                monoio::time::sleep(std::time::Duration::from_micros(10)).await;
             }
         }
     }

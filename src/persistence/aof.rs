@@ -166,11 +166,50 @@ pub async fn aof_writer_task(
 
     #[cfg(feature = "runtime-tokio")]
     let mut writer = tokio::io::BufWriter::new(file);
+    #[cfg(feature = "runtime-tokio")]
     let mut last_fsync = Instant::now();
     #[cfg(feature = "runtime-tokio")]
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     #[cfg(feature = "runtime-tokio")]
     interval.tick().await; // consume first tick
+
+    // Monoio fallback: AOF writer uses sync I/O in a simple recv loop.
+    #[cfg(feature = "runtime-monoio")]
+    {
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&aof_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open AOF file {}: {}", aof_path.display(), e);
+                return;
+            }
+        };
+        loop {
+            // Use blocking recv since monoio doesn't support tokio::select!
+            match rx.recv() {
+                Ok(AofMessage::Append(data)) => {
+                    let _ = file.write_all(&data);
+                    if fsync == FsyncPolicy::Always {
+                        let _ = file.flush();
+                        let _ = std::io::Write::flush(&mut file);
+                    }
+                }
+                Ok(AofMessage::Shutdown) | Err(_) => {
+                    let _ = file.flush();
+                    info!("AOF writer shutting down (monoio)");
+                    break;
+                }
+                Ok(AofMessage::Rewrite(_db)) => {
+                    // AOF rewrite under monoio: not yet implemented
+                }
+            }
+        }
+        return;
+    }
 
     loop {
         #[cfg(feature = "runtime-tokio")]
@@ -515,6 +554,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// Rewrite the AOF file with synthetic commands from current database state.
 ///
 /// Writes to a temporary file first, then atomically renames for crash safety.
+#[cfg(feature = "runtime-tokio")]
 pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result<()> {
     // Clone database state: lock each db individually with read lock
     let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db

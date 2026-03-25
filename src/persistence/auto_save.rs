@@ -81,6 +81,28 @@ pub async fn run_auto_save(
                 break;
             }
         }
+
+        #[cfg(feature = "runtime-monoio")]
+        {
+            use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+            let sleep = TimerImpl::sleep(std::time::Duration::from_secs(1));
+            sleep.await;
+            let elapsed = last_save.elapsed().as_secs();
+            let changes = change_counter.load(Ordering::Relaxed);
+            let should_save = rules.iter().any(|&(secs, threshold)| {
+                elapsed >= secs && changes >= threshold
+            });
+            if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+                info!("Auto-save triggered: {} changes in {}s", changes, elapsed);
+                let _ = bgsave_start(db.clone(), dir.clone(), dbfilename.clone());
+                change_counter.store(0, Ordering::Relaxed);
+                last_save = Instant::now();
+            }
+            if cancel.is_cancelled() {
+                info!("Auto-save task shutting down");
+                break;
+            }
+        }
     }
 }
 
@@ -120,6 +142,29 @@ pub async fn run_auto_save_sharded(
                 }
             }
             _ = cancel.cancelled() => {
+                info!("Auto-save task shutting down");
+                break;
+            }
+        }
+
+        #[cfg(feature = "runtime-monoio")]
+        {
+            use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+            let sleep = TimerImpl::sleep(std::time::Duration::from_secs(1));
+            sleep.await;
+            let elapsed = last_save.elapsed().as_secs();
+            let changes = change_counter.load(Ordering::Relaxed);
+            let should_save = rules.iter().any(|&(secs, threshold)| {
+                elapsed >= secs && changes >= threshold
+            });
+            if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+                let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+                info!("Auto-save triggered: {} changes in {}s, epoch {}", changes, elapsed, epoch);
+                let _ = snapshot_trigger.send(epoch);
+                change_counter.store(0, Ordering::Relaxed);
+                last_save = Instant::now();
+            }
+            if cancel.is_cancelled() {
                 info!("Auto-save task shutting down");
                 break;
             }

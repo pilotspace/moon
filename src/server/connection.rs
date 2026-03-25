@@ -10,7 +10,8 @@ use std::sync::{Arc, RwLock};
 use parking_lot::Mutex;
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
-use tokio::net::TcpStream;
+use crate::runtime::TcpStream;
+#[cfg(feature = "runtime-tokio")]
 use tokio_util::codec::Framed;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
@@ -92,6 +93,7 @@ fn apply_resp3_conversion(cmd: &[u8], response: Frame, proto: u8) -> Frame {
 /// into a batch, executes them under a single lock acquisition, then writes all
 /// responses outside the lock. This reduces lock acquisitions from N per pipeline
 /// to 1 per batch cycle.
+#[cfg(feature = "runtime-tokio")]
 pub async fn handle_connection(
     stream: TcpStream,
     db: SharedDatabases,
@@ -1326,6 +1328,7 @@ fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
 ///
 /// Connection-level commands (AUTH, SUBSCRIBE, MULTI/EXEC) are handled at the
 /// connection level same as the non-sharded handler.
+#[cfg(feature = "runtime-tokio")]
 pub async fn handle_connection_sharded(
     stream: TcpStream,
     databases: Rc<RefCell<Vec<Database>>>,
@@ -2453,6 +2456,7 @@ fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
 ///    first-wakeup-wins, BlockCancel cleanup on completion/timeout/shutdown.
 ///
 /// CRITICAL: RefCell borrows MUST be dropped before any .await point.
+#[cfg(feature = "runtime-tokio")]
 async fn handle_blocking_command(
     cmd: &[u8],
     args: &[Frame],

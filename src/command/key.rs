@@ -530,7 +530,12 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
             if let Some(entry) = db.remove(key) {
                 count += 1;
                 if should_async_drop(&entry) {
+                    // Async drop for large collections: spawn a blocking
+                    // task to avoid holding the event loop.
+                    #[cfg(feature = "runtime-tokio")]
                     tokio::task::spawn_blocking(move || drop(entry));
+                    #[cfg(feature = "runtime-monoio")]
+                    drop(entry);
                 }
                 // Small values drop normally (entry goes out of scope)
             }

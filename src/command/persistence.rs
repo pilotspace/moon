@@ -64,6 +64,7 @@ pub fn bgsave_start(
 
     let path = PathBuf::from(dir).join(dbfilename);
 
+    #[cfg(feature = "runtime-tokio")]
     tokio::task::spawn_blocking(move || {
         match rdb::save_from_snapshot(&snapshot, &path) {
             Ok(()) => {
@@ -75,6 +76,22 @@ pub fn bgsave_start(
         }
         SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
     });
+
+    #[cfg(feature = "runtime-monoio")]
+    {
+        // Monoio: synchronous save (no spawn_blocking available).
+        // This blocks the current thread but is acceptable for the monoio
+        // thread-per-core model where persistence is a rare operation.
+        match rdb::save_from_snapshot(&snapshot, &path) {
+            Ok(()) => {
+                info!("Background RDB save completed: {}", path.display());
+            }
+            Err(e) => {
+                error!("Background RDB save failed: {}", e);
+            }
+        }
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
 
     Frame::SimpleString(Bytes::from_static(b"Background saving started"))
 }

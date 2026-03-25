@@ -390,7 +390,7 @@ pub async fn run_gossip_ticker(
                                 {
                                     // Use try_lock to avoid holding std RwLock across await
                                     // We're in a sync context here so blocking_lock is safe
-                                    let mut guard = vote_tx.blocking_lock();
+                                    let mut guard = vote_tx.lock();
                                     *guard = Some(tx);
                                 }
                                 let cs_election = cluster_state.clone();
@@ -402,7 +402,7 @@ pub async fn run_gossip_ticker(
                                         cs_election, sa, offset, rx,
                                     ).await;
                                     // Clear vote_tx when election ends
-                                    *vtx.lock().await = None;
+                                    *vtx.lock() = None;
                                 });
                             }
                         }
