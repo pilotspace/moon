@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use tracing::info;
 
+use crate::runtime::{TokioFileIo, traits::FileIo};
 use crate::storage::db::Database;
 
 /// Per-shard WAL writer with batched fsync.
@@ -44,10 +45,7 @@ impl WalWriter {
     /// Opens file in append+create mode. Pre-allocates 8KB buffer.
     pub fn new(shard_id: usize, dir: &Path) -> std::io::Result<Self> {
         let file_path = wal_path(dir, shard_id);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
+        let file = TokioFileIo::open_append(&file_path)?;
 
         let write_offset = file.metadata()?.len();
 
@@ -155,10 +153,7 @@ impl WalWriter {
         }
 
         // Open a fresh WAL file
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_path)?;
+        let file = TokioFileIo::open_append(&self.file_path)?;
         self.file = Some(file);
 
         // Reset counters
