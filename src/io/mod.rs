@@ -1,4 +1,5 @@
 pub mod static_responses;
+#[cfg(feature = "runtime-tokio")]
 pub mod tokio_driver;
 
 #[cfg(target_os = "linux")]
