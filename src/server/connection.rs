@@ -2091,6 +2091,7 @@ pub async fn handle_connection_sharded(
                             selected_db,
                             &databases,
                             &dispatch_tx,
+                            &spsc_notifiers,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2103,6 +2104,7 @@ pub async fn handle_connection_sharded(
                             selected_db,
                             &databases,
                             &dispatch_tx,
+                            &spsc_notifiers,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2114,6 +2116,7 @@ pub async fn handle_connection_sharded(
                             selected_db,
                             &databases,
                             &dispatch_tx,
+                            &spsc_notifiers,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2129,6 +2132,7 @@ pub async fn handle_connection_sharded(
                             selected_db,
                             &databases,
                             &dispatch_tx,
+                            &spsc_notifiers,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2959,7 +2963,7 @@ pub async fn handle_connection_sharded_monoio(
                 if cmd.eq_ignore_ascii_case(b"KEYS") {
                     let response = crate::shard::coordinator::coordinate_keys(
                         cmd_args, shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx,
+                        &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
                     codec.encode_frame(&response, &mut write_buf);
                     continue;
@@ -2967,7 +2971,7 @@ pub async fn handle_connection_sharded_monoio(
                 if cmd.eq_ignore_ascii_case(b"SCAN") {
                     let response = crate::shard::coordinator::coordinate_scan(
                         cmd_args, shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx,
+                        &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
                     codec.encode_frame(&response, &mut write_buf);
                     continue;
@@ -2975,7 +2979,7 @@ pub async fn handle_connection_sharded_monoio(
                 if cmd.eq_ignore_ascii_case(b"DBSIZE") {
                     let response = crate::shard::coordinator::coordinate_dbsize(
                         shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx,
+                        &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
                     codec.encode_frame(&response, &mut write_buf);
                     continue;
@@ -2985,7 +2989,7 @@ pub async fn handle_connection_sharded_monoio(
                 if is_multi_key_command(cmd, cmd_args) {
                     let response = crate::shard::coordinator::coordinate_multi_key(
                         cmd, cmd_args, shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx,
+                        &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
                     codec.encode_frame(&response, &mut write_buf);
                     continue;

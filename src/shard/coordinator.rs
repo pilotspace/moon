@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ringbuf::traits::Producer;
@@ -32,11 +33,12 @@ pub async fn coordinate_multi_key(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
-        coordinate_mget(args, my_shard, num_shards, db_index, databases, dispatch_tx).await
+        coordinate_mget(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers).await
     } else if cmd.eq_ignore_ascii_case(b"MSET") {
-        coordinate_mset(args, my_shard, num_shards, db_index, databases, dispatch_tx).await
+        coordinate_mset(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers).await
     } else {
         // DEL, UNLINK, EXISTS with multiple keys
         coordinate_multi_del_or_exists(
@@ -47,6 +49,7 @@ pub async fn coordinate_multi_key(
             db_index,
             databases,
             dispatch_tx,
+            spsc_notifiers,
         )
         .await
     }
@@ -61,11 +64,15 @@ fn extract_key(frame: &Frame) -> Option<Bytes> {
 }
 
 /// Send a ShardMessage via SPSC with spin-retry on full buffer.
+///
+/// Calls `notify_one()` on the target shard's notifier after successful push
+/// for immediate wake (avoids relying on the 1ms periodic timer safety net).
 async fn spsc_send(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     my_shard: usize,
     target_shard: usize,
     msg: ShardMessage,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) {
     let target_idx = ChannelMesh::target_index(my_shard, target_shard);
     let mut pending = msg;
@@ -75,7 +82,10 @@ async fn spsc_send(
             producers[target_idx].try_push(pending)
         }; // borrow dropped before yield
         match push_result {
-            Ok(()) => return,
+            Ok(()) => {
+                spsc_notifiers[target_shard].notify_one();
+                return;
+            }
             Err(val) => {
                 pending = val;
                 // Yield to other tasks to avoid busy-spinning on full SPSC buffer.
@@ -100,6 +110,7 @@ async fn coordinate_mget(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -164,7 +175,7 @@ async fn coordinate_mget(
                 commands,
                 reply_tx: tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg).await;
+            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_rxs.push((original_indices, rx));
         }
     }
@@ -207,6 +218,7 @@ async fn coordinate_mset(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     if args.is_empty() || args.len() % 2 != 0 {
         return Frame::Error(Bytes::from_static(
@@ -271,7 +283,7 @@ async fn coordinate_mset(
                 commands,
                 reply_tx: tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg).await;
+            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_rxs.push(rx);
         }
     }
@@ -295,6 +307,7 @@ async fn coordinate_multi_del_or_exists(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     let cmd_upper = cmd.to_ascii_uppercase();
 
@@ -352,7 +365,7 @@ async fn coordinate_multi_del_or_exists(
                 commands,
                 reply_tx: tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg).await;
+            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_rxs.push(rx);
         }
     }
@@ -380,6 +393,7 @@ pub async fn coordinate_keys(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -420,7 +434,7 @@ pub async fn coordinate_keys(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx: tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg).await;
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_rxs.push(rx);
     }
 
@@ -447,6 +461,7 @@ pub async fn coordinate_scan(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -503,7 +518,7 @@ pub async fn coordinate_scan(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx: tx,
         };
-        spsc_send(dispatch_tx, my_shard, target_shard_id, msg).await;
+        spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
         match rx.await {
             Ok(f) => f,
             Err(_) => Frame::Error(Bytes::from_static(b"ERR cross-shard scan failed")),
@@ -558,6 +573,7 @@ pub async fn coordinate_dbsize(
     db_index: usize,
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
     let mut total: i64 = 0;
     let mut pending_rxs: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
@@ -580,7 +596,7 @@ pub async fn coordinate_dbsize(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx: tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg).await;
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_rxs.push(rx);
     }
 
@@ -654,8 +670,9 @@ mod tests {
         ];
 
         // With num_shards=1, all keys are local
+        let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let result =
-            coordinate_mget(&args, 0, 1, 0, &databases, &dispatch_tx).await;
+            coordinate_mget(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers).await;
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 2);
@@ -680,7 +697,8 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"20")),
         ];
 
-        let result = coordinate_mset(&args, 0, 1, 0, &databases, &dispatch_tx).await;
+        let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
+        let result = coordinate_mset(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers).await;
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify keys were set
@@ -707,8 +725,9 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"nonexistent")),
         ];
 
+        let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let result =
-            coordinate_multi_del_or_exists(b"DEL", &args, 0, 1, 0, &databases, &dispatch_tx).await;
+            coordinate_multi_del_or_exists(b"DEL", &args, 0, 1, 0, &databases, &dispatch_tx, &notifiers).await;
         assert_eq!(result, Frame::Integer(2)); // a and b deleted, nonexistent = 0
     }
 }
