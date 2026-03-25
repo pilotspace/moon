@@ -30,7 +30,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use tracing::info;
+use bytes::BytesMut;
+use tracing::{info, warn};
 
 use crate::runtime::{TokioFileIo, traits::FileIo};
 use crate::storage::db::Database;
@@ -307,14 +308,152 @@ impl WalWriter {
 
 /// Replay a per-shard WAL file into the given databases.
 ///
-/// Uses the same RESP parsing and command dispatch as `aof::replay_aof`.
-/// Returns the number of commands successfully replayed.
+/// Auto-detects v1 (raw RESP) vs v2 (RRDWAL header + CRC32 block framing) format
+/// by checking whether the first 6 bytes match the WAL_MAGIC signature.
 ///
-/// NOTE: This replay function only understands v1 (raw RESP) format.
-/// Plan 02 will implement v2-aware replay that understands block framing.
+/// Returns the number of commands successfully replayed.
 pub fn replay_wal(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
-    // Delegate to aof::replay_aof since the format is identical (RESP wire format)
-    crate::persistence::aof::replay_aof(databases, path)
+    let data = std::fs::read(path)?;
+    if data.is_empty() {
+        return Ok(0);
+    }
+    // Auto-detect: check if first 6 bytes match WAL_MAGIC
+    if data.len() >= WAL_HEADER_SIZE && &data[..6] == WAL_MAGIC {
+        replay_wal_v2(databases, &data)
+    } else {
+        // V1 fallback: delegate to AOF replay (raw RESP)
+        crate::persistence::aof::replay_aof(databases, path)
+    }
+}
+
+/// Replay a WAL v2 file from an in-memory byte slice.
+///
+/// Parses the 32-byte header, then iterates over CRC32-checksummed block frames.
+/// Stops on first corrupted or truncated block, returning commands replayed so far.
+fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize> {
+    // Parse and validate header
+    if data.len() < WAL_HEADER_SIZE {
+        anyhow::bail!("WAL v2 file too short for header");
+    }
+    let version = data[6];
+    if version != WAL_VERSION {
+        anyhow::bail!("Unsupported WAL version: {}", version);
+    }
+    let shard_id = u16::from_le_bytes([data[7], data[8]]);
+    let epoch = u64::from_le_bytes(data[9..17].try_into().unwrap());
+    info!("Replaying WAL v2: shard={}, epoch={}", shard_id, epoch);
+
+    let mut offset = WAL_HEADER_SIZE;
+    let mut total_commands: usize = 0;
+    let config = crate::protocol::ParseConfig::default();
+    let db_count = databases.len();
+    let mut selected_db: usize = 0;
+
+    while offset < data.len() {
+        // Need at least 4 bytes for block_len
+        if offset + 4 > data.len() {
+            warn!("WAL v2: truncated block_len at offset {}, stopping", offset);
+            break;
+        }
+        let block_len =
+            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        // Minimum block content: cmd_count(2) + db_idx(1) + crc32(4) = 7
+        if block_len < 7 {
+            warn!(
+                "WAL v2: invalid block_len {} at offset {}, stopping",
+                block_len,
+                offset - 4
+            );
+            break;
+        }
+        if offset + block_len > data.len() {
+            warn!(
+                "WAL v2: block extends past EOF at offset {}, stopping",
+                offset - 4
+            );
+            break;
+        }
+
+        let block_data = &data[offset..offset + block_len];
+
+        // Extract fields
+        let payload_len = block_len - 7; // minus cmd_count(2) + db_idx(1) + crc32(4)
+        let payload = &block_data[3..3 + payload_len];
+        let stored_crc =
+            u32::from_le_bytes(block_data[block_len - 4..block_len].try_into().unwrap());
+
+        // Verify CRC: covers cmd_count(2B) + db_idx(1B) + payload
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&block_data[0..3]); // cmd_count + db_idx
+        hasher.update(payload);
+        let computed_crc = hasher.finalize();
+
+        if computed_crc != stored_crc {
+            warn!(
+                "WAL v2: CRC mismatch at offset {} (stored={:#010x}, computed={:#010x}), \
+                 stopping replay after {} commands",
+                offset - 4,
+                stored_crc,
+                computed_crc,
+                total_commands
+            );
+            break; // Stop on first corrupted block -- ordering matters
+        }
+
+        // Parse RESP commands from payload
+        let mut buf = BytesMut::from(payload);
+
+        while !buf.is_empty() {
+            match crate::protocol::parse::parse(&mut buf, &config) {
+                Ok(Some(frame)) => {
+                    let (cmd, cmd_args) = match &frame {
+                        crate::protocol::Frame::Array(arr) if !arr.is_empty() => {
+                            let name = match &arr[0] {
+                                crate::protocol::Frame::BulkString(s) => s.as_ref(),
+                                crate::protocol::Frame::SimpleString(s) => s.as_ref(),
+                                _ => {
+                                    total_commands += 1;
+                                    continue;
+                                }
+                            };
+                            (name as &[u8], &arr[1..])
+                        }
+                        _ => {
+                            total_commands += 1;
+                            continue;
+                        }
+                    };
+                    let _ = crate::command::dispatch(
+                        &mut databases[selected_db],
+                        cmd,
+                        cmd_args,
+                        &mut selected_db,
+                        db_count,
+                    );
+                    total_commands += 1;
+                }
+                Ok(None) => {
+                    if !buf.is_empty() {
+                        warn!(
+                            "WAL v2: truncated RESP in block at offset {}",
+                            offset - 4
+                        );
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!("WAL v2: RESP parse error in block: {}", e);
+                    break;
+                }
+            }
+        }
+
+        offset += block_len;
+    }
+
+    Ok(total_commands)
 }
 
 /// Construct the WAL file path for a given shard.
@@ -374,7 +513,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Plan 02 implements v2 replay
     fn test_wal_replay_round_trip() {
         let dir = tempdir().unwrap();
         let mut writer = WalWriter::new(0, dir.path()).unwrap();
@@ -497,7 +635,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Plan 02 implements v2 replay
     fn test_wal_replay_with_collections() {
         let dir = tempdir().unwrap();
         let mut writer = WalWriter::new(0, dir.path()).unwrap();
@@ -605,5 +742,140 @@ mod tests {
 
         // Verify payload is the original RESP data
         assert_eq!(payload, &data[..]);
+    }
+
+    #[test]
+    fn test_wal_v1_backward_compat() {
+        // Write raw RESP bytes (v1 format -- no header, no framing)
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shard-0.wal");
+
+        let cmd1 = make_command(&[b"SET", b"oldkey1", b"oldval1"]);
+        let cmd2 = make_command(&[b"SET", b"oldkey2", b"oldval2"]);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&serialize_to_bytes(&cmd1));
+        raw.extend_from_slice(&serialize_to_bytes(&cmd2));
+        std::fs::write(&path, &raw).unwrap();
+
+        // replay_wal should auto-detect v1 (no RRDWAL magic) and delegate to replay_aof
+        let mut dbs = vec![Database::new()];
+        let count = replay_wal(&mut dbs, &path).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            dbs[0].get(b"oldkey1").unwrap().value.as_bytes().unwrap(),
+            b"oldval1"
+        );
+        assert_eq!(
+            dbs[0].get(b"oldkey2").unwrap().value.as_bytes().unwrap(),
+            b"oldval2"
+        );
+    }
+
+    #[test]
+    fn test_wal_v2_corruption_stops_replay() {
+        let dir = tempdir().unwrap();
+        let mut writer = WalWriter::new(0, dir.path()).unwrap();
+
+        // Block 1: 3 SET commands
+        let cmd1 = make_command(&[b"SET", b"key1", b"val1"]);
+        let cmd2 = make_command(&[b"SET", b"key2", b"val2"]);
+        let cmd3 = make_command(&[b"SET", b"key3", b"val3"]);
+        writer.append(&serialize_command(&cmd1));
+        writer.append(&serialize_command(&cmd2));
+        writer.append(&serialize_command(&cmd3));
+        writer.flush_if_needed().unwrap();
+
+        // Block 2: 2 SET commands
+        let cmd4 = make_command(&[b"SET", b"key4", b"val4"]);
+        let cmd5 = make_command(&[b"SET", b"key5", b"val5"]);
+        writer.append(&serialize_command(&cmd4));
+        writer.append(&serialize_command(&cmd5));
+        writer.flush_sync().unwrap();
+
+        // Read the file and corrupt the CRC of the second block
+        let mut data = std::fs::read(writer.path()).unwrap();
+
+        // Find second block: after header(32) + first block(4 + block_len)
+        let first_block_len = u32::from_le_bytes(
+            data[WAL_HEADER_SIZE..WAL_HEADER_SIZE + 4].try_into().unwrap(),
+        ) as usize;
+        let second_block_start = WAL_HEADER_SIZE + 4 + first_block_len;
+        let second_block_len = u32::from_le_bytes(
+            data[second_block_start..second_block_start + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        // Flip a byte in the CRC of the second block (last 4 bytes of block content)
+        let crc_offset = second_block_start + 4 + second_block_len - 4;
+        data[crc_offset] ^= 0xFF;
+
+        // Write corrupted data to a new file
+        let corrupted_path = dir.path().join("corrupted.wal");
+        std::fs::write(&corrupted_path, &data).unwrap();
+
+        // Replay should stop after first block (3 commands)
+        let mut dbs = vec![Database::new()];
+        let count = replay_wal(&mut dbs, &corrupted_path).unwrap();
+        assert_eq!(count, 3, "should replay only first block's 3 commands");
+
+        // Keys from block 1 should be set
+        assert_eq!(
+            dbs[0].get(b"key1").unwrap().value.as_bytes().unwrap(),
+            b"val1"
+        );
+        assert_eq!(
+            dbs[0].get(b"key2").unwrap().value.as_bytes().unwrap(),
+            b"val2"
+        );
+        assert_eq!(
+            dbs[0].get(b"key3").unwrap().value.as_bytes().unwrap(),
+            b"val3"
+        );
+
+        // Keys from block 2 should NOT be set (corruption stopped replay)
+        assert!(dbs[0].get(b"key4").is_none(), "key4 should not exist");
+        assert!(dbs[0].get(b"key5").is_none(), "key5 should not exist");
+    }
+
+    #[test]
+    fn test_wal_v2_truncated_block_stops() {
+        let dir = tempdir().unwrap();
+        let mut writer = WalWriter::new(0, dir.path()).unwrap();
+
+        // Write one valid block
+        let cmd = make_command(&[b"SET", b"tkey", b"tval"]);
+        writer.append(&serialize_command(&cmd));
+        writer.flush_sync().unwrap();
+
+        // Read file and truncate mid-way through what would be a second block
+        let mut data = std::fs::read(writer.path()).unwrap();
+        // Append a partial block: block_len says 100, but only provide 5 bytes of content
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 5]);
+
+        let truncated_path = dir.path().join("truncated.wal");
+        std::fs::write(&truncated_path, &data).unwrap();
+
+        // Replay should return the 1 command from the valid first block
+        let mut dbs = vec![Database::new()];
+        let count = replay_wal(&mut dbs, &truncated_path).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            dbs[0].get(b"tkey").unwrap().value.as_bytes().unwrap(),
+            b"tval"
+        );
+    }
+
+    #[test]
+    fn test_wal_v2_empty_after_header() {
+        let dir = tempdir().unwrap();
+        let _writer = WalWriter::new(0, dir.path()).unwrap();
+
+        // Writer creates file with just the 32-byte header (no appends, no flush)
+        let path = wal_path(dir.path(), 0);
+        let mut dbs = vec![Database::new()];
+        let count = replay_wal(&mut dbs, &path).unwrap();
+        assert_eq!(count, 0);
     }
 }
