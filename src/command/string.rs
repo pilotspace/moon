@@ -35,8 +35,8 @@ pub fn get(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GET"),
     };
     match db.get(key) {
-        Some(entry) => match entry.value.as_bytes() {
-            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+        Some(entry) => match entry.value.as_bytes_owned() {
+            Some(v) => Frame::BulkString(v),
             None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
@@ -144,8 +144,8 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Get old value if needed
     let old_value = if get_old {
-        db.get(&key).map(|e| match e.value.as_bytes() {
-            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+        db.get(&key).map(|e| match e.value.as_bytes_owned() {
+            Some(v) => Frame::BulkString(v),
             None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         })
     } else {
@@ -222,8 +222,8 @@ pub fn mget(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
         match db.get(key) {
-            Some(entry) => match entry.value.as_bytes() {
-                Some(v) => results.push(Frame::BulkString(Bytes::copy_from_slice(v))),
+            Some(entry) => match entry.value.as_bytes_owned() {
+                Some(v) => results.push(Frame::BulkString(v)),
                 None => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),
@@ -470,8 +470,8 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
         Some(entry) => {
             let expiry = entry.expires_at_ms(base_ts);
-            match entry.value.as_bytes() {
-                Some(v) => (Some(Bytes::copy_from_slice(v)), expiry),
+            match entry.value.as_bytes_owned() {
+                Some(v) => (Some(v), expiry),
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -620,8 +620,8 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GETSET"),
     };
 
-    let old = db.get(&key).map(|e| match e.value.as_bytes() {
-        Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+    let old = db.get(&key).map(|e| match e.value.as_bytes_owned() {
+        Some(v) => Frame::BulkString(v),
         None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
     });
 
@@ -641,8 +641,8 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GETDEL"),
     };
     match db.remove(key) {
-        Some(entry) => match entry.value.as_bytes() {
-            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+        Some(entry) => match entry.value.as_bytes_owned() {
+            Some(v) => Frame::BulkString(v),
             None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
@@ -661,8 +661,8 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
 
     // First, get value (returns None if key doesn't exist or expired)
     let value = match db.get(&key) {
-        Some(entry) => match entry.value.as_bytes() {
-            Some(v) => Bytes::copy_from_slice(v),
+        Some(entry) => match entry.value.as_bytes_owned() {
+            Some(v) => v,
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -807,8 +807,8 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("GET"),
     };
     match db.get_if_alive(key, now_ms) {
-        Some(entry) => match entry.value.as_bytes() {
-            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+        Some(entry) => match entry.value.as_bytes_owned() {
+            Some(v) => Frame::BulkString(v),
             None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
         },
         None => Frame::Null,
@@ -830,8 +830,8 @@ pub fn mget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             }
         };
         match db.get_if_alive(key, now_ms) {
-            Some(entry) => match entry.value.as_bytes() {
-                Some(v) => results.push(Frame::BulkString(Bytes::copy_from_slice(v))),
+            Some(entry) => match entry.value.as_bytes_owned() {
+                Some(v) => results.push(Frame::BulkString(v)),
                 None => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),

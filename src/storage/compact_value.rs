@@ -236,6 +236,26 @@ impl CompactValue {
         }
     }
 
+    /// Fast path: get string bytes as owned Bytes.
+    /// For heap strings, this clones the Bytes (Arc refcount bump, no memcpy).
+    /// For inline SSO strings (<=12 bytes), this copies from the inline buffer.
+    /// Returns None for non-string types.
+    pub fn as_bytes_owned(&self) -> Option<Bytes> {
+        if self.is_inline() {
+            let len = self.inline_len();
+            Some(Bytes::copy_from_slice(&self.payload[..len]))
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: pointer created via Box::into_raw, not yet freed
+            let rv = unsafe { &*self.heap_raw_ptr() };
+            match rv {
+                RedisValue::String(s) => Some(s.clone()), // Arc bump, NOT memcpy
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Get a mutable reference to the underlying heap RedisValue.
     /// Returns None for inline (SSO) values.
     pub fn as_redis_value_mut(&mut self) -> Option<&mut RedisValue> {
