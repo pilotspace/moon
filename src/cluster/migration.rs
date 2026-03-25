@@ -193,8 +193,8 @@ pub fn handle_get_keys_in_slot(
         if result.len() >= count {
             break;
         }
-        if slot_for_key(key) == slot {
-            result.push(Bytes::copy_from_slice(key));
+        if slot_for_key(key.as_bytes()) == slot {
+            result.push(Bytes::copy_from_slice(key.as_bytes()));
         }
     }
     result

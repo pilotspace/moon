@@ -23,7 +23,7 @@ pub mod iter;
 pub mod segment;
 pub mod simd;
 
-use bytes::Bytes;
+use super::compact_key::CompactKey;
 
 use iter::{Iter, IterMut, Keys, Values};
 use segment::{h2, home_buckets, InsertResult, Segment};
@@ -60,7 +60,7 @@ pub struct DashTable<K, V> {
     len: usize,
 }
 
-impl<V> DashTable<Bytes, V> {
+impl<V> DashTable<CompactKey, V> {
     /// Create a new empty DashTable with one segment.
     pub fn new() -> Self {
         DashTable {
@@ -121,7 +121,7 @@ impl<V> DashTable<Bytes, V> {
     /// # Panics
     /// Panics if `idx >= segment_count()`.
     #[inline]
-    pub fn segment(&self, idx: usize) -> &Segment<Bytes, V> {
+    pub fn segment(&self, idx: usize) -> &Segment<CompactKey, V> {
         &self.segments[idx]
     }
 
@@ -160,8 +160,8 @@ impl<V> DashTable<Bytes, V> {
     }
 
     /// Insert a key-value pair. Returns `Some(old_value)` if the key existed.
-    pub fn insert(&mut self, key: Bytes, value: V) -> Option<V> {
-        let hash = hash_key(&key);
+    pub fn insert(&mut self, key: CompactKey, value: V) -> Option<V> {
+        let hash = hash_key(key.as_ref());
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
         let h2_val = h2(hash);
@@ -201,7 +201,7 @@ impl<V> DashTable<Bytes, V> {
 
     /// Remove a key and return both key and value.
     #[allow(dead_code)]
-    pub fn remove_entry(&mut self, key: &[u8]) -> Option<(Bytes, V)> {
+    pub fn remove_entry(&mut self, key: &[u8]) -> Option<(CompactKey, V)> {
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
@@ -217,27 +217,27 @@ impl<V> DashTable<Bytes, V> {
     }
 
     /// Return an iterator over `(&Bytes, &V)` pairs.
-    pub fn iter(&self) -> Iter<'_, Bytes, V> {
-        let segments: Vec<&Segment<Bytes, V>> =
+    pub fn iter(&self) -> Iter<'_, CompactKey, V> {
+        let segments: Vec<&Segment<CompactKey, V>> =
             self.segments.iter().map(|s| &**s).collect();
         Iter::new(segments, self.len)
     }
 
     /// Return a mutable iterator over `(&Bytes, &mut V)` pairs.
-    pub fn iter_mut(&mut self) -> IterMut<'_, Bytes, V> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, CompactKey, V> {
         let total = self.len;
-        let segments: Vec<&mut Segment<Bytes, V>> =
+        let segments: Vec<&mut Segment<CompactKey, V>> =
             self.segments.iter_mut().map(|s| &mut **s).collect();
         IterMut::new(segments, total)
     }
 
     /// Return an iterator over keys.
-    pub fn keys(&self) -> Keys<'_, Bytes, V> {
+    pub fn keys(&self) -> Keys<'_, CompactKey, V> {
         Keys(self.iter())
     }
 
     /// Return an iterator over values.
-    pub fn values(&self) -> Values<'_, Bytes, V> {
+    pub fn values(&self) -> Values<'_, CompactKey, V> {
         Values(self.iter())
     }
 
@@ -249,7 +249,7 @@ impl<V> DashTable<Bytes, V> {
     /// 3. Update directory entries to point to the new segment
     fn split_segment(&mut self, dir_idx: usize) {
         let seg_store_idx = self.directory[dir_idx];
-        let hasher = |k: &Bytes| hash_key(k);
+        let hasher = |k: &CompactKey| hash_key(k.as_ref());
         let new_seg = self.segments[seg_store_idx].split(&hasher);
         let new_depth = new_seg.depth();
 
@@ -290,9 +290,9 @@ impl<V> DashTable<Bytes, V> {
     }
 }
 
-impl<'a, V> IntoIterator for &'a DashTable<Bytes, V> {
-    type Item = (&'a Bytes, &'a V);
-    type IntoIter = Iter<'a, Bytes, V>;
+impl<'a, V> IntoIterator for &'a DashTable<CompactKey, V> {
+    type Item = (&'a CompactKey, &'a V);
+    type IntoIter = Iter<'a, CompactKey, V>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -303,7 +303,6 @@ impl<'a, V> IntoIterator for &'a DashTable<Bytes, V> {
 mod tests {
     use super::*;
     use super::segment::TOTAL_SLOTS;
-    use bytes::Bytes;
 
     fn test_value(n: u32) -> String {
         format!("value_{}", n)
@@ -311,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_new_empty() {
-        let table: DashTable<Bytes, String> = DashTable::new();
+        let table: DashTable<CompactKey, String> = DashTable::new();
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
         assert_eq!(table.get(b"anything"), None);
@@ -319,10 +318,10 @@ mod tests {
 
     #[test]
     fn test_insert_and_get() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
 
         for i in 0..10 {
-            let key = Bytes::from(format!("key_{}", i));
+            let key = CompactKey::from(format!("key_{}", i));
             let val = test_value(i);
             assert_eq!(table.insert(key, val), None);
         }
@@ -338,8 +337,8 @@ mod tests {
 
     #[test]
     fn test_insert_replace() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
-        let key = Bytes::from("mykey");
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        let key = CompactKey::from("mykey");
 
         assert_eq!(table.insert(key.clone(), "first".into()), None);
         assert_eq!(table.len(), 1);
@@ -353,8 +352,8 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
-        let key = Bytes::from("remove_me");
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        let key = CompactKey::from("remove_me");
         table.insert(key.clone(), "value".into());
         assert_eq!(table.len(), 1);
 
@@ -368,8 +367,8 @@ mod tests {
 
     #[test]
     fn test_contains_key() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
-        let key = Bytes::from("exists");
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        let key = CompactKey::from("exists");
         table.insert(key.clone(), "yes".into());
         assert!(table.contains_key(b"exists"));
         assert!(!table.contains_key(b"nope"));
@@ -380,18 +379,18 @@ mod tests {
 
     #[test]
     fn test_keys_iter() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         let mut expected_keys: Vec<String> = Vec::new();
 
         for i in 0..5 {
-            let key = Bytes::from(format!("k{}", i));
+            let key = CompactKey::from(format!("k{}", i));
             expected_keys.push(format!("k{}", i));
             table.insert(key, test_value(i));
         }
 
         let mut actual_keys: Vec<String> = table
             .keys()
-            .map(|k| String::from_utf8_lossy(k).to_string())
+            .map(|k| String::from_utf8_lossy(k.as_bytes()).to_string())
             .collect();
         actual_keys.sort();
         expected_keys.sort();
@@ -400,9 +399,9 @@ mod tests {
 
     #[test]
     fn test_iter() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..8 {
-            table.insert(Bytes::from(format!("iter_{}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("iter_{}", i)), test_value(i));
         }
 
         let count = table.iter().count();
@@ -412,9 +411,9 @@ mod tests {
 
     #[test]
     fn test_iter_mut() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..5 {
-            table.insert(Bytes::from(format!("mut_{}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("mut_{}", i)), test_value(i));
         }
 
         for (_k, v) in table.iter_mut() {
@@ -430,10 +429,10 @@ mod tests {
 
     #[test]
     fn test_large_insert_triggers_split() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
 
         for i in 0..100 {
-            let key = Bytes::from(format!("large_{:04}", i));
+            let key = CompactKey::from(format!("large_{:04}", i));
             table.insert(key, test_value(i));
         }
 
@@ -451,10 +450,10 @@ mod tests {
 
     #[test]
     fn test_1000_entries() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
 
         for i in 0..1000 {
-            let key = Bytes::from(format!("stress_{:06}", i));
+            let key = CompactKey::from(format!("stress_{:06}", i));
             table.insert(key, test_value(i));
         }
 
@@ -513,31 +512,31 @@ mod tests {
 
     #[test]
     fn test_with_capacity() {
-        let table: DashTable<Bytes, String> = DashTable::with_capacity(1000);
+        let table: DashTable<CompactKey, String> = DashTable::with_capacity(1000);
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
     }
 
     #[test]
     fn test_iter_empty() {
-        let table: DashTable<Bytes, String> = DashTable::new();
+        let table: DashTable<CompactKey, String> = DashTable::new();
         assert_eq!(table.iter().count(), 0);
     }
 
     #[test]
     fn test_iter_count_matches_len() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..50 {
-            table.insert(Bytes::from(format!("cnt_{}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("cnt_{}", i)), test_value(i));
         }
         assert_eq!(table.iter().count(), table.len());
     }
 
     #[test]
     fn test_iter_after_removes() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..20 {
-            table.insert(Bytes::from(format!("rem_{}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("rem_{}", i)), test_value(i));
         }
         for i in 0..10 {
             table.remove(format!("rem_{}", i).as_bytes());
@@ -548,9 +547,9 @@ mod tests {
 
     #[test]
     fn test_values_iter() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..5 {
-            table.insert(Bytes::from(format!("v_{}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("v_{}", i)), test_value(i));
         }
         assert_eq!(table.values().count(), 5);
     }
@@ -558,9 +557,9 @@ mod tests {
     #[test]
     fn test_directory_doubling() {
         // Insert enough to force multiple splits and directory doublings
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..200 {
-            table.insert(Bytes::from(format!("dd_{:06}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("dd_{:06}", i)), test_value(i));
         }
 
         // Directory should have grown
@@ -581,12 +580,12 @@ mod tests {
     fn test_segment_iter_occupied() {
         use segment::Segment;
 
-        let mut seg: Segment<Bytes, String> = Segment::new(0);
+        let mut seg: Segment<CompactKey, String> = Segment::new(0);
         // Insert 5 entries using the segment's insert method
         for i in 0..5 {
-            let key = Bytes::from(format!("seg_key_{}", i));
+            let key = CompactKey::from(format!("seg_key_{}", i));
             let val = format!("seg_val_{}", i);
-            let hash = hash_key(&key);
+            let hash = hash_key(key.as_ref());
             let h2_val = segment::h2(hash);
             let (ba, bb) = segment::home_buckets(hash);
             seg.insert(h2_val, key, val, ba, bb);
@@ -598,7 +597,7 @@ mod tests {
         // Verify all keys are present
         let keys: Vec<String> = occupied
             .iter()
-            .map(|(k, _)| String::from_utf8_lossy(k).to_string())
+            .map(|(k, _)| String::from_utf8_lossy(k.as_bytes()).to_string())
             .collect();
         for i in 0..5 {
             let expected_key = format!("seg_key_{}", i);
@@ -612,11 +611,11 @@ mod tests {
 
     #[test]
     fn test_segment_count_grows_after_split() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         assert_eq!(table.segment_count(), 1);
 
         for i in 0..100 {
-            table.insert(Bytes::from(format!("sc_{:04}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("sc_{:04}", i)), test_value(i));
         }
 
         assert!(
@@ -628,9 +627,9 @@ mod tests {
 
     #[test]
     fn test_segment_index_for_hash_matches_get() {
-        let mut table: DashTable<Bytes, String> = DashTable::new();
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
         for i in 0..50 {
-            table.insert(Bytes::from(format!("si_{:04}", i)), test_value(i));
+            table.insert(CompactKey::from(format!("si_{:04}", i)), test_value(i));
         }
 
         // For each key, verify segment_index_for_hash points to the segment containing it

@@ -171,9 +171,9 @@ impl SnapshotState {
             .filter(|(db_idx, s_idx, _, _)| *db_idx == self.current_db && *s_idx == seg_idx)
             .map(|(_, _, k, e)| (k.clone(), e.clone()))
             .collect();
-        let overflow_keys: HashSet<Bytes> = overflow_entries
+        let overflow_keys: HashSet<&[u8]> = overflow_entries
             .iter()
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.as_ref())
             .collect();
 
         // Remove consumed overflow entries
@@ -196,13 +196,13 @@ impl SnapshotState {
 
         // Write live entries, skipping those already in overflow and expired ones
         for (key, entry) in segment.iter_occupied() {
-            if overflow_keys.contains(key) {
+            if overflow_keys.contains(key.as_bytes()) {
                 continue;
             }
             if entry.has_expiry() && entry.is_expired_at(base_ts, now_ms) {
                 continue;
             }
-            rdb::write_entry(&mut segment_entries, key, entry, base_ts)
+            rdb::write_entry(&mut segment_entries, key.as_bytes(), entry, base_ts)
                 .expect("segment entry serialization failed");
             entry_count += 1;
         }
@@ -554,10 +554,10 @@ mod tests {
         let cow_old_entry = cow_old_entry.clone();
 
         assert!(state.is_segment_pending(0, 1));
-        state.capture_cow(0, 1, cow_key.clone(), cow_old_entry);
+        state.capture_cow(0, 1, cow_key.to_bytes(), cow_old_entry);
 
         // Now overwrite the key in the live database (simulating a write during snapshot)
-        dbs[0].set_string(cow_key.clone(), Bytes::from_static(b"NEW_VALUE"));
+        dbs[0].set_string(cow_key.to_bytes(), Bytes::from_static(b"NEW_VALUE"));
 
         // Continue advancing until done
         while !state.advance_one_segment(&dbs) {}
@@ -566,7 +566,7 @@ mod tests {
         // Load and verify the COW captured the old value (not the new one)
         let mut loaded = vec![Database::new()];
         let _count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        let entry = loaded[0].get(&cow_key).unwrap();
+        let entry = loaded[0].get(cow_key.as_bytes()).unwrap();
         match entry.value.as_redis_value() {
             RedisValueRef::String(s) => {
                 // The snapshot should have the OLD value from COW, not "NEW_VALUE"

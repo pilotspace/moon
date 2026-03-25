@@ -46,6 +46,12 @@ impl CompactKey {
         self.as_ref()
     }
 
+    /// Convert to owned `Bytes` (copies inline data, or copies heap data).
+    #[inline]
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::copy_from_slice(self.as_ref())
+    }
+
     /// Return true if the key is stored inline (no heap allocation).
     #[inline]
     pub fn is_inline(&self) -> bool {
@@ -127,6 +133,20 @@ impl PartialEq for CompactKey {
 
 impl Eq for CompactKey {}
 
+impl PartialOrd for CompactKey {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CompactKey {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_ref().cmp(other.as_ref())
+    }
+}
+
 impl PartialEq<[u8]> for CompactKey {
     #[inline]
     fn eq(&self, other: &[u8]) -> bool {
@@ -201,6 +221,13 @@ impl From<&[u8]> for CompactKey {
 impl From<&str> for CompactKey {
     #[inline]
     fn from(s: &str) -> Self {
+        Self::from(s.as_bytes())
+    }
+}
+
+impl From<String> for CompactKey {
+    #[inline]
+    fn from(s: String) -> Self {
         Self::from(s.as_bytes())
     }
 }

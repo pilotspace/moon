@@ -3,6 +3,7 @@ use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use super::bptree::BPTree;
+use super::compact_key::CompactKey;
 use super::compact_value::{CompactValue, RedisValueRef};
 use super::dashtable::DashTable;
 use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
@@ -263,7 +264,7 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
 /// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
 /// a `CompactValue`, optional expiration (TTL delta), and packed metadata.
 pub struct Database {
-    data: DashTable<Bytes, Entry>,
+    data: DashTable<CompactKey, Entry>,
     used_memory: usize,
     /// Cached current time in epoch seconds; set once per batch to avoid
     /// repeated `SystemTime::now()` syscalls on every command.
@@ -368,13 +369,13 @@ impl Database {
     /// Insert or replace an entry, tracking memory and version.
     pub fn set(&mut self, key: Bytes, mut entry: Entry) {
         // If key exists, carry forward version+1 and subtract old memory
-        if let Some(old_entry) = self.data.get(&key) {
+        if let Some(old_entry) = self.data.get(key.as_ref()) {
             let new_version = old_entry.version() + 1;
             entry.set_version(new_version);
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(&key, old_entry));
         }
         self.used_memory += entry_overhead(&key, &entry);
-        self.data.insert(key, entry);
+        self.data.insert(CompactKey::from(key), entry);
     }
 
     /// Remove a key and return its entry. No expiry check needed (DEL removes regardless).
@@ -412,7 +413,7 @@ impl Database {
     }
 
     /// Iterator over all keys (caller does glob filtering).
-    pub fn keys(&self) -> impl Iterator<Item = &Bytes> {
+    pub fn keys(&self) -> impl Iterator<Item = &CompactKey> {
         self.data.keys()
     }
 
@@ -444,7 +445,7 @@ impl Database {
     }
 
     /// Check if an entry is expired without requiring &mut self.
-    fn check_expired(data: &DashTable<Bytes, Entry>, key: &[u8], base_ts: u32, now_ms: u64) -> bool {
+    fn check_expired(data: &DashTable<CompactKey, Entry>, key: &[u8], base_ts: u32, now_ms: u64) -> bool {
         data.get(key)
             .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
     }
@@ -494,7 +495,7 @@ impl Database {
     }
 
     /// Mutable access to the data map (for eviction to remove keys directly).
-    pub fn data_mut(&mut self) -> &mut DashTable<Bytes, Entry> {
+    pub fn data_mut(&mut self) -> &mut DashTable<CompactKey, Entry> {
         &mut self.data
     }
 
@@ -517,7 +518,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_hash();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -574,7 +575,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_list();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -631,7 +632,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_set();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -704,7 +705,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_set_intset();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -754,7 +755,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_hash_listpack();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -804,7 +805,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_list_listpack();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -860,7 +861,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_sorted_set_bptree();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
@@ -931,7 +932,7 @@ impl Database {
     }
 
     /// Collect keys that have an expiration set.
-    pub fn keys_with_expiry(&self) -> Vec<Bytes> {
+    pub fn keys_with_expiry(&self) -> Vec<CompactKey> {
         self.data
             .iter()
             .filter(|(_, e)| e.has_expiry())
@@ -949,7 +950,7 @@ impl Database {
     }
 
     /// Read-only access to the data map (for SCAN iteration).
-    pub fn data(&self) -> &DashTable<Bytes, Entry> {
+    pub fn data(&self) -> &DashTable<CompactKey, Entry> {
         &self.data
     }
 
@@ -1208,7 +1209,7 @@ impl Database {
         }
         if !self.data.contains_key(key) {
             let entry = Entry::new_stream();
-            let k = Bytes::copy_from_slice(key);
+            let k = CompactKey::from(key);
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }

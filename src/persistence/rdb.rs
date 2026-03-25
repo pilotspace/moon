@@ -10,6 +10,7 @@ use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
 use crate::storage::bptree::BPTree;
+use crate::storage::compact_key::CompactKey;
 use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_secs, current_time_ms, Entry, RedisValue};
@@ -62,7 +63,7 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key, entry, base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry, base_ts)?;
         }
     }
 
@@ -86,7 +87,7 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
 /// Save from pre-cloned snapshot data (used by BGSAVE to avoid holding the lock).
 ///
 /// Each element in `snapshot` is a Vec of (key, entry, base_ts) for a database index.
-pub fn save_from_snapshot(snapshot: &[(Vec<(Bytes, Entry)>, u32)], path: &Path) -> anyhow::Result<()> {
+pub fn save_from_snapshot(snapshot: &[(Vec<(CompactKey, Entry)>, u32)], path: &Path) -> anyhow::Result<()> {
     let mut buf = Vec::new();
 
     // Header
@@ -106,7 +107,7 @@ pub fn save_from_snapshot(snapshot: &[(Vec<(Bytes, Entry)>, u32)], path: &Path) 
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key, entry, *base_ts)?;
+            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
         }
     }
 
@@ -223,9 +224,9 @@ pub fn distribute_loaded_to_shards(
 
     for (db_idx, db) in loaded_dbs.into_iter().enumerate() {
         for (key, entry) in db.data().iter() {
-            let target_shard = key_to_shard(key, num_shards);
+            let target_shard = key_to_shard(key.as_bytes(), num_shards);
             if target_shard < shard_dbs.len() && db_idx < shard_dbs[target_shard].len() {
-                shard_dbs[target_shard][db_idx].set(key.clone(), entry.clone());
+                shard_dbs[target_shard][db_idx].set(key.to_bytes(), entry.clone());
             }
         }
     }
@@ -260,7 +261,7 @@ pub fn merge_shard_snapshots(
 
 pub(crate) fn write_entry(
     buf: &mut Vec<u8>,
-    key: &Bytes,
+    key: &[u8],
     entry: &Entry,
     base_ts: u32,
 ) -> anyhow::Result<()> {

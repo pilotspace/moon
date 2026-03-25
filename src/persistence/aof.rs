@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use crate::command::{dispatch, DispatchResult};
 use crate::protocol::{Frame, ParseConfig};
 use crate::protocol::{parse, serialize};
+use crate::storage::compact_key::CompactKey;
 use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_time_ms, Entry};
@@ -337,7 +338,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                 RedisValueRef::String(val) => {
                     let frame = Frame::Array(vec![
                         Frame::BulkString(Bytes::from_static(b"SET")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                         Frame::BulkString(Bytes::copy_from_slice(val)),
                     ]);
                     serialize::serialize(&frame, &mut buf);
@@ -348,7 +349,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"HSET")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for (field, val) in map.iter() {
                         args.push(Frame::BulkString(field.clone()));
@@ -363,7 +364,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"HSET")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for (field, val) in &map {
                         args.push(Frame::BulkString(field.clone()));
@@ -377,7 +378,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"RPUSH")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for elem in list.iter() {
                         args.push(Frame::BulkString(elem.clone()));
@@ -391,7 +392,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"RPUSH")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for elem in &list {
                         args.push(Frame::BulkString(elem.clone()));
@@ -404,7 +405,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"SADD")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for member in set.iter() {
                         args.push(Frame::BulkString(member.clone()));
@@ -418,7 +419,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"SADD")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for member in &set {
                         args.push(Frame::BulkString(member.clone()));
@@ -432,7 +433,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"SADD")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for member in &set {
                         args.push(Frame::BulkString(member.clone()));
@@ -446,7 +447,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"ZADD")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for (member, score) in members.iter() {
                         args.push(Frame::BulkString(Bytes::from(score.to_string())));
@@ -461,7 +462,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     let mut args = vec![
                         Frame::BulkString(Bytes::from_static(b"ZADD")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                     ];
                     for (member_entry, score_entry) in &pairs {
                         let score_bytes = score_entry.as_bytes();
@@ -474,7 +475,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for (id, fields) in &stream.entries {
                         let mut args = vec![
                             Frame::BulkString(Bytes::from_static(b"XADD")),
-                            Frame::BulkString(key.clone()),
+                            Frame::BulkString(key.to_bytes()),
                             Frame::BulkString(id.to_bytes()),
                         ];
                         for (field, value) in fields {
@@ -493,7 +494,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     let remaining_ms = exp_ms - now_ms;
                     let pexpire_frame = Frame::Array(vec![
                         Frame::BulkString(Bytes::from_static(b"PEXPIRE")),
-                        Frame::BulkString(key.clone()),
+                        Frame::BulkString(key.to_bytes()),
                         Frame::BulkString(Bytes::from(remaining_ms.to_string())),
                     ]);
                     serialize::serialize(&pexpire_frame, &mut buf);
@@ -510,7 +511,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// Writes to a temporary file first, then atomically renames for crash safety.
 pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result<()> {
     // Clone database state: lock each db individually with read lock
-    let snapshot: Vec<(Vec<(Bytes, Entry)>, u32)> = db
+    let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
@@ -529,7 +530,7 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result
     for (entries, _base_ts) in &snapshot {
         let mut db = Database::new();
         for (key, entry) in entries {
-            db.set(key.clone(), entry.clone());
+            db.set(key.to_bytes(), entry.clone());
         }
         temp_dbs.push(db);
     }

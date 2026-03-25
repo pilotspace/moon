@@ -65,8 +65,8 @@ fn expire_cycle(db: &mut Database) {
 
         let mut expired_count = 0;
         for key in &sampled {
-            if db.is_key_expired(key) {
-                db.remove(key);
+            if db.is_key_expired(key.as_bytes()) {
+                db.remove(key.as_bytes());
                 expired_count += 1;
             }
         }
@@ -119,7 +119,7 @@ mod tests {
 
         // Non-expired keys should remain
         for i in 0..5 {
-            let key = Bytes::from(format!("alive_{}", i));
+            let key = crate::storage::compact_key::CompactKey::from(format!("alive_{}", i));
             assert!(db.keys_with_expiry().contains(&key), "Key alive_{} should still exist", i);
         }
 

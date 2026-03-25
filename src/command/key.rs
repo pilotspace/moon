@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
+use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::current_time_ms;
 use crate::storage::Database;
 
@@ -409,13 +410,13 @@ pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Collect all keys first (need to release immutable borrow before calling db.get)
-    let all_keys: Vec<Bytes> = db.keys().cloned().collect();
+    let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
 
     let mut result = Vec::new();
     for key in all_keys {
         // Trigger lazy expiry by calling exists
-        if db.exists(&key) && glob_match(pattern, &key) {
-            result.push(Frame::BulkString(key));
+        if db.exists(key.as_bytes()) && glob_match(pattern, key.as_bytes()) {
+            result.push(Frame::BulkString(key.to_bytes()));
         }
     }
 
@@ -601,10 +602,10 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // Collect all non-expired keys sorted for deterministic iteration
-    let all_keys: Vec<Bytes> = db.keys().cloned().collect();
-    let mut sorted_keys: Vec<Bytes> = Vec::new();
+    let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
+    let mut sorted_keys: Vec<CompactKey> = Vec::new();
     for key in all_keys {
-        if db.exists(&key) {
+        if db.exists(key.as_bytes()) {
             sorted_keys.push(key);
         }
     }
@@ -623,7 +624,7 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
 
         // TYPE filter
         if let Some(tf) = type_filter {
-            if let Some(entry) = db.get(key) {
+            if let Some(entry) = db.get(key.as_bytes()) {
                 let tn = entry.value.type_name().as_bytes();
                 if !tf.eq_ignore_ascii_case(tn) {
                     continue;
@@ -635,12 +636,12 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
 
         // MATCH filter
         if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, key) {
+            if !glob_match(pattern, key.as_bytes()) {
                 continue;
             }
         }
 
-        results.push(Frame::BulkString(key.clone()));
+        results.push(Frame::BulkString(key.to_bytes()));
     }
 
     let next_cursor = if pos >= total {
@@ -761,8 +762,8 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
     let mut result = Vec::new();
     for key in db.keys() {
-        if db.exists_if_alive(key, now_ms) && glob_match(pattern, key) {
-            result.push(Frame::BulkString(key.clone()));
+        if db.exists_if_alive(key.as_bytes(), now_ms) && glob_match(pattern, key.as_bytes()) {
+            result.push(Frame::BulkString(key.to_bytes()));
         }
     }
     Frame::Array(result)
@@ -825,8 +826,8 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 
     // Collect all non-expired keys sorted for deterministic iteration
-    let mut sorted_keys: Vec<Bytes> = db.keys()
-        .filter(|k| db.exists_if_alive(k, now_ms))
+    let mut sorted_keys: Vec<CompactKey> = db.keys()
+        .filter(|k| db.exists_if_alive(k.as_bytes(), now_ms))
         .cloned()
         .collect();
     sorted_keys.sort();
@@ -843,7 +844,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
         // TYPE filter
         if let Some(tf) = type_filter {
-            if let Some(entry) = db.get_if_alive(key, now_ms) {
+            if let Some(entry) = db.get_if_alive(key.as_bytes(), now_ms) {
                 let tn = entry.value.type_name().as_bytes();
                 if !tf.eq_ignore_ascii_case(tn) {
                     continue;
@@ -855,12 +856,12 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
         // MATCH filter
         if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, key) {
+            if !glob_match(pattern, key.as_bytes()) {
                 continue;
             }
         }
 
-        results.push(Frame::BulkString(key.clone()));
+        results.push(Frame::BulkString(key.to_bytes()));
     }
 
     let next_cursor = if pos >= total {

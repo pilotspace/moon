@@ -3,6 +3,7 @@ use rand::seq::IndexedRandom;
 
 use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
+use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::lfu_decay;
 use crate::storage::Database;
 
@@ -100,7 +101,7 @@ fn evict_one(db: &mut Database, config: &RuntimeConfig, policy: &EvictionPolicy)
 
 /// Evict the key with the oldest last_access from a random sample.
 fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool {
-    let keys: Vec<Bytes> = if volatile_only {
+    let keys: Vec<CompactKey> = if volatile_only {
         db.data()
             .iter()
             .filter(|(_, e)| e.has_expiry())
@@ -116,13 +117,13 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
 
     let mut rng = rand::rng();
     let sample_size = samples.min(keys.len());
-    let sampled: Vec<&Bytes> = keys.choose_multiple(&mut rng, sample_size).collect();
+    let sampled: Vec<&CompactKey> = keys.choose_multiple(&mut rng, sample_size).collect();
 
-    let mut oldest_key: Option<Bytes> = None;
+    let mut oldest_key: Option<CompactKey> = None;
     let mut oldest_access = None;
 
     for key in sampled {
-        if let Some(entry) = db.data().get(key) {
+        if let Some(entry) = db.data().get(key.as_bytes()) {
             let la = entry.last_access();
             match oldest_access {
                 None => {
@@ -140,7 +141,7 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
     }
 
     if let Some(key) = oldest_key {
-        db.remove(&key);
+        db.remove(key.as_bytes());
         true
     } else {
         false
@@ -154,7 +155,7 @@ fn evict_one_lfu(
     lfu_decay_time: u64,
     volatile_only: bool,
 ) -> bool {
-    let keys: Vec<Bytes> = if volatile_only {
+    let keys: Vec<CompactKey> = if volatile_only {
         db.data()
             .iter()
             .filter(|(_, e)| e.has_expiry())
@@ -170,14 +171,14 @@ fn evict_one_lfu(
 
     let mut rng = rand::rng();
     let sample_size = samples.min(keys.len());
-    let sampled: Vec<&Bytes> = keys.choose_multiple(&mut rng, sample_size).collect();
+    let sampled: Vec<&CompactKey> = keys.choose_multiple(&mut rng, sample_size).collect();
 
-    let mut evict_key: Option<Bytes> = None;
+    let mut evict_key: Option<CompactKey> = None;
     let mut lowest_counter: Option<u8> = None;
     let mut oldest_access_for_tie = None;
 
     for key in sampled {
-        if let Some(entry) = db.data().get(key) {
+        if let Some(entry) = db.data().get(key.as_bytes()) {
             let effective_counter =
                 lfu_decay(entry.access_counter(), entry.last_access(), lfu_decay_time);
 
@@ -201,7 +202,7 @@ fn evict_one_lfu(
     }
 
     if let Some(key) = evict_key {
-        db.remove(&key);
+        db.remove(key.as_bytes());
         true
     } else {
         false
@@ -210,7 +211,7 @@ fn evict_one_lfu(
 
 /// Evict one random key.
 fn evict_one_random(db: &mut Database, volatile_only: bool) -> bool {
-    let keys: Vec<Bytes> = if volatile_only {
+    let keys: Vec<CompactKey> = if volatile_only {
         db.data()
             .iter()
             .filter(|(_, e)| e.has_expiry())
@@ -226,7 +227,7 @@ fn evict_one_random(db: &mut Database, volatile_only: bool) -> bool {
 
     let mut rng = rand::rng();
     if let Some(key) = keys.choose(&mut rng) {
-        db.remove(key);
+        db.remove(key.as_bytes());
         true
     } else {
         false
@@ -235,7 +236,7 @@ fn evict_one_random(db: &mut Database, volatile_only: bool) -> bool {
 
 /// Evict the key with the soonest TTL expiration from a random sample.
 fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
-    let keys: Vec<Bytes> = db
+    let keys: Vec<CompactKey> = db
         .data()
         .iter()
         .filter(|(_, e)| e.has_expiry())
@@ -248,13 +249,13 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
 
     let mut rng = rand::rng();
     let sample_size = samples.min(keys.len());
-    let sampled: Vec<&Bytes> = keys.choose_multiple(&mut rng, sample_size).collect();
+    let sampled: Vec<&CompactKey> = keys.choose_multiple(&mut rng, sample_size).collect();
 
-    let mut evict_key: Option<Bytes> = None;
+    let mut evict_key: Option<CompactKey> = None;
     let mut soonest_expiry: Option<u64> = None;
 
     for key in sampled {
-        if let Some(entry) = db.data().get(key) {
+        if let Some(entry) = db.data().get(key.as_bytes()) {
             if entry.has_expiry() {
                 let exp = entry.expires_at_ms(db.base_timestamp());
                 let should_evict = match soonest_expiry {
@@ -270,7 +271,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
     }
 
     if let Some(key) = evict_key {
-        db.remove(&key);
+        db.remove(key.as_bytes());
         true
     } else {
         false
