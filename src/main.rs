@@ -151,6 +151,7 @@ fn main() -> anyhow::Result<()> {
                     .build()
                     .expect("failed to build shard runtime");
 
+                let local = tokio::task::LocalSet::new();
                 let mut shard = Shard::new(
                     id,
                     num_shards,
@@ -163,7 +164,7 @@ fn main() -> anyhow::Result<()> {
                     shard.restore_from_persistence(dir);
                 }
 
-                rt.block_on(shard.run(
+                rt.block_on(local.run_until(shard.run(
                     conn_rx,
                     consumers,
                     producers,
@@ -177,7 +178,7 @@ fn main() -> anyhow::Result<()> {
                     config_port,
                     shard_acl_table,
                     shard_runtime_config,
-                ));
+                )));
             })
             .expect("failed to spawn shard thread");
 

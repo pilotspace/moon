@@ -1,3 +1,5 @@
 /target
 replication.state
 replication.state.tmp
+*.wal
+*.wal.old
