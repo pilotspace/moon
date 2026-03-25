@@ -9,6 +9,8 @@ compile_error!(
     "Features `runtime-tokio` and `runtime-monoio` are mutually exclusive. Enable only one."
 );
 
+pub mod cancel;
+pub mod channel;
 pub mod traits;
 
 #[cfg(feature = "runtime-tokio")]
