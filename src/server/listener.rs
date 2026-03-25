@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use parking_lot::Mutex;
+#[cfg(feature = "runtime-tokio")]
 use crate::runtime::TcpListener;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
@@ -244,6 +245,74 @@ pub async fn run_sharded(
                         debug!("New connection from {} -> shard {}", addr, next_shard);
                         let tx = &conn_txs[next_shard];
                         if tx.send_async(stream).await.is_err() {
+                            error!("Failed to send connection to shard {}", next_shard);
+                        }
+                        next_shard = (next_shard + 1) % num_shards;
+                    }
+                    Err(e) => {
+                        error!("Accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                info!("Listener shutting down");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Non-sharded mode is not supported under monoio -- use `--shards 1`.
+#[cfg(feature = "runtime-monoio")]
+pub async fn run(_config: ServerConfig) -> anyhow::Result<()> {
+    anyhow::bail!("Non-sharded mode not supported under monoio -- use --shards 1")
+}
+
+/// Run the sharded accept loop under Monoio.
+///
+/// Uses `monoio::net::TcpListener` for async accept and converts accepted
+/// `monoio::net::TcpStream` to `std::net::TcpStream` for cross-thread handoff
+/// to shard threads via flume channels.
+#[cfg(feature = "runtime-monoio")]
+pub async fn run_sharded(
+    config: ServerConfig,
+    conn_txs: Vec<channel::MpscSender<crate::runtime::TcpStream>>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", config.bind, config.port);
+    let listener = monoio::net::TcpListener::bind(&addr)?;
+    let num_shards = conn_txs.len();
+    info!("Listening on {} ({} shards, monoio)", addr, num_shards);
+
+    let mut next_shard: usize = 0;
+
+    // Ctrl+C handler -- ctrlc crate sets handler on OS thread, signals our token
+    let shutdown_signal = shutdown.clone();
+    ctrlc::set_handler(move || {
+        info!("Shutdown signal received");
+        shutdown_signal.cancel();
+    })
+    .expect("failed to set Ctrl+C handler");
+
+    loop {
+        monoio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        debug!("New connection from {} -> shard {}", addr, next_shard);
+                        // Convert monoio TcpStream to std::net::TcpStream for cross-thread send.
+                        // monoio::net::TcpStream is !Send (Rc<SharedFd>), so we extract the raw fd.
+                        let std_stream = {
+                            use std::os::unix::io::{IntoRawFd, FromRawFd};
+                            let fd = stream.into_raw_fd();
+                            unsafe { std::net::TcpStream::from_raw_fd(fd) }
+                        };
+                        let tx = &conn_txs[next_shard];
+                        // Use blocking send -- flume send is non-blocking for unbounded,
+                        // and we're in an async context but send is fast enough.
+                        if tx.send(std_stream).is_err() {
                             error!("Failed to send connection to shard {}", next_shard);
                         }
                         next_shard = (next_shard + 1) % num_shards;

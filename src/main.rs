@@ -290,12 +290,41 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "runtime-monoio")]
     {
         // Monoio listener: simplified startup. Cluster bus and gossip not yet
-        // supported under monoio. The listener waits for shutdown.
+        // supported under monoio.
+
+        // Auto-save runs on a dedicated thread (same pattern as AOF writer).
+        if config.save.is_some() {
+            let rules = rust_redis::persistence::auto_save::parse_save_rules(&config.save);
+            if !rules.is_empty() {
+                let auto_save_token = cancel_token.child_token();
+                let auto_save_counter = change_counter.clone();
+                let snap_tx = snapshot_trigger_tx;
+                std::thread::Builder::new()
+                    .name("auto-save".to_string())
+                    .spawn(move || {
+                        RuntimeFactoryImpl::block_on_local(
+                            "auto-save".to_string(),
+                            rust_redis::persistence::auto_save::run_auto_save_sharded(
+                                rules,
+                                auto_save_counter,
+                                auto_save_token,
+                                snap_tx,
+                            ),
+                        );
+                    })
+                    .expect("failed to spawn auto-save thread");
+                info!("Auto-save timer started (sharded mode, monoio)");
+            }
+        }
+
         RuntimeFactoryImpl::block_on_local(
             "listener".to_string(),
             async move {
-                info!("Monoio listener started (stub -- awaiting shutdown)");
-                listener_cancel.cancelled().await;
+                if let Err(e) =
+                    server::listener::run_sharded(config, conn_txs, listener_cancel).await
+                {
+                    tracing::error!("Listener error: {}", e);
+                }
             },
         );
     }
