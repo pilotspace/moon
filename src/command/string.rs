@@ -57,6 +57,15 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SET"),
     };
 
+    // Fast path: plain SET key value (no options) — skip option parsing entirely
+    if args.len() == 2 {
+        let mut entry = Entry::new_string(value);
+        entry.set_last_access(db.now());
+        entry.set_access_counter(5);
+        db.set(key, entry);
+        return ok();
+    }
+
     let mut expires_at_ms: u64 = 0;
     let mut nx = false;
     let mut xx = false;
