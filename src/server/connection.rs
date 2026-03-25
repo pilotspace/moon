@@ -2855,3 +2855,135 @@ fn format_blocking_score(score: f64) -> String {
         format!("{}", score)
     }
 }
+
+/// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
+///
+/// Reads RESP frames from the TCP stream, dispatches commands through the same
+/// `crate::command::dispatch()` path as the tokio handler, and writes responses back.
+///
+/// MVP scope: SET/GET/PING/QUIT/SELECT/DEL/COMMAND and all other commands supported
+/// by `dispatch()`. Skips pub/sub, blocking, tracking, cluster, replication, and ACL
+/// enforcement -- those parameters are accepted but unused for future wiring.
+///
+/// Key difference from tokio path: monoio's `stream.read(buf)` takes ownership of the
+/// buffer and returns `(Result<usize>, buf)`. We use a `Vec<u8>` intermediate for the
+/// read since monoio's IoBufMut is implemented for Vec<u8>, then copy into BytesMut
+/// for codec parsing.
+#[cfg(feature = "runtime-monoio")]
+pub async fn handle_connection_sharded_monoio(
+    mut stream: monoio::net::TcpStream,
+    databases: Rc<RefCell<Vec<Database>>>,
+    shard_id: usize,
+    num_shards: usize,
+    _dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    _pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    _blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    shutdown: CancellationToken,
+    _aof_tx: Option<channel::MpscSender<AofMessage>>,
+    _tracking_table: Rc<RefCell<TrackingTable>>,
+    _client_id: u64,
+    _repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    _cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    _lua: Rc<mlua::Lua>,
+    _script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
+    _config_port: u16,
+    _acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    _runtime_config: Arc<RwLock<RuntimeConfig>>,
+    _spsc_notifiers: Vec<Arc<channel::Notify>>,
+) {
+    use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+
+    let _peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let mut read_buf = BytesMut::with_capacity(8192);
+    let mut write_buf = BytesMut::with_capacity(8192);
+    let mut codec = RespCodec::default();
+    let mut selected_db: usize = 0;
+    let db_count = databases.borrow().len();
+
+    loop {
+        // Read data from stream using monoio ownership I/O.
+        // Vec<u8> implements monoio's IoBufMut trait.
+        let tmp_buf = vec![0u8; 8192];
+        let (result, tmp_buf) = stream.read(tmp_buf).await;
+        match result {
+            Ok(0) => break, // connection closed
+            Ok(n) => {
+                read_buf.extend_from_slice(&tmp_buf[..n]);
+            }
+            Err(_) => break,
+        }
+
+        // Parse all complete frames from the read buffer
+        let mut frames = Vec::new();
+        loop {
+            match codec.decode_frame(&mut read_buf) {
+                Ok(Some(frame)) => frames.push(frame),
+                Ok(None) => break,
+                Err(_) => return, // parse error, close connection
+            }
+        }
+
+        if frames.is_empty() {
+            continue;
+        }
+
+        // Process frames through the same dispatch logic as the tokio path
+        write_buf.clear();
+        let mut should_quit = false;
+
+        for frame in &frames {
+            if let Some((cmd, cmd_args)) = extract_command(frame) {
+                // Dispatch to database
+                let mut dbs = databases.borrow_mut();
+                let db = &mut dbs[selected_db];
+                let result = dispatch(db, cmd, cmd_args, &mut selected_db, db_count);
+                drop(dbs);
+
+                match result {
+                    DispatchResult::Response(resp) => {
+                        codec.encode_frame(&resp, &mut write_buf);
+                    }
+                    DispatchResult::Quit(resp) => {
+                        codec.encode_frame(&resp, &mut write_buf);
+                        should_quit = true;
+                    }
+                }
+            } else {
+                // Invalid command format
+                let err = Frame::Error(Bytes::from_static(b"ERR invalid command format"));
+                codec.encode_frame(&err, &mut write_buf);
+            }
+        }
+
+        // Write all responses in one batch using ownership I/O
+        if !write_buf.is_empty() {
+            let data = write_buf.split().to_vec();
+            let (result, _data): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
+            if result.is_err() {
+                break;
+            }
+        }
+
+        if should_quit {
+            break;
+        }
+
+        // Check shutdown (polled after each batch -- acceptable for MVP)
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        // Shrink buffers if they grew too large
+        if read_buf.capacity() > 65536 {
+            let remaining = read_buf.split();
+            read_buf = BytesMut::with_capacity(8192);
+            if !remaining.is_empty() {
+                read_buf.extend_from_slice(&remaining);
+            }
+        }
+    }
+}
