@@ -70,6 +70,19 @@ enum InFlightSend {
     Fixed(u16),
 }
 
+/// Stub connection handler for monoio runtime.
+///
+/// Accepts a monoio TcpStream and waits for shutdown. Plan 02 implements
+/// the real connection handler with AsyncReadRent/AsyncWriteRent I/O.
+#[cfg(feature = "runtime-monoio")]
+async fn handle_connection_monoio_stub(
+    _stream: monoio::net::TcpStream,
+    _shard_id: usize,
+    shutdown: CancellationToken,
+) {
+    shutdown.cancelled().await;
+}
+
 impl Shard {
     /// Create a new shard with `num_databases` empty databases.
     pub fn new(id: usize, num_shards: usize, num_databases: usize, config: RuntimeConfig) -> Self {
@@ -533,18 +546,168 @@ impl Shard {
                 }
             }
 
-            // Monoio runtime: event loop stub. Monoio's I/O model (AsyncReadRent/
-            // AsyncWriteRent with buffer ownership transfer) requires fundamentally
-            // different connection handling. This stub compiles and shuts down cleanly.
+            // Monoio runtime: full event loop with monoio::select! mirroring the tokio path.
+            // Connection handling is stubbed (Plan 02 implements the real handler).
             #[cfg(feature = "runtime-monoio")]
-            {
-                // Wait for shutdown signal
-                shutdown.cancelled().await;
-                info!("Shard {} shutting down (monoio)", self.id);
-                if let Some(ref mut wal) = wal_writer {
-                    let _ = wal.shutdown();
+            monoio::select! {
+                // Accept new connections from listener
+                stream = conn_rx.recv_async() => {
+                    match stream {
+                        Ok(std_tcp_stream) => {
+                            // Convert std::net::TcpStream to monoio::net::TcpStream
+                            match monoio::net::TcpStream::from_std(std_tcp_stream) {
+                                Ok(tcp_stream) => {
+                                    let sd = shutdown.clone();
+                                    monoio::spawn(async move {
+                                        handle_connection_monoio_stub(tcp_stream, shard_id, sd).await;
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Shard {}: from_std failed: {}", shard_id, e);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            info!("Shard {} connection channel closed", self.id);
+                            break;
+                        }
+                    }
                 }
-                break;
+                // SPSC notify -- event-driven cross-shard message drain
+                _ = spsc_notify_local.notified() => {
+                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
+                    Self::drain_spsc_shared(
+                        &databases,
+                        &mut consumers,
+                        &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc,
+                        &mut pending_snapshot,
+                        &mut snapshot_state,
+                        &mut wal_writer,
+                        &mut repl_backlog,
+                        &mut replica_txs,
+                        &repl_state,
+                        shard_id,
+                        &script_cache_rc,
+                    );
+
+                    // Handle pending SnapshotBegin from SPSC
+                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
+                        if snapshot_state.is_some() {
+                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
+                        } else {
+                            let dbs = databases.borrow();
+                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
+                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
+                            snapshot_reply_tx = Some(reply_tx);
+                            drop(dbs);
+                        }
+                    }
+                }
+                // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
+                _ = periodic_interval.tick() => {
+                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
+                    Self::drain_spsc_shared(
+                        &databases,
+                        &mut consumers,
+                        &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc,
+                        &mut pending_snapshot,
+                        &mut snapshot_state,
+                        &mut wal_writer,
+                        &mut repl_backlog,
+                        &mut replica_txs,
+                        &repl_state,
+                        shard_id,
+                        &script_cache_rc,
+                    );
+
+                    // Handle pending SnapshotBegin from SPSC
+                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
+                        if snapshot_state.is_some() {
+                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
+                        } else {
+                            let dbs = databases.borrow();
+                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
+                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
+                            snapshot_reply_tx = Some(reply_tx);
+                            drop(dbs);
+                        }
+                    }
+
+                    // Check watch channel for auto-save snapshot triggers
+                    {
+                        let new_epoch = snapshot_trigger_rx.borrow();
+                        if new_epoch > last_snapshot_epoch && snapshot_state.is_none() {
+                            last_snapshot_epoch = new_epoch;
+                            if let Some(ref dir) = persistence_dir {
+                                let snap_path = std::path::PathBuf::from(dir)
+                                    .join(format!("shard-{}.rrdshard", shard_id));
+                                let dbs = databases.borrow();
+                                snapshot_state = Some(SnapshotState::new(
+                                    shard_id as u16, new_epoch, &dbs, snap_path,
+                                ));
+                                drop(dbs);
+                            }
+                        }
+                    }
+
+                    // Advance snapshot one segment per tick (cooperative)
+                    if let Some(ref mut snap) = snapshot_state {
+                        let dbs = databases.borrow();
+                        let done = snap.advance_one_segment(&dbs);
+                        drop(dbs);
+                        if done {
+                            let epoch = snap.epoch;
+                            if let Err(e) = snap.finalize() {
+                                tracing::error!("Shard {}: snapshot finalize failed: {}", shard_id, e);
+                                if let Some(tx) = snapshot_reply_tx.take() {
+                                    let _ = tx.send(Err(format!("finalize failed: {}", e)));
+                                }
+                            } else {
+                                info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
+                                if let Some(ref mut wal) = wal_writer {
+                                    let _ = wal.truncate_after_snapshot(epoch);
+                                }
+                                if let Some(tx) = snapshot_reply_tx.take() {
+                                    let _ = tx.send(Ok(()));
+                                }
+                            }
+                            snapshot_state = None;
+                        }
+                    }
+
+                    // Flush WAL on 1ms tick
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.flush_if_needed();
+                    }
+                }
+                // WAL fsync on 1-second interval
+                _ = wal_sync_interval.tick() => {
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.sync_to_disk();
+                    }
+                }
+                // Expire timed-out blocked clients every 10ms
+                _ = block_timeout_interval.tick() => {
+                    let now = std::time::Instant::now();
+                    blocking_rc.borrow_mut().expire_timed_out(now);
+                }
+                // Cooperative active expiry every 100ms
+                _ = expiry_interval.tick() => {
+                    let mut dbs = databases.borrow_mut();
+                    for db in dbs.iter_mut() {
+                        crate::server::expiration::expire_cycle_direct(db);
+                    }
+                }
+                // Shutdown
+                _ = shutdown.cancelled() => {
+                    info!("Shard {} shutting down (monoio)", self.id);
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.shutdown();
+                    }
+                    break;
+                }
             }
         }
 
