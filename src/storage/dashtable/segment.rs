@@ -18,7 +18,7 @@ use std::borrow::Borrow;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use super::simd::{BitMask, Group, DELETED, EMPTY};
+use super::simd::{Group, DELETED, EMPTY};
 
 /// Number of regular (home) bucket slots per segment.
 pub const REGULAR_SLOTS: usize = 56;
@@ -220,6 +220,7 @@ impl<K, V> Segment<K, V> {
     ///
     /// Search order: group containing bucket_a, group containing bucket_b, then stash.
     /// Returns `Some(slot_index)` if found, `None` otherwise.
+    #[allow(unused_unsafe)] // prefetch_ptr is unsafe on x86_64 but safe on aarch64
     pub fn find<Q: ?Sized>(&self, h2: u8, key: &Q, bucket_a: usize, bucket_b: usize) -> Option<usize>
     where
         K: Borrow<Q>,

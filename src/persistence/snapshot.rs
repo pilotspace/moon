@@ -5,7 +5,7 @@
 //! values captured in a per-snapshot overflow buffer (segment-level COW).
 
 use std::collections::HashSet;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -13,7 +13,6 @@ use bytes::Bytes;
 use crc32fast::Hasher;
 
 use crate::persistence::rdb;
-use crate::storage::dashtable::DashTable;
 use crate::storage::db::Database;
 use crate::storage::entry::{current_secs, current_time_ms, Entry};
 

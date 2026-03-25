@@ -1,8 +1,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
-use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::{current_time_ms, Entry, RedisValue};
+use crate::storage::entry::{current_time_ms, Entry};
 use crate::storage::Database;
 
 /// Helper: return ERR wrong number of arguments for a given command.

@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use tracing::{error, info};
+use tracing::info;
 
 use crate::storage::db::Database;
 

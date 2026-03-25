@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::replication::handshake::ReplicaHandshakeState;
 use crate::replication::state::{save_replication_state, ReplicationRole, ReplicationState};

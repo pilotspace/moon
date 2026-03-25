@@ -25,7 +25,7 @@ pub fn handle_acl(
     acl_table: &Arc<RwLock<AclTable>>,
     acl_log: &mut AclLog,
     current_user: &str,
-    client_addr: &str,
+    _client_addr: &str,
     runtime_config: &Arc<RwLock<RuntimeConfig>>,
 ) -> Frame {
     let sub = match sub_and_args.first().and_then(|f| extract_str(f)) {

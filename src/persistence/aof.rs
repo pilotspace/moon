@@ -15,7 +15,7 @@ use crate::protocol::{Frame, ParseConfig};
 use crate::protocol::{parse, serialize};
 use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::{current_time_ms, Entry, RedisValue};
+use crate::storage::entry::{current_time_ms, Entry};
 
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;

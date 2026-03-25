@@ -2,7 +2,7 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::rules::apply_rule;
-use super::table::{AclTable, AclUser, CommandPermissions, KeyPattern};
+use super::table::{AclTable, AclUser, CommandPermissions};
 
 /// Serialize a user to an ACL file line:
 /// "user <name> on|off [nopass] [#hash ...] [~pattern ...] [&channel ...] [+@all|-@all ...]"
@@ -123,6 +123,7 @@ pub async fn acl_table_from_config(config: &crate::config::ServerConfig) -> AclT
 mod tests {
     use super::*;
     use crate::acl::rules::hash_password;
+    use crate::acl::table::KeyPattern;
 
     #[test]
     fn test_user_to_acl_line_default_nopass() {

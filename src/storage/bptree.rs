@@ -468,8 +468,8 @@ impl BPTree {
             node.keys[child_idx] = separator;
             node.children[child_idx + 1] = new_child;
             node.len += 1;
-            // Recompute counts for the two affected children
-            drop(node);
+            // Release mutable borrow before recomputing child counts
+            let _ = node;
             self.recompute_child_count(node_id, child_idx);
             self.recompute_child_count(node_id, child_idx + 1);
             InsertResult::Done(is_new)
@@ -1272,37 +1272,35 @@ impl<'a> Iterator for BPTreeRevIter<'a> {
     type Item = (OrderedFloat<f64>, &'a Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let leaf_id = self.leaf?;
-            let leaf = self.tree.leaf(leaf_id);
-            let n = leaf.entry_count();
-            if n == 0 {
-                self.leaf = None;
-                return None;
-            }
-            if self.index < n {
-                let (score, member) = &leaf.entries[self.index];
-                if *score < self.min {
-                    self.leaf = None;
-                    return None;
-                }
-                if self.index == 0 {
-                    // Move to prev leaf
-                    self.leaf = leaf.prev;
-                    if let Some(prev_id) = self.leaf {
-                        let prev = self.tree.leaf(prev_id);
-                        let pn = prev.entry_count();
-                        self.index = if pn > 0 { pn - 1 } else { 0 };
-                    }
-                } else {
-                    self.index -= 1;
-                }
-                return Some((*score, member));
-            }
-            // index >= n, shouldn't happen normally but handle gracefully
+        let leaf_id = self.leaf?;
+        let leaf = self.tree.leaf(leaf_id);
+        let n = leaf.entry_count();
+        if n == 0 {
             self.leaf = None;
             return None;
         }
+        if self.index < n {
+            let (score, member) = &leaf.entries[self.index];
+            if *score < self.min {
+                self.leaf = None;
+                return None;
+            }
+            if self.index == 0 {
+                // Move to prev leaf
+                self.leaf = leaf.prev;
+                if let Some(prev_id) = self.leaf {
+                    let prev = self.tree.leaf(prev_id);
+                    let pn = prev.entry_count();
+                    self.index = if pn > 0 { pn - 1 } else { 0 };
+                }
+            } else {
+                self.index -= 1;
+            }
+            return Some((*score, member));
+        }
+        // index >= n, shouldn't happen normally but handle gracefully
+        self.leaf = None;
+        None
     }
 }
 

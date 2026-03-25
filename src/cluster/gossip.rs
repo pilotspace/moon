@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
 

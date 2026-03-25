@@ -26,7 +26,7 @@ pub mod simd;
 use bytes::Bytes;
 
 use iter::{Iter, IterMut, Keys, Values};
-use segment::{h2, home_buckets, InsertResult, Segment, TOTAL_SLOTS};
+use segment::{h2, home_buckets, InsertResult, Segment};
 
 /// Compute the xxh64 hash of a byte slice.
 #[inline]
@@ -302,6 +302,7 @@ impl<'a, V> IntoIterator for &'a DashTable<Bytes, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::segment::TOTAL_SLOTS;
     use bytes::Bytes;
 
     fn test_value(n: u32) -> String {

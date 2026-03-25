@@ -4,11 +4,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
 
-// Encoding prefixes
-const LP_ENCODING_7BIT_UINT_MASK: u8 = 0x80; // 0xxxxxxx = 7-bit uint
-const LP_ENCODING_6BIT_STR_MASK: u8 = 0xC0; // 10xxxxxx = 6-bit string len
-const LP_ENCODING_13BIT_INT_MASK: u8 = 0xE0; // 110xxxxx = 13-bit int (2 bytes)
-const LP_ENCODING_12BIT_STR_MASK: u8 = 0xF0; // 1110xxxx = 12-bit string len (3 bytes header)
+// Encoding prefix masks (reserved for future decode-path use)
+#[allow(dead_code)]
+const LP_ENCODING_7BIT_UINT_MASK: u8 = 0x80;
+#[allow(dead_code)]
+const LP_ENCODING_6BIT_STR_MASK: u8 = 0xC0;
+#[allow(dead_code)]
+const LP_ENCODING_13BIT_INT_MASK: u8 = 0xE0;
+#[allow(dead_code)]
+const LP_ENCODING_12BIT_STR_MASK: u8 = 0xF0;
 const LP_ENCODING_16BIT_INT: u8 = 0xF1;
 const LP_ENCODING_24BIT_INT: u8 = 0xF2;
 const LP_ENCODING_32BIT_INT: u8 = 0xF3;

@@ -215,8 +215,8 @@ pub fn persist(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Integer(0);
             }
             // Key exists and has TTL -- remove it
-            // We need to re-borrow mutably, so use set_expiry
-            drop(entry);
+            // Release immutable borrow before mutable set_expiry call
+            let _ = entry;
             db.set_expiry(key, 0);
             Frame::Integer(1)
         }

@@ -14,7 +14,7 @@
 
 use tracing::info;
 
-use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
+use crate::cluster::{ClusterState, NodeFlags};
 
 /// Check if we should initiate failover.
 ///
