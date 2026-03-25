@@ -80,8 +80,14 @@ fn main() -> anyhow::Result<()> {
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
     let (snapshot_trigger_tx, snapshot_trigger_rx) = tokio::sync::watch::channel(0u64);
 
-    // Persistence directory for per-shard WAL and snapshots
-    let persistence_dir = Some(config.dir.clone());
+    // Persistence directory for per-shard WAL and snapshots.
+    // Only set when persistence is actually enabled (appendonly=yes or save rules exist)
+    // to avoid creating WAL writers that fsync on every tick for no benefit.
+    let persistence_dir = if config.appendonly == "yes" || config.save.is_some() {
+        Some(config.dir.clone())
+    } else {
+        None
+    };
 
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) = rust_redis::replication::state::load_replication_state(

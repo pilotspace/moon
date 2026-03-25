@@ -226,17 +226,28 @@ impl Shard {
         let mut snapshot_state: Option<SnapshotState> = None;
         let mut snapshot_reply_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>> = None;
 
-        // Per-shard WAL writer (created if persistence dir is configured)
+        // Per-shard WAL writer (created only when persistence is actually enabled).
+        // When persistence_dir is None (appendonly=no and no save rules), skip WAL
+        // entirely to avoid unnecessary fsync on every 1ms tick.
+        let appendonly_enabled = runtime_config
+            .read()
+            .map(|cfg| cfg.appendonly != "no")
+            .unwrap_or(false);
         let mut wal_writer: Option<WalWriter> = if let Some(ref dir) = persistence_dir {
-            match WalWriter::new(shard_id, std::path::Path::new(dir)) {
-                Ok(w) => {
-                    info!("Shard {}: WAL writer initialized", shard_id);
-                    Some(w)
+            if appendonly_enabled {
+                match WalWriter::new(shard_id, std::path::Path::new(dir)) {
+                    Ok(w) => {
+                        info!("Shard {}: WAL writer initialized", shard_id);
+                        Some(w)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
-                    None
-                }
+            } else {
+                info!("Shard {}: WAL skipped (appendonly disabled, snapshot-only persistence)", shard_id);
+                None
             }
         } else {
             None
