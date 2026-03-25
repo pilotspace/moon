@@ -22,6 +22,8 @@ use rand::Rng;
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
+#[cfg(feature = "runtime-monoio")]
+use monoio::io::AsyncWriteRentExt;
 use tracing::{info, warn};
 
 use crate::cluster::gossip::{build_message, serialize_gossip, GossipMsgType};
@@ -284,6 +286,144 @@ pub async fn run_election_task(
                 }
             }
             _ => break, // timeout or channel closed
+        }
+    }
+
+    if votes >= quorum {
+        info!(
+            "Failover election won: epoch={}, votes={}/{}",
+            new_epoch, votes, quorum
+        );
+        let mut cs = cluster_state.write().unwrap();
+        check_and_initiate_failover(&mut cs, _my_repl_offset);
+        cs.failover_state = FailoverState::None;
+    } else {
+        warn!(
+            "Failover election timed out: epoch={}, votes={}/{}",
+            new_epoch, votes, quorum
+        );
+        let mut cs = cluster_state.write().unwrap();
+        cs.failover_state = FailoverState::None;
+    }
+}
+
+/// Async election task (monoio variant): waits the jittered delay, sends
+/// FailoverAuthRequest to all masters, collects votes, and promotes on majority.
+///
+/// Uses monoio::time::sleep, monoio::spawn, monoio::select!, and ownership I/O.
+#[cfg(feature = "runtime-monoio")]
+pub async fn run_election_task(
+    cluster_state: Arc<RwLock<ClusterState>>,
+    self_addr: SocketAddr,
+    _my_repl_offset: u64,
+    vote_rx: crate::runtime::channel::MpscReceiver<String>,
+) {
+    // Compute delay (rank 0 for now; multi-replica ranking is future work)
+    let replica_rank = 0u32;
+    let delay = compute_failover_delay(replica_rank);
+
+    // Set state to WaitingDelay
+    {
+        let mut cs = cluster_state.write().unwrap();
+        cs.failover_state = FailoverState::WaitingDelay {
+            start_ms: now_ms(),
+            delay_ms: delay,
+        };
+    }
+
+    monoio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+    // Increment epoch and build FailoverAuthRequest
+    let (new_epoch, quorum, master_addrs) = {
+        let mut cs = cluster_state.write().unwrap();
+        cs.epoch += 1;
+        let new_epoch = cs.epoch;
+        let quorum = cs.quorum();
+        let my_id = cs.node_id.clone();
+
+        // Collect bus addresses of all known masters
+        let addrs: Vec<SocketAddr> = cs
+            .nodes
+            .values()
+            .filter(|n| n.node_id != my_id && matches!(n.flags, NodeFlags::Master))
+            .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port))
+            .collect();
+
+        cs.failover_state = FailoverState::WaitingVotes {
+            epoch: new_epoch,
+            votes_received: 1, // self-vote
+            votes_needed: quorum,
+        };
+
+        (new_epoch, quorum, addrs)
+    };
+
+    // Build the auth request message
+    let auth_msg = {
+        let cs = cluster_state.read().unwrap();
+        let mut msg = build_message(&cs, self_addr, GossipMsgType::FailoverAuthRequest);
+        msg.config_epoch = new_epoch;
+        msg
+    };
+
+    // Send to all masters
+    let data = serialize_gossip(&auth_msg);
+    for addr in &master_addrs {
+        let data = data.clone();
+        let addr = *addr;
+        monoio::spawn(async move {
+            if let Ok(mut stream) = monoio::net::TcpStream::connect(addr).await {
+                let len = (data.len() as u32).to_be_bytes();
+                let len_vec = len.to_vec();
+                let (wr, _) = stream.write_all(len_vec).await;
+                if wr.is_err() {
+                    return;
+                }
+                let (wr, _) = stream.write_all(data).await;
+                if wr.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    info!(
+        "Failover election started: epoch={}, sent auth request to {} masters, need {} votes",
+        new_epoch,
+        master_addrs.len(),
+        quorum
+    );
+
+    // Collect votes with 5-second timeout
+    let mut votes: u32 = 1; // self-vote
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        if votes >= quorum {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        monoio::select! {
+            result = vote_rx.recv_async() => {
+                match result {
+                    Ok(_voter_id) => {
+                        votes += 1;
+                        let mut cs = cluster_state.write().unwrap();
+                        if let FailoverState::WaitingVotes {
+                            ref mut votes_received,
+                            ..
+                        } = cs.failover_state
+                        {
+                            *votes_received = votes;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            _ = monoio::time::sleep(remaining) => break,
         }
     }
 
