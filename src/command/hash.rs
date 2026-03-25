@@ -675,9 +675,9 @@ pub fn hget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(f) => f,
         None => return err_wrong_args("HGET"),
     };
-    match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(map)) => match map.get(field) {
-            Some(v) => Frame::BulkString(v.clone()),
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => match href.get_field(field) {
+            Some(v) => Frame::BulkString(v),
             None => Frame::Null,
         },
         Ok(None) => Frame::Null,
@@ -694,7 +694,7 @@ pub fn hmget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HMGET"),
     };
-    let map_opt = match db.get_hash_if_alive(key, now_ms) {
+    let href_opt = match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(m) => m,
         Err(e) => return e,
     };
@@ -707,9 +707,9 @@ pub fn hmget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 continue;
             }
         };
-        match &map_opt {
-            Some(map) => match map.get(field) {
-                Some(v) => results.push(Frame::BulkString(v.clone())),
+        match &href_opt {
+            Some(href) => match href.get_field(field) {
+                Some(v) => results.push(Frame::BulkString(v)),
                 None => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),
@@ -727,12 +727,13 @@ pub fn hgetall_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HGETALL"),
     };
-    match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(map)) => {
-            let mut result = Vec::with_capacity(map.len() * 2);
-            for (field, value) in map {
-                result.push(Frame::BulkString(field.clone()));
-                result.push(Frame::BulkString(value.clone()));
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let entries = href.entries();
+            let mut result = Vec::with_capacity(entries.len() * 2);
+            for (field, value) in entries {
+                result.push(Frame::BulkString(field));
+                result.push(Frame::BulkString(value));
             }
             Frame::Array(result)
         }
@@ -750,8 +751,8 @@ pub fn hlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HLEN"),
     };
-    match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(map)) => Frame::Integer(map.len() as i64),
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => Frame::Integer(href.len() as i64),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -766,9 +767,9 @@ pub fn hkeys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HKEYS"),
     };
-    match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(map)) => {
-            let fields: Vec<Frame> = map.keys().map(|k| Frame::BulkString(k.clone())).collect();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let fields: Vec<Frame> = href.entries().into_iter().map(|(k, _)| Frame::BulkString(k)).collect();
             Frame::Array(fields)
         }
         Ok(None) => Frame::Array(vec![]),
@@ -785,9 +786,9 @@ pub fn hvals_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HVALS"),
     };
-    match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(map)) => {
-            let values: Vec<Frame> = map.values().map(|v| Frame::BulkString(v.clone())).collect();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let values: Vec<Frame> = href.entries().into_iter().map(|(_, v)| Frame::BulkString(v)).collect();
             Frame::Array(values)
         }
         Ok(None) => Frame::Array(vec![]),
@@ -808,9 +809,9 @@ pub fn hexists_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(f) => f,
         None => return err_wrong_args("HEXISTS"),
     };
-    match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(map)) => {
-            if map.contains_key(field) { Frame::Integer(1) } else { Frame::Integer(0) }
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            if href.get_field(field).is_some() { Frame::Integer(1) } else { Frame::Integer(0) }
         }
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
@@ -858,8 +859,12 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
         i += 1;
     }
-    let map = match db.get_hash_if_alive(key, now_ms) {
-        Ok(Some(m)) => m,
+    let entries = match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let mut e = href.entries();
+            e.sort_by(|a, b| a.0.cmp(&b.0));
+            e
+        }
         Ok(None) => {
             return Frame::Array(vec![
                 Frame::BulkString(Bytes::from_static(b"0")),
@@ -868,14 +873,12 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
         Err(e) => return e,
     };
-    let mut fields: Vec<(&Bytes, &Bytes)> = map.iter().collect();
-    fields.sort_by(|a, b| a.0.cmp(b.0));
-    let total = fields.len();
+    let total = entries.len();
     let mut results = Vec::new();
     let mut pos = cursor;
     let mut checked = 0;
     while pos < total && checked < count {
-        let (field, value) = fields[pos];
+        let (ref field, ref value) = entries[pos];
         pos += 1;
         checked += 1;
         if let Some(pattern) = match_pattern {

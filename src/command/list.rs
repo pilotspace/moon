@@ -781,8 +781,8 @@ pub fn llen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("LLEN"),
     };
-    match db.get_list_if_alive(key, now_ms) {
-        Ok(Some(list)) => Frame::Integer(list.len() as i64),
+    match db.get_list_ref_if_alive(key, now_ms) {
+        Ok(Some(lref)) => Frame::Integer(lref.len() as i64),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -813,12 +813,12 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             ))
         }
     };
-    let list = match db.get_list_if_alive(key, now_ms) {
+    let lref = match db.get_list_ref_if_alive(key, now_ms) {
         Ok(Some(l)) => l,
         Ok(None) => return Frame::Array(vec![]),
         Err(e) => return e,
     };
-    let len = list.len() as i64;
+    let len = lref.len() as i64;
     let mut s = if start < 0 { len + start } else { start };
     let mut e = if stop < 0 { len + stop } else { stop };
     if s < 0 { s = 0; }
@@ -826,8 +826,9 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if s > e || s >= len {
         return Frame::Array(vec![]);
     }
-    let items: Vec<Frame> = (s as usize..=e as usize)
-        .map(|i| Frame::BulkString(list[i].clone()))
+    let items: Vec<Frame> = lref.range(s as usize, e as usize)
+        .into_iter()
+        .map(Frame::BulkString)
         .collect();
     Frame::Array(items)
 }
@@ -849,13 +850,16 @@ pub fn lindex_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             ))
         }
     };
-    let list = match db.get_list_if_alive(key, now_ms) {
+    let lref = match db.get_list_ref_if_alive(key, now_ms) {
         Ok(Some(l)) => l,
         Ok(None) => return Frame::Null,
         Err(e) => return e,
     };
-    match resolve_index(index, list.len()) {
-        Some(i) => Frame::BulkString(list[i].clone()),
+    match resolve_index(index, lref.len()) {
+        Some(i) => match lref.get(i) {
+            Some(v) => Frame::BulkString(v),
+            None => Frame::Null,
+        },
         None => Frame::Null,
     }
 }
@@ -916,7 +920,7 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
     }
-    let list = match db.get_list_if_alive(key, now_ms) {
+    let lref = match db.get_list_ref_if_alive(key, now_ms) {
         Ok(Some(l)) => l,
         Ok(None) => {
             return if count.is_some() {
@@ -927,7 +931,8 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
         Err(e) => return e,
     };
-    let len = list.len();
+    let all_elements = lref.iter_bytes();
+    let len = all_elements.len();
     let max_count = match count {
         Some(0) => usize::MAX,
         Some(c) => c,
@@ -939,7 +944,7 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         let mut skip = rank as usize - 1;
         let scan_limit = if maxlen > 0 { maxlen.min(len) } else { len };
         for idx in 0..scan_limit {
-            if list[idx] == element {
+            if all_elements[idx] == element {
                 if skip > 0 {
                     skip -= 1;
                 } else {
@@ -956,7 +961,7 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         for idx in (0..len).rev() {
             if scanned >= scan_limit { break; }
             scanned += 1;
-            if list[idx] == element {
+            if all_elements[idx] == element {
                 if skip > 0 {
                     skip -= 1;
                 } else {

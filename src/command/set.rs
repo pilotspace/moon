@@ -906,8 +906,8 @@ fn collect_sets_readonly(
 ) -> Result<Vec<Option<HashSet<Bytes>>>, Frame> {
     let mut sets = Vec::with_capacity(keys.len());
     for key in keys {
-        match db.get_set_if_alive(key, now_ms) {
-            Ok(Some(set)) => sets.push(Some(set.clone())),
+        match db.get_set_ref_if_alive(key, now_ms) {
+            Ok(Some(sref)) => sets.push(Some(sref.to_hash_set())),
             Ok(None) => sets.push(None),
             Err(e) => return Err(e),
         }
@@ -924,9 +924,9 @@ pub fn smembers_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SMEMBERS"),
     };
-    match db.get_set_if_alive(key, now_ms) {
-        Ok(Some(set)) => {
-            let members: Vec<Frame> = set.iter().map(|m| Frame::BulkString(m.clone())).collect();
+    match db.get_set_ref_if_alive(key, now_ms) {
+        Ok(Some(sref)) => {
+            let members: Vec<Frame> = sref.members().into_iter().map(Frame::BulkString).collect();
             Frame::Array(members)
         }
         Ok(None) => Frame::Array(vec![]),
@@ -943,8 +943,8 @@ pub fn scard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SCARD"),
     };
-    match db.get_set_if_alive(key, now_ms) {
-        Ok(Some(set)) => Frame::Integer(set.len() as i64),
+    match db.get_set_ref_if_alive(key, now_ms) {
+        Ok(Some(sref)) => Frame::Integer(sref.len() as i64),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -963,9 +963,9 @@ pub fn sismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(m) => m,
         None => return err_wrong_args("SISMEMBER"),
     };
-    match db.get_set_if_alive(key, now_ms) {
-        Ok(Some(set)) => {
-            if set.contains(member) { Frame::Integer(1) } else { Frame::Integer(0) }
+    match db.get_set_ref_if_alive(key, now_ms) {
+        Ok(Some(sref)) => {
+            if sref.contains(member) { Frame::Integer(1) } else { Frame::Integer(0) }
         }
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
@@ -981,15 +981,15 @@ pub fn smismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         Some(k) => k,
         None => return err_wrong_args("SMISMEMBER"),
     };
-    match db.get_set_if_alive(key, now_ms) {
-        Ok(maybe_set) => {
+    match db.get_set_ref_if_alive(key, now_ms) {
+        Ok(maybe_sref) => {
             let results: Vec<Frame> = args[1..]
                 .iter()
                 .map(|arg| {
                     let member = extract_bytes(arg);
-                    match (maybe_set, member) {
-                        (Some(set), Some(m)) => {
-                            if set.contains(m) { Frame::Integer(1) } else { Frame::Integer(0) }
+                    match (&maybe_sref, member) {
+                        (Some(sref), Some(m)) => {
+                            if sref.contains(m) { Frame::Integer(1) } else { Frame::Integer(0) }
                         }
                         _ => Frame::Integer(0),
                     }
@@ -1091,17 +1091,17 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         Some(k) => k,
         None => return err_wrong_args("SRANDMEMBER"),
     };
-    let set = match db.get_set_if_alive(key, now_ms) {
-        Ok(Some(s)) => s.clone(),
+    let set_members = match db.get_set_ref_if_alive(key, now_ms) {
+        Ok(Some(sref)) => sref.members(),
         Ok(None) => {
             return if args.len() == 1 { Frame::Null } else { Frame::Array(vec![]) };
         }
         Err(e) => return e,
     };
-    if set.is_empty() {
+    if set_members.is_empty() {
         return if args.len() == 1 { Frame::Null } else { Frame::Array(vec![]) };
     }
-    let members: Vec<&Bytes> = set.iter().collect();
+    let members: Vec<&Bytes> = set_members.iter().collect();
     let mut rng = rand::rng();
     if args.len() == 1 {
         let chosen = members.choose(&mut rng).unwrap();
@@ -1174,9 +1174,9 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
         i += 1;
     }
-    let members: Vec<Bytes> = match db.get_set_if_alive(key, now_ms) {
-        Ok(Some(set)) => {
-            let mut v: Vec<Bytes> = set.iter().cloned().collect();
+    let members: Vec<Bytes> = match db.get_set_ref_if_alive(key, now_ms) {
+        Ok(Some(sref)) => {
+            let mut v = sref.members();
             v.sort();
             v
         }
