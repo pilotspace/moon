@@ -2881,7 +2881,7 @@ pub async fn handle_connection_sharded_monoio(
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    _pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
     _blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     aof_tx: Option<channel::MpscSender<AofMessage>>,
@@ -2909,7 +2909,216 @@ pub async fn handle_connection_sharded_monoio(
     let mut selected_db: usize = 0;
     let db_count = databases.borrow().len();
 
+    // Pub/Sub connection-local state
+    let mut subscription_count: usize = 0;
+    let mut subscriber_id: u64 = 0;
+    let mut pubsub_tx: Option<channel::MpscSender<Frame>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<Frame>> = None;
+
+    // Transaction (MULTI/EXEC) connection-local state
+    let mut in_multi: bool = false;
+    let mut command_queue: Vec<Frame> = Vec::new();
+
     loop {
+        // Subscriber mode: bidirectional select on client commands + published messages
+        if subscription_count > 0 {
+            let rx = pubsub_rx.as_ref().unwrap();
+            let sub_tmp_buf = vec![0u8; 8192];
+            monoio::select! {
+                read_result = stream.read(sub_tmp_buf) => {
+                    let (result, buf) = read_result;
+                    match result {
+                        Ok(0) => break, // connection closed
+                        Ok(n) => {
+                            read_buf.extend_from_slice(&buf[..n]);
+                            // Parse frames from buffer
+                            loop {
+                                match codec.decode_frame(&mut read_buf) {
+                                    Ok(Some(frame)) => {
+                                        if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                                            match cmd {
+                                                _ if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") => {
+                                                    if cmd_args.is_empty() {
+                                                        let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"));
+                                                        let mut resp_buf = BytesMut::new();
+                                                        codec.encode_frame(&err, &mut resp_buf);
+                                                        let data = resp_buf.to_vec();
+                                                        let (wr, _) = stream.write_all(data).await;
+                                                        if wr.is_err() { break; }
+                                                        continue;
+                                                    }
+                                                    for arg in cmd_args {
+                                                        if let Some(channel) = extract_bytes(arg) {
+                                                            let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                            pubsub_registry.borrow_mut().subscribe(channel.clone(), sub);
+                                                            subscription_count += 1;
+                                                            let resp = pubsub::subscribe_response(&channel, subscription_count);
+                                                            let mut resp_buf = BytesMut::new();
+                                                            codec.encode_frame(&resp, &mut resp_buf);
+                                                            let data = resp_buf.to_vec();
+                                                            let (wr, _) = stream.write_all(data).await;
+                                                            if wr.is_err() { break; }
+                                                        }
+                                                    }
+                                                }
+                                                _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
+                                                    if cmd_args.is_empty() {
+                                                        let removed = pubsub_registry.borrow_mut().unsubscribe_all(subscriber_id);
+                                                        if removed.is_empty() {
+                                                            subscription_count = pubsub_registry.borrow().total_subscription_count(subscriber_id);
+                                                            let resp = pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count);
+                                                            let mut resp_buf = BytesMut::new();
+                                                            codec.encode_frame(&resp, &mut resp_buf);
+                                                            let data = resp_buf.to_vec();
+                                                            let (wr, _) = stream.write_all(data).await;
+                                                            if wr.is_err() { break; }
+                                                        } else {
+                                                            for ch in &removed {
+                                                                subscription_count = subscription_count.saturating_sub(1);
+                                                                let resp = pubsub::unsubscribe_response(ch, subscription_count);
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&resp, &mut resp_buf);
+                                                                let data = resp_buf.to_vec();
+                                                                let (wr, _) = stream.write_all(data).await;
+                                                                if wr.is_err() { break; }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        for arg in cmd_args {
+                                                            if let Some(channel) = extract_bytes(arg) {
+                                                                pubsub_registry.borrow_mut().unsubscribe(channel.as_ref(), subscriber_id);
+                                                                subscription_count = subscription_count.saturating_sub(1);
+                                                                let resp = pubsub::unsubscribe_response(&channel, subscription_count);
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&resp, &mut resp_buf);
+                                                                let data = resp_buf.to_vec();
+                                                                let (wr, _) = stream.write_all(data).await;
+                                                                if wr.is_err() { break; }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                _ if cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") => {
+                                                    if cmd_args.is_empty() {
+                                                        let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'psubscribe' command"));
+                                                        let mut resp_buf = BytesMut::new();
+                                                        codec.encode_frame(&err, &mut resp_buf);
+                                                        let data = resp_buf.to_vec();
+                                                        let (wr, _) = stream.write_all(data).await;
+                                                        if wr.is_err() { break; }
+                                                        continue;
+                                                    }
+                                                    for arg in cmd_args {
+                                                        if let Some(pattern) = extract_bytes(arg) {
+                                                            let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                            pubsub_registry.borrow_mut().psubscribe(pattern.clone(), sub);
+                                                            subscription_count += 1;
+                                                            let resp = pubsub::psubscribe_response(&pattern, subscription_count);
+                                                            let mut resp_buf = BytesMut::new();
+                                                            codec.encode_frame(&resp, &mut resp_buf);
+                                                            let data = resp_buf.to_vec();
+                                                            let (wr, _) = stream.write_all(data).await;
+                                                            if wr.is_err() { break; }
+                                                        }
+                                                    }
+                                                }
+                                                _ if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") => {
+                                                    if cmd_args.is_empty() {
+                                                        let removed = pubsub_registry.borrow_mut().punsubscribe_all(subscriber_id);
+                                                        if removed.is_empty() {
+                                                            subscription_count = pubsub_registry.borrow().total_subscription_count(subscriber_id);
+                                                            let resp = pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count);
+                                                            let mut resp_buf = BytesMut::new();
+                                                            codec.encode_frame(&resp, &mut resp_buf);
+                                                            let data = resp_buf.to_vec();
+                                                            let (wr, _) = stream.write_all(data).await;
+                                                            if wr.is_err() { break; }
+                                                        } else {
+                                                            for pat in &removed {
+                                                                subscription_count = subscription_count.saturating_sub(1);
+                                                                let resp = pubsub::punsubscribe_response(pat, subscription_count);
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&resp, &mut resp_buf);
+                                                                let data = resp_buf.to_vec();
+                                                                let (wr, _) = stream.write_all(data).await;
+                                                                if wr.is_err() { break; }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        for arg in cmd_args {
+                                                            if let Some(pattern) = extract_bytes(arg) {
+                                                                pubsub_registry.borrow_mut().punsubscribe(pattern.as_ref(), subscriber_id);
+                                                                subscription_count = subscription_count.saturating_sub(1);
+                                                                let resp = pubsub::punsubscribe_response(&pattern, subscription_count);
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&resp, &mut resp_buf);
+                                                                let data = resp_buf.to_vec();
+                                                                let (wr, _) = stream.write_all(data).await;
+                                                                if wr.is_err() { break; }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                _ if cmd.eq_ignore_ascii_case(b"PING") => {
+                                                    let resp = Frame::Array(vec![
+                                                        Frame::BulkString(Bytes::from_static(b"pong")),
+                                                        Frame::BulkString(Bytes::from_static(b"")),
+                                                    ]);
+                                                    let mut resp_buf = BytesMut::new();
+                                                    codec.encode_frame(&resp, &mut resp_buf);
+                                                    let data = resp_buf.to_vec();
+                                                    let (wr, _) = stream.write_all(data).await;
+                                                    if wr.is_err() { break; }
+                                                }
+                                                _ if cmd.eq_ignore_ascii_case(b"QUIT") => {
+                                                    let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
+                                                    let mut resp_buf = BytesMut::new();
+                                                    codec.encode_frame(&resp, &mut resp_buf);
+                                                    let data = resp_buf.to_vec();
+                                                    let (wr, _) = stream.write_all(data).await;
+                                                    let _ = wr; // ignore write error on quit
+                                                    return; // exit connection
+                                                }
+                                                _ => {
+                                                    let cmd_str = String::from_utf8_lossy(cmd);
+                                                    let err = Frame::Error(Bytes::from(format!(
+                                                        "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+                                                        cmd_str.to_lowercase()
+                                                    )));
+                                                    let mut resp_buf = BytesMut::new();
+                                                    codec.encode_frame(&err, &mut resp_buf);
+                                                    let data = resp_buf.to_vec();
+                                                    let (wr, _) = stream.write_all(data).await;
+                                                    if wr.is_err() { break; }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => break, // need more data
+                                    Err(_) => return,  // parse error
+                                }
+                            }
+                        }
+                        Err(_) => break, // connection error
+                    }
+                }
+                msg = rx.recv_async() => {
+                    match msg {
+                        Ok(frame) => {
+                            let mut resp_buf = BytesMut::new();
+                            codec.encode_frame(&frame, &mut resp_buf);
+                            let data = resp_buf.to_vec();
+                            let (result, _) = stream.write_all(data).await;
+                            if result.is_err() { break; }
+                        }
+                        Err(_) => break, // all senders dropped
+                    }
+                }
+                _ = shutdown.cancelled() => { break; }
+            }
+            continue;
+        }
+
         // Read data from stream using monoio ownership I/O.
         // Vec<u8> implements monoio's IoBufMut trait.
         let tmp_buf = vec![0u8; 8192];
@@ -2956,6 +3165,114 @@ pub async fn handle_connection_sharded_monoio(
                 codec.encode_frame(&resp, &mut write_buf);
                 should_quit = true;
                 break;
+            }
+
+            // --- SUBSCRIBE / PSUBSCRIBE ---
+            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
+                if cmd_args.is_empty() {
+                    let cmd_name = if is_pattern { "psubscribe" } else { "subscribe" };
+                    let err = Frame::Error(Bytes::from(format!(
+                        "ERR wrong number of arguments for '{}' command", cmd_name
+                    )));
+                    codec.encode_frame(&err, &mut write_buf);
+                    continue;
+                }
+                // Allocate pubsub channel if not yet created
+                if pubsub_tx.is_none() {
+                    let (tx, rx) = channel::mpsc_bounded(256);
+                    pubsub_tx = Some(tx);
+                    pubsub_rx = Some(rx);
+                }
+                if subscriber_id == 0 {
+                    subscriber_id = crate::pubsub::next_subscriber_id();
+                }
+                for arg in cmd_args {
+                    if let Some(ch) = extract_bytes(arg) {
+                        let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                        if is_pattern {
+                            pubsub_registry.borrow_mut().psubscribe(ch.clone(), sub);
+                        } else {
+                            pubsub_registry.borrow_mut().subscribe(ch.clone(), sub);
+                        }
+                        subscription_count += 1;
+                        let resp = if is_pattern {
+                            pubsub::psubscribe_response(&ch, subscription_count)
+                        } else {
+                            pubsub::subscribe_response(&ch, subscription_count)
+                        };
+                        codec.encode_frame(&resp, &mut write_buf);
+                    }
+                }
+                // Flush responses and re-enter loop (next iteration enters subscriber mode)
+                if !write_buf.is_empty() {
+                    let data = write_buf.split().to_vec();
+                    let (result, _): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
+                    if result.is_err() { return; }
+                }
+                break; // break out of frame loop to re-enter main loop in subscriber mode
+            }
+
+            // --- UNSUBSCRIBE / PUNSUBSCRIBE (in normal mode, no-op if not subscribed) ---
+            if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                let is_pattern = cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE");
+                let resp = if is_pattern {
+                    pubsub::punsubscribe_response(&Bytes::from_static(b""), 0)
+                } else {
+                    pubsub::unsubscribe_response(&Bytes::from_static(b""), 0)
+                };
+                codec.encode_frame(&resp, &mut write_buf);
+                continue;
+            }
+
+            // --- MULTI ---
+            if cmd.eq_ignore_ascii_case(b"MULTI") {
+                if in_multi {
+                    let err = Frame::Error(Bytes::from_static(b"ERR MULTI calls can not be nested"));
+                    codec.encode_frame(&err, &mut write_buf);
+                } else {
+                    in_multi = true;
+                    command_queue.clear();
+                    let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
+                    codec.encode_frame(&resp, &mut write_buf);
+                }
+                continue;
+            }
+
+            // --- EXEC ---
+            if cmd.eq_ignore_ascii_case(b"EXEC") {
+                if !in_multi {
+                    let err = Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI"));
+                    codec.encode_frame(&err, &mut write_buf);
+                } else {
+                    in_multi = false;
+                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db);
+                    command_queue.clear();
+                    codec.encode_frame(&result, &mut write_buf);
+                }
+                continue;
+            }
+
+            // --- DISCARD ---
+            if cmd.eq_ignore_ascii_case(b"DISCARD") {
+                if !in_multi {
+                    let err = Frame::Error(Bytes::from_static(b"ERR DISCARD without MULTI"));
+                    codec.encode_frame(&err, &mut write_buf);
+                } else {
+                    in_multi = false;
+                    command_queue.clear();
+                    let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
+                    codec.encode_frame(&resp, &mut write_buf);
+                }
+                continue;
+            }
+
+            // --- MULTI queue mode: queue commands when in transaction ---
+            if in_multi {
+                command_queue.push(frame.clone());
+                let resp = Frame::SimpleString(Bytes::from_static(b"QUEUED"));
+                codec.encode_frame(&resp, &mut write_buf);
+                continue;
             }
 
             // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE ---
