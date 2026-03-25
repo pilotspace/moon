@@ -2876,11 +2876,11 @@ pub async fn handle_connection_sharded_monoio(
     databases: Rc<RefCell<Vec<Database>>>,
     shard_id: usize,
     num_shards: usize,
-    _dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     _pubsub_registry: Rc<RefCell<PubSubRegistry>>,
     _blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
-    _aof_tx: Option<channel::MpscSender<AofMessage>>,
+    aof_tx: Option<channel::MpscSender<AofMessage>>,
     _tracking_table: Rc<RefCell<TrackingTable>>,
     _client_id: u64,
     _repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
@@ -2890,7 +2890,7 @@ pub async fn handle_connection_sharded_monoio(
     _config_port: u16,
     _acl_table: Arc<RwLock<crate::acl::AclTable>>,
     _runtime_config: Arc<RwLock<RuntimeConfig>>,
-    _spsc_notifiers: Vec<Arc<channel::Notify>>,
+    spsc_notifiers: Vec<Arc<channel::Notify>>,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
@@ -2932,31 +2932,146 @@ pub async fn handle_connection_sharded_monoio(
             continue;
         }
 
-        // Process frames through the same dispatch logic as the tokio path
+        // Process frames with shard routing, cross-shard dispatch, and AOF logging
         write_buf.clear();
         let mut should_quit = false;
 
         for frame in &frames {
-            if let Some((cmd, cmd_args)) = extract_command(frame) {
-                // Dispatch to database
+            let (cmd, cmd_args) = match extract_command(frame) {
+                Some(pair) => pair,
+                None => {
+                    let err = Frame::Error(Bytes::from_static(b"ERR invalid command format"));
+                    codec.encode_frame(&err, &mut write_buf);
+                    continue;
+                }
+            };
+
+            // --- QUIT ---
+            if cmd.eq_ignore_ascii_case(b"QUIT") {
+                let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
+                codec.encode_frame(&resp, &mut write_buf);
+                should_quit = true;
+                break;
+            }
+
+            // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE ---
+            if num_shards > 1 {
+                if cmd.eq_ignore_ascii_case(b"KEYS") {
+                    let response = crate::shard::coordinator::coordinate_keys(
+                        cmd_args, shard_id, num_shards, selected_db,
+                        &databases, &dispatch_tx,
+                    ).await;
+                    codec.encode_frame(&response, &mut write_buf);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"SCAN") {
+                    let response = crate::shard::coordinator::coordinate_scan(
+                        cmd_args, shard_id, num_shards, selected_db,
+                        &databases, &dispatch_tx,
+                    ).await;
+                    codec.encode_frame(&response, &mut write_buf);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"DBSIZE") {
+                    let response = crate::shard::coordinator::coordinate_dbsize(
+                        shard_id, num_shards, selected_db,
+                        &databases, &dispatch_tx,
+                    ).await;
+                    codec.encode_frame(&response, &mut write_buf);
+                    continue;
+                }
+
+                // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
+                if is_multi_key_command(cmd, cmd_args) {
+                    let response = crate::shard::coordinator::coordinate_multi_key(
+                        cmd, cmd_args, shard_id, num_shards, selected_db,
+                        &databases, &dispatch_tx,
+                    ).await;
+                    codec.encode_frame(&response, &mut write_buf);
+                    continue;
+                }
+            }
+
+            // --- Routing: keyless, local, or remote ---
+            let target_shard = extract_primary_key(cmd, cmd_args)
+                .map(|key| key_to_shard(key, num_shards));
+
+            let is_local = match target_shard {
+                None => true,
+                Some(s) if s == shard_id => true,
+                _ => false,
+            };
+
+            if is_local {
+                // LOCAL FAST PATH: zero cross-shard overhead
                 let mut dbs = databases.borrow_mut();
-                let db = &mut dbs[selected_db];
-                let result = dispatch(db, cmd, cmd_args, &mut selected_db, db_count);
+                dbs[selected_db].refresh_now();
+                let result = dispatch(
+                    &mut dbs[selected_db], cmd, cmd_args,
+                    &mut selected_db, db_count,
+                );
                 drop(dbs);
 
-                match result {
-                    DispatchResult::Response(resp) => {
-                        codec.encode_frame(&resp, &mut write_buf);
-                    }
-                    DispatchResult::Quit(resp) => {
-                        codec.encode_frame(&resp, &mut write_buf);
+                let response = match result {
+                    DispatchResult::Response(f) => f,
+                    DispatchResult::Quit(f) => {
                         should_quit = true;
+                        f
+                    }
+                };
+
+                // AOF logging for successful local writes
+                if !matches!(response, Frame::Error(_)) {
+                    if let Some(ref tx) = aof_tx {
+                        if aof::is_write_command(cmd) {
+                            let serialized = aof::serialize_command(frame);
+                            let _ = tx.try_send(AofMessage::Append(serialized));
+                        }
                     }
                 }
-            } else {
-                // Invalid command format
-                let err = Frame::Error(Bytes::from_static(b"ERR invalid command format"));
-                codec.encode_frame(&err, &mut write_buf);
+
+                codec.encode_frame(&response, &mut write_buf);
+            } else if let Some(target) = target_shard {
+                // REMOTE DISPATCH: route to correct shard via SPSC + oneshot reply
+                let (tx, rx) = channel::oneshot();
+                let msg = ShardMessage::Execute {
+                    db_index: selected_db,
+                    command: std::sync::Arc::new(frame.clone()),
+                    reply_tx: tx,
+                };
+                let target_idx = ChannelMesh::target_index(shard_id, target);
+                let mut msg_pending = msg;
+                loop {
+                    let push_result = {
+                        let mut producers = dispatch_tx.borrow_mut();
+                        producers[target_idx].try_push(msg_pending)
+                    };
+                    match push_result {
+                        Ok(()) => {
+                            spsc_notifiers[target].notify_one();
+                            break;
+                        }
+                        Err(val) => {
+                            msg_pending = val;
+                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
+                        }
+                    }
+                }
+                let response = rx.await.unwrap_or(
+                    Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed")),
+                );
+
+                // AOF logging for successful remote writes
+                if !matches!(response, Frame::Error(_)) {
+                    if let Some(ref tx) = aof_tx {
+                        if aof::is_write_command(cmd) {
+                            let serialized = aof::serialize_command(frame);
+                            let _ = tx.try_send(AofMessage::Append(serialized));
+                        }
+                    }
+                }
+
+                codec.encode_frame(&response, &mut write_buf);
             }
         }
 
@@ -2985,6 +3100,9 @@ pub async fn handle_connection_sharded_monoio(
             if !remaining.is_empty() {
                 read_buf.extend_from_slice(&remaining);
             }
+        }
+        if write_buf.capacity() > 65536 {
+            write_buf = BytesMut::with_capacity(8192);
         }
     }
 }
