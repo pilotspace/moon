@@ -2659,6 +2659,232 @@ async fn handle_blocking_command(
     frame
 }
 
+/// Monoio version of handle_blocking_command.
+///
+/// Identical logic to the tokio version but uses:
+/// - `monoio::select!` instead of `tokio::select!`
+/// - `monoio::time::sleep` instead of `tokio::time::sleep`
+/// - `std::pin::pin!` instead of `tokio::pin!`
+/// - `monoio::time::sleep(Duration::from_micros(10))` for SPSC backpressure
+///
+/// CRITICAL: RefCell borrows MUST be dropped before any .await point.
+#[cfg(feature = "runtime-monoio")]
+async fn handle_blocking_command_monoio(
+    cmd: &[u8],
+    args: &[Frame],
+    selected_db: usize,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    shard_id: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    shutdown: &CancellationToken,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    use futures::stream::FuturesUnordered;
+
+    // Parse timeout (last argument for all blocking commands)
+    let timeout_secs = match parse_blocking_timeout(cmd, args) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    // Parse keys and command-specific args
+    let (keys, blocked_cmd_factory) = match parse_blocking_args(cmd, args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // --- Non-blocking fast path: try to get data immediately ---
+    {
+        let mut dbs = databases.borrow_mut();
+        let db = &mut dbs[selected_db];
+        for key in &keys {
+            let result = try_immediate_pop(cmd, db, key, args);
+            if let Some(frame) = result {
+                return frame;
+            }
+        }
+    } // dbs borrow dropped here -- CRITICAL before await
+
+    let deadline = if timeout_secs > 0.0 {
+        Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
+    } else {
+        None // 0 = block forever
+    };
+
+    // --- Single-key fast path: one registration, direct await (zero overhead) ---
+    if keys.len() == 1 {
+        let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
+        let wait_id = {
+            let mut reg = blocking_registry.borrow_mut();
+            let wait_id = reg.next_wait_id();
+            let entry = crate::blocking::WaitEntry {
+                wait_id,
+                cmd: blocked_cmd_factory(),
+                reply_tx,
+                deadline,
+            };
+            reg.register(selected_db, keys[0].clone(), entry);
+            wait_id
+        }; // reg borrow dropped
+
+        return if let Some(dl) = deadline {
+            monoio::select! {
+                res = reply_rx => {
+                    match res {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) | Err(_) => Frame::Null,
+                    }
+                }
+                _ = monoio::time::sleep(dl.saturating_duration_since(std::time::Instant::now())) => {
+                    blocking_registry.borrow_mut().remove_wait(wait_id);
+                    Frame::Null
+                }
+                _ = shutdown.cancelled() => {
+                    blocking_registry.borrow_mut().remove_wait(wait_id);
+                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                }
+            }
+        } else {
+            monoio::select! {
+                res = reply_rx => {
+                    match res {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) | Err(_) => Frame::Null,
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    blocking_registry.borrow_mut().remove_wait(wait_id);
+                    Frame::Error(Bytes::from_static(b"ERR server shutting down"))
+                }
+            }
+        };
+    }
+
+    // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
+    // Uses FuturesUnordered for first-wakeup-wins semantics.
+    let wait_id;
+    let mut receivers: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
+        FuturesUnordered::new();
+    let mut registered_remote_shards: Vec<usize> = Vec::new();
+
+    {
+        let mut reg = blocking_registry.borrow_mut();
+        let mut producers = dispatch_tx.borrow_mut();
+        wait_id = reg.next_wait_id();
+
+        for key in &keys {
+            let target = key_to_shard(key, num_shards);
+            let (tx, rx) = channel::oneshot::<Option<Frame>>();
+            receivers.push(rx);
+
+            if target == shard_id {
+                // Local registration
+                let entry = crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx: tx,
+                    deadline,
+                };
+                reg.register(selected_db, key.clone(), entry);
+            } else {
+                // Remote registration via SPSC
+                let target_idx = ChannelMesh::target_index(shard_id, target);
+                let msg = ShardMessage::BlockRegister {
+                    db_index: selected_db,
+                    key: key.clone(),
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx: tx,
+                };
+                // SPSC push with backpressure retry (monoio pattern)
+                let mut msg_pending = msg;
+                loop {
+                    match producers[target_idx].try_push(msg_pending) {
+                        Ok(()) => {
+                            spsc_notifiers[target].notify_one();
+                            break;
+                        }
+                        Err(val) => {
+                            msg_pending = val;
+                            // Drop borrows before await
+                            drop(producers);
+                            drop(reg);
+                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
+                            reg = blocking_registry.borrow_mut();
+                            producers = dispatch_tx.borrow_mut();
+                        }
+                    }
+                }
+                if !registered_remote_shards.contains(&target) {
+                    registered_remote_shards.push(target);
+                }
+            }
+        }
+    } // borrows dropped -- CRITICAL before await
+
+    // Await first successful result from any key/shard.
+    // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
+    // returning the successful Ok. We must skip Err/None results and keep polling.
+    let frame = if let Some(dl) = deadline {
+        let mut sleep = std::pin::pin!(monoio::time::sleep(dl.saturating_duration_since(std::time::Instant::now())));
+        let mut result_frame = Frame::Null;
+        loop {
+            monoio::select! {
+                result = receivers.next() => {
+                    match result {
+                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
+                        Some(Err(_)) => continue, // sender dropped (cleanup race), try next
+                        None => break, // all receivers exhausted
+                    }
+                }
+                _ = &mut sleep => break,
+                _ = shutdown.cancelled() => {
+                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
+                    break;
+                }
+            }
+        }
+        result_frame
+    } else {
+        let mut result_frame = Frame::Null;
+        loop {
+            monoio::select! {
+                result = receivers.next() => {
+                    match result {
+                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
+                        Some(Err(_)) => continue,
+                        None => break,
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
+                    break;
+                }
+            }
+        }
+        result_frame
+    };
+
+    // Cleanup: cancel all remaining registrations (local + remote)
+    blocking_registry.borrow_mut().remove_wait(wait_id);
+    if !registered_remote_shards.is_empty() {
+        let mut producers = dispatch_tx.borrow_mut();
+        for &remote_shard in &registered_remote_shards {
+            let target_idx = ChannelMesh::target_index(shard_id, remote_shard);
+            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+            spsc_notifiers[remote_shard].notify_one();
+        }
+    }
+    // Drop remaining receivers; remote senders get Err on send -- harmless
+    drop(receivers);
+
+    frame
+}
+
 /// Parse timeout from the last argument of a blocking command.
 /// Returns seconds as f64. 0 = block forever.
 fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, Frame> {
@@ -2882,7 +3108,7 @@ pub async fn handle_connection_sharded_monoio(
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_registry: Rc<RefCell<PubSubRegistry>>,
-    _blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     aof_tx: Option<channel::MpscSender<AofMessage>>,
     _tracking_table: Rc<RefCell<TrackingTable>>,
@@ -3267,6 +3493,38 @@ pub async fn handle_connection_sharded_monoio(
                 continue;
             }
 
+            // --- BLOCKING COMMANDS (BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX) ---
+            if cmd.eq_ignore_ascii_case(b"BLPOP")
+                || cmd.eq_ignore_ascii_case(b"BRPOP")
+                || cmd.eq_ignore_ascii_case(b"BLMOVE")
+                || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
+                || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
+            {
+                // Inside MULTI: queue as non-blocking variant
+                if in_multi {
+                    let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
+                    command_queue.push(nb_frame);
+                    codec.encode_frame(&Frame::SimpleString(Bytes::from_static(b"QUEUED")), &mut write_buf);
+                    continue;
+                }
+
+                // Flush accumulated responses before blocking
+                if !write_buf.is_empty() {
+                    let data = write_buf.split().to_vec();
+                    let (result, _): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
+                    if result.is_err() { return; }
+                }
+
+                let blocking_response = handle_blocking_command_monoio(
+                    cmd, cmd_args, selected_db, &databases, &blocking_registry,
+                    shard_id, num_shards, &dispatch_tx, &shutdown, &spsc_notifiers,
+                ).await;
+
+                // Encode blocking response directly
+                codec.encode_frame(&blocking_response, &mut write_buf);
+                break; // Blocking command ends the pipeline batch
+            }
+
             // --- MULTI queue mode: queue commands when in transaction ---
             if in_multi {
                 command_queue.push(frame.clone());
@@ -3347,6 +3605,32 @@ pub async fn handle_connection_sharded_monoio(
                         if aof::is_write_command(cmd) {
                             let serialized = aof::serialize_command(frame);
                             let _ = tx.try_send(AofMessage::Append(serialized));
+                        }
+                    }
+                }
+
+                // Post-dispatch wakeup hooks for producer commands (blocking waiters)
+                if !matches!(response, Frame::Error(_)) {
+                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        || cmd.eq_ignore_ascii_case(b"ZADD");
+                    if needs_wake {
+                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                            let mut dbs = databases.borrow_mut();
+                            let mut reg = blocking_registry.borrow_mut();
+                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            {
+                                crate::blocking::wakeup::try_wake_list_waiter(
+                                    &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                );
+                            } else {
+                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                    &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                );
+                            }
                         }
                     }
                 }
