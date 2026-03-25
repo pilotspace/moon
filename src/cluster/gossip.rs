@@ -13,7 +13,8 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
+use crate::cluster::bus::SharedVoteTx;
+use crate::cluster::{ClusterNode, ClusterState, FailoverState, NodeFlags};
 
 pub const GOSSIP_MAGIC: u32 = 0x52656469; // "Redi"
 pub const GOSSIP_VERSION: u16 = 1;
@@ -349,13 +350,17 @@ pub fn check_failure_states(state: &mut ClusterState, node_timeout_ms: u64) {
 /// Background gossip ticker: sends PING to a random peer every 100ms.
 ///
 /// Runs as a separate async task on the listener runtime (NOT on shard threads).
+/// Also monitors for master FAIL and spawns election task for replicas.
 pub async fn run_gossip_ticker(
     self_addr: SocketAddr,
     cluster_state: Arc<RwLock<ClusterState>>,
     node_timeout_ms: u64,
     shutdown: CancellationToken,
+    vote_tx: SharedVoteTx,
+    repl_state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut election_spawned = false;
     loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -363,6 +368,43 @@ pub async fn run_gossip_ticker(
                 let (target_addr, ping_msg) = {
                     let mut cs = cluster_state.write().unwrap();
                     check_failure_states(&mut cs, node_timeout_ms);
+
+                    // Reset election_spawned when failover state returns to None
+                    if election_spawned && cs.failover_state == FailoverState::None {
+                        election_spawned = false;
+                    }
+
+                    // Check if we should initiate failover (replica with FAIL master)
+                    if !election_spawned {
+                        let my_flags = cs.my_node().flags.clone();
+                        if let NodeFlags::Replica { ref master_id } = my_flags {
+                            let master_is_fail = cs.nodes.get(master_id)
+                                .map(|n| matches!(n.flags, NodeFlags::Fail))
+                                .unwrap_or(false);
+                            if master_is_fail && cs.failover_state == FailoverState::None {
+                                election_spawned = true;
+                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                {
+                                    // Use try_lock to avoid holding std RwLock across await
+                                    // We're in a sync context here so blocking_lock is safe
+                                    let mut guard = vote_tx.blocking_lock();
+                                    *guard = Some(tx);
+                                }
+                                let cs_election = cluster_state.clone();
+                                let sa = self_addr;
+                                let offset = repl_state.read().unwrap().total_offset();
+                                let vtx = vote_tx.clone();
+                                tokio::spawn(async move {
+                                    crate::cluster::failover::run_election_task(
+                                        cs_election, sa, offset, rx,
+                                    ).await;
+                                    // Clear vote_tx when election ends
+                                    *vtx.lock().await = None;
+                                });
+                            }
+                        }
+                    }
+
                     let target = cs.nodes.values()
                         .filter(|n| n.node_id != cs.node_id)
                         .next()
