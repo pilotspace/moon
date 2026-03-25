@@ -1,4 +1,5 @@
 pub mod bptree;
+pub mod compact_key;
 pub mod compact_value;
 pub mod dashtable;
 pub mod db;
