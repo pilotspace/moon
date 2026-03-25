@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
 use crate::command::persistence::{bgsave_start, SAVE_IN_PROGRESS, SNAPSHOT_EPOCH};
@@ -53,10 +53,12 @@ pub async fn run_auto_save(
     change_counter: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) {
+    #[cfg(feature = "runtime-tokio")]
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut last_save = Instant::now();
 
     loop {
+        #[cfg(feature = "runtime-tokio")]
         tokio::select! {
             _ = interval.tick() => {
                 let elapsed = last_save.elapsed().as_secs();
@@ -92,12 +94,14 @@ pub async fn run_auto_save_sharded(
     rules: Vec<(u64, u64)>,
     change_counter: Arc<AtomicU64>,
     cancel: CancellationToken,
-    snapshot_trigger: tokio::sync::watch::Sender<u64>,
+    snapshot_trigger: crate::runtime::channel::WatchSender<u64>,
 ) {
+    #[cfg(feature = "runtime-tokio")]
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut last_save = Instant::now();
 
     loop {
+        #[cfg(feature = "runtime-tokio")]
         tokio::select! {
             _ = interval.tick() => {
                 let elapsed = last_save.elapsed().as_secs();

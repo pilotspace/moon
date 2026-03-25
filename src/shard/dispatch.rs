@@ -2,6 +2,7 @@ use bytes::Bytes;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::protocol::Frame;
+use crate::runtime::channel;
 
 const HASH_SEED: u64 = 0;
 
@@ -40,20 +41,20 @@ pub enum ShardMessage {
     Execute {
         db_index: usize,
         command: std::sync::Arc<Frame>,
-        reply_tx: tokio::sync::oneshot::Sender<Frame>,
+        reply_tx: channel::OneshotSender<Frame>,
     },
     /// Execute a multi-key sub-operation on this shard.
     MultiExecute {
         db_index: usize,
         commands: Vec<(Bytes, Frame)>, // (key, command) pairs for this shard
-        reply_tx: tokio::sync::oneshot::Sender<Vec<Frame>>,
+        reply_tx: channel::OneshotSender<Vec<Frame>>,
     },
     /// Execute a batch of pipelined commands on this shard.
     /// Each command is independent (not transactional). Returns one response per command.
     PipelineBatch {
         db_index: usize,
         commands: Vec<std::sync::Arc<Frame>>,
-        reply_tx: tokio::sync::oneshot::Sender<Vec<Frame>>,
+        reply_tx: channel::OneshotSender<Vec<Frame>>,
     },
     /// Publish a message to local subscribers on this shard.
     PubSubFanOut { channel: Bytes, message: Bytes },
@@ -63,7 +64,7 @@ pub enum ShardMessage {
     SnapshotBegin {
         epoch: u64,
         snapshot_dir: std::path::PathBuf,
-        reply_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply_tx: channel::OneshotSender<Result<(), String>>,
     },
     /// Register a blocked client waiting for data on a key (cross-shard).
     BlockRegister {
@@ -71,7 +72,7 @@ pub enum ShardMessage {
         key: Bytes,
         wait_id: u64,
         cmd: crate::blocking::BlockedCommand,
-        reply_tx: tokio::sync::oneshot::Sender<Option<crate::protocol::Frame>>,
+        reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
     },
     /// Cancel a blocked client registration (woken by another shard or timed out).
     BlockCancel {
@@ -82,7 +83,7 @@ pub enum ShardMessage {
     /// The shard adds `tx` to its replica_txs list for WAL fan-out.
     RegisterReplica {
         replica_id: u64,
-        tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        tx: channel::MpscSender<bytes::Bytes>,
     },
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
@@ -94,7 +95,7 @@ pub enum ShardMessage {
         db_index: usize,
         slot: u16,
         count: usize,
-        reply_tx: tokio::sync::oneshot::Sender<Vec<bytes::Bytes>>,
+        reply_tx: channel::OneshotSender<Vec<bytes::Bytes>>,
     },
     /// Notify shard of slot ownership changes (no-op placeholder for future per-shard caching).
     SlotOwnershipUpdate {

@@ -15,6 +15,7 @@ use ringbuf::HeapProd;
 
 use crate::command::{dispatch as cmd_dispatch, DispatchResult};
 use crate::protocol::Frame;
+use crate::runtime::channel;
 use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::Database;
@@ -120,7 +121,7 @@ async fn coordinate_mget(
 
     let total = args.len();
     let mut results: Vec<Option<Frame>> = vec![None; total];
-    let mut pending_rxs: Vec<(Vec<usize>, tokio::sync::oneshot::Receiver<Vec<Frame>>)> = Vec::new();
+    let mut pending_rxs: Vec<(Vec<usize>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::new();
 
     // Iterate in ascending shard-ID order (BTreeMap guarantees this)
     for (shard_id, indexed_keys) in &groups {
@@ -143,7 +144,7 @@ async fn coordinate_mget(
             }
         } else {
             // Remote dispatch: batch of GET commands via MultiExecute
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = indexed_keys
                 .iter()
                 .map(|(_, k)| {
@@ -239,7 +240,7 @@ async fn coordinate_mset(
         return crate::command::string::mset(&mut dbs[db_index], args);
     }
 
-    let mut pending_rxs: Vec<tokio::sync::oneshot::Receiver<Vec<Frame>>> = Vec::new();
+    let mut pending_rxs: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
@@ -249,7 +250,7 @@ async fn coordinate_mset(
                 dbs[db_index].set_string(key.clone(), value.clone());
             }
         } else {
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = kv_pairs
                 .iter()
                 .map(|(k, v)| {
@@ -316,7 +317,7 @@ async fn coordinate_multi_del_or_exists(
     }
 
     let mut total_count: i64 = 0;
-    let mut pending_rxs: Vec<tokio::sync::oneshot::Receiver<Vec<Frame>>> = Vec::new();
+    let mut pending_rxs: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
 
     for (shard_id, key_args) in &groups {
         if *shard_id == my_shard {
@@ -330,7 +331,7 @@ async fn coordinate_multi_del_or_exists(
                 total_count += n;
             }
         } else {
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = key_args
                 .iter()
                 .map(|arg| {
@@ -383,7 +384,7 @@ pub async fn coordinate_keys(
     }
 
     let mut all_keys: Vec<Frame> = Vec::new();
-    let mut pending_rxs: Vec<tokio::sync::oneshot::Receiver<Frame>> = Vec::new();
+    let mut pending_rxs: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
 
     // Execute locally on this shard
     {
@@ -402,7 +403,7 @@ pub async fn coordinate_keys(
         if target == my_shard {
             continue;
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = channel::oneshot();
         let cmd_frame = {
             let mut parts = vec![Frame::BulkString(Bytes::from_static(b"KEYS"))];
             for a in args {
@@ -489,7 +490,7 @@ pub async fn coordinate_scan(
         }
     } else {
         // Remote dispatch
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = channel::oneshot();
         let mut parts = vec![Frame::BulkString(Bytes::from_static(b"SCAN"))];
         parts.extend(scan_args);
         let cmd_frame = Frame::Array(parts);
@@ -555,7 +556,7 @@ pub async fn coordinate_dbsize(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
 ) -> Frame {
     let mut total: i64 = 0;
-    let mut pending_rxs: Vec<tokio::sync::oneshot::Receiver<Frame>> = Vec::new();
+    let mut pending_rxs: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
 
     // Local shard
     {
@@ -568,7 +569,7 @@ pub async fn coordinate_dbsize(
         if target == my_shard {
             continue;
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = channel::oneshot();
         let cmd_frame = Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"DBSIZE"))]);
         let msg = ShardMessage::Execute {
             db_index,

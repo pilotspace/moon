@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
+use crate::runtime::channel;
 use tracing::{error, info, warn};
 
 use crate::command::{dispatch, DispatchResult};
@@ -141,14 +141,16 @@ pub fn serialize_command(frame: &Frame) -> Bytes {
 /// Background AOF writer task. Receives commands via mpsc channel and appends them
 /// to the AOF file. Handles fsync according to the configured policy.
 pub async fn aof_writer_task(
-    mut rx: mpsc::Receiver<AofMessage>,
+    rx: channel::MpscReceiver<AofMessage>,
     aof_path: PathBuf,
     fsync: FsyncPolicy,
     cancel: CancellationToken,
 ) {
+    #[cfg(feature = "runtime-tokio")]
     use tokio::io::AsyncWriteExt;
 
     // Open file in append mode (create if not exists)
+    #[cfg(feature = "runtime-tokio")]
     let file: tokio::fs::File = match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -162,16 +164,20 @@ pub async fn aof_writer_task(
         }
     };
 
+    #[cfg(feature = "runtime-tokio")]
     let mut writer = tokio::io::BufWriter::new(file);
     let mut last_fsync = Instant::now();
+    #[cfg(feature = "runtime-tokio")]
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    #[cfg(feature = "runtime-tokio")]
     interval.tick().await; // consume first tick
 
     loop {
+        #[cfg(feature = "runtime-tokio")]
         tokio::select! {
-            msg = rx.recv() => {
+            msg = rx.recv_async() => {
                 match msg {
-                    Some(AofMessage::Append(data)) => {
+                    Ok(AofMessage::Append(data)) => {
                         if let Err(e) = writer.write_all(&data).await {
                             error!("AOF write error: {}", e);
                             continue;
@@ -186,7 +192,7 @@ pub async fn aof_writer_task(
                             }
                         }
                     }
-                    Some(AofMessage::Rewrite(db)) => {
+                    Ok(AofMessage::Rewrite(db)) => {
                         // Flush current writer before rewrite
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
@@ -211,7 +217,7 @@ pub async fn aof_writer_task(
                             }
                         }
                     }
-                    Some(AofMessage::Shutdown) | None => {
+                    Ok(AofMessage::Shutdown) | Err(_) => {
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
                         info!("AOF writer shutting down");
@@ -539,8 +545,8 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result
 
     // Write to temp file, then atomic rename
     let tmp_path = aof_path.with_extension("aof.tmp");
-    tokio::fs::write(&tmp_path, &commands).await?;
-    tokio::fs::rename(&tmp_path, aof_path).await?;
+    std::fs::write(&tmp_path, &commands)?;
+    std::fs::rename(&tmp_path, aof_path)?;
 
     info!("AOF rewrite complete: {} bytes", commands.len());
     Ok(())

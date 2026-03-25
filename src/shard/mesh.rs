@@ -4,7 +4,8 @@ use ringbuf::traits::Split;
 use ringbuf::HeapCons;
 use ringbuf::HeapProd;
 use ringbuf::HeapRb;
-use tokio::sync::mpsc;
+
+use crate::runtime::channel;
 
 use super::dispatch::ShardMessage;
 
@@ -33,11 +34,11 @@ pub struct ChannelMesh {
     /// consumers[receiver_shard] = Vec of consumers, one per other shard.
     consumers: Vec<Vec<HeapCons<ShardMessage>>>,
     /// Connection channels: listener sends TcpStream to each shard.
-    conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>>,
-    conn_rxs: Vec<Option<mpsc::Receiver<tokio::net::TcpStream>>>,
+    conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>>,
+    conn_rxs: Vec<Option<channel::MpscReceiver<tokio::net::TcpStream>>>,
     /// Per-shard Notify instances for event-driven SPSC wake.
     /// Producers call `notify_one()` after pushing to wake the target shard immediately.
-    spsc_notifiers: Vec<Arc<tokio::sync::Notify>>,
+    spsc_notifiers: Vec<Arc<channel::Notify>>,
     num_shards: usize,
 }
 
@@ -78,14 +79,14 @@ impl ChannelMesh {
         let mut conn_txs = Vec::with_capacity(n);
         let mut conn_rxs = Vec::with_capacity(n);
         for _ in 0..n {
-            let (tx, rx) = mpsc::channel(CONN_CHANNEL_CAPACITY);
+            let (tx, rx) = channel::mpsc_bounded(CONN_CHANNEL_CAPACITY);
             conn_txs.push(tx);
             conn_rxs.push(Some(rx));
         }
 
         // Per-shard Notify for event-driven SPSC wake (replaces 1ms polling).
-        let spsc_notifiers: Vec<Arc<tokio::sync::Notify>> =
-            (0..n).map(|_| Arc::new(tokio::sync::Notify::new())).collect();
+        let spsc_notifiers: Vec<Arc<channel::Notify>> =
+            (0..n).map(|_| Arc::new(channel::Notify::new())).collect();
 
         ChannelMesh {
             producers,
@@ -115,7 +116,7 @@ impl ChannelMesh {
     /// Take the connection receiver for a specific shard (call once during setup).
     ///
     /// Panics if called more than once for the same shard.
-    pub fn take_conn_rx(&mut self, shard_id: usize) -> mpsc::Receiver<tokio::net::TcpStream> {
+    pub fn take_conn_rx(&mut self, shard_id: usize) -> channel::MpscReceiver<tokio::net::TcpStream> {
         self.conn_rxs[shard_id]
             .take()
             .expect("conn_rx already taken")
@@ -124,17 +125,17 @@ impl ChannelMesh {
     /// Get a clone of the connection sender for a specific shard.
     ///
     /// The listener uses this to distribute new connections to shards.
-    pub fn conn_tx(&self, shard_id: usize) -> mpsc::Sender<tokio::net::TcpStream> {
+    pub fn conn_tx(&self, shard_id: usize) -> channel::MpscSender<tokio::net::TcpStream> {
         self.conn_txs[shard_id].clone()
     }
 
     /// Get the Notify handle for a specific shard (used by the shard's own event loop).
-    pub fn take_notify(&self, shard_id: usize) -> Arc<tokio::sync::Notify> {
+    pub fn take_notify(&self, shard_id: usize) -> Arc<channel::Notify> {
         self.spsc_notifiers[shard_id].clone()
     }
 
     /// Get all notifiers (used by connection handlers to wake target shards after SPSC push).
-    pub fn all_notifiers(&self) -> Vec<Arc<tokio::sync::Notify>> {
+    pub fn all_notifiers(&self) -> Vec<Arc<channel::Notify>> {
         self.spsc_notifiers.clone()
     }
 
@@ -285,9 +286,9 @@ mod tests {
             let client = client_res.unwrap();
             let (_server, _addr) = accept_res.unwrap();
 
-            tx.send(client).await.unwrap();
-            let received = rx.recv().await;
-            assert!(received.is_some(), "should receive TcpStream");
+            tx.send_async(client).await.unwrap();
+            let received = rx.recv_async().await;
+            assert!(received.is_ok(), "should receive TcpStream");
         });
     }
 

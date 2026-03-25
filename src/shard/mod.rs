@@ -10,8 +10,8 @@ use std::time::Duration;
 use ringbuf::traits::Consumer;
 use ringbuf::HeapCons;
 use ringbuf::HeapProd;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use crate::runtime::channel;
+use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
 use crate::command::{dispatch as cmd_dispatch, DispatchResult};
@@ -136,21 +136,21 @@ impl Shard {
     /// Runs cooperative active expiry. Shuts down gracefully on cancellation.
     pub async fn run(
         &mut self,
-        mut conn_rx: mpsc::Receiver<tokio::net::TcpStream>,
+        mut conn_rx: channel::MpscReceiver<tokio::net::TcpStream>,
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
-        aof_tx: Option<mpsc::Sender<crate::persistence::aof::AofMessage>>,
+        aof_tx: Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
         bind_addr: Option<String>,
         persistence_dir: Option<String>,
-        mut snapshot_trigger_rx: tokio::sync::watch::Receiver<u64>,
+        mut snapshot_trigger_rx: channel::WatchReceiver<u64>,
         repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
         acl_table: Arc<RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<RwLock<RuntimeConfig>>,
-        spsc_notify: Arc<tokio::sync::Notify>,
-        all_notifiers: Vec<Arc<tokio::sync::Notify>>,
+        spsc_notify: Arc<channel::Notify>,
+        all_notifiers: Vec<Arc<channel::Notify>>,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -230,7 +230,7 @@ impl Shard {
 
         // Per-shard snapshot state (None when no snapshot is active)
         let mut snapshot_state: Option<SnapshotState> = None;
-        let mut snapshot_reply_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>> = None;
+        let mut snapshot_reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
 
         // Per-shard WAL writer (created only when persistence is actually enabled).
         // When persistence_dir is None (appendonly=no and no save rules), skip WAL
@@ -267,14 +267,14 @@ impl Shard {
 
         // Per-shard replica sender channels: (replica_id, Sender<Bytes>).
         // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
-        let mut replica_txs: Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)> = Vec::new();
+        let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
 
         // Shared ReplicationState injected from server startup.
         // When Some, enables WAL fan-out offset tracking and replica connection handling.
         let repl_state: Option<Arc<RwLock<ReplicationState>>> = repl_state_ext;
 
         // Track last seen snapshot epoch to detect watch channel triggers
-        let mut last_snapshot_epoch = *snapshot_trigger_rx.borrow();
+        let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
 
         let mut expiry_interval = TokioTimer::interval(Duration::from_millis(100));
         // Periodic timer for WAL flush, snapshot advance, io_uring poll (1ms).
@@ -291,9 +291,9 @@ impl Shard {
         loop {
             tokio::select! {
                 // Accept new connections from listener
-                stream = conn_rx.recv() => {
+                stream = conn_rx.recv_async() => {
                     match stream {
-                        Some(tcp_stream) => {
+                        Ok(tcp_stream) => {
                             // On Linux with io_uring: extract raw fd, register with
                             // UringDriver for io_uring-based recv/send. Skip Tokio task.
                             #[cfg(target_os = "linux")]
@@ -365,7 +365,7 @@ impl Shard {
                                 ).await;
                             });
                         }
-                        None => {
+                        Err(_) => {
                             info!("Shard {} connection channel closed", self.id);
                             break;
                         }
@@ -374,7 +374,7 @@ impl Shard {
                 // Arm 1: Immediate SPSC wake -- event-driven, no polling delay.
                 // Producers call notify_one() after SPSC push; this wakes the shard instantly.
                 _ = spsc_notify_local.notified() => {
-                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)> = None;
+                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
                         &mut consumers,
@@ -406,7 +406,7 @@ impl Shard {
                 // Arm 2: Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll.
                 // Also drains SPSC as a safety net in case a notify was missed.
                 _ = periodic_interval.tick() => {
-                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)> = None;
+                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
                         &mut consumers,
@@ -436,8 +436,8 @@ impl Shard {
                     }
 
                     // Check watch channel for auto-save snapshot triggers
-                    if snapshot_trigger_rx.has_changed().unwrap_or(false) {
-                        let new_epoch = *snapshot_trigger_rx.borrow_and_update();
+                    {
+                        let new_epoch = snapshot_trigger_rx.borrow();
                         if new_epoch > last_snapshot_epoch && snapshot_state.is_none() {
                             last_snapshot_epoch = new_epoch;
                             if let Some(ref dir) = persistence_dir {
@@ -565,11 +565,11 @@ impl Shard {
         consumers: &mut [HeapCons<ShardMessage>],
         pubsub_registry: &mut PubSubRegistry,
         blocking_registry: &Rc<RefCell<BlockingRegistry>>,
-        pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        pending_snapshot: &mut Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
         repl_backlog: &mut Option<ReplicationBacklog>,
-        replica_txs: &mut Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)>,
+        replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -653,11 +653,11 @@ impl Shard {
         pubsub_registry: &mut PubSubRegistry,
         blocking_registry: &Rc<RefCell<BlockingRegistry>>,
         msg: ShardMessage,
-        pending_snapshot: &mut Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        pending_snapshot: &mut Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
         repl_backlog: &mut Option<ReplicationBacklog>,
-        replica_txs: &mut Vec<(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)>,
+        replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -1270,7 +1270,7 @@ impl Shard {
         data: &[u8],
         wal_writer: &mut Option<WalWriter>,
         repl_backlog: &mut Option<ReplicationBacklog>,
-        replica_txs: &[(u64, tokio::sync::mpsc::Sender<bytes::Bytes>)],
+        replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
     ) {

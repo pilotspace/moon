@@ -7,9 +7,11 @@
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
+#[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
-use tokio::time::{sleep, Duration};
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::replication::handshake::ReplicaHandshakeState;
@@ -29,6 +31,7 @@ pub struct ReplicaTaskConfig {
 ///
 /// Connects to master, performs PSYNC2 handshake, streams and dispatches WAL commands.
 /// Reconnects with exponential backoff on disconnect.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     let addr = format!("{}:{}", cfg.master_host, cfg.master_port);
     let mut backoff_ms = 500u64;
@@ -63,12 +66,13 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
             }
         }
 
-        sleep(Duration::from_millis(backoff_ms)).await;
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
     }
 }
 
 /// Perform the PSYNC2 handshake with master, then stream and apply replication data.
+#[cfg(feature = "runtime-tokio")]
 async fn run_handshake_and_stream(
     mut stream: TcpStream,
     cfg: &ReplicaTaskConfig,
@@ -228,6 +232,7 @@ async fn run_handshake_and_stream(
 ///
 /// Master sends RESP-encoded commands in the same format as the WAL (RESP Array frames).
 /// We parse each frame and route it to the correct shard via key_to_shard.
+#[cfg(feature = "runtime-tokio")]
 async fn stream_commands(
     stream: &mut TcpStream,
     cfg: &ReplicaTaskConfig,
@@ -254,6 +259,7 @@ async fn stream_commands(
 }
 
 /// Read a single line (up to CRLF) from the stream.
+#[cfg(feature = "runtime-tokio")]
 async fn read_line(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -271,6 +277,7 @@ async fn read_line(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Read a RESP bulk string ($<len>\r\n<bytes>\r\n).
+#[cfg(feature = "runtime-tokio")]
 async fn read_bulk_string(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let len_line = read_line(stream).await?;
     if len_line.first() != Some(&b'$') {

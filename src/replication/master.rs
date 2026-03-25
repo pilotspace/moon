@@ -5,7 +5,9 @@
 
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "runtime-tokio")]
 use tokio::io::AsyncWriteExt;
+#[cfg(feature = "runtime-tokio")]
 use tokio::net::tcp::OwnedWriteHalf;
 use tracing::info;
 
@@ -30,6 +32,7 @@ use crate::replication::state::{ReplicaInfo, ReplicationState};
 ///   1. Send +CONTINUE <repl_id>
 ///   2. Send backlog bytes from client_offset to current offset for each shard
 ///   3. Register replica with all shards for live streaming
+#[cfg(feature = "runtime-tokio")]
 pub async fn handle_psync_on_master(
     client_repl_id: &str,
     client_offset: i64,
@@ -71,11 +74,11 @@ pub async fn handle_psync_on_master(
                 .as_secs();
 
             let num_shards = shard_producers.len();
-            let mut snap_rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), String>>> = Vec::new();
+            let mut snap_rxs: Vec<crate::runtime::channel::OneshotReceiver<Result<(), String>>> = Vec::new();
 
             for (shard_id, prod) in shard_producers.iter_mut().enumerate() {
                 use ringbuf::traits::Producer;
-                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (tx, rx) = crate::runtime::channel::oneshot();
                 let msg = crate::shard::dispatch::ShardMessage::SnapshotBegin {
                     epoch,
                     snapshot_dir: snap_dir.clone(),
@@ -99,7 +102,7 @@ pub async fn handle_psync_on_master(
             // Transfer per-shard RDB files
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                let data = tokio::fs::read(&snap_path).await.unwrap_or_default();
+                let data = std::fs::read(&snap_path).unwrap_or_default();
                 let header = format!("${}\r\n", data.len());
                 write_half.write_all(header.as_bytes()).await?;
                 write_half.write_all(&data).await?;
@@ -176,6 +179,7 @@ pub async fn handle_psync_on_master(
 ///
 /// For each shard, creates a bounded mpsc channel, spawns a replica_sender_task
 /// that drains the channel to the socket, and sends RegisterReplica to each shard.
+#[cfg(feature = "runtime-tokio")]
 async fn register_replica_with_shards(
     addr: std::net::SocketAddr,
     write_half: OwnedWriteHalf,
@@ -198,7 +202,7 @@ async fn register_replica_with_shards(
     let mut ack_offsets = Vec::with_capacity(num_shards);
 
     for shard_id in 0..num_shards {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(channel_capacity);
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(channel_capacity);
         shard_txs.push(tx.clone());
         ack_offsets.push(std::sync::atomic::AtomicU64::new(0));
 
@@ -214,7 +218,7 @@ async fn register_replica_with_shards(
         // Spawn sender task: drains channel -> writes to TCP socket
         let wh = Arc::clone(&write_half);
         tokio::spawn(async move {
-            while let Some(data) = rx.recv().await {
+            while let Ok(data) = rx.recv_async().await {
                 let mut guard = wh.lock().await;
                 if guard.write_all(&data).await.is_err() {
                     info!("Replica sender shard {}: socket closed", shard_id);
@@ -262,7 +266,7 @@ pub async fn wait_for_replicas(
     };
 
     let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
 
     loop {
         let acked_count = {
@@ -283,9 +287,10 @@ pub async fn wait_for_replicas(
         if acked_count >= num_required {
             return acked_count;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return acked_count;
         }
+        #[cfg(feature = "runtime-tokio")]
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

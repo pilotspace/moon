@@ -45,7 +45,7 @@ pub struct WaitEntry {
     /// Which blocking command variant.
     pub cmd: BlockedCommand,
     /// Oneshot sender to deliver the result. Second send attempt returns Err (natural guard).
-    pub reply_tx: tokio::sync::oneshot::Sender<Option<Frame>>,
+    pub reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     /// Absolute deadline (None = block forever, 0 timeout).
     pub deadline: Option<tokio::time::Instant>,
 }

@@ -34,7 +34,7 @@ pub struct ReplicaInfo {
     /// Per-shard acknowledged offsets from this replica (updated on REPLCONF ACK).
     pub ack_offsets: Vec<AtomicU64>,
     /// Channels to per-shard sender tasks. shard_txs[shard_id] = Sender for that shard.
-    pub shard_txs: Vec<tokio::sync::mpsc::Sender<Bytes>>,
+    pub shard_txs: Vec<crate::runtime::channel::MpscSender<Bytes>>,
     /// Last ACK time as unix seconds (for lag computation in INFO).
     pub last_ack_time: AtomicU64,
 }
