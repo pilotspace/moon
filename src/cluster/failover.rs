@@ -184,7 +184,7 @@ pub async fn run_election_task(
     cluster_state: Arc<RwLock<ClusterState>>,
     self_addr: SocketAddr,
     _my_repl_offset: u64,
-    mut vote_rx: tokio::sync::mpsc::Receiver<String>,
+    mut vote_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     // Compute delay (rank 0 for now; multi-replica ranking is future work)
     let replica_rank = 0u32;

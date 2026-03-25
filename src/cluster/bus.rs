@@ -17,6 +17,11 @@ use crate::cluster::gossip::{
 };
 use crate::cluster::ClusterState;
 
+/// Shared vote sender: set by gossip ticker when election starts, cleared when election ends.
+/// Bus handler forwards FailoverAuthAck votes through this channel.
+pub type SharedVoteTx =
+    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>;
+
 /// Run the cluster bus listener loop.
 ///
 /// Spawns a new task for each incoming peer connection.
@@ -27,6 +32,7 @@ pub async fn run_cluster_bus(
     self_addr: SocketAddr,
     cluster_state: Arc<RwLock<ClusterState>>,
     shutdown: CancellationToken,
+    vote_tx: SharedVoteTx,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", bind, cluster_port);
     let listener = TcpListener::bind(&addr).await?;
@@ -40,8 +46,9 @@ pub async fn run_cluster_bus(
                         let cs = cluster_state.clone();
                         let tok = shutdown.child_token();
                         let sa = self_addr;
+                        let vtx = vote_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_cluster_peer(stream, peer_addr, sa, cs, tok).await {
+                            if let Err(e) = handle_cluster_peer(stream, peer_addr, sa, cs, tok, vtx).await {
                                 debug!("Cluster peer {} error: {}", peer_addr, e);
                             }
                         });
@@ -71,6 +78,7 @@ async fn handle_cluster_peer(
     self_addr: SocketAddr,
     cluster_state: Arc<RwLock<ClusterState>>,
     shutdown: CancellationToken,
+    vote_tx: SharedVoteTx,
 ) -> anyhow::Result<()> {
     loop {
         // Read 4-byte length prefix
@@ -120,9 +128,41 @@ async fn handle_cluster_peer(
                 let mut cs = cluster_state.write().unwrap();
                 merge_gossip_into_state(&mut cs, &msg);
             }
-            GossipMsgType::FailoverAuthRequest | GossipMsgType::FailoverAuthAck => {
-                // Handled in failover module (Phase 20-04)
-                debug!("Received failover msg from {}", peer_addr);
+            GossipMsgType::FailoverAuthRequest => {
+                let sender_id = std::str::from_utf8(&msg.sender_node_id)
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .to_string();
+                let request_epoch = msg.config_epoch;
+                let voted = {
+                    let mut cs = cluster_state.write().unwrap();
+                    crate::cluster::failover::handle_failover_auth_request(
+                        &mut cs,
+                        &sender_id,
+                        request_epoch,
+                    )
+                };
+                if voted {
+                    // Send FailoverAuthAck back to the requesting replica
+                    let ack = {
+                        let cs = cluster_state.read().unwrap();
+                        build_message(&cs, self_addr, GossipMsgType::FailoverAuthAck)
+                    };
+                    let ack_bytes = serialize_gossip(&ack);
+                    let len = (ack_bytes.len() as u32).to_be_bytes();
+                    let _ = stream.write_all(&len).await;
+                    let _ = stream.write_all(&ack_bytes).await;
+                }
+            }
+            GossipMsgType::FailoverAuthAck => {
+                let sender_id = std::str::from_utf8(&msg.sender_node_id)
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .to_string();
+                debug!("Received failover ACK from {}", sender_id);
+                if let Some(tx) = vote_tx.lock().await.as_ref() {
+                    let _ = tx.send(sender_id);
+                }
             }
         }
     }

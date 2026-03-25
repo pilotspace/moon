@@ -233,6 +233,13 @@ fn main() -> anyhow::Result<()> {
             let bind2 = config.bind.clone();
             let self_addr: std::net::SocketAddr =
                 format!("{}:{}", config.bind, config.port).parse().unwrap();
+
+            // Shared vote channel: gossip ticker sets sender when election starts,
+            // bus handler forwards FailoverAuthAck votes through it.
+            let failover_vote_tx: rust_redis::cluster::bus::SharedVoteTx =
+                std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+            let bus_vote_tx = failover_vote_tx.clone();
             tokio::spawn(async move {
                 if let Err(e) = rust_redis::cluster::bus::run_cluster_bus(
                     &bind2,
@@ -240,6 +247,7 @@ fn main() -> anyhow::Result<()> {
                     self_addr,
                     cs_clone,
                     bus_cancel,
+                    bus_vote_tx,
                 )
                 .await
                 {
@@ -252,12 +260,16 @@ fn main() -> anyhow::Result<()> {
             let node_timeout = config.cluster_node_timeout;
             let self_addr2: std::net::SocketAddr =
                 format!("{}:{}", config.bind, config.port).parse().unwrap();
+            let gossip_vote_tx = failover_vote_tx.clone();
+            let gossip_repl_state = repl_state.clone();
             tokio::spawn(async move {
                 rust_redis::cluster::gossip::run_gossip_ticker(
                     self_addr2,
                     cs_gossip,
                     node_timeout,
                     gossip_cancel,
+                    gossip_vote_tx,
+                    gossip_repl_state,
                 )
                 .await;
             });
