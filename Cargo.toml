@@ -54,6 +54,12 @@ criterion = { version = "0.8", features = ["html_reports"] }
 redis = { version = "0.27", features = ["tokio-comp"] }
 tempfile = "3"
 
+[profile.release]
+debug = true          # Debug symbols for flamegraphs/profiling
+lto = "thin"          # Cross-crate inlining without excessive build time
+codegen-units = 1     # Maximum optimization
+opt-level = 3         # Full optimization
+
 [[bench]]
 name = "resp_parsing"
 harness = false

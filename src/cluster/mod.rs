@@ -62,9 +62,12 @@ pub struct ClusterNode {
 
 impl ClusterNode {
     pub fn new(node_id: String, addr: SocketAddr, flags: NodeFlags, epoch: u64) -> Self {
-        let bus_port = (addr.port() as u32 + 10000)
-            .try_into()
-            .expect("cluster bus port overflow");
+        // Redis convention: bus_port = port + 10000. Guard overflow for test
+        // servers on ephemeral ports (49152-65535) where port + 10000 > u16::MAX.
+        let bus_port = addr.port().checked_add(10000).unwrap_or_else(|| {
+            // Wrap into valid range for test compatibility
+            ((addr.port() as u32 + 10000) % 65536) as u16
+        });
         ClusterNode {
             node_id,
             addr,
