@@ -1982,31 +1982,35 @@ pub async fn handle_connection_sharded(
 
                     // === ACL permission check (NOPERM gate) ===
                     // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled via continue above.
-                    if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
-                        &current_user, cmd, cmd_args,
-                    ) {
-                        acl_log.push(crate::acl::AclLogEntry {
-                            reason: "command".to_string(),
-                            object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                            username: current_user.clone(),
-                            client_addr: peer_addr.clone(),
-                            timestamp_ms: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
-                        });
-                        responses.push(Frame::Error(Bytes::from(format!(
-                            "NOPERM {}", deny_reason
-                        ))));
-                        continue;
-                    }
-
-                    // === ACL key pattern check ===
+                    // Acquire the ACL read lock ONCE for both command and key permission checks.
                     {
-                        let is_write = crate::persistence::aof::is_write_command(cmd);
-                        if let Some(deny_reason) = acl_table.read().unwrap().check_key_permission(
-                            &current_user, cmd, cmd_args, is_write,
+                        let acl_guard = acl_table.read().unwrap();
+                        if let Some(deny_reason) = acl_guard.check_command_permission(
+                            &current_user, cmd, cmd_args,
                         ) {
+                            drop(acl_guard);
+                            acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!(
+                                "NOPERM {}", deny_reason
+                            ))));
+                            continue;
+                        }
+
+                        // === ACL key pattern check (same lock guard) ===
+                        let is_write_for_acl = crate::persistence::aof::is_write_command(cmd);
+                        if let Some(deny_reason) = acl_guard.check_key_permission(
+                            &current_user, cmd, cmd_args, is_write_for_acl,
+                        ) {
+                            drop(acl_guard);
                             acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
