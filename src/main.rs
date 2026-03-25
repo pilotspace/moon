@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use rust_redis::config::ServerConfig;
 use rust_redis::persistence::aof::{self, AofMessage, FsyncPolicy};
+use rust_redis::runtime::{TokioRuntimeFactory, traits::RuntimeFactory};
 use rust_redis::server;
 use rust_redis::shard::mesh::{ChannelMesh, CHANNEL_BUFFER_SIZE};
 use rust_redis::shard::Shard;
@@ -157,12 +158,6 @@ fn main() -> anyhow::Result<()> {
                 // Pin shard thread to core BEFORE any allocations (NUMA locality)
                 rust_redis::shard::numa::pin_to_core(id);
 
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build shard runtime");
-
-                let local = tokio::task::LocalSet::new();
                 let mut shard = Shard::new(
                     id,
                     num_shards,
@@ -175,23 +170,28 @@ fn main() -> anyhow::Result<()> {
                     shard.restore_from_persistence(dir);
                 }
 
-                rt.block_on(local.run_until(shard.run(
-                    conn_rx,
-                    consumers,
-                    producers,
-                    shard_cancel,
-                    shard_aof_tx,
-                    Some(shard_bind_addr),
-                    shard_persistence_dir,
-                    shard_snap_rx,
-                    Some(shard_repl_state),
-                    shard_cluster_state,
-                    config_port,
-                    shard_acl_table,
-                    shard_runtime_config,
-                    shard_spsc_notify,
-                    shard_all_notifiers,
-                )));
+                TokioRuntimeFactory::block_on_local(
+                    format!("shard-{}", id),
+                    async move {
+                        shard.run(
+                            conn_rx,
+                            consumers,
+                            producers,
+                            shard_cancel,
+                            shard_aof_tx,
+                            Some(shard_bind_addr),
+                            shard_persistence_dir,
+                            shard_snap_rx,
+                            Some(shard_repl_state),
+                            shard_cluster_state,
+                            config_port,
+                            shard_acl_table,
+                            shard_runtime_config,
+                            shard_spsc_notify,
+                            shard_all_notifiers,
+                        ).await;
+                    },
+                );
             })
             .expect("failed to spawn shard thread");
 
