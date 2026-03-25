@@ -15,8 +15,8 @@ use rust_redis::runtime::{TokioRuntimeFactory, traits::RuntimeFactory};
 use rust_redis::server;
 use rust_redis::shard::mesh::{ChannelMesh, CHANNEL_BUFFER_SIZE};
 use rust_redis::shard::Shard;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use rust_redis::runtime::cancel::CancellationToken;
+use rust_redis::runtime::channel;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -51,8 +51,8 @@ fn main() -> anyhow::Result<()> {
 
     // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
     // The AOF writer task will be spawned on the listener runtime.
-    let aof_tx: Option<mpsc::Sender<AofMessage>> = if config.appendonly == "yes" {
-        let (tx, rx) = mpsc::channel::<AofMessage>(10_000);
+    let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
         let aof_token = cancel_token.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
-    let (snapshot_trigger_tx, snapshot_trigger_rx) = tokio::sync::watch::channel(0u64);
+    let (snapshot_trigger_tx, snapshot_trigger_rx) = rust_redis::runtime::channel::watch(0u64);
 
     // Persistence directory for per-shard WAL and snapshots.
     // Only set when persistence is actually enabled (appendonly=yes or save rules exist)
@@ -283,7 +283,7 @@ fn main() -> anyhow::Result<()> {
 
     // After listener exits, send AOF shutdown and cancel all shards
     if let Some(ref tx) = aof_tx {
-        let _ = tx.blocking_send(AofMessage::Shutdown);
+        let _ = tx.send(AofMessage::Shutdown);
     }
     cancel_token.cancel();
     for handle in shard_handles {

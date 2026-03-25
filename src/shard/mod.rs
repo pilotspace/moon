@@ -136,14 +136,14 @@ impl Shard {
     /// Runs cooperative active expiry. Shuts down gracefully on cancellation.
     pub async fn run(
         &mut self,
-        mut conn_rx: channel::MpscReceiver<tokio::net::TcpStream>,
+        conn_rx: channel::MpscReceiver<tokio::net::TcpStream>,
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
         aof_tx: Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
         bind_addr: Option<String>,
         persistence_dir: Option<String>,
-        mut snapshot_trigger_rx: channel::WatchReceiver<u64>,
+        snapshot_trigger_rx: channel::WatchReceiver<u64>,
         repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
@@ -511,7 +511,7 @@ impl Shard {
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.tick() => {
-                    let now = tokio::time::Instant::now();
+                    let now = std::time::Instant::now();
                     blocking_rc.borrow_mut().expire_timed_out(now);
                 }
                 // Cooperative active expiry
@@ -1319,10 +1319,9 @@ mod tests {
     use bytes::Bytes;
     use ringbuf::HeapRb;
     use ringbuf::traits::{Producer, Split};
-    use tokio::sync::mpsc as tokio_mpsc;
-
     use crate::protocol::Frame;
     use crate::pubsub::subscriber::Subscriber;
+    use crate::runtime::channel as rt_channel;
 
     #[test]
     fn test_shard_new() {
@@ -1355,7 +1354,7 @@ mod tests {
         let mut pubsub = PubSubRegistry::new();
         let databases = Rc::new(RefCell::new(vec![Database::new()]));
 
-        let (tx, mut rx) = tokio_mpsc::channel::<Frame>(16);
+        let (tx, rx) = rt_channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 42);
         pubsub.subscribe(Bytes::from_static(b"news"), sub);
 

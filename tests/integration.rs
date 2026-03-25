@@ -5,8 +5,8 @@
 
 use redis::AsyncCommands;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use rust_redis::runtime::cancel::CancellationToken;
+use rust_redis::runtime::channel;
 
 use rust_redis::config::ServerConfig;
 use rust_redis::server::listener;
@@ -2397,7 +2397,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
     // Build the channel mesh and spawn shards on std threads (like main.rs)
     std::thread::spawn(move || {
         let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
-        let conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>> =
+        let conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>> =
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
         let all_notifiers = mesh.all_notifiers();
 
@@ -2428,7 +2428,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     );
 
-                    let (_, snap_rx) = tokio::sync::watch::channel(0u64);
+                    let (_, snap_rx) = channel::watch(0u64);
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
                         rust_redis::acl::AclTable::load_or_default(&shard_config),
                     ));
@@ -3431,7 +3431,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
     std::thread::spawn(move || {
         let num_shards = 1;
         let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
-        let conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>> =
+        let conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>> =
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
         // Initialize cluster state
@@ -3474,7 +3474,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     );
 
-                    let (_, snap_rx) = tokio::sync::watch::channel(0u64);
+                    let (_, snap_rx) = channel::watch(0u64);
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
                         rust_redis::acl::AclTable::load_or_default(&shard_config),
                     ));

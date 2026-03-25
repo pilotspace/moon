@@ -11,9 +11,9 @@ use parking_lot::Mutex;
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
+use crate::runtime::channel;
 
 use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
@@ -98,7 +98,7 @@ pub async fn handle_connection(
     shutdown: CancellationToken,
     requirepass: Option<String>,
     config: Arc<ServerConfig>,
-    aof_tx: Option<mpsc::Sender<AofMessage>>,
+    aof_tx: Option<channel::MpscSender<AofMessage>>,
     change_counter: Option<Arc<AtomicU64>>,
     pubsub_registry: Arc<Mutex<PubSubRegistry>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
@@ -120,13 +120,13 @@ pub async fn handle_connection(
 
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
-    let mut pubsub_rx: Option<mpsc::Receiver<Frame>> = None;
-    let mut pubsub_tx: Option<mpsc::Sender<Frame>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<Frame>> = None;
+    let mut pubsub_tx: Option<channel::MpscSender<Frame>> = None;
     let mut subscriber_id: u64 = 0;
 
     // Client tracking state
     let mut tracking_state = TrackingState::default();
-    let mut tracking_rx: Option<mpsc::Receiver<Frame>> = None;
+    let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
 
     // RESP3/HELLO connection-local state
     let mut client_name: Option<Bytes> = None;
@@ -296,14 +296,14 @@ pub async fn handle_connection(
                         None => break,
                     }
                 }
-                msg = rx.recv() => {
+                msg = rx.recv_async() => {
                     match msg {
-                        Some(frame) => {
+                        Ok(frame) => {
                             if framed.send(frame).await.is_err() {
                                 break;
                             }
                         }
-                        None => {
+                        Err(_) => {
                             // All senders dropped (shouldn't happen normally)
                             break;
                         }
@@ -494,7 +494,7 @@ pub async fn handle_connection(
                                                     tracking_state.optout = config_parsed.optout;
 
                                                     if tracking_rx.is_none() {
-                                                        let (tx, rx) = mpsc::channel::<Frame>(256);
+                                                        let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
                                                         tracking_state.invalidation_tx = Some(tx.clone());
                                                         tracking_rx = Some(rx);
 
@@ -714,7 +714,7 @@ pub async fn handle_connection(
                             // Send AOF entries accumulated so far
                             for bytes in aof_entries.drain(..) {
                                 if let Some(ref tx) = aof_tx {
-                                    let _ = tx.send(AofMessage::Append(bytes)).await;
+                                    let _ = tx.send_async(AofMessage::Append(bytes)).await;
                                 }
                                 if let Some(ref counter) = change_counter {
                                     counter.fetch_add(1, Ordering::Relaxed);
@@ -729,7 +729,7 @@ pub async fn handle_connection(
                             } else {
                                 // Allocate subscriber resources if not yet done
                                 if pubsub_tx.is_none() {
-                                    let (tx, rx) = mpsc::channel::<Frame>(256);
+                                    let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
                                     subscriber_id = pubsub::next_subscriber_id();
                                     pubsub_tx = Some(tx);
                                     pubsub_rx = Some(rx);
@@ -1080,7 +1080,7 @@ pub async fn handle_connection(
                 // --- Send AOF entries OUTSIDE the lock ---
                 for bytes in aof_entries {
                     if let Some(ref tx) = aof_tx {
-                        let _ = tx.send(AofMessage::Append(bytes)).await;
+                        let _ = tx.send_async(AofMessage::Append(bytes)).await;
                     }
                     if let Some(ref counter) = change_counter {
                         counter.fetch_add(1, Ordering::Relaxed);
@@ -1096,7 +1096,7 @@ pub async fn handle_connection(
             // Deliver tracking invalidation Push frames to client
             msg = async {
                 if let Some(ref mut rx) = tracking_rx {
-                    rx.recv().await
+                    rx.recv_async().await.ok()
                 } else {
                     std::future::pending().await
                 }
@@ -1336,7 +1336,7 @@ pub async fn handle_connection_sharded(
     blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
-    aof_tx: Option<mpsc::Sender<AofMessage>>,
+    aof_tx: Option<channel::MpscSender<AofMessage>>,
     tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
@@ -1346,7 +1346,7 @@ pub async fn handle_connection_sharded(
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
-    spsc_notifiers: Vec<std::sync::Arc<tokio::sync::Notify>>,
+    spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -1373,7 +1373,7 @@ pub async fn handle_connection_sharded(
 
     // Client tracking state
     let mut tracking_state = TrackingState::default();
-    let mut tracking_rx: Option<mpsc::Receiver<Frame>> = None;
+    let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
 
     // RESP3/HELLO connection-local state
     let mut client_name: Option<Bytes> = None;
@@ -1814,7 +1814,7 @@ pub async fn handle_connection_sharded(
                                                 tracking_state.optout = config_parsed.optout;
 
                                                 if tracking_rx.is_none() {
-                                                    let (tx, rx) = mpsc::channel::<Frame>(256);
+                                                    let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
                                                     tracking_state.invalidation_tx = Some(tx.clone());
                                                     tracking_rx = Some(rx);
 
@@ -2246,11 +2246,11 @@ pub async fn handle_connection_sharded(
                 if !remote_groups.is_empty() {
                     let mut reply_futures: Vec<(
                         Vec<(usize, Option<Bytes>, Vec<u8>)>, // (resp_idx, aof_bytes, cmd_name)
-                        tokio::sync::oneshot::Receiver<Vec<Frame>>,
+                        channel::OneshotReceiver<Vec<Frame>>,
                     )> = Vec::with_capacity(remote_groups.len());
 
                     for (target, entries) in remote_groups {
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let (reply_tx, reply_rx) = channel::oneshot();
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
 
@@ -2491,14 +2491,14 @@ async fn handle_blocking_command(
     } // dbs borrow dropped here -- CRITICAL before await
 
     let deadline = if timeout_secs > 0.0 {
-        Some(tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
+        Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
     } else {
         None // 0 = block forever
     };
 
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Option<Frame>>();
+        let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
         let wait_id = {
             let mut reg = blocking_registry.borrow_mut();
             let wait_id = reg.next_wait_id();
@@ -2520,7 +2520,7 @@ async fn handle_blocking_command(
                         Ok(None) | Err(_) => Frame::Null,
                     }
                 }
-                _ = tokio::time::sleep_until(dl) => {
+                _ = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now())) => {
                     blocking_registry.borrow_mut().remove_wait(wait_id);
                     Frame::Null
                 }
@@ -2548,7 +2548,7 @@ async fn handle_blocking_command(
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
     // Uses FuturesUnordered for first-wakeup-wins semantics.
     let wait_id;
-    let mut receivers: FuturesUnordered<tokio::sync::oneshot::Receiver<Option<Frame>>> =
+    let mut receivers: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
         FuturesUnordered::new();
     let mut registered_remote_shards: Vec<usize> = Vec::new();
 
@@ -2559,7 +2559,7 @@ async fn handle_blocking_command(
 
         for key in &keys {
             let target = key_to_shard(key, num_shards);
-            let (tx, rx) = tokio::sync::oneshot::channel::<Option<Frame>>();
+            let (tx, rx) = channel::oneshot::<Option<Frame>>();
             receivers.push(rx);
 
             if target == shard_id {
@@ -2593,7 +2593,7 @@ async fn handle_blocking_command(
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
     let frame = if let Some(dl) = deadline {
-        let sleep = tokio::time::sleep_until(dl);
+        let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
         tokio::pin!(sleep);
         let mut result_frame = Frame::Null;
         loop {

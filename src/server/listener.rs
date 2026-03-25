@@ -3,8 +3,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
+use crate::runtime::channel;
 use tracing::{debug, error, info};
 
 use crate::command::connection as conn_cmd;
@@ -91,8 +91,8 @@ pub async fn run_with_shutdown(
     let config = Arc::new(config);
 
     // Set up AOF writer task if appendonly is enabled
-    let aof_tx: Option<mpsc::Sender<AofMessage>> = if config.appendonly == "yes" {
-        let (tx, rx) = mpsc::channel::<AofMessage>(10_000);
+    let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
         let aof_token = token.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
@@ -190,7 +190,7 @@ pub async fn run_with_shutdown(
                 info!("Server shutting down");
                 // Send shutdown to AOF writer
                 if let Some(ref tx) = aof_tx {
-                    let _ = tx.send(AofMessage::Shutdown).await;
+                    let _ = tx.send_async(AofMessage::Shutdown).await;
                 }
                 break;
             }
@@ -206,7 +206,7 @@ pub async fn run_with_shutdown(
 /// It does NOT own any database state -- all data lives in shard threads.
 pub async fn run_sharded(
     config: ServerConfig,
-    conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>>,
+    conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
@@ -231,7 +231,7 @@ pub async fn run_sharded(
                     Ok((stream, addr)) => {
                         debug!("New connection from {} -> shard {}", addr, next_shard);
                         let tx = &conn_txs[next_shard];
-                        if tx.send(stream).await.is_err() {
+                        if tx.send_async(stream).await.is_err() {
                             error!("Failed to send connection to shard {}", next_shard);
                         }
                         next_shard = (next_shard + 1) % num_shards;

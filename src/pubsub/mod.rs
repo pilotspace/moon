@@ -231,12 +231,12 @@ fn pmessage_frame(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
+    use crate::runtime::channel;
 
     #[tokio::test]
     async fn test_subscribe_and_publish() {
         let mut registry = PubSubRegistry::new();
-        let (tx, mut rx) = mpsc::channel::<Frame>(16);
+        let (tx, mut rx) = channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -245,7 +245,7 @@ mod tests {
         let count = registry.publish(&channel, &Bytes::from_static(b"hello"));
         assert_eq!(count, 1);
 
-        let msg = rx.recv().await.unwrap();
+        let msg = rx.recv_async().await.unwrap();
         assert_eq!(
             msg,
             message_frame(&Bytes::from_static(b"news"), &Bytes::from_static(b"hello"))
@@ -255,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn test_psubscribe_glob() {
         let mut registry = PubSubRegistry::new();
-        let (tx, mut rx) = mpsc::channel::<Frame>(16);
+        let (tx, mut rx) = channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 1);
         let pattern = Bytes::from_static(b"news.*");
 
@@ -265,7 +265,7 @@ mod tests {
         let count = registry.publish(&channel, &Bytes::from_static(b"goal!"));
         assert_eq!(count, 1);
 
-        let msg = rx.recv().await.unwrap();
+        let msg = rx.recv_async().await.unwrap();
         assert_eq!(
             msg,
             pmessage_frame(
@@ -279,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe() {
         let mut registry = PubSubRegistry::new();
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -294,7 +294,7 @@ mod tests {
     async fn test_slow_subscriber_disconnected() {
         let mut registry = PubSubRegistry::new();
         // capacity-1 channel: immediately full after one message
-        let (tx, _rx) = mpsc::channel::<Frame>(1);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(1);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -315,8 +315,8 @@ mod tests {
     #[tokio::test]
     async fn test_publish_returns_count() {
         let mut registry = PubSubRegistry::new();
-        let (tx1, _rx1) = mpsc::channel::<Frame>(16);
-        let (tx2, _rx2) = mpsc::channel::<Frame>(16);
+        let (tx1, _rx1) = channel::mpsc_bounded::<Frame>(16);
+        let (tx2, _rx2) = channel::mpsc_bounded::<Frame>(16);
         let sub1 = Subscriber::new(tx1, 1);
         let sub2 = Subscriber::new(tx2, 2);
         let channel = Bytes::from_static(b"news");
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_unsubscribe_all() {
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         let mut registry = PubSubRegistry::new();
         let sub1 = Subscriber::new(tx.clone(), 1);
         let sub2 = Subscriber::new(tx, 1); // same id, different channels
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_punsubscribe_all() {
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         let mut registry = PubSubRegistry::new();
         let sub1 = Subscriber::new(tx.clone(), 1);
         let sub2 = Subscriber::new(tx, 1);

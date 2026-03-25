@@ -2,7 +2,7 @@ pub mod invalidation;
 
 use bytes::Bytes;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use crate::runtime::channel;
 
 use crate::protocol::Frame;
 
@@ -16,7 +16,7 @@ pub struct TrackingState {
     pub noloop: bool,
     pub redirect: Option<u64>,
     pub prefixes: Vec<Bytes>,
-    pub invalidation_tx: Option<mpsc::Sender<Frame>>,
+    pub invalidation_tx: Option<channel::MpscSender<Frame>>,
 }
 
 impl Default for TrackingState {
@@ -49,8 +49,8 @@ pub struct TrackingTable {
     key_clients: HashMap<Bytes, Vec<(u64, bool)>>,
     /// BCAST mode: list of (client_id, prefix, noloop)
     bcast_clients: Vec<(u64, Bytes, bool)>,
-    /// Client channels: client_id -> mpsc::Sender<Frame>
-    client_channels: HashMap<u64, mpsc::Sender<Frame>>,
+    /// Client channels: client_id -> MpscSender<Frame>
+    client_channels: HashMap<u64, channel::MpscSender<Frame>>,
     /// Redirect map: source_client_id -> target_client_id
     redirects: HashMap<u64, u64>,
     /// Maximum keys tracked (bounded table)
@@ -70,7 +70,7 @@ impl TrackingTable {
     }
 
     /// Register a client's invalidation channel.
-    pub fn register_client(&mut self, client_id: u64, tx: mpsc::Sender<Frame>) {
+    pub fn register_client(&mut self, client_id: u64, tx: channel::MpscSender<Frame>) {
         self.client_channels.insert(client_id, tx);
     }
 
@@ -103,8 +103,8 @@ impl TrackingTable {
     /// Invalidate a key: collect all clients that tracked this key (normal mode)
     /// and all BCAST clients whose prefixes match. Returns list of channels to notify.
     /// Removes the key from the tracking table after collection.
-    pub fn invalidate_key(&mut self, key: &Bytes, writer_client_id: u64) -> Vec<mpsc::Sender<Frame>> {
-        let mut to_notify: Vec<mpsc::Sender<Frame>> = Vec::new();
+    pub fn invalidate_key(&mut self, key: &Bytes, writer_client_id: u64) -> Vec<channel::MpscSender<Frame>> {
+        let mut to_notify: Vec<channel::MpscSender<Frame>> = Vec::new();
 
         // Normal mode: check key_clients
         if let Some(clients) = self.key_clients.remove(key) {
@@ -154,7 +154,7 @@ impl TrackingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
+    use crate::runtime::channel;
 
     #[test]
     fn test_new_creates_empty_table() {
@@ -192,10 +192,10 @@ mod tests {
         assert_eq!(clients, vec![1, 2]);
     }
 
-    #[tokio::test]
-    async fn test_invalidate_key_returns_senders_and_removes() {
+    #[test]
+    fn test_invalidate_key_returns_senders_and_removes() {
         let mut table = TrackingTable::new();
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx);
         let key = Bytes::from_static(b"foo");
         table.track_key(1, &key, false);
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn test_untrack_all_removes_client() {
         let mut table = TrackingTable::new();
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx);
         let key1 = Bytes::from_static(b"foo");
         let key2 = Bytes::from_static(b"bar");
@@ -222,10 +222,10 @@ mod tests {
         assert!(!table.client_channels.contains_key(&1));
     }
 
-    #[tokio::test]
-    async fn test_bcast_prefix_match() {
+    #[test]
+    fn test_bcast_prefix_match() {
         let mut table = TrackingTable::new();
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx);
         table.register_prefix(1, Bytes::from_static(b"user:"), false);
 
@@ -234,10 +234,10 @@ mod tests {
         assert_eq!(senders.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_bcast_prefix_no_match() {
+    #[test]
+    fn test_bcast_prefix_no_match() {
         let mut table = TrackingTable::new();
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx);
         table.register_prefix(1, Bytes::from_static(b"user:"), false);
 
@@ -246,10 +246,10 @@ mod tests {
         assert!(senders.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_noloop_skips_self_invalidation() {
+    #[test]
+    fn test_noloop_skips_self_invalidation() {
         let mut table = TrackingTable::new();
-        let (tx, _rx) = mpsc::channel::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx);
         let key = Bytes::from_static(b"foo");
         table.track_key(1, &key, true); // noloop = true
@@ -259,11 +259,11 @@ mod tests {
         assert!(senders.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_redirect_sends_to_target() {
+    #[test]
+    fn test_redirect_sends_to_target() {
         let mut table = TrackingTable::new();
-        let (tx1, _rx1) = mpsc::channel::<Frame>(16);
-        let (tx2, mut rx2) = mpsc::channel::<Frame>(16);
+        let (tx1, _rx1) = channel::mpsc_bounded::<Frame>(16);
+        let (tx2, rx2) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx1);
         table.register_client(2, tx2);
         table.set_redirect(1, 2); // redirect client 1's invalidations to client 2

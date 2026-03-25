@@ -99,6 +99,7 @@ impl<T: Clone> WatchSender<T> {
     }
 }
 
+#[derive(Clone)]
 pub struct WatchReceiver<T> {
     shared: Arc<Mutex<T>>,
     notify_rx: flume::Receiver<()>,

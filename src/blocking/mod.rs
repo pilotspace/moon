@@ -47,7 +47,7 @@ pub struct WaitEntry {
     /// Oneshot sender to deliver the result. Second send attempt returns Err (natural guard).
     pub reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     /// Absolute deadline (None = block forever, 0 timeout).
-    pub deadline: Option<tokio::time::Instant>,
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Per-shard blocking registry. Manages FIFO wait queues keyed by (db_index, key).
@@ -144,9 +144,9 @@ impl BlockingRegistry {
     /// Expire all timed-out waiters. Sends None through their reply channels.
     ///
     /// Two-pass approach: first collect timed-out entries, then clean up.
-    pub fn expire_timed_out(&mut self, now: tokio::time::Instant) {
+    pub fn expire_timed_out(&mut self, now: std::time::Instant) {
         // Pass 1: collect timed-out (wait_id, reply_tx) pairs
-        let mut timed_out: Vec<(u64, tokio::sync::oneshot::Sender<Option<Frame>>)> = Vec::new();
+        let mut timed_out: Vec<(u64, crate::runtime::channel::OneshotSender<Option<Frame>>)> = Vec::new();
         let mut timed_out_ids: Vec<u64> = Vec::new();
 
         for queue in self.waiters.values_mut() {
@@ -197,7 +197,7 @@ mod tests {
     fn test_register_and_pop_front() {
         let mut reg = BlockingRegistry::new(0);
         let id = reg.next_wait_id();
-        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let (tx, _rx) = crate::runtime::channel::oneshot();
         let entry = WaitEntry {
             wait_id: id,
             cmd: BlockedCommand::BLPop,
@@ -220,7 +220,7 @@ mod tests {
         let key = Bytes::from_static(b"mylist");
 
         let id1 = reg.next_wait_id();
-        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx1, _rx1) = crate::runtime::channel::oneshot();
         reg.register(0, key.clone(), WaitEntry {
             wait_id: id1,
             cmd: BlockedCommand::BLPop,
@@ -229,7 +229,7 @@ mod tests {
         });
 
         let id2 = reg.next_wait_id();
-        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = crate::runtime::channel::oneshot();
         reg.register(0, key.clone(), WaitEntry {
             wait_id: id2,
             cmd: BlockedCommand::BRPop,
@@ -250,14 +250,14 @@ mod tests {
         let key1 = Bytes::from_static(b"list1");
         let key2 = Bytes::from_static(b"list2");
 
-        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx1, _rx1) = crate::runtime::channel::oneshot();
         reg.register(0, key1.clone(), WaitEntry {
             wait_id: id,
             cmd: BlockedCommand::BLPop,
             reply_tx: tx1,
             deadline: None,
         });
-        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = crate::runtime::channel::oneshot();
         reg.register(0, key2.clone(), WaitEntry {
             wait_id: id,
             cmd: BlockedCommand::BLPop,

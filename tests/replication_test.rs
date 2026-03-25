@@ -4,7 +4,7 @@
 //! and REPLICAOF NO ONE promotion -- using real TCP connections.
 
 use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
+use rust_redis::runtime::cancel::CancellationToken;
 
 use rust_redis::config::ServerConfig;
 use rust_redis::server::listener;

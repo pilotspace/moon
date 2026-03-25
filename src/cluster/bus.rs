@@ -7,9 +7,11 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "runtime-tokio")]
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::cluster::gossip::{
@@ -20,12 +22,13 @@ use crate::cluster::ClusterState;
 /// Shared vote sender: set by gossip ticker when election starts, cleared when election ends.
 /// Bus handler forwards FailoverAuthAck votes through this channel.
 pub type SharedVoteTx =
-    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>;
+    Arc<tokio::sync::Mutex<Option<crate::runtime::channel::MpscSender<String>>>>;
 
 /// Run the cluster bus listener loop.
 ///
 /// Spawns a new task for each incoming peer connection.
 /// Should be spawned on the listener runtime as a separate task.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_cluster_bus(
     bind: &str,
     cluster_port: u16,
@@ -72,6 +75,7 @@ pub async fn run_cluster_bus(
 /// Reads length-prefixed gossip messages in a loop.
 /// For PING/MEET: responds with PONG.
 /// For PONG: merges into our state.
+#[cfg(feature = "runtime-tokio")]
 async fn handle_cluster_peer(
     mut stream: TcpStream,
     peer_addr: SocketAddr,

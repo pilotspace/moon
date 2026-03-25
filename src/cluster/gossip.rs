@@ -8,9 +8,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
 use tracing::warn;
 
 use crate::cluster::bus::SharedVoteTx;
@@ -351,6 +353,7 @@ pub fn check_failure_states(state: &mut ClusterState, node_timeout_ms: u64) {
 ///
 /// Runs as a separate async task on the listener runtime (NOT on shard threads).
 /// Also monitors for master FAIL and spawns election task for replicas.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_gossip_ticker(
     self_addr: SocketAddr,
     cluster_state: Arc<RwLock<ClusterState>>,
@@ -383,7 +386,7 @@ pub async fn run_gossip_ticker(
                                 .unwrap_or(false);
                             if master_is_fail && cs.failover_state == FailoverState::None {
                                 election_spawned = true;
-                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                let (tx, rx) = crate::runtime::channel::mpsc_unbounded();
                                 {
                                     // Use try_lock to avoid holding std RwLock across await
                                     // We're in a sync context here so blocking_lock is safe

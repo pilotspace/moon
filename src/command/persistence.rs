@@ -11,7 +11,7 @@ use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 use tracing::{error, info};
 
-use tokio::sync::mpsc;
+use crate::runtime::channel;
 
 use crate::persistence::aof::AofMessage;
 use crate::persistence::rdb;
@@ -100,7 +100,7 @@ pub fn bgsave_start_sharded(
 
     let mut prods = producers.borrow_mut();
     for prod in prods.iter_mut() {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let (tx, _rx) = crate::runtime::channel::oneshot();
         let _ = prod.try_push(ShardMessage::SnapshotBegin {
             epoch,
             snapshot_dir: snap_dir.clone(),
@@ -122,7 +122,7 @@ pub fn bgsave_start_sharded(
 /// Sends a Rewrite message to the AOF writer task, which will generate
 /// synthetic commands from current database state and replace the AOF file.
 pub fn bgrewriteaof_start(
-    aof_tx: &mpsc::Sender<AofMessage>,
+    aof_tx: &channel::MpscSender<AofMessage>,
     db: SharedDatabases,
 ) -> Frame {
     match aof_tx.try_send(AofMessage::Rewrite(db)) {

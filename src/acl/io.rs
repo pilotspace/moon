@@ -1,5 +1,4 @@
-use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::io::BufRead;
 
 use super::rules::apply_rule;
 use super::table::{AclTable, AclUser, CommandPermissions};
@@ -74,25 +73,25 @@ pub fn parse_acl_line(line: &str) -> Option<AclUser> {
 }
 
 /// Save all users to an ACL file (atomic tmp+rename).
-pub async fn acl_save(path: &str, table: &AclTable) -> std::io::Result<()> {
+pub fn acl_save(path: &str, table: &AclTable) -> std::io::Result<()> {
     let tmp_path = format!("{}.tmp", path);
     let mut content = String::new();
     for user in table.list_users() {
         content.push_str(&user_to_acl_line(user));
         content.push('\n');
     }
-    fs::write(&tmp_path, content.as_bytes()).await?;
-    fs::rename(&tmp_path, path).await?;
+    std::fs::write(&tmp_path, content.as_bytes())?;
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
 /// Load an ACL table from file. Returns error if file can't be read.
-pub async fn acl_load(path: &str) -> std::io::Result<AclTable> {
-    let file = fs::File::open(path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+pub fn acl_load(path: &str) -> std::io::Result<AclTable> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
     let mut table = AclTable::new();
-    while let Some(line) = lines.next_line().await? {
+    for line in reader.lines() {
+        let line = line?;
         if let Some(user) = parse_acl_line(&line) {
             table.set_user(user.username.clone(), user);
         }
@@ -102,9 +101,9 @@ pub async fn acl_load(path: &str) -> std::io::Result<AclTable> {
 
 /// Load AclTable from config: uses aclfile if configured, otherwise bootstraps from requirepass.
 /// Non-fatal: if aclfile missing, falls back to load_or_default.
-pub async fn acl_table_from_config(config: &crate::config::ServerConfig) -> AclTable {
+pub fn acl_table_from_config(config: &crate::config::ServerConfig) -> AclTable {
     if let Some(ref path) = config.aclfile {
-        match acl_load(path).await {
+        match acl_load(path) {
             Ok(table) => {
                 return table;
             }
@@ -177,8 +176,8 @@ mod tests {
         assert!(matches!(parsed.allowed_commands, CommandPermissions::AllAllowed));
     }
 
-    #[tokio::test]
-    async fn test_acl_save_load_roundtrip() {
+    #[test]
+    fn test_acl_save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.acl");
         let path_str = path.to_str().unwrap();
@@ -199,9 +198,9 @@ mod tests {
         let default_user = AclUser::new_default_nopass();
         table.set_user("default".to_string(), default_user);
 
-        acl_save(path_str, &table).await.unwrap();
+        acl_save(path_str, &table).unwrap();
 
-        let loaded = acl_load(path_str).await.unwrap();
+        let loaded = acl_load(path_str).unwrap();
         let alice_loaded = loaded.get_user("alice").unwrap();
         assert!(alice_loaded.enabled);
         assert!(alice_loaded.nopass);

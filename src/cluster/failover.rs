@@ -17,7 +17,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
+#[cfg(feature = "runtime-tokio")]
 use tokio::io::AsyncWriteExt;
+#[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
@@ -180,11 +182,12 @@ pub fn compute_failover_delay(replica_rank: u32) -> u64 {
 /// to all masters, collects votes, and promotes on majority.
 ///
 /// Spawned when this replica detects its master is FAIL.
+#[cfg(feature = "runtime-tokio")]
 pub async fn run_election_task(
     cluster_state: Arc<RwLock<ClusterState>>,
     self_addr: SocketAddr,
     _my_repl_offset: u64,
-    mut vote_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    vote_rx: crate::runtime::channel::MpscReceiver<String>,
 ) {
     // Compute delay (rank 0 for now; multi-replica ranking is future work)
     let replica_rank = 0u32;
@@ -199,7 +202,7 @@ pub async fn run_election_task(
         };
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 
     // Increment epoch and build FailoverAuthRequest
     let (new_epoch, quorum, master_addrs) = {
@@ -257,18 +260,18 @@ pub async fn run_election_task(
 
     // Collect votes with 5-second timeout
     let mut votes: u32 = 1; // self-vote
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
         if votes >= quorum {
             break;
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
-        match tokio::time::timeout(remaining, vote_rx.recv()).await {
-            Ok(Some(_voter_id)) => {
+        match tokio::time::timeout(remaining, vote_rx.recv_async()).await {
+            Ok(Ok(_voter_id)) => {
                 votes += 1;
                 let mut cs = cluster_state.write().unwrap();
                 if let FailoverState::WaitingVotes {

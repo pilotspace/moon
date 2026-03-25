@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::seq::IndexedRandom;
-use tokio_util::sync::CancellationToken;
+use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
 use crate::storage::Database;
