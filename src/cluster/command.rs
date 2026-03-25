@@ -41,7 +41,7 @@ pub fn handle_cluster_command(
         b"COUNTKEYSINSLOT" => handle_cluster_countkeysinslot(&args[1..]),
         b"RESET" => handle_cluster_reset(&args[1..], cluster_state, self_addr),
         b"REPLICATE" => handle_cluster_replicate(&args[1..], cluster_state),
-        b"FAILOVER" => Frame::SimpleString(Bytes::from_static(b"OK")), // implemented in 20-04
+        b"FAILOVER" => handle_cluster_failover(&args[1..], cluster_state),
         _ => Frame::Error(Bytes::from(format!(
             "ERR unknown subcommand '{}' for CLUSTER",
             String::from_utf8_lossy(&subcmd_upper)
@@ -365,6 +365,80 @@ pub fn handle_cluster_replicate(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) 
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
+// --- Failover command ------------------------------------------------------------
+
+/// CLUSTER FAILOVER mode: Normal (election via gossip), Force (skip vote), Takeover (skip vote + bump epoch).
+enum FailoverMode {
+    Normal,
+    Force,
+    Takeover,
+}
+
+/// Return current unix milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// CLUSTER FAILOVER [FORCE|TAKEOVER] -- manually trigger failover on a replica.
+///
+/// - No args: sets FailoverState::WaitingDelay for gossip ticker to start election.
+/// - FORCE: skips vote collection, promotes immediately (master may be unreachable).
+/// - TAKEOVER: bumps epoch and promotes immediately (no delay, no voting).
+fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Frame {
+    // Parse optional subcommand: FORCE or TAKEOVER
+    let mode = if let Some(arg) = args.first() {
+        let s = extract_string(arg).to_ascii_uppercase();
+        match s.as_str() {
+            "FORCE" => FailoverMode::Force,
+            "TAKEOVER" => FailoverMode::Takeover,
+            _ => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR CLUSTER FAILOVER only accepts FORCE or TAKEOVER",
+                ))
+            }
+        }
+    } else {
+        FailoverMode::Normal
+    };
+
+    let mut state = cs.write().unwrap();
+
+    // Must be a replica to failover
+    let _master_id = match &state.my_node().flags {
+        NodeFlags::Replica { master_id } => master_id.clone(),
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR CLUSTER FAILOVER can only be called on a replica node",
+            ))
+        }
+    };
+
+    match mode {
+        FailoverMode::Normal => {
+            // Set failover_state to trigger election on next gossip tick
+            state.failover_state = crate::cluster::FailoverState::WaitingDelay {
+                start_ms: now_ms(),
+                delay_ms: 0, // gossip ticker will compute actual delay
+            };
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
+        FailoverMode::Force => {
+            // Skip voting, promote immediately (master may be unreachable)
+            crate::cluster::failover::check_and_initiate_failover(&mut state, 0);
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
+        FailoverMode::Takeover => {
+            // Skip everything: bump epoch, promote, take slots
+            state.epoch += 1;
+            crate::cluster::failover::check_and_initiate_failover(&mut state, 0);
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
+    }
+}
+
 // --- Helpers ---------------------------------------------------------------------
 
 fn parse_slots(args: &[Frame]) -> Result<Vec<u16>, String> {
@@ -585,5 +659,125 @@ mod tests {
         let result = handle_cluster_command(&args, &cs, "127.0.0.1:6379".parse().unwrap());
         assert!(matches!(result, Frame::SimpleString(_)));
         assert_eq!(cs.read().unwrap().nodes.len(), 2);
+    }
+
+    /// Helper: create a ClusterState where this node is a replica of a FAIL master.
+    fn make_replica_with_fail_master() -> Arc<RwLock<ClusterState>> {
+        let my_id = "a".repeat(40);
+        let master_id = "b".repeat(40);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
+        let cs = Arc::new(RwLock::new(ClusterState::new(my_id.clone(), addr)));
+        {
+            let mut state = cs.write().unwrap();
+            // Make self a replica
+            state.my_node_mut().flags = NodeFlags::Replica {
+                master_id: master_id.clone(),
+            };
+            // Add master node as FAIL with some slots
+            let mut master = ClusterNode::new(
+                master_id.clone(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
+                NodeFlags::Fail,
+                1,
+            );
+            for slot in 0u16..=100 {
+                master.set_slot(slot);
+            }
+            state.nodes.insert(master_id, master);
+        }
+        cs
+    }
+
+    /// CLUSTER FAILOVER on a master returns ERR.
+    #[test]
+    fn test_failover_rejects_on_master() {
+        let cs = make_cs(); // default is master
+        let result = handle_cluster_failover(&[], &cs);
+        match result {
+            Frame::Error(msg) => {
+                let s = String::from_utf8_lossy(&msg);
+                assert!(
+                    s.contains("can only be called on a replica"),
+                    "unexpected error: {}",
+                    s
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    /// CLUSTER FAILOVER FORCE on a replica with FAIL master promotes to master.
+    #[test]
+    fn test_failover_force_promotes_replica() {
+        let cs = make_replica_with_fail_master();
+        let args = vec![Frame::BulkString(bytes::Bytes::from_static(b"FORCE"))];
+        let result = handle_cluster_failover(&args, &cs);
+        assert!(matches!(result, Frame::SimpleString(_)));
+        let state = cs.read().unwrap();
+        assert!(
+            matches!(state.my_node().flags, NodeFlags::Master),
+            "expected Master after FORCE failover"
+        );
+        // Should have inherited master's slots
+        assert!(state.my_node().owns_slot(50));
+    }
+
+    /// CLUSTER FAILOVER TAKEOVER promotes and increments epoch.
+    #[test]
+    fn test_failover_takeover_promotes_replica() {
+        let cs = make_replica_with_fail_master();
+        let epoch_before = cs.read().unwrap().epoch;
+        let args = vec![Frame::BulkString(bytes::Bytes::from_static(b"TAKEOVER"))];
+        let result = handle_cluster_failover(&args, &cs);
+        assert!(matches!(result, Frame::SimpleString(_)));
+        let state = cs.read().unwrap();
+        assert!(
+            matches!(state.my_node().flags, NodeFlags::Master),
+            "expected Master after TAKEOVER failover"
+        );
+        // Epoch should have been bumped (TAKEOVER +1, then check_and_initiate_failover +1)
+        assert!(
+            state.epoch > epoch_before,
+            "epoch {} should be > {}",
+            state.epoch,
+            epoch_before
+        );
+        assert!(state.my_node().owns_slot(50));
+    }
+
+    /// CLUSTER FAILOVER with invalid subcommand returns ERR.
+    #[test]
+    fn test_failover_invalid_subcommand() {
+        let cs = make_replica_with_fail_master();
+        let args = vec![Frame::BulkString(bytes::Bytes::from_static(b"INVALID"))];
+        let result = handle_cluster_failover(&args, &cs);
+        match result {
+            Frame::Error(msg) => {
+                let s = String::from_utf8_lossy(&msg);
+                assert!(
+                    s.contains("only accepts FORCE or TAKEOVER"),
+                    "unexpected error: {}",
+                    s
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    /// CLUSTER FAILOVER (no args) on a replica sets WaitingDelay state.
+    #[test]
+    fn test_failover_normal_sets_waiting_delay() {
+        let cs = make_replica_with_fail_master();
+        let result = handle_cluster_failover(&[], &cs);
+        assert!(matches!(result, Frame::SimpleString(_)));
+        let state = cs.read().unwrap();
+        assert!(
+            matches!(
+                state.failover_state,
+                crate::cluster::FailoverState::WaitingDelay { .. }
+            ),
+            "expected WaitingDelay state, got {:?}",
+            state.failover_state
+        );
     }
 }
