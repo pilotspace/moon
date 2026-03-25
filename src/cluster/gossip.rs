@@ -13,6 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
+#[cfg(feature = "runtime-monoio")]
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use crate::runtime::cancel::CancellationToken;
 use tracing::warn;
 
@@ -434,6 +436,109 @@ pub async fn run_gossip_ticker(
                                     if let Ok(pong) = deserialize_gossip(&pong_buf) {
                                         let mut cs2 = cs.write().unwrap();
                                         merge_gossip_into_state(&mut cs2, &pong);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
+/// Background gossip ticker (monoio variant): sends PING to a random peer every 100ms.
+///
+/// Uses `loop { monoio::time::sleep() }` instead of `tokio::time::interval`.
+/// Uses `monoio::spawn` for election task and ping senders.
+/// Uses ownership-based I/O for all TCP reads/writes.
+#[cfg(feature = "runtime-monoio")]
+pub async fn run_gossip_ticker(
+    self_addr: SocketAddr,
+    cluster_state: Arc<RwLock<ClusterState>>,
+    node_timeout_ms: u64,
+    shutdown: CancellationToken,
+    vote_tx: SharedVoteTx,
+    repl_state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+) {
+    let mut election_spawned = false;
+    loop {
+        monoio::select! {
+            _ = monoio::time::sleep(Duration::from_millis(100)) => {
+                // Pick a random peer to PING
+                let (target_addr, ping_msg) = {
+                    let mut cs = cluster_state.write().unwrap();
+                    check_failure_states(&mut cs, node_timeout_ms);
+
+                    // Reset election_spawned when failover state returns to None
+                    if election_spawned && cs.failover_state == FailoverState::None {
+                        election_spawned = false;
+                    }
+
+                    // Check if we should initiate failover (replica with FAIL master)
+                    if !election_spawned {
+                        let my_flags = cs.my_node().flags.clone();
+                        if let NodeFlags::Replica { ref master_id } = my_flags {
+                            let master_is_fail = cs.nodes.get(master_id)
+                                .map(|n| matches!(n.flags, NodeFlags::Fail))
+                                .unwrap_or(false);
+                            if master_is_fail && cs.failover_state == FailoverState::None {
+                                election_spawned = true;
+                                let (tx, rx) = crate::runtime::channel::mpsc_unbounded();
+                                {
+                                    let mut guard = vote_tx.lock();
+                                    *guard = Some(tx);
+                                }
+                                let cs_election = cluster_state.clone();
+                                let sa = self_addr;
+                                let offset = repl_state.read().unwrap().total_offset();
+                                let vtx = vote_tx.clone();
+                                monoio::spawn(async move {
+                                    crate::cluster::failover::run_election_task(
+                                        cs_election, sa, offset, rx,
+                                    ).await;
+                                    // Clear vote_tx when election ends
+                                    *vtx.lock() = None;
+                                });
+                            }
+                        }
+                    }
+
+                    let target = cs.nodes.values()
+                        .filter(|n| n.node_id != cs.node_id)
+                        .next()
+                        .map(|n| SocketAddr::new(n.addr.ip(), n.bus_port));
+                    let msg = build_message(&cs, self_addr, GossipMsgType::Ping);
+                    cs.messages_sent += 1;
+                    (target, msg)
+                };
+                if let Some(target_addr) = target_addr {
+                    let cs = cluster_state.clone();
+                    monoio::spawn(async move {
+                        if let Ok(mut stream) = monoio::net::TcpStream::connect(target_addr).await {
+                            let data = serialize_gossip(&ping_msg);
+                            let len = (data.len() as u32).to_be_bytes();
+                            let len_vec = len.to_vec();
+                            let (wr, _) = stream.write_all(len_vec).await;
+                            if wr.is_err() { return; }
+                            let (wr, _) = stream.write_all(data).await;
+                            if wr.is_err() { return; }
+                            // Read PONG response
+                            let len_buf = vec![0u8; 4];
+                            let (res, len_buf) = stream.read(len_buf).await;
+                            if let Ok(4) = res {
+                                let pong_len = u32::from_be_bytes(
+                                    len_buf[..4].try_into().unwrap(),
+                                ) as usize;
+                                let pong_buf = vec![0u8; pong_len];
+                                let (res, pong_buf) = stream.read(pong_buf).await;
+                                if let Ok(n) = res {
+                                    if n == pong_len {
+                                        if let Ok(pong) = deserialize_gossip(&pong_buf) {
+                                            let mut cs2 = cs.write().unwrap();
+                                            merge_gossip_into_state(&mut cs2, &pong);
+                                        }
                                     }
                                 }
                             }
