@@ -1024,80 +1024,96 @@ impl Shard {
                     .or_insert_with(|| bytes::BytesMut::with_capacity(4096));
                 parse_buf.extend_from_slice(&data);
 
+                // Phase A: Parse all frames into a batch (up to 1024, matching Tokio path MAX_BATCH).
                 let parse_config = crate::protocol::ParseConfig::default();
+                let mut batch: Vec<crate::protocol::Frame> = Vec::with_capacity(16);
+                let mut parse_error = false;
                 loop {
                     match crate::protocol::parse(parse_buf, &parse_config) {
                         Ok(Some(frame)) => {
-                            // Execute command against shard databases
-                            let response = {
-                                let mut dbs = databases.borrow_mut();
-                                let db_count = dbs.len();
-                                let (cmd, args) = match Self::extract_command_static(&frame) {
-                                    Some(pair) => pair,
-                                    None => {
-                                        crate::protocol::Frame::Error(
-                                            bytes::Bytes::from_static(b"ERR invalid command"),
-                                        )
-                                    }
-                                };
-                                dbs[0].refresh_now();
-                                let mut selected = 0usize;
-                                let result = cmd_dispatch(
-                                    &mut dbs[0], cmd, args, &mut selected, db_count,
-                                );
-                                match result {
-                                    DispatchResult::Response(f) => f,
-                                    DispatchResult::Quit(f) => f,
-                                }
-                            };
+                            batch.push(frame);
+                            if batch.len() >= 1024 { break; }
+                        }
+                        Ok(None) => break,
+                        Err(crate::protocol::ParseError::Incomplete) => break,
+                        Err(_) => {
+                            parse_error = true;
+                            break;
+                        }
+                    }
+                }
 
-                            // Send response via io_uring with proper buffer lifetime management.
-                            // Priority: 1) BulkString writev (zero-copy GET), 2) Fixed pool buf
-                            // (no get_user_pages), 3) Heap BytesMut fallback.
-                            match response {
-                                crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
-                                    // Zero-copy path: scatter-gather via writev
-                                    match driver.submit_writev_bulkstring(conn_id, value.clone()) {
-                                        Ok(guard) => {
-                                            inflight_sends
-                                                .entry(conn_id)
-                                                .or_default()
-                                                .push(InFlightSend::Writev(guard));
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "writev failed for conn {}: {}, falling back to send",
-                                                conn_id, e
-                                            );
-                                            // Fallback: try pooled fixed buffer, then heap
-                                            let mut resp_buf = bytes::BytesMut::new();
-                                            crate::protocol::serialize(&response, &mut resp_buf);
-                                            Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
-                                        }
-                                    }
+                if parse_error {
+                    // Protocol error: close connection, reclaim pooled buffers
+                    if let Some(sends) = inflight_sends.remove(&conn_id) {
+                        for send in sends {
+                            if let InFlightSend::Fixed(idx) = send {
+                                driver.reclaim_send_buf(idx);
+                            }
+                        }
+                    }
+                    let _ = driver.close_connection(conn_id);
+                    parse_bufs.remove(&conn_id);
+                    return;
+                }
+
+                if batch.is_empty() { return; }
+
+                // Phase B: Dispatch all commands under a single borrow_mut (reduces
+                // RefCell overhead from N borrows to 1 per batch).
+                let responses: Vec<crate::protocol::Frame> = {
+                    let mut dbs = databases.borrow_mut();
+                    let db_count = dbs.len();
+                    dbs[0].refresh_now();
+                    let mut selected = 0usize;
+                    batch.iter().map(|frame| {
+                        let (cmd, args) = match Self::extract_command_static(frame) {
+                            Some(pair) => pair,
+                            None => {
+                                return crate::protocol::Frame::Error(
+                                    bytes::Bytes::from_static(b"ERR invalid command"),
+                                );
+                            }
+                        };
+                        let result = cmd_dispatch(
+                            &mut dbs[0], cmd, args, &mut selected, db_count,
+                        );
+                        match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
+                        }
+                    }).collect()
+                };
+
+                // Phase C: Serialize and send all responses (outside borrow).
+                // Priority: 1) BulkString writev (zero-copy GET), 2) Fixed pool buf
+                // (no get_user_pages), 3) Heap BytesMut fallback.
+                for response in responses {
+                    match response {
+                        crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
+                            // Zero-copy path: scatter-gather via writev
+                            match driver.submit_writev_bulkstring(conn_id, value.clone()) {
+                                Ok(guard) => {
+                                    inflight_sends
+                                        .entry(conn_id)
+                                        .or_default()
+                                        .push(InFlightSend::Writev(guard));
                                 }
-                                _ => {
-                                    // Standard path: serialize then send via pool or heap
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "writev failed for conn {}: {}, falling back to send",
+                                        conn_id, e
+                                    );
                                     let mut resp_buf = bytes::BytesMut::new();
                                     crate::protocol::serialize(&response, &mut resp_buf);
                                     Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
                                 }
                             }
                         }
-                        Ok(None) => break, // Need more data
-                        Err(crate::protocol::ParseError::Incomplete) => break,
-                        Err(_) => {
-                            // Protocol error: close connection, reclaim pooled buffers
-                            if let Some(sends) = inflight_sends.remove(&conn_id) {
-                                for send in sends {
-                                    if let InFlightSend::Fixed(idx) = send {
-                                        driver.reclaim_send_buf(idx);
-                                    }
-                                }
-                            }
-                            let _ = driver.close_connection(conn_id);
-                            parse_bufs.remove(&conn_id);
-                            break;
+                        _ => {
+                            let mut resp_buf = bytes::BytesMut::new();
+                            crate::protocol::serialize(&response, &mut resp_buf);
+                            Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
                         }
                     }
                 }
