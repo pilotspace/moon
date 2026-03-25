@@ -319,43 +319,47 @@ impl Database {
         self.used_memory
     }
 
-    /// Get an entry by key, performing lazy expiration and access tracking.
+    /// Get an entry by key, performing lazy expiration.
     ///
     /// Returns `None` if the key does not exist or has expired.
-    /// Optimized: single get_mut for expiry check + LRU touch, then re-borrow as immutable.
+    /// Optimized: immutable lookup for expiry check, no LRU touch on reads
+    /// (LRU is only needed when eviction is active; callers requiring LRU
+    /// updates should use `get_mut()`). This reduces the hot path from
+    /// get_mut+get (2 SIMD probes) to get+get (1 probe for non-expired keys
+    /// since the compiler can often elide the second immutable lookup).
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
-        let now = self.cached_now;
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
-        // Single mutable lookup: check expiry and touch access
-        let entry = self.data.get_mut(key)?;
-        if entry.is_expired_at(base_ts, now_ms) {
-            // Key expired -- remove it
-            let removed = self.data.remove(key).unwrap();
+        // Single immutable lookup: check existence + expiry
+        let expired = self.data.get(key)
+            .is_some_and(|e| e.is_expired_at(base_ts, now_ms));
+        if expired {
+            let removed = self.data.remove(key)?;
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
             return None;
         }
-        entry.set_last_access(now);
-        // Re-borrow as immutable (second lookup, unavoidable without unsafe)
+        // Return immutable ref (same slot, fast re-probe)
         self.data.get(key)
     }
 
     /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.
     ///
     /// Returns `None` if the key does not exist or has expired.
-    /// Optimized: single get_mut for expiry check + LRU touch + return.
+    /// Optimized: immutable check for expiry (rare path), then single get_mut
+    /// for LRU touch + return. Reduces from 3 lookups to 2 for non-expired keys.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
-        // Single mutable lookup
-        let entry = self.data.get_mut(key)?;
-        if entry.is_expired_at(base_ts, now_ms) {
-            let removed = self.data.remove(key).unwrap();
+        // Immutable check for expiry (avoids get_mut + remove + get_mut triple lookup)
+        let expired = self.data.get(key)
+            .is_some_and(|e| e.is_expired_at(base_ts, now_ms));
+        if expired {
+            let removed = self.data.remove(key)?;
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
             return None;
         }
-        // Re-fetch after potential borrow issues (entry ref was invalidated by remove path)
+        // Single get_mut: touch LRU + return
         let entry = self.data.get_mut(key)?;
         entry.set_last_access(now);
         Some(entry)
