@@ -60,10 +60,13 @@ pub struct Shard {
 /// replacing the previous std::mem::forget memory leak.
 #[cfg(target_os = "linux")]
 enum InFlightSend {
-    /// Serialized response buffer for non-BulkString frames.
+    /// Serialized response buffer for non-BulkString frames (heap fallback).
     Buf(bytes::BytesMut),
     /// Scatter-gather writev guard for BulkString (zero-copy GET) responses.
     Writev(WritevGuard),
+    /// Pre-registered fixed buffer index from SendBufPool.
+    /// Buffer is reclaimed to pool on SendComplete (no heap alloc/free).
+    Fixed(u16),
 }
 
 impl Shard {
@@ -964,6 +967,43 @@ impl Shard {
 
     /// Process a single io_uring completion event (Linux only).
     ///
+    /// Send a serialized response buffer via io_uring.
+    ///
+    /// Tries the pre-registered fixed buffer pool first (zero get_user_pages overhead).
+    /// If the pool is exhausted or the response is too large for a pooled buffer,
+    /// falls back to heap-allocated BytesMut with regular submit_send.
+    #[cfg(target_os = "linux")]
+    fn send_serialized(
+        driver: &mut UringDriver,
+        conn_id: u32,
+        resp_buf: bytes::BytesMut,
+        inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
+    ) {
+        let resp_len = resp_buf.len();
+        // Try pooled fixed buffer: must fit in pool buffer size
+        if let Some((buf_idx, pool_buf)) = driver.alloc_send_buf() {
+            if resp_len <= pool_buf.len() {
+                pool_buf[..resp_len].copy_from_slice(&resp_buf);
+                let _ = driver.submit_send_fixed(conn_id, buf_idx, resp_len as u32);
+                inflight_sends
+                    .entry(conn_id)
+                    .or_default()
+                    .push(InFlightSend::Fixed(buf_idx));
+                return;
+            }
+            // Response too large for pooled buffer -- reclaim and fall through to heap
+            driver.reclaim_send_buf(buf_idx);
+        }
+        // Fallback: heap-allocated BytesMut with regular send
+        let len = resp_len as u32;
+        let ptr = resp_buf.as_ptr();
+        let _ = driver.submit_send(conn_id, ptr, len);
+        inflight_sends
+            .entry(conn_id)
+            .or_default()
+            .push(InFlightSend::Buf(resp_buf));
+    }
+
     /// Handles recv (parse RESP frames + execute commands + send responses),
     /// disconnect, recv rearm, accept, and send completion events.
     /// Command dispatch reuses the same `extract_command_static` + `cmd_dispatch`
@@ -1012,8 +1052,8 @@ impl Shard {
                             };
 
                             // Send response via io_uring with proper buffer lifetime management.
-                            // BulkString responses use writev scatter-gather (zero-copy from DashTable).
-                            // All other responses use submit_send with tracked InFlightSend::Buf.
+                            // Priority: 1) BulkString writev (zero-copy GET), 2) Fixed pool buf
+                            // (no get_user_pages), 3) Heap BytesMut fallback.
                             match response {
                                 crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
                                     // Zero-copy path: scatter-gather via writev
@@ -1029,49 +1069,50 @@ impl Shard {
                                                 "writev failed for conn {}: {}, falling back to send",
                                                 conn_id, e
                                             );
-                                            // Fallback to regular send
+                                            // Fallback: try pooled fixed buffer, then heap
                                             let mut resp_buf = bytes::BytesMut::new();
                                             crate::protocol::serialize(&response, &mut resp_buf);
-                                            let len = resp_buf.len() as u32;
-                                            let ptr = resp_buf.as_ptr();
-                                            let _ = driver.submit_send(conn_id, ptr, len);
-                                            inflight_sends
-                                                .entry(conn_id)
-                                                .or_default()
-                                                .push(InFlightSend::Buf(resp_buf));
+                                            Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
                                         }
                                     }
                                 }
                                 _ => {
-                                    // Standard path: serialize + send (buffer tracked, no leak)
+                                    // Standard path: serialize then send via pool or heap
                                     let mut resp_buf = bytes::BytesMut::new();
                                     crate::protocol::serialize(&response, &mut resp_buf);
-                                    let len = resp_buf.len() as u32;
-                                    let ptr = resp_buf.as_ptr();
-                                    let _ = driver.submit_send(conn_id, ptr, len);
-                                    inflight_sends
-                                        .entry(conn_id)
-                                        .or_default()
-                                        .push(InFlightSend::Buf(resp_buf));
+                                    Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
                                 }
                             }
                         }
                         Ok(None) => break, // Need more data
                         Err(crate::protocol::ParseError::Incomplete) => break,
                         Err(_) => {
-                            // Protocol error: close connection
+                            // Protocol error: close connection, reclaim pooled buffers
+                            if let Some(sends) = inflight_sends.remove(&conn_id) {
+                                for send in sends {
+                                    if let InFlightSend::Fixed(idx) = send {
+                                        driver.reclaim_send_buf(idx);
+                                    }
+                                }
+                            }
                             let _ = driver.close_connection(conn_id);
                             parse_bufs.remove(&conn_id);
-                            inflight_sends.remove(&conn_id);
                             break;
                         }
                     }
                 }
             }
             IoEvent::Disconnect { conn_id } => {
+                // Reclaim all pooled Fixed buffers before removing the connection
+                if let Some(sends) = inflight_sends.remove(&conn_id) {
+                    for send in sends {
+                        if let InFlightSend::Fixed(idx) = send {
+                            driver.reclaim_send_buf(idx);
+                        }
+                    }
+                }
                 let _ = driver.close_connection(conn_id);
                 parse_bufs.remove(&conn_id);
-                inflight_sends.remove(&conn_id);
             }
             IoEvent::RecvNeedsRearm { conn_id } => {
                 let _ = driver.rearm_recv(conn_id);
@@ -1087,10 +1128,15 @@ impl Shard {
                 }
             }
             IoEvent::SendComplete { conn_id } => {
-                // Drop the oldest in-flight send buffer (FIFO order matches CQE order)
+                // Drop the oldest in-flight send buffer (FIFO order matches CQE order).
+                // Fixed buffers are reclaimed to pool; Buf/Writev are dropped (freed).
                 if let Some(sends) = inflight_sends.get_mut(&conn_id) {
                     if !sends.is_empty() {
-                        sends.remove(0);
+                        let send = sends.remove(0);
+                        if let InFlightSend::Fixed(idx) = send {
+                            driver.reclaim_send_buf(idx);
+                        }
+                        // Buf and Writev variants: drop frees memory
                     }
                     if sends.is_empty() {
                         inflight_sends.remove(&conn_id);
@@ -1098,9 +1144,16 @@ impl Shard {
                 }
             }
             IoEvent::SendError { conn_id, .. } => {
+                // Reclaim all pooled Fixed buffers before cleanup
+                if let Some(sends) = inflight_sends.remove(&conn_id) {
+                    for send in sends {
+                        if let InFlightSend::Fixed(idx) = send {
+                            driver.reclaim_send_buf(idx);
+                        }
+                    }
+                }
                 let _ = driver.close_connection(conn_id);
                 parse_bufs.remove(&conn_id);
-                inflight_sends.remove(&conn_id);
             }
             IoEvent::Timeout | IoEvent::Wakeup => {
                 // Handled by the spsc_interval tick (already draining SPSC)
