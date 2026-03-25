@@ -48,6 +48,13 @@ pub enum ShardMessage {
         commands: Vec<(Bytes, Frame)>, // (key, command) pairs for this shard
         reply_tx: tokio::sync::oneshot::Sender<Vec<Frame>>,
     },
+    /// Execute a batch of pipelined commands on this shard.
+    /// Each command is independent (not transactional). Returns one response per command.
+    PipelineBatch {
+        db_index: usize,
+        commands: Vec<std::sync::Arc<Frame>>,
+        reply_tx: tokio::sync::oneshot::Sender<Vec<Frame>>,
+    },
     /// Publish a message to local subscribers on this shard.
     PubSubFanOut { channel: Bytes, message: Bytes },
     /// Begin a cooperative snapshot at the given epoch.

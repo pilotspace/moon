@@ -52,8 +52,10 @@ pub enum AofMessage {
     Shutdown,
 }
 
-/// List of all write commands that should be logged to AOF.
+/// Canonical list of all write commands for AOF logging (reference/documentation).
 /// SELECT is included so replay can track database switching.
+/// The actual check is done via (length, first_byte) match in `is_write_command`.
+#[allow(dead_code)]
 const WRITE_COMMANDS: &[&[u8]] = &[
     b"SET", b"MSET", b"SETNX", b"SETEX", b"PSETEX",
     b"GETSET", b"GETDEL", b"GETEX",
@@ -70,14 +72,67 @@ const WRITE_COMMANDS: &[&[u8]] = &[
     b"SELECT",
 ];
 
-/// Check if a command name (uppercased) is a write command that should be logged to AOF.
+/// Check if a command name is a write command that should be logged to AOF.
+///
+/// Uses (length, first_byte) dispatch for O(1) lookup instead of linear scan.
+#[inline]
 pub fn is_write_command(name: &[u8]) -> bool {
-    WRITE_COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(name))
+    let len = name.len();
+    if len == 0 { return false; }
+    let b0 = name[0] | 0x20;
+    match (len, b0) {
+        // 3-letter
+        (3, b's') => name.eq_ignore_ascii_case(b"SET"),
+        (3, b'd') => name.eq_ignore_ascii_case(b"DEL"),
+        // 4-letter
+        (4, b'i') => name.eq_ignore_ascii_case(b"INCR"),
+        (4, b'd') => name.eq_ignore_ascii_case(b"DECR"),
+        (4, b'm') => name.eq_ignore_ascii_case(b"MSET"),
+        (4, b'h') => name.eq_ignore_ascii_case(b"HSET") || name.eq_ignore_ascii_case(b"HDEL"),
+        (4, b'l') => name.eq_ignore_ascii_case(b"LSET") || name.eq_ignore_ascii_case(b"LREM") || name.eq_ignore_ascii_case(b"LPOP"),
+        (4, b'r') => name.eq_ignore_ascii_case(b"RPOP"),
+        (4, b's') => name.eq_ignore_ascii_case(b"SADD") || name.eq_ignore_ascii_case(b"SREM") || name.eq_ignore_ascii_case(b"SPOP"),
+        (4, b'z') => name.eq_ignore_ascii_case(b"ZADD") || name.eq_ignore_ascii_case(b"ZREM"),
+        // 5-letter
+        (5, b'l') => name.eq_ignore_ascii_case(b"LPUSH") || name.eq_ignore_ascii_case(b"LTRIM") || name.eq_ignore_ascii_case(b"LMOVE"),
+        (5, b'r') => name.eq_ignore_ascii_case(b"RPUSH"),
+        (5, b'h') => name.eq_ignore_ascii_case(b"HMSET"),
+        (5, b's') => name.eq_ignore_ascii_case(b"SETNX") || name.eq_ignore_ascii_case(b"SETEX"),
+        // 6-letter
+        (6, b'a') => name.eq_ignore_ascii_case(b"APPEND"),
+        (6, b'd') => name.eq_ignore_ascii_case(b"DECRBY"),
+        (6, b'e') => name.eq_ignore_ascii_case(b"EXPIRE"),
+        (6, b'g') => name.eq_ignore_ascii_case(b"GETSET") || name.eq_ignore_ascii_case(b"GETDEL"),
+        (6, b'h') => name.eq_ignore_ascii_case(b"HSETNX"),
+        (6, b'i') => name.eq_ignore_ascii_case(b"INCRBY"),
+        (6, b'p') => name.eq_ignore_ascii_case(b"PSETEX"),
+        (6, b'r') => name.eq_ignore_ascii_case(b"RENAME"),
+        (6, b's') => name.eq_ignore_ascii_case(b"SELECT"),
+        (6, b'u') => name.eq_ignore_ascii_case(b"UNLINK"),
+        // 7-letter
+        (7, b'h') => name.eq_ignore_ascii_case(b"HINCRBY"),
+        (7, b'l') => name.eq_ignore_ascii_case(b"LINSERT"),
+        (7, b'p') => name.eq_ignore_ascii_case(b"PEXPIRE") || name.eq_ignore_ascii_case(b"PERSIST"),
+        (7, b'z') => name.eq_ignore_ascii_case(b"ZINCRBY") || name.eq_ignore_ascii_case(b"ZPOPMIN") || name.eq_ignore_ascii_case(b"ZPOPMAX"),
+        // 5-letter GETEX
+        (5, b'g') => name.eq_ignore_ascii_case(b"GETEX"),
+        // 8-letter
+        (8, b'r') => name.eq_ignore_ascii_case(b"RENAMENX"),
+        // 11-letter
+        (11, b'i') => name.eq_ignore_ascii_case(b"INCRBYFLOAT"),
+        (11, b's') => name.eq_ignore_ascii_case(b"SINTERSTORE") || name.eq_ignore_ascii_case(b"SUNIONSTORE"),
+        (11, b'z') => name.eq_ignore_ascii_case(b"ZUNIONSTORE") || name.eq_ignore_ascii_case(b"ZINTERSTORE"),
+        // 10-letter
+        (10, b's') => name.eq_ignore_ascii_case(b"SDIFFSTORE"),
+        // 12-letter
+        (12, b'h') => name.eq_ignore_ascii_case(b"HINCRBYFLOAT"),
+        _ => false,
+    }
 }
 
 /// Serialize a Frame into RESP wire format bytes.
 pub fn serialize_command(frame: &Frame) -> Bytes {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(64);
     serialize::serialize(frame, &mut buf);
     buf.freeze()
 }

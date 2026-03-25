@@ -2399,6 +2399,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
         let conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>> =
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
+        let all_notifiers = mesh.all_notifiers();
 
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
@@ -2408,6 +2409,8 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             let conn_rx = mesh.take_conn_rx(id);
             let shard_config = config.clone();
             let shard_cancel = cancel.clone();
+            let shard_spsc_notify = mesh.take_notify(id);
+            let shard_all_notifiers = all_notifiers.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-shard-{}", id))
@@ -2433,7 +2436,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     ));
                     rt.block_on(local.run_until(
-                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0, acl_t, rt_cfg),
+                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0, acl_t, rt_cfg, shard_spsc_notify, shard_all_notifiers),
                     ));
                 })
                 .expect("failed to spawn shard thread");
@@ -3441,6 +3444,8 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         let cluster_state =
             Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
 
+        let all_notifiers = mesh.all_notifiers();
+
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
         for id in 0..num_shards {
@@ -3450,6 +3455,8 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             let shard_config = config.clone();
             let shard_cancel = cancel.clone();
             let shard_cs = cluster_state.clone();
+            let shard_spsc_notify = mesh.take_notify(id);
+            let shard_all_notifiers = all_notifiers.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-cluster-shard-{}", id))
@@ -3488,6 +3495,8 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         shard_config.port,
                         acl_t,
                         rt_cfg,
+                        shard_spsc_notify,
+                        shard_all_notifiers,
                     )));
                 })
                 .expect("failed to spawn shard thread");

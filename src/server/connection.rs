@@ -1248,42 +1248,44 @@ fn execute_transaction(
 /// Returns `None` for keyless commands (PING, DBSIZE, SELECT, etc.)
 /// which should execute locally on the connection's shard.
 fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
-    // Keyless commands: execute locally
-    if cmd.eq_ignore_ascii_case(b"PING")
-        || cmd.eq_ignore_ascii_case(b"ECHO")
-        || cmd.eq_ignore_ascii_case(b"SELECT")
-        || cmd.eq_ignore_ascii_case(b"QUIT")
-        || cmd.eq_ignore_ascii_case(b"INFO")
-        || cmd.eq_ignore_ascii_case(b"COMMAND")
-        || cmd.eq_ignore_ascii_case(b"DBSIZE")
-        || cmd.eq_ignore_ascii_case(b"KEYS")
-        || cmd.eq_ignore_ascii_case(b"SCAN")
-        || cmd.eq_ignore_ascii_case(b"CLUSTER")
-        || cmd.eq_ignore_ascii_case(b"ASKING")
-        || cmd.eq_ignore_ascii_case(b"AUTH")
-        || cmd.eq_ignore_ascii_case(b"CONFIG")
-        || cmd.eq_ignore_ascii_case(b"HELLO")
-        || cmd.eq_ignore_ascii_case(b"CLIENT")
-        || cmd.eq_ignore_ascii_case(b"WAIT")
-        || cmd.eq_ignore_ascii_case(b"REPLCONF")
-        || cmd.eq_ignore_ascii_case(b"PSYNC")
-        || cmd.eq_ignore_ascii_case(b"BGSAVE")
-        || cmd.eq_ignore_ascii_case(b"BGREWRITEAOF")
-        || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
-        || cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE")
-        || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
-        || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE")
-        || cmd.eq_ignore_ascii_case(b"PUBLISH")
-        || cmd.eq_ignore_ascii_case(b"MULTI")
-        || cmd.eq_ignore_ascii_case(b"EXEC")
-        || cmd.eq_ignore_ascii_case(b"DISCARD")
-        || cmd.eq_ignore_ascii_case(b"DEBUG")
-        || cmd.eq_ignore_ascii_case(b"REPLICAOF")
-        || cmd.eq_ignore_ascii_case(b"SLAVEOF")
-    {
-        return None;
-    }
-    if args.is_empty() {
+    // Fast check: is this command keyless? Uses (length, first_byte) dispatch.
+    let len = cmd.len();
+    if len == 0 { return None; }
+    let b0 = cmd[0] | 0x20;
+
+    let is_keyless = match (len, b0) {
+        (4, b'a') => cmd.eq_ignore_ascii_case(b"AUTH"),
+        (4, b'e') => cmd.eq_ignore_ascii_case(b"ECHO") || cmd.eq_ignore_ascii_case(b"EXEC"),
+        (4, b'i') => cmd.eq_ignore_ascii_case(b"INFO"),
+        (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS"),
+        (4, b'p') => cmd.eq_ignore_ascii_case(b"PING"),
+        (4, b'q') => cmd.eq_ignore_ascii_case(b"QUIT"),
+        (4, b's') => cmd.eq_ignore_ascii_case(b"SCAN"),
+        (4, b'w') => cmd.eq_ignore_ascii_case(b"WAIT"),
+        (5, b'd') => cmd.eq_ignore_ascii_case(b"DEBUG"),
+        (5, b'h') => cmd.eq_ignore_ascii_case(b"HELLO"),
+        (5, b'm') => cmd.eq_ignore_ascii_case(b"MULTI"),
+        (5, b'p') => cmd.eq_ignore_ascii_case(b"PSYNC"),
+        (6, b'a') => cmd.eq_ignore_ascii_case(b"ASKING"),
+        (6, b'b') => cmd.eq_ignore_ascii_case(b"BGSAVE"),
+        (6, b'c') => cmd.eq_ignore_ascii_case(b"CLIENT") || cmd.eq_ignore_ascii_case(b"CONFIG"),
+        (6, b'd') => cmd.eq_ignore_ascii_case(b"DBSIZE"),
+        (6, b's') => cmd.eq_ignore_ascii_case(b"SELECT"),
+        (7, b'c') => cmd.eq_ignore_ascii_case(b"COMMAND") || cmd.eq_ignore_ascii_case(b"CLUSTER"),
+        (7, b'd') => cmd.eq_ignore_ascii_case(b"DISCARD"),
+        (7, b'p') => cmd.eq_ignore_ascii_case(b"PUBLISH"),
+        (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF"),
+        (8, b'r') => cmd.eq_ignore_ascii_case(b"REPLCONF"),
+        (9, b'r') => cmd.eq_ignore_ascii_case(b"REPLICAOF"),
+        (9, b's') => cmd.eq_ignore_ascii_case(b"SUBSCRIBE"),
+        (10, b'p') => cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"),
+        (11, b'u') => cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE"),
+        (12, b'p') => cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE"),
+        (13, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
+        _ => false,
+    };
+
+    if is_keyless || args.is_empty() {
         return None;
     }
     match &args[0] {
@@ -1297,18 +1299,17 @@ fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
 /// These commands operate on multiple keys that may live on different shards.
 /// Single-arg DEL/UNLINK/EXISTS are NOT multi-key (handled as single-key fast path).
 fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
-    if cmd.eq_ignore_ascii_case(b"MGET") || cmd.eq_ignore_ascii_case(b"MSET") {
-        return true;
+    let len = cmd.len();
+    if len == 0 { return false; }
+    let b0 = cmd[0] | 0x20;
+    match (len, b0) {
+        (4, b'm') => cmd.eq_ignore_ascii_case(b"MGET") || cmd.eq_ignore_ascii_case(b"MSET"),
+        // DEL, UNLINK, EXISTS with multiple keys
+        (3, b'd') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"DEL"),
+        (6, b'u') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"UNLINK"),
+        (6, b'e') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"EXISTS"),
+        _ => false,
     }
-    // DEL, UNLINK, EXISTS with multiple keys
-    if args.len() > 1
-        && (cmd.eq_ignore_ascii_case(b"DEL")
-            || cmd.eq_ignore_ascii_case(b"UNLINK")
-            || cmd.eq_ignore_ascii_case(b"EXISTS"))
-    {
-        return true;
-    }
-    false
 }
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
@@ -1345,13 +1346,22 @@ pub async fn handle_connection_sharded(
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    spsc_notifiers: Vec<std::sync::Arc<tokio::sync::Notify>>,
 ) {
-    // Capture peer address before Framed wraps the stream
+    use tokio::io::AsyncWriteExt;
+
+    // Capture peer address before we start using the stream
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let mut framed = Framed::new(stream, RespCodec::default());
+
+    // Direct buffer I/O: bypass Framed/codec for the hot path.
+    let mut stream = stream;
+    let mut read_buf = BytesMut::with_capacity(8192);
+    let mut write_buf = BytesMut::with_capacity(8192);
+    let parse_config = crate::protocol::ParseConfig::default();
+    let mut protocol_version: u8 = 2;
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
@@ -1375,27 +1385,51 @@ pub async fn handle_connection_sharded(
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
     let mut arena = Bump::with_capacity(4096);
 
+    let mut break_outer = false;
     loop {
         tokio::select! {
-            first_result = framed.next() => {
-                let first_frame = match first_result {
-                    Some(Ok(frame)) => frame,
-                    Some(Err(_)) => break,
-                    None => break,
-                };
+            result = stream.readable() => {
+                if result.is_err() { break; }
 
-                // Collect batch: first frame + all immediately available frames
-                let mut batch = vec![first_frame];
-                const MAX_BATCH: usize = 1024;
-                while batch.len() < MAX_BATCH {
-                    match framed.next().now_or_never() {
-                        Some(Some(Ok(frame))) => batch.push(frame),
-                        _ => break,
+                // Read all available data from socket into read_buf
+                match stream.try_read_buf(&mut read_buf) {
+                    Ok(0) => break, // connection closed
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                }
+                // Drain socket buffer: read more if available
+                loop {
+                    match stream.try_read_buf(&mut read_buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
                     }
                 }
 
-                let mut responses: BumpVec<Frame> = BumpVec::with_capacity_in(batch.len(), &arena);
+                // Parse all complete frames from buffer
+                let mut batch: Vec<Frame> = Vec::with_capacity(64);
+                const MAX_BATCH: usize = 1024;
+                loop {
+                    match crate::protocol::parse(&mut read_buf, &parse_config) {
+                        Ok(Some(frame)) => {
+                            batch.push(frame);
+                            if batch.len() >= MAX_BATCH { break; }
+                        }
+                        Ok(None) => break,
+                        Err(crate::protocol::ParseError::Incomplete) => break,
+                        Err(_) => { break_outer = true; break; }
+                    }
+                }
+                if break_outer { break; }
+                if batch.is_empty() { continue; }
+
+                let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
+                // Pipeline batch optimization: collect remote commands by target shard
+                // to dispatch as a single PipelineBatch per shard instead of individual Execute messages.
+                // Maps target_shard -> Vec<(response_index, Arc<Frame>, aof_bytes, cmd_name_bytes)>
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>> = HashMap::with_capacity(num_shards);
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -1424,13 +1458,13 @@ pub async fn handle_connection_sharded(
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
                                 let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                                     cmd_args,
-                                    framed.codec().protocol_version(),
+                                    protocol_version,
                                     client_id,
                                     &acl_table,
                                     &mut authenticated,
                                 );
                                 if !matches!(&response, Frame::Error(_)) {
-                                    framed.codec_mut().set_protocol_version(new_proto);
+                                    protocol_version = new_proto;
                                 }
                                 if let Some(name) = new_name {
                                     client_name = Some(name);
@@ -1547,7 +1581,9 @@ pub async fn handle_connection_sharded(
                                     sha1: sha1.clone(),
                                     script: script_bytes.clone(),
                                 };
-                                let _ = producers[idx].try_push(msg);
+                                if producers[idx].try_push(msg).is_ok() {
+                                    spsc_notifiers[target].notify_one();
+                                }
                             }
                             drop(producers);
                         }
@@ -1617,13 +1653,13 @@ pub async fn handle_connection_sharded(
                     if cmd.eq_ignore_ascii_case(b"HELLO") {
                         let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                             cmd_args,
-                            framed.codec().protocol_version(),
+                            protocol_version,
                             client_id,
                             &acl_table,
                             &mut authenticated,
                         );
                         if !matches!(&response, Frame::Error(_)) {
-                            framed.codec_mut().set_protocol_version(new_proto);
+                            protocol_version = new_proto;
                         }
                         if let Some(name) = new_name {
                             client_name = Some(name);
@@ -1884,12 +1920,17 @@ pub async fn handle_connection_sharded(
                         }
 
                         // Flush accumulated responses before entering blocking mode.
-                        let send_responses: Vec<Frame> = responses.into_iter().collect();
-                        for response in send_responses {
-                            if framed.send(response).await.is_err() {
-                                arena.reset();
-                                return;
+                        write_buf.clear();
+                        for response in responses.iter() {
+                            if protocol_version >= 3 {
+                                crate::protocol::serialize_resp3(response, &mut write_buf);
+                            } else {
+                                crate::protocol::serialize(response, &mut write_buf);
                             }
+                        }
+                        if stream.write_all(&write_buf).await.is_err() {
+                            arena.reset();
+                            return;
                         }
 
                         let blocking_response = handle_blocking_command(
@@ -1903,10 +1944,10 @@ pub async fn handle_connection_sharded(
                             &dispatch_tx,
                             &shutdown,
                         ).await;
-                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, framed.codec().protocol_version());
+                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, protocol_version);
 
                         // Re-initialize responses for the blocking command's result
-                        responses = BumpVec::with_capacity_in(1, &arena);
+                        responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
                         // Break out of batch -- blocking command ends the pipeline
                         break;
@@ -1936,7 +1977,9 @@ pub async fn handle_connection_sharded(
                                             channel: ch.clone(),
                                             message: msg.clone(),
                                         };
-                                        let _ = producers[idx].try_push(fanout_msg); // best-effort
+                                        if producers[idx].try_push(fanout_msg).is_ok() {
+                                            spsc_notifiers[target].notify_one();
+                                        }
                                     }
                                     drop(producers);
                                     responses.push(Frame::Integer(local_count));
@@ -2132,23 +2175,25 @@ pub async fn handle_connection_sharded(
                         };
                         // Post-dispatch wakeup hooks for producer commands
                         if !matches!(response, Frame::Error(_)) {
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            {
+                                || cmd.eq_ignore_ascii_case(b"ZADD");
+                            if needs_wake {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     let mut reg = blocking_registry.borrow_mut();
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, &mut dbs[selected_db], selected_db, &key,
-                                    );
-                                }
-                            }
-                            if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut reg = blocking_registry.borrow_mut();
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, &mut dbs[selected_db], selected_db, &key,
-                                    );
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2182,27 +2227,51 @@ pub async fn handle_connection_sharded(
                             }
                         }
                         // Apply RESP3 response conversion if needed
-                        let response = apply_resp3_conversion(cmd, response, framed.codec().protocol_version());
+                        let response = apply_resp3_conversion(cmd, response, protocol_version);
                         responses.push(response);
                     } else if let Some(target) = target_shard {
-                        // REMOTE DISPATCH: send via SPSC, await oneshot reply
+                        // DEFERRED REMOTE: collect for batch dispatch after loop
+                        let resp_idx = responses.len();
+                        responses.push(Frame::Null); // placeholder, filled after batch dispatch
+                        let cmd_name = cmd.to_vec();
+                        remote_groups
+                            .entry(target)
+                            .or_default()
+                            .push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_name));
+                    }
+                }
+
+                // Phase 2: Dispatch all deferred remote commands as batched PipelineBatch
+                // messages (one per target shard), await all in parallel.
+                if !remote_groups.is_empty() {
+                    let mut reply_futures: Vec<(
+                        Vec<(usize, Option<Bytes>, Vec<u8>)>, // (resp_idx, aof_bytes, cmd_name)
+                        tokio::sync::oneshot::Receiver<Vec<Frame>>,
+                    )> = Vec::with_capacity(remote_groups.len());
+
+                    for (target, entries) in remote_groups {
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        let msg = ShardMessage::Execute {
+                        let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
+                            entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
+
+                        let msg = ShardMessage::PipelineBatch {
                             db_index: selected_db,
-                            command: std::sync::Arc::new(frame.clone()),
+                            commands,
                             reply_tx,
                         };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
                         {
-                            // Spin-retry on full ring buffer (rare in practice)
                             let mut pending = msg;
                             loop {
                                 let push_result = {
                                     let mut producers = dispatch_tx.borrow_mut();
                                     producers[target_idx].try_push(pending)
-                                }; // borrow dropped here before yield
+                                };
                                 match push_result {
-                                    Ok(()) => break,
+                                    Ok(()) => {
+                                        spsc_notifiers[target].notify_one();
+                                        break;
+                                    }
                                     Err(val) => {
                                         pending = val;
                                         tokio::task::yield_now().await;
@@ -2210,41 +2279,50 @@ pub async fn handle_connection_sharded(
                                 }
                             }
                         }
-                        // Await the reply from the target shard
+                        reply_futures.push((meta, reply_rx));
+                    }
+
+                    // Await all shard responses (they execute in parallel on different shards)
+                    let proto_ver = protocol_version;
+                    for (meta, reply_rx) in reply_futures {
                         match reply_rx.await {
-                            Ok(response) => {
-                                // Log successful write commands to AOF
-                                if let Some(bytes) = aof_bytes {
-                                    if !matches!(response, Frame::Error(_)) {
-                                        if let Some(ref tx) = aof_tx {
-                                            let _ = tx.try_send(AofMessage::Append(bytes));
+                            Ok(shard_responses) => {
+                                for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                                    // AOF logging for successful remote writes
+                                    if let Some(bytes) = aof_bytes {
+                                        if !matches!(resp, Frame::Error(_)) {
+                                            if let Some(ref tx) = aof_tx {
+                                                let _ = tx.try_send(AofMessage::Append(bytes));
+                                            }
                                         }
                                     }
+                                    let resp = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                                    responses[resp_idx] = resp;
                                 }
-                                // Apply RESP3 response conversion if needed
-                                let response = apply_resp3_conversion(cmd, response, framed.codec().protocol_version());
-                                responses.push(response);
                             }
-                            Err(_) => responses.push(Frame::Error(
-                                Bytes::from_static(b"ERR cross-shard dispatch failed"),
-                            )),
+                            Err(_) => {
+                                for (resp_idx, _, _) in meta {
+                                    responses[resp_idx] = Frame::Error(
+                                        Bytes::from_static(b"ERR cross-shard dispatch failed"),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
 
-                // Drain BumpVec into owned Vec before await points (Send safety),
-                // then drop arena-backed storage so arena.reset() can reclaim.
-                let send_responses: Vec<Frame> = responses.into_iter().collect();
                 arena.reset(); // O(1) bulk deallocation of batch temporaries
 
-                // Write all responses using feed()+flush() to batch into a single
-                // syscall instead of send() per frame (which flushes each time).
-                for response in send_responses {
-                    if framed.feed(response).await.is_err() {
-                        return;
+                // Serialize all responses into write_buf, then do ONE write_all syscall.
+                write_buf.clear();
+                for response in &responses {
+                    if protocol_version >= 3 {
+                        crate::protocol::serialize_resp3(response, &mut write_buf);
+                    } else {
+                        crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if framed.flush().await.is_err() {
+                if stream.write_all(&write_buf).await.is_err() {
                     return;
                 }
 
@@ -2253,9 +2331,16 @@ pub async fn handle_connection_sharded(
                 }
             }
             _ = shutdown.cancelled() => {
-                let _ = framed.send(Frame::Error(
+                write_buf.clear();
+                let shutdown_err = Frame::Error(
                     Bytes::from_static(b"ERR server shutting down")
-                )).await;
+                );
+                if protocol_version >= 3 {
+                    crate::protocol::serialize_resp3(&shutdown_err, &mut write_buf);
+                } else {
+                    crate::protocol::serialize(&shutdown_err, &mut write_buf);
+                }
+                let _ = stream.write_all(&write_buf).await;
                 break;
             }
         }

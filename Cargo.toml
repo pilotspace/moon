@@ -55,10 +55,11 @@ redis = { version = "0.27", features = ["tokio-comp"] }
 tempfile = "3"
 
 [profile.release]
-debug = true          # Debug symbols for flamegraphs/profiling
-lto = "thin"          # Cross-crate inlining without excessive build time
-codegen-units = 1     # Maximum optimization
+debug = false         # No debug symbols for smaller/faster binary
+lto = "fat"           # Full cross-crate LTO for maximum inlining
+codegen-units = 1     # Single codegen unit for global optimization
 opt-level = 3         # Full optimization
+strip = true          # Strip symbols
 
 [[bench]]
 name = "resp_parsing"
@@ -70,4 +71,8 @@ harness = false
 
 [[bench]]
 name = "bptree_memory"
+harness = false
+
+[[bench]]
+name = "get_hotpath"
 harness = false

@@ -145,6 +145,8 @@ impl Shard {
         config_port: u16,
         acl_table: Arc<RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<RwLock<RuntimeConfig>>,
+        spsc_notify: Arc<tokio::sync::Notify>,
+        all_notifiers: Vec<Arc<tokio::sync::Notify>>,
     ) {
         // On Linux, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
@@ -271,11 +273,16 @@ impl Shard {
         let mut last_snapshot_epoch = *snapshot_trigger_rx.borrow();
 
         let mut expiry_interval = tokio::time::interval(Duration::from_millis(100));
-        // SPSC drain interval -- check for cross-shard messages every 1ms.
-        // On Linux with io_uring, this also polls for io_uring completions.
-        let mut spsc_interval = tokio::time::interval(Duration::from_millis(1));
+        // Periodic timer for WAL flush, snapshot advance, io_uring poll (1ms).
+        // SPSC drain now uses event-driven Notify instead of polling.
+        let mut periodic_interval = tokio::time::interval(Duration::from_millis(1));
         // Blocking command timeout scanner -- expire timed-out blocked clients every 10ms.
         let mut block_timeout_interval = tokio::time::interval(Duration::from_millis(10));
+        // WAL fsync interval -- sync to disk every 1 second (everysec policy).
+        // write_all() happens on every 1ms tick; fsync is deferred to this interval.
+        let mut wal_sync_interval = tokio::time::interval(Duration::from_secs(1));
+        // Local reference to this shard's SPSC Notify (for the select! arm).
+        let spsc_notify_local = spsc_notify;
 
         loop {
             tokio::select! {
@@ -328,6 +335,7 @@ impl Shard {
                             let sc = script_cache_rc.clone();
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
+                            let notifiers = all_notifiers.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -349,6 +357,7 @@ impl Shard {
                                     cp,
                                     acl,
                                     rtcfg,
+                                    notifiers,
                                 ).await;
                             });
                         }
@@ -358,9 +367,41 @@ impl Shard {
                         }
                     }
                 }
-                // Drain SPSC consumers and poll io_uring completions (Linux)
-                _ = spsc_interval.tick() => {
-                    // Drain SPSC, collecting SnapshotBegin messages for deferred handling
+                // Arm 1: Immediate SPSC wake -- event-driven, no polling delay.
+                // Producers call notify_one() after SPSC push; this wakes the shard instantly.
+                _ = spsc_notify_local.notified() => {
+                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)> = None;
+                    Self::drain_spsc_shared(
+                        &databases,
+                        &mut consumers,
+                        &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc,
+                        &mut pending_snapshot,
+                        &mut snapshot_state,
+                        &mut wal_writer,
+                        &mut repl_backlog,
+                        &mut replica_txs,
+                        &repl_state,
+                        shard_id,
+                        &script_cache_rc,
+                    );
+
+                    // Handle pending SnapshotBegin from SPSC
+                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
+                        if snapshot_state.is_some() {
+                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
+                        } else {
+                            let dbs = databases.borrow();
+                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
+                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
+                            snapshot_reply_tx = Some(reply_tx);
+                            drop(dbs);
+                        }
+                    }
+                }
+                // Arm 2: Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll.
+                // Also drains SPSC as a safety net in case a notify was missed.
+                _ = periodic_interval.tick() => {
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -434,7 +475,7 @@ impl Shard {
                         }
                     }
 
-                    // Flush WAL on 1ms tick
+                    // Flush WAL on 1ms tick (write to page cache only; sync is separate)
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_if_needed();
                     }
@@ -455,6 +496,13 @@ impl Shard {
                                 uring_listener_fd,
                             );
                         }
+                    }
+                }
+                // WAL fsync on 1-second interval (everysec durability).
+                // write_all() already happened on each 1ms tick; this just does fsync.
+                _ = wal_sync_interval.tick() => {
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.sync_to_disk();
                     }
                 }
                 // Expire timed-out blocked clients every 10ms
@@ -525,25 +573,23 @@ impl Shard {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
 
+        // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
+        let mut execute_batch: Vec<ShardMessage> = Vec::new();
+        let mut other_messages: Vec<ShardMessage> = Vec::new();
+
         for consumer in consumers.iter_mut() {
             while drained < MAX_DRAIN_PER_CYCLE {
                 match consumer.try_pop() {
                     Some(msg) => {
                         drained += 1;
-                        Self::handle_shard_message_shared(
-                            databases,
-                            pubsub_registry,
-                            blocking_registry,
-                            msg,
-                            pending_snapshot,
-                            snapshot_state,
-                            wal_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            script_cache,
-                        );
+                        match &msg {
+                            ShardMessage::Execute { .. }
+                            | ShardMessage::PipelineBatch { .. }
+                            | ShardMessage::MultiExecute { .. } => {
+                                execute_batch.push(msg);
+                            }
+                            _ => other_messages.push(msg),
+                        }
                     }
                     None => break,
                 }
@@ -551,6 +597,46 @@ impl Shard {
             if drained >= MAX_DRAIN_PER_CYCLE {
                 break;
             }
+        }
+
+        // Process Execute/PipelineBatch/MultiExecute batch under single borrow_mut
+        if !execute_batch.is_empty() {
+            for msg in execute_batch {
+                // Each handler borrows internally, but we avoid interleaving
+                // with non-Execute messages that might also borrow differently.
+                Self::handle_shard_message_shared(
+                    databases,
+                    pubsub_registry,
+                    blocking_registry,
+                    msg,
+                    pending_snapshot,
+                    snapshot_state,
+                    wal_writer,
+                    repl_backlog,
+                    replica_txs,
+                    repl_state,
+                    shard_id,
+                    script_cache,
+                );
+            }
+        }
+
+        // Process other messages (PubSubFanOut, SnapshotBegin, etc.)
+        for msg in other_messages {
+            Self::handle_shard_message_shared(
+                databases,
+                pubsub_registry,
+                blocking_registry,
+                msg,
+                pending_snapshot,
+                snapshot_state,
+                wal_writer,
+                repl_backlog,
+                replica_txs,
+                repl_state,
+                shard_id,
+                script_cache,
+            );
         }
     }
 
@@ -594,7 +680,8 @@ impl Shard {
                     };
 
                     // COW intercept: capture old value before write if snapshot is active
-                    if aof::is_write_command(cmd) {
+                    let is_write = aof::is_write_command(cmd);
+                    if is_write {
                         Self::cow_intercept(snapshot_state, &dbs, db_idx, &command);
                     }
 
@@ -606,7 +693,7 @@ impl Shard {
                     };
 
                     // WAL append + replication fan-out for successful write commands
-                    if aof::is_write_command(cmd) && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let serialized = aof::serialize_command(&command);
                         Self::wal_append_and_fanout(
                             &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
@@ -615,31 +702,30 @@ impl Shard {
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        if cmd.eq_ignore_ascii_case(b"LPUSH")
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                             || cmd.eq_ignore_ascii_case(b"RPUSH")
                             || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        {
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
                             if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
                                 let mut reg = blocking_registry.borrow_mut();
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut dbs[db_idx], db_idx, &key,
-                                );
-                            }
-                        }
-                        if cmd.eq_ignore_ascii_case(b"ZADD") {
-                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
-                                let mut reg = blocking_registry.borrow_mut();
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut dbs[db_idx], db_idx, &key,
-                                );
-                            }
-                        }
-                        if cmd.eq_ignore_ascii_case(b"XADD") {
-                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
-                                let mut reg = blocking_registry.borrow_mut();
-                                crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg, &mut dbs[db_idx], db_idx, &key,
-                                );
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                    );
+                                }
                             }
                         }
                     }
@@ -670,7 +756,8 @@ impl Shard {
                     };
 
                     // COW intercept for each write command in the batch
-                    if aof::is_write_command(cmd) {
+                    let is_write = aof::is_write_command(cmd);
+                    if is_write {
                         Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
                     }
 
@@ -683,11 +770,88 @@ impl Shard {
                     };
 
                     // WAL append + replication fan-out for successful write commands
-                    if aof::is_write_command(cmd) && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let serialized = aof::serialize_command(cmd_frame);
                         Self::wal_append_and_fanout(
                             &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
                         );
+                    }
+
+                    results.push(frame);
+                }
+                let _ = reply_tx.send(results);
+            }
+            ShardMessage::PipelineBatch {
+                db_index,
+                commands,
+                reply_tx,
+            } => {
+                let mut results = Vec::with_capacity(commands.len());
+                let mut dbs = databases.borrow_mut();
+                let db_count = dbs.len();
+                let db_idx = db_index.min(db_count.saturating_sub(1));
+                dbs[db_idx].refresh_now();
+                for cmd_frame in &commands {
+                    let (cmd, args) = match Self::extract_command_static(cmd_frame) {
+                        Some(pair) => pair,
+                        None => {
+                            results.push(crate::protocol::Frame::Error(
+                                bytes::Bytes::from_static(b"ERR invalid command format"),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    // COW intercept for each write command in the batch
+                    let is_write = aof::is_write_command(cmd);
+                    if is_write {
+                        Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
+                    }
+
+                    let mut selected = db_idx;
+                    let result =
+                        cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
+                    let frame = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => f,
+                    };
+
+                    // WAL append + replication fan-out for successful write commands
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let serialized = aof::serialize_command(cmd_frame);
+                        Self::wal_append_and_fanout(
+                            &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
+                        );
+                    }
+
+                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
+                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     results.push(frame);

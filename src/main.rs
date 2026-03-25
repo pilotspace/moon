@@ -128,6 +128,9 @@ fn main() -> anyhow::Result<()> {
         std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config()))
     };
 
+    // Collect all notifiers before spawning shard threads
+    let all_notifiers = mesh.all_notifiers();
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
     let config_port = config.port;
@@ -145,6 +148,8 @@ fn main() -> anyhow::Result<()> {
         let shard_cluster_state = cluster_state.clone();
         let shard_acl_table = acl_table.clone();
         let shard_runtime_config = runtime_config_shared.clone();
+        let shard_spsc_notify = mesh.take_notify(id);
+        let shard_all_notifiers = all_notifiers.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -184,6 +189,8 @@ fn main() -> anyhow::Result<()> {
                     config_port,
                     shard_acl_table,
                     shard_runtime_config,
+                    shard_spsc_notify,
+                    shard_all_notifiers,
                 )));
             })
             .expect("failed to spawn shard thread");

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ringbuf::traits::Split;
 use ringbuf::HeapCons;
 use ringbuf::HeapProd;
@@ -33,6 +35,9 @@ pub struct ChannelMesh {
     /// Connection channels: listener sends TcpStream to each shard.
     conn_txs: Vec<mpsc::Sender<tokio::net::TcpStream>>,
     conn_rxs: Vec<Option<mpsc::Receiver<tokio::net::TcpStream>>>,
+    /// Per-shard Notify instances for event-driven SPSC wake.
+    /// Producers call `notify_one()` after pushing to wake the target shard immediately.
+    spsc_notifiers: Vec<Arc<tokio::sync::Notify>>,
     num_shards: usize,
 }
 
@@ -78,11 +83,16 @@ impl ChannelMesh {
             conn_rxs.push(Some(rx));
         }
 
+        // Per-shard Notify for event-driven SPSC wake (replaces 1ms polling).
+        let spsc_notifiers: Vec<Arc<tokio::sync::Notify>> =
+            (0..n).map(|_| Arc::new(tokio::sync::Notify::new())).collect();
+
         ChannelMesh {
             producers,
             consumers,
             conn_txs,
             conn_rxs,
+            spsc_notifiers,
             num_shards: n,
         }
     }
@@ -116,6 +126,16 @@ impl ChannelMesh {
     /// The listener uses this to distribute new connections to shards.
     pub fn conn_tx(&self, shard_id: usize) -> mpsc::Sender<tokio::net::TcpStream> {
         self.conn_txs[shard_id].clone()
+    }
+
+    /// Get the Notify handle for a specific shard (used by the shard's own event loop).
+    pub fn take_notify(&self, shard_id: usize) -> Arc<tokio::sync::Notify> {
+        self.spsc_notifiers[shard_id].clone()
+    }
+
+    /// Get all notifiers (used by connection handlers to wake target shards after SPSC push).
+    pub fn all_notifiers(&self) -> Vec<Arc<tokio::sync::Notify>> {
+        self.spsc_notifiers.clone()
     }
 
     /// Number of shards in this mesh.

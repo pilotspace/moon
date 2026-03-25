@@ -71,34 +71,60 @@ impl WalWriter {
         self.buf.extend_from_slice(data);
     }
 
-    /// Flush buffered data to disk if the buffer is non-empty.
+    /// Flush buffered data to OS page cache if the buffer is non-empty.
     ///
-    /// Called on the shard's 1ms tick (batched fsync interval).
-    /// Returns Ok(()) immediately if the buffer is empty.
+    /// Called on the shard's 1ms tick. Only does write_all() (fast, goes to
+    /// OS page cache), NOT fsync. Use sync_to_disk() for durability.
     pub fn flush_if_needed(&mut self) -> std::io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        self.do_flush()
+        self.do_write()
     }
 
-    /// Force flush regardless of buffer state. Used on shutdown and before snapshot.
+    /// Force flush with fsync. Used on shutdown and before snapshot.
     pub fn flush_sync(&mut self) -> std::io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        self.do_flush()
+        self.do_write()?;
+        self.do_sync()
     }
 
-    /// Internal flush: write buffer to file, fsync, update offsets, clear buffer.
-    fn do_flush(&mut self) -> std::io::Result<()> {
+    /// Sync file data to disk (fsync). Called on a less-frequent interval
+    /// (e.g. every second for "everysec" mode) to avoid blocking the shard
+    /// on every 1ms tick.
+    pub fn sync_to_disk(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut file) = self.file {
+            file.sync_data()?;
+            self.last_fsync = Instant::now();
+            Ok(())
+        } else {
+            Ok(()) // No file open, nothing to sync
+        }
+    }
+
+    /// Internal write: write buffer to file (page cache only), update offsets, clear buffer.
+    fn do_write(&mut self) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
             file.write_all(&self.buf)?;
-            file.sync_data()?;
             let written = self.buf.len() as u64;
             self.write_offset += written;
             self.bytes_written += written;
             self.buf.clear(); // clear but keep allocation
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "WAL file handle is closed",
+            ))
+        }
+    }
+
+    /// Internal sync: fsync only.
+    fn do_sync(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut file) = self.file {
+            file.sync_data()?;
             self.last_fsync = Instant::now();
             Ok(())
         } else {
@@ -116,7 +142,7 @@ impl WalWriter {
     pub fn truncate_after_snapshot(&mut self, new_epoch: u64) -> std::io::Result<()> {
         // Flush any pending data first
         if !self.buf.is_empty() {
-            self.do_flush()?;
+            self.flush_sync()?;
         }
 
         // Close current file
@@ -150,7 +176,7 @@ impl WalWriter {
     /// Graceful shutdown: flush pending data, fsync, close file handle.
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         if !self.buf.is_empty() {
-            self.do_flush()?;
+            self.flush_sync()?;
         }
         // Drop file handle explicitly
         self.file.take();
