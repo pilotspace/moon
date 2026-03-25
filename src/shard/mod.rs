@@ -27,6 +27,8 @@ use crate::replication::state::ReplicationState;
 use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
 #[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
+#[cfg(feature = "runtime-monoio")]
+use crate::server::connection::handle_connection_sharded_monoio;
 use crate::storage::Database;
 use crate::tracking::TrackingTable;
 
@@ -70,18 +72,7 @@ enum InFlightSend {
     Fixed(u16),
 }
 
-/// Stub connection handler for monoio runtime.
-///
-/// Accepts a monoio TcpStream and waits for shutdown. Plan 02 implements
-/// the real connection handler with AsyncReadRent/AsyncWriteRent I/O.
-#[cfg(feature = "runtime-monoio")]
-async fn handle_connection_monoio_stub(
-    _stream: monoio::net::TcpStream,
-    _shard_id: usize,
-    shutdown: CancellationToken,
-) {
-    shutdown.cancelled().await;
-}
+// Stub removed: Plan 02 replaced with handle_connection_sharded_monoio in connection.rs.
 
 impl Shard {
     /// Create a new shard with `num_databases` empty databases.
@@ -557,9 +548,28 @@ impl Shard {
                             // Convert std::net::TcpStream to monoio::net::TcpStream
                             match monoio::net::TcpStream::from_std(std_tcp_stream) {
                                 Ok(tcp_stream) => {
+                                    let dbs = databases.clone();
+                                    let dtx = dispatch_tx.clone();
+                                    let psr = pubsub_rc.clone();
+                                    let blk = blocking_rc.clone();
                                     let sd = shutdown.clone();
+                                    let aof = aof_tx.clone();
+                                    let trk = tracking_rc.clone();
+                                    let cid = conn_cmd::next_client_id();
+                                    let rs = repl_state.clone();
+                                    let cs = cluster_state.clone();
+                                    let cp = config_port;
+                                    let lua = lua_rc.clone();
+                                    let sc = script_cache_rc.clone();
+                                    let acl = acl_table.clone();
+                                    let rtcfg = runtime_config.clone();
+                                    let notifiers = all_notifiers.clone();
                                     monoio::spawn(async move {
-                                        handle_connection_monoio_stub(tcp_stream, shard_id, sd).await;
+                                        handle_connection_sharded_monoio(
+                                            tcp_stream, dbs, shard_id, num_shards,
+                                            dtx, psr, blk, sd, aof, trk, cid,
+                                            rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                        ).await;
                                     });
                                 }
                                 Err(e) => {
