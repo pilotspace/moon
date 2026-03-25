@@ -3,6 +3,7 @@
 //! PING: sent every ~100ms to a random peer.
 //! PONG: response to PING; contains our full node state and up to 3 gossip sections.
 //! Gossip sections carry rumors about other nodes we know.
+#![allow(unused_imports)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};

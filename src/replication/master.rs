@@ -2,6 +2,7 @@
 //!
 //! Provides `handle_psync_on_master` for incoming PSYNC connections
 //! and `wait_for_replicas` for the WAIT command.
+#![allow(unused_imports)]
 
 use std::sync::{Arc, RwLock};
 

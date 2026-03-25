@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};

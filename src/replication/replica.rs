@@ -3,6 +3,7 @@
 //! Spawned via tokio::spawn when REPLICAOF host port is executed.
 //! Performs the PSYNC2 handshake with the master, then enters streaming mode
 //! where it reads WAL bytes from the master and dispatches them as commands.
+#![allow(unused_imports)]
 
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::Ordering;

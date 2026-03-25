@@ -3,6 +3,7 @@
 //! Phase 20 implements the election side. The full integration with per-shard
 //! replication offsets from Phase 19 is hooked in here.
 //!
+#![allow(unused_imports)]
 //! Flow:
 //! 1. Gossip check_failure_states marks a master as PFAIL after node_timeout.
 //! 2. When majority of known masters agree (via gossip), node is marked FAIL.

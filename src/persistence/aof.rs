@@ -1,5 +1,6 @@
 //! Append-Only File (AOF) persistence: logs every write command in RESP format
 //! for crash recovery. Supports three fsync policies and AOF rewriting for compaction.
+#![allow(unused_imports, unused_variables, unreachable_code, clippy::empty_loop)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

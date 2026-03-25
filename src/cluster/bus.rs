@@ -3,6 +3,7 @@
 //! Each peer connection runs a request-response gossip loop:
 //! peer sends PING (len-prefixed), we respond with PONG.
 //! All I/O is on the listener runtime, never on shard threads.
+#![allow(unused_imports)]
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};

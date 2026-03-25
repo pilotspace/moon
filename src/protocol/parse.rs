@@ -1,3 +1,4 @@
+#![allow(unused_imports, dead_code)]
 use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};

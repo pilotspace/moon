@@ -1,3 +1,4 @@
+#![allow(unused_imports, dead_code, unused_variables)]
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};

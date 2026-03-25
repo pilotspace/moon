@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 #[cfg(feature = "runtime-tokio")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};

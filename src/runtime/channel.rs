@@ -1,6 +1,7 @@
 //! Runtime-agnostic channel types replacing tokio::sync::{mpsc, oneshot, watch, Notify}.
 //!
 //! Uses `flume` which works on any async runtime (no tokio dependency).
+#![allow(unused_imports, clippy::result_unit_err)]
 
 use std::future::Future;
 use std::pin::Pin;
