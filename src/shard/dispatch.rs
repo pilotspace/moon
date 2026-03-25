@@ -34,9 +34,12 @@ pub enum ShardMessage {
     /// New TCP connection assigned to this shard by the listener.
     NewConnection(tokio::net::TcpStream),
     /// Execute a single-key command on this shard, send result back.
+    /// The command is wrapped in Arc to avoid deep-cloning the Frame::Array
+    /// when dispatching across shards (only an Arc refcount bump instead of
+    /// heap-allocating a new Vec + cloning each inner Frame).
     Execute {
         db_index: usize,
-        command: Frame,
+        command: std::sync::Arc<Frame>,
         reply_tx: tokio::sync::oneshot::Sender<Frame>,
     },
     /// Execute a multi-key sub-operation on this shard.

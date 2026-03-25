@@ -412,7 +412,7 @@ pub async fn coordinate_keys(
         };
         let msg = ShardMessage::Execute {
             db_index,
-            command: cmd_frame,
+            command: std::sync::Arc::new(cmd_frame),
             reply_tx: tx,
         };
         spsc_send(dispatch_tx, my_shard, target, msg).await;
@@ -495,7 +495,7 @@ pub async fn coordinate_scan(
         let cmd_frame = Frame::Array(parts);
         let msg = ShardMessage::Execute {
             db_index,
-            command: cmd_frame,
+            command: std::sync::Arc::new(cmd_frame),
             reply_tx: tx,
         };
         spsc_send(dispatch_tx, my_shard, target_shard_id, msg).await;
@@ -572,7 +572,7 @@ pub async fn coordinate_dbsize(
         let cmd_frame = Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"DBSIZE"))]);
         let msg = ShardMessage::Execute {
             db_index,
-            command: cmd_frame,
+            command: std::sync::Arc::new(cmd_frame),
             reply_tx: tx,
         };
         spsc_send(dispatch_tx, my_shard, target, msg).await;

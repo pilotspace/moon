@@ -2189,7 +2189,7 @@ pub async fn handle_connection_sharded(
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         let msg = ShardMessage::Execute {
                             db_index: selected_db,
-                            command: frame.clone(),
+                            command: std::sync::Arc::new(frame.clone()),
                             reply_tx,
                         };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
