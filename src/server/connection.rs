@@ -3375,20 +3375,23 @@ pub async fn handle_connection_sharded_monoio(
         write_buf.clear();
         let mut should_quit = false;
 
-        for frame in &frames {
-            let (cmd, cmd_args) = match extract_command(frame) {
+        // Pipeline batch optimization: collect responses and defer remote commands
+        // for batched PipelineBatch dispatch (one per target shard, parallel await).
+        let mut responses: Vec<Frame> = Vec::with_capacity(frames.len());
+        let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>> = HashMap::with_capacity(num_shards);
+
+        for frame in frames {
+            let (cmd, cmd_args) = match extract_command(&frame) {
                 Some(pair) => pair,
                 None => {
-                    let err = Frame::Error(Bytes::from_static(b"ERR invalid command format"));
-                    codec.encode_frame(&err, &mut write_buf);
+                    responses.push(Frame::Error(Bytes::from_static(b"ERR invalid command format")));
                     continue;
                 }
             };
 
             // --- QUIT ---
             if cmd.eq_ignore_ascii_case(b"QUIT") {
-                let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
-                codec.encode_frame(&resp, &mut write_buf);
+                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 should_quit = true;
                 break;
             }
@@ -3401,7 +3404,7 @@ pub async fn handle_connection_sharded_monoio(
                     let err = Frame::Error(Bytes::from(format!(
                         "ERR wrong number of arguments for '{}' command", cmd_name
                     )));
-                    codec.encode_frame(&err, &mut write_buf);
+                    responses.push(err);
                     continue;
                 }
                 // Allocate pubsub channel if not yet created
@@ -3412,6 +3415,10 @@ pub async fn handle_connection_sharded_monoio(
                 }
                 if subscriber_id == 0 {
                     subscriber_id = crate::pubsub::next_subscriber_id();
+                }
+                // Flush accumulated responses before entering subscriber mode
+                for resp in &responses {
+                    codec.encode_frame(resp, &mut write_buf);
                 }
                 for arg in cmd_args {
                     if let Some(ch) = extract_bytes(arg) {
@@ -3436,6 +3443,7 @@ pub async fn handle_connection_sharded_monoio(
                     let (result, _): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
                     if result.is_err() { return; }
                 }
+                responses.clear();
                 break; // break out of frame loop to re-enter main loop in subscriber mode
             }
 
@@ -3447,20 +3455,18 @@ pub async fn handle_connection_sharded_monoio(
                 } else {
                     pubsub::unsubscribe_response(&Bytes::from_static(b""), 0)
                 };
-                codec.encode_frame(&resp, &mut write_buf);
+                responses.push(resp);
                 continue;
             }
 
             // --- MULTI ---
             if cmd.eq_ignore_ascii_case(b"MULTI") {
                 if in_multi {
-                    let err = Frame::Error(Bytes::from_static(b"ERR MULTI calls can not be nested"));
-                    codec.encode_frame(&err, &mut write_buf);
+                    responses.push(Frame::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
                 } else {
                     in_multi = true;
                     command_queue.clear();
-                    let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
-                    codec.encode_frame(&resp, &mut write_buf);
+                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 }
                 continue;
             }
@@ -3468,13 +3474,12 @@ pub async fn handle_connection_sharded_monoio(
             // --- EXEC ---
             if cmd.eq_ignore_ascii_case(b"EXEC") {
                 if !in_multi {
-                    let err = Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI"));
-                    codec.encode_frame(&err, &mut write_buf);
+                    responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                 } else {
                     in_multi = false;
                     let result = execute_transaction_sharded(&databases, &command_queue, selected_db);
                     command_queue.clear();
-                    codec.encode_frame(&result, &mut write_buf);
+                    responses.push(result);
                 }
                 continue;
             }
@@ -3482,13 +3487,11 @@ pub async fn handle_connection_sharded_monoio(
             // --- DISCARD ---
             if cmd.eq_ignore_ascii_case(b"DISCARD") {
                 if !in_multi {
-                    let err = Frame::Error(Bytes::from_static(b"ERR DISCARD without MULTI"));
-                    codec.encode_frame(&err, &mut write_buf);
+                    responses.push(Frame::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
                 } else {
                     in_multi = false;
                     command_queue.clear();
-                    let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
-                    codec.encode_frame(&resp, &mut write_buf);
+                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 }
                 continue;
             }
@@ -3504,11 +3507,14 @@ pub async fn handle_connection_sharded_monoio(
                 if in_multi {
                     let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
                     command_queue.push(nb_frame);
-                    codec.encode_frame(&Frame::SimpleString(Bytes::from_static(b"QUEUED")), &mut write_buf);
+                    responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                     continue;
                 }
 
                 // Flush accumulated responses before blocking
+                for resp in &responses {
+                    codec.encode_frame(resp, &mut write_buf);
+                }
                 if !write_buf.is_empty() {
                     let data = write_buf.split().to_vec();
                     let (result, _): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
@@ -3522,14 +3528,14 @@ pub async fn handle_connection_sharded_monoio(
 
                 // Encode blocking response directly
                 codec.encode_frame(&blocking_response, &mut write_buf);
+                responses.clear();
                 break; // Blocking command ends the pipeline batch
             }
 
             // --- MULTI queue mode: queue commands when in transaction ---
             if in_multi {
-                command_queue.push(frame.clone());
-                let resp = Frame::SimpleString(Bytes::from_static(b"QUEUED"));
-                codec.encode_frame(&resp, &mut write_buf);
+                command_queue.push(frame);
+                responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                 continue;
             }
 
@@ -3540,7 +3546,7 @@ pub async fn handle_connection_sharded_monoio(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
-                    codec.encode_frame(&response, &mut write_buf);
+                    responses.push(response);
                     continue;
                 }
                 if cmd.eq_ignore_ascii_case(b"SCAN") {
@@ -3548,7 +3554,7 @@ pub async fn handle_connection_sharded_monoio(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
-                    codec.encode_frame(&response, &mut write_buf);
+                    responses.push(response);
                     continue;
                 }
                 if cmd.eq_ignore_ascii_case(b"DBSIZE") {
@@ -3556,7 +3562,7 @@ pub async fn handle_connection_sharded_monoio(
                         shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
-                    codec.encode_frame(&response, &mut write_buf);
+                    responses.push(response);
                     continue;
                 }
 
@@ -3566,7 +3572,7 @@ pub async fn handle_connection_sharded_monoio(
                         cmd, cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
                     ).await;
-                    codec.encode_frame(&response, &mut write_buf);
+                    responses.push(response);
                     continue;
                 }
             }
@@ -3603,7 +3609,7 @@ pub async fn handle_connection_sharded_monoio(
                 if !matches!(response, Frame::Error(_)) {
                     if let Some(ref tx) = aof_tx {
                         if aof::is_write_command(cmd) {
-                            let serialized = aof::serialize_command(frame);
+                            let serialized = aof::serialize_command(&frame);
                             let _ = tx.try_send(AofMessage::Append(serialized));
                         }
                     }
@@ -3635,49 +3641,96 @@ pub async fn handle_connection_sharded_monoio(
                     }
                 }
 
-                codec.encode_frame(&response, &mut write_buf);
+                responses.push(response);
             } else if let Some(target) = target_shard {
-                // REMOTE DISPATCH: route to correct shard via SPSC + oneshot reply
-                let (tx, rx) = channel::oneshot();
-                let msg = ShardMessage::Execute {
+                // DEFERRED REMOTE: collect for batch dispatch after loop
+                let resp_idx = responses.len();
+                responses.push(Frame::Null); // placeholder, filled after batch dispatch
+                // Pre-compute AOF bytes before moving frame into Arc
+                let aof_bytes = if aof_tx.is_some() && aof::is_write_command(cmd) {
+                    Some(aof::serialize_command(&frame))
+                } else {
+                    None
+                };
+                let cmd_name = cmd.to_vec();
+                remote_groups
+                    .entry(target)
+                    .or_default()
+                    .push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_name));
+            }
+        }
+
+        // Phase 2: Dispatch all deferred remote commands as batched PipelineBatch
+        // messages (one per target shard), await all in parallel.
+        if !remote_groups.is_empty() {
+            let mut reply_futures: Vec<(
+                Vec<(usize, Option<Bytes>, Vec<u8>)>, // (resp_idx, aof_bytes, cmd_name)
+                channel::OneshotReceiver<Vec<Frame>>,
+            )> = Vec::with_capacity(remote_groups.len());
+
+            for (target, entries) in remote_groups {
+                let (reply_tx, reply_rx) = channel::oneshot();
+                let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
+                    entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
+
+                let msg = ShardMessage::PipelineBatch {
                     db_index: selected_db,
-                    command: std::sync::Arc::new(frame.clone()),
-                    reply_tx: tx,
+                    commands,
+                    reply_tx,
                 };
                 let target_idx = ChannelMesh::target_index(shard_id, target);
-                let mut msg_pending = msg;
-                loop {
-                    let push_result = {
-                        let mut producers = dispatch_tx.borrow_mut();
-                        producers[target_idx].try_push(msg_pending)
-                    };
-                    match push_result {
-                        Ok(()) => {
-                            spsc_notifiers[target].notify_one();
-                            break;
-                        }
-                        Err(val) => {
-                            msg_pending = val;
-                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
-                        }
-                    }
-                }
-                let response = rx.recv().await.unwrap_or(
-                    Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed")),
-                );
-
-                // AOF logging for successful remote writes
-                if !matches!(response, Frame::Error(_)) {
-                    if let Some(ref tx) = aof_tx {
-                        if aof::is_write_command(cmd) {
-                            let serialized = aof::serialize_command(frame);
-                            let _ = tx.try_send(AofMessage::Append(serialized));
+                {
+                    let mut pending = msg;
+                    loop {
+                        let push_result = {
+                            let mut producers = dispatch_tx.borrow_mut();
+                            producers[target_idx].try_push(pending)
+                        };
+                        match push_result {
+                            Ok(()) => {
+                                spsc_notifiers[target].notify_one();
+                                break;
+                            }
+                            Err(val) => {
+                                pending = val;
+                                monoio::time::sleep(std::time::Duration::from_micros(10)).await;
+                            }
                         }
                     }
                 }
-
-                codec.encode_frame(&response, &mut write_buf);
+                reply_futures.push((meta, reply_rx));
             }
+
+            // Await all shard responses (they execute in parallel on different shards)
+            for (meta, reply_rx) in reply_futures {
+                match reply_rx.recv().await {
+                    Ok(shard_responses) => {
+                        for ((resp_idx, aof_bytes, _cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                            // AOF logging for successful remote writes
+                            if let Some(bytes) = aof_bytes {
+                                if !matches!(resp, Frame::Error(_)) {
+                                    if let Some(ref tx) = aof_tx {
+                                        let _ = tx.try_send(AofMessage::Append(bytes));
+                                    }
+                                }
+                            }
+                            responses[resp_idx] = resp;
+                        }
+                    }
+                    Err(_) => {
+                        for (resp_idx, _, _) in meta {
+                            responses[resp_idx] = Frame::Error(
+                                Bytes::from_static(b"ERR cross-shard dispatch failed"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Serialize all responses into write_buf, then do ONE write_all syscall.
+        for response in &responses {
+            codec.encode_frame(response, &mut write_buf);
         }
 
         // Write all responses in one batch using ownership I/O
