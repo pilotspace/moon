@@ -282,6 +282,7 @@ impl Shard {
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
 
         let mut expiry_interval = TimerImpl::interval(Duration::from_millis(100));
+        let mut eviction_interval = TimerImpl::interval(Duration::from_millis(100));
         // Periodic timer for WAL flush, snapshot advance, io_uring poll (1ms).
         // SPSC drain now uses event-driven Notify instead of polling.
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
@@ -356,7 +357,7 @@ impl Shard {
                                     psr,
                                     blk,
                                     sd,
-                                    None, // requirepass: TODO wire from shard config
+                                    runtime_config.read().map(|cfg| cfg.requirepass.clone()).ok().flatten(),
                                     aof,
                                     trk,
                                     cid,
@@ -527,6 +528,16 @@ impl Shard {
                         crate::server::expiration::expire_cycle_direct(db);
                     }
                 }
+                // Background eviction timer -- proactive memory reclaim every 100ms
+                _ = eviction_interval.tick() => {
+                    let rt = runtime_config.read().unwrap();
+                    if rt.maxmemory > 0 {
+                        let mut dbs = databases.borrow_mut();
+                        for db in dbs.iter_mut() {
+                            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
+                        }
+                    }
+                }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
                     // Flush and shutdown WAL writer
@@ -565,9 +576,10 @@ impl Shard {
                                     let rtcfg = runtime_config.clone();
                                     let notifiers = all_notifiers.clone();
                                     monoio::spawn(async move {
+                                        let reqpass = runtime_config.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
                                         handle_connection_sharded_monoio(
                                             tcp_stream, dbs, shard_id, num_shards,
-                                            dtx, psr, blk, sd, None, aof, trk, cid,
+                                            dtx, psr, blk, sd, reqpass, aof, trk, cid,
                                             rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
                                         ).await;
                                     });
@@ -708,6 +720,16 @@ impl Shard {
                     let mut dbs = databases.borrow_mut();
                     for db in dbs.iter_mut() {
                         crate::server::expiration::expire_cycle_direct(db);
+                    }
+                }
+                // Background eviction timer -- proactive memory reclaim every 100ms
+                _ = eviction_interval.tick() => {
+                    let rt = runtime_config.read().unwrap();
+                    if rt.maxmemory > 0 {
+                        let mut dbs = databases.borrow_mut();
+                        for db in dbs.iter_mut() {
+                            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
+                        }
                     }
                 }
                 // Shutdown

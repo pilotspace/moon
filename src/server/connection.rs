@@ -2164,6 +2164,17 @@ pub async fn handle_connection_sharded(
 
                     if is_local {
                         // LOCAL FAST PATH: zero cross-shard overhead
+                        // Eviction check before write dispatch
+                        if aof::is_write_command(cmd) {
+                            let rt = runtime_config.read().unwrap();
+                            let mut dbs_ev = databases.borrow_mut();
+                            if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
+                                drop(dbs_ev);
+                                responses.push(oom_frame);
+                                continue;
+                            }
+                            drop(dbs_ev);
+                        }
                         let mut dbs = databases.borrow_mut();
                         let db_count = dbs.len();
                         dbs[selected_db].refresh_now();
@@ -4357,6 +4368,17 @@ pub async fn handle_connection_sharded_monoio(
 
             if is_local {
                 // LOCAL FAST PATH: single borrow_mut covers dispatch + wakeup (no per-command acquire/release)
+                // Eviction check before write dispatch
+                if crate::persistence::aof::is_write_command(cmd) {
+                    let rt = runtime_config.read().unwrap();
+                    let mut dbs_ev = databases.borrow_mut();
+                    if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
+                        drop(dbs_ev);
+                        responses.push(oom_frame);
+                        continue;
+                    }
+                    drop(dbs_ev);
+                }
                 let mut dbs = databases.borrow_mut();
                 // No refresh_now here — called once per batch before the loop
                 let result = dispatch(
