@@ -548,6 +548,21 @@ pub async fn handle_connection(
                             responses.push(response);
                             continue;
                         }
+                        // SAVE -- synchronous save (single-threaded mode only)
+                        if cmd.eq_ignore_ascii_case(b"SAVE") {
+                            let response = crate::command::persistence::handle_save(
+                                &db,
+                                &config.dir,
+                                &config.dbfilename,
+                            );
+                            responses.push(response);
+                            continue;
+                        }
+                        // LASTSAVE -- return timestamp of last successful save
+                        if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
+                            responses.push(crate::command::persistence::handle_lastsave());
+                            continue;
+                        }
                         // BGREWRITEAOF
                         if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
                             let response = if let Some(ref tx) = aof_tx {
@@ -1263,7 +1278,7 @@ fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
         (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS"),
         (4, b'p') => cmd.eq_ignore_ascii_case(b"PING"),
         (4, b'q') => cmd.eq_ignore_ascii_case(b"QUIT"),
-        (4, b's') => cmd.eq_ignore_ascii_case(b"SCAN"),
+        (4, b's') => cmd.eq_ignore_ascii_case(b"SCAN") || cmd.eq_ignore_ascii_case(b"SAVE"),
         (4, b'w') => cmd.eq_ignore_ascii_case(b"WAIT"),
         (5, b'd') => cmd.eq_ignore_ascii_case(b"DEBUG"),
         (5, b'h') => cmd.eq_ignore_ascii_case(b"HELLO"),
@@ -1278,6 +1293,7 @@ fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
         (7, b'd') => cmd.eq_ignore_ascii_case(b"DISCARD"),
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PUBLISH"),
         (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF"),
+        (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
         (8, b'r') => cmd.eq_ignore_ascii_case(b"REPLCONF"),
         (9, b'r') => cmd.eq_ignore_ascii_case(b"REPLICAOF"),
         (9, b's') => cmd.eq_ignore_ascii_case(b"SUBSCRIBE"),
@@ -2024,6 +2040,18 @@ pub async fn handle_connection_sharded(
                             num_shards,
                         );
                         responses.push(response);
+                        continue;
+                    }
+                    // SAVE -- not supported in sharded mode
+                    if cmd.eq_ignore_ascii_case(b"SAVE") {
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"ERR SAVE not supported in sharded mode, use BGSAVE",
+                        )));
+                        continue;
+                    }
+                    // LASTSAVE -- return timestamp of last successful save
+                    if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
+                        responses.push(crate::command::persistence::handle_lastsave());
                         continue;
                     }
 
@@ -4170,6 +4198,18 @@ pub async fn handle_connection_sharded_monoio(
                     &dispatch_tx, ".", num_shards,
                 );
                 responses.push(response);
+                continue;
+            }
+            // SAVE -- not supported in sharded mode
+            if cmd.eq_ignore_ascii_case(b"SAVE") {
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR SAVE not supported in sharded mode, use BGSAVE",
+                )));
+                continue;
+            }
+            // LASTSAVE -- return timestamp of last successful save
+            if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
+                responses.push(crate::command::persistence::handle_lastsave());
                 continue;
             }
 

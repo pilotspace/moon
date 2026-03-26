@@ -28,6 +28,12 @@ pub static SNAPSHOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Global flag indicating whether a background save is in progress.
 pub static SAVE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Unix timestamp of last successful save (SAVE or BGSAVE).
+pub static LAST_SAVE_TIME: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the last BGSAVE completed successfully.
+pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
+
 /// Start a background RDB save (BGSAVE command).
 ///
 /// Clones all database entries under the lock, then spawns a blocking task
@@ -69,9 +75,18 @@ pub fn bgsave_start(
         match rdb::save_from_snapshot(&snapshot, &path) {
             Ok(()) => {
                 info!("Background RDB save completed: {}", path.display());
+                BGSAVE_LAST_STATUS.store(true, Ordering::Relaxed);
+                LAST_SAVE_TIME.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
             }
             Err(e) => {
                 error!("Background RDB save failed: {}", e);
+                BGSAVE_LAST_STATUS.store(false, Ordering::Relaxed);
             }
         }
         SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -85,9 +100,18 @@ pub fn bgsave_start(
         match rdb::save_from_snapshot(&snapshot, &path) {
             Ok(()) => {
                 info!("Background RDB save completed: {}", path.display());
+                BGSAVE_LAST_STATUS.store(true, Ordering::Relaxed);
+                LAST_SAVE_TIME.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
             }
             Err(e) => {
                 error!("Background RDB save failed: {}", e);
+                BGSAVE_LAST_STATUS.store(false, Ordering::Relaxed);
             }
         }
         SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -150,6 +174,58 @@ pub fn bgrewriteaof_start(
             b"ERR Background AOF rewrite failed to start",
         )),
     }
+}
+
+/// SAVE command: synchronous save to disk. Blocks until complete.
+///
+/// Clones all entries under read locks (same as BGSAVE), then serializes
+/// synchronously. Not supported in sharded mode -- use BGSAVE instead.
+pub fn handle_save(
+    db: &SharedDatabases,
+    dir: &str,
+    dbfilename: &str,
+) -> Frame {
+    if SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+        return Frame::Error(Bytes::from_static(
+            b"ERR Background save already in progress",
+        ));
+    }
+
+    // Clone snapshot: lock each db individually with read lock (same pattern as bgsave_start)
+    let snapshot: Vec<(Vec<(crate::storage::compact_key::CompactKey, crate::storage::entry::Entry)>, u32)> = db
+        .iter()
+        .map(|lock| {
+            let guard = lock.read();
+            let base_ts = guard.base_timestamp();
+            let entries = guard
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (entries, base_ts)
+        })
+        .collect();
+
+    let path = PathBuf::from(dir).join(dbfilename);
+    match rdb::save_from_snapshot(&snapshot, &path) {
+        Ok(()) => {
+            LAST_SAVE_TIME.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Ordering::Relaxed,
+            );
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
+        Err(e) => Frame::Error(Bytes::from(format!("ERR {}", e))),
+    }
+}
+
+/// LASTSAVE command: returns Unix timestamp of last successful save.
+pub fn handle_lastsave() -> Frame {
+    let ts = LAST_SAVE_TIME.load(Ordering::Relaxed);
+    Frame::Integer(ts as i64)
 }
 
 #[cfg(test)]

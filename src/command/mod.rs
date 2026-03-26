@@ -346,6 +346,7 @@ pub fn is_read_command(cmd: &[u8]) -> bool {
         (6, b'z') => cmd.eq_ignore_ascii_case(b"ZSCORE") || cmd.eq_ignore_ascii_case(b"ZRANGE") || cmd.eq_ignore_ascii_case(b"ZCOUNT"),
         (7, b'c') => cmd.eq_ignore_ascii_case(b"COMMAND"),
         (7, b'h') => cmd.eq_ignore_ascii_case(b"HGETALL") || cmd.eq_ignore_ascii_case(b"HEXISTS"),
+        (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
         (8, b's') => cmd.eq_ignore_ascii_case(b"SMEMBERS"),
         (8, b'z') => cmd.eq_ignore_ascii_case(b"ZREVRANK"),
         (9, b's') => cmd.eq_ignore_ascii_case(b"SISMEMBER"),

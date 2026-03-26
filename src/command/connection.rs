@@ -132,6 +132,20 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("# Memory\r\n");
     sections.push_str("\r\n");
 
+    sections.push_str("# Persistence\r\n");
+    sections.push_str(&format!(
+        "loading:0\r\n\
+         rdb_bgsave_in_progress:{}\r\n\
+         rdb_last_save_time:{}\r\n\
+         rdb_last_bgsave_status:{}\r\n\
+         aof_enabled:0\r\n\
+         aof_rewrite_in_progress:0\r\n",
+        if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 },
+        crate::command::persistence::LAST_SAVE_TIME.load(std::sync::atomic::Ordering::Relaxed),
+        if crate::command::persistence::BGSAVE_LAST_STATUS.load(std::sync::atomic::Ordering::Relaxed) { "ok" } else { "err" },
+    ));
+    sections.push_str("\r\n");
+
     sections.push_str("# Keyspace\r\n");
     let key_count = db.len();
     let expires_count = db.expires_count();
