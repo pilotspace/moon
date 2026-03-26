@@ -3,3 +3,8 @@ replication.state
 replication.state.tmp
 *.wal
 *.wal.old
+appendonly.aof
+appendonlydir/
+shard-*.wal
+shard-*.wal.old
+shard-*.rrdshard
