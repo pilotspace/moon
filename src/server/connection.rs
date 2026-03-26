@@ -3087,6 +3087,215 @@ fn format_blocking_score(score: f64) -> String {
     }
 }
 
+/// Inline dispatch: attempt to process a single GET or SET command directly from
+/// the raw RESP bytes in `read_buf`, bypassing Frame construction and the dispatch
+/// table entirely.  Only active when `num_shards == 1` (all keys are local).
+///
+/// Returns the number of bytes consumed from `read_buf` (0 if no command was inlined).
+/// On success the serialized response is appended to `write_buf`.
+#[cfg(feature = "runtime-monoio")]
+fn try_inline_dispatch(
+    read_buf: &mut BytesMut,
+    write_buf: &mut BytesMut,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    selected_db: usize,
+    aof_tx: &Option<channel::MpscSender<AofMessage>>,
+) -> usize {
+    let buf = &read_buf[..];
+    let len = buf.len();
+
+    // Minimum valid command: *2\r\n$3\r\nGET\r\n$1\r\nX\r\n = 24 bytes
+    if len < 24 {
+        return 0;
+    }
+
+    // Must start with RESP array marker
+    if buf[0] != b'*' {
+        return 0;
+    }
+
+    // --- Detect *2\r\n (GET) or *3\r\n (SET) ---
+    let (is_get, is_set) = if buf[1] == b'2' && buf[2] == b'\r' && buf[3] == b'\n' {
+        (true, false)
+    } else if buf[1] == b'3' && buf[2] == b'\r' && buf[3] == b'\n' {
+        (false, true)
+    } else {
+        return 0;
+    };
+
+    // After "*N\r\n" expect "$3\r\n" for 3-letter command name
+    // Position 4: must be '$', pos 5: '3', pos 6-7: \r\n
+    if buf[4] != b'$' || buf[5] != b'3' || buf[6] != b'\r' || buf[7] != b'\n' {
+        return 0;
+    }
+
+    // Positions 8,9,10 = command name (case-insensitive)
+    let cmd_upper = [
+        buf[8].to_ascii_uppercase(),
+        buf[9].to_ascii_uppercase(),
+        buf[10].to_ascii_uppercase(),
+    ];
+
+    if is_get && cmd_upper != [b'G', b'E', b'T'] {
+        return 0;
+    }
+    if is_set && cmd_upper != [b'S', b'E', b'T'] {
+        return 0;
+    }
+
+    // After command: \r\n at positions 11,12
+    if buf[11] != b'\r' || buf[12] != b'\n' {
+        return 0;
+    }
+
+    // Now parse first argument (the key): "$<keylen>\r\n<key>\r\n"
+    // Position 13 must be '$'
+    if len <= 13 || buf[13] != b'$' {
+        return 0;
+    }
+
+    // Parse key length digits starting at position 14
+    let mut pos = 14usize;
+    let mut key_len: usize = 0;
+    while pos < len && buf[pos] != b'\r' {
+        let d = buf[pos];
+        if d < b'0' || d > b'9' {
+            return 0; // non-digit in length field
+        }
+        key_len = key_len * 10 + (d - b'0') as usize;
+        pos += 1;
+    }
+    // Need \r\n after key length
+    if pos + 1 >= len || buf[pos] != b'\r' || buf[pos + 1] != b'\n' {
+        return 0;
+    }
+    pos += 2; // skip \r\n
+
+    // Need key_len bytes + \r\n
+    let key_start = pos;
+    let key_end = key_start + key_len;
+    if key_end + 2 > len {
+        return 0; // partial key data
+    }
+    if buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
+        return 0;
+    }
+
+    if is_get {
+        // GET: done parsing — total consumed = key_end + 2
+        let consumed = key_end + 2;
+        let key_bytes = &buf[key_start..key_end];
+
+        // Lookup in database
+        let mut dbs = databases.borrow_mut();
+        let db = &mut dbs[selected_db];
+        match db.get(key_bytes) {
+            Some(entry) => {
+                match entry.value.as_bytes() {
+                    Some(val) => {
+                        // $<len>\r\n<val>\r\n
+                        write_buf.extend_from_slice(b"$");
+                        let mut itoa_buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(val);
+                        write_buf.extend_from_slice(b"\r\n");
+                    }
+                    None => {
+                        // Wrong type
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                }
+            }
+            None => {
+                // Null bulk string
+                write_buf.extend_from_slice(b"$-1\r\n");
+            }
+        }
+        drop(dbs);
+        let _ = read_buf.split_to(consumed);
+        return 1;
+    }
+
+    // --- SET: parse value argument ---
+    let mut vpos = key_end + 2; // after key's trailing \r\n
+    if vpos >= len || buf[vpos] != b'$' {
+        return 0;
+    }
+    vpos += 1; // skip '$'
+
+    let mut val_len: usize = 0;
+    while vpos < len && buf[vpos] != b'\r' {
+        let d = buf[vpos];
+        if d < b'0' || d > b'9' {
+            return 0;
+        }
+        val_len = val_len * 10 + (d - b'0') as usize;
+        vpos += 1;
+    }
+    if vpos + 1 >= len || buf[vpos] != b'\r' || buf[vpos + 1] != b'\n' {
+        return 0;
+    }
+    vpos += 2; // skip \r\n
+
+    let val_start = vpos;
+    let val_end = val_start + val_len;
+    if val_end + 2 > len {
+        return 0; // partial value
+    }
+    if buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
+        return 0;
+    }
+
+    let consumed = val_end + 2;
+
+    // Create owned copies of key and value before advancing read_buf
+    let key_owned = Bytes::copy_from_slice(&buf[key_start..key_end]);
+    let val_owned = Bytes::copy_from_slice(&buf[val_start..val_end]);
+
+    // AOF: capture the raw RESP bytes before we advance the buffer
+    if let Some(tx) = aof_tx {
+        let aof_bytes = Bytes::copy_from_slice(&buf[..consumed]);
+        let _ = tx.try_send(AofMessage::Append(aof_bytes));
+    }
+
+    // Insert into database
+    {
+        let entry = crate::storage::entry::Entry::new_string(val_owned);
+        let mut dbs = databases.borrow_mut();
+        dbs[selected_db].set(key_owned, entry);
+    }
+
+    // +OK\r\n
+    write_buf.extend_from_slice(b"+OK\r\n");
+
+    let _ = read_buf.split_to(consumed);
+    1
+}
+
+/// Loop wrapper: call try_inline_dispatch repeatedly until it returns 0.
+/// Returns total number of commands inlined.
+#[cfg(feature = "runtime-monoio")]
+fn try_inline_dispatch_loop(
+    read_buf: &mut BytesMut,
+    write_buf: &mut BytesMut,
+    databases: &Rc<RefCell<Vec<Database>>>,
+    selected_db: usize,
+    aof_tx: &Option<channel::MpscSender<AofMessage>>,
+) -> usize {
+    let mut total = 0;
+    loop {
+        let n = try_inline_dispatch(read_buf, write_buf, databases, selected_db, aof_tx);
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    total
+}
+
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
 ///
 /// Reads RESP frames from the TCP stream, dispatches commands through the same
@@ -3380,6 +3589,33 @@ pub async fn handle_connection_sharded_monoio(
             Err(_) => break,
         }
 
+        // Inline dispatch: for single-shard mode, handle GET/SET directly from raw
+        // bytes without Frame construction or dispatch table lookup.
+        if num_shards == 1 {
+            // Refresh time once before inline dispatch (same as batch refresh below)
+            {
+                let mut dbs = databases.borrow_mut();
+                dbs[selected_db].refresh_now();
+            }
+            let inlined = try_inline_dispatch_loop(
+                &mut read_buf, &mut write_buf, &databases, selected_db, &aof_tx,
+            );
+            if inlined > 0 && read_buf.is_empty() {
+                // All commands were inlined -- flush write_buf and continue
+                if !write_buf.is_empty() {
+                    let data = write_buf.split().freeze();
+                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
+                        stream.write_all(data).await;
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // If read_buf still has data, fall through to normal Frame parsing
+            // for remaining commands. Inlined responses are already in write_buf.
+        }
+
         // Parse all complete frames from the read buffer (reuse pre-allocated Vec, cap at 1024)
         frames.clear();
         loop {
@@ -3400,7 +3636,9 @@ pub async fn handle_connection_sharded_monoio(
         }
 
         // Process frames with shard routing, cross-shard dispatch, and AOF logging
-        write_buf.clear();
+        // Note: do NOT clear write_buf -- it may contain responses from inline dispatch.
+        // The inline path appends directly; the normal path appends via encode_frame below.
+        // write_buf is cleared via .split().freeze() at the flush point each iteration.
         let mut should_quit = false;
 
         // Pipeline batch optimization: reuse pre-allocated containers (clear, not re-create).
