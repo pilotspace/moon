@@ -9,7 +9,7 @@
 //! ```text
 //! Directory (Vec<usize>)   -- indices into segments store
 //!   |
-//! Segments (Vec<Box<Segment>>)  -- owned segment storage
+//! Segments (SegmentSlab)        -- slab-allocated segment storage
 //!   |
 //!   +-- Segment 0: [ctrl: 64 bytes] [keys: 60 slots] [values: 60 slots]
 //!   +-- Segment 1: ...
@@ -62,13 +62,106 @@ fn segment_index(hash: u64, depth: u32) -> usize {
     }
 }
 
+/// Slab allocator for DashTable segments.
+///
+/// Pre-allocates segments in contiguous Vec "slabs" instead of individual Box
+/// allocations. Benefits: eliminates per-segment allocator metadata (~16-32B per
+/// segment), improves cache locality during segment scans, reduces heap
+/// fragmentation.
+///
+/// Segments are addressed by a flat index. New slabs are allocated with a
+/// doubling growth strategy (capped at 1024 segments per slab) so existing
+/// segment pointers within earlier slabs are never invalidated by growth.
+struct SegmentSlab<K, V> {
+    /// Contiguous blocks of segments. Each inner Vec is one slab.
+    slabs: Vec<Vec<Segment<K, V>>>,
+    /// Flat index -> (slab_idx, slot_idx) for O(1) lookup without
+    /// division/modulo (slabs may have different capacities).
+    index_map: Vec<(u32, u32)>,
+    /// Number of segments per next slab allocation (doubles each time).
+    next_slab_capacity: usize,
+}
+
+impl<K, V> SegmentSlab<K, V> {
+    fn new() -> Self {
+        SegmentSlab {
+            slabs: Vec::new(),
+            index_map: Vec::new(),
+            next_slab_capacity: 16,
+        }
+    }
+
+    /// Add a segment, returning its flat index.
+    fn push(&mut self, segment: Segment<K, V>) -> usize {
+        // Check if current last slab has room
+        let needs_new_slab = self.slabs.is_empty()
+            || self.slabs.last().unwrap().len() >= self.slabs.last().unwrap().capacity();
+
+        if needs_new_slab {
+            let cap = self.next_slab_capacity;
+            self.slabs.push(Vec::with_capacity(cap));
+            // Double for next time, cap at 1024
+            self.next_slab_capacity = (cap * 2).min(1024);
+        }
+
+        let slab_idx = self.slabs.len() - 1;
+        let slot_idx = self.slabs[slab_idx].len();
+        self.slabs[slab_idx].push(segment);
+
+        let flat_idx = self.index_map.len();
+        self.index_map.push((slab_idx as u32, slot_idx as u32));
+        flat_idx
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.index_map.len()
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> &Segment<K, V> {
+        let (si, sli) = self.index_map[idx];
+        &self.slabs[si as usize][sli as usize]
+    }
+
+    #[inline]
+    fn get_mut(&mut self, idx: usize) -> &mut Segment<K, V> {
+        let (si, sli) = self.index_map[idx];
+        &mut self.slabs[si as usize][sli as usize]
+    }
+
+    /// Collect immutable references to all segments (for iterator construction).
+    fn collect_refs(&self) -> Vec<&Segment<K, V>> {
+        self.index_map
+            .iter()
+            .map(|&(si, sli)| &self.slabs[si as usize][sli as usize])
+            .collect()
+    }
+
+    /// Collect mutable references to all segments (for iterator construction).
+    ///
+    /// SAFETY: Each index_map entry refers to a unique (slab_idx, slot_idx) pair,
+    /// so no two mutable references alias. We use raw pointers to work around
+    /// the borrow checker's inability to prove non-aliasing across Vec indexing.
+    fn collect_mut_refs(&mut self) -> Vec<&mut Segment<K, V>> {
+        let slabs_ptr = self.slabs.as_mut_ptr();
+        self.index_map
+            .iter()
+            .map(|&(si, sli)| unsafe {
+                let slab = &mut *slabs_ptr.add(si as usize);
+                &mut *slab.as_mut_ptr().add(sli as usize)
+            })
+            .collect()
+    }
+}
+
 /// A segmented hash table with Swiss Table SIMD probing.
 ///
 /// Provides a HashMap-compatible API with per-segment incremental rehashing
 /// (no memory spike on resize) and SIMD-accelerated 16-way parallel key lookup.
 pub struct DashTable<K, V> {
-    /// Segment storage: each segment is owned by exactly one slot here.
-    segments: Vec<Box<Segment<K, V>>>,
+    /// Segment storage: slab-allocated for contiguous memory layout.
+    segments: SegmentSlab<K, V>,
     /// Directory: maps hash-derived indices to segment storage indices.
     /// Multiple directory entries may point to the same segment (extendible hashing).
     directory: Vec<usize>,
@@ -81,8 +174,10 @@ pub struct DashTable<K, V> {
 impl<V> DashTable<CompactKey, V> {
     /// Create a new empty DashTable with one segment.
     pub fn new() -> Self {
+        let mut segments = SegmentSlab::new();
+        segments.push(Segment::new(0));
         DashTable {
-            segments: vec![Box::new(Segment::new(0))],
+            segments,
             directory: vec![0],
             depth: 0,
             len: 0,
@@ -102,10 +197,10 @@ impl<V> DashTable<CompactKey, V> {
             (num_segments as f64).log2().ceil() as u32
         };
         let dir_size = 1usize << depth;
-        let mut segments = Vec::with_capacity(dir_size);
+        let mut segments = SegmentSlab::new();
         let mut directory = Vec::with_capacity(dir_size);
         for i in 0..dir_size {
-            segments.push(Box::new(Segment::new(depth)));
+            segments.push(Segment::new(depth));
             directory.push(i);
         }
         DashTable {
@@ -140,7 +235,7 @@ impl<V> DashTable<CompactKey, V> {
     /// Panics if `idx >= segment_count()`.
     #[inline]
     pub fn segment(&self, idx: usize) -> &Segment<CompactKey, V> {
-        &self.segments[idx]
+        self.segments.get(idx)
     }
 
     /// Determine which segment storage index a key hash maps to.
@@ -159,11 +254,11 @@ impl<V> DashTable<CompactKey, V> {
         let seg_idx = self.directory[dir_idx];
 
         // Prefetch segment data while computing home bucket (overlaps ~10ns L2/L3 miss)
-        prefetch_segment(&self.segments[seg_idx]);
+        prefetch_segment(self.segments.get(seg_idx));
 
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
-        self.segments[seg_idx].get(h2_val, key, ba, bb)
+        self.segments.get(seg_idx).get(h2_val, key, ba, bb)
     }
 
     /// Look up a key and return a mutable reference to its value.
@@ -173,11 +268,11 @@ impl<V> DashTable<CompactKey, V> {
         let seg_idx = self.directory[dir_idx];
 
         // Prefetch segment data while computing home bucket
-        prefetch_segment(&self.segments[seg_idx]);
+        prefetch_segment(self.segments.get(seg_idx));
 
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
-        self.segments[seg_idx].get_mut(h2_val, key, ba, bb)
+        self.segments.get_mut(seg_idx).get_mut(h2_val, key, ba, bb)
     }
 
     /// Check if the table contains the given key.
@@ -192,12 +287,12 @@ impl<V> DashTable<CompactKey, V> {
         let seg_idx = self.directory[dir_idx];
 
         // Prefetch segment data while computing home bucket
-        prefetch_segment(&self.segments[seg_idx]);
+        prefetch_segment(self.segments.get(seg_idx));
 
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        match self.segments[seg_idx].insert(h2_val, key, value, ba, bb) {
+        match self.segments.get_mut(seg_idx).insert(h2_val, key, value, ba, bb) {
             InsertResult::Inserted => {
                 self.len += 1;
                 None
@@ -220,12 +315,12 @@ impl<V> DashTable<CompactKey, V> {
         let seg_idx = self.directory[dir_idx];
 
         // Prefetch segment data while computing home bucket
-        prefetch_segment(&self.segments[seg_idx]);
+        prefetch_segment(self.segments.get(seg_idx));
 
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        self.segments[seg_idx]
+        self.segments.get_mut(seg_idx)
             .remove(h2_val, key, ba, bb)
             .map(|(_k, v)| {
                 self.len -= 1;
@@ -241,12 +336,12 @@ impl<V> DashTable<CompactKey, V> {
         let seg_idx = self.directory[dir_idx];
 
         // Prefetch segment data while computing home bucket
-        prefetch_segment(&self.segments[seg_idx]);
+        prefetch_segment(self.segments.get(seg_idx));
 
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        self.segments[seg_idx]
+        self.segments.get_mut(seg_idx)
             .remove(h2_val, key, ba, bb)
             .map(|(k, v)| {
                 self.len -= 1;
@@ -256,17 +351,13 @@ impl<V> DashTable<CompactKey, V> {
 
     /// Return an iterator over `(&Bytes, &V)` pairs.
     pub fn iter(&self) -> Iter<'_, CompactKey, V> {
-        let segments: Vec<&Segment<CompactKey, V>> =
-            self.segments.iter().map(|s| &**s).collect();
-        Iter::new(segments, self.len)
+        Iter::new(self.segments.collect_refs(), self.len)
     }
 
     /// Return a mutable iterator over `(&Bytes, &mut V)` pairs.
     pub fn iter_mut(&mut self) -> IterMut<'_, CompactKey, V> {
         let total = self.len;
-        let segments: Vec<&mut Segment<CompactKey, V>> =
-            self.segments.iter_mut().map(|s| &mut **s).collect();
-        IterMut::new(segments, total)
+        IterMut::new(self.segments.collect_mut_refs(), total)
     }
 
     /// Return an iterator over keys.
@@ -288,12 +379,11 @@ impl<V> DashTable<CompactKey, V> {
     fn split_segment(&mut self, dir_idx: usize) {
         let seg_store_idx = self.directory[dir_idx];
         let hasher = |k: &CompactKey| hash_key(k.as_ref());
-        let new_seg = self.segments[seg_store_idx].split(&hasher);
+        let new_seg = self.segments.get_mut(seg_store_idx).split(&hasher);
         let new_depth = new_seg.depth();
 
-        // Add new segment to the store
-        let new_store_idx = self.segments.len();
-        self.segments.push(Box::new(new_seg));
+        // Add new segment to the slab store
+        let new_store_idx = self.segments.push(new_seg);
 
         // Double directory if needed
         while new_depth > self.depth {
@@ -483,7 +573,7 @@ mod tests {
         }
 
         // Should have more than 1 segment after splits
-        assert!(table.segments.len() > 1, "Expected splits to occur");
+        assert!(table.segment_count() > 1, "Expected splits to occur");
     }
 
     #[test]
