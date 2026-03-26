@@ -347,6 +347,7 @@ impl Shard {
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
                             let notifiers = all_notifiers.clone();
+                            let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -357,7 +358,7 @@ impl Shard {
                                     psr,
                                     blk,
                                     sd,
-                                    runtime_config.read().map(|cfg| cfg.requirepass.clone()).ok().flatten(),
+                                    reqpass,
                                     aof,
                                     trk,
                                     cid,

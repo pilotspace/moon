@@ -165,12 +165,13 @@ pub async fn handle_connection(
                                         for arg in cmd_args {
                                             if let Some(channel) = extract_bytes(arg) {
                                                 // ACL channel permission check
-                                                {
+                                                let deny = {
                                                     let acl_guard = acl_table.read().unwrap();
-                                                    if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
-                                                        let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
-                                                        continue;
-                                                    }
+                                                    acl_guard.check_channel_permission(&current_user, channel.as_ref()).map(|r| r.to_string())
+                                                };
+                                                if let Some(deny_reason) = deny {
+                                                    let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                    continue;
                                                 }
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().subscribe(channel.clone(), sub);
@@ -222,12 +223,13 @@ pub async fn handle_connection(
                                         for arg in cmd_args {
                                             if let Some(pattern) = extract_bytes(arg) {
                                                 // ACL channel permission check
-                                                {
+                                                let deny = {
                                                     let acl_guard = acl_table.read().unwrap();
-                                                    if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, pattern.as_ref()) {
-                                                        let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
-                                                        continue;
-                                                    }
+                                                    acl_guard.check_channel_permission(&current_user, pattern.as_ref()).map(|r| r.to_string())
+                                                };
+                                                if let Some(deny_reason) = deny {
+                                                    let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                    continue;
                                                 }
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().psubscribe(pattern.clone(), sub);
@@ -758,13 +760,13 @@ pub async fn handle_connection(
                                 for arg in cmd_args {
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
                                         // ACL channel permission check
-                                        {
+                                        let deny = {
                                             let acl_guard = acl_table.read().unwrap();
-                                            if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel_or_pattern.as_ref()) {
-                                                drop(acl_guard);
-                                                let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
-                                                continue;
-                                            }
+                                            acl_guard.check_channel_permission(&current_user, channel_or_pattern.as_ref()).map(|r| r.to_string())
+                                        };
+                                        if let Some(deny_reason) = deny {
+                                            let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                            continue;
                                         }
                                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                         {

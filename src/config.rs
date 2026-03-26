@@ -79,6 +79,26 @@ pub struct ServerConfig {
     /// Maximum number of entries in the ACL log
     #[arg(long, default_value_t = 128)]
     pub acllog_max_len: usize,
+
+    /// TLS port (0 = TLS disabled)
+    #[arg(long, default_value_t = 0)]
+    pub tls_port: u16,
+
+    /// Path to TLS certificate file (PEM format)
+    #[arg(long)]
+    pub tls_cert_file: Option<String>,
+
+    /// Path to TLS private key file (PEM format)
+    #[arg(long)]
+    pub tls_key_file: Option<String>,
+
+    /// Path to CA certificate for client authentication (mTLS)
+    #[arg(long)]
+    pub tls_ca_cert_file: Option<String>,
+
+    /// TLS 1.3 cipher suites (comma-separated, e.g., "TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256")
+    #[arg(long)]
+    pub tls_ciphersuites: Option<String>,
 }
 
 impl ServerConfig {
