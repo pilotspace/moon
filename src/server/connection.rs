@@ -3402,6 +3402,12 @@ pub async fn handle_connection_sharded_monoio(
         responses.clear();
         remote_groups.clear();
 
+        // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
+        {
+            let mut dbs = databases.borrow_mut();
+            dbs[selected_db].refresh_now();
+        }
+
         for frame in frames.drain(..) {
             let (cmd, cmd_args) = match extract_command(&frame) {
                 Some(pair) => pair,
@@ -3610,14 +3616,13 @@ pub async fn handle_connection_sharded_monoio(
             };
 
             if is_local {
-                // LOCAL FAST PATH: zero cross-shard overhead
+                // LOCAL FAST PATH: single borrow_mut covers dispatch + wakeup (no per-command acquire/release)
                 let mut dbs = databases.borrow_mut();
-                dbs[selected_db].refresh_now();
+                // No refresh_now here — called once per batch before the loop
                 let result = dispatch(
                     &mut dbs[selected_db], cmd, cmd_args,
                     &mut selected_db, db_count,
                 );
-                drop(dbs);
 
                 let response = match result {
                     DispatchResult::Response(f) => f,
@@ -3627,7 +3632,7 @@ pub async fn handle_connection_sharded_monoio(
                     }
                 };
 
-                // AOF logging for successful local writes
+                // AOF logging for successful local writes (no borrow needed, holding is fine — no await)
                 if !matches!(response, Frame::Error(_)) {
                     if let Some(ref tx) = aof_tx {
                         if aof::is_write_command(cmd) {
@@ -3637,7 +3642,7 @@ pub async fn handle_connection_sharded_monoio(
                     }
                 }
 
-                // Post-dispatch wakeup hooks for producer commands (blocking waiters)
+                // Post-dispatch wakeup hooks for producer commands (reuse outer dbs — no re-borrow)
                 if !matches!(response, Frame::Error(_)) {
                     let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                         || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -3645,7 +3650,6 @@ pub async fn handle_connection_sharded_monoio(
                         || cmd.eq_ignore_ascii_case(b"ZADD");
                     if needs_wake {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            let mut dbs = databases.borrow_mut();
                             let mut reg = blocking_registry.borrow_mut();
                             if cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -3663,6 +3667,7 @@ pub async fn handle_connection_sharded_monoio(
                     }
                 }
 
+                drop(dbs); // Single drop at end of local block
                 responses.push(response);
             } else if let Some(target) = target_shard {
                 // DEFERRED REMOTE: collect for batch dispatch after loop
