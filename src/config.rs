@@ -71,6 +71,14 @@ pub struct ServerConfig {
     /// Cluster node timeout in milliseconds (PFAIL detection threshold)
     #[arg(long, default_value_t = 15000)]
     pub cluster_node_timeout: u64,
+
+    /// Enable protected mode (reject non-loopback connections when no password set)
+    #[arg(long, default_value = "yes")]
+    pub protected_mode: String,
+
+    /// Maximum number of entries in the ACL log
+    #[arg(long, default_value_t = 128)]
+    pub acllog_max_len: usize,
 }
 
 impl ServerConfig {
@@ -86,6 +94,9 @@ impl ServerConfig {
             appendonly: self.appendonly.clone(),
             appendfsync: self.appendfsync.clone(),
             aclfile: self.aclfile.clone(),
+            requirepass: self.requirepass.clone(),
+            protected_mode: self.protected_mode.clone(),
+            acllog_max_len: self.acllog_max_len,
         }
     }
 }
@@ -113,6 +124,12 @@ pub struct RuntimeConfig {
     pub appendfsync: String,
     /// ACL file path (mutable via CONFIG SET).
     pub aclfile: Option<String>,
+    /// Require clients to authenticate with this password (mutable via CONFIG SET).
+    pub requirepass: Option<String>,
+    /// Protected mode setting (mutable via CONFIG SET).
+    pub protected_mode: String,
+    /// Maximum number of entries in the ACL log (mutable via CONFIG SET).
+    pub acllog_max_len: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -127,6 +144,9 @@ impl Default for RuntimeConfig {
             appendonly: "no".to_string(),
             appendfsync: "everysec".to_string(),
             aclfile: None,
+            requirepass: None,
+            protected_mode: "yes".to_string(),
+            acllog_max_len: 128,
         }
     }
 }

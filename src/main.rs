@@ -29,6 +29,15 @@ fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::parse();
 
+    // Protected mode startup warning
+    if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
+        tracing::warn!(
+            "WARNING: no password set. Protected mode is enabled. \
+             Only loopback connections are accepted. \
+             Use --requirepass or --protected-mode no to change this."
+        );
+    }
+
     // Determine number of shards
     let num_shards = if config.shards == 0 {
         std::thread::available_parallelism()

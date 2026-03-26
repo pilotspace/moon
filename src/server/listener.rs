@@ -174,7 +174,24 @@ pub async fn run_with_shutdown(
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, addr)) => {
+                    Ok((mut stream, addr)) => {
+                        // Protected mode: reject non-loopback connections when no auth configured
+                        if config.protected_mode == "yes"
+                            && config.requirepass.is_none()
+                            && config.aclfile.is_none()
+                        {
+                            let ip = addr.ip();
+                            if !ip.is_loopback() {
+                                tracing::warn!(
+                                    "Protected mode: rejected connection from {} (no password set, use --protected-mode no to disable)",
+                                    addr
+                                );
+                                let err_msg = b"-DENIED Redis is running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers to Redis you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface. 2) Set a password for the default user.\r\n";
+                                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, err_msg).await;
+                                continue;
+                            }
+                        }
+
                         debug!("New connection from {}", addr);
                         let db = db.clone();
                         let conn_token = token.child_token();
@@ -228,6 +245,10 @@ pub async fn run_sharded(
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards)", addr, num_shards);
 
+    let protected_mode_active = config.protected_mode == "yes"
+        && config.requirepass.is_none()
+        && config.aclfile.is_none();
+
     let mut next_shard: usize = 0;
 
     // Ctrl+C handler
@@ -242,7 +263,18 @@ pub async fn run_sharded(
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, addr)) => {
+                    Ok((mut stream, addr)) => {
+                        // Protected mode: reject non-loopback connections when no auth configured
+                        if protected_mode_active && !addr.ip().is_loopback() {
+                            tracing::warn!(
+                                "Protected mode: rejected connection from {} (no password set, use --protected-mode no to disable)",
+                                addr
+                            );
+                            let err_msg = b"-DENIED Redis is running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers to Redis you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface. 2) Set a password for the default user.\r\n";
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, err_msg).await;
+                            continue;
+                        }
+
                         debug!("New connection from {} -> shard {}", addr, next_shard);
                         let tx = &conn_txs[next_shard];
                         if tx.send_async(stream).await.is_err() {
@@ -287,6 +319,10 @@ pub async fn run_sharded(
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards, monoio)", addr, num_shards);
 
+    let protected_mode_active = config.protected_mode == "yes"
+        && config.requirepass.is_none()
+        && config.aclfile.is_none();
+
     let mut next_shard: usize = 0;
 
     // Ctrl+C handler -- ctrlc crate sets handler on OS thread, signals our token
@@ -301,7 +337,19 @@ pub async fn run_sharded(
         monoio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, addr)) => {
+                    Ok((mut stream, addr)) => {
+                        // Protected mode: reject non-loopback connections when no auth configured
+                        if protected_mode_active && !addr.ip().is_loopback() {
+                            tracing::warn!(
+                                "Protected mode: rejected connection from {} (no password set, use --protected-mode no to disable)",
+                                addr
+                            );
+                            // Write error and drop stream to close connection.
+                            let err_msg: Vec<u8> = b"-DENIED Redis is running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers to Redis you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface. 2) Set a password for the default user.\r\n".to_vec();
+                            let _ = monoio::io::AsyncWriteRentExt::write_all(&mut stream, err_msg).await;
+                            continue;
+                        }
+
                         debug!("New connection from {} -> shard {}", addr, next_shard);
                         // Convert monoio TcpStream to std::net::TcpStream for cross-thread send.
                         // monoio::net::TcpStream is !Send (Rc<SharedFd>), so we extract the raw fd.
