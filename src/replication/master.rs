@@ -104,10 +104,16 @@ pub async fn handle_psync_on_master(
                 }
             }
 
-            // Transfer per-shard RDB files
+            // Transfer per-shard RDB files using async I/O to avoid blocking the event loop.
+            //
+            // TODO: For standard Redis replicas, convert RRDSHARD data to Redis RDB format
+            // using crate::persistence::redis_rdb::write_rdb() before sending. Currently we
+            // send RRDSHARD format which our own replicas understand natively. The redis_rdb
+            // module (from Plan 43-01) provides the conversion primitives when needed.
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                let data = std::fs::read(&snap_path).unwrap_or_default();
+                let data = tokio::fs::read(&snap_path).await
+                    .unwrap_or_default();
                 let header = format!("${}\r\n", data.len());
                 write_half.write_all(header.as_bytes()).await?;
                 write_half.write_all(&data).await?;
@@ -256,7 +262,14 @@ pub async fn handle_psync_on_master(
                 }
             }
 
-            // Transfer per-shard RDB files
+            // Transfer per-shard RDB files.
+            // Monoio: synchronous file read. Thread-per-core model means this
+            // blocks only this core's event loop. For large files, consider
+            // monoio::fs::File with read_at() in the future.
+            //
+            // TODO: For standard Redis replicas, convert RRDSHARD data to Redis RDB format
+            // using crate::persistence::redis_rdb::write_rdb() before sending. Currently we
+            // send RRDSHARD format which our own replicas understand natively.
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
                 let file_data = std::fs::read(&snap_path).unwrap_or_default();
