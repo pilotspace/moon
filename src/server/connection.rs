@@ -3380,11 +3380,16 @@ pub async fn handle_connection_sharded_monoio(
             Err(_) => break,
         }
 
-        // Parse all complete frames from the read buffer (reuse pre-allocated Vec)
+        // Parse all complete frames from the read buffer (reuse pre-allocated Vec, cap at 1024)
         frames.clear();
         loop {
             match codec.decode_frame(&mut read_buf) {
-                Ok(Some(frame)) => frames.push(frame),
+                Ok(Some(frame)) => {
+                    frames.push(frame);
+                    if frames.len() >= 1024 {
+                        break;
+                    }
+                }
                 Ok(None) => break,
                 Err(_) => return, // parse error, close connection
             }
