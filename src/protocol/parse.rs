@@ -8,9 +8,11 @@ use super::inline;
 
 /// Attempt to parse one RESP2 frame from the buffer.
 ///
-/// Uses a single-pass approach: validates completeness and extracts frame data
-/// in one traversal of the buffer. On success, advances the buffer past the
-/// consumed bytes and returns `Ok(Some(frame))`.
+/// Uses a two-pass approach for zero-copy argument extraction:
+/// 1. Validate structure and compute byte length (parse_single_frame, result discarded)
+/// 2. Freeze validated bytes and extract frame data via Bytes::slice (Arc refcount bump, no memcpy)
+///
+/// On success, advances the buffer past the consumed bytes and returns `Ok(Some(frame))`.
 /// Returns `Ok(None)` if the buffer doesn't contain a complete frame (need more data).
 /// Returns `Err` if the data violates the RESP2 protocol specification.
 pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, ParseError> {
@@ -26,10 +28,15 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
         _ => return inline::parse_inline(buf),
     }
 
+    // Pass 1: Validate structure and compute total byte length (zero allocations)
     let mut pos = 0;
-    match parse_single_frame(&buf[..], &mut pos, config, 0) {
-        Ok(frame) => {
-            buf.advance(pos);
+    match validate_frame(&buf[..], &mut pos, config, 0) {
+        Ok(()) => {
+            // Pass 2: Zero-copy extraction from frozen Bytes
+            // split_to moves bytes out of buf; freeze() enables Arc-backed slicing
+            let frozen = buf.split_to(pos).freeze();
+            let mut zc_pos = 0;
+            let frame = parse_frame_zerocopy(&frozen, &mut zc_pos, config, 0);
             Ok(Some(frame))
         }
         Err(ParseError::Incomplete) => Ok(None),
@@ -404,6 +411,190 @@ fn read_decimal(buf: &[u8], pos: &mut usize) -> Result<i64, ParseError> {
     })?;
     *pos = crlf + 2;
     Ok(n)
+}
+
+/// Lightweight validation pass: walks the buffer to compute total frame byte length
+/// without allocating any Frame objects. Returns Ok(()) on success with `pos` advanced
+/// past the complete frame, or Err on incomplete/invalid data.
+fn validate_frame(
+    buf: &[u8],
+    pos: &mut usize,
+    config: &ParseConfig,
+    depth: usize,
+) -> Result<(), ParseError> {
+    if depth > config.max_array_depth {
+        return Err(ParseError::Invalid {
+            message: format!("array nesting depth {} exceeds maximum {}", depth, config.max_array_depth),
+            offset: *pos,
+        });
+    }
+    if *pos >= buf.len() {
+        return Err(ParseError::Incomplete);
+    }
+    let type_byte = buf[*pos];
+    *pos += 1;
+
+    match type_byte {
+        b'+' | b'-' | b'(' => {
+            // SimpleString, Error, BigNumber: skip to CRLF
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            *pos = crlf + 2;
+            Ok(())
+        }
+        b':' => {
+            // Integer: validate parseable
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+                message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
+                offset: *pos,
+            })?;
+            *pos = crlf + 2;
+            Ok(())
+        }
+        b',' => {
+            // Double: validate parseable
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
+                message: "invalid UTF-8 in double".into(),
+                offset: *pos,
+            })?;
+            if !matches!(s, "inf" | "-inf" | "nan") {
+                s.parse::<f64>().map_err(|_| ParseError::Invalid {
+                    message: format!("invalid double: {:?}", s),
+                    offset: *pos,
+                })?;
+            }
+            *pos = crlf + 2;
+            Ok(())
+        }
+        b'#' => {
+            // Boolean: must be exactly t or f followed by CRLF
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            let line = &buf[*pos..crlf];
+            match line {
+                b"t" | b"f" => {}
+                _ => {
+                    return Err(ParseError::Invalid {
+                        message: format!(
+                            "invalid boolean value: {:?}",
+                            String::from_utf8_lossy(line)
+                        ),
+                        offset: *pos,
+                    });
+                }
+            }
+            *pos = crlf + 2;
+            Ok(())
+        }
+        b'_' => {
+            // Null: just CRLF
+            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            *pos = crlf + 2;
+            Ok(())
+        }
+        b'$' => {
+            let len = read_decimal(buf, pos)?;
+            if len == -1 { return Ok(()); } // Null bulk string
+            if len < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid bulk string length: {}", len),
+                    offset: *pos,
+                });
+            }
+            let len = len as usize;
+            if len > config.max_bulk_string_size {
+                return Err(ParseError::Invalid {
+                    message: format!("bulk string size {} exceeds maximum {}", len, config.max_bulk_string_size),
+                    offset: *pos,
+                });
+            }
+            let remaining = buf.len() - *pos;
+            if remaining < len + 2 {
+                return Err(ParseError::Incomplete);
+            }
+            *pos += len + 2; // skip data + \r\n
+            Ok(())
+        }
+        b'=' => {
+            // VerbatimString: length-prefixed like bulk string
+            let len = read_decimal(buf, pos)?;
+            if len < 4 {
+                return Err(ParseError::Invalid {
+                    message: format!("verbatim string length {} too short", len),
+                    offset: *pos,
+                });
+            }
+            let len = len as usize;
+            if len > config.max_bulk_string_size {
+                return Err(ParseError::Invalid {
+                    message: format!("verbatim string size {} exceeds maximum {}", len, config.max_bulk_string_size),
+                    offset: *pos,
+                });
+            }
+            let remaining = buf.len() - *pos;
+            if remaining < len + 2 {
+                return Err(ParseError::Incomplete);
+            }
+            if buf[*pos + 3] != b':' {
+                return Err(ParseError::Invalid {
+                    message: "verbatim string missing ':' after 3-byte encoding".into(),
+                    offset: *pos + 3,
+                });
+            }
+            *pos += len + 2;
+            Ok(())
+        }
+        b'*' | b'~' | b'>' => {
+            // Array, Set, Push: count + elements
+            let count = read_decimal(buf, pos)?;
+            if count == -1 { return Ok(()); } // Null array
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid array/set/push length: {}", count),
+                    offset: *pos,
+                });
+            }
+            let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!("length {} exceeds maximum {}", count, config.max_array_length),
+                    offset: *pos,
+                });
+            }
+            for _ in 0..count {
+                validate_frame(buf, pos, config, depth + 1)?;
+            }
+            Ok(())
+        }
+        b'%' => {
+            // Map: count pairs
+            let count = read_decimal(buf, pos)?;
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid map length: {}", count),
+                    offset: *pos,
+                });
+            }
+            let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!("map length {} exceeds maximum {}", count, config.max_array_length),
+                    offset: *pos,
+                });
+            }
+            for _ in 0..count {
+                validate_frame(buf, pos, config, depth + 1)?;
+                validate_frame(buf, pos, config, depth + 1)?;
+            }
+            Ok(())
+        }
+        byte => Err(ParseError::Invalid {
+            message: format!("unknown type byte: 0x{:02x}", byte),
+            offset: *pos - 1,
+        }),
+    }
 }
 
 /// Parse a single RESP2 frame from buf using direct index tracking.
