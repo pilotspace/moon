@@ -3149,6 +3149,15 @@ pub async fn handle_connection_sharded_monoio(
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
     let mut tmp_buf = vec![0u8; 8192];
 
+    // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
+    // These are cleared and reused each iteration instead of being recreated.
+    let mut responses: Vec<Frame> = Vec::with_capacity(64);
+    let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>> = HashMap::with_capacity(num_shards);
+    let mut reply_futures: Vec<(
+        Vec<(usize, Option<Bytes>, Vec<u8>)>,
+        channel::OneshotReceiver<Vec<Frame>>,
+    )> = Vec::with_capacity(num_shards);
+
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if subscription_count > 0 {
@@ -3380,10 +3389,9 @@ pub async fn handle_connection_sharded_monoio(
         write_buf.clear();
         let mut should_quit = false;
 
-        // Pipeline batch optimization: collect responses and defer remote commands
-        // for batched PipelineBatch dispatch (one per target shard, parallel await).
-        let mut responses: Vec<Frame> = Vec::with_capacity(frames.len());
-        let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>> = HashMap::with_capacity(num_shards);
+        // Pipeline batch optimization: reuse pre-allocated containers (clear, not re-create).
+        responses.clear();
+        remote_groups.clear();
 
         for frame in frames {
             let (cmd, cmd_args) = match extract_command(&frame) {
@@ -3668,12 +3676,9 @@ pub async fn handle_connection_sharded_monoio(
         // Phase 2: Dispatch all deferred remote commands as batched PipelineBatch
         // messages (one per target shard), await all in parallel.
         if !remote_groups.is_empty() {
-            let mut reply_futures: Vec<(
-                Vec<(usize, Option<Bytes>, Vec<u8>)>, // (resp_idx, aof_bytes, cmd_name)
-                channel::OneshotReceiver<Vec<Frame>>,
-            )> = Vec::with_capacity(remote_groups.len());
+            reply_futures.clear();
 
-            for (target, entries) in remote_groups {
+            for (target, entries) in remote_groups.drain() {
                 let (reply_tx, reply_rx) = channel::oneshot();
                 let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
                     entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
@@ -3707,7 +3712,7 @@ pub async fn handle_connection_sharded_monoio(
             }
 
             // Await all shard responses (they execute in parallel on different shards)
-            for (meta, reply_rx) in reply_futures {
+            for (meta, reply_rx) in reply_futures.drain(..) {
                 match reply_rx.recv().await {
                     Ok(shard_responses) => {
                         for ((resp_idx, aof_bytes, _cmd_name), resp) in meta.into_iter().zip(shard_responses) {
