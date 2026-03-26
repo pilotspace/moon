@@ -125,9 +125,16 @@ impl Hash for CompactKey {
 }
 
 impl PartialEq for CompactKey {
-    #[inline]
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
+        // Fast path: if both are inline (high bit clear), compare raw 24-byte arrays.
+        // This compiles to 3 QWORD comparisons with no function calls.
+        if (self.data[0] | other.data[0]) & HEAP_FLAG == 0 {
+            self.data == other.data
+        } else {
+            // Slow path: at least one is heap-allocated, compare byte slices.
+            self.as_bytes() == other.as_bytes()
+        }
     }
 }
 
