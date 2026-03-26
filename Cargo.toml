@@ -45,7 +45,15 @@ tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync"] }
 
 [features]
-default = ["runtime-tokio", "jemalloc"]
+# Platform-aware defaults:
+#   Linux/macOS: Monoio is default (io_uring / kqueue, thread-per-core)
+#   Windows:     Tokio is default (IOCP, work-stealing fallback)
+#
+# Usage:
+#   cargo build                                                    # Monoio on Linux/macOS
+#   cargo build --no-default-features --features runtime-tokio,jemalloc   # force Tokio
+#   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
+default = ["runtime-monoio", "jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 runtime-tokio = ["dep:tokio", "dep:tokio-util"]
 runtime-monoio = ["dep:monoio"]

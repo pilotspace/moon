@@ -1,12 +1,25 @@
 //! Runtime abstraction layer for async runtime swappability.
 //!
 //! Defines trait contracts for Timer, Spawn, Factory, ConnectionIo, and FileIo.
-//! The default `runtime-tokio` feature provides Tokio implementations.
-//! The `runtime-monoio` feature provides Monoio implementations (thread-per-core, io_uring/kqueue).
+//!
+//! **Default runtime:** `runtime-monoio` (Linux: io_uring, macOS: kqueue via FusionDriver)
+//! **Fallback runtime:** `runtime-tokio` (Windows: IOCP, or explicit opt-in on any platform)
+//!
+//! To use Tokio instead: `cargo build --no-default-features --features runtime-tokio,jemalloc`
 
 #[cfg(all(feature = "runtime-tokio", feature = "runtime-monoio"))]
 compile_error!(
     "Features `runtime-tokio` and `runtime-monoio` are mutually exclusive. Enable only one."
+);
+
+#[cfg(all(feature = "runtime-monoio", target_os = "windows"))]
+compile_error!(
+    "Monoio does not support Windows. Use: cargo build --no-default-features --features runtime-tokio,jemalloc"
+);
+
+#[cfg(not(any(feature = "runtime-tokio", feature = "runtime-monoio")))]
+compile_error!(
+    "No runtime selected. Enable either `runtime-tokio` or `runtime-monoio` feature."
 );
 
 pub mod cancel;
