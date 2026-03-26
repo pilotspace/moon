@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::protocol::Frame;
 use crate::storage::entry::Entry;
 use crate::storage::Database;
-
+use crate::framevec;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -220,9 +220,9 @@ pub fn smembers(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get_set(key) {
         Ok(Some(set)) => {
             let members: Vec<Frame> = set.iter().map(|m| Frame::BulkString(m.clone())).collect();
-            Frame::Array(members)
+            Frame::Array(members.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -308,7 +308,7 @@ pub fn smismember(db: &mut Database, args: &[Frame]) -> Frame {
                     }
                 })
                 .collect();
-            Frame::Array(results)
+            Frame::Array(results.into())
         }
         Err(e) => e,
     }
@@ -362,12 +362,12 @@ pub fn sinter(db: &mut Database, args: &[Frame]) -> Frame {
     for s in sets {
         match s {
             Some(set) => concrete.push(set),
-            None => return Frame::Array(vec![]),
+            None => return Frame::Array(framevec![]),
         }
     }
 
     if concrete.is_empty() {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     // Start with the smallest set for efficiency
@@ -378,7 +378,7 @@ pub fn sinter(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members)
+    Frame::Array(members.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +408,7 @@ pub fn sunion(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members)
+    Frame::Array(members.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +432,7 @@ pub fn sdiff(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut result = match &sets[0] {
         Some(set) => set.clone(),
-        None => return Frame::Array(vec![]),
+        None => return Frame::Array(framevec![]),
     };
 
     for s in &sets[1..] {
@@ -442,7 +442,7 @@ pub fn sdiff(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members)
+    Frame::Array(members.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +647,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
             return if args.len() == 1 {
                 Frame::Null
             } else {
-                Frame::Array(vec![])
+                Frame::Array(framevec![])
             };
         }
         Err(e) => return e,
@@ -657,7 +657,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         return if args.len() == 1 {
             Frame::Null
         } else {
-            Frame::Array(vec![])
+            Frame::Array(framevec![])
         };
     }
 
@@ -680,7 +680,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     if count == 0 {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     if count > 0 {
@@ -691,7 +691,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
             .map(|m| Frame::BulkString((*m).clone())
             )
             .collect();
-        Frame::Array(chosen)
+        Frame::Array(chosen.into())
     } else {
         // Allow duplicates
         let n = count.unsigned_abs() as usize;
@@ -700,7 +700,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
             let chosen = members.choose(&mut rng).unwrap();
             result.push(Frame::BulkString((*chosen).clone()));
         }
-        Frame::Array(result)
+        Frame::Array(result.into())
     }
 }
 
@@ -727,7 +727,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
             return if args.len() == 1 {
                 Frame::Null
             } else {
-                Frame::Array(vec![])
+                Frame::Array(framevec![])
             };
         }
         Err(e) => return e,
@@ -737,7 +737,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         return if args.len() == 1 {
             Frame::Null
         } else {
-            Frame::Array(vec![])
+            Frame::Array(framevec![])
         };
     }
 
@@ -770,7 +770,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     if count == 0 {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     let n = std::cmp::min(count, members.len());
@@ -789,7 +789,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let result: Vec<Frame> = chosen.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -884,9 +884,9 @@ pub fn sscan(db: &mut Database, args: &[Frame]) -> Frame {
         Bytes::from(pos.to_string())
     };
 
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(next_cursor),
-        Frame::Array(results),
+        Frame::Array(results.into()),
     ])
 }
 
@@ -927,9 +927,9 @@ pub fn smembers_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_set_ref_if_alive(key, now_ms) {
         Ok(Some(sref)) => {
             let members: Vec<Frame> = sref.members().into_iter().map(Frame::BulkString).collect();
-            Frame::Array(members)
+            Frame::Array(members.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -995,7 +995,7 @@ pub fn smismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
                     }
                 })
                 .collect();
-            Frame::Array(results)
+            Frame::Array(results.into())
         }
         Err(e) => e,
     }
@@ -1018,11 +1018,11 @@ pub fn sinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     for s in sets {
         match s {
             Some(set) => concrete.push(set),
-            None => return Frame::Array(vec![]),
+            None => return Frame::Array(framevec![]),
         }
     }
     if concrete.is_empty() {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
     concrete.sort_by_key(|s| s.len());
     let mut result = concrete[0].clone();
@@ -1030,7 +1030,7 @@ pub fn sinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         result.retain(|m| other.contains(m));
     }
     let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members)
+    Frame::Array(members.into())
 }
 
 /// SUNION (read-only).
@@ -1053,7 +1053,7 @@ pub fn sunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
     }
     let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members)
+    Frame::Array(members.into())
 }
 
 /// SDIFF (read-only).
@@ -1071,7 +1071,7 @@ pub fn sdiff_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let mut result = match &sets[0] {
         Some(set) => set.clone(),
-        None => return Frame::Array(vec![]),
+        None => return Frame::Array(framevec![]),
     };
     for s in &sets[1..] {
         if let Some(set) = s {
@@ -1079,7 +1079,7 @@ pub fn sdiff_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
     }
     let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members)
+    Frame::Array(members.into())
 }
 
 /// SRANDMEMBER (read-only).
@@ -1094,12 +1094,12 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     let set_members = match db.get_set_ref_if_alive(key, now_ms) {
         Ok(Some(sref)) => sref.members(),
         Ok(None) => {
-            return if args.len() == 1 { Frame::Null } else { Frame::Array(vec![]) };
+            return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
         }
         Err(e) => return e,
     };
     if set_members.is_empty() {
-        return if args.len() == 1 { Frame::Null } else { Frame::Array(vec![]) };
+        return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
     }
     let members: Vec<&Bytes> = set_members.iter().collect();
     let mut rng = rand::rng();
@@ -1116,14 +1116,14 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         }
     };
     if count == 0 {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
     if count > 0 {
         let n = std::cmp::min(count as usize, members.len());
         let chosen: Vec<Frame> = members.choose_multiple(&mut rng, n)
             .map(|m| Frame::BulkString((*m).clone()))
             .collect();
-        Frame::Array(chosen)
+        Frame::Array(chosen.into())
     } else {
         let n = count.unsigned_abs() as usize;
         let mut result = Vec::with_capacity(n);
@@ -1131,7 +1131,7 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
             let chosen = members.choose(&mut rng).unwrap();
             result.push(Frame::BulkString((*chosen).clone()));
         }
-        Frame::Array(result)
+        Frame::Array(result.into())
     }
 }
 
@@ -1201,9 +1201,9 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     } else {
         Bytes::from(pos.to_string())
     };
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(next_cursor),
-        Frame::Array(results),
+        Frame::Array(results.into()),
     ])
 }
 
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(result, Frame::Integer(0));
 
         let result = smembers(&mut db, &[bs(b"missing")]);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     // --- SISMEMBER / SMISMEMBER tests ---
@@ -1291,7 +1291,7 @@ mod tests {
         let result = smismember(&mut db, &[bs(b"myset"), bs(b"a"), bs(b"c"), bs(b"b")]);
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::Integer(1), Frame::Integer(0), Frame::Integer(1)])
+            Frame::Array(framevec![Frame::Integer(1), Frame::Integer(0), Frame::Integer(1)])
         );
     }
 
@@ -1327,7 +1327,7 @@ mod tests {
         setup_set(&mut db, b"s1", &[b"a", b"b"]);
 
         let result = sinter(&mut db, &[bs(b"s1"), bs(b"missing")]);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     // --- SUNION tests ---
@@ -1515,7 +1515,7 @@ mod tests {
         assert_eq!(result, Frame::Null);
 
         let result = spop(&mut db, &[bs(b"missing"), bs(b"3")]);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     // --- SSCAN tests ---
@@ -1569,7 +1569,7 @@ mod tests {
         match result {
             Frame::Array(arr) => {
                 assert_eq!(arr[0], Frame::BulkString(Bytes::from_static(b"0")));
-                assert_eq!(arr[1], Frame::Array(vec![]));
+                assert_eq!(arr[1], Frame::Array(framevec![]));
             }
             _ => panic!("expected array"),
         }

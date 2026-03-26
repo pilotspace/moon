@@ -12,13 +12,12 @@ use crate::runtime::channel;
 use tracing::{error, info, warn};
 
 use crate::command::{dispatch, DispatchResult};
-use crate::protocol::{Frame, ParseConfig};
-use crate::protocol::{parse, serialize};
+use crate::protocol::{Frame, ParseConfig, parse, serialize};
 use crate::storage::compact_key::CompactKey;
 use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::{current_time_ms, Entry};
-
+use crate::framevec;
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
@@ -367,7 +366,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
         // Generate SELECT if not db 0
         if db_idx > 0 {
-            let select_frame = Frame::Array(vec![
+            let select_frame = Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"SELECT")),
                 Frame::BulkString(Bytes::from(db_idx.to_string())),
             ]);
@@ -382,7 +381,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
             match entry.value.as_redis_value() {
                 RedisValueRef::String(val) => {
-                    let frame = Frame::Array(vec![
+                    let frame = Frame::Array(framevec![
                         Frame::BulkString(Bytes::from_static(b"SET")),
                         Frame::BulkString(key.to_bytes()),
                         Frame::BulkString(Bytes::copy_from_slice(val)),
@@ -401,7 +400,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         args.push(Frame::BulkString(field.clone()));
                         args.push(Frame::BulkString(val.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::HashListpack(lp) => {
                     let map = lp.to_hash_map();
@@ -416,7 +415,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         args.push(Frame::BulkString(field.clone()));
                         args.push(Frame::BulkString(val.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::List(list) => {
                     if list.is_empty() {
@@ -429,7 +428,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for elem in list.iter() {
                         args.push(Frame::BulkString(elem.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::ListListpack(lp) => {
                     let list = lp.to_vec_deque();
@@ -443,7 +442,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for elem in &list {
                         args.push(Frame::BulkString(elem.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::Set(set) => {
                     if set.is_empty() {
@@ -456,7 +455,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for member in set.iter() {
                         args.push(Frame::BulkString(member.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::SetListpack(lp) => {
                     let set = lp.to_hash_set();
@@ -470,7 +469,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for member in &set {
                         args.push(Frame::BulkString(member.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::SetIntset(is) => {
                     let set = is.to_hash_set();
@@ -484,7 +483,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     for member in &set {
                         args.push(Frame::BulkString(member.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::SortedSet { members, .. }
                 | RedisValueRef::SortedSetBPTree { members, .. } => {
@@ -499,7 +498,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         args.push(Frame::BulkString(Bytes::from(score.to_string())));
                         args.push(Frame::BulkString(member.clone()));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::SortedSetListpack(lp) => {
                     let pairs: Vec<_> = lp.iter_pairs().collect();
@@ -515,7 +514,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         args.push(Frame::BulkString(Bytes::from(score_bytes)));
                         args.push(Frame::BulkString(Bytes::from(member_entry.as_bytes())));
                     }
-                    serialize::serialize(&Frame::Array(args), &mut buf);
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::Stream(stream) => {
                     for (id, fields) in &stream.entries {
@@ -528,7 +527,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                             args.push(Frame::BulkString(field.clone()));
                             args.push(Frame::BulkString(value.clone()));
                         }
-                        serialize::serialize(&Frame::Array(args), &mut buf);
+                        serialize::serialize(&Frame::Array(args.into()), &mut buf);
                     }
                 }
             }
@@ -538,7 +537,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                 let exp_ms = entry.expires_at_ms(base_ts);
                 if exp_ms > now_ms {
                     let remaining_ms = exp_ms - now_ms;
-                    let pexpire_frame = Frame::Array(vec![
+                    let pexpire_frame = Frame::Array(framevec![
                         Frame::BulkString(Bytes::from_static(b"PEXPIRE")),
                         Frame::BulkString(key.to_bytes()),
                         Frame::BulkString(Bytes::from(remaining_ms.to_string())),

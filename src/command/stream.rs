@@ -5,7 +5,7 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::storage::db::Database;
 use crate::storage::stream::StreamId;
-
+use crate::framevec;
 fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
     match frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
@@ -27,9 +27,9 @@ pub(crate) fn format_entry(id: StreamId, fields: &[(Bytes, Bytes)]) -> Frame {
         field_frames.push(Frame::BulkString(f.clone()));
         field_frames.push(Frame::BulkString(v.clone()));
     }
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(id.to_bytes()),
-        Frame::Array(field_frames),
+        Frame::Array(field_frames.into()),
     ])
 }
 
@@ -264,9 +264,9 @@ pub fn xrange(db: &mut Database, args: &[Frame]) -> Frame {
                 .into_iter()
                 .map(|(id, fields)| format_entry(id, fields))
                 .collect();
-            Frame::Array(frames)
+            Frame::Array(frames.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -321,9 +321,9 @@ pub fn xrevrange(db: &mut Database, args: &[Frame]) -> Frame {
                 .into_iter()
                 .map(|(id, fields)| format_entry(id, fields))
                 .collect();
-            Frame::Array(frames)
+            Frame::Array(frames.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -538,16 +538,16 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
                     .into_iter()
                     .map(|(id, fields)| format_entry(id, fields))
                     .collect();
-                results.push(Frame::Array(vec![
+                results.push(Frame::Array(framevec![
                     Frame::BulkString(key.clone()),
-                    Frame::Array(entry_frames),
+                    Frame::Array(entry_frames.into()),
                 ]));
             }
             Ok(None) => {
                 // Stream doesn't exist, no entries
-                results.push(Frame::Array(vec![
+                results.push(Frame::Array(framevec![
                     Frame::BulkString(key.clone()),
-                    Frame::Array(vec![]),
+                    Frame::Array(framevec![]),
                 ]));
             }
             Err(e) => return e,
@@ -555,7 +555,7 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     if has_entries {
-        Frame::Array(results)
+        Frame::Array(results.into())
     } else {
         Frame::Null
     }
@@ -892,14 +892,14 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
             .iter()
             .map(|(id, fields)| format_entry(*id, fields))
             .collect();
-        results.push(Frame::Array(vec![
+        results.push(Frame::Array(framevec![
             Frame::BulkString(key.clone()),
-            Frame::Array(entry_frames),
+            Frame::Array(entry_frames.into()),
         ]));
     }
 
     if has_entries {
-        Frame::Array(results)
+        Frame::Array(results.into())
     } else {
         Frame::Null
     }
@@ -976,7 +976,7 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(summary) => {
                 if summary.is_empty() {
                     // No pending entries
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::Integer(0),
                         Frame::Null,
                         Frame::Null,
@@ -988,17 +988,17 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
                     let consumer_frames: Vec<Frame> = consumers
                         .iter()
                         .map(|(name, count)| {
-                            Frame::Array(vec![
+                            Frame::Array(framevec![
                                 Frame::BulkString(name.clone()),
                                 Frame::BulkString(Bytes::from(count.to_string())),
                             ])
                         })
                         .collect();
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::Integer(total as i64),
                         Frame::BulkString(min_id.to_bytes()),
                         Frame::BulkString(max_id.to_bytes()),
-                        Frame::Array(consumer_frames),
+                        Frame::Array(consumer_frames.into()),
                     ])
                 }
             }
@@ -1068,7 +1068,7 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
                 let frames: Vec<Frame> = details
                     .into_iter()
                     .map(|(id, consumer, idle, delivery_count)| {
-                        Frame::Array(vec![
+                        Frame::Array(framevec![
                             Frame::BulkString(id.to_bytes()),
                             Frame::BulkString(consumer),
                             Frame::Integer(idle as i64),
@@ -1076,7 +1076,7 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
                         ])
                     })
                     .collect();
-                Frame::Array(frames)
+                Frame::Array(frames.into())
             }
             Err(e) => Frame::Error(Bytes::from(e)),
         }
@@ -1128,7 +1128,7 @@ pub fn xclaim(db: &mut Database, args: &[Frame]) -> Frame {
 
     let stream = match db.get_stream_mut(key) {
         Ok(Some(s)) => s,
-        Ok(None) => return Frame::Array(vec![]),
+        Ok(None) => return Frame::Array(framevec![]),
         Err(e) => return e,
     };
 
@@ -1138,7 +1138,7 @@ pub fn xclaim(db: &mut Database, args: &[Frame]) -> Frame {
                 .iter()
                 .map(|(id, fields)| format_entry(*id, fields))
                 .collect();
-            Frame::Array(frames)
+            Frame::Array(frames.into())
         }
         Err(e) => Frame::Error(Bytes::from(e)),
     }
@@ -1212,10 +1212,10 @@ pub fn xautoclaim(db: &mut Database, args: &[Frame]) -> Frame {
                 .iter()
                 .map(|id| Frame::BulkString(id.to_bytes()))
                 .collect();
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(next_id.to_bytes()),
-                Frame::Array(claimed_frames),
-                Frame::Array(deleted_frames),
+                Frame::Array(claimed_frames.into()),
+                Frame::Array(deleted_frames.into()),
             ])
         }
         Err(e) => Frame::Error(Bytes::from(e)),
@@ -1250,7 +1250,7 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
             format_entry(id, fields)
         });
 
-        Frame::Array(vec![
+        Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"length")),
             Frame::Integer(stream.length as i64),
             Frame::BulkString(Bytes::from_static(b"radix-tree-keys")),
@@ -1274,7 +1274,7 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
         };
 
         let groups: Vec<Frame> = stream.groups.iter().map(|(name, group)| {
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"name")),
                 Frame::BulkString(name.clone()),
                 Frame::BulkString(Bytes::from_static(b"consumers")),
@@ -1285,7 +1285,7 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::BulkString(group.last_delivered_id.to_bytes()),
             ])
         }).collect();
-        Frame::Array(groups)
+        Frame::Array(groups.into())
     } else if subcmd.eq_ignore_ascii_case(b"CONSUMERS") {
         if args.len() < 3 {
             return err_wrong_args("XINFO CONSUMERS");
@@ -1307,7 +1307,7 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
         let now = crate::storage::entry::current_time_ms();
         let consumers: Vec<Frame> = group.consumers.iter().map(|(name, c)| {
             let idle = now.saturating_sub(c.seen_time);
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"name")),
                 Frame::BulkString(name.clone()),
                 Frame::BulkString(Bytes::from_static(b"pending")),
@@ -1316,7 +1316,7 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Integer(idle as i64),
             ])
         }).collect();
-        Frame::Array(consumers)
+        Frame::Array(consumers.into())
     } else {
         Frame::Error(Bytes::from_static(
             b"ERR 'XINFO' command 'UNKNOWN' not recognized",
@@ -1619,7 +1619,7 @@ mod tests {
         let mut db = Database::new();
         let args = make_args(&[b"nostream", b"-", b"+"]);
         let result = xrange(&mut db, &args);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     #[test]

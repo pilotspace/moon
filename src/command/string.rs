@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::storage::entry::{current_time_ms, Entry};
 use crate::storage::Database;
-
+use crate::framevec;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -238,7 +238,7 @@ pub fn mget(db: &mut Database, args: &[Frame]) -> Frame {
             None => results.push(Frame::Null),
         }
     }
-    Frame::Array(results)
+    Frame::Array(results.into())
 }
 
 /// MSET command handler.
@@ -846,7 +846,7 @@ pub fn mget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             None => results.push(Frame::Null),
         }
     }
-    Frame::Array(results)
+    Frame::Array(results.into())
 }
 
 /// STRLEN (read-only).
@@ -1028,7 +1028,7 @@ mod tests {
         let result = mget(&mut db, &[bs(b"k1"), bs(b"k2"), bs(b"k3")]);
         assert_eq!(
             result,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"v1")),
                 Frame::Null,
                 Frame::BulkString(Bytes::from_static(b"v3")),

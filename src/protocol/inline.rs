@@ -2,7 +2,7 @@ use memchr::{memchr, memchr2};
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::frame::{Frame, ParseError};
+use super::frame::{Frame, FrameVec, ParseError};
 
 /// Parse an inline command from the buffer.
 ///
@@ -24,7 +24,7 @@ pub fn parse_inline(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
     let line = &buf[..crlf_pos];
 
     // Split by whitespace (spaces and tabs) using SIMD, filtering empty slices
-    let mut args: Vec<Frame> = Vec::new();
+    let mut args = FrameVec::new();
     let mut start = 0;
     while start < line.len() {
         // Skip whitespace
@@ -87,6 +87,7 @@ fn find_crlf_position(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framevec;
 
     fn parse_inline_bytes(input: &[u8]) -> Result<Option<Frame>, ParseError> {
         let mut buf = BytesMut::from(input);
@@ -98,7 +99,7 @@ mod tests {
         let result = parse_inline_bytes(b"PING\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
     }
 
@@ -107,7 +108,7 @@ mod tests {
         let result = parse_inline_bytes(b"SET key value\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"SET")),
                 Frame::BulkString(Bytes::from_static(b"key")),
                 Frame::BulkString(Bytes::from_static(b"value")),
@@ -120,7 +121,7 @@ mod tests {
         let result = parse_inline_bytes(b"SET  key  value\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"SET")),
                 Frame::BulkString(Bytes::from_static(b"key")),
                 Frame::BulkString(Bytes::from_static(b"value")),
@@ -152,7 +153,7 @@ mod tests {
         let frame1 = parse_inline(&mut buf).unwrap().unwrap();
         assert_eq!(
             frame1,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"GET")),
                 Frame::BulkString(Bytes::from_static(b"key")),
             ])
@@ -160,7 +161,7 @@ mod tests {
         let frame2 = parse_inline(&mut buf).unwrap().unwrap();
         assert_eq!(
             frame2,
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
     }
 
@@ -169,7 +170,7 @@ mod tests {
         let result = parse_inline_bytes(b"  PING\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
     }
 
@@ -178,7 +179,7 @@ mod tests {
         let result = parse_inline_bytes(b"SET\tkey\tvalue\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"SET")),
                 Frame::BulkString(Bytes::from_static(b"key")),
                 Frame::BulkString(Bytes::from_static(b"value")),

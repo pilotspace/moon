@@ -6,7 +6,7 @@ use crate::acl::{AclLog, AclLogEntry, AclTable, CommandPermissions};
 use crate::acl::rules::get_category_commands;
 use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
-
+use crate::framevec;
 fn extract_str(frame: &Frame) -> Option<&str> {
     match frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => std::str::from_utf8(b).ok(),
@@ -55,7 +55,7 @@ pub fn handle_acl(
                     Frame::BulkString(Bytes::from(line))
                 })
                 .collect();
-            Frame::Array(lines)
+            Frame::Array(lines.into())
         }
 
         "GETUSER" => {
@@ -124,17 +124,17 @@ pub fn handle_acl(
                             parts.join(" ")
                         }
                     };
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::BulkString(Bytes::from_static(b"username")),
                         Frame::BulkString(Bytes::from(user.username.clone())),
                         Frame::BulkString(Bytes::from_static(b"flags")),
-                        Frame::Array(flags),
+                        Frame::Array(flags.into()),
                         Frame::BulkString(Bytes::from_static(b"passwords")),
-                        Frame::Array(passwords),
+                        Frame::Array(passwords.into()),
                         Frame::BulkString(Bytes::from_static(b"keys")),
-                        Frame::Array(keys),
+                        Frame::Array(keys.into()),
                         Frame::BulkString(Bytes::from_static(b"channels")),
-                        Frame::Array(channels),
+                        Frame::Array(channels.into()),
                         Frame::BulkString(Bytes::from_static(b"commands")),
                         Frame::BulkString(Bytes::from(commands)),
                     ])
@@ -326,7 +326,7 @@ pub fn handle_acl(
 }
 
 fn log_entry_to_frame(entry: &AclLogEntry) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"reason")),
         Frame::BulkString(Bytes::from(entry.reason.clone())),
         Frame::BulkString(Bytes::from_static(b"object")),

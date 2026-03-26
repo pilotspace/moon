@@ -92,7 +92,7 @@ impl Encoder<Frame> for RespCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use crate::framevec;    use bytes::Bytes;
 
     #[test]
     fn test_decode_frame_simple_string() {
@@ -142,7 +142,7 @@ mod tests {
         let frame = codec.decode_frame(&mut buf).unwrap().unwrap();
         assert_eq!(
             frame,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"PING")),
                 Frame::BulkString(Bytes::from_static(b"hello")),
             ])

@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use mlua::prelude::*;
 
-use crate::protocol::Frame;
-
+use crate::protocol::{Frame, FrameVec};
+use crate::framevec;
 /// Convert a Lua value to a Redis Frame (Lua -> RESP2 conversion).
 ///
 /// Redis-compatible conversion table:
@@ -35,7 +35,7 @@ pub fn lua_value_to_frame(lua: &Lua, value: &LuaValue) -> mlua::Result<Frame> {
                 return Ok(Frame::Error(Bytes::copy_from_slice(&e.as_bytes())));
             }
             // Array table: iterate integer keys 1, 2, 3... stopping at first nil
-            let mut items = Vec::new();
+            let mut items = FrameVec::new();
             let mut i = 1i64;
             loop {
                 let val: LuaValue = t.get(i)?;
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn test_frame_array_to_lua() {
         let lua = Lua::new();
-        let arr = Frame::Array(vec![Frame::Integer(1), Frame::Integer(2)]);
+        let arr = Frame::Array(framevec![Frame::Integer(1), Frame::Integer(2)]);
         let val = frame_to_lua_value(&lua, &arr).unwrap();
         match val {
             LuaValue::Table(t) => {

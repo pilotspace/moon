@@ -66,7 +66,7 @@ pub fn config_get(
         }
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// Handle CONFIG SET for runtime-mutable parameters.

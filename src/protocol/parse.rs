@@ -3,7 +3,7 @@ use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::frame::{Frame, ParseConfig, ParseError};
+use super::frame::{Frame, FrameVec, ParseConfig, ParseError};
 use super::inline;
 
 /// Attempt to parse one RESP2 frame from the buffer.
@@ -128,7 +128,7 @@ fn parse_single_frame_zc(
                     offset: *pos,
                 });
             }
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame_zc(buf, pos, config, depth + 1)?);
             }
@@ -149,7 +149,7 @@ fn parse_single_frame_zc(
         b'~' => {
             let count = read_decimal_zc(buf, pos)?;
             let count = count as usize;
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame_zc(buf, pos, config, depth + 1)?);
             }
@@ -204,7 +204,7 @@ fn parse_single_frame_zc(
         }
         b'>' => {
             let count = read_decimal_zc(buf, pos)? as usize;
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame_zc(buf, pos, config, depth + 1)?);
             }
@@ -285,7 +285,7 @@ fn parse_frame_zerocopy(
                 return Frame::Null;
             }
             let count = count as usize;
-            let mut items = Vec::with_capacity(count.min(config.max_array_length));
+            let mut items = FrameVec::with_capacity(count.min(config.max_array_length));
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
@@ -311,7 +311,7 @@ fn parse_frame_zerocopy(
             let line = &buf[*pos..crlf];
             let count = atoi::atoi::<i64>(line).unwrap() as usize;
             *pos = crlf + 2;
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
@@ -363,7 +363,7 @@ fn parse_frame_zerocopy(
             let line = &buf[*pos..crlf];
             let count = atoi::atoi::<i64>(line).unwrap() as usize;
             *pos = crlf + 2;
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
@@ -698,7 +698,7 @@ fn parse_single_frame(
                     offset: *pos,
                 });
             }
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame(buf, pos, config, depth + 1)?);
             }
@@ -845,7 +845,7 @@ fn parse_single_frame(
                     offset: *pos,
                 });
             }
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame(buf, pos, config, depth + 1)?);
             }
@@ -870,7 +870,7 @@ fn parse_single_frame(
                     offset: *pos,
                 });
             }
-            let mut items = Vec::with_capacity(count);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame(buf, pos, config, depth + 1)?);
             }
@@ -886,6 +886,7 @@ fn parse_single_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framevec;
 
     fn parse_bytes(input: &[u8]) -> Result<Option<Frame>, ParseError> {
         let mut buf = BytesMut::from(input);
@@ -989,7 +990,7 @@ mod tests {
     #[test]
     fn test_parse_empty_array() {
         let result = parse_bytes(b"*0\r\n").unwrap().unwrap();
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     // === Array tests ===
@@ -1001,7 +1002,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"foo")),
                 Frame::BulkString(Bytes::from_static(b"bar")),
             ])
@@ -1013,7 +1014,7 @@ mod tests {
         let result = parse_bytes(b"*1\r\n*1\r\n:1\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::Array(vec![Frame::Integer(1)])])
+            Frame::Array(framevec![Frame::Array(framevec![Frame::Integer(1)])])
         );
     }
 
@@ -1024,7 +1025,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"hey")),
                 Frame::Null,
                 Frame::BulkString(Bytes::from_static(b"foo")),
@@ -1069,7 +1070,7 @@ mod tests {
         let result = parse_bytes(b"!foo\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"!foo"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"!foo"))])
         );
     }
 
@@ -1133,7 +1134,7 @@ mod tests {
         let result = parse_bytes(b"PING\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
     }
 
@@ -1148,7 +1149,7 @@ mod tests {
         let result = parse_bytes(b"*1\r\n$4\r\nPING\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"PING"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
         );
     }
 
@@ -1240,7 +1241,7 @@ mod tests {
         let result = parse_bytes(b"~3\r\n+a\r\n+b\r\n+c\r\n").unwrap().unwrap();
         assert_eq!(
             result,
-            Frame::Set(vec![
+            Frame::Set(framevec![
                 Frame::SimpleString(Bytes::from_static(b"a")),
                 Frame::SimpleString(Bytes::from_static(b"b")),
                 Frame::SimpleString(Bytes::from_static(b"c")),
@@ -1255,9 +1256,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Frame::Push(vec![
+            Frame::Push(framevec![
                 Frame::BulkString(Bytes::from_static(b"invalidate")),
-                Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"foo"))]),
+                Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"foo"))]),
             ])
         );
     }

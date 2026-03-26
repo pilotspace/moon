@@ -13,6 +13,7 @@ atoi = "2.0"
 bumpalo = { version = "3.20", features = ["collections"] }
 bytes = "1.10"
 memchr = "2.8"
+smallvec = { version = "1.15", features = ["union"] }
 thiserror = "2.0"
 mimalloc = { version = "0.1", default-features = false }
 crossbeam-utils = "0.8"

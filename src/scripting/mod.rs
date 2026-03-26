@@ -163,7 +163,7 @@ pub fn handle_script_subcommand(
                 Frame::Integer(if exists { 1 } else { 0 })
             })
             .collect();
-        (Frame::Array(results), None)
+        (Frame::Array(results.into()), None)
     } else if sub.eq_ignore_ascii_case(b"FLUSH") {
         cache.borrow_mut().flush();
         (Frame::SimpleString(Bytes::from_static(b"OK")), None)

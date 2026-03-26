@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::blocking::{BlockedCommand, BlockingRegistry, Direction};
 use crate::protocol::Frame;
 use crate::storage::Database;
-
+use crate::framevec;
 /// Called after LPUSH/RPUSH successfully adds elements to a list key.
 /// Pops the first waiter (FIFO) and executes the appropriate pop operation.
 /// Returns true if a blocked client was woken (element was consumed by the waiter).
@@ -29,7 +29,7 @@ pub fn try_wake_list_waiter(
                 // Pop from left, return [key, value]
                 let val = db.list_pop_front(key);
                 val.map(|v| {
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::BulkString(key.clone()),
                         Frame::BulkString(v),
                     ])
@@ -39,7 +39,7 @@ pub fn try_wake_list_waiter(
                 // Pop from right, return [key, value]
                 let val = db.list_pop_back(key);
                 val.map(|v| {
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::BulkString(key.clone()),
                         Frame::BulkString(v),
                     ])
@@ -100,7 +100,7 @@ pub fn try_wake_zset_waiter(
             BlockedCommand::BZPopMin => {
                 // Pop min, return [key, member, score]
                 db.zset_pop_min(key).map(|(member, score)| {
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::BulkString(key.clone()),
                         Frame::BulkString(member),
                         Frame::BulkString(Bytes::from(format_score(score))),
@@ -110,7 +110,7 @@ pub fn try_wake_zset_waiter(
             BlockedCommand::BZPopMax => {
                 // Pop max, return [key, member, score]
                 db.zset_pop_max(key).map(|(member, score)| {
-                    Frame::Array(vec![
+                    Frame::Array(framevec![
                         Frame::BulkString(key.clone()),
                         Frame::BulkString(member),
                         Frame::BulkString(Bytes::from(format_score(score))),
@@ -170,10 +170,10 @@ pub fn try_wake_stream_waiter(
                             let entry_frames: Vec<crate::protocol::Frame> = entries.iter()
                                 .map(|(id, fields)| format_entry(*id, fields))
                                 .collect();
-                            Some(crate::protocol::Frame::Array(vec![
-                                crate::protocol::Frame::Array(vec![
+                            Some(crate::protocol::Frame::Array(framevec![
+                                crate::protocol::Frame::Array(framevec![
                                     crate::protocol::Frame::BulkString(key.clone()),
-                                    crate::protocol::Frame::Array(entry_frames),
+                                    crate::protocol::Frame::Array(entry_frames.into()),
                                 ])
                             ]))
                         } else { None }
@@ -187,10 +187,10 @@ pub fn try_wake_stream_waiter(
                             let entry_frames: Vec<crate::protocol::Frame> = entries.iter()
                                 .map(|(id, fields)| format_entry(*id, fields))
                                 .collect();
-                            Some(crate::protocol::Frame::Array(vec![
-                                crate::protocol::Frame::Array(vec![
+                            Some(crate::protocol::Frame::Array(framevec![
+                                crate::protocol::Frame::Array(framevec![
                                     crate::protocol::Frame::BulkString(key.clone()),
-                                    crate::protocol::Frame::Array(entry_frames),
+                                    crate::protocol::Frame::Array(entry_frames.into()),
                                 ])
                             ]))
                         }

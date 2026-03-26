@@ -36,7 +36,8 @@ pub fn maybe_convert_resp3(cmd: &[u8], response: Frame, proto: u8) -> Frame {
 pub fn array_to_map(frame: Frame) -> Frame {
     match frame {
         Frame::Array(items) if items.len() % 2 == 0 && !items.is_empty() => {
-            let mut pairs = Vec::with_capacity(items.len() / 2);
+            let len = items.len();
+            let mut pairs = Vec::with_capacity(len / 2);
             let mut iter = items.into_iter();
             while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
                 pairs.push((k, v));
@@ -80,10 +81,11 @@ pub fn bulk_to_double(frame: Frame) -> Frame {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::framevec;
 
     #[test]
     fn test_array_to_map() {
-        let arr = Frame::Array(vec![
+        let arr = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"k1")),
             Frame::BulkString(Bytes::from_static(b"v1")),
             Frame::BulkString(Bytes::from_static(b"k2")),
@@ -107,14 +109,14 @@ mod tests {
 
     #[test]
     fn test_array_to_map_empty_passthrough() {
-        let arr = Frame::Array(vec![]);
+        let arr = Frame::Array(framevec![]);
         let result = array_to_map(arr.clone());
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     #[test]
     fn test_array_to_set() {
-        let arr = Frame::Array(vec![
+        let arr = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"a")),
             Frame::BulkString(Bytes::from_static(b"b")),
             Frame::BulkString(Bytes::from_static(b"c")),
@@ -122,7 +124,7 @@ mod tests {
         let result = array_to_set(arr);
         assert_eq!(
             result,
-            Frame::Set(vec![
+            Frame::Set(framevec![
                 Frame::BulkString(Bytes::from_static(b"a")),
                 Frame::BulkString(Bytes::from_static(b"b")),
                 Frame::BulkString(Bytes::from_static(b"c")),
@@ -162,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_maybe_convert_hgetall_resp3() {
-        let arr = Frame::Array(vec![
+        let arr = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"k")),
             Frame::BulkString(Bytes::from_static(b"v")),
         ]);
@@ -178,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_maybe_convert_hgetall_resp2_unchanged() {
-        let arr = Frame::Array(vec![
+        let arr = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"k")),
             Frame::BulkString(Bytes::from_static(b"v")),
         ]);
@@ -188,14 +190,14 @@ mod tests {
 
     #[test]
     fn test_maybe_convert_smembers_resp3() {
-        let arr = Frame::Array(vec![
+        let arr = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"a")),
             Frame::BulkString(Bytes::from_static(b"b")),
         ]);
         let result = maybe_convert_resp3(b"SMEMBERS", arr, 3);
         assert_eq!(
             result,
-            Frame::Set(vec![
+            Frame::Set(framevec![
                 Frame::BulkString(Bytes::from_static(b"a")),
                 Frame::BulkString(Bytes::from_static(b"b")),
             ])

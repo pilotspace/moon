@@ -7,7 +7,7 @@ use crate::storage::bptree::BPTree;
 use crate::protocol::Frame;
 use crate::storage::db::SortedSetRef;
 use crate::storage::Database;
-
+use crate::framevec;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -544,7 +544,7 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
         db.remove(&key);
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// ZPOPMAX key [count]
@@ -594,7 +594,7 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
         db.remove(&key);
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// ZSCAN key cursor [MATCH pattern] [COUNT count]
@@ -686,15 +686,15 @@ pub fn zscan(db: &mut Database, args: &[Frame]) -> Frame {
                 Bytes::from(pos.to_string())
             };
 
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(next_cursor),
-                Frame::Array(result_items),
+                Frame::Array(result_items.into()),
             ])
         }
         Ok(None) => {
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"0")),
-                Frame::Array(vec![]),
+                Frame::Array(framevec![]),
             ])
         }
         Err(e) => e,
@@ -819,7 +819,7 @@ pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
                 zrange_by_rank(scores, &min_arg, &max_arg, rev, withscores)
             }
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -833,7 +833,7 @@ fn zrange_by_rank(
 ) -> Frame {
     let total = scores.len() as i64;
     if total == 0 {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     let start_raw: i64 = match std::str::from_utf8(min_arg).ok().and_then(|s| s.parse().ok()) {
@@ -850,7 +850,7 @@ fn zrange_by_rank(
     let stop = if stop_raw < 0 { (total + stop_raw).max(0) } else { stop_raw.min(total - 1) };
 
     if start > stop {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     let mut result = Vec::new();
@@ -876,7 +876,7 @@ fn zrange_by_rank(
         }
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 fn zrange_by_score(
@@ -953,7 +953,7 @@ fn zrange_by_score(
         }
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 fn zrange_by_lex(
@@ -1018,7 +1018,7 @@ fn zrange_by_lex(
         }
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// ZREVRANGE key start stop [WITHSCORES]
@@ -1048,7 +1048,7 @@ pub fn zrevrange(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some((_members, scores))) => {
             zrange_by_rank(scores, &start_arg, &stop_arg, true, withscores)
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1114,7 +1114,7 @@ pub fn zrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some((members, scores))) => {
             zrange_by_score(members, scores, &min_arg, &max_arg, false, withscores, limit_offset, limit_count)
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1183,7 +1183,7 @@ pub fn zrevrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
             // then reverse the result
             zrange_by_score(members, scores, &min_arg, &max_arg, true, withscores, limit_offset, limit_count)
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1474,7 +1474,7 @@ fn zrange_from_entries(
 ) -> Frame {
     let total = entries.len() as i64;
     if total == 0 {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     if by_score {
@@ -1491,7 +1491,7 @@ fn zrange_from_entries(
             if withscores { v.push(Frame::BulkString(Bytes::from(format_score(*score)))); }
             v
         }).collect();
-        Frame::Array(result)
+        Frame::Array(result.into())
     } else if by_lex {
         let min_bound = match parse_lex_bound(min_arg) { Ok(b) => b, Err(e) => return e };
         let max_bound = match parse_lex_bound(max_arg) { Ok(b) => b, Err(e) => return e };
@@ -1506,7 +1506,7 @@ fn zrange_from_entries(
             if withscores { v.push(Frame::BulkString(Bytes::from(format_score(*score)))); }
             v
         }).collect();
-        Frame::Array(result)
+        Frame::Array(result.into())
     } else {
         // By rank
         let start_raw: i64 = match std::str::from_utf8(min_arg).ok().and_then(|s| s.parse().ok()) {
@@ -1520,7 +1520,7 @@ fn zrange_from_entries(
         let start = if start_raw < 0 { (total + start_raw).max(0) as usize } else { start_raw as usize };
         let stop = if stop_raw < 0 { (total + stop_raw).max(0) as usize } else { (stop_raw as usize).min(entries.len().saturating_sub(1)) };
         if start > stop || start >= entries.len() {
-            return Frame::Array(vec![]);
+            return Frame::Array(framevec![]);
         }
         let slice: Vec<&(Bytes, f64)> = if rev {
             entries[start..=stop].iter().rev().collect()
@@ -1532,7 +1532,7 @@ fn zrange_from_entries(
             if withscores { v.push(Frame::BulkString(Bytes::from(format_score(*score)))); }
             v
         }).collect();
-        Frame::Array(result)
+        Frame::Array(result.into())
     }
 }
 
@@ -1677,7 +1677,7 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 }
             }
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1700,7 +1700,7 @@ pub fn zrevrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 }
             }
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1739,7 +1739,7 @@ pub fn zrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fra
                 }
             }
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1778,7 +1778,7 @@ pub fn zrevrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> 
                 }
             }
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -1890,9 +1890,9 @@ pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 pos += 1;
             }
             let next_cursor = if pos >= all_members.len() { Bytes::from_static(b"0") } else { Bytes::from(pos.to_string()) };
-            Frame::Array(vec![Frame::BulkString(next_cursor), Frame::Array(result_items)])
+            Frame::Array(framevec![Frame::BulkString(next_cursor), Frame::Array(result_items.into())])
         }
-        Ok(None) => Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"0")), Frame::Array(vec![])]),
+        Ok(None) => Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"0")), Frame::Array(framevec![])]),
         Err(e) => e,
     }
 }

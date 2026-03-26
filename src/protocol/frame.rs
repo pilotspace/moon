@@ -1,6 +1,104 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
+use smallvec::SmallVec;
 use thiserror::Error;
+
+/// SmallVec-backed Frame collection, boxed for recursive type safety.
+///
+/// Frame is recursive (Array contains Frames), so inline SmallVec would create
+/// an infinitely-sized type. Boxing provides the indirection the compiler needs
+/// while SmallVec provides inline storage for up to 4 elements within the Box
+/// allocation -- no separate data pointer needed for small arrays.
+///
+/// For Redis commands with <= 4 args (GET=2, SET=3, HSET=4 -- 95%+ of commands),
+/// FrameVec uses a single fixed-size heap allocation (~300 bytes) with no
+/// additional data allocation, vs Vec's variable-size allocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameVec(Box<SmallVec<[Frame; 4]>>);
+
+impl FrameVec {
+    #[inline]
+    pub fn new() -> Self {
+        Self(Box::new(SmallVec::new()))
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self(Box::new(SmallVec::with_capacity(cap)))
+    }
+
+    #[inline]
+    pub fn from_vec(v: Vec<Frame>) -> Self {
+        Self(Box::new(SmallVec::from_vec(v)))
+    }
+
+    #[inline]
+    pub fn from_elem(elem: Frame) -> Self {
+        Self(Box::new(smallvec::smallvec![elem]))
+    }
+}
+
+impl Default for FrameVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for FrameVec {
+    type Target = SmallVec<[Frame; 4]>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FrameVec {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl IntoIterator for FrameVec {
+    type Item = Frame;
+    type IntoIter = smallvec::IntoIter<[Frame; 4]>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        (*self.0).into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FrameVec {
+    type Item = &'a Frame;
+    type IntoIter = std::slice::Iter<'a, Frame>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl FromIterator<Frame> for FrameVec {
+    fn from_iter<I: IntoIterator<Item = Frame>>(iter: I) -> Self {
+        Self(Box::new(iter.into_iter().collect()))
+    }
+}
+
+impl From<Vec<Frame>> for FrameVec {
+    fn from(v: Vec<Frame>) -> Self {
+        Self::from_vec(v)
+    }
+}
+
+/// Create a `FrameVec` from a list of `Frame` values, analogous to `vec![]`.
+#[macro_export]
+macro_rules! framevec {
+    () => {
+        $crate::protocol::FrameVec::new()
+    };
+    ($($x:expr),+ $(,)?) => {
+        $crate::protocol::FrameVec::from_vec(vec![$($x),+])
+    };
+}
 
 /// Default maximum size for bulk strings (512 MB).
 pub const DEFAULT_MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
@@ -27,7 +125,7 @@ pub enum Frame {
     /// `$<len>\r\n<data>\r\n` -- Binary-safe string
     BulkString(Bytes),
     /// `*<count>\r\n<elements...>` -- Ordered collection of frames
-    Array(Vec<Frame>),
+    Array(FrameVec),
     /// `$-1\r\n` (RESP2) or `_\r\n` (RESP3) -- Null value
     Null,
 
@@ -35,7 +133,7 @@ pub enum Frame {
     /// `%<count>\r\n<key><value>...` -- Key-value map
     Map(Vec<(Frame, Frame)>),
     /// `~<count>\r\n<elements...>` -- Unordered set of frames
-    Set(Vec<Frame>),
+    Set(FrameVec),
     /// `,<double>\r\n` -- IEEE 754 double-precision float
     Double(f64),
     /// `#t\r\n` or `#f\r\n` -- Boolean value
@@ -50,7 +148,7 @@ pub enum Frame {
     /// `(<number>\r\n` -- Arbitrary precision integer as bytes
     BigNumber(Bytes),
     /// `><count>\r\n<elements...>` -- Push data (server-initiated)
-    Push(Vec<Frame>),
+    Push(FrameVec),
     /// Already-serialized RESP data -- written directly to output, no re-serialization.
     /// Used by hot-path commands (GET) to skip Frame construction + serialize overhead.
     PreSerialized(Bytes),
@@ -154,6 +252,16 @@ impl Default for ParseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framevec;
+
+    #[test]
+    fn frame_size_measurement() {
+        let size = std::mem::size_of::<Frame>();
+        println!("Frame size after FrameVec change: {} bytes (was 72)", size);
+        println!("FrameVec size: {} bytes", std::mem::size_of::<FrameVec>());
+        // Frame should stay small since FrameVec wraps Box (8 byte pointer)
+        assert!(size <= 72, "Frame size {} exceeds 72 bytes", size);
+    }
 
     #[test]
     fn test_frame_simple_string_debug_clone_partialeq() {
@@ -172,8 +280,8 @@ mod tests {
 
     #[test]
     fn test_frame_empty_array_is_valid() {
-        let frame = Frame::Array(vec![]);
-        assert_eq!(frame, Frame::Array(vec![]));
+        let frame = Frame::Array(framevec![]);
+        assert_eq!(frame, Frame::Array(framevec![]));
     }
 
     #[test]

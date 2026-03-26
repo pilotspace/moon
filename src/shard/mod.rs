@@ -1525,7 +1525,7 @@ impl Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use crate::framevec;    use bytes::Bytes;
     use ringbuf::HeapRb;
     use ringbuf::traits::{Producer, Split};
     use crate::protocol::Frame;
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_extract_command_static_ping() {
-        let frame = Frame::Array(vec![
+        let frame = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"PING")),
         ]);
         let (cmd, args) = Shard::extract_command_static(&frame).unwrap();
@@ -1635,7 +1635,7 @@ mod tests {
 
     #[test]
     fn test_extract_command_static_with_args() {
-        let frame = Frame::Array(vec![
+        let frame = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"SET")),
             Frame::BulkString(Bytes::from_static(b"key")),
             Frame::BulkString(Bytes::from_static(b"value")),
@@ -1652,11 +1652,11 @@ mod tests {
         assert!(Shard::extract_command_static(&frame).is_none());
 
         // Empty array
-        let frame = Frame::Array(vec![]);
+        let frame = Frame::Array(framevec![]);
         assert!(Shard::extract_command_static(&frame).is_none());
 
         // Array with non-string first element
-        let frame = Frame::Array(vec![Frame::Integer(42)]);
+        let frame = Frame::Array(framevec![Frame::Integer(42)]);
         assert!(Shard::extract_command_static(&frame).is_none());
     }
 

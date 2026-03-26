@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 use crate::storage::Database;
-
+use crate::framevec;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -158,7 +158,7 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get_list(&key) {
         Ok(None) => {
             return if args.len() == 2 {
-                Frame::Array(vec![])
+                Frame::Array(framevec![])
             } else {
                 Frame::Null
             };
@@ -206,7 +206,7 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
                     items.push(Frame::BulkString(v));
                 }
             }
-            Frame::Array(items)
+            Frame::Array(items.into())
         }
     };
 
@@ -231,7 +231,7 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get_list(&key) {
         Ok(None) => {
             return if args.len() == 2 {
-                Frame::Array(vec![])
+                Frame::Array(framevec![])
             } else {
                 Frame::Null
             };
@@ -276,7 +276,7 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
                     items.push(Frame::BulkString(v));
                 }
             }
-            Frame::Array(items)
+            Frame::Array(items.into())
         }
     };
 
@@ -331,7 +331,7 @@ pub fn lrange(db: &mut Database, args: &[Frame]) -> Frame {
 
     let list = match db.get_list(key) {
         Ok(Some(l)) => l,
-        Ok(None) => return Frame::Array(vec![]),
+        Ok(None) => return Frame::Array(framevec![]),
         Err(e) => return e,
     };
 
@@ -349,13 +349,13 @@ pub fn lrange(db: &mut Database, args: &[Frame]) -> Frame {
         e = len - 1;
     }
     if s > e || s >= len {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
 
     let items: Vec<Frame> = (s as usize..=e as usize)
         .map(|i| Frame::BulkString(list[i].clone()))
         .collect();
-    Frame::Array(items)
+    Frame::Array(items.into())
 }
 
 /// LINDEX key index
@@ -697,7 +697,7 @@ pub fn lpos(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some(l)) => l,
         Ok(None) => {
             return if count.is_some() {
-                Frame::Array(vec![])
+                Frame::Array(framevec![])
             } else {
                 Frame::Null
             };
@@ -815,7 +815,7 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let lref = match db.get_list_ref_if_alive(key, now_ms) {
         Ok(Some(l)) => l,
-        Ok(None) => return Frame::Array(vec![]),
+        Ok(None) => return Frame::Array(framevec![]),
         Err(e) => return e,
     };
     let len = lref.len() as i64;
@@ -824,13 +824,13 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if s < 0 { s = 0; }
     if e >= len { e = len - 1; }
     if s > e || s >= len {
-        return Frame::Array(vec![]);
+        return Frame::Array(framevec![]);
     }
     let items: Vec<Frame> = lref.range(s as usize, e as usize)
         .into_iter()
         .map(Frame::BulkString)
         .collect();
-    Frame::Array(items)
+    Frame::Array(items.into())
 }
 
 /// LINDEX (read-only).
@@ -924,7 +924,7 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Ok(Some(l)) => l,
         Ok(None) => {
             return if count.is_some() {
-                Frame::Array(vec![])
+                Frame::Array(framevec![])
             } else {
                 Frame::Null
             };
@@ -1078,7 +1078,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"c"), bs(b"b"), bs(b"a")])
+            Frame::Array(framevec![bs(b"c"), bs(b"b"), bs(b"a")])
         );
     }
 
@@ -1099,7 +1099,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"a"), bs(b"b"), bs(b"c")])
+            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")])
         );
     }
 
@@ -1120,7 +1120,7 @@ mod tests {
         let result = lpop(&mut db, &[bs(b"mylist"), bs(b"2")]);
         assert_eq!(
             result,
-            Frame::Array(vec![bs(b"a"), bs(b"b")])
+            Frame::Array(framevec![bs(b"a"), bs(b"b")])
         );
     }
 
@@ -1156,7 +1156,7 @@ mod tests {
         let result = rpop(&mut db, &[bs(b"mylist"), bs(b"2")]);
         assert_eq!(
             result,
-            Frame::Array(vec![bs(b"c"), bs(b"b")])
+            Frame::Array(framevec![bs(b"c"), bs(b"b")])
         );
     }
 
@@ -1193,7 +1193,7 @@ mod tests {
         let result = lrange(&mut db, &[bs(b"mylist"), bs(b"1"), bs(b"2")]);
         assert_eq!(
             result,
-            Frame::Array(vec![bs(b"b"), bs(b"c")])
+            Frame::Array(framevec![bs(b"b"), bs(b"c")])
         );
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
         let result = lrange(&mut db, &[bs(b"mylist"), bs(b"-3"), bs(b"-1")]);
         assert_eq!(
             result,
-            Frame::Array(vec![bs(b"b"), bs(b"c"), bs(b"d")])
+            Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"d")])
         );
     }
 
@@ -1215,7 +1215,7 @@ mod tests {
         let result = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"100")]);
         assert_eq!(
             result,
-            Frame::Array(vec![bs(b"a"), bs(b"b"), bs(b"c")])
+            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")])
         );
     }
 
@@ -1223,7 +1223,7 @@ mod tests {
     fn test_lrange_missing_key() {
         let mut db = Database::new();
         let result = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     // --- LINDEX tests ---
@@ -1283,7 +1283,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"a"), bs(b"x"), bs(b"b"), bs(b"c")])
+            Frame::Array(framevec![bs(b"a"), bs(b"x"), bs(b"b"), bs(b"c")])
         );
     }
 
@@ -1296,7 +1296,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"a"), bs(b"b"), bs(b"x"), bs(b"c")])
+            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"x"), bs(b"c")])
         );
     }
 
@@ -1332,7 +1332,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"b"), bs(b"c"), bs(b"a")])
+            Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"a")])
         );
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"a"), bs(b"b"), bs(b"c")])
+            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")])
         );
     }
 
@@ -1356,7 +1356,7 @@ mod tests {
         let result = lrem(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"a")]);
         assert_eq!(result, Frame::Integer(3));
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(range, Frame::Array(vec![bs(b"b"), bs(b"c")]));
+        assert_eq!(range, Frame::Array(framevec![bs(b"b"), bs(b"c")]));
     }
 
     #[test]
@@ -1378,7 +1378,7 @@ mod tests {
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             range,
-            Frame::Array(vec![bs(b"b"), bs(b"c"), bs(b"d")])
+            Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"d")])
         );
     }
 
@@ -1423,7 +1423,7 @@ mod tests {
         let result = lpos(&mut db, &[bs(b"mylist"), bs(b"b"), bs(b"COUNT"), bs(b"0")]);
         assert_eq!(
             result,
-            Frame::Array(vec![Frame::Integer(1), Frame::Integer(3)])
+            Frame::Array(framevec![Frame::Integer(1), Frame::Integer(3)])
         );
     }
 
@@ -1432,7 +1432,7 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c", b"b", b"d"]);
         let result = lpos(&mut db, &[bs(b"mylist"), bs(b"b"), bs(b"COUNT"), bs(b"1")]);
-        assert_eq!(result, Frame::Array(vec![Frame::Integer(1)]));
+        assert_eq!(result, Frame::Array(framevec![Frame::Integer(1)]));
     }
 
     #[test]
@@ -1444,7 +1444,7 @@ mod tests {
             &mut db,
             &[bs(b"mylist"), bs(b"b"), bs(b"MAXLEN"), bs(b"2"), bs(b"COUNT"), bs(b"0")],
         );
-        assert_eq!(result, Frame::Array(vec![Frame::Integer(1)]));
+        assert_eq!(result, Frame::Array(framevec![Frame::Integer(1)]));
     }
 
     // --- WRONGTYPE test ---

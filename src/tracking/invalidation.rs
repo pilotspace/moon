@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use crate::protocol::Frame;
-
+use crate::framevec;
 /// Construct an invalidation Push frame for the given keys.
 /// Wire format: >2\r\n$10\r\ninvalidate\r\n*N\r\n$len\r\nkey\r\n...
 pub fn invalidation_push(keys: &[Bytes]) -> Frame {
@@ -8,9 +8,9 @@ pub fn invalidation_push(keys: &[Bytes]) -> Frame {
         .iter()
         .map(|k| Frame::BulkString(k.clone()))
         .collect();
-    Frame::Push(vec![
+    Frame::Push(framevec![
         Frame::BulkString(Bytes::from_static(b"invalidate")),
-        Frame::Array(key_frames),
+        Frame::Array(key_frames.into()),
     ])
 }
 
@@ -24,9 +24,9 @@ mod tests {
         let frame = invalidation_push(&[key.clone()]);
         assert_eq!(
             frame,
-            Frame::Push(vec![
+            Frame::Push(framevec![
                 Frame::BulkString(Bytes::from_static(b"invalidate")),
-                Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"foo"))]),
+                Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"foo"))]),
             ])
         );
     }
@@ -40,9 +40,9 @@ mod tests {
         let frame = invalidation_push(&keys);
         assert_eq!(
             frame,
-            Frame::Push(vec![
+            Frame::Push(framevec![
                 Frame::BulkString(Bytes::from_static(b"invalidate")),
-                Frame::Array(vec![
+                Frame::Array(framevec![
                     Frame::BulkString(Bytes::from_static(b"foo")),
                     Frame::BulkString(Bytes::from_static(b"bar")),
                 ]),

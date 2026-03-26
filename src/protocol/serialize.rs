@@ -233,6 +233,7 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::framevec;
 
     use super::super::frame::ParseConfig;
     use super::super::parse;
@@ -295,13 +296,13 @@ mod tests {
 
     #[test]
     fn test_serialize_empty_array() {
-        let buf = serialize_frame(&Frame::Array(vec![]));
+        let buf = serialize_frame(&Frame::Array(framevec![]));
         assert_eq!(&buf[..], b"*0\r\n");
     }
 
     #[test]
     fn test_serialize_array_of_bulk_strings() {
-        let frame = Frame::Array(vec![
+        let frame = Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"foo")),
             Frame::BulkString(Bytes::from_static(b"bar")),
         ]);
@@ -311,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_serialize_nested_array() {
-        let frame = Frame::Array(vec![Frame::Array(vec![Frame::Integer(1)])]);
+        let frame = Frame::Array(framevec![Frame::Array(framevec![Frame::Integer(1)])]);
         let buf = serialize_frame(&frame);
         assert_eq!(&buf[..], b"*1\r\n*1\r\n:1\r\n");
     }
@@ -360,8 +361,8 @@ mod tests {
 
     #[test]
     fn test_round_trip_array() {
-        round_trip(&Frame::Array(vec![])); // empty
-        round_trip(&Frame::Array(vec![
+        round_trip(&Frame::Array(framevec![])); // empty
+        round_trip(&Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"SET")),
             Frame::BulkString(Bytes::from_static(b"key")),
             Frame::BulkString(Bytes::from_static(b"value")),
@@ -370,21 +371,21 @@ mod tests {
 
     #[test]
     fn test_round_trip_nested_array() {
-        round_trip(&Frame::Array(vec![
-            Frame::Array(vec![Frame::Integer(1), Frame::Integer(2)]),
-            Frame::Array(vec![Frame::Integer(3), Frame::Integer(4)]),
+        round_trip(&Frame::Array(framevec![
+            Frame::Array(framevec![Frame::Integer(1), Frame::Integer(2)]),
+            Frame::Array(framevec![Frame::Integer(3), Frame::Integer(4)]),
         ]));
     }
 
     #[test]
     fn test_round_trip_mixed_array_with_null() {
-        round_trip(&Frame::Array(vec![
+        round_trip(&Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"hello")),
             Frame::Null,
             Frame::Integer(42),
             Frame::SimpleString(Bytes::from_static(b"OK")),
             Frame::Error(Bytes::from_static(b"ERR")),
-            Frame::Array(vec![Frame::Null, Frame::Integer(-1)]),
+            Frame::Array(framevec![Frame::Null, Frame::Integer(-1)]),
         ]));
     }
 
@@ -458,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_serialize_resp3_set() {
-        let buf = serialize_resp3_frame(&Frame::Set(vec![
+        let buf = serialize_resp3_frame(&Frame::Set(framevec![
             Frame::SimpleString(Bytes::from_static(b"a")),
             Frame::SimpleString(Bytes::from_static(b"b")),
         ]));
@@ -467,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_serialize_resp3_push() {
-        let buf = serialize_resp3_frame(&Frame::Push(vec![
+        let buf = serialize_resp3_frame(&Frame::Push(framevec![
             Frame::SimpleString(Bytes::from_static(b"a")),
             Frame::SimpleString(Bytes::from_static(b"b")),
         ]));
@@ -536,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_resp3_set() {
-        round_trip_resp3(&Frame::Set(vec![
+        round_trip_resp3(&Frame::Set(framevec![
             Frame::SimpleString(Bytes::from_static(b"a")),
             Frame::SimpleString(Bytes::from_static(b"b")),
             Frame::SimpleString(Bytes::from_static(b"c")),
@@ -545,9 +546,9 @@ mod tests {
 
     #[test]
     fn test_round_trip_resp3_push() {
-        round_trip_resp3(&Frame::Push(vec![
+        round_trip_resp3(&Frame::Push(framevec![
             Frame::BulkString(Bytes::from_static(b"invalidate")),
-            Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"foo"))]),
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"foo"))]),
         ]));
     }
 
@@ -572,7 +573,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             parsed,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::SimpleString(Bytes::from_static(b"k1")),
                 Frame::Integer(1),
                 Frame::SimpleString(Bytes::from_static(b"k2")),
@@ -583,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_resp2_downgrade_set_to_array() {
-        let frame = Frame::Set(vec![
+        let frame = Frame::Set(framevec![
             Frame::SimpleString(Bytes::from_static(b"a")),
             Frame::SimpleString(Bytes::from_static(b"b")),
         ]);
@@ -594,7 +595,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             parsed,
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::SimpleString(Bytes::from_static(b"a")),
                 Frame::SimpleString(Bytes::from_static(b"b")),
             ])

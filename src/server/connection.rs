@@ -35,7 +35,7 @@ use crate::tracking::{TrackingState, TrackingTable};
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
 use super::codec::RespCodec;
-
+use crate::framevec;
 /// Extract command name (as raw byte slice reference) and args from a Frame::Array.
 /// Returns the name without allocation -- callers use `eq_ignore_ascii_case` for matching.
 fn extract_command(frame: &Frame) -> Option<(&[u8], &[Frame])> {
@@ -272,7 +272,7 @@ pub async fn handle_connection(
                                     }
                                     _ if cmd.eq_ignore_ascii_case(b"PING") => {
                                         // In subscriber mode, PING returns Array per Redis spec
-                                        let _ = framed.send(Frame::Array(vec![
+                                        let _ = framed.send(Frame::Array(framevec![
                                             Frame::BulkString(Bytes::from_static(b"pong")),
                                             Frame::BulkString(Bytes::from_static(b"")),
                                         ])).await;
@@ -1239,7 +1239,7 @@ fn execute_transaction(
         results.push(response);
     }
 
-    (Frame::Array(results), aof_entries)
+    (Frame::Array(results.into()), aof_entries)
 }
 
 // ============================================================================
@@ -2412,7 +2412,7 @@ fn execute_transaction_sharded(
         results.push(response);
     }
 
-    Frame::Array(results)
+    Frame::Array(results.into())
 }
 
 /// Convert a blocking command to its non-blocking equivalent for MULTI/EXEC.
@@ -2450,7 +2450,7 @@ fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
             new_args.push(first_key.clone());
         }
     }
-    Frame::Array(new_args)
+    Frame::Array(new_args.into())
 }
 
 /// Handle a blocking command (BLPOP/BRPOP/BLMOVE/BZPOPMIN/BZPOPMAX).
@@ -3028,23 +3028,23 @@ fn parse_blocking_args(
 /// Try to pop data immediately (non-blocking fast path).
 fn try_immediate_pop(cmd: &[u8], db: &mut Database, key: &Bytes, args: &[Frame]) -> Option<Frame> {
     if cmd.eq_ignore_ascii_case(b"BLPOP") {
-        db.list_pop_front(key).map(|v| Frame::Array(vec![
+        db.list_pop_front(key).map(|v| Frame::Array(framevec![
             Frame::BulkString(key.clone()),
             Frame::BulkString(v),
         ]))
     } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
-        db.list_pop_back(key).map(|v| Frame::Array(vec![
+        db.list_pop_back(key).map(|v| Frame::Array(framevec![
             Frame::BulkString(key.clone()),
             Frame::BulkString(v),
         ]))
     } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
-        db.zset_pop_min(key).map(|(member, score)| Frame::Array(vec![
+        db.zset_pop_min(key).map(|(member, score)| Frame::Array(framevec![
             Frame::BulkString(key.clone()),
             Frame::BulkString(member),
             Frame::BulkString(Bytes::from(format_blocking_score(score))),
         ]))
     } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
-        db.zset_pop_max(key).map(|(member, score)| Frame::Array(vec![
+        db.zset_pop_max(key).map(|(member, score)| Frame::Array(framevec![
             Frame::BulkString(key.clone()),
             Frame::BulkString(member),
             Frame::BulkString(Bytes::from(format_blocking_score(score))),
@@ -3286,7 +3286,7 @@ pub async fn handle_connection_sharded_monoio(
                                                     }
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"PING") => {
-                                                    let resp = Frame::Array(vec![
+                                                    let resp = Frame::Array(framevec![
                                                         Frame::BulkString(Bytes::from_static(b"pong")),
                                                         Frame::BulkString(Bytes::from_static(b"")),
                                                     ]);

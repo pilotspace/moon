@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 use crate::storage::Database;
-
+use crate::framevec;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -283,7 +283,7 @@ pub fn hmget(db: &mut Database, args: &[Frame]) -> Frame {
             None => results.push(Frame::Null),
         }
     }
-    Frame::Array(results)
+    Frame::Array(results.into())
 }
 
 /// HGETALL key
@@ -304,9 +304,9 @@ pub fn hgetall(db: &mut Database, args: &[Frame]) -> Frame {
                 result.push(Frame::BulkString(field.clone()));
                 result.push(Frame::BulkString(value.clone()));
             }
-            Frame::Array(result)
+            Frame::Array(result.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -374,9 +374,9 @@ pub fn hkeys(db: &mut Database, args: &[Frame]) -> Frame {
                 .keys()
                 .map(|k| Frame::BulkString(k.clone()))
                 .collect();
-            Frame::Array(fields)
+            Frame::Array(fields.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -398,9 +398,9 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
                 .values()
                 .map(|v| Frame::BulkString(v.clone()))
                 .collect();
-            Frame::Array(values)
+            Frame::Array(values.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -613,9 +613,9 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some(m)) => m,
         Ok(None) => {
             // Key missing -- return cursor 0 with empty array
-            return Frame::Array(vec![
+            return Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"0")),
-                Frame::Array(vec![]),
+                Frame::Array(framevec![]),
             ]);
         }
         Err(e) => return e,
@@ -652,9 +652,9 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
         Bytes::from(pos.to_string())
     };
 
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(next_cursor),
-        Frame::Array(results),
+        Frame::Array(results.into()),
     ])
 }
 
@@ -715,7 +715,7 @@ pub fn hmget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             None => results.push(Frame::Null),
         }
     }
-    Frame::Array(results)
+    Frame::Array(results.into())
 }
 
 /// HGETALL (read-only).
@@ -735,9 +735,9 @@ pub fn hgetall_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 result.push(Frame::BulkString(field));
                 result.push(Frame::BulkString(value));
             }
-            Frame::Array(result)
+            Frame::Array(result.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -770,9 +770,9 @@ pub fn hkeys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(href)) => {
             let fields: Vec<Frame> = href.entries().into_iter().map(|(k, _)| Frame::BulkString(k)).collect();
-            Frame::Array(fields)
+            Frame::Array(fields.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -789,9 +789,9 @@ pub fn hvals_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(href)) => {
             let values: Vec<Frame> = href.entries().into_iter().map(|(_, v)| Frame::BulkString(v)).collect();
-            Frame::Array(values)
+            Frame::Array(values.into())
         }
-        Ok(None) => Frame::Array(vec![]),
+        Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
 }
@@ -866,9 +866,9 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             e
         }
         Ok(None) => {
-            return Frame::Array(vec![
+            return Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"0")),
-                Frame::Array(vec![]),
+                Frame::Array(framevec![]),
             ]);
         }
         Err(e) => return e,
@@ -894,9 +894,9 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     } else {
         Bytes::from(pos.to_string())
     };
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(next_cursor),
-        Frame::Array(results),
+        Frame::Array(results.into()),
     ])
 }
 
@@ -1074,7 +1074,7 @@ mod tests {
         let mut db = Database::new();
         let args = make_args(&[b"nokey"]);
         let result = hgetall(&mut db, &args);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     #[test]
@@ -1154,8 +1154,8 @@ mod tests {
     fn test_hkeys_hvals_missing() {
         let mut db = Database::new();
         let args = make_args(&[b"nokey"]);
-        assert_eq!(hkeys(&mut db, &args), Frame::Array(vec![]));
-        assert_eq!(hvals(&mut db, &args), Frame::Array(vec![]));
+        assert_eq!(hkeys(&mut db, &args), Frame::Array(framevec![]));
+        assert_eq!(hvals(&mut db, &args), Frame::Array(framevec![]));
     }
 
     #[test]
@@ -1335,7 +1335,7 @@ mod tests {
             Frame::Array(outer) => {
                 assert_eq!(outer.len(), 2);
                 assert_eq!(outer[0], Frame::BulkString(Bytes::from_static(b"0")));
-                assert_eq!(outer[1], Frame::Array(vec![]));
+                assert_eq!(outer[1], Frame::Array(framevec![]));
             }
             _ => panic!("Expected Array"),
         }

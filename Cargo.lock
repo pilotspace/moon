@@ -1451,6 +1451,7 @@ dependencies = [
  "ringbuf",
  "sha1_smol",
  "sha2",
+ "smallvec",
  "tempfile",
  "thiserror",
  "tikv-jemallocator",

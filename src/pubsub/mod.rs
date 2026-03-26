@@ -9,7 +9,7 @@ use crate::command::key::glob_match;
 use crate::protocol::Frame;
 
 use self::subscriber::Subscriber;
-
+use crate::framevec;
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Allocate a globally unique subscriber ID.
@@ -175,7 +175,7 @@ impl PubSubRegistry {
 
 /// Build a subscribe confirmation response frame.
 pub fn subscribe_response(channel: &Bytes, count: usize) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"subscribe")),
         Frame::BulkString(channel.clone()),
         Frame::Integer(count as i64),
@@ -184,7 +184,7 @@ pub fn subscribe_response(channel: &Bytes, count: usize) -> Frame {
 
 /// Build an unsubscribe confirmation response frame.
 pub fn unsubscribe_response(channel: &Bytes, count: usize) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"unsubscribe")),
         Frame::BulkString(channel.clone()),
         Frame::Integer(count as i64),
@@ -193,7 +193,7 @@ pub fn unsubscribe_response(channel: &Bytes, count: usize) -> Frame {
 
 /// Build a psubscribe confirmation response frame.
 pub fn psubscribe_response(pattern: &Bytes, count: usize) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"psubscribe")),
         Frame::BulkString(pattern.clone()),
         Frame::Integer(count as i64),
@@ -202,7 +202,7 @@ pub fn psubscribe_response(pattern: &Bytes, count: usize) -> Frame {
 
 /// Build a punsubscribe confirmation response frame.
 pub fn punsubscribe_response(pattern: &Bytes, count: usize) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"punsubscribe")),
         Frame::BulkString(pattern.clone()),
         Frame::Integer(count as i64),
@@ -211,7 +211,7 @@ pub fn punsubscribe_response(pattern: &Bytes, count: usize) -> Frame {
 
 /// Build a message delivery frame for exact-channel subscription.
 fn message_frame(channel: &Bytes, payload: &Bytes) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"message")),
         Frame::BulkString(channel.clone()),
         Frame::BulkString(payload.clone()),
@@ -220,7 +220,7 @@ fn message_frame(channel: &Bytes, payload: &Bytes) -> Frame {
 
 /// Build a pmessage delivery frame for pattern subscription.
 fn pmessage_frame(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Frame {
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(Bytes::from_static(b"pmessage")),
         Frame::BulkString(pattern.clone()),
         Frame::BulkString(channel.clone()),

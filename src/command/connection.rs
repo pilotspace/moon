@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
-
+use crate::framevec;
 /// Global monotonic client ID counter.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -109,10 +109,10 @@ pub fn command(args: &[Frame]) -> Frame {
     // Check for DOCS subcommand (case-insensitive, zero-alloc)
     if let Some(Frame::BulkString(sub)) | Some(Frame::SimpleString(sub)) = args.first() {
         if sub.eq_ignore_ascii_case(b"DOCS") || sub.eq_ignore_ascii_case(b"COUNT") {
-            return Frame::Array(vec![]);
+            return Frame::Array(framevec![]);
         }
     }
-    Frame::Array(vec![])
+    Frame::Array(framevec![])
 }
 
 /// INFO command handler.
@@ -392,7 +392,7 @@ pub fn hello_acl(
         ),
         (
             Frame::BulkString(Bytes::from_static(b"modules")),
-            Frame::Array(vec![]),
+            Frame::Array(framevec![]),
         ),
     ]);
 
@@ -600,7 +600,7 @@ pub fn hello(
         ),
         (
             Frame::BulkString(Bytes::from_static(b"modules")),
-            Frame::Array(vec![]),
+            Frame::Array(framevec![]),
         ),
     ]);
 
@@ -697,13 +697,13 @@ mod tests {
     #[test]
     fn test_command_docs() {
         let result = command(&[Frame::BulkString(Bytes::from_static(b"DOCS"))]);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     #[test]
     fn test_command_docs_lowercase() {
         let result = command(&[Frame::BulkString(Bytes::from_static(b"docs"))]);
-        assert_eq!(result, Frame::Array(vec![]));
+        assert_eq!(result, Frame::Array(framevec![]));
     }
 
     #[test]

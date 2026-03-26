@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeFlags};
 use crate::cluster::slots::slot_for_key;
 use crate::protocol::Frame;
-
+use crate::framevec;
 /// Entry point: dispatch CLUSTER <subcommand> [args...] to the correct handler.
 ///
 /// Returns a Frame response, or Frame::Error if the subcommand is unknown or args invalid.
@@ -152,12 +152,12 @@ pub fn handle_cluster_slots(cs: &Arc<RwLock<ClusterState>>) -> Frame {
                 }
                 prev = Some(slot);
             } else if let (Some(s), Some(p)) = (start.take(), prev.take()) {
-                let node_entry = Frame::Array(vec![
+                let node_entry = Frame::Array(framevec![
                     Frame::BulkString(Bytes::from(node.addr.ip().to_string())),
                     Frame::Integer(node.addr.port() as i64),
                     Frame::BulkString(Bytes::from(node.node_id.clone())),
                 ]);
-                result.push(Frame::Array(vec![
+                result.push(Frame::Array(framevec![
                     Frame::Integer(s as i64),
                     Frame::Integer(p as i64),
                     node_entry,
@@ -165,19 +165,19 @@ pub fn handle_cluster_slots(cs: &Arc<RwLock<ClusterState>>) -> Frame {
             }
         }
         if let (Some(s), Some(p)) = (start, prev) {
-            let node_entry = Frame::Array(vec![
+            let node_entry = Frame::Array(framevec![
                 Frame::BulkString(Bytes::from(node.addr.ip().to_string())),
                 Frame::Integer(node.addr.port() as i64),
                 Frame::BulkString(Bytes::from(node.node_id.clone())),
             ]);
-            result.push(Frame::Array(vec![
+            result.push(Frame::Array(framevec![
                 Frame::Integer(s as i64),
                 Frame::Integer(p as i64),
                 node_entry,
             ]));
         }
     }
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// CLUSTER MEET <ip> <port> -- add a node to our cluster state.

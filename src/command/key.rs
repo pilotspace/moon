@@ -4,7 +4,7 @@ use crate::protocol::Frame;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::current_time_ms;
 use crate::storage::Database;
-
+use crate::framevec;
 /// Helper: build an ERR frame for wrong number of arguments.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -274,7 +274,7 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
             None => Frame::Null,
         }
     } else if subcommand.eq_ignore_ascii_case(b"HELP") {
-        Frame::Array(vec![
+        Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
             Frame::BulkString(Bytes::from_static(b"  Return the encoding of the object stored at <key>.")),
             Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
@@ -427,7 +427,7 @@ pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
 
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// RENAME key newkey
@@ -662,9 +662,9 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         Bytes::from(pos.to_string())
     };
 
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(next_cursor),
-        Frame::Array(results),
+        Frame::Array(results.into()),
     ])
 }
 
@@ -778,7 +778,7 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             result.push(Frame::BulkString(key.to_bytes()));
         }
     }
-    Frame::Array(result)
+    Frame::Array(result.into())
 }
 
 /// SCAN (read-only).
@@ -882,9 +882,9 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Bytes::from(pos.to_string())
     };
 
-    Frame::Array(vec![
+    Frame::Array(framevec![
         Frame::BulkString(next_cursor),
-        Frame::Array(results),
+        Frame::Array(results.into()),
     ])
 }
 

@@ -20,7 +20,7 @@ use crate::runtime::channel;
 use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::Database;
-
+use crate::framevec;
 /// Coordinate a multi-key command across shards.
 ///
 /// Routes MGET, MSET, DEL (multi), UNLINK (multi), and EXISTS (multi)
@@ -163,7 +163,7 @@ async fn coordinate_mget(
             let commands: Vec<(Bytes, Frame)> = indexed_keys
                 .iter()
                 .map(|(_, k)| {
-                    let cmd = Frame::Array(vec![
+                    let cmd = Frame::Array(framevec![
                         Frame::BulkString(Bytes::from_static(b"GET")),
                         Frame::BulkString(k.clone()),
                     ]);
@@ -270,7 +270,7 @@ async fn coordinate_mset(
             let commands: Vec<(Bytes, Frame)> = kv_pairs
                 .iter()
                 .map(|(k, v)| {
-                    let cmd = Frame::Array(vec![
+                    let cmd = Frame::Array(framevec![
                         Frame::BulkString(Bytes::from_static(b"SET")),
                         Frame::BulkString(k.clone()),
                         Frame::BulkString(v.clone()),
@@ -353,7 +353,7 @@ async fn coordinate_multi_del_or_exists(
                 .iter()
                 .map(|arg| {
                     let key = extract_key(arg).unwrap_or_default();
-                    let cmd_frame = Frame::Array(vec![
+                    let cmd_frame = Frame::Array(framevec![
                         Frame::BulkString(Bytes::from(cmd_upper.clone())),
                         arg.clone(),
                     ]);
@@ -427,7 +427,7 @@ pub async fn coordinate_keys(
             for a in args {
                 parts.push(a.clone());
             }
-            Frame::Array(parts)
+            Frame::Array(parts.into())
         };
         let msg = ShardMessage::Execute {
             db_index,
@@ -447,7 +447,7 @@ pub async fn coordinate_keys(
         }
     }
 
-    Frame::Array(all_keys)
+    Frame::Array(all_keys.into())
 }
 
 /// Coordinate SCAN across all shards.
@@ -512,7 +512,7 @@ pub async fn coordinate_scan(
         let (tx, rx) = channel::oneshot();
         let mut parts = vec![Frame::BulkString(Bytes::from_static(b"SCAN"))];
         parts.extend(scan_args);
-        let cmd_frame = Frame::Array(parts);
+        let cmd_frame = Frame::Array(parts.into());
         let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
@@ -555,7 +555,7 @@ pub async fn coordinate_scan(
                 ((target_shard_id as u64) << 48) | (next_shard_cursor as u64 & 0x0000_FFFF_FFFF_FFFF)
             };
 
-            Frame::Array(vec![
+            Frame::Array(framevec![
                 Frame::BulkString(Bytes::from(next_composite.to_string())),
                 keys,
             ])
@@ -590,7 +590,7 @@ pub async fn coordinate_dbsize(
             continue;
         }
         let (tx, rx) = channel::oneshot();
-        let cmd_frame = Frame::Array(vec![Frame::BulkString(Bytes::from_static(b"DBSIZE"))]);
+        let cmd_frame = Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"DBSIZE"))]);
         let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
