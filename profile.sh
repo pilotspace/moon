@@ -242,25 +242,28 @@ _measure_memory_for_server() {
             redis-benchmark -p "$port" -t set -n "$count" -r "$count" -d "$VALUE_SIZE" -q 2>/dev/null | tail -1 >&2
             ;;
         hash)
-            {
+            (
+                set +eo pipefail
                 for ((i=0; i<count; i++)); do
                     printf "HSET key:%d f1 %0${VALUE_SIZE}d f2 %0${VALUE_SIZE}d f3 val3 f4 val4 f5 val5\r\n" "$i" "$i" "$i"
                 done
-            } | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2
+            ) | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2 || true
             ;;
         list)
-            {
+            (
+                set +eo pipefail
                 for ((i=0; i<count; i++)); do
                     printf "LPUSH list:%d e1 e2 e3 e4 e5 e6 e7 e8 e9 e10\r\n" "$i"
                 done
-            } | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2
+            ) | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2 || true
             ;;
         zset)
-            {
+            (
+                set +eo pipefail
                 for ((i=0; i<count; i++)); do
                     printf "ZADD zset:%d 1 m1 2 m2 3 m3 4 m4 5 m5 6 m6 7 m7 8 m8 9 m9 10 m10\r\n" "$i"
                 done
-            } | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2
+            ) | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2 || true
             ;;
     esac
 
@@ -343,11 +346,12 @@ _measure_fragmentation_for_server() {
 
     # Delete 500K random keys
     log "Deleting ${del_count} keys from $server_label..."
-    {
+    (
+        set +eo pipefail
         for ((i=0; i<del_count; i++)); do
             printf "DEL key:%012d\r\n" "$((RANDOM * RANDOM % frag_count))"
         done
-    } | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2
+    ) | redis-cli -p "$port" --pipe 2>/dev/null | tail -1 >&2 || true
     sleep 0.5
 
     local rss_after_delete
@@ -414,10 +418,10 @@ _measure_cpu_for_server() {
     # Stop sampler
     kill "$sampler_pid" 2>/dev/null; wait "$sampler_pid" 2>/dev/null || true
 
-    # Parse ops/sec (sum of SET and GET)
+    # Parse ops/sec (sum of SET and GET) — look for "requests per second" summary lines
     local set_rps get_rps
-    set_rps=$(echo "$bench_output" | tr '\r' '\n' | grep "SET:" | awk '{print $2}' | sed 's/,//g')
-    get_rps=$(echo "$bench_output" | tr '\r' '\n' | grep "GET:" | awk '{print $2}' | sed 's/,//g')
+    set_rps=$(echo "$bench_output" | tr '\r' '\n' | grep "SET:.*requests per second" | awk '{print $2}' | sed 's/,//g' | head -1)
+    get_rps=$(echo "$bench_output" | tr '\r' '\n' | grep "GET:.*requests per second" | awk '{print $2}' | sed 's/,//g' | head -1)
     [[ -z "$set_rps" ]] && set_rps=0
     [[ -z "$get_rps" ]] && get_rps=0
     local total_rps
