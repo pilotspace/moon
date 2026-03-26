@@ -1527,4 +1527,14 @@ mod tests {
         db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
         assert_eq!(db.data_mut().len(), 1);
     }
+
+    #[test]
+    fn test_refresh_now_from_cache() {
+        let mut db = Database::new();
+        let clock = CachedClock::new();
+        db.refresh_now_from_cache(&clock);
+        // cached_now should match clock
+        assert_eq!(db.now(), clock.secs());
+        assert_eq!(db.now_ms(), clock.ms());
+    }
 }

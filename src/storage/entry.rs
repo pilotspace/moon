@@ -670,4 +670,35 @@ mod tests {
     fn test_compact_entry_size() {
         assert_eq!(std::mem::size_of::<CompactEntry>(), 24);
     }
+
+    #[test]
+    fn test_cached_clock_initial_values() {
+        let clock = CachedClock::new();
+        // Should be within 1 second of real time
+        let real_secs = current_secs();
+        assert!((clock.secs() as i64 - real_secs as i64).abs() <= 1);
+        let real_ms = current_time_ms();
+        assert!((clock.ms() as i64 - real_ms as i64).abs() <= 1000);
+    }
+
+    #[test]
+    fn test_cached_clock_update() {
+        let clock = CachedClock::new();
+        let before = clock.ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        clock.update();
+        let after = clock.ms();
+        assert!(after >= before);
+    }
+
+    #[test]
+    fn test_cached_clock_clone_shares_state() {
+        let clock1 = CachedClock::new();
+        let clock2 = clock1.clone();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        clock1.update();
+        // Both see the same value because they share Arc
+        assert_eq!(clock1.ms(), clock2.ms());
+        assert_eq!(clock1.secs(), clock2.secs());
+    }
 }
