@@ -3145,6 +3145,10 @@ pub async fn handle_connection_sharded_monoio(
     let mut in_multi: bool = false;
     let mut command_queue: Vec<Frame> = Vec::new();
 
+    // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
+    // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
+    let mut tmp_buf = vec![0u8; 8192];
+
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if subscription_count > 0 {
@@ -3346,9 +3350,10 @@ pub async fn handle_connection_sharded_monoio(
         }
 
         // Read data from stream using monoio ownership I/O.
-        // Vec<u8> implements monoio's IoBufMut trait.
-        let tmp_buf = vec![0u8; 8192];
-        let (result, tmp_buf) = stream.read(tmp_buf).await;
+        // Reuse pre-allocated buffer; resize restores capacity without new allocation.
+        tmp_buf.resize(8192, 0);
+        let (result, returned_buf) = stream.read(tmp_buf).await;
+        tmp_buf = returned_buf;
         match result {
             Ok(0) => break, // connection closed
             Ok(n) => {

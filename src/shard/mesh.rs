@@ -13,7 +13,7 @@ use super::dispatch::ShardMessage;
 pub const CHANNEL_BUFFER_SIZE: usize = 4096;
 
 /// Connection channel capacity for listener -> shard.
-pub const CONN_CHANNEL_CAPACITY: usize = 256;
+pub const CONN_CHANNEL_CAPACITY: usize = 4096;
 
 /// SPSC channel mesh connecting all shard pairs.
 ///
