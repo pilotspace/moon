@@ -3181,8 +3181,8 @@ pub async fn handle_connection_sharded_monoio(
                                                         let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"));
                                                         let mut resp_buf = BytesMut::new();
                                                         codec.encode_frame(&err, &mut resp_buf);
-                                                        let data = resp_buf.to_vec();
-                                                        let (wr, _) = stream.write_all(data).await;
+                                                        let data = resp_buf.freeze();
+                                                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                         if wr.is_err() { break; }
                                                         continue;
                                                     }
@@ -3194,8 +3194,8 @@ pub async fn handle_connection_sharded_monoio(
                                                             let resp = pubsub::subscribe_response(&channel, subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
-                                                            let data = resp_buf.to_vec();
-                                                            let (wr, _) = stream.write_all(data).await;
+                                                            let data = resp_buf.freeze();
+                                                            let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                             if wr.is_err() { break; }
                                                         }
                                                     }
@@ -3208,8 +3208,8 @@ pub async fn handle_connection_sharded_monoio(
                                                             let resp = pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
-                                                            let data = resp_buf.to_vec();
-                                                            let (wr, _) = stream.write_all(data).await;
+                                                            let data = resp_buf.freeze();
+                                                            let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                             if wr.is_err() { break; }
                                                         } else {
                                                             for ch in &removed {
@@ -3217,8 +3217,8 @@ pub async fn handle_connection_sharded_monoio(
                                                                 let resp = pubsub::unsubscribe_response(ch, subscription_count);
                                                                 let mut resp_buf = BytesMut::new();
                                                                 codec.encode_frame(&resp, &mut resp_buf);
-                                                                let data = resp_buf.to_vec();
-                                                                let (wr, _) = stream.write_all(data).await;
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                                 if wr.is_err() { break; }
                                                             }
                                                         }
@@ -3230,8 +3230,8 @@ pub async fn handle_connection_sharded_monoio(
                                                                 let resp = pubsub::unsubscribe_response(&channel, subscription_count);
                                                                 let mut resp_buf = BytesMut::new();
                                                                 codec.encode_frame(&resp, &mut resp_buf);
-                                                                let data = resp_buf.to_vec();
-                                                                let (wr, _) = stream.write_all(data).await;
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                                 if wr.is_err() { break; }
                                                             }
                                                         }
@@ -3242,8 +3242,8 @@ pub async fn handle_connection_sharded_monoio(
                                                         let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'psubscribe' command"));
                                                         let mut resp_buf = BytesMut::new();
                                                         codec.encode_frame(&err, &mut resp_buf);
-                                                        let data = resp_buf.to_vec();
-                                                        let (wr, _) = stream.write_all(data).await;
+                                                        let data = resp_buf.freeze();
+                                                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                         if wr.is_err() { break; }
                                                         continue;
                                                     }
@@ -3255,8 +3255,8 @@ pub async fn handle_connection_sharded_monoio(
                                                             let resp = pubsub::psubscribe_response(&pattern, subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
-                                                            let data = resp_buf.to_vec();
-                                                            let (wr, _) = stream.write_all(data).await;
+                                                            let data = resp_buf.freeze();
+                                                            let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                             if wr.is_err() { break; }
                                                         }
                                                     }
@@ -3269,8 +3269,8 @@ pub async fn handle_connection_sharded_monoio(
                                                             let resp = pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
-                                                            let data = resp_buf.to_vec();
-                                                            let (wr, _) = stream.write_all(data).await;
+                                                            let data = resp_buf.freeze();
+                                                            let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                             if wr.is_err() { break; }
                                                         } else {
                                                             for pat in &removed {
@@ -3278,8 +3278,8 @@ pub async fn handle_connection_sharded_monoio(
                                                                 let resp = pubsub::punsubscribe_response(pat, subscription_count);
                                                                 let mut resp_buf = BytesMut::new();
                                                                 codec.encode_frame(&resp, &mut resp_buf);
-                                                                let data = resp_buf.to_vec();
-                                                                let (wr, _) = stream.write_all(data).await;
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                                 if wr.is_err() { break; }
                                                             }
                                                         }
@@ -3291,8 +3291,8 @@ pub async fn handle_connection_sharded_monoio(
                                                                 let resp = pubsub::punsubscribe_response(&pattern, subscription_count);
                                                                 let mut resp_buf = BytesMut::new();
                                                                 codec.encode_frame(&resp, &mut resp_buf);
-                                                                let data = resp_buf.to_vec();
-                                                                let (wr, _) = stream.write_all(data).await;
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                                 if wr.is_err() { break; }
                                                             }
                                                         }
@@ -3305,16 +3305,16 @@ pub async fn handle_connection_sharded_monoio(
                                                     ]);
                                                     let mut resp_buf = BytesMut::new();
                                                     codec.encode_frame(&resp, &mut resp_buf);
-                                                    let data = resp_buf.to_vec();
-                                                    let (wr, _) = stream.write_all(data).await;
+                                                    let data = resp_buf.freeze();
+                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     if wr.is_err() { break; }
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                                     let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
                                                     let mut resp_buf = BytesMut::new();
                                                     codec.encode_frame(&resp, &mut resp_buf);
-                                                    let data = resp_buf.to_vec();
-                                                    let (wr, _) = stream.write_all(data).await;
+                                                    let data = resp_buf.freeze();
+                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     let _ = wr; // ignore write error on quit
                                                     return; // exit connection
                                                 }
@@ -3326,8 +3326,8 @@ pub async fn handle_connection_sharded_monoio(
                                                     )));
                                                     let mut resp_buf = BytesMut::new();
                                                     codec.encode_frame(&err, &mut resp_buf);
-                                                    let data = resp_buf.to_vec();
-                                                    let (wr, _) = stream.write_all(data).await;
+                                                    let data = resp_buf.freeze();
+                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     if wr.is_err() { break; }
                                                 }
                                             }
@@ -3346,8 +3346,8 @@ pub async fn handle_connection_sharded_monoio(
                         Ok(frame) => {
                             let mut resp_buf = BytesMut::new();
                             codec.encode_frame(&frame, &mut resp_buf);
-                            let data = resp_buf.to_vec();
-                            let (result, _) = stream.write_all(data).await;
+                            let data = resp_buf.freeze();
+                            let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                             if result.is_err() { break; }
                         }
                         Err(_) => break, // all senders dropped
@@ -3452,8 +3452,8 @@ pub async fn handle_connection_sharded_monoio(
                 }
                 // Flush responses and re-enter loop (next iteration enters subscriber mode)
                 if !write_buf.is_empty() {
-                    let data = write_buf.split().to_vec();
-                    let (result, _): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
+                    let data = write_buf.split().freeze();
+                    let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                     if result.is_err() { return; }
                 }
                 responses.clear();
@@ -3529,8 +3529,8 @@ pub async fn handle_connection_sharded_monoio(
                     codec.encode_frame(resp, &mut write_buf);
                 }
                 if !write_buf.is_empty() {
-                    let data = write_buf.split().to_vec();
-                    let (result, _): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
+                    let data = write_buf.split().freeze();
+                    let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                     if result.is_err() { return; }
                 }
 
@@ -3745,8 +3745,8 @@ pub async fn handle_connection_sharded_monoio(
 
         // Write all responses in one batch using ownership I/O
         if !write_buf.is_empty() {
-            let data = write_buf.split().to_vec();
-            let (result, _data): (std::io::Result<usize>, Vec<u8>) = stream.write_all(data).await;
+            let data = write_buf.split().freeze();
+            let (result, _data): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
             if result.is_err() {
                 break;
             }

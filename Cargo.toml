@@ -42,7 +42,7 @@ hex = "0.4"
 ctrlc = "3.4"
 
 tikv-jemallocator = { version = "0.6", optional = true }
-monoio = { version = "0.2", optional = true, features = ["sync"] }
+monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 
 [features]
 # Platform-aware defaults:
