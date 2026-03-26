@@ -576,7 +576,7 @@ impl Shard {
                                     let rtcfg = runtime_config.clone();
                                     let notifiers = all_notifiers.clone();
                                     monoio::spawn(async move {
-                                        let reqpass = runtime_config.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                                        let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
                                         handle_connection_sharded_monoio(
                                             tcp_stream, dbs, shard_id, num_shards,
                                             dtx, psr, blk, sd, reqpass, aof, trk, cid,

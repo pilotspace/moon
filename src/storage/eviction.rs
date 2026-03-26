@@ -7,6 +7,24 @@ use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::lfu_decay;
 use crate::storage::Database;
 
+/// Compare two LRU timestamps with u16 wraparound handling.
+/// Uses signed-distance comparison: treats the 16-bit clock as circular.
+/// Returns true if `a` is considered older (less recent) than `b`.
+#[inline]
+pub fn lru_is_older(a: u32, b: u32) -> bool {
+    let a16 = a as i16;
+    let b16 = b as i16;
+    // Signed difference handles wraparound: if b recently wrapped past 0
+    // and a is near 65535, (a16 - b16) will be a large positive number,
+    // meaning a is "older" (further in the past).
+    a16.wrapping_sub(b16) > 0
+}
+
+/// Sum used_memory across all databases for aggregate eviction decisions.
+pub fn aggregate_used_memory(databases: &[Database]) -> usize {
+    databases.iter().map(|db| db.estimated_memory()).sum()
+}
+
 /// Eviction policy variants matching Redis maxmemory-policy.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvictionPolicy {
@@ -131,7 +149,7 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
                     oldest_access = Some(la);
                 }
                 Some(ref oldest) => {
-                    if la < *oldest {
+                    if lru_is_older(la, *oldest) {
                         oldest_key = Some(key.clone());
                         oldest_access = Some(la);
                     }
@@ -189,7 +207,7 @@ fn evict_one_lfu(
                     effective_counter < lowest
                         || (effective_counter == lowest
                             && oldest_access_for_tie
-                                .map_or(true, |t| la < t))
+                                .map_or(true, |t| lru_is_older(la, t)))
                 }
             };
 
@@ -294,6 +312,9 @@ mod tests {
             appendonly: "no".to_string(),
             appendfsync: "everysec".to_string(),
             aclfile: None,
+            requirepass: None,
+            protected_mode: "yes".to_string(),
+            acllog_max_len: 128,
         }
     }
 

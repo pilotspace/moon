@@ -757,6 +757,15 @@ pub async fn handle_connection(
                                 let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                                 for arg in cmd_args {
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
+                                        // ACL channel permission check
+                                        {
+                                            let acl_guard = acl_table.read().unwrap();
+                                            if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel_or_pattern.as_ref()) {
+                                                drop(acl_guard);
+                                                let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                continue;
+                                            }
+                                        }
                                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                         {
                                             let mut registry = pubsub_registry.lock();
@@ -2021,6 +2030,17 @@ pub async fn handle_connection_sharded(
                     // TODO: Full subscriber mode support (Plan 06+ or future enhancement).
                     // For now, handle basic subscribe/unsubscribe responses.
                     if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                        // ACL channel permission check for Tokio sharded handler
+                        for arg in cmd_args {
+                            if let Some(channel) = extract_bytes(arg) {
+                                let acl_guard = acl_table.read().unwrap();
+                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
+                                    drop(acl_guard);
+                                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                                    continue;
+                                }
+                            }
+                        }
                         // Stub: subscriber mode in sharded handler is deferred
                         responses.push(Frame::Error(
                             Bytes::from_static(b"ERR SUBSCRIBE not yet supported in sharded mode"),
@@ -3441,6 +3461,19 @@ pub async fn handle_connection_sharded_monoio(
                                                     }
                                                     for arg in cmd_args {
                                                         if let Some(channel) = extract_bytes(arg) {
+                                                            // ACL channel permission check
+                                                            {
+                                                                let acl_guard = acl_table.read().unwrap();
+                                                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
+                                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                    let mut resp_buf = BytesMut::new();
+                                                                    codec.encode_frame(&err, &mut resp_buf);
+                                                                    let data = resp_buf.freeze();
+                                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                    if wr.is_err() { break; }
+                                                                    continue;
+                                                                }
+                                                            }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.borrow_mut().subscribe(channel.clone(), sub);
                                                             subscription_count += 1;
@@ -3502,6 +3535,19 @@ pub async fn handle_connection_sharded_monoio(
                                                     }
                                                     for arg in cmd_args {
                                                         if let Some(pattern) = extract_bytes(arg) {
+                                                            // ACL channel permission check
+                                                            {
+                                                                let acl_guard = acl_table.read().unwrap();
+                                                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, pattern.as_ref()) {
+                                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                    let mut resp_buf = BytesMut::new();
+                                                                    codec.encode_frame(&err, &mut resp_buf);
+                                                                    let data = resp_buf.freeze();
+                                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                    if wr.is_err() { break; }
+                                                                    continue;
+                                                                }
+                                                            }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.borrow_mut().psubscribe(pattern.clone(), sub);
                                                             subscription_count += 1;
@@ -4157,6 +4203,16 @@ pub async fn handle_connection_sharded_monoio(
                 }
                 for arg in cmd_args {
                     if let Some(ch) = extract_bytes(arg) {
+                        // ACL channel permission check
+                        {
+                            let acl_guard = acl_table.read().unwrap();
+                            if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
+                                drop(acl_guard);
+                                let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                codec.encode_frame(&err, &mut write_buf);
+                                continue;
+                            }
+                        }
                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                         if is_pattern {
                             pubsub_registry.borrow_mut().psubscribe(ch.clone(), sub);
