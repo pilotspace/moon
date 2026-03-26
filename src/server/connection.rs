@@ -3158,6 +3158,9 @@ pub async fn handle_connection_sharded_monoio(
         channel::OneshotReceiver<Vec<Frame>>,
     )> = Vec::with_capacity(num_shards);
 
+    // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
+    let mut frames: Vec<Frame> = Vec::with_capacity(64);
+
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if subscription_count > 0 {
@@ -3359,8 +3362,14 @@ pub async fn handle_connection_sharded_monoio(
         }
 
         // Read data from stream using monoio ownership I/O.
-        // Reuse pre-allocated buffer; resize restores capacity without new allocation.
-        tmp_buf.resize(8192, 0);
+        // Reuse pre-allocated buffer; restore length without zero-fill overhead.
+        // SAFETY: monoio will overwrite the buffer contents on read; the buffer was
+        // initially allocated as vec![0u8; 8192] so the allocation is valid.
+        // We only use returned_buf[..n] after the read, never uninitialized bytes.
+        if tmp_buf.len() < 8192 {
+            tmp_buf.reserve(8192 - tmp_buf.len());
+            unsafe { tmp_buf.set_len(8192); }
+        }
         let (result, returned_buf) = stream.read(tmp_buf).await;
         tmp_buf = returned_buf;
         match result {
@@ -3371,8 +3380,8 @@ pub async fn handle_connection_sharded_monoio(
             Err(_) => break,
         }
 
-        // Parse all complete frames from the read buffer
-        let mut frames = Vec::new();
+        // Parse all complete frames from the read buffer (reuse pre-allocated Vec)
+        frames.clear();
         loop {
             match codec.decode_frame(&mut read_buf) {
                 Ok(Some(frame)) => frames.push(frame),
@@ -3393,7 +3402,7 @@ pub async fn handle_connection_sharded_monoio(
         responses.clear();
         remote_groups.clear();
 
-        for frame in frames {
+        for frame in frames.drain(..) {
             let (cmd, cmd_args) = match extract_command(&frame) {
                 Some(pair) => pair,
                 None => {
@@ -3771,6 +3780,9 @@ pub async fn handle_connection_sharded_monoio(
         }
         if write_buf.capacity() > 65536 {
             write_buf = BytesMut::with_capacity(8192);
+        }
+        if tmp_buf.capacity() > 65536 {
+            tmp_buf = vec![0u8; 8192];
         }
     }
 }
