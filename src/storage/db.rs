@@ -6,7 +6,7 @@ use super::bptree::BPTree;
 use super::compact_key::CompactKey;
 use super::compact_value::{CompactValue, RedisValueRef};
 use super::dashtable::DashTable;
-use super::entry::{current_secs, current_time_ms, Entry, RedisValue};
+use super::entry::{current_secs, current_time_ms, CachedClock, Entry, RedisValue};
 use super::intset::Intset;
 use super::listpack::Listpack;
 use super::stream::Stream as StreamData;
@@ -289,9 +289,22 @@ impl Database {
         }
     }
 
-    /// Update the cached timestamp. Call once per batch to amortize syscall cost.
-    /// Does NOT update base_timestamp (it stays fixed for TTL delta stability).
+    /// Update the cached timestamp from a shared [`CachedClock`].
+    ///
+    /// Reads two `AtomicU64` values (Relaxed) instead of issuing `clock_gettime`
+    /// syscalls.  The clock is updated once per shard event-loop tick (1 ms).
     #[inline]
+    pub fn refresh_now_from_cache(&mut self, clock: &CachedClock) {
+        self.cached_now = clock.secs();
+        self.cached_now_ms = clock.ms();
+    }
+
+    /// Fallback: update the cached timestamp via `SystemTime::now()` syscall.
+    ///
+    /// Kept for callers that do not yet have a `CachedClock` reference (e.g. the
+    /// non-sharded legacy handler).  Marked `#[cold]` to hint the compiler that
+    /// the fast path is `refresh_now_from_cache`.
+    #[cold]
     pub fn refresh_now(&mut self) {
         self.cached_now = current_secs();
         self.cached_now_ms = current_time_ms();

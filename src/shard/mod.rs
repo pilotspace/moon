@@ -24,6 +24,7 @@ use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
+use crate::storage::entry::CachedClock;
 use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
 #[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
@@ -293,6 +294,10 @@ impl Shard {
         // Local reference to this shard's SPSC Notify (for the select! arm).
         let spsc_notify_local = spsc_notify;
 
+        // Per-shard cached clock: updated once per 1ms tick, read by all
+        // connection handlers on this shard via Relaxed atomic loads.
+        let cached_clock = CachedClock::new();
+
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
@@ -346,6 +351,7 @@ impl Shard {
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
                             let notifiers = all_notifiers.clone();
+                            let clk = cached_clock.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -368,6 +374,7 @@ impl Shard {
                                     acl,
                                     rtcfg,
                                     notifiers,
+                                    clk,
                                 ).await;
                             });
                         }
@@ -394,6 +401,7 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
                     // Handle pending SnapshotBegin from SPSC
@@ -412,6 +420,9 @@ impl Shard {
                 // Arm 2: Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll.
                 // Also drains SPSC as a safety net in case a notify was missed.
                 _ = periodic_interval.tick() => {
+                    // Refresh the per-shard cached clock once per tick (1ms).
+                    cached_clock.update();
+
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -426,9 +437,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (tokio arm 2)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -504,6 +516,7 @@ impl Shard {
                                 &mut uring_parse_bufs,
                                 &mut inflight_sends,
                                 uring_listener_fd,
+                                &cached_clock,
                             );
                         }
                     }
@@ -564,11 +577,13 @@ impl Shard {
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
                                     let notifiers = all_notifiers.clone();
+                                    let clk = cached_clock.clone();
                                     monoio::spawn(async move {
                                         handle_connection_sharded_monoio(
                                             tcp_stream, dbs, shard_id, num_shards,
                                             dtx, psr, blk, sd, None, aof, trk, cid,
                                             rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                            clk,
                                         ).await;
                                     });
                                 }
@@ -599,9 +614,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (monoio notify arm)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -616,6 +632,9 @@ impl Shard {
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
                 _ = periodic_interval.tick() => {
+                    // Refresh the per-shard cached clock once per tick (1ms).
+                    cached_clock.update();
+
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -630,9 +649,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (monoio periodic arm)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -762,6 +782,7 @@ impl Shard {
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+        cached_clock: &CachedClock,
     ) {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
@@ -810,6 +831,7 @@ impl Shard {
                     repl_state,
                     shard_id,
                     script_cache,
+                    cached_clock,
                 );
             }
         }
@@ -829,6 +851,7 @@ impl Shard {
                 repl_state,
                 shard_id,
                 script_cache,
+                cached_clock,
             );
         }
     }
@@ -850,6 +873,7 @@ impl Shard {
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+        cached_clock: &CachedClock,
     ) {
         match msg {
             ShardMessage::Execute {
@@ -861,7 +885,7 @@ impl Shard {
                     let mut dbs = databases.borrow_mut();
                     let db_count = dbs.len();
                     let db_idx = db_index.min(db_count.saturating_sub(1));
-                    dbs[db_idx].refresh_now();
+                    dbs[db_idx].refresh_now_from_cache(cached_clock);
                     let (cmd, args) = match Self::extract_command_static(&command) {
                         Some(pair) => pair,
                         None => {
@@ -936,7 +960,7 @@ impl Shard {
                 let mut dbs = databases.borrow_mut();
                 let db_count = dbs.len();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now();
+                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 for (_key, cmd_frame) in &commands {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -983,7 +1007,7 @@ impl Shard {
                 let mut dbs = databases.borrow_mut();
                 let db_count = dbs.len();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now();
+                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 for cmd_frame in &commands {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -1205,6 +1229,7 @@ impl Shard {
         parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
         inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
         uring_listener_fd: Option<std::os::fd::RawFd>,
+        cached_clock: &CachedClock,
     ) {
         match event {
             IoEvent::Recv { conn_id, data } => {
@@ -1253,7 +1278,7 @@ impl Shard {
                 let responses: Vec<crate::protocol::Frame> = {
                     let mut dbs = databases.borrow_mut();
                     let db_count = dbs.len();
-                    dbs[0].refresh_now();
+                    dbs[0].refresh_now_from_cache(cached_clock);
                     let mut selected = 0usize;
                     batch.iter().map(|frame| {
                         let (cmd, args) = match Self::extract_command_static(frame) {
@@ -1677,6 +1702,8 @@ mod tests {
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
+        let clock = CachedClock::new();
+
         // Process disconnect event -- should clean up parse buffer and inflight sends
         Shard::handle_uring_event(
             IoEvent::Disconnect { conn_id: 42 },
@@ -1685,6 +1712,7 @@ mod tests {
             &mut parse_bufs,
             &mut inflight_sends,
             None,
+            &clock,
         );
 
         assert!(!parse_bufs.contains_key(&42), "parse buffer should be removed on disconnect");
@@ -1705,6 +1733,8 @@ mod tests {
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
+        let clock = CachedClock::new();
+
         // SendComplete should clean up oldest in-flight send (no panic if empty)
         Shard::handle_uring_event(
             IoEvent::SendComplete { conn_id: 1 },
@@ -1713,6 +1743,7 @@ mod tests {
             &mut parse_bufs,
             &mut inflight_sends,
             None,
+            &clock,
         );
     }
 }

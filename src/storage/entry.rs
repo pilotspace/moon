@@ -29,6 +29,58 @@ pub fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Shared cached clock updated once per shard event loop tick (1ms).
+///
+/// Stores seconds and milliseconds in two `AtomicU64` values behind `Arc`,
+/// so cloning gives connection handlers a reference to the same shard clock.
+/// Relaxed ordering is correct: expiry checks tolerate up to 1ms staleness,
+/// and we avoid the cost of acquire/release fences on the hot path.
+#[derive(Clone)]
+pub struct CachedClock {
+    secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CachedClock {
+    pub fn new() -> Self {
+        let now_secs = current_secs() as u64;
+        let now_ms = current_time_ms();
+        Self {
+            secs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_secs)),
+            ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_ms)),
+        }
+    }
+
+    /// Update the cached clock. Called once per shard tick (1ms).
+    #[inline]
+    pub fn update(&self) {
+        self.secs.store(
+            current_secs() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.ms
+            .store(current_time_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read cached seconds.
+    #[inline]
+    pub fn secs(&self) -> u32 {
+        self.secs.load(std::sync::atomic::Ordering::Relaxed) as u32
+    }
+
+    /// Read cached milliseconds.
+    #[inline]
+    pub fn ms(&self) -> u64 {
+        self.ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for CachedClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The type of value stored in a Redis key.
 #[derive(Debug, Clone)]
 pub enum RedisValue {

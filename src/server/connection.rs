@@ -27,6 +27,7 @@ use crate::pubsub::{self, PubSubRegistry};
 use crate::pubsub::subscriber::Subscriber;
 use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
+use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::storage::Database;
 use crate::tracking::{TrackingState, TrackingTable};
@@ -1351,6 +1352,7 @@ pub async fn handle_connection_sharded(
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+    cached_clock: CachedClock,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -1887,6 +1889,7 @@ pub async fn handle_connection_sharded(
                                 &databases,
                                 &command_queue,
                                 selected_db,
+                                &cached_clock,
                             );
                             command_queue.clear();
                             responses.push(result);
@@ -2092,6 +2095,7 @@ pub async fn handle_connection_sharded(
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2105,6 +2109,7 @@ pub async fn handle_connection_sharded(
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2133,6 +2138,7 @@ pub async fn handle_connection_sharded(
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2166,7 +2172,7 @@ pub async fn handle_connection_sharded(
                         // LOCAL FAST PATH: zero cross-shard overhead
                         let mut dbs = databases.borrow_mut();
                         let db_count = dbs.len();
-                        dbs[selected_db].refresh_now();
+                        dbs[selected_db].refresh_now_from_cache(&cached_clock);
                         let result = dispatch(
                             &mut dbs[selected_db],
                             cmd,
@@ -2385,10 +2391,11 @@ fn execute_transaction_sharded(
     databases: &Rc<RefCell<Vec<Database>>>,
     command_queue: &[Frame],
     selected_db: usize,
+    cached_clock: &CachedClock,
 ) -> Frame {
     let mut dbs = databases.borrow_mut();
     let db_count = dbs.len();
-    dbs[selected_db].refresh_now();
+    dbs[selected_db].refresh_now_from_cache(cached_clock);
 
     let mut results = Vec::with_capacity(command_queue.len());
     let mut selected = selected_db;
@@ -3331,6 +3338,7 @@ pub async fn handle_connection_sharded_monoio(
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
+    cached_clock: CachedClock,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
@@ -3607,7 +3615,7 @@ pub async fn handle_connection_sharded_monoio(
             // Refresh time once before inline dispatch (same as batch refresh below)
             {
                 let mut dbs = databases.borrow_mut();
-                dbs[selected_db].refresh_now();
+                dbs[selected_db].refresh_now_from_cache(&cached_clock);
             }
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf, &mut write_buf, &databases, selected_db, &aof_tx,
@@ -3660,7 +3668,7 @@ pub async fn handle_connection_sharded_monoio(
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         {
             let mut dbs = databases.borrow_mut();
-            dbs[selected_db].refresh_now();
+            dbs[selected_db].refresh_now_from_cache(&cached_clock);
         }
 
         for frame in frames.drain(..) {
@@ -4238,7 +4246,7 @@ pub async fn handle_connection_sharded_monoio(
                     responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                 } else {
                     in_multi = false;
-                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db);
+                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db, &cached_clock);
                     command_queue.clear();
                     responses.push(result);
                 }
@@ -4306,6 +4314,7 @@ pub async fn handle_connection_sharded_monoio(
                     let response = crate::shard::coordinator::coordinate_keys(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4314,6 +4323,7 @@ pub async fn handle_connection_sharded_monoio(
                     let response = crate::shard::coordinator::coordinate_scan(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4332,6 +4342,7 @@ pub async fn handle_connection_sharded_monoio(
                     let response = crate::shard::coordinator::coordinate_multi_key(
                         cmd, cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
