@@ -139,20 +139,77 @@ pub fn bgsave_start_sharded(
     let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let snap_dir = PathBuf::from(snapshot_dir);
 
+    let mut receivers = Vec::with_capacity(num_shards);
     let mut prods = producers.borrow_mut();
     for prod in prods.iter_mut() {
-        let (tx, _rx) = crate::runtime::channel::oneshot();
+        let (tx, rx) = crate::runtime::channel::oneshot();
         let _ = prod.try_push(ShardMessage::SnapshotBegin {
             epoch,
             snapshot_dir: snap_dir.clone(),
             reply_tx: tx,
         });
+        receivers.push(rx);
     }
     drop(prods);
 
-    // Clear flag after sending -- shards handle completion independently.
-    // A proper implementation would track completion via the oneshot channels.
-    SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    // Spawn a completion watcher that awaits all shard replies before
+    // clearing SAVE_IN_PROGRESS. This replaces the old fire-and-forget
+    // pattern that cleared the flag immediately after sending messages.
+    #[cfg(feature = "runtime-tokio")]
+    tokio::task::spawn_local(async move {
+        let mut all_ok = true;
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("Shard snapshot failed: {}", e);
+                    all_ok = false;
+                }
+                Err(_) => {
+                    error!("Shard snapshot channel dropped");
+                    all_ok = false;
+                }
+            }
+        }
+        BGSAVE_LAST_STATUS.store(all_ok, Ordering::Relaxed);
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        LAST_SAVE_TIME.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
+    });
+
+    #[cfg(feature = "runtime-monoio")]
+    monoio::spawn(async move {
+        let mut all_ok = true;
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("Shard snapshot failed: {}", e);
+                    all_ok = false;
+                }
+                Err(_) => {
+                    error!("Shard snapshot channel dropped");
+                    all_ok = false;
+                }
+            }
+        }
+        BGSAVE_LAST_STATUS.store(all_ok, Ordering::Relaxed);
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        LAST_SAVE_TIME.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
+    });
 
     info!("BGSAVE triggered: epoch {} across {} shards", epoch, num_shards);
     Frame::SimpleString(Bytes::from_static(b"Background saving started"))
@@ -244,5 +301,20 @@ mod tests {
 
         // Reset
         SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_last_save_time_initial() {
+        // LAST_SAVE_TIME starts at 0 (no save has occurred yet)
+        // Note: other tests may have modified this, so just verify the static exists
+        // and is an AtomicU64 that can be loaded.
+        let _ = LAST_SAVE_TIME.load(Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_bgsave_last_status_initial() {
+        // BGSAVE_LAST_STATUS starts as true (no failure has occurred)
+        // Note: verify the static exists and is accessible
+        let _ = BGSAVE_LAST_STATUS.load(Ordering::Relaxed);
     }
 }
