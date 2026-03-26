@@ -119,7 +119,8 @@ pub async fn handle_connection(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let mut acl_log = crate::acl::AclLog::new(128);
+    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
@@ -163,6 +164,14 @@ pub async fn handle_connection(
                                         }
                                         for arg in cmd_args {
                                             if let Some(channel) = extract_bytes(arg) {
+                                                // ACL channel permission check
+                                                {
+                                                    let acl_guard = acl_table.read().unwrap();
+                                                    if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
+                                                        let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                        continue;
+                                                    }
+                                                }
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().subscribe(channel.clone(), sub);
                                                 subscription_count += 1;
@@ -212,6 +221,14 @@ pub async fn handle_connection(
                                         }
                                         for arg in cmd_args {
                                             if let Some(pattern) = extract_bytes(arg) {
+                                                // ACL channel permission check
+                                                {
+                                                    let acl_guard = acl_table.read().unwrap();
+                                                    if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, pattern.as_ref()) {
+                                                        let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                        continue;
+                                                    }
+                                                }
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().psubscribe(pattern.clone(), sub);
                                                 subscription_count += 1;
@@ -1369,7 +1386,8 @@ pub async fn handle_connection_sharded(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let mut acl_log = crate::acl::AclLog::new(128);
+    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
@@ -3360,7 +3378,8 @@ pub async fn handle_connection_sharded_monoio(
     let mut protocol_version: u8 = 2;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let mut acl_log = crate::acl::AclLog::new(128);
+    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
     let mut client_name: Option<Bytes> = None;

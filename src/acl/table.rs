@@ -188,15 +188,12 @@ impl AclTable {
         }
     }
 
-    /// Bootstrap from ServerConfig. Creates the default user from requirepass (or nopass).
+    /// Bootstrap from ServerConfig. Loads aclfile if configured, otherwise creates
+    /// the default user from requirepass (or nopass).
     pub fn load_or_default(config: &ServerConfig) -> Self {
-        let mut table = AclTable::new();
-        let default_user = match &config.requirepass {
-            Some(p) if !p.is_empty() => AclUser::new_default_with_password(p),
-            _ => AclUser::new_default_nopass(),
-        };
-        table.users.insert("default".to_string(), default_user);
-        table
+        // Delegate to io::acl_table_from_config which handles aclfile loading
+        // with fallback to requirepass-based default.
+        crate::acl::io::acl_table_from_config(config)
     }
 
     pub fn get_user(&self, username: &str) -> Option<&AclUser> {
