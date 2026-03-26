@@ -51,6 +51,28 @@ pub enum Frame {
     BigNumber(Bytes),
     /// `><count>\r\n<elements...>` -- Push data (server-initiated)
     Push(Vec<Frame>),
+    /// Already-serialized RESP data -- written directly to output, no re-serialization.
+    /// Used by hot-path commands (GET) to skip Frame construction + serialize overhead.
+    PreSerialized(Bytes),
+}
+
+/// Check if a pre-serialized RESP bulk string wire format equals a BulkString payload.
+/// Expected wire format: `$<len>\r\n<data>\r\n`
+fn preserialized_eq_bulk_string(wire: &Bytes, data: &Bytes) -> bool {
+    // Minimum wire: "$0\r\n\r\n" = 6 bytes
+    if wire.len() < 6 || wire[0] != b'$' {
+        return false;
+    }
+    // Find the first \r\n to get the length prefix
+    let Some(crlf_pos) = wire[1..].windows(2).position(|w| w == b"\r\n") else {
+        return false;
+    };
+    let header_end = 1 + crlf_pos + 2; // past the \r\n
+    // The data portion is wire[header_end .. wire.len()-2] (strip trailing \r\n)
+    if wire.len() < header_end + 2 {
+        return false;
+    }
+    &wire[header_end..wire.len() - 2] == data.as_ref()
 }
 
 impl PartialEq for Frame {
@@ -78,6 +100,12 @@ impl PartialEq for Frame {
             ) => ae == be && ad == bd,
             (Self::BigNumber(a), Self::BigNumber(b)) => a == b,
             (Self::Push(a), Self::Push(b)) => a == b,
+            (Self::PreSerialized(a), Self::PreSerialized(b)) => a == b,
+            // Cross-variant: PreSerialized bulk string == BulkString
+            (Self::PreSerialized(wire), Self::BulkString(data))
+            | (Self::BulkString(data), Self::PreSerialized(wire)) => {
+                preserialized_eq_bulk_string(wire, data)
+            }
             _ => false,
         }
     }

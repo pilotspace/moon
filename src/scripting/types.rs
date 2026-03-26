@@ -89,6 +89,19 @@ pub fn frame_to_lua_value(lua: &Lua, frame: &Frame) -> mlua::Result<LuaValue> {
         }
         Frame::Boolean(b) => Ok(LuaValue::Integer(if *b { 1 } else { 0 })),
         Frame::Double(f) => Ok(LuaValue::Integer(*f as i64)),
+        Frame::PreSerialized(wire) => {
+            // Extract payload from pre-serialized RESP bulk string: $<len>\r\n<data>\r\n
+            if wire.len() >= 6 && wire[0] == b'$' {
+                if let Some(crlf) = wire[1..].windows(2).position(|w| w == b"\r\n") {
+                    let data_start = 1 + crlf + 2;
+                    if wire.len() >= data_start + 2 {
+                        let data = &wire[data_start..wire.len() - 2];
+                        return Ok(LuaValue::String(lua.create_string(data)?));
+                    }
+                }
+            }
+            Ok(LuaValue::Boolean(false))
+        }
         // Other RESP3 variants (Map, Set, etc.) -- convert to false
         _ => Ok(LuaValue::Boolean(false)),
     }

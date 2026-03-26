@@ -107,6 +107,10 @@ pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
             buf.put_slice(n);
             buf.put_slice(b"\r\n");
         }
+        Frame::PreSerialized(data) => {
+            // Already contains complete RESP wire format -- write directly
+            buf.put_slice(data);
+        }
     }
 }
 
@@ -217,6 +221,10 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
             for item in items {
                 serialize_resp3(item, buf);
             }
+        }
+        Frame::PreSerialized(data) => {
+            // Already contains complete RESP wire format -- write directly
+            buf.put_slice(data);
         }
     }
 }
