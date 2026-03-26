@@ -44,7 +44,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync"] }
 
 [features]
-default = ["runtime-tokio"]
+default = ["runtime-tokio", "jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 runtime-tokio = ["dep:tokio", "dep:tokio-util"]
 runtime-monoio = ["dep:monoio"]
