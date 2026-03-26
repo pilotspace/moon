@@ -81,3 +81,7 @@ harness = false
 [[bench]]
 name = "get_hotpath"
 harness = false
+
+[[bench]]
+name = "compact_key"
+harness = false
