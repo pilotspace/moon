@@ -34,6 +34,24 @@ pub fn hash_key(key: &[u8]) -> u64 {
     xxhash_rust::xxh64::xxh64(key, 0)
 }
 
+/// Issue a software prefetch hint for a segment's memory.
+///
+/// Called after computing the segment index but before computing h2/home_buckets.
+/// The ~6ns hash computation overlaps with the prefetch latency (~10ns on L2/L3 miss),
+/// so the segment data is likely in L1 by the time we access it.
+#[inline(always)]
+fn prefetch_segment<K, V>(segment: &Segment<K, V>) {
+    let ptr = segment as *const Segment<K, V> as *const u8;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
+    }
+}
+
 /// Compute the segment directory index from a hash and the current global depth.
 #[inline]
 fn segment_index(hash: u64, depth: u32) -> usize {
@@ -139,6 +157,10 @@ impl<V> DashTable<CompactKey, V> {
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket (overlaps ~10ns L2/L3 miss)
+        prefetch_segment(&self.segments[seg_idx]);
+
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
         self.segments[seg_idx].get(h2_val, key, ba, bb)
@@ -149,6 +171,10 @@ impl<V> DashTable<CompactKey, V> {
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket
+        prefetch_segment(&self.segments[seg_idx]);
+
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
         self.segments[seg_idx].get_mut(h2_val, key, ba, bb)
@@ -164,6 +190,10 @@ impl<V> DashTable<CompactKey, V> {
         let hash = hash_key(key.as_ref());
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket
+        prefetch_segment(&self.segments[seg_idx]);
+
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
@@ -188,6 +218,10 @@ impl<V> DashTable<CompactKey, V> {
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket
+        prefetch_segment(&self.segments[seg_idx]);
+
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
@@ -205,6 +239,10 @@ impl<V> DashTable<CompactKey, V> {
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket
+        prefetch_segment(&self.segments[seg_idx]);
+
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
