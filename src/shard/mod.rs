@@ -466,7 +466,7 @@ impl Shard {
                         drop(dbs);
                         if done {
                             let epoch = snap.epoch;
-                            if let Err(e) = snap.finalize() {
+                            if let Err(e) = snap.finalize_async().await {
                                 tracing::error!("Shard {}: snapshot finalize failed: {}", shard_id, e);
                                 if let Some(tx) = snapshot_reply_tx.take() {
                                     let _ = tx.send(Err(format!("finalize failed: {}", e)));
@@ -669,7 +669,7 @@ impl Shard {
                         drop(dbs);
                         if done {
                             let epoch = snap.epoch;
-                            if let Err(e) = snap.finalize() {
+                            if let Err(e) = snap.finalize_async().await {
                                 tracing::error!("Shard {}: snapshot finalize failed: {}", shard_id, e);
                                 if let Some(tx) = snapshot_reply_tx.take() {
                                     let _ = tx.send(Err(format!("finalize failed: {}", e)));

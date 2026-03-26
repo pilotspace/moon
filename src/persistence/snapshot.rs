@@ -259,6 +259,48 @@ impl SnapshotState {
         Ok(())
     }
 
+    /// Async variant of finalize: uses tokio::fs for non-blocking I/O.
+    ///
+    /// Under Monoio, falls back to synchronous write (thread-per-core model,
+    /// rare operation, acceptable blocking).
+    pub async fn finalize_async(&mut self) -> anyhow::Result<()> {
+        // Write EOF marker
+        self.output_buf.push(EOF_MARKER);
+
+        // Global CRC32 of entire output_buf
+        let mut hasher = Hasher::new();
+        hasher.update(&self.output_buf);
+        let global_crc = hasher.finalize();
+        self.output_buf.extend_from_slice(&global_crc.to_le_bytes());
+
+        // Atomic write: write to .tmp, then rename
+        let tmp_path = self.file_path.with_extension("rrdshard.tmp");
+
+        // Take ownership of buffer to avoid borrow across await
+        let buf = std::mem::take(&mut self.output_buf);
+        let file_path = self.file_path.clone();
+
+        #[cfg(feature = "runtime-tokio")]
+        {
+            tokio::fs::write(&tmp_path, &buf)
+                .await
+                .context("Failed to write temporary snapshot file")?;
+            tokio::fs::rename(&tmp_path, &file_path)
+                .await
+                .context("Failed to rename temporary snapshot file")?;
+        }
+
+        #[cfg(feature = "runtime-monoio")]
+        {
+            std::fs::write(&tmp_path, &buf)
+                .context("Failed to write temporary snapshot file")?;
+            std::fs::rename(&tmp_path, &file_path)
+                .context("Failed to rename temporary snapshot file")?;
+        }
+
+        Ok(())
+    }
+
     /// Check if all databases have been fully serialized.
     #[inline]
     pub fn is_complete(&self) -> bool {
@@ -683,5 +725,26 @@ mod tests {
         );
 
         assert!(state.is_complete());
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn test_finalize_async_writes_valid_file() {
+        let (_dir, path) = snap_path();
+        let mut dbs = vec![Database::new()];
+        dbs[0].set_string(Bytes::from_static(b"async_k1"), Bytes::from_static(b"async_v1"));
+        dbs[0].set_string(Bytes::from_static(b"async_k2"), Bytes::from_static(b"async_v2"));
+
+        let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
+        while !state.advance_one_segment(&dbs) {}
+        state.finalize_async().await.unwrap();
+
+        // Verify file was written and is loadable
+        assert!(path.exists(), "Snapshot file should exist after finalize_async");
+        let mut loaded = vec![Database::new()];
+        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
+        assert_eq!(count, 2);
+        assert!(loaded[0].get(b"async_k1").is_some());
+        assert!(loaded[0].get(b"async_k2").is_some());
     }
 }
