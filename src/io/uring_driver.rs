@@ -680,6 +680,33 @@ pub struct WritevGuard {
 }
 
 impl UringDriver {
+    /// Submit a direct send for PreSerialized RESP data.
+    ///
+    /// PreSerialized frames contain complete wire format -- no assembly needed.
+    /// Uses a single iovec writev since data is contiguous.
+    /// Returns a WritevGuard that the caller must keep alive until SendComplete.
+    pub fn submit_send_preserialized(
+        &mut self,
+        conn_id: u32,
+        data: bytes::Bytes,
+    ) -> std::io::Result<WritevGuard> {
+        let mut guard = WritevGuard {
+            iovecs: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; 3],
+            header_buf: [0u8; 32],
+            _value_hold: data,
+        };
+        // Single iovec -- PreSerialized is already complete RESP wire format
+        guard.iovecs[0] = libc::iovec {
+            iov_base: guard._value_hold.as_ptr() as *mut libc::c_void,
+            iov_len: guard._value_hold.len(),
+        };
+        self.submit_writev(conn_id, guard.iovecs.as_ptr(), 1)?;
+        Ok(guard)
+    }
+
     /// Submit writev for a BulkString response using scatter-gather.
     /// Returns a WritevGuard that the caller must keep alive until SendComplete.
     pub fn submit_writev_bulkstring(

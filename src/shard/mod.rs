@@ -1299,6 +1299,26 @@ impl Shard {
                                 }
                             }
                         }
+                        crate::protocol::Frame::PreSerialized(ref data) if !data.is_empty() => {
+                            // Zero-copy path for PreSerialized: already RESP wire format
+                            match driver.submit_send_preserialized(conn_id, data.clone()) {
+                                Ok(guard) => {
+                                    inflight_sends
+                                        .entry(conn_id)
+                                        .or_default()
+                                        .push(InFlightSend::Writev(guard));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "writev preserialized failed for conn {}: {}, falling back",
+                                        conn_id, e
+                                    );
+                                    let mut resp_buf = bytes::BytesMut::new();
+                                    crate::protocol::serialize(&response, &mut resp_buf);
+                                    Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
+                                }
+                            }
+                        }
                         _ => {
                             let mut resp_buf = bytes::BytesMut::new();
                             crate::protocol::serialize(&response, &mut resp_buf);
