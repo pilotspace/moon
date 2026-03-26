@@ -27,6 +27,8 @@ use crate::replication::state::ReplicationState;
 use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
 #[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
+#[cfg(feature = "runtime-tokio")]
+use crate::server::connection::handle_connection_sharded_inner;
 #[cfg(feature = "runtime-monoio")]
 use crate::server::connection::handle_connection_sharded_monoio;
 use crate::storage::Database;
@@ -141,7 +143,8 @@ impl Shard {
     /// Runs cooperative active expiry. Shuts down gracefully on cancellation.
     pub async fn run(
         &mut self,
-        conn_rx: channel::MpscReceiver<crate::runtime::TcpStream>,
+        conn_rx: channel::MpscReceiver<(crate::runtime::TcpStream, bool)>,
+        tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
@@ -300,35 +303,38 @@ impl Shard {
                 // Accept new connections from listener
                 stream = conn_rx.recv_async() => {
                     match stream {
-                        Ok(tcp_stream) => {
+                        Ok((tcp_stream, is_tls)) => {
                             // On Linux with io_uring: extract raw fd, register with
                             // UringDriver for io_uring-based recv/send. Skip Tokio task.
+                            // Note: io_uring path does not support TLS (plain TCP only).
                             #[cfg(target_os = "linux")]
                             {
-                                if let Some(ref mut driver) = uring_state {
-                                    match tcp_stream.into_std() {
-                                        Ok(std_stream) => {
-                                            use std::os::unix::io::IntoRawFd;
-                                            let raw_fd = std_stream.into_raw_fd();
-                                            match driver.register_connection(raw_fd) {
-                                                Ok(Some(_conn_id)) => {
-                                                    // Connection registered, io_uring handles I/O
-                                                }
-                                                Ok(None) => {
-                                                    // FD table full, connection rejected (close handled inside)
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
+                                if !is_tls {
+                                    if let Some(ref mut driver) = uring_state {
+                                        match tcp_stream.into_std() {
+                                            Ok(std_stream) => {
+                                                use std::os::unix::io::IntoRawFd;
+                                                let raw_fd = std_stream.into_raw_fd();
+                                                match driver.register_connection(raw_fd) {
+                                                    Ok(Some(_conn_id)) => {
+                                                        // Connection registered, io_uring handles I/O
+                                                    }
+                                                    Ok(None) => {
+                                                        // FD table full, connection rejected (close handled inside)
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
+                                                    }
                                                 }
                                             }
+                                            Err(e) => {
+                                                tracing::warn!("Shard {}: into_std failed: {}", shard_id, e);
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("Shard {}: into_std failed: {}", shard_id, e);
-                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
-                                // Fallthrough: uring_state is None, use Tokio path below
+                                // Fallthrough: uring_state is None or is_tls, use Tokio path below
                             }
 
                             let dbs = databases.clone();
@@ -348,30 +354,55 @@ impl Shard {
                             let rtcfg = runtime_config.clone();
                             let notifiers = all_notifiers.clone();
                             let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
-                            tokio::task::spawn_local(async move {
-                                handle_connection_sharded(
-                                    tcp_stream,
-                                    dbs,
-                                    shard_id,
-                                    num_shards,
-                                    dtx,
-                                    psr,
-                                    blk,
-                                    sd,
-                                    reqpass,
-                                    aof,
-                                    trk,
-                                    cid,
-                                    rs,
-                                    cs,
-                                    lua,
-                                    sc,
-                                    cp,
-                                    acl,
-                                    rtcfg,
-                                    notifiers,
-                                ).await;
-                            });
+
+                            if is_tls && tls_config.is_some() {
+                                // TLS handshake before handler spawn (wrap-before-spawn pattern)
+                                let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                let peer_addr = tcp_stream.peer_addr()
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                tokio::task::spawn_local(async move {
+                                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                                    match acceptor.accept(tcp_stream).await {
+                                        Ok(tls_stream) => {
+                                            handle_connection_sharded_inner(
+                                                tls_stream, peer_addr, dbs, shard_id, num_shards,
+                                                dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                                                rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                            ).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Shard {}: TLS handshake failed: {}", shard_id, e);
+                                        }
+                                    }
+                                });
+                            } else {
+                                // Plain TCP connection
+                                tokio::task::spawn_local(async move {
+                                    handle_connection_sharded(
+                                        tcp_stream,
+                                        dbs,
+                                        shard_id,
+                                        num_shards,
+                                        dtx,
+                                        psr,
+                                        blk,
+                                        sd,
+                                        reqpass,
+                                        aof,
+                                        trk,
+                                        cid,
+                                        rs,
+                                        cs,
+                                        lua,
+                                        sc,
+                                        cp,
+                                        acl,
+                                        rtcfg,
+                                        notifiers,
+                                    ).await;
+                                });
+                            }
                         }
                         Err(_) => {
                             info!("Shard {} connection channel closed", self.id);
@@ -556,7 +587,7 @@ impl Shard {
                 // Accept new connections from listener
                 stream = conn_rx.recv_async() => {
                     match stream {
-                        Ok(std_tcp_stream) => {
+                        Ok((std_tcp_stream, is_tls)) => {
                             // Convert std::net::TcpStream to monoio::net::TcpStream
                             match monoio::net::TcpStream::from_std(std_tcp_stream) {
                                 Ok(tcp_stream) => {
@@ -576,14 +607,41 @@ impl Shard {
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
                                     let notifiers = all_notifiers.clone();
-                                    monoio::spawn(async move {
-                                        let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
-                                        handle_connection_sharded_monoio(
-                                            tcp_stream, dbs, shard_id, num_shards,
-                                            dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                            rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
-                                        ).await;
-                                    });
+
+                                    let peer_addr = tcp_stream.peer_addr()
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|_| "unknown".to_string());
+
+                                    if is_tls && tls_config.is_some() {
+                                        // Monoio TLS handshake before handler spawn
+                                        let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                        monoio::spawn(async move {
+                                            let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
+                                            match acceptor.accept(tcp_stream).await {
+                                                Ok(tls_stream) => {
+                                                    let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                                                    handle_connection_sharded_monoio(
+                                                        tls_stream, peer_addr, dbs, shard_id, num_shards,
+                                                        dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                                                        rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                                    ).await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("Shard {}: Monoio TLS handshake failed: {}", shard_id, e);
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        // Plain TCP connection
+                                        monoio::spawn(async move {
+                                            let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                                            handle_connection_sharded_monoio(
+                                                tcp_stream, peer_addr, dbs, shard_id, num_shards,
+                                                dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                                                rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                            ).await;
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("Shard {}: from_std failed: {}", shard_id, e);

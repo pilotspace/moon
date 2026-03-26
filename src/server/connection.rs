@@ -1380,13 +1380,48 @@ pub async fn handle_connection_sharded(
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
 ) {
-    use tokio::io::AsyncWriteExt;
-
-    // Capture peer address before we start using the stream
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    handle_connection_sharded_inner(
+        stream, peer_addr, databases, shard_id, num_shards,
+        dispatch_tx, pubsub_registry, blocking_registry, shutdown,
+        requirepass, aof_tx, tracking_table, client_id,
+        repl_state, cluster_state, lua, script_cache, config_port,
+        acl_table, runtime_config, spsc_notifiers,
+    ).await;
+}
+
+/// Generic inner handler for sharded connections (Tokio runtime).
+///
+/// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
+/// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
+#[cfg(feature = "runtime-tokio")]
+pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: S,
+    peer_addr: String,
+    databases: Rc<RefCell<Vec<Database>>>,
+    shard_id: usize,
+    num_shards: usize,
+    dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    shutdown: CancellationToken,
+    requirepass: Option<String>,
+    aof_tx: Option<channel::MpscSender<AofMessage>>,
+    tracking_table: Rc<RefCell<TrackingTable>>,
+    client_id: u64,
+    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    lua: std::rc::Rc<mlua::Lua>,
+    script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
+    config_port: u16,
+    acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Direct buffer I/O: bypass Framed/codec for the hot path.
     let mut stream = stream;
@@ -1421,23 +1456,11 @@ pub async fn handle_connection_sharded(
     let mut break_outer = false;
     loop {
         tokio::select! {
-            result = stream.readable() => {
-                if result.is_err() { break; }
-
-                // Read all available data from socket into read_buf
-                match stream.try_read_buf(&mut read_buf) {
+            result = stream.read_buf(&mut read_buf) => {
+                match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(_) => break,
-                }
-                // Drain socket buffer: read more if available
-                loop {
-                    match stream.try_read_buf(&mut read_buf) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
                 }
 
                 // Parse all complete frames from buffer
@@ -3361,8 +3384,9 @@ fn try_inline_dispatch_loop(
 /// read since monoio's IoBufMut is implemented for Vec<u8>, then copy into BytesMut
 /// for codec parsing.
 #[cfg(feature = "runtime-monoio")]
-pub async fn handle_connection_sharded_monoio(
-    mut stream: monoio::net::TcpStream,
+pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent>(
+    mut stream: S,
+    peer_addr: String,
     databases: Rc<RefCell<Vec<Database>>>,
     shard_id: usize,
     num_shards: usize,
@@ -3384,11 +3408,6 @@ pub async fn handle_connection_sharded_monoio(
     spsc_notifiers: Vec<Arc<channel::Notify>>,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-
-    let peer_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
 
     let mut read_buf = BytesMut::with_capacity(8192);
     let mut write_buf = BytesMut::with_capacity(8192);

@@ -39,6 +39,13 @@ async fn start_server() -> (u16, CancellationToken) {
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     tokio::spawn(async move {

@@ -34,8 +34,8 @@ pub struct ChannelMesh {
     /// consumers[receiver_shard] = Vec of consumers, one per other shard.
     consumers: Vec<Vec<HeapCons<ShardMessage>>>,
     /// Connection channels: listener sends TcpStream to each shard.
-    conn_txs: Vec<channel::MpscSender<crate::runtime::TcpStream>>,
-    conn_rxs: Vec<Option<channel::MpscReceiver<crate::runtime::TcpStream>>>,
+    conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
+    conn_rxs: Vec<Option<channel::MpscReceiver<(crate::runtime::TcpStream, bool)>>>,
     /// Per-shard Notify instances for event-driven SPSC wake.
     /// Producers call `notify_one()` after pushing to wake the target shard immediately.
     spsc_notifiers: Vec<Arc<channel::Notify>>,
@@ -116,7 +116,7 @@ impl ChannelMesh {
     /// Take the connection receiver for a specific shard (call once during setup).
     ///
     /// Panics if called more than once for the same shard.
-    pub fn take_conn_rx(&mut self, shard_id: usize) -> channel::MpscReceiver<crate::runtime::TcpStream> {
+    pub fn take_conn_rx(&mut self, shard_id: usize) -> channel::MpscReceiver<(crate::runtime::TcpStream, bool)> {
         self.conn_rxs[shard_id]
             .take()
             .expect("conn_rx already taken")
@@ -125,7 +125,7 @@ impl ChannelMesh {
     /// Get a clone of the connection sender for a specific shard.
     ///
     /// The listener uses this to distribute new connections to shards.
-    pub fn conn_tx(&self, shard_id: usize) -> channel::MpscSender<crate::runtime::TcpStream> {
+    pub fn conn_tx(&self, shard_id: usize) -> channel::MpscSender<(crate::runtime::TcpStream, bool)> {
         self.conn_txs[shard_id].clone()
     }
 
@@ -286,7 +286,7 @@ mod tests {
             let client = client_res.unwrap();
             let (_server, _addr) = accept_res.unwrap();
 
-            tx.send_async(client).await.unwrap();
+            tx.send_async((client, false)).await.unwrap();
             let received = rx.recv_async().await;
             assert!(received.is_ok(), "should receive TcpStream");
         });

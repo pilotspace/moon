@@ -38,6 +38,23 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Build TLS configuration if tls_port is set
+    let tls_config: Option<std::sync::Arc<rustls::ServerConfig>> = if config.tls_port > 0 {
+        let cert = config.tls_cert_file.as_ref()
+            .expect("--tls-cert-file required when --tls-port is set");
+        let key = config.tls_key_file.as_ref()
+            .expect("--tls-key-file required when --tls-port is set");
+        let tls_cfg = rust_redis::tls::build_tls_config(
+            cert, key,
+            config.tls_ca_cert_file.as_deref(),
+            config.tls_ciphersuites.as_deref(),
+        ).expect("Failed to build TLS config");
+        info!("TLS enabled on port {} (TLS 1.3, rustls + aws-lc-rs)", config.tls_port);
+        Some(tls_cfg)
+    } else {
+        None
+    };
+
     // Determine number of shards
     let num_shards = if config.shards == 0 {
         std::thread::available_parallelism()
@@ -159,6 +176,7 @@ fn main() -> anyhow::Result<()> {
         let shard_runtime_config = runtime_config_shared.clone();
         let shard_spsc_notify = mesh.take_notify(id);
         let shard_all_notifiers = all_notifiers.clone();
+        let shard_tls_config = tls_config.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -183,6 +201,7 @@ fn main() -> anyhow::Result<()> {
                     async move {
                         shard.run(
                             conn_rx,
+                            shard_tls_config,
                             consumers,
                             producers,
                             shard_cancel,
