@@ -567,7 +567,7 @@ impl Shard {
                                     monoio::spawn(async move {
                                         handle_connection_sharded_monoio(
                                             tcp_stream, dbs, shard_id, num_shards,
-                                            dtx, psr, blk, sd, aof, trk, cid,
+                                            dtx, psr, blk, sd, None, aof, trk, cid,
                                             rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
                                         ).await;
                                     });

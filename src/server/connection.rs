@@ -3319,21 +3319,22 @@ pub async fn handle_connection_sharded_monoio(
     pubsub_registry: Rc<RefCell<PubSubRegistry>>,
     blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
+    requirepass: Option<String>,
     aof_tx: Option<channel::MpscSender<AofMessage>>,
-    _tracking_table: Rc<RefCell<TrackingTable>>,
-    _client_id: u64,
-    _repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
-    _cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
-    _lua: Rc<mlua::Lua>,
-    _script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
-    _config_port: u16,
-    _acl_table: Arc<RwLock<crate::acl::AclTable>>,
-    _runtime_config: Arc<RwLock<RuntimeConfig>>,
+    tracking_table: Rc<RefCell<TrackingTable>>,
+    client_id: u64,
+    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    lua: Rc<mlua::Lua>,
+    script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
+    config_port: u16,
+    acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
-    let _peer_addr = stream
+    let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -3343,6 +3344,16 @@ pub async fn handle_connection_sharded_monoio(
     let mut codec = RespCodec::default();
     let mut selected_db: usize = 0;
     let db_count = databases.borrow().len();
+
+    // Connection-level state (mirroring Tokio handler)
+    let mut protocol_version: u8 = 2;
+    let mut authenticated = requirepass.is_none();
+    let mut current_user: String = "default".to_string();
+    let mut acl_log = crate::acl::AclLog::new(128);
+    let mut tracking_state = TrackingState::default();
+    let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
+    let mut client_name: Option<Bytes> = None;
+    let mut asking: bool = false;
 
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
@@ -3591,7 +3602,8 @@ pub async fn handle_connection_sharded_monoio(
 
         // Inline dispatch: for single-shard mode, handle GET/SET directly from raw
         // bytes without Frame construction or dispatch table lookup.
-        if num_shards == 1 {
+        // Skip inline dispatch when not authenticated — AUTH must go through normal path.
+        if num_shards == 1 && authenticated {
             // Refresh time once before inline dispatch (same as batch refresh below)
             {
                 let mut dbs = databases.borrow_mut();
@@ -3652,6 +3664,59 @@ pub async fn handle_connection_sharded_monoio(
         }
 
         for frame in frames.drain(..) {
+            // --- AUTH gate ---
+            if !authenticated {
+                match extract_command(&frame) {
+                    Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
+                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                        if let Some(uname) = opt_user {
+                            authenticated = true;
+                            current_user = uname;
+                        } else {
+                            acl_log.push(crate::acl::AclLogEntry {
+                                reason: "auth".to_string(),
+                                object: "AUTH".to_string(),
+                                username: current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            });
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+                    Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
+                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
+                            cmd_args, protocol_version, client_id, &acl_table, &mut authenticated,
+                        );
+                        if !matches!(&response, Frame::Error(_)) {
+                            protocol_version = new_proto;
+                        }
+                        if let Some(name) = new_name {
+                            client_name = Some(name);
+                        }
+                        if let Some(uname) = opt_user {
+                            current_user = uname;
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+                    Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        should_quit = true;
+                        break;
+                    }
+                    _ => {
+                        responses.push(Frame::Error(
+                            Bytes::from_static(b"NOAUTH Authentication required.")
+                        ));
+                        continue;
+                    }
+                }
+            }
+
             let (cmd, cmd_args) = match extract_command(&frame) {
                 Some(pair) => pair,
                 None => {
@@ -3665,6 +3730,375 @@ pub async fn handle_connection_sharded_monoio(
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 should_quit = true;
                 break;
+            }
+
+            // --- ASKING: set per-connection flag for next command ---
+            if cmd.eq_ignore_ascii_case(b"ASKING") {
+                asking = true;
+                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                continue;
+            }
+
+            // --- CLUSTER subcommands ---
+            if cmd.eq_ignore_ascii_case(b"CLUSTER") {
+                if let Some(ref cs) = cluster_state {
+                    let self_addr: std::net::SocketAddr =
+                        format!("127.0.0.1:{}", config_port)
+                            .parse()
+                            .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
+                    let resp = crate::cluster::command::handle_cluster_command(
+                        cmd_args, cs, self_addr,
+                    );
+                    responses.push(resp);
+                } else {
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"ERR This instance has cluster support disabled",
+                    )));
+                }
+                continue;
+            }
+
+            // --- Lua scripting: EVALSHA ---
+            if cmd.eq_ignore_ascii_case(b"EVALSHA") {
+                let response = {
+                    let mut dbs = databases.borrow_mut();
+                    let db_count = dbs.len();
+                    let db = &mut dbs[selected_db];
+                    crate::scripting::handle_evalsha(
+                        &lua, &script_cache, cmd_args, db,
+                        shard_id, num_shards, selected_db, db_count,
+                    )
+                };
+                responses.push(response);
+                continue;
+            }
+
+            // --- Lua scripting: EVAL ---
+            if cmd.eq_ignore_ascii_case(b"EVAL") {
+                let response = {
+                    let mut dbs = databases.borrow_mut();
+                    let db_count = dbs.len();
+                    let db = &mut dbs[selected_db];
+                    crate::scripting::handle_eval(
+                        &lua, &script_cache, cmd_args, db,
+                        shard_id, num_shards, selected_db, db_count,
+                    )
+                };
+                responses.push(response);
+                continue;
+            }
+
+            // --- SCRIPT subcommands: LOAD, EXISTS, FLUSH ---
+            if cmd.eq_ignore_ascii_case(b"SCRIPT") {
+                let (response, fanout) = crate::scripting::handle_script_subcommand(&script_cache, cmd_args);
+                if let Some((sha1, script_bytes)) = fanout {
+                    let mut producers = dispatch_tx.borrow_mut();
+                    for target in 0..num_shards {
+                        if target == shard_id {
+                            continue;
+                        }
+                        let idx = ChannelMesh::target_index(shard_id, target);
+                        let msg = ShardMessage::ScriptLoad {
+                            sha1: sha1.clone(),
+                            script: script_bytes.clone(),
+                        };
+                        if producers[idx].try_push(msg).is_ok() {
+                            spsc_notifiers[target].notify_one();
+                        }
+                    }
+                    drop(producers);
+                }
+                responses.push(response);
+                continue;
+            }
+
+            // --- Cluster slot routing (pre-dispatch) ---
+            if crate::cluster::cluster_enabled() {
+                if let Some(ref cs) = cluster_state {
+                    let was_asking = asking;
+                    asking = false;
+
+                    let maybe_key = extract_primary_key(cmd, cmd_args);
+                    if let Some(key) = maybe_key {
+                        let slot = crate::cluster::slots::slot_for_key(key);
+                        let route = cs.read().unwrap().route_slot(slot, was_asking);
+                        match route {
+                            crate::cluster::SlotRoute::Local => {} // proceed
+                            other => {
+                                let err_frame = other.into_error_frame(slot);
+                                responses.push(err_frame);
+                                continue;
+                            }
+                        }
+
+                        // CROSSSLOT check for multi-key commands
+                        if is_multi_key_command(cmd, cmd_args) {
+                            let first_slot = slot;
+                            let mut cross_slot = false;
+                            for arg in cmd_args.iter().skip(1) {
+                                if let Some(k) = match arg {
+                                    Frame::BulkString(b) => Some(b.as_ref()),
+                                    _ => None,
+                                } {
+                                    if crate::cluster::slots::slot_for_key(k) != first_slot {
+                                        cross_slot = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if cross_slot {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"CROSSSLOT Keys in request don't hash to the same slot",
+                                )));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- AUTH (already authenticated) ---
+            if cmd.eq_ignore_ascii_case(b"AUTH") {
+                let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                if let Some(uname) = opt_user {
+                    current_user = uname;
+                }
+                responses.push(response);
+                continue;
+            }
+
+            // --- HELLO (protocol negotiation, ACL-aware) ---
+            if cmd.eq_ignore_ascii_case(b"HELLO") {
+                let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
+                    cmd_args, protocol_version, client_id, &acl_table, &mut authenticated,
+                );
+                if !matches!(&response, Frame::Error(_)) {
+                    protocol_version = new_proto;
+                }
+                if let Some(name) = new_name {
+                    client_name = Some(name);
+                }
+                if let Some(uname) = opt_user {
+                    current_user = uname;
+                }
+                responses.push(response);
+                continue;
+            }
+
+            // --- ACL command (intercepted at connection level) ---
+            if cmd.eq_ignore_ascii_case(b"ACL") {
+                let response = crate::command::acl::handle_acl(
+                    cmd_args, &acl_table, &mut acl_log, &current_user, &peer_addr, &runtime_config,
+                );
+                responses.push(response);
+                continue;
+            }
+
+            // --- REPLICAOF / SLAVEOF ---
+            if cmd.eq_ignore_ascii_case(b"REPLICAOF")
+                || cmd.eq_ignore_ascii_case(b"SLAVEOF")
+            {
+                use crate::command::connection::{replicaof, ReplicaofAction};
+                let (resp, action) = replicaof(cmd_args);
+                if let Some(action) = action {
+                    if let Some(ref rs) = repl_state {
+                        match action {
+                            ReplicaofAction::StartReplication { host, port } => {
+                                if let Ok(mut rs_guard) = rs.write() {
+                                    rs_guard.role = crate::replication::state::ReplicationRole::Replica {
+                                        host: host.clone(),
+                                        port,
+                                        state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
+                                    };
+                                }
+                                let rs_clone = Arc::clone(rs);
+                                let cfg = crate::replication::replica::ReplicaTaskConfig {
+                                    master_host: host,
+                                    master_port: port,
+                                    repl_state: rs_clone,
+                                    num_shards,
+                                    persistence_dir: None,
+                                    listening_port: 0,
+                                };
+                                monoio::spawn(crate::replication::replica::run_replica_task(cfg));
+                            }
+                            ReplicaofAction::PromoteToMaster => {
+                                use crate::replication::state::generate_repl_id;
+                                if let Ok(mut rs_guard) = rs.write() {
+                                    rs_guard.repl_id2 = rs_guard.repl_id.clone();
+                                    rs_guard.repl_id = generate_repl_id();
+                                    rs_guard.role = crate::replication::state::ReplicationRole::Master;
+                                }
+                            }
+                            ReplicaofAction::NoOp => {}
+                        }
+                    }
+                }
+                responses.push(resp);
+                continue;
+            }
+
+            // --- REPLCONF ---
+            if cmd.eq_ignore_ascii_case(b"REPLCONF") {
+                let resp = crate::command::connection::replconf(cmd_args);
+                responses.push(resp);
+                continue;
+            }
+
+            // --- INFO (with replication section) ---
+            if cmd.eq_ignore_ascii_case(b"INFO") {
+                let dbs = databases.borrow();
+                let response_text = {
+                    let resp_frame = conn_cmd::info_readonly(&dbs[selected_db], cmd_args);
+                    match resp_frame {
+                        Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+                        _ => String::new(),
+                    }
+                };
+                drop(dbs);
+                let mut response_text = response_text;
+                if let Some(ref rs) = repl_state {
+                    if let Ok(rs_guard) = rs.try_read() {
+                        response_text.push_str(
+                            &crate::replication::handshake::build_info_replication(&rs_guard),
+                        );
+                    }
+                }
+                responses.push(Frame::BulkString(Bytes::from(response_text)));
+                continue;
+            }
+
+            // --- READONLY enforcement: reject writes on replicas ---
+            if let Some(ref rs) = repl_state {
+                if let Ok(rs_guard) = rs.try_read() {
+                    if matches!(
+                        rs_guard.role,
+                        crate::replication::state::ReplicationRole::Replica { .. }
+                    ) {
+                        if crate::persistence::aof::is_write_command(cmd) {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"READONLY You can't write against a read only replica.",
+                            )));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // --- CLIENT subcommands (ID, SETNAME, GETNAME, TRACKING) ---
+            if cmd.eq_ignore_ascii_case(b"CLIENT") {
+                if let Some(sub) = cmd_args.first() {
+                    if let Some(sub_bytes) = extract_bytes(sub) {
+                        if sub_bytes.eq_ignore_ascii_case(b"ID") {
+                            responses.push(conn_cmd::client_id(client_id));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"SETNAME") {
+                            if cmd_args.len() != 2 {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
+                                )));
+                            } else {
+                                client_name = extract_bytes(&cmd_args[1]);
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            }
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"GETNAME") {
+                            responses.push(match &client_name {
+                                Some(name) => Frame::BulkString(name.clone()),
+                                None => Frame::Null,
+                            });
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+                            match crate::command::client::parse_tracking_args(cmd_args) {
+                                Ok(config_parsed) => {
+                                    if config_parsed.enable {
+                                        tracking_state.enabled = true;
+                                        tracking_state.bcast = config_parsed.bcast;
+                                        tracking_state.noloop = config_parsed.noloop;
+                                        tracking_state.optin = config_parsed.optin;
+                                        tracking_state.optout = config_parsed.optout;
+
+                                        if tracking_rx.is_none() {
+                                            let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
+                                            tracking_state.invalidation_tx = Some(tx.clone());
+                                            tracking_rx = Some(rx);
+
+                                            let mut table = tracking_table.borrow_mut();
+                                            table.register_client(client_id, tx);
+                                            if let Some(target) = config_parsed.redirect {
+                                                table.set_redirect(client_id, target);
+                                            }
+                                            for prefix in &config_parsed.prefixes {
+                                                table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
+                                            }
+                                        }
+                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    } else {
+                                        tracking_state = TrackingState::default();
+                                        tracking_table.borrow_mut().untrack_all(client_id);
+                                        tracking_rx = None;
+                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    }
+                                    continue;
+                                }
+                                Err(err_frame) => {
+                                    responses.push(err_frame);
+                                    continue;
+                                }
+                            }
+                        }
+                        // Unknown CLIENT subcommand
+                        responses.push(Frame::Error(Bytes::from(format!(
+                            "ERR unknown subcommand '{}'",
+                            String::from_utf8_lossy(&sub_bytes)
+                        ))));
+                        continue;
+                    }
+                }
+                responses.push(Frame::Error(
+                    Bytes::from_static(b"ERR wrong number of arguments for 'client' command"),
+                ));
+                continue;
+            }
+
+            // --- PUBLISH: local delivery + cross-shard fan-out ---
+            if cmd.eq_ignore_ascii_case(b"PUBLISH") {
+                if cmd_args.len() != 2 {
+                    responses.push(Frame::Error(
+                        Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
+                    ));
+                } else {
+                    let channel = extract_bytes(&cmd_args[0]);
+                    let message = extract_bytes(&cmd_args[1]);
+                    match (channel, message) {
+                        (Some(ch), Some(msg)) => {
+                            let local_count = pubsub_registry.borrow_mut().publish(&ch, &msg);
+                            let mut producers = dispatch_tx.borrow_mut();
+                            for target in 0..num_shards {
+                                if target == shard_id {
+                                    continue;
+                                }
+                                let idx = ChannelMesh::target_index(shard_id, target);
+                                let fanout_msg = ShardMessage::PubSubFanOut {
+                                    channel: ch.clone(),
+                                    message: msg.clone(),
+                                };
+                                if producers[idx].try_push(fanout_msg).is_ok() {
+                                    spsc_notifiers[target].notify_one();
+                                }
+                            }
+                            drop(producers);
+                            responses.push(Frame::Integer(local_count));
+                        }
+                        _ => responses.push(Frame::Error(
+                            Bytes::from_static(b"ERR invalid channel or message"),
+                        )),
+                    }
+                }
+                continue;
             }
 
             // --- SUBSCRIBE / PSUBSCRIBE ---
@@ -3728,6 +4162,62 @@ pub async fn handle_connection_sharded_monoio(
                 };
                 responses.push(resp);
                 continue;
+            }
+
+            // --- BGSAVE: trigger per-shard cooperative snapshot ---
+            if cmd.eq_ignore_ascii_case(b"BGSAVE") {
+                let response = crate::command::persistence::bgsave_start_sharded(
+                    &dispatch_tx, ".", num_shards,
+                );
+                responses.push(response);
+                continue;
+            }
+
+            // === ACL permission check (NOPERM gate) ===
+            // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
+            {
+                let acl_guard = acl_table.read().unwrap();
+                if let Some(deny_reason) = acl_guard.check_command_permission(
+                    &current_user, cmd, cmd_args,
+                ) {
+                    drop(acl_guard);
+                    acl_log.push(crate::acl::AclLogEntry {
+                        reason: "command".to_string(),
+                        object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                        username: current_user.clone(),
+                        client_addr: peer_addr.clone(),
+                        timestamp_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    });
+                    responses.push(Frame::Error(Bytes::from(format!(
+                        "NOPERM {}", deny_reason
+                    ))));
+                    continue;
+                }
+
+                // === ACL key pattern check (same lock guard) ===
+                let is_write_for_acl = crate::persistence::aof::is_write_command(cmd);
+                if let Some(deny_reason) = acl_guard.check_key_permission(
+                    &current_user, cmd, cmd_args, is_write_for_acl,
+                ) {
+                    drop(acl_guard);
+                    acl_log.push(crate::acl::AclLogEntry {
+                        reason: "command".to_string(),
+                        object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                        username: current_user.clone(),
+                        client_addr: peer_addr.clone(),
+                        timestamp_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    });
+                    responses.push(Frame::Error(Bytes::from(format!(
+                        "NOPERM {}", deny_reason
+                    ))));
+                    continue;
+                }
             }
 
             // --- MULTI ---
@@ -3858,6 +4348,13 @@ pub async fn handle_connection_sharded_monoio(
                 _ => false,
             };
 
+            // Pre-classify write commands for AOF + tracking
+            let is_write = if aof_tx.is_some() || tracking_state.enabled {
+                aof::is_write_command(cmd)
+            } else {
+                false
+            };
+
             if is_local {
                 // LOCAL FAST PATH: single borrow_mut covers dispatch + wakeup (no per-command acquire/release)
                 let mut dbs = databases.borrow_mut();
@@ -3875,13 +4372,11 @@ pub async fn handle_connection_sharded_monoio(
                     }
                 };
 
-                // AOF logging for successful local writes (no borrow needed, holding is fine — no await)
-                if !matches!(response, Frame::Error(_)) {
+                // AOF logging for successful local writes
+                if !matches!(response, Frame::Error(_)) && is_write {
                     if let Some(ref tx) = aof_tx {
-                        if aof::is_write_command(cmd) {
-                            let serialized = aof::serialize_command(&frame);
-                            let _ = tx.try_send(AofMessage::Append(serialized));
-                        }
+                        let serialized = aof::serialize_command(&frame);
+                        let _ = tx.try_send(AofMessage::Append(serialized));
                     }
                 }
 
@@ -3911,6 +4406,30 @@ pub async fn handle_connection_sharded_monoio(
                 }
 
                 drop(dbs); // Single drop at end of local block
+
+                // Track key on read / invalidate tracked key on write
+                if tracking_state.enabled {
+                    if is_write {
+                        if !matches!(response, Frame::Error(_)) {
+                            if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                                if !senders.is_empty() {
+                                    let push = crate::tracking::invalidation::invalidation_push(&[key]);
+                                    for tx in senders {
+                                        let _ = tx.try_send(push.clone());
+                                    }
+                                }
+                            }
+                        }
+                    } else if !tracking_state.bcast {
+                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                            tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
+                        }
+                    }
+                }
+
+                // Apply RESP3 response conversion if needed
+                let response = apply_resp3_conversion(cmd, response, protocol_version);
                 responses.push(response);
             } else if let Some(target) = target_shard {
                 // DEFERRED REMOTE: collect for batch dispatch after loop
@@ -3972,7 +4491,7 @@ pub async fn handle_connection_sharded_monoio(
             for (meta, reply_rx) in reply_futures.drain(..) {
                 match reply_rx.recv().await {
                     Ok(shard_responses) => {
-                        for ((resp_idx, aof_bytes, _cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
                             // AOF logging for successful remote writes
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(resp, Frame::Error(_)) {
@@ -3981,6 +4500,7 @@ pub async fn handle_connection_sharded_monoio(
                                     }
                                 }
                             }
+                            let resp = apply_resp3_conversion(&cmd_name, resp, protocol_version);
                             responses[resp_idx] = resp;
                         }
                     }
