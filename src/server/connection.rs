@@ -1367,6 +1367,7 @@ pub async fn handle_connection_sharded(
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+    snapshot_trigger_tx: channel::WatchSender<u64>,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -2034,12 +2035,9 @@ pub async fn handle_connection_sharded(
 
                     // --- BGSAVE: trigger per-shard cooperative snapshot ---
                     if cmd.eq_ignore_ascii_case(b"BGSAVE") {
-                        let snap_dir = runtime_config.read().unwrap().dir.clone();
                         let response = crate::command::persistence::bgsave_start_sharded(
-                            &dispatch_tx,
-                            &snap_dir,
+                            &snapshot_trigger_tx,
                             num_shards,
-                            &spsc_notifiers,
                         );
                         responses.push(response);
                         continue;
@@ -3361,6 +3359,7 @@ pub async fn handle_connection_sharded_monoio(
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
+    snapshot_trigger_tx: channel::WatchSender<u64>,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
@@ -4196,9 +4195,9 @@ pub async fn handle_connection_sharded_monoio(
 
             // --- BGSAVE: trigger per-shard cooperative snapshot ---
             if cmd.eq_ignore_ascii_case(b"BGSAVE") {
-                let snap_dir = runtime_config.read().unwrap().dir.clone();
                 let response = crate::command::persistence::bgsave_start_sharded(
-                    &dispatch_tx, &snap_dir, num_shards, &spsc_notifiers,
+                    &snapshot_trigger_tx,
+                    num_shards,
                 );
                 responses.push(response);
                 continue;

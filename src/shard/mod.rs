@@ -149,6 +149,7 @@ impl Shard {
         bind_addr: Option<String>,
         persistence_dir: Option<String>,
         snapshot_trigger_rx: channel::WatchReceiver<u64>,
+        snapshot_trigger_tx: channel::WatchSender<u64>,
         repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
@@ -346,6 +347,7 @@ impl Shard {
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
                             let notifiers = all_notifiers.clone();
+                            let snap_tx = snapshot_trigger_tx.clone();
                             tokio::task::spawn_local(async move {
                                 handle_connection_sharded(
                                     tcp_stream,
@@ -368,6 +370,7 @@ impl Shard {
                                     acl,
                                     rtcfg,
                                     notifiers,
+                                    snap_tx,
                                 ).await;
                             });
                         }
@@ -564,11 +567,13 @@ impl Shard {
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
                                     let notifiers = all_notifiers.clone();
+                                    let snap_tx = snapshot_trigger_tx.clone();
                                     monoio::spawn(async move {
                                         handle_connection_sharded_monoio(
                                             tcp_stream, dbs, shard_id, num_shards,
                                             dtx, psr, blk, sd, None, aof, trk, cid,
                                             rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                            snap_tx,
                                         ).await;
                                     });
                                 }

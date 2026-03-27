@@ -144,6 +144,7 @@ fn main() -> anyhow::Result<()> {
         let shard_bind_addr = bind_addr.clone();
         let shard_persistence_dir = persistence_dir.clone();
         let shard_snap_rx = snapshot_trigger_rx.clone();
+        let shard_snap_tx = snapshot_trigger_tx.clone();
         let shard_repl_state = repl_state.clone();
         let shard_cluster_state = cluster_state.clone();
         let shard_acl_table = acl_table.clone();
@@ -181,6 +182,7 @@ fn main() -> anyhow::Result<()> {
                             Some(shard_bind_addr),
                             shard_persistence_dir,
                             shard_snap_rx,
+                            shard_snap_tx,
                             Some(shard_repl_state),
                             shard_cluster_state,
                             config_port,

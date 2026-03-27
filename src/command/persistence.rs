@@ -1,14 +1,10 @@
 //! Persistence command handlers (BGSAVE, BGREWRITEAOF).
 
-use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ringbuf::traits::Producer;
-use ringbuf::HeapProd;
 use tracing::{error, info};
 
 use crate::runtime::channel;
@@ -16,7 +12,6 @@ use crate::runtime::channel;
 use crate::persistence::aof::AofMessage;
 use crate::persistence::rdb;
 use crate::protocol::Frame;
-use crate::shard::dispatch::ShardMessage;
 use crate::storage::Database;
 
 /// Type alias for the per-database RwLock container.
@@ -126,14 +121,17 @@ pub fn bgsave_start(
 
 /// Start a cooperative per-shard snapshot (BGSAVE command, sharded mode).
 ///
-/// Increments the global epoch and sends SnapshotBegin to all shards via SPSC.
-/// Each shard independently snapshots its databases at this epoch.
-/// Returns immediately -- snapshot happens asynchronously in shard event loops.
+/// Bumps the global epoch and broadcasts via the watch channel. Every shard's
+/// event loop checks the watch channel on its periodic 1ms tick and starts its
+/// own snapshot independently. Completion is tracked via BGSAVE_SHARDS_REMAINING
+/// atomic counter — the last shard to finish clears SAVE_IN_PROGRESS.
+///
+/// This approach works reliably across both Tokio and Monoio because it uses
+/// the same watch-channel path as auto-save, avoiding SPSC (which has no
+/// self-producer for the local shard).
 pub fn bgsave_start_sharded(
-    producers: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    snapshot_dir: &str,
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
-    spsc_notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
 ) -> Frame {
     if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Frame::Error(Bytes::from_static(
@@ -142,98 +140,11 @@ pub fn bgsave_start_sharded(
     }
 
     let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    let snap_dir = PathBuf::from(snapshot_dir);
+    BGSAVE_SHARDS_REMAINING.store(num_shards as u64, Ordering::SeqCst);
 
-    let mut receivers = Vec::with_capacity(num_shards);
-    let mut prods = producers.borrow_mut();
-    for (i, prod) in prods.iter_mut().enumerate() {
-        let (tx, rx) = crate::runtime::channel::oneshot();
-        match prod.try_push(ShardMessage::SnapshotBegin {
-            epoch,
-            snapshot_dir: snap_dir.clone(),
-            reply_tx: tx,
-        }) {
-            Ok(()) => {
-                receivers.push(rx);
-            }
-            Err(_msg) => {
-                error!("BGSAVE: SPSC full for shard {}, SnapshotBegin dropped!", i);
-                // Push a receiver that will never resolve — the watcher thread will
-                // detect this as a dropped channel and mark failure.
-                let (_tx2, rx2) = crate::runtime::channel::oneshot();
-                receivers.push(rx2);
-            }
-        }
-        // Wake the shard's event loop to drain SPSC
-        if i < spsc_notifiers.len() {
-            spsc_notifiers[i].notify_one();
-        }
-    }
-    drop(prods);
-
-    // Spawn a completion watcher that awaits all shard replies before
-    // clearing SAVE_IN_PROGRESS. This replaces the old fire-and-forget
-    // pattern that cleared the flag immediately after sending messages.
-    #[cfg(feature = "runtime-tokio")]
-    tokio::task::spawn_local(async move {
-        let mut all_ok = true;
-        for rx in receivers {
-            match rx.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error!("Shard snapshot failed: {}", e);
-                    all_ok = false;
-                }
-                Err(_) => {
-                    error!("Shard snapshot channel dropped");
-                    all_ok = false;
-                }
-            }
-        }
-        BGSAVE_LAST_STATUS.store(all_ok, Ordering::Relaxed);
-        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
-        LAST_SAVE_TIME.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            Ordering::Relaxed,
-        );
-        info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
-    });
-
-    // Under Monoio's thread-per-core model, monoio::spawn on the listener thread
-    // cannot properly await cross-thread oneshot replies. Use a dedicated OS thread
-    // to block on the flume receivers synchronously.
-    #[cfg(feature = "runtime-monoio")]
-    {
-        std::thread::spawn(move || {
-            let mut all_ok = true;
-            for rx in receivers {
-                match rx.recv_blocking() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        error!("Shard snapshot failed: {}", e);
-                        all_ok = false;
-                    }
-                    Err(_) => {
-                        error!("Shard snapshot channel dropped");
-                        all_ok = false;
-                    }
-                }
-            }
-            BGSAVE_LAST_STATUS.store(all_ok, Ordering::Relaxed);
-            SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
-            LAST_SAVE_TIME.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                Ordering::Relaxed,
-            );
-            info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
-        });
-    }
+    // Broadcast epoch to all shards via watch channel.
+    // Each shard picks this up on its next timer tick and starts its snapshot.
+    let _ = snapshot_trigger.send(epoch);
 
     info!("BGSAVE triggered: epoch {} across {} shards", epoch, num_shards);
     Frame::SimpleString(Bytes::from_static(b"Background saving started"))

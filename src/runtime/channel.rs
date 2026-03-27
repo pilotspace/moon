@@ -92,6 +92,7 @@ pub fn watch<T: Clone + Send + Sync + 'static>(initial: T) -> (WatchSender<T>, W
     )
 }
 
+#[derive(Clone)]
 pub struct WatchSender<T> {
     shared: Arc<Mutex<T>>,
     notify_tx: flume::Sender<()>,
