@@ -42,6 +42,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --no-default-features --features runtime-tokio,jemalloc
+        timeout-minutes: 10
 
   msrv:
     name: MSRV (1.85)
