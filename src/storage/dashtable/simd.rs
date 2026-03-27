@@ -32,6 +32,9 @@ impl Group {
     ///
     /// Returns a `BitMask` where bit `i` is set if `ctrl[i] == h2`.
     ///
+    /// # Safety
+    /// Requires x86_64 with SSE2 support (baseline on all x86_64 CPUs).
+    ///
     /// # SSE2 path (x86_64)
     /// Uses `_mm_load_si128` + `_mm_cmpeq_epi8` + `_mm_movemask_epi8` for
     /// 16-way parallel comparison in a single instruction sequence.
@@ -77,6 +80,9 @@ impl Group {
     ///
     /// Both EMPTY (0xFF) and DELETED (0x80) have bit 7 set.
     /// All FULL slots have H2 values in 0x00..0x7F (bit 7 clear).
+    ///
+    /// # Safety
+    /// Requires x86_64 with SSE2 support (baseline on all x86_64 CPUs).
     #[cfg(target_arch = "x86_64")]
     #[inline]
     #[target_feature(enable = "sse2")]

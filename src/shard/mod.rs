@@ -40,8 +40,10 @@ use crate::tracking::TrackingTable;
 
 use std::sync::{Arc, RwLock};
 
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+use crate::io::{IoEvent, WritevGuard};
 #[cfg(target_os = "linux")]
-use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
+use crate::io::{UringConfig, UringDriver};
 
 use self::dispatch::ShardMessage;
 
@@ -63,11 +65,11 @@ pub struct Shard {
     pub pubsub_registry: PubSubRegistry,
 }
 
-/// In-flight send buffer variants for proper RAII lifetime management (Linux only).
+/// In-flight send buffer variants for proper RAII lifetime management (Linux + tokio only).
 ///
 /// Keeps buffers alive until the corresponding io_uring SendComplete CQE arrives,
 /// replacing the previous std::mem::forget memory leak.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 enum InFlightSend {
     /// Serialized response buffer for non-BulkString frames (heap fallback).
     Buf(bytes::BytesMut),
@@ -1369,14 +1371,12 @@ impl Shard {
         }
     }
 
-    /// Process a single io_uring completion event (Linux only).
-    ///
     /// Send a serialized response buffer via io_uring.
     ///
     /// Tries the pre-registered fixed buffer pool first (zero get_user_pages overhead).
     /// If the pool is exhausted or the response is too large for a pooled buffer,
     /// falls back to heap-allocated BytesMut with regular submit_send.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     fn send_serialized(
         driver: &mut UringDriver,
         conn_id: u32,
@@ -1412,7 +1412,7 @@ impl Shard {
     /// disconnect, recv rearm, accept, and send completion events.
     /// Command dispatch reuses the same `extract_command_static` + `cmd_dispatch`
     /// path as the Tokio connection handler.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     fn handle_uring_event(
         event: IoEvent,
         driver: &mut UringDriver,
@@ -1933,7 +1933,7 @@ mod tests {
 
     /// Linux-only: verify handle_uring_event processes Disconnect correctly.
     /// This test only compiles and runs on Linux CI.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_disconnect() {
         use crate::io::{IoEvent, UringConfig, UringDriver};
@@ -1968,7 +1968,7 @@ mod tests {
     }
 
     /// Linux-only: verify handle_uring_event processes SendComplete as no-op.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_send_complete() {
         use crate::io::{IoEvent, UringConfig, UringDriver};

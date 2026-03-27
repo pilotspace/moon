@@ -40,8 +40,8 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 struct ConnState {
     /// Fixed FD index in the registered table.
     fixed_fd_idx: u32,
-    /// Raw file descriptor.
-    raw_fd: RawFd,
+    /// Raw file descriptor (kept for future diagnostic/close use).
+    _raw_fd: RawFd,
     /// Accumulation buffer for partial RESP frames spanning multiple recvs.
     read_buf: BytesMut,
     /// Whether this connection has an active multishot recv.
@@ -108,10 +108,7 @@ impl SendBufPool {
         let mut free_list = Vec::with_capacity(count as usize);
 
         for i in 0..count {
-            let mut buf = Vec::with_capacity(size);
-            // Set length to capacity so the entire buffer is valid memory
-            // that can be registered with the kernel.
-            unsafe { buf.set_len(size) };
+            let buf = vec![0u8; size];
             buffers.push(buf);
             free_list.push(i);
         }
@@ -308,7 +305,7 @@ impl UringDriver {
             conn_id,
             ConnState {
                 fixed_fd_idx: fixed_idx,
-                raw_fd,
+                _raw_fd: raw_fd,
                 read_buf: BytesMut::with_capacity(0), // allocated on-demand for partial frames
                 recv_active: false,
             },
@@ -476,7 +473,7 @@ impl UringDriver {
     pub fn submit_and_wait(&mut self) -> std::io::Result<usize> {
         if self.pending_sqes == 0 {
             // Nothing to submit, but still check for CQEs
-            return self.ring.submit_and_wait(1).map_err(Into::into);
+            return self.ring.submit_and_wait(1);
         }
         let n = self.ring.submit_and_wait(1)?;
         self.pending_sqes = 0;
