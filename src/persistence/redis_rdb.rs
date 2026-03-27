@@ -13,13 +13,13 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
 
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::db::Database;
-use crate::storage::entry::{current_time_ms, Entry, RedisValue};
+use crate::storage::entry::{Entry, RedisValue, current_time_ms};
 
 // ---------------------------------------------------------------------------
 // Redis RDB opcodes and type tags
@@ -429,10 +429,7 @@ pub fn load_rdb(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize
 
     // Verify magic + version
     if &data[..5] != REDIS_RDB_MAGIC {
-        bail!(
-            "Invalid RDB magic: expected REDIS, got {:?}",
-            &data[..5]
-        );
+        bail!("Invalid RDB magic: expected REDIS, got {:?}", &data[..5]);
     }
     if &data[5..9] != REDIS_RDB_VERSION {
         // We only support version 0010 for now
@@ -879,7 +876,12 @@ mod tests {
         // TTL should be approximately the same (within 1 second tolerance)
         let loaded_ms = entry.expires_at_ms(0);
         let diff = (loaded_ms as i64 - expire_ms as i64).unsigned_abs();
-        assert!(diff < 1000, "TTL mismatch: loaded={}, expected={}", loaded_ms, expire_ms);
+        assert!(
+            diff < 1000,
+            "TTL mismatch: loaded={}, expected={}",
+            loaded_ms,
+            expire_ms
+        );
     }
 
     #[test]
@@ -906,8 +908,14 @@ mod tests {
         match entry.as_redis_value() {
             RedisValueRef::Hash(map) => {
                 assert_eq!(map.len(), 2);
-                assert_eq!(map.get(&Bytes::from_static(b"field1")).unwrap(), &Bytes::from_static(b"val1"));
-                assert_eq!(map.get(&Bytes::from_static(b"field2")).unwrap(), &Bytes::from_static(b"val2"));
+                assert_eq!(
+                    map.get(&Bytes::from_static(b"field1")).unwrap(),
+                    &Bytes::from_static(b"val1")
+                );
+                assert_eq!(
+                    map.get(&Bytes::from_static(b"field2")).unwrap(),
+                    &Bytes::from_static(b"val2")
+                );
             }
             _ => panic!("Expected hash value"),
         }

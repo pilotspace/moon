@@ -926,11 +926,7 @@ impl BPTree {
             for (i, key) in right_keys.into_iter().enumerate() {
                 left.keys[left_n + 1 + i] = key;
             }
-            for (i, (child, count)) in right_children
-                .into_iter()
-                .zip(right_counts)
-                .enumerate()
-            {
+            for (i, (child, count)) in right_children.into_iter().zip(right_counts).enumerate() {
                 left.children[left_n + 1 + i] = child;
                 left.counts[left_n + 1 + i] = count;
             }
@@ -1007,9 +1003,7 @@ impl BPTree {
             let node = self.internal(node_id);
             let child_idx = node.search(key);
             // Sum counts of all children to the left
-            let left_count: usize = (0..child_idx)
-                .map(|i| node.counts[i] as usize)
-                .sum();
+            let left_count: usize = (0..child_idx).map(|i| node.counts[i] as usize).sum();
             let child_id = node.children[child_idx];
             self.rank_internal(child_id, key, level - 1)
                 .map(|r| left_count + r)
@@ -1018,8 +1012,7 @@ impl BPTree {
 
     /// Return 0-based rank from the end (descending order).
     pub fn rev_rank(&self, score: OrderedFloat<f64>, member: &[u8]) -> Option<usize> {
-        self.rank(score, member)
-            .map(|r| self.len - 1 - r)
+        self.rank(score, member).map(|r| self.len - 1 - r)
     }
 
     // -----------------------------------------------------------------------
@@ -1164,11 +1157,7 @@ impl BPTree {
         }
     }
 
-    pub fn range_rev(
-        &self,
-        min: OrderedFloat<f64>,
-        max: OrderedFloat<f64>,
-    ) -> BPTreeRevIter<'_> {
+    pub fn range_rev(&self, min: OrderedFloat<f64>, max: OrderedFloat<f64>) -> BPTreeRevIter<'_> {
         let (leaf, index) = self.find_end(max);
         BPTreeRevIter {
             tree: self,
@@ -1384,9 +1373,7 @@ mod tests {
         for i in 0..20 {
             tree.insert(OrderedFloat(i as f64), Bytes::from(format!("m{}", i)));
         }
-        let results: Vec<_> = tree
-            .range(OrderedFloat(5.0), OrderedFloat(10.0))
-            .collect();
+        let results: Vec<_> = tree.range(OrderedFloat(5.0), OrderedFloat(10.0)).collect();
         assert_eq!(results.len(), 6); // 5,6,7,8,9,10
         for (i, (score, _member)) in results.iter().enumerate() {
             assert_eq!(score.0, (5 + i) as f64);
@@ -1444,7 +1431,8 @@ mod tests {
         for i in 0..10000 {
             assert!(
                 tree.contains(OrderedFloat(i as f64), format!("m{}", i).as_bytes()),
-                "missing entry at {}", i
+                "missing entry at {}",
+                i
             );
         }
 
@@ -1466,7 +1454,8 @@ mod tests {
         for i in 0..n {
             assert!(
                 tree.remove(OrderedFloat(i as f64), format!("m{}", i).as_bytes()),
-                "failed to remove {}", i
+                "failed to remove {}",
+                i
             );
         }
         assert_eq!(tree.len(), 0);
@@ -1489,9 +1478,9 @@ mod tests {
         assert_eq!(tree.len(), 3);
 
         let all: Vec<_> = tree.iter().collect();
-        assert_eq!(all[0].0 .0, f64::NEG_INFINITY);
-        assert_eq!(all[1].0 .0, 0.0);
-        assert_eq!(all[2].0 .0, f64::INFINITY);
+        assert_eq!(all[0].0.0, f64::NEG_INFINITY);
+        assert_eq!(all[1].0.0, 0.0);
+        assert_eq!(all[2].0.0, f64::INFINITY);
     }
 
     #[test]
@@ -1503,7 +1492,7 @@ mod tests {
         let all: Vec<_> = tree.iter().collect();
         assert_eq!(all.len(), 50);
         for i in 0..50 {
-            assert_eq!(all[i].0 .0, i as f64);
+            assert_eq!(all[i].0.0, i as f64);
         }
     }
 
@@ -1571,7 +1560,7 @@ mod tests {
         let all: Vec<_> = tree.iter_rev().collect();
         assert_eq!(all.len(), 30);
         for i in 0..30 {
-            assert_eq!(all[i].0 .0, (29 - i) as f64);
+            assert_eq!(all[i].0.0, (29 - i) as f64);
         }
     }
 
@@ -1629,7 +1618,7 @@ mod tests {
         tree.insert(OrderedFloat(5.0), Bytes::from("only"));
         assert_eq!(tree.rank(OrderedFloat(5.0), b"only"), Some(0));
         assert_eq!(tree.rev_rank(OrderedFloat(5.0), b"only"), Some(0));
-        assert_eq!(tree.get_by_rank(0).unwrap().0 .0, 5.0);
+        assert_eq!(tree.get_by_rank(0).unwrap().0.0, 5.0);
 
         let range: Vec<_> = tree.range(OrderedFloat(0.0), OrderedFloat(10.0)).collect();
         assert_eq!(range.len(), 1);
@@ -1644,10 +1633,7 @@ mod tests {
         // BPTree: arena-allocated, LEAF_CAPACITY=14 entries per leaf
         let mut tree = BPTree::new();
         for i in 0..n {
-            tree.insert(
-                OrderedFloat(i as f64),
-                Bytes::from(format!("m:{:06}", i)),
-            );
+            tree.insert(OrderedFloat(i as f64), Bytes::from(format!("m:{:06}", i)));
         }
 
         // BTreeMap: standard library B-tree

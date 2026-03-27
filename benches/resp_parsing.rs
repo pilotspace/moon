@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
+use rust_redis::protocol::{Frame, ParseConfig, parse, serialize};
 use std::hint::black_box;
-use rust_redis::protocol::{parse, serialize, Frame, ParseConfig};
 
 fn bench_parse_simple_string(c: &mut Criterion) {
     let config = ParseConfig::default();

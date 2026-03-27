@@ -79,7 +79,9 @@ const ZEROED_ID: &str = "0000000000000000000000000000000000000000";
 /// Generate a Redis-compatible 40-char hex replication ID.
 pub fn generate_repl_id() -> String {
     let mut rng = rand::rng();
-    (0..20).map(|_| format!("{:02x}", rng.random::<u8>())).collect()
+    (0..20)
+        .map(|_| format!("{:02x}", rng.random::<u8>()))
+        .collect()
 }
 
 /// Atomically persist replication IDs to {dir}/replication.state.

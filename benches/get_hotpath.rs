@@ -4,7 +4,7 @@
 //! vs Redis's ~50ns per GET.
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use rust_redis::protocol::{self, Frame, ParseConfig};
 use rust_redis::storage::Database;
@@ -153,13 +153,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
             };
 
             // Dispatch
-            let result = rust_redis::command::dispatch(
-                &mut db,
-                cmd,
-                args,
-                &mut 0usize,
-                16,
-            );
+            let result = rust_redis::command::dispatch(&mut db, cmd, args, &mut 0usize, 16);
 
             // Serialize response
             buf.clear();
@@ -184,10 +178,8 @@ fn bench_get_hotpath(c: &mut Criterion) {
     // ─── Stage 11: xxhash key routing ───
     c.bench_function("11_xxhash_key_route", |b| {
         b.iter(|| {
-            let shard = rust_redis::shard::dispatch::key_to_shard(
-                black_box(lookup_key.as_ref()),
-                12,
-            );
+            let shard =
+                rust_redis::shard::dispatch::key_to_shard(black_box(lookup_key.as_ref()), 12);
             black_box(shard);
         })
     });

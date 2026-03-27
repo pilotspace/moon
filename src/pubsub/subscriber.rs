@@ -1,5 +1,5 @@
-use crate::runtime::channel;
 use crate::protocol::Frame;
+use crate::runtime::channel;
 
 /// A subscriber wrapping an mpsc sender for delivering pub/sub messages.
 ///

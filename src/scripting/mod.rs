@@ -71,9 +71,7 @@ pub fn handle_evalsha(
 
     // Extract SHA1 hex from first argument
     let sha1_hex = match &args[0] {
-        Frame::BulkString(b) => {
-            String::from_utf8_lossy(b).to_lowercase()
-        }
+        Frame::BulkString(b) => String::from_utf8_lossy(b).to_lowercase(),
         _ => {
             return Frame::Error(Bytes::from_static(b"ERR invalid SHA1 hex string"));
         }
@@ -131,10 +129,7 @@ pub fn handle_script_subcommand(
 
     if sub.eq_ignore_ascii_case(b"LOAD") {
         if args.len() != 2 {
-            return (
-                Frame::Error(Bytes::from_static(b"ERR syntax error")),
-                None,
-            );
+            return (Frame::Error(Bytes::from_static(b"ERR syntax error")), None);
         }
         let script = match &args[1] {
             Frame::BulkString(b) => b.clone(),
@@ -307,9 +302,7 @@ fn run_script(
     match result {
         Ok(frame) => frame,
         Err(mlua::Error::RuntimeError(msg)) if msg.contains("ERR Lua script timeout") => {
-            Frame::Error(Bytes::from_static(
-                b"BUSY Lua script timeout exceeded",
-            ))
+            Frame::Error(Bytes::from_static(b"BUSY Lua script timeout exceeded"))
         }
         Err(e) => Frame::Error(Bytes::from(format!("ERR Error running script: {e}"))),
     }
@@ -383,15 +376,7 @@ mod tests {
         let lua = setup_lua_vm().unwrap();
         let mut db = Database::new();
 
-        let result = run_script(
-            &lua,
-            b"return 42",
-            vec![],
-            vec![],
-            &mut db,
-            0,
-            1,
-        );
+        let result = run_script(&lua, b"return 42", vec![], vec![], &mut db, 0, 1);
         assert!(matches!(result, Frame::Integer(42)));
     }
 
@@ -503,7 +488,9 @@ mod tests {
         let args = vec![
             Frame::BulkString(Bytes::from_static(b"EXISTS")),
             Frame::BulkString(Bytes::from(sha)),
-            Frame::BulkString(Bytes::from_static(b"0000000000000000000000000000000000000000")),
+            Frame::BulkString(Bytes::from_static(
+                b"0000000000000000000000000000000000000000",
+            )),
         ];
         let (response, fanout) = handle_script_subcommand(&cache, &args);
         assert!(fanout.is_none());
@@ -552,7 +539,9 @@ mod tests {
         let mut db = Database::new();
 
         let args = vec![
-            Frame::BulkString(Bytes::from_static(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")),
+            Frame::BulkString(Bytes::from_static(
+                b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            )),
             Frame::BulkString(Bytes::from_static(b"0")),
         ];
 

@@ -1,13 +1,10 @@
-use bytes::Bytes;
-use crate::protocol::Frame;
 use crate::framevec;
+use crate::protocol::Frame;
+use bytes::Bytes;
 /// Construct an invalidation Push frame for the given keys.
 /// Wire format: >2\r\n$10\r\ninvalidate\r\n*N\r\n$len\r\nkey\r\n...
 pub fn invalidation_push(keys: &[Bytes]) -> Frame {
-    let key_frames: Vec<Frame> = keys
-        .iter()
-        .map(|k| Frame::BulkString(k.clone()))
-        .collect();
+    let key_frames: Vec<Frame> = keys.iter().map(|k| Frame::BulkString(k.clone())).collect();
     Frame::Push(framevec![
         Frame::BulkString(Bytes::from_static(b"invalidate")),
         Frame::Array(key_frames.into()),
@@ -33,10 +30,7 @@ mod tests {
 
     #[test]
     fn test_invalidation_push_multiple_keys() {
-        let keys = vec![
-            Bytes::from_static(b"foo"),
-            Bytes::from_static(b"bar"),
-        ];
+        let keys = vec![Bytes::from_static(b"foo"), Bytes::from_static(b"bar")];
         let frame = invalidation_push(&keys);
         assert_eq!(
             frame,

@@ -8,13 +8,13 @@ use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use bytes::Bytes;
 use crc32fast::Hasher;
 
 use crate::persistence::rdb;
 use crate::storage::db::Database;
-use crate::storage::entry::{current_secs, current_time_ms, Entry};
+use crate::storage::entry::{Entry, current_secs, current_time_ms};
 
 // Per-shard snapshot format constants
 const SHARD_RDB_MAGIC: &[u8] = b"RRDSHARD";
@@ -70,10 +70,7 @@ impl SnapshotState {
             .iter()
             .map(|db| db.data().segment_count())
             .collect();
-        let base_timestamps: Vec<u32> = databases
-            .iter()
-            .map(|db| db.base_timestamp())
-            .collect();
+        let base_timestamps: Vec<u32> = databases.iter().map(|db| db.base_timestamp()).collect();
         let serialized_segments: Vec<Vec<bool>> = segment_counts
             .iter()
             .map(|&count| vec![false; count])
@@ -140,7 +137,8 @@ impl SnapshotState {
         if !self.header_written {
             self.output_buf.extend_from_slice(SHARD_RDB_MAGIC);
             self.output_buf.push(SHARD_RDB_VERSION);
-            self.output_buf.extend_from_slice(&self.shard_id.to_le_bytes());
+            self.output_buf
+                .extend_from_slice(&self.shard_id.to_le_bytes());
             self.output_buf.extend_from_slice(&self.epoch.to_le_bytes());
             self.header_written = true;
         }
@@ -171,10 +169,8 @@ impl SnapshotState {
             .filter(|(db_idx, s_idx, _, _)| *db_idx == self.current_db && *s_idx == seg_idx)
             .map(|(_, _, k, e)| (k.clone(), e.clone()))
             .collect();
-        let overflow_keys: HashSet<&[u8]> = overflow_entries
-            .iter()
-            .map(|(k, _)| k.as_ref())
-            .collect();
+        let overflow_keys: HashSet<&[u8]> =
+            overflow_entries.iter().map(|(k, _)| k.as_ref()).collect();
 
         // Remove consumed overflow entries
         self.overflow
@@ -296,8 +292,7 @@ impl SnapshotState {
 
         #[cfg(feature = "runtime-monoio")]
         {
-            std::fs::write(&tmp_path, &buf)
-                .context("Failed to write temporary snapshot file")?;
+            std::fs::write(&tmp_path, &buf).context("Failed to write temporary snapshot file")?;
             std::fs::rename(&tmp_path, &file_path)
                 .context("Failed to rename temporary snapshot file")?;
         }
@@ -330,10 +325,7 @@ pub fn shard_snapshot_save(
 /// Load a per-shard snapshot file and populate databases. Returns total keys loaded.
 ///
 /// Reads RRDSHARD format with per-segment CRC32 verification.
-pub fn shard_snapshot_load(
-    databases: &mut [Database],
-    path: &Path,
-) -> anyhow::Result<usize> {
+pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
     let data = std::fs::read(path).context("Failed to read snapshot file")?;
 
     // Minimum size: magic(8) + version(1) + shard_id(2) + epoch(8) + eof(1) + global_crc(4) = 24
@@ -616,7 +608,11 @@ mod tests {
         match entry.value.as_redis_value() {
             RedisValueRef::String(s) => {
                 // The snapshot should have the OLD value from COW, not "NEW_VALUE"
-                assert_ne!(s.as_ref() as &[u8], b"NEW_VALUE", "COW should have captured old value");
+                assert_ne!(
+                    s.as_ref() as &[u8],
+                    b"NEW_VALUE",
+                    "COW should have captured old value"
+                );
             }
             _ => panic!("Expected string"),
         }
@@ -642,7 +638,10 @@ mod tests {
         // Value string bytes start at offset 30+1+4+7+8+4 = 54, end at 75
         // Corrupt a byte in the value string area (offset 60)
         let corrupt_offset = 60;
-        assert!(corrupt_offset < data.len() - 8, "File too small for corruption test");
+        assert!(
+            corrupt_offset < data.len() - 8,
+            "File too small for corruption test"
+        );
         data[corrupt_offset] ^= 0xFF;
 
         // Recalculate the global CRC to isolate the segment CRC check
@@ -712,7 +711,11 @@ mod tests {
 
         // First advance should return false (not done -- more segments to process)
         let done = state.advance_one_segment(&dbs);
-        assert!(!done, "First advance should not complete with {} segments", seg_count);
+        assert!(
+            !done,
+            "First advance should not complete with {} segments",
+            seg_count
+        );
 
         // Advance all remaining segments
         let mut advances = 1;
@@ -736,15 +739,24 @@ mod tests {
     async fn test_finalize_async_writes_valid_file() {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"async_k1"), Bytes::from_static(b"async_v1"));
-        dbs[0].set_string(Bytes::from_static(b"async_k2"), Bytes::from_static(b"async_v2"));
+        dbs[0].set_string(
+            Bytes::from_static(b"async_k1"),
+            Bytes::from_static(b"async_v1"),
+        );
+        dbs[0].set_string(
+            Bytes::from_static(b"async_k2"),
+            Bytes::from_static(b"async_v2"),
+        );
 
         let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
         while !state.advance_one_segment(&dbs) {}
         state.finalize_async().await.unwrap();
 
         // Verify file was written and is loadable
-        assert!(path.exists(), "Snapshot file should exist after finalize_async");
+        assert!(
+            path.exists(),
+            "Snapshot file should exist after finalize_async"
+        );
         let mut loaded = vec![Database::new()];
         let count = shard_snapshot_load(&mut loaded, &path).unwrap();
         assert_eq!(count, 2);

@@ -100,7 +100,8 @@ impl Listpack {
     pub fn push_back(&mut self, value: &[u8]) {
         let encoded = encode_entry(value);
         let insert_pos = self.data.len() - 1; // before terminator
-        self.data.splice(insert_pos..insert_pos, encoded.iter().cloned());
+        self.data
+            .splice(insert_pos..insert_pos, encoded.iter().cloned());
         self.update_header();
     }
 
@@ -108,7 +109,8 @@ impl Listpack {
     pub fn push_front(&mut self, value: &[u8]) {
         let encoded = encode_entry(value);
         let insert_pos = 6; // after header (4 + 2)
-        self.data.splice(insert_pos..insert_pos, encoded.iter().cloned());
+        self.data
+            .splice(insert_pos..insert_pos, encoded.iter().cloned());
         self.update_header();
     }
 
@@ -197,9 +199,7 @@ impl Listpack {
 
     /// Iterate as (field, value) pairs for hash usage.
     pub fn iter_pairs(&self) -> ListpackPairIter<'_> {
-        ListpackPairIter {
-            inner: self.iter(),
-        }
+        ListpackPairIter { inner: self.iter() }
     }
 
     /// Iterate as (score, member) pairs for sorted set usage.
@@ -457,7 +457,10 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
             }
             LP_ENCODING_32BIT_INT => {
                 let val = i32::from_le_bytes([
-                    data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
                 ]) as i64;
                 let entry_len = 5;
                 let backlen_bytes = encode_backlen(entry_len);
@@ -466,8 +469,14 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
             }
             LP_ENCODING_64BIT_INT => {
                 let val = i64::from_le_bytes([
-                    data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4],
-                    data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                    data[pos + 8],
                 ]);
                 let entry_len = 9;
                 let backlen_bytes = encode_backlen(entry_len);
@@ -476,7 +485,10 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
             }
             LP_ENCODING_32BIT_STR => {
                 let len = u32::from_le_bytes([
-                    data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
                 ]) as usize;
                 let start = pos + 5;
                 let str_data = data[start..start + len].to_vec();
@@ -494,7 +506,10 @@ impl<'a> Iterator for ListpackIter<'a> {
     type Item = ListpackEntry;
 
     fn next(&mut self) -> Option<ListpackEntry> {
-        if self.remaining == 0 || self.pos >= self.data.len() - 1 || self.data[self.pos] == LP_TERMINATOR {
+        if self.remaining == 0
+            || self.pos >= self.data.len() - 1
+            || self.data[self.pos] == LP_TERMINATOR
+        {
             return None;
         }
         let (entry, next_pos) = decode_entry_at(self.data, self.pos);

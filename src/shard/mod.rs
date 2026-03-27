@@ -7,25 +7,27 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ringbuf::traits::Consumer;
+use crate::runtime::cancel::CancellationToken;
+use crate::runtime::channel;
 use ringbuf::HeapCons;
 use ringbuf::HeapProd;
-use crate::runtime::channel;
-use crate::runtime::cancel::CancellationToken;
+use ringbuf::traits::Consumer;
 use tracing::info;
 
-use crate::command::{dispatch as cmd_dispatch, DispatchResult};
+use crate::blocking::BlockingRegistry;
+use crate::command::connection as conn_cmd;
+use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::config::RuntimeConfig;
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
-use crate::command::connection as conn_cmd;
-use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
-use crate::storage::entry::CachedClock;
-use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
+use crate::runtime::{
+    TimerImpl,
+    traits::{RuntimeInterval, RuntimeTimer},
+};
 #[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
 #[cfg(feature = "runtime-tokio")]
@@ -33,6 +35,7 @@ use crate::server::connection::handle_connection_sharded_inner;
 #[cfg(feature = "runtime-monoio")]
 use crate::server::connection::handle_connection_sharded_monoio;
 use crate::storage::Database;
+use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
 use std::sync::{Arc, RwLock};
@@ -194,14 +197,25 @@ impl Shard {
                 match Self::create_reuseport_listener(addr) {
                     Ok(listener_fd) => {
                         if let Err(e) = d.submit_multishot_accept(listener_fd) {
-                            tracing::warn!("Shard {}: multishot accept failed: {}, using conn_rx", self.id, e);
+                            tracing::warn!(
+                                "Shard {}: multishot accept failed: {}, using conn_rx",
+                                self.id,
+                                e
+                            );
                         } else {
-                            info!("Shard {}: multishot accept armed on fd {}", self.id, listener_fd);
+                            info!(
+                                "Shard {}: multishot accept armed on fd {}",
+                                self.id, listener_fd
+                            );
                             uring_listener_fd = Some(listener_fd);
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx", self.id, e);
+                        tracing::warn!(
+                            "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
+                            self.id,
+                            e
+                        );
                     }
                 }
             }
@@ -263,7 +277,10 @@ impl Shard {
                     }
                 }
             } else {
-                info!("Shard {}: WAL skipped (appendonly disabled, snapshot-only persistence)", shard_id);
+                info!(
+                    "Shard {}: WAL skipped (appendonly disabled, snapshot-only persistence)",
+                    shard_id
+                );
                 None
             }
         } else {
@@ -850,21 +867,29 @@ impl Shard {
         // Close per-shard SO_REUSEPORT listener fd if created (Linux only).
         #[cfg(target_os = "linux")]
         if let Some(lfd) = uring_listener_fd {
-            unsafe { libc::close(lfd); }
+            unsafe {
+                libc::close(lfd);
+            }
         }
 
         // Restore databases and pubsub_registry back to self for cleanup.
         self.databases = match Rc::try_unwrap(databases) {
             Ok(refcell) => refcell.into_inner(),
             Err(_) => {
-                info!("Shard {}: could not reclaim databases (outstanding Rc references)", self.id);
+                info!(
+                    "Shard {}: could not reclaim databases (outstanding Rc references)",
+                    self.id
+                );
                 Vec::new()
             }
         };
         self.pubsub_registry = match Rc::try_unwrap(pubsub_rc) {
             Ok(refcell) => refcell.into_inner(),
             Err(_) => {
-                info!("Shard {}: could not reclaim pubsub_registry (outstanding Rc references)", self.id);
+                info!(
+                    "Shard {}: could not reclaim pubsub_registry (outstanding Rc references)",
+                    self.id
+                );
                 PubSubRegistry::new()
             }
         };
@@ -880,7 +905,11 @@ impl Shard {
         consumers: &mut [HeapCons<ShardMessage>],
         pubsub_registry: &mut PubSubRegistry,
         blocking_registry: &Rc<RefCell<BlockingRegistry>>,
-        pending_snapshot: &mut Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)>,
+        pending_snapshot: &mut Option<(
+            u64,
+            std::path::PathBuf,
+            channel::OneshotSender<Result<(), String>>,
+        )>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
         repl_backlog: &mut Option<ReplicationBacklog>,
@@ -971,7 +1000,11 @@ impl Shard {
         pubsub_registry: &mut PubSubRegistry,
         blocking_registry: &Rc<RefCell<BlockingRegistry>>,
         msg: ShardMessage,
-        pending_snapshot: &mut Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)>,
+        pending_snapshot: &mut Option<(
+            u64,
+            std::path::PathBuf,
+            channel::OneshotSender<Result<(), String>>,
+        )>,
         snapshot_state: &mut Option<SnapshotState>,
         wal_writer: &mut Option<WalWriter>,
         repl_backlog: &mut Option<ReplicationBacklog>,
@@ -1019,7 +1052,12 @@ impl Shard {
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let serialized = aof::serialize_command(&command);
                         Self::wal_append_and_fanout(
-                            &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
+                            &serialized,
+                            wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
                         );
                     }
 
@@ -1031,22 +1069,34 @@ impl Shard {
                             || cmd.eq_ignore_ascii_case(b"ZADD")
                             || cmd.eq_ignore_ascii_case(b"XADD");
                         if needs_wake {
-                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
+                            if let Some(key) = args
+                                .first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                            {
                                 let mut reg = blocking_registry.borrow_mut();
                                 if cmd.eq_ignore_ascii_case(b"LPUSH")
                                     || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE")
                                 {
                                     crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                        &mut reg,
+                                        &mut dbs[db_idx],
+                                        db_idx,
+                                        &key,
                                     );
                                 } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                     crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                        &mut reg,
+                                        &mut dbs[db_idx],
+                                        db_idx,
+                                        &key,
                                     );
                                 } else {
                                     crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                        &mut reg,
+                                        &mut dbs[db_idx],
+                                        db_idx,
+                                        &key,
                                     );
                                 }
                             }
@@ -1071,9 +1121,9 @@ impl Shard {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
                         None => {
-                            results.push(crate::protocol::Frame::Error(
-                                bytes::Bytes::from_static(b"ERR invalid command format"),
-                            ));
+                            results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR invalid command format",
+                            )));
                             continue;
                         }
                     };
@@ -1085,8 +1135,7 @@ impl Shard {
                     }
 
                     let mut selected = db_idx;
-                    let result =
-                        cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
+                    let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1096,7 +1145,12 @@ impl Shard {
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let serialized = aof::serialize_command(cmd_frame);
                         Self::wal_append_and_fanout(
-                            &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
+                            &serialized,
+                            wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
                         );
                     }
 
@@ -1118,9 +1172,9 @@ impl Shard {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
                         None => {
-                            results.push(crate::protocol::Frame::Error(
-                                bytes::Bytes::from_static(b"ERR invalid command format"),
-                            ));
+                            results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR invalid command format",
+                            )));
                             continue;
                         }
                     };
@@ -1132,8 +1186,7 @@ impl Shard {
                     }
 
                     let mut selected = db_idx;
-                    let result =
-                        cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
+                    let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1143,7 +1196,12 @@ impl Shard {
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let serialized = aof::serialize_command(cmd_frame);
                         Self::wal_append_and_fanout(
-                            &serialized, wal_writer, repl_backlog, replica_txs, repl_state, shard_id,
+                            &serialized,
+                            wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
                         );
                     }
 
@@ -1155,22 +1213,34 @@ impl Shard {
                             || cmd.eq_ignore_ascii_case(b"ZADD")
                             || cmd.eq_ignore_ascii_case(b"XADD");
                         if needs_wake {
-                            if let Some(key) = args.first().and_then(|f| crate::server::connection::extract_bytes(f)) {
+                            if let Some(key) = args
+                                .first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                            {
                                 let mut reg = blocking_registry.borrow_mut();
                                 if cmd.eq_ignore_ascii_case(b"LPUSH")
                                     || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE")
                                 {
                                     crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                        &mut reg,
+                                        &mut dbs[db_idx],
+                                        db_idx,
+                                        &key,
                                     );
                                 } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                     crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                        &mut reg,
+                                        &mut dbs[db_idx],
+                                        db_idx,
+                                        &key,
                                     );
                                 } else {
                                     crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg, &mut dbs[db_idx], db_idx, &key,
+                                        &mut reg,
+                                        &mut dbs[db_idx],
+                                        db_idx,
+                                        &key,
                                     );
                                 }
                             }
@@ -1191,11 +1261,21 @@ impl Shard {
                     script_cache.borrow_mut().load(script);
                 }
             }
-            ShardMessage::SnapshotBegin { epoch, snapshot_dir, reply_tx } => {
+            ShardMessage::SnapshotBegin {
+                epoch,
+                snapshot_dir,
+                reply_tx,
+            } => {
                 // Defer to main event loop where we have mutable access to snapshot_state
                 *pending_snapshot = Some((epoch, snapshot_dir, reply_tx));
             }
-            ShardMessage::BlockRegister { db_index, key, wait_id, cmd, reply_tx } => {
+            ShardMessage::BlockRegister {
+                db_index,
+                key,
+                wait_id,
+                cmd,
+                reply_tx,
+            } => {
                 let entry = crate::blocking::WaitEntry {
                     wait_id,
                     cmd,
@@ -1271,12 +1351,10 @@ impl Shard {
         let Some(snap) = snapshot else { return };
         // Extract the primary key from the command (args[1] for Array commands)
         let key = match command {
-            crate::protocol::Frame::Array(args) if args.len() >= 2 => {
-                match &args[1] {
-                    crate::protocol::Frame::BulkString(k) => k,
-                    _ => return,
-                }
-            }
+            crate::protocol::Frame::Array(args) if args.len() >= 2 => match &args[1] {
+                crate::protocol::Frame::BulkString(k) => k,
+                _ => return,
+            },
             _ => return,
         };
         let hash = crate::storage::dashtable::hash_key(key);
@@ -1356,7 +1434,9 @@ impl Shard {
                     match crate::protocol::parse(parse_buf, &parse_config) {
                         Ok(Some(frame)) => {
                             batch.push(frame);
-                            if batch.len() >= 1024 { break; }
+                            if batch.len() >= 1024 {
+                                break;
+                            }
                         }
                         Ok(None) => break,
                         Err(crate::protocol::ParseError::Incomplete) => break,
@@ -1381,7 +1461,9 @@ impl Shard {
                     return;
                 }
 
-                if batch.is_empty() { return; }
+                if batch.is_empty() {
+                    return;
+                }
 
                 // Phase B: Dispatch all commands under a single borrow_mut (reduces
                 // RefCell overhead from N borrows to 1 per batch).
@@ -1390,23 +1472,25 @@ impl Shard {
                     let db_count = dbs.len();
                     dbs[0].refresh_now_from_cache(cached_clock);
                     let mut selected = 0usize;
-                    batch.iter().map(|frame| {
-                        let (cmd, args) = match Self::extract_command_static(frame) {
-                            Some(pair) => pair,
-                            None => {
-                                return crate::protocol::Frame::Error(
-                                    bytes::Bytes::from_static(b"ERR invalid command"),
-                                );
+                    batch
+                        .iter()
+                        .map(|frame| {
+                            let (cmd, args) = match Self::extract_command_static(frame) {
+                                Some(pair) => pair,
+                                None => {
+                                    return crate::protocol::Frame::Error(
+                                        bytes::Bytes::from_static(b"ERR invalid command"),
+                                    );
+                                }
+                            };
+                            let result =
+                                cmd_dispatch(&mut dbs[0], cmd, args, &mut selected, db_count);
+                            match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => f,
                             }
-                        };
-                        let result = cmd_dispatch(
-                            &mut dbs[0], cmd, args, &mut selected, db_count,
-                        );
-                        match result {
-                            DispatchResult::Response(f) => f,
-                            DispatchResult::Quit(f) => f,
-                        }
-                    }).collect()
+                        })
+                        .collect()
                 };
 
                 // Phase C: Serialize and send all responses (outside borrow).
@@ -1426,11 +1510,17 @@ impl Shard {
                                 Err(e) => {
                                     tracing::warn!(
                                         "writev failed for conn {}: {}, falling back to send",
-                                        conn_id, e
+                                        conn_id,
+                                        e
                                     );
                                     let mut resp_buf = bytes::BytesMut::new();
                                     crate::protocol::serialize(&response, &mut resp_buf);
-                                    Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
+                                    Self::send_serialized(
+                                        driver,
+                                        conn_id,
+                                        resp_buf,
+                                        inflight_sends,
+                                    );
                                 }
                             }
                         }
@@ -1446,11 +1536,17 @@ impl Shard {
                                 Err(e) => {
                                     tracing::warn!(
                                         "writev preserialized failed for conn {}: {}, falling back",
-                                        conn_id, e
+                                        conn_id,
+                                        e
                                     );
                                     let mut resp_buf = bytes::BytesMut::new();
                                     crate::protocol::serialize(&response, &mut resp_buf);
-                                    Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
+                                    Self::send_serialized(
+                                        driver,
+                                        conn_id,
+                                        resp_buf,
+                                        inflight_sends,
+                                    );
                                 }
                             }
                         }
@@ -1528,9 +1624,9 @@ impl Shard {
     #[cfg(target_os = "linux")]
     fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
         use std::net::SocketAddr;
-        let sock_addr: SocketAddr = addr.parse().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-        })?;
+        let sock_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         // Create TCP socket
         let fd = unsafe {
@@ -1582,12 +1678,16 @@ impl Shard {
                     )
                 };
                 if ret < 0 {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                     return Err(std::io::Error::last_os_error());
                 }
             }
             SocketAddr::V6(_) => {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "IPv6 not yet supported for SO_REUSEPORT listener",
@@ -1598,7 +1698,9 @@ impl Shard {
         // Listen with backlog 1024
         let ret = unsafe { libc::listen(fd, 1024) };
         if ret < 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(std::io::Error::last_os_error());
         }
 
@@ -1642,7 +1744,9 @@ impl Shard {
     }
 
     /// Extract command name and args from a Frame (static helper for SPSC dispatch).
-    fn extract_command_static(frame: &crate::protocol::Frame) -> Option<(&[u8], &[crate::protocol::Frame])> {
+    fn extract_command_static(
+        frame: &crate::protocol::Frame,
+    ) -> Option<(&[u8], &[crate::protocol::Frame])> {
         match frame {
             crate::protocol::Frame::Array(args) if !args.is_empty() => {
                 let name = match &args[0] {
@@ -1660,12 +1764,13 @@ impl Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framevec;    use bytes::Bytes;
-    use ringbuf::HeapRb;
-    use ringbuf::traits::{Producer, Split};
+    use crate::framevec;
     use crate::protocol::Frame;
     use crate::pubsub::subscriber::Subscriber;
     use crate::runtime::channel as rt_channel;
+    use bytes::Bytes;
+    use ringbuf::HeapRb;
+    use ringbuf::traits::{Producer, Split};
 
     #[test]
     fn test_shard_new() {
@@ -1717,7 +1822,21 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache, &clock);
+        Shard::drain_spsc_shared(
+            &databases,
+            &mut [cons],
+            &mut pubsub,
+            &blocking,
+            &mut pending_snap,
+            &mut snap_state,
+            &mut wal_w,
+            &mut None,
+            &mut Vec::new(),
+            &None,
+            0,
+            &script_cache,
+            &clock,
+        );
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -1757,14 +1876,26 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache, &clock);
+        Shard::drain_spsc_shared(
+            &databases,
+            &mut [cons],
+            &mut pubsub,
+            &blocking,
+            &mut pending_snap,
+            &mut snap_state,
+            &mut wal_w,
+            &mut None,
+            &mut Vec::new(),
+            &None,
+            0,
+            &script_cache,
+            &clock,
+        );
     }
 
     #[test]
     fn test_extract_command_static_ping() {
-        let frame = Frame::Array(framevec![
-            Frame::BulkString(Bytes::from_static(b"PING")),
-        ]);
+        let frame = Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING")),]);
         let (cmd, args) = Shard::extract_command_static(&frame).unwrap();
         assert_eq!(cmd, b"PING");
         assert!(args.is_empty());
@@ -1827,7 +1958,10 @@ mod tests {
             &clock,
         );
 
-        assert!(!parse_bufs.contains_key(&42), "parse buffer should be removed on disconnect");
+        assert!(
+            !parse_bufs.contains_key(&42),
+            "parse buffer should be removed on disconnect"
+        );
     }
 
     /// Linux-only: verify handle_uring_event processes SendComplete as no-op.

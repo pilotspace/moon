@@ -355,8 +355,7 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
             warn!("WAL v2: truncated block_len at offset {}, stopping", offset);
             break;
         }
-        let block_len =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         // Minimum block content: cmd_count(2) + db_idx(1) + crc32(4) = 7
@@ -436,10 +435,7 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
                 }
                 Ok(None) => {
                     if !buf.is_empty() {
-                        warn!(
-                            "WAL v2: truncated RESP in block at offset {}",
-                            offset - 4
-                        );
+                        warn!("WAL v2: truncated RESP in block at offset {}", offset - 4);
                     }
                     break;
                 }
@@ -504,7 +500,8 @@ mod tests {
         assert_eq!(contents[6], WAL_VERSION);
         // After header, the block contains the RESP payload
         let block_start = WAL_HEADER_SIZE;
-        let block_len = u32::from_le_bytes(contents[block_start..block_start + 4].try_into().unwrap());
+        let block_len =
+            u32::from_le_bytes(contents[block_start..block_start + 4].try_into().unwrap());
         // Extract payload from block: skip block_len(4) + cmd_count(2) + db_idx(1) = 7 bytes
         let payload_start = block_start + 7;
         let payload_len = block_len as usize - 2 - 1 - 4; // subtract cmd_count + db_idx + crc
@@ -532,9 +529,18 @@ mod tests {
         let count = replay_wal(&mut dbs, writer.path()).unwrap();
         assert_eq!(count, 3);
 
-        assert_eq!(dbs[0].get(b"key1").unwrap().value.as_bytes().unwrap(), b"val1");
-        assert_eq!(dbs[0].get(b"key2").unwrap().value.as_bytes().unwrap(), b"val2");
-        assert_eq!(dbs[0].get(b"key3").unwrap().value.as_bytes().unwrap(), b"val3");
+        assert_eq!(
+            dbs[0].get(b"key1").unwrap().value.as_bytes().unwrap(),
+            b"val1"
+        );
+        assert_eq!(
+            dbs[0].get(b"key2").unwrap().value.as_bytes().unwrap(),
+            b"val2"
+        );
+        assert_eq!(
+            dbs[0].get(b"key3").unwrap().value.as_bytes().unwrap(),
+            b"val3"
+        );
     }
 
     #[test]
@@ -613,8 +619,13 @@ mod tests {
 
         // Parse the block
         let block_start = WAL_HEADER_SIZE;
-        let block_len = u32::from_le_bytes(contents[block_start..block_start + 4].try_into().unwrap());
-        let cmd_count = u16::from_le_bytes(contents[block_start + 4..block_start + 6].try_into().unwrap());
+        let block_len =
+            u32::from_le_bytes(contents[block_start..block_start + 4].try_into().unwrap());
+        let cmd_count = u16::from_le_bytes(
+            contents[block_start + 4..block_start + 6]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(cmd_count, 100);
 
         // Extract payload
@@ -664,7 +675,10 @@ mod tests {
 
         // Verify hash
         let hash = dbs[0].get_hash(b"myhash").unwrap().unwrap();
-        assert_eq!(hash.get(&Bytes::from_static(b"f1")).unwrap().as_ref(), b"v1");
+        assert_eq!(
+            hash.get(&Bytes::from_static(b"f1")).unwrap().as_ref(),
+            b"v1"
+        );
 
         // Verify list
         let list = dbs[0].get_list(b"mylist").unwrap().unwrap();
@@ -729,7 +743,8 @@ mod tests {
         let payload_len = block_len as usize - 2 - 1 - 4;
         let payload = &contents[bs + 7..bs + 7 + payload_len];
         let crc_offset = bs + 7 + payload_len;
-        let stored_crc = u32::from_le_bytes(contents[crc_offset..crc_offset + 4].try_into().unwrap());
+        let stored_crc =
+            u32::from_le_bytes(contents[crc_offset..crc_offset + 4].try_into().unwrap());
 
         // Recompute CRC over cmd_count + db_idx + payload
         let mut hasher = crc32fast::Hasher::new();
@@ -797,7 +812,9 @@ mod tests {
 
         // Find second block: after header(32) + first block(4 + block_len)
         let first_block_len = u32::from_le_bytes(
-            data[WAL_HEADER_SIZE..WAL_HEADER_SIZE + 4].try_into().unwrap(),
+            data[WAL_HEADER_SIZE..WAL_HEADER_SIZE + 4]
+                .try_into()
+                .unwrap(),
         ) as usize;
         let second_block_start = WAL_HEADER_SIZE + 4 + first_block_len;
         let second_block_len = u32::from_le_bytes(

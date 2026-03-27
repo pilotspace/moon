@@ -3,7 +3,7 @@
 //! Measures creation throughput, as_bytes() access, hashing, equality comparison,
 //! and cloning for both SSO-inline and heap-allocated key paths.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

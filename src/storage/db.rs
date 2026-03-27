@@ -6,7 +6,7 @@ use super::bptree::BPTree;
 use super::compact_key::CompactKey;
 use super::compact_value::{CompactValue, RedisValueRef};
 use super::dashtable::DashTable;
-use super::entry::{current_secs, current_time_ms, CachedClock, Entry, RedisValue};
+use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms};
 use super::intset::Intset;
 use super::listpack::Listpack;
 use super::stream::Stream as StreamData;
@@ -84,12 +84,10 @@ impl<'a> ListRef<'a> {
     /// Get a range of elements [start..=end]. Caller must clamp bounds.
     pub fn range(&self, start: usize, end: usize) -> Vec<Bytes> {
         match self {
-            ListRef::Deque(d) => {
-                (start..=end).filter_map(|i| d.get(i).cloned()).collect()
-            }
-            ListRef::Listpack(lp) => {
-                (start..=end).filter_map(|i| lp.get_at(i).map(|e| e.to_bytes())).collect()
-            }
+            ListRef::Deque(d) => (start..=end).filter_map(|i| d.get(i).cloned()).collect(),
+            ListRef::Listpack(lp) => (start..=end)
+                .filter_map(|i| lp.get_at(i).map(|e| e.to_bytes()))
+                .collect(),
         }
     }
 
@@ -202,22 +200,26 @@ impl<'a> SortedSetRef<'a> {
     /// Get all (member, score) pairs sorted by score then member.
     pub fn entries_sorted(&self) -> Vec<(Bytes, f64)> {
         match self {
-            SortedSetRef::BPTree { tree, .. } => {
-                tree.iter().map(|(score, member)| (member.clone(), score.0)).collect()
-            }
+            SortedSetRef::BPTree { tree, .. } => tree
+                .iter()
+                .map(|(score, member)| (member.clone(), score.0))
+                .collect(),
             SortedSetRef::Listpack(lp) => {
                 let mut pairs: Vec<(Bytes, f64)> = Vec::new();
                 for (m, s) in lp.iter_score_member_pairs() {
                     let score = match s {
                         super::listpack::ListpackEntry::Integer(i) => i as f64,
-                        super::listpack::ListpackEntry::String(ref b) => {
-                            std::str::from_utf8(b).ok().and_then(|ss| ss.parse().ok()).unwrap_or(0.0)
-                        }
+                        super::listpack::ListpackEntry::String(ref b) => std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|ss| ss.parse().ok())
+                            .unwrap_or(0.0),
                     };
                     pairs.push((m.to_bytes(), score));
                 }
                 pairs.sort_by(|a, b| {
-                    OrderedFloat(a.1).cmp(&OrderedFloat(b.1)).then_with(|| a.0.cmp(&b.0))
+                    OrderedFloat(a.1)
+                        .cmp(&OrderedFloat(b.1))
+                        .then_with(|| a.0.cmp(&b.0))
                 });
                 pairs
             }
@@ -345,11 +347,15 @@ impl Database {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         // Single immutable lookup: check existence + expiry
-        let expired = self.data.get(key)
+        let expired = self
+            .data
+            .get(key)
             .is_some_and(|e| e.is_expired_at(base_ts, now_ms));
         if expired {
             let removed = self.data.remove(key)?;
-            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+            self.used_memory = self
+                .used_memory
+                .saturating_sub(entry_overhead(key, &removed));
             return None;
         }
         // Return immutable ref (same slot, fast re-probe)
@@ -366,11 +372,15 @@ impl Database {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         // Immutable check for expiry (avoids get_mut + remove + get_mut triple lookup)
-        let expired = self.data.get(key)
+        let expired = self
+            .data
+            .get(key)
             .is_some_and(|e| e.is_expired_at(base_ts, now_ms));
         if expired {
             let removed = self.data.remove(key)?;
-            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+            self.used_memory = self
+                .used_memory
+                .saturating_sub(entry_overhead(key, &removed));
             return None;
         }
         // Single get_mut: touch LRU + return
@@ -385,7 +395,9 @@ impl Database {
         if let Some(old_entry) = self.data.get(key.as_ref()) {
             let new_version = old_entry.version() + 1;
             entry.set_version(new_version);
-            self.used_memory = self.used_memory.saturating_sub(entry_overhead(&key, old_entry));
+            self.used_memory = self
+                .used_memory
+                .saturating_sub(entry_overhead(&key, old_entry));
         }
         self.used_memory += entry_overhead(&key, &entry);
         self.data.insert(CompactKey::from(key), entry);
@@ -411,7 +423,9 @@ impl Database {
             Some(entry) => {
                 if entry.is_expired_at(base_ts, now_ms) {
                     let removed = self.data.remove(key).unwrap();
-                    self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &removed));
+                    self.used_memory = self
+                        .used_memory
+                        .saturating_sub(entry_overhead(key, &removed));
                     false
                 } else {
                     true
@@ -458,7 +472,12 @@ impl Database {
     }
 
     /// Check if an entry is expired without requiring &mut self.
-    fn check_expired(data: &DashTable<CompactKey, Entry>, key: &[u8], base_ts: u32, now_ms: u64) -> bool {
+    fn check_expired(
+        data: &DashTable<CompactKey, Entry>,
+        key: &[u8],
+        base_ts: u32,
+        now_ms: u64,
+    ) -> bool {
         data.get(key)
             .is_some_and(|e| e.is_expired_at(base_ts, now_ms))
     }
@@ -471,7 +490,10 @@ impl Database {
     /// Convenience: set a string value with an expiry (unix millis).
     pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at_ms: u64) {
         let base_ts = self.base_timestamp;
-        self.set(key, Entry::new_string_with_expiry(value, expires_at_ms, base_ts));
+        self.set(
+            key,
+            Entry::new_string_with_expiry(value, expires_at_ms, base_ts),
+        );
     }
 
     /// Check if a single entry is expired.
@@ -517,10 +539,7 @@ impl Database {
     ///
     /// New keys start with compact listpack encoding and are upgraded to
     /// full HashMap on first mutable access (eager upgrade).
-    pub fn get_or_create_hash(
-        &mut self,
-        key: &[u8],
-    ) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
+    pub fn get_or_create_hash(&mut self, key: &[u8]) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         // Expire check
@@ -575,10 +594,7 @@ impl Database {
 
     /// Get or create a list entry. Returns mutable ref to inner VecDeque.
     /// New keys start with full encoding. Upgrades compact listpack on access.
-    pub fn get_or_create_list(
-        &mut self,
-        key: &[u8],
-    ) -> Result<&mut VecDeque<Bytes>, Frame> {
+    pub fn get_or_create_list(&mut self, key: &[u8]) -> Result<&mut VecDeque<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
@@ -632,10 +648,7 @@ impl Database {
 
     /// Get or create a set entry. Returns mutable ref to inner HashSet.
     /// New keys start with full encoding. Upgrades compact encodings on access.
-    pub fn get_or_create_set(
-        &mut self,
-        key: &[u8],
-    ) -> Result<&mut HashSet<Bytes>, Frame> {
+    pub fn get_or_create_set(&mut self, key: &[u8]) -> Result<&mut HashSet<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
@@ -705,10 +718,7 @@ impl Database {
     /// Returns Err if the key exists but holds a non-set type.
     /// Returns Ok(None) if the key exists but is not an intset (caller should use get_or_create_set).
     /// Returns Ok(Some(&mut Intset)) if the key holds or was created as an intset.
-    pub fn get_or_create_intset(
-        &mut self,
-        key: &[u8],
-    ) -> Result<Option<&mut Intset>, Frame> {
+    pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
@@ -732,10 +742,7 @@ impl Database {
 
     /// Upgrade an intset entry to a full HashSet and return mutable ref.
     /// Panics if the key doesn't exist or isn't a SetIntset.
-    pub fn upgrade_intset_to_set(
-        &mut self,
-        key: &[u8],
-    ) -> &mut HashSet<Bytes> {
+    pub fn upgrade_intset_to_set(&mut self, key: &[u8]) -> &mut HashSet<Bytes> {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetIntset(is)) => {
@@ -782,10 +789,7 @@ impl Database {
 
     /// Upgrade a HashListpack to full Hash. Returns mutable ref to the HashMap.
     /// Panics if the key doesn't exist or isn't a HashListpack.
-    pub fn upgrade_hash_listpack_to_hash(
-        &mut self,
-        key: &[u8],
-    ) -> &mut HashMap<Bytes, Bytes> {
+    pub fn upgrade_hash_listpack_to_hash(&mut self, key: &[u8]) -> &mut HashMap<Bytes, Bytes> {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::HashListpack(lp)) => {
@@ -832,10 +836,7 @@ impl Database {
 
     /// Upgrade a ListListpack to full List. Returns mutable ref to the VecDeque.
     /// Panics if the key doesn't exist or isn't a ListListpack.
-    pub fn upgrade_list_listpack_to_list(
-        &mut self,
-        key: &[u8],
-    ) -> &mut VecDeque<Bytes> {
+    pub fn upgrade_list_listpack_to_list(&mut self, key: &[u8]) -> &mut VecDeque<Bytes> {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::ListListpack(lp)) => {
@@ -858,13 +859,7 @@ impl Database {
     pub fn get_or_create_sorted_set(
         &mut self,
         key: &[u8],
-    ) -> Result<
-        (
-            &mut HashMap<Bytes, f64>,
-            &mut BPTree,
-        ),
-        Frame,
-    > {
+    ) -> Result<(&mut HashMap<Bytes, f64>, &mut BPTree), Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
@@ -902,13 +897,7 @@ impl Database {
     pub fn get_sorted_set(
         &mut self,
         key: &[u8],
-    ) -> Result<
-        Option<(
-            &HashMap<Bytes, f64>,
-            &BPTree,
-        )>,
-        Frame,
-    > {
+    ) -> Result<Option<(&HashMap<Bytes, f64>, &BPTree)>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
         if Self::check_expired(&self.data, key, base_ts, now_ms) {
@@ -918,9 +907,14 @@ impl Database {
         }
         // Upgrade old SortedSet (BTreeMap) to SortedSetBPTree on access
         if let Some(entry) = self.data.get(key) {
-            if matches!(entry.value.as_redis_value(), RedisValueRef::SortedSet { .. }) {
+            if matches!(
+                entry.value.as_redis_value(),
+                RedisValueRef::SortedSet { .. }
+            ) {
                 let entry = self.data.get_mut(key).unwrap();
-                if let Some(RedisValue::SortedSet { members, scores }) = entry.value.as_redis_value_mut() {
+                if let Some(RedisValue::SortedSet { members, scores }) =
+                    entry.value.as_redis_value_mut()
+                {
                     let mut tree = BPTree::new();
                     let new_members = std::mem::take(members);
                     let old_scores = std::mem::take(scores);
@@ -1058,21 +1052,14 @@ impl Database {
         &self,
         key: &[u8],
         now_ms: u64,
-    ) -> Result<
-        Option<(
-            &HashMap<Bytes, f64>,
-            &BPTree,
-        )>,
-        Frame,
-    > {
+    ) -> Result<Option<(&HashMap<Bytes, f64>, &BPTree)>, Frame> {
         let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
             Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::SortedSetBPTree { tree, members } => Ok(Some((members, tree))),
-                RedisValueRef::SortedSet { .. }
-                | RedisValueRef::SortedSetListpack(_) => Ok(None),
+                RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetListpack(_) => Ok(None),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -1081,7 +1068,11 @@ impl Database {
     // ---- Enum-based readonly accessors that handle compact encodings ----
 
     /// Read-only hash access via HashRef enum. Handles both HashMap and Listpack.
-    pub fn get_hash_ref_if_alive(&self, key: &[u8], now_ms: u64) -> Result<Option<HashRef<'_>>, Frame> {
+    pub fn get_hash_ref_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<HashRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
@@ -1095,7 +1086,11 @@ impl Database {
     }
 
     /// Read-only list access via ListRef enum. Handles both VecDeque and Listpack.
-    pub fn get_list_ref_if_alive(&self, key: &[u8], now_ms: u64) -> Result<Option<ListRef<'_>>, Frame> {
+    pub fn get_list_ref_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<ListRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
@@ -1109,7 +1104,11 @@ impl Database {
     }
 
     /// Read-only set access via SetRef enum. Handles HashSet, Listpack, and Intset.
-    pub fn get_set_ref_if_alive(&self, key: &[u8], now_ms: u64) -> Result<Option<SetRef<'_>>, Frame> {
+    pub fn get_set_ref_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<SetRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
@@ -1124,7 +1123,11 @@ impl Database {
     }
 
     /// Read-only sorted set access via SortedSetRef enum. Handles BPTree, Listpack, and Legacy.
-    pub fn get_sorted_set_ref_if_alive(&self, key: &[u8], now_ms: u64) -> Result<Option<SortedSetRef<'_>>, Frame> {
+    pub fn get_sorted_set_ref_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<SortedSetRef<'_>>, Frame> {
         let base_ts = self.base_timestamp;
         match self.data.get(key) {
             None => Ok(None),
@@ -1398,7 +1401,10 @@ mod tests {
         let map = db.get_or_create_hash(b"myhash").unwrap();
         map.insert(Bytes::from_static(b"field"), Bytes::from_static(b"value"));
         let map = db.get_hash(b"myhash").unwrap().unwrap();
-        assert_eq!(map.get(&Bytes::from_static(b"field")).unwrap().as_ref(), b"value");
+        assert_eq!(
+            map.get(&Bytes::from_static(b"field")).unwrap().as_ref(),
+            b"value"
+        );
     }
 
     #[test]
@@ -1492,7 +1498,10 @@ mod tests {
         assert_eq!(db.estimated_memory(), 0);
         // Overwrite should not double-count
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"longer_value"));
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"longer_value"),
+        );
         assert!(db.estimated_memory() > 0);
         // Should not equal 2x the original
         assert_ne!(db.estimated_memory(), mem_after_set * 2);

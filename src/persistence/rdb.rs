@@ -4,16 +4,16 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use bytes::Bytes;
 use crc32fast::Hasher;
 use ordered_float::OrderedFloat;
 
 use crate::storage::bptree::BPTree;
 use crate::storage::compact_key::CompactKey;
-use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::{current_secs, current_time_ms, Entry, RedisValue};
+use crate::storage::db::Database;
+use crate::storage::entry::{Entry, RedisValue, current_secs, current_time_ms};
 use crate::storage::stream::{Stream as StreamData, StreamId};
 
 // Format constants
@@ -87,7 +87,10 @@ pub fn save(databases: &[Database], path: &Path) -> anyhow::Result<()> {
 /// Save from pre-cloned snapshot data (used by BGSAVE to avoid holding the lock).
 ///
 /// Each element in `snapshot` is a Vec of (key, entry, base_ts) for a database index.
-pub fn save_from_snapshot(snapshot: &[(Vec<(CompactKey, Entry)>, u32)], path: &Path) -> anyhow::Result<()> {
+pub fn save_from_snapshot(
+    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
+    path: &Path,
+) -> anyhow::Result<()> {
     let mut buf = Vec::new();
 
     // Header
@@ -98,7 +101,10 @@ pub fn save_from_snapshot(snapshot: &[(Vec<(CompactKey, Entry)>, u32)], path: &P
 
     for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
         // Filter expired and skip empty
-        let live: Vec<_> = entries.iter().filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms)).collect();
+        let live: Vec<_> = entries
+            .iter()
+            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .collect();
         if live.is_empty() {
             continue;
         }
@@ -188,7 +194,11 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
                 cursor.read_exact(&mut db_idx)?;
                 current_db = db_idx[0] as usize;
                 if current_db >= databases.len() {
-                    bail!("RDB references database {} but only {} configured", current_db, databases.len());
+                    bail!(
+                        "RDB references database {} but only {} configured",
+                        current_db,
+                        databases.len()
+                    );
                 }
             }
             type_tag => {
@@ -240,9 +250,8 @@ pub fn merge_shard_snapshots(
     shard_snapshots: Vec<Vec<(Vec<(Bytes, Entry)>, u32)>>,
     num_databases: usize,
 ) -> Vec<(Vec<(Bytes, Entry)>, u32)> {
-    let mut merged: Vec<(Vec<(Bytes, Entry)>, u32)> = (0..num_databases)
-        .map(|_| (Vec::new(), 0u32))
-        .collect();
+    let mut merged: Vec<(Vec<(Bytes, Entry)>, u32)> =
+        (0..num_databases).map(|_| (Vec::new(), 0u32)).collect();
 
     for shard_snap in shard_snapshots {
         for (db_idx, (entries, base_ts)) in shard_snap.into_iter().enumerate() {
@@ -435,11 +444,7 @@ pub(crate) fn read_entry(
     let ttl_ms = i64::from_le_bytes(ttl_buf);
 
     // expires_at_ms: if ttl_ms > 0 it's already absolute unix millis
-    let expires_at_ms = if ttl_ms > 0 {
-        ttl_ms as u64
-    } else {
-        0
-    };
+    let expires_at_ms = if ttl_ms > 0 { ttl_ms as u64 } else { 0 };
 
     // Value
     let value = match type_tag {
@@ -553,11 +558,14 @@ pub(crate) fn read_entry(
                     let mut dc_buf = [0u8; 8];
                     cursor.read_exact(&mut dt_buf)?;
                     cursor.read_exact(&mut dc_buf)?;
-                    pel.insert(pid, crate::storage::stream::PendingEntry {
-                        consumer: consumer_name,
-                        delivery_time: u64::from_le_bytes(dt_buf),
-                        delivery_count: u64::from_le_bytes(dc_buf),
-                    });
+                    pel.insert(
+                        pid,
+                        crate::storage::stream::PendingEntry {
+                            consumer: consumer_name,
+                            delivery_time: u64::from_le_bytes(dt_buf),
+                            delivery_count: u64::from_le_bytes(dc_buf),
+                        },
+                    );
                 }
 
                 let consumer_count = read_u32(cursor)? as usize;

@@ -232,8 +232,8 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::framevec;
+    use bytes::Bytes;
 
     use super::super::frame::ParseConfig;
     use super::super::parse;
@@ -335,7 +335,9 @@ mod tests {
 
     #[test]
     fn test_round_trip_error() {
-        round_trip(&Frame::Error(Bytes::from_static(b"ERR something went wrong")));
+        round_trip(&Frame::Error(Bytes::from_static(
+            b"ERR something went wrong",
+        )));
     }
 
     #[test]

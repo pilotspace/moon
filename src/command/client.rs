@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::protocol::Frame;
+use bytes::Bytes;
 
 /// Parsed CLIENT TRACKING configuration.
 pub struct TrackingConfig {

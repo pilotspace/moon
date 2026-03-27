@@ -1,4 +1,3 @@
-
 use super::Frame;
 
 /// Convert a dispatch response to RESP3 types based on command name.
@@ -25,8 +24,9 @@ pub fn maybe_convert_resp3(cmd: &[u8], response: Frame, proto: u8) -> Frame {
         // Boolean responses (integer 0/1 -> boolean)
         // Note: EXISTS is intentionally excluded -- multi-key EXISTS returns a count > 1
         // which should remain Integer. Single-key EXISTS would need arg-count awareness.
-        b"SISMEMBER" | b"HEXISTS" | b"EXPIRE" | b"PEXPIRE" | b"PERSIST" | b"SETNX"
-        | b"MSETNX" => int_to_bool(response),
+        b"SISMEMBER" | b"HEXISTS" | b"EXPIRE" | b"PEXPIRE" | b"PERSIST" | b"SETNX" | b"MSETNX" => {
+            int_to_bool(response)
+        }
         // Double responses (bulk string -> double)
         b"ZSCORE" | b"ZINCRBY" | b"INCRBYFLOAT" | b"HINCRBYFLOAT" => bulk_to_double(response),
         _ => response,
@@ -80,8 +80,8 @@ pub fn bulk_to_double(frame: Frame) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::framevec;
+    use bytes::Bytes;
 
     #[test]
     fn test_array_to_map() {
@@ -151,10 +151,7 @@ mod tests {
         );
         // Non-numeric passthrough
         let non_num = Frame::BulkString(Bytes::from_static(b"notanumber"));
-        assert_eq!(
-            bulk_to_double(non_num.clone()),
-            non_num
-        );
+        assert_eq!(bulk_to_double(non_num.clone()), non_num);
     }
 
     #[test]
@@ -227,26 +224,17 @@ mod tests {
     #[test]
     fn test_maybe_convert_get_unchanged() {
         let val = Frame::BulkString(Bytes::from_static(b"val"));
-        assert_eq!(
-            maybe_convert_resp3(b"GET", val.clone(), 3),
-            val
-        );
+        assert_eq!(maybe_convert_resp3(b"GET", val.clone(), 3), val);
     }
 
     #[test]
     fn test_maybe_convert_error_passthrough() {
         let err = Frame::Error(Bytes::from_static(b"ERR something"));
-        assert_eq!(
-            maybe_convert_resp3(b"HGETALL", err.clone(), 3),
-            err
-        );
+        assert_eq!(maybe_convert_resp3(b"HGETALL", err.clone(), 3), err);
     }
 
     #[test]
     fn test_maybe_convert_null_passthrough() {
-        assert_eq!(
-            maybe_convert_resp3(b"ZSCORE", Frame::Null, 3),
-            Frame::Null
-        );
+        assert_eq!(maybe_convert_resp3(b"ZSCORE", Frame::Null, 3), Frame::Null);
     }
 }

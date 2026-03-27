@@ -24,7 +24,10 @@ pub fn pin_to_core(core_id: usize) {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = core_id;
-        tracing::debug!("Thread pinning not available on this platform (shard {})", core_id);
+        tracing::debug!(
+            "Thread pinning not available on this platform (shard {})",
+            core_id
+        );
     }
 }
 

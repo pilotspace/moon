@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use crate::storage::bptree::BPTree;
 
-use crate::protocol::Frame;
-use crate::storage::db::SortedSetRef;
-use crate::storage::Database;
 use crate::framevec;
+use crate::protocol::Frame;
+use crate::storage::Database;
+use crate::storage::db::SortedSetRef;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -66,11 +66,7 @@ fn zadd_member(
 }
 
 /// Remove a member from the sorted set. Returns true if the member existed.
-fn zrem_member(
-    members: &mut HashMap<Bytes, f64>,
-    scores: &mut BPTree,
-    member: &[u8],
-) -> bool {
+fn zrem_member(members: &mut HashMap<Bytes, f64>, scores: &mut BPTree, member: &[u8]) -> bool {
     if let Some(score) = members.remove(member) {
         scores.remove(OrderedFloat(score), member);
         true
@@ -120,8 +116,7 @@ impl ScoreBound {
 }
 
 fn parse_score_bound(s: &[u8]) -> Result<ScoreBound, Frame> {
-    let s_str = std::str::from_utf8(s)
-        .map_err(|_| err("ERR min or max is not a float"))?;
+    let s_str = std::str::from_utf8(s).map_err(|_| err("ERR min or max is not a float"))?;
     if s_str == "-inf" {
         return Ok(ScoreBound::NegInf);
     }
@@ -166,16 +161,12 @@ fn parse_lex_bound(s: &[u8]) -> Result<LexBound, Frame> {
         return Ok(LexBound::PosInf);
     }
     if s.is_empty() {
-        return Err(err(
-            "ERR min or max not valid string range item",
-        ));
+        return Err(err("ERR min or max not valid string range item"));
     }
     match s[0] {
         b'[' => Ok(LexBound::Inclusive(Bytes::copy_from_slice(&s[1..]))),
         b'(' => Ok(LexBound::Exclusive(Bytes::copy_from_slice(&s[1..]))),
-        _ => Err(err(
-            "ERR min or max not valid string range item",
-        )),
+        _ => Err(err("ERR min or max not valid string range item")),
     }
 }
 
@@ -222,12 +213,24 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b.as_ref(),
             None => break,
         };
-        if arg.eq_ignore_ascii_case(b"NX") { nx = true; i += 1; }
-        else if arg.eq_ignore_ascii_case(b"XX") { xx = true; i += 1; }
-        else if arg.eq_ignore_ascii_case(b"GT") { gt = true; i += 1; }
-        else if arg.eq_ignore_ascii_case(b"LT") { lt = true; i += 1; }
-        else if arg.eq_ignore_ascii_case(b"CH") { ch = true; i += 1; }
-        else { break; }
+        if arg.eq_ignore_ascii_case(b"NX") {
+            nx = true;
+            i += 1;
+        } else if arg.eq_ignore_ascii_case(b"XX") {
+            xx = true;
+            i += 1;
+        } else if arg.eq_ignore_ascii_case(b"GT") {
+            gt = true;
+            i += 1;
+        } else if arg.eq_ignore_ascii_case(b"LT") {
+            lt = true;
+            i += 1;
+        } else if arg.eq_ignore_ascii_case(b"CH") {
+            ch = true;
+            i += 1;
+        } else {
+            break;
+        }
     }
 
     // NX and XX are mutually exclusive
@@ -279,18 +282,18 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         let existing_score = members.get(&member).copied();
 
         let should_update = match existing_score {
-            None => !xx,  // New member: add unless XX
+            None => !xx, // New member: add unless XX
             Some(old) => {
                 if nx {
-                    false  // NX: never update existing
+                    false // NX: never update existing
                 } else if gt && lt {
-                    false  // GT+LT together: never update (mutually exclusive)
+                    false // GT+LT together: never update (mutually exclusive)
                 } else if gt {
                     score > old
                 } else if lt {
                     score < old
                 } else {
-                    true  // No flags: always update
+                    true // No flags: always update
                 }
             }
         };
@@ -300,7 +303,9 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
             if is_new {
                 added += 1;
                 changed += 1;
-            } else if existing_score.is_some() && (existing_score.unwrap() - score).abs() > f64::EPSILON {
+            } else if existing_score.is_some()
+                && (existing_score.unwrap() - score).abs() > f64::EPSILON
+            {
                 changed += 1;
             }
         }
@@ -364,12 +369,10 @@ pub fn zscore(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     match db.get_sorted_set(key) {
-        Ok(Some((members, _scores))) => {
-            match members.get(member) {
-                Some(score) => Frame::BulkString(Bytes::from(format_score(*score))),
-                None => Frame::Null,
-            }
-        }
+        Ok(Some((members, _scores))) => match members.get(member) {
+            Some(score) => Frame::BulkString(Bytes::from(format_score(*score))),
+            None => Frame::Null,
+        },
         Ok(None) => Frame::Null,
         Err(e) => e,
     }
@@ -450,17 +453,13 @@ pub fn zrank(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => {
-            match members.get(member) {
-                Some(score) => {
-                    match scores.rank(OrderedFloat(*score), member) {
-                        Some(rank) => Frame::Integer(rank as i64),
-                        None => Frame::Null,
-                    }
-                }
+        Ok(Some((members, scores))) => match members.get(member) {
+            Some(score) => match scores.rank(OrderedFloat(*score), member) {
+                Some(rank) => Frame::Integer(rank as i64),
                 None => Frame::Null,
-            }
-        }
+            },
+            None => Frame::Null,
+        },
         Ok(None) => Frame::Null,
         Err(e) => e,
     }
@@ -481,17 +480,13 @@ pub fn zrevrank(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => {
-            match members.get(member) {
-                Some(score) => {
-                    match scores.rev_rank(OrderedFloat(*score), member) {
-                        Some(rev_rank) => Frame::Integer(rev_rank as i64),
-                        None => Frame::Null,
-                    }
-                }
+        Ok(Some((members, scores))) => match members.get(member) {
+            Some(score) => match scores.rev_rank(OrderedFloat(*score), member) {
+                Some(rev_rank) => Frame::Integer(rev_rank as i64),
                 None => Frame::Null,
-            }
-        }
+            },
+            None => Frame::Null,
+        },
         Ok(None) => Frame::Null,
         Err(e) => e,
     }
@@ -512,7 +507,10 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b,
             None => return err_wrong_args("ZPOPMIN"),
         };
-        match std::str::from_utf8(count_bytes).ok().and_then(|s| s.parse::<i64>().ok()) {
+        match std::str::from_utf8(count_bytes)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             Some(c) if c >= 0 => c as usize,
             _ => return err("ERR value is not an integer or out of range"),
         }
@@ -562,7 +560,10 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b,
             None => return err_wrong_args("ZPOPMAX"),
         };
-        match std::str::from_utf8(count_bytes).ok().and_then(|s| s.parse::<i64>().ok()) {
+        match std::str::from_utf8(count_bytes)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             Some(c) if c >= 0 => c as usize,
             _ => return err("ERR value is not an integer or out of range"),
         }
@@ -625,7 +626,10 @@ pub fn zscan(db: &mut Database, args: &[Frame]) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(b) => b.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
         if opt.eq_ignore_ascii_case(b"MATCH") {
             if i + 1 < args.len() {
@@ -691,12 +695,10 @@ pub fn zscan(db: &mut Database, args: &[Frame]) -> Frame {
                 Frame::Array(result_items.into()),
             ])
         }
-        Ok(None) => {
-            Frame::Array(framevec![
-                Frame::BulkString(Bytes::from_static(b"0")),
-                Frame::Array(framevec![]),
-            ])
-        }
+        Ok(None) => Frame::Array(framevec![
+            Frame::BulkString(Bytes::from_static(b"0")),
+            Frame::Array(framevec![]),
+        ]),
         Err(e) => e,
     }
 }
@@ -766,13 +768,24 @@ pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(b) => b.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
-        if opt.eq_ignore_ascii_case(b"BYSCORE") { by_score = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"BYLEX") { by_lex = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"REV") { rev = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+        if opt.eq_ignore_ascii_case(b"BYSCORE") {
+            by_score = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"BYLEX") {
+            by_lex = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"REV") {
+            rev = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 < args.len() {
                 let off_b = match extract_bytes(&args[i + 1]) {
                     Some(b) => b,
@@ -782,12 +795,8 @@ pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
                     Some(b) => b,
                     None => return err_wrong_args("ZRANGE"),
                 };
-                limit_offset = std::str::from_utf8(off_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok());
+                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
+                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
                 if limit_offset.is_none() || limit_count.is_none() {
                     return err("ERR value is not an integer or out of range");
                 }
@@ -806,15 +815,35 @@ pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
 
     // LIMIT is only valid with BYSCORE or BYLEX
     if limit_offset.is_some() && !by_score && !by_lex {
-        return err("ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
+        return err(
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+        );
     }
 
     match db.get_sorted_set(key) {
         Ok(Some((members, scores))) => {
             if by_score {
-                zrange_by_score(members, scores, &min_arg, &max_arg, rev, withscores, limit_offset, limit_count)
+                zrange_by_score(
+                    members,
+                    scores,
+                    &min_arg,
+                    &max_arg,
+                    rev,
+                    withscores,
+                    limit_offset,
+                    limit_count,
+                )
             } else if by_lex {
-                zrange_by_lex(scores, &min_arg, &max_arg, rev, withscores, members, limit_offset, limit_count)
+                zrange_by_lex(
+                    scores,
+                    &min_arg,
+                    &max_arg,
+                    rev,
+                    withscores,
+                    members,
+                    limit_offset,
+                    limit_count,
+                )
             } else {
                 zrange_by_rank(scores, &min_arg, &max_arg, rev, withscores)
             }
@@ -836,18 +865,32 @@ fn zrange_by_rank(
         return Frame::Array(framevec![]);
     }
 
-    let start_raw: i64 = match std::str::from_utf8(min_arg).ok().and_then(|s| s.parse().ok()) {
+    let start_raw: i64 = match std::str::from_utf8(min_arg)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) => v,
         None => return err("ERR value is not an integer or out of range"),
     };
-    let stop_raw: i64 = match std::str::from_utf8(max_arg).ok().and_then(|s| s.parse().ok()) {
+    let stop_raw: i64 = match std::str::from_utf8(max_arg)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) => v,
         None => return err("ERR value is not an integer or out of range"),
     };
 
     // Normalize negative indices
-    let start = if start_raw < 0 { (total + start_raw).max(0) } else { start_raw.min(total) };
-    let stop = if stop_raw < 0 { (total + stop_raw).max(0) } else { stop_raw.min(total - 1) };
+    let start = if start_raw < 0 {
+        (total + start_raw).max(0)
+    } else {
+        start_raw.min(total)
+    };
+    let stop = if stop_raw < 0 {
+        (total + stop_raw).max(0)
+    } else {
+        stop_raw.min(total - 1)
+    };
 
     if start > stop {
         return Frame::Array(framevec![]);
@@ -942,7 +985,11 @@ fn zrange_by_score(
     let limited: Vec<_> = if count < 0 {
         entries.into_iter().skip(offset).collect()
     } else {
-        entries.into_iter().skip(offset).take(count as usize).collect()
+        entries
+            .into_iter()
+            .skip(offset)
+            .take(count as usize)
+            .collect()
     };
 
     let mut result = Vec::new();
@@ -1005,7 +1052,11 @@ fn zrange_by_lex(
     let limited: Vec<_> = if count < 0 {
         entries.into_iter().skip(offset).collect()
     } else {
-        entries.into_iter().skip(offset).take(count as usize).collect()
+        entries
+            .into_iter()
+            .skip(offset)
+            .take(count as usize)
+            .collect()
     };
 
     let mut result = Vec::new();
@@ -1079,10 +1130,15 @@ pub fn zrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(b) => b.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 < args.len() {
                 let off_b = match extract_bytes(&args[i + 1]) {
                     Some(b) => b,
@@ -1092,12 +1148,8 @@ pub fn zrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
                     Some(b) => b,
                     None => return err_wrong_args("ZRANGEBYSCORE"),
                 };
-                limit_offset = std::str::from_utf8(off_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok());
+                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
+                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
                 if limit_offset.is_none() || limit_count.is_none() {
                     return err("ERR value is not an integer or out of range");
                 }
@@ -1111,9 +1163,16 @@ pub fn zrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => {
-            zrange_by_score(members, scores, &min_arg, &max_arg, false, withscores, limit_offset, limit_count)
-        }
+        Ok(Some((members, scores))) => zrange_by_score(
+            members,
+            scores,
+            &min_arg,
+            &max_arg,
+            false,
+            withscores,
+            limit_offset,
+            limit_count,
+        ),
         Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
@@ -1146,10 +1205,15 @@ pub fn zrevrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(b) => b.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 < args.len() {
                 let off_b = match extract_bytes(&args[i + 1]) {
                     Some(b) => b,
@@ -1159,12 +1223,8 @@ pub fn zrevrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
                     Some(b) => b,
                     None => return err_wrong_args("ZREVRANGEBYSCORE"),
                 };
-                limit_offset = std::str::from_utf8(off_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b)
-                    .ok()
-                    .and_then(|s| s.parse().ok());
+                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
+                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
                 if limit_offset.is_none() || limit_count.is_none() {
                     return err("ERR value is not an integer or out of range");
                 }
@@ -1181,7 +1241,16 @@ pub fn zrevrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some((members, scores))) => {
             // Use min_arg and max_arg but in correct order for the score filter,
             // then reverse the result
-            zrange_by_score(members, scores, &min_arg, &max_arg, true, withscores, limit_offset, limit_count)
+            zrange_by_score(
+                members,
+                scores,
+                &min_arg,
+                &max_arg,
+                true,
+                withscores,
+                limit_offset,
+                limit_count,
+            )
         }
         Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
@@ -1221,7 +1290,9 @@ pub fn zcount(db: &mut Database, args: &[Frame]) -> Frame {
             let range_max = OrderedFloat(max_bound.value());
             let count = scores
                 .range(range_min, range_max)
-                .filter(|(score, _)| min_bound.includes(score.0) && max_bound.includes_upper(score.0))
+                .filter(|(score, _)| {
+                    min_bound.includes(score.0) && max_bound.includes_upper(score.0)
+                })
                 .count();
             Frame::Integer(count as i64)
         }
@@ -1281,7 +1352,11 @@ pub fn zinterstore(db: &mut Database, args: &[Frame]) -> Frame {
 }
 
 fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
-    let cmd_name = if intersect { "ZINTERSTORE" } else { "ZUNIONSTORE" };
+    let cmd_name = if intersect {
+        "ZINTERSTORE"
+    } else {
+        "ZUNIONSTORE"
+    };
     if args.len() < 3 {
         return err_wrong_args(cmd_name);
     }
@@ -1322,7 +1397,10 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(b) => b.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
         if opt.eq_ignore_ascii_case(b"WEIGHTS") {
             for w in 0..numkeys {
@@ -1333,10 +1411,7 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
                     Some(b) => b,
                     None => return err_wrong_args(cmd_name),
                 };
-                let wval: f64 = match std::str::from_utf8(wb)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
+                let wval: f64 = match std::str::from_utf8(wb).ok().and_then(|s| s.parse().ok()) {
                     Some(v) => v,
                     None => return err("ERR weight value is not a float"),
                 };
@@ -1478,47 +1553,97 @@ fn zrange_from_entries(
     }
 
     if by_score {
-        let min_bound = match parse_score_bound(min_arg) { Ok(b) => b, Err(e) => return e };
-        let max_bound = match parse_score_bound(max_arg) { Ok(b) => b, Err(e) => return e };
-        let mut filtered: Vec<&(Bytes, f64)> = entries.iter()
+        let min_bound = match parse_score_bound(min_arg) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let max_bound = match parse_score_bound(max_arg) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let mut filtered: Vec<&(Bytes, f64)> = entries
+            .iter()
             .filter(|(_, s)| min_bound.includes(*s) && max_bound.includes_upper(*s))
             .collect();
-        if rev { filtered.reverse(); }
+        if rev {
+            filtered.reverse();
+        }
         let offset = limit_offset.unwrap_or(0).max(0) as usize;
-        let count = limit_count.map(|c| if c < 0 { filtered.len() } else { c as usize }).unwrap_or(filtered.len());
-        let result: Vec<Frame> = filtered.into_iter().skip(offset).take(count).flat_map(|(member, score)| {
-            let mut v = vec![Frame::BulkString(member.clone())];
-            if withscores { v.push(Frame::BulkString(Bytes::from(format_score(*score)))); }
-            v
-        }).collect();
+        let count = limit_count
+            .map(|c| if c < 0 { filtered.len() } else { c as usize })
+            .unwrap_or(filtered.len());
+        let result: Vec<Frame> = filtered
+            .into_iter()
+            .skip(offset)
+            .take(count)
+            .flat_map(|(member, score)| {
+                let mut v = vec![Frame::BulkString(member.clone())];
+                if withscores {
+                    v.push(Frame::BulkString(Bytes::from(format_score(*score))));
+                }
+                v
+            })
+            .collect();
         Frame::Array(result.into())
     } else if by_lex {
-        let min_bound = match parse_lex_bound(min_arg) { Ok(b) => b, Err(e) => return e };
-        let max_bound = match parse_lex_bound(max_arg) { Ok(b) => b, Err(e) => return e };
-        let mut filtered: Vec<&(Bytes, f64)> = entries.iter()
+        let min_bound = match parse_lex_bound(min_arg) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let max_bound = match parse_lex_bound(max_arg) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let mut filtered: Vec<&(Bytes, f64)> = entries
+            .iter()
             .filter(|(member, _)| lex_in_range(member, &min_bound, &max_bound))
             .collect();
-        if rev { filtered.reverse(); }
+        if rev {
+            filtered.reverse();
+        }
         let offset = limit_offset.unwrap_or(0).max(0) as usize;
-        let count = limit_count.map(|c| if c < 0 { filtered.len() } else { c as usize }).unwrap_or(filtered.len());
-        let result: Vec<Frame> = filtered.into_iter().skip(offset).take(count).flat_map(|(member, score)| {
-            let mut v = vec![Frame::BulkString(member.clone())];
-            if withscores { v.push(Frame::BulkString(Bytes::from(format_score(*score)))); }
-            v
-        }).collect();
+        let count = limit_count
+            .map(|c| if c < 0 { filtered.len() } else { c as usize })
+            .unwrap_or(filtered.len());
+        let result: Vec<Frame> = filtered
+            .into_iter()
+            .skip(offset)
+            .take(count)
+            .flat_map(|(member, score)| {
+                let mut v = vec![Frame::BulkString(member.clone())];
+                if withscores {
+                    v.push(Frame::BulkString(Bytes::from(format_score(*score))));
+                }
+                v
+            })
+            .collect();
         Frame::Array(result.into())
     } else {
         // By rank
-        let start_raw: i64 = match std::str::from_utf8(min_arg).ok().and_then(|s| s.parse().ok()) {
+        let start_raw: i64 = match std::str::from_utf8(min_arg)
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return err("ERR value is not an integer or out of range"),
         };
-        let stop_raw: i64 = match std::str::from_utf8(max_arg).ok().and_then(|s| s.parse().ok()) {
+        let stop_raw: i64 = match std::str::from_utf8(max_arg)
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => return err("ERR value is not an integer or out of range"),
         };
-        let start = if start_raw < 0 { (total + start_raw).max(0) as usize } else { start_raw as usize };
-        let stop = if stop_raw < 0 { (total + stop_raw).max(0) as usize } else { (stop_raw as usize).min(entries.len().saturating_sub(1)) };
+        let start = if start_raw < 0 {
+            (total + start_raw).max(0) as usize
+        } else {
+            start_raw as usize
+        };
+        let stop = if stop_raw < 0 {
+            (total + stop_raw).max(0) as usize
+        } else {
+            (stop_raw as usize).min(entries.len().saturating_sub(1))
+        };
         if start > stop || start >= entries.len() {
             return Frame::Array(framevec![]);
         }
@@ -1527,11 +1652,16 @@ fn zrange_from_entries(
         } else {
             entries[start..=stop].iter().collect()
         };
-        let result: Vec<Frame> = slice.into_iter().flat_map(|(member, score)| {
-            let mut v = vec![Frame::BulkString(member.clone())];
-            if withscores { v.push(Frame::BulkString(Bytes::from(format_score(*score)))); }
-            v
-        }).collect();
+        let result: Vec<Frame> = slice
+            .into_iter()
+            .flat_map(|(member, score)| {
+                let mut v = vec![Frame::BulkString(member.clone())];
+                if withscores {
+                    v.push(Frame::BulkString(Bytes::from(format_score(*score))));
+                }
+                v
+            })
+            .collect();
         Frame::Array(result.into())
     }
 }
@@ -1542,9 +1672,17 @@ fn zrange_from_entries(
 
 /// ZSCORE (read-only).
 pub fn zscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 2 { return err_wrong_args("ZSCORE"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZSCORE") };
-    let member = match extract_bytes(&args[1]) { Some(b) => b, None => return err_wrong_args("ZSCORE") };
+    if args.len() != 2 {
+        return err_wrong_args("ZSCORE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZSCORE"),
+    };
+    let member = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZSCORE"),
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => match zref.score(member) {
             Some(score) => Frame::BulkString(Bytes::from(format_score(score))),
@@ -1557,8 +1695,13 @@ pub fn zscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZCARD (read-only).
 pub fn zcard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 1 { return err_wrong_args("ZCARD"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZCARD") };
+    if args.len() != 1 {
+        return err_wrong_args("ZCARD");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZCARD"),
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => Frame::Integer(zref.len() as i64),
         Ok(None) => Frame::Integer(0),
@@ -1568,9 +1711,17 @@ pub fn zcard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZRANK (read-only).
 pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 2 { return err_wrong_args("ZRANK"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZRANK") };
-    let member = match extract_bytes(&args[1]) { Some(b) => b, None => return err_wrong_args("ZRANK") };
+    if args.len() != 2 {
+        return err_wrong_args("ZRANK");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZRANK"),
+    };
+    let member = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZRANK"),
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
             // For BPTree/Legacy variants, use the optimized rank
@@ -1586,7 +1737,10 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                     let entries = zref.entries_sorted();
                     let target_score = OrderedFloat(score);
                     let target_member = Bytes::copy_from_slice(member);
-                    match entries.iter().position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member) {
+                    match entries
+                        .iter()
+                        .position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member)
+                    {
                         Some(rank) => Frame::Integer(rank as i64),
                         None => Frame::Null,
                     }
@@ -1601,30 +1755,39 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZREVRANK (read-only).
 pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 2 { return err_wrong_args("ZREVRANK"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZREVRANK") };
-    let member = match extract_bytes(&args[1]) { Some(b) => b, None => return err_wrong_args("ZREVRANK") };
+    if args.len() != 2 {
+        return err_wrong_args("ZREVRANK");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZREVRANK"),
+    };
+    let member = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZREVRANK"),
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            match (&zref, zref.score(member)) {
-                (SortedSetRef::BPTree { tree, .. }, Some(score)) => {
-                    match tree.rev_rank(OrderedFloat(score), member) {
-                        Some(rev_rank) => Frame::Integer(rev_rank as i64),
-                        None => Frame::Null,
-                    }
+        Ok(Some(zref)) => match (&zref, zref.score(member)) {
+            (SortedSetRef::BPTree { tree, .. }, Some(score)) => {
+                match tree.rev_rank(OrderedFloat(score), member) {
+                    Some(rev_rank) => Frame::Integer(rev_rank as i64),
+                    None => Frame::Null,
                 }
-                (SortedSetRef::Listpack(_), Some(score)) => {
-                    let entries = zref.entries_sorted();
-                    let target_score = OrderedFloat(score);
-                    let target_member = Bytes::copy_from_slice(member);
-                    match entries.iter().position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member) {
-                        Some(rank) => Frame::Integer((entries.len() - 1 - rank) as i64),
-                        None => Frame::Null,
-                    }
-                }
-                _ => Frame::Null,
             }
-        }
+            (SortedSetRef::Listpack(_), Some(score)) => {
+                let entries = zref.entries_sorted();
+                let target_score = OrderedFloat(score);
+                let target_member = Bytes::copy_from_slice(member);
+                match entries
+                    .iter()
+                    .position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member)
+                {
+                    Some(rank) => Frame::Integer((entries.len() - 1 - rank) as i64),
+                    None => Frame::Null,
+                }
+            }
+            _ => Frame::Null,
+        },
         Ok(None) => Frame::Null,
         Err(e) => e,
     }
@@ -1632,10 +1795,21 @@ pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZRANGE (read-only).
 pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() < 3 { return err_wrong_args("ZRANGE"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZRANGE") };
-    let min_arg = match extract_bytes(&args[1]) { Some(b) => b.clone(), None => return err_wrong_args("ZRANGE") };
-    let max_arg = match extract_bytes(&args[2]) { Some(b) => b.clone(), None => return err_wrong_args("ZRANGE") };
+    if args.len() < 3 {
+        return err_wrong_args("ZRANGE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZRANGE"),
+    };
+    let min_arg = match extract_bytes(&args[1]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZRANGE"),
+    };
+    let max_arg = match extract_bytes(&args[2]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZRANGE"),
+    };
     let mut by_score = false;
     let mut by_lex = false;
     let mut rev = false;
@@ -1644,36 +1818,100 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut limit_count: Option<i64> = None;
     let mut i = 3;
     while i < args.len() {
-        let opt = match extract_bytes(&args[i]) { Some(b) => b.as_ref(), None => { i += 1; continue; } };
-        if opt.eq_ignore_ascii_case(b"BYSCORE") { by_score = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"BYLEX") { by_lex = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"REV") { rev = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"BYSCORE") {
+            by_score = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"BYLEX") {
+            by_lex = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"REV") {
+            rev = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) { Some(b) => b, None => return err_wrong_args("ZRANGE") };
-                let cnt_b = match extract_bytes(&args[i + 2]) { Some(b) => b, None => return err_wrong_args("ZRANGE") };
+                let off_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGE"),
+                };
+                let cnt_b = match extract_bytes(&args[i + 2]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGE"),
+                };
                 limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
                 limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() { return err("ERR value is not an integer or out of range"); }
+                if limit_offset.is_none() || limit_count.is_none() {
+                    return err("ERR value is not an integer or out of range");
+                }
                 i += 3;
-            } else { return err_wrong_args("ZRANGE"); }
-        } else { i += 1; }
+            } else {
+                return err_wrong_args("ZRANGE");
+            }
+        } else {
+            i += 1;
+        }
     }
-    if by_score && by_lex { return err("ERR BYSCORE and BYLEX options are not compatible"); }
-    if limit_offset.is_some() && !by_score && !by_lex { return err("ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"); }
+    if by_score && by_lex {
+        return err("ERR BYSCORE and BYLEX options are not compatible");
+    }
+    if limit_offset.is_some() && !by_score && !by_lex {
+        return err(
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+        );
+    }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
             match (&zref, zref.members_map(), zref.bptree()) {
                 (_, Some(members), Some(scores)) => {
-                    if by_score { zrange_by_score(members, scores, &min_arg, &max_arg, rev, withscores, limit_offset, limit_count) }
-                    else if by_lex { zrange_by_lex(scores, &min_arg, &max_arg, rev, withscores, members, limit_offset, limit_count) }
-                    else { zrange_by_rank(scores, &min_arg, &max_arg, rev, withscores) }
+                    if by_score {
+                        zrange_by_score(
+                            members,
+                            scores,
+                            &min_arg,
+                            &max_arg,
+                            rev,
+                            withscores,
+                            limit_offset,
+                            limit_count,
+                        )
+                    } else if by_lex {
+                        zrange_by_lex(
+                            scores,
+                            &min_arg,
+                            &max_arg,
+                            rev,
+                            withscores,
+                            members,
+                            limit_offset,
+                            limit_count,
+                        )
+                    } else {
+                        zrange_by_rank(scores, &min_arg, &max_arg, rev, withscores)
+                    }
                 }
                 _ => {
                     // Listpack fallback: convert to sorted entries and apply range logic
                     let entries = zref.entries_sorted();
-                    zrange_from_entries(&entries, &min_arg, &max_arg, by_score, by_lex, rev, withscores, limit_offset, limit_count)
+                    zrange_from_entries(
+                        &entries,
+                        &min_arg,
+                        &max_arg,
+                        by_score,
+                        by_lex,
+                        rev,
+                        withscores,
+                        limit_offset,
+                        limit_count,
+                    )
                 }
             }
         }
@@ -1684,22 +1922,35 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZREVRANGE (read-only).
 pub fn zrevrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() < 3 { return err_wrong_args("ZREVRANGE"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZREVRANGE") };
-    let start_arg = match extract_bytes(&args[1]) { Some(b) => b.clone(), None => return err_wrong_args("ZREVRANGE") };
-    let stop_arg = match extract_bytes(&args[2]) { Some(b) => b.clone(), None => return err_wrong_args("ZREVRANGE") };
+    if args.len() < 3 {
+        return err_wrong_args("ZREVRANGE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZREVRANGE"),
+    };
+    let start_arg = match extract_bytes(&args[1]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZREVRANGE"),
+    };
+    let stop_arg = match extract_bytes(&args[2]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZREVRANGE"),
+    };
     let withscores = args.len() > 3
-        && extract_bytes(&args[3]).map(|b| b.eq_ignore_ascii_case(b"WITHSCORES")).unwrap_or(false);
+        && extract_bytes(&args[3])
+            .map(|b| b.eq_ignore_ascii_case(b"WITHSCORES"))
+            .unwrap_or(false);
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            match zref.bptree() {
-                Some(scores) => zrange_by_rank(scores, &start_arg, &stop_arg, true, withscores),
-                None => {
-                    let entries = zref.entries_sorted();
-                    zrange_from_entries(&entries, &start_arg, &stop_arg, false, false, true, withscores, None, None)
-                }
+        Ok(Some(zref)) => match zref.bptree() {
+            Some(scores) => zrange_by_rank(scores, &start_arg, &stop_arg, true, withscores),
+            None => {
+                let entries = zref.entries_sorted();
+                zrange_from_entries(
+                    &entries, &start_arg, &stop_arg, false, false, true, withscores, None, None,
+                )
             }
-        }
+        },
         Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
@@ -1707,38 +1958,86 @@ pub fn zrevrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZRANGEBYSCORE (read-only).
 pub fn zrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() < 3 { return err_wrong_args("ZRANGEBYSCORE"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZRANGEBYSCORE") };
-    let min_arg = match extract_bytes(&args[1]) { Some(b) => b.clone(), None => return err_wrong_args("ZRANGEBYSCORE") };
-    let max_arg = match extract_bytes(&args[2]) { Some(b) => b.clone(), None => return err_wrong_args("ZRANGEBYSCORE") };
+    if args.len() < 3 {
+        return err_wrong_args("ZRANGEBYSCORE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZRANGEBYSCORE"),
+    };
+    let min_arg = match extract_bytes(&args[1]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZRANGEBYSCORE"),
+    };
+    let max_arg = match extract_bytes(&args[2]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZRANGEBYSCORE"),
+    };
     let mut withscores = false;
     let mut limit_offset: Option<i64> = None;
     let mut limit_count: Option<i64> = None;
     let mut i = 3;
     while i < args.len() {
-        let opt = match extract_bytes(&args[i]) { Some(b) => b.as_ref(), None => { i += 1; continue; } };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) { Some(b) => b, None => return err_wrong_args("ZRANGEBYSCORE") };
-                let cnt_b = match extract_bytes(&args[i + 2]) { Some(b) => b, None => return err_wrong_args("ZRANGEBYSCORE") };
+                let off_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGEBYSCORE"),
+                };
+                let cnt_b = match extract_bytes(&args[i + 2]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZRANGEBYSCORE"),
+                };
                 limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
                 limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() { return err("ERR value is not an integer or out of range"); }
+                if limit_offset.is_none() || limit_count.is_none() {
+                    return err("ERR value is not an integer or out of range");
+                }
                 i += 3;
-            } else { return err_wrong_args("ZRANGEBYSCORE"); }
-        } else { i += 1; }
+            } else {
+                return err_wrong_args("ZRANGEBYSCORE");
+            }
+        } else {
+            i += 1;
+        }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            match (zref.members_map(), zref.bptree()) {
-                (Some(members), Some(scores)) => zrange_by_score(members, scores, &min_arg, &max_arg, false, withscores, limit_offset, limit_count),
-                _ => {
-                    let entries = zref.entries_sorted();
-                    zrange_from_entries(&entries, &min_arg, &max_arg, true, false, false, withscores, limit_offset, limit_count)
-                }
+        Ok(Some(zref)) => match (zref.members_map(), zref.bptree()) {
+            (Some(members), Some(scores)) => zrange_by_score(
+                members,
+                scores,
+                &min_arg,
+                &max_arg,
+                false,
+                withscores,
+                limit_offset,
+                limit_count,
+            ),
+            _ => {
+                let entries = zref.entries_sorted();
+                zrange_from_entries(
+                    &entries,
+                    &min_arg,
+                    &max_arg,
+                    true,
+                    false,
+                    false,
+                    withscores,
+                    limit_offset,
+                    limit_count,
+                )
             }
-        }
+        },
         Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
@@ -1746,38 +2045,86 @@ pub fn zrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fra
 
 /// ZREVRANGEBYSCORE (read-only).
 pub fn zrevrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() < 3 { return err_wrong_args("ZREVRANGEBYSCORE"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZREVRANGEBYSCORE") };
-    let max_arg = match extract_bytes(&args[1]) { Some(b) => b.clone(), None => return err_wrong_args("ZREVRANGEBYSCORE") };
-    let min_arg = match extract_bytes(&args[2]) { Some(b) => b.clone(), None => return err_wrong_args("ZREVRANGEBYSCORE") };
+    if args.len() < 3 {
+        return err_wrong_args("ZREVRANGEBYSCORE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZREVRANGEBYSCORE"),
+    };
+    let max_arg = match extract_bytes(&args[1]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZREVRANGEBYSCORE"),
+    };
+    let min_arg = match extract_bytes(&args[2]) {
+        Some(b) => b.clone(),
+        None => return err_wrong_args("ZREVRANGEBYSCORE"),
+    };
     let mut withscores = false;
     let mut limit_offset: Option<i64> = None;
     let mut limit_count: Option<i64> = None;
     let mut i = 3;
     while i < args.len() {
-        let opt = match extract_bytes(&args[i]) { Some(b) => b.as_ref(), None => { i += 1; continue; } };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") { withscores = true; i += 1; }
-        else if opt.eq_ignore_ascii_case(b"LIMIT") {
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) { Some(b) => b, None => return err_wrong_args("ZREVRANGEBYSCORE") };
-                let cnt_b = match extract_bytes(&args[i + 2]) { Some(b) => b, None => return err_wrong_args("ZREVRANGEBYSCORE") };
+                let off_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZREVRANGEBYSCORE"),
+                };
+                let cnt_b = match extract_bytes(&args[i + 2]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZREVRANGEBYSCORE"),
+                };
                 limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
                 limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() { return err("ERR value is not an integer or out of range"); }
+                if limit_offset.is_none() || limit_count.is_none() {
+                    return err("ERR value is not an integer or out of range");
+                }
                 i += 3;
-            } else { return err_wrong_args("ZREVRANGEBYSCORE"); }
-        } else { i += 1; }
+            } else {
+                return err_wrong_args("ZREVRANGEBYSCORE");
+            }
+        } else {
+            i += 1;
+        }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            match (zref.members_map(), zref.bptree()) {
-                (Some(members), Some(scores)) => zrange_by_score(members, scores, &min_arg, &max_arg, true, withscores, limit_offset, limit_count),
-                _ => {
-                    let entries = zref.entries_sorted();
-                    zrange_from_entries(&entries, &min_arg, &max_arg, true, false, true, withscores, limit_offset, limit_count)
-                }
+        Ok(Some(zref)) => match (zref.members_map(), zref.bptree()) {
+            (Some(members), Some(scores)) => zrange_by_score(
+                members,
+                scores,
+                &min_arg,
+                &max_arg,
+                true,
+                withscores,
+                limit_offset,
+                limit_count,
+            ),
+            _ => {
+                let entries = zref.entries_sorted();
+                zrange_from_entries(
+                    &entries,
+                    &min_arg,
+                    &max_arg,
+                    true,
+                    false,
+                    true,
+                    withscores,
+                    limit_offset,
+                    limit_count,
+                )
             }
-        }
+        },
         Ok(None) => Frame::Array(framevec![]),
         Err(e) => e,
     }
@@ -1785,28 +2132,51 @@ pub fn zrevrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> 
 
 /// ZCOUNT (read-only).
 pub fn zcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 3 { return err_wrong_args("ZCOUNT"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZCOUNT") };
-    let min_bytes = match extract_bytes(&args[1]) { Some(b) => b, None => return err_wrong_args("ZCOUNT") };
-    let max_bytes = match extract_bytes(&args[2]) { Some(b) => b, None => return err_wrong_args("ZCOUNT") };
-    let min_bound = match parse_score_bound(min_bytes) { Ok(b) => b, Err(e) => return e };
-    let max_bound = match parse_score_bound(max_bytes) { Ok(b) => b, Err(e) => return e };
+    if args.len() != 3 {
+        return err_wrong_args("ZCOUNT");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZCOUNT"),
+    };
+    let min_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZCOUNT"),
+    };
+    let max_bytes = match extract_bytes(&args[2]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZCOUNT"),
+    };
+    let min_bound = match parse_score_bound(min_bytes) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let max_bound = match parse_score_bound(max_bytes) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            match zref.bptree() {
-                Some(scores) => {
-                    let range_min = OrderedFloat(min_bound.value());
-                    let range_max = OrderedFloat(max_bound.value());
-                    let count = scores.range(range_min, range_max).filter(|(score, _)| min_bound.includes(score.0) && max_bound.includes_upper(score.0)).count();
-                    Frame::Integer(count as i64)
-                }
-                None => {
-                    let entries = zref.entries_sorted();
-                    let count = entries.iter().filter(|(_, s)| min_bound.includes(*s) && max_bound.includes_upper(*s)).count();
-                    Frame::Integer(count as i64)
-                }
+        Ok(Some(zref)) => match zref.bptree() {
+            Some(scores) => {
+                let range_min = OrderedFloat(min_bound.value());
+                let range_max = OrderedFloat(max_bound.value());
+                let count = scores
+                    .range(range_min, range_max)
+                    .filter(|(score, _)| {
+                        min_bound.includes(score.0) && max_bound.includes_upper(score.0)
+                    })
+                    .count();
+                Frame::Integer(count as i64)
             }
-        }
+            None => {
+                let entries = zref.entries_sorted();
+                let count = entries
+                    .iter()
+                    .filter(|(_, s)| min_bound.includes(*s) && max_bound.includes_upper(*s))
+                    .count();
+                Frame::Integer(count as i64)
+            }
+        },
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -1814,26 +2184,47 @@ pub fn zcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZLEXCOUNT (read-only).
 pub fn zlexcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() != 3 { return err_wrong_args("ZLEXCOUNT"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZLEXCOUNT") };
-    let min_bytes = match extract_bytes(&args[1]) { Some(b) => b, None => return err_wrong_args("ZLEXCOUNT") };
-    let max_bytes = match extract_bytes(&args[2]) { Some(b) => b, None => return err_wrong_args("ZLEXCOUNT") };
-    let min_bound = match parse_lex_bound(min_bytes) { Ok(b) => b, Err(e) => return e };
-    let max_bound = match parse_lex_bound(max_bytes) { Ok(b) => b, Err(e) => return e };
+    if args.len() != 3 {
+        return err_wrong_args("ZLEXCOUNT");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZLEXCOUNT"),
+    };
+    let min_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZLEXCOUNT"),
+    };
+    let max_bytes = match extract_bytes(&args[2]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZLEXCOUNT"),
+    };
+    let min_bound = match parse_lex_bound(min_bytes) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let max_bound = match parse_lex_bound(max_bytes) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            match zref.bptree() {
-                Some(scores) => {
-                    let count = scores.iter().filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound)).count();
-                    Frame::Integer(count as i64)
-                }
-                None => {
-                    let entries = zref.entries_sorted();
-                    let count = entries.iter().filter(|(member, _)| lex_in_range(member, &min_bound, &max_bound)).count();
-                    Frame::Integer(count as i64)
-                }
+        Ok(Some(zref)) => match zref.bptree() {
+            Some(scores) => {
+                let count = scores
+                    .iter()
+                    .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
+                    .count();
+                Frame::Integer(count as i64)
             }
-        }
+            None => {
+                let entries = zref.entries_sorted();
+                let count = entries
+                    .iter()
+                    .filter(|(member, _)| lex_in_range(member, &min_bound, &max_bound))
+                    .count();
+                Frame::Integer(count as i64)
+            }
+        },
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -1841,10 +2232,21 @@ pub fn zlexcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZSCAN (read-only).
 pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.len() < 2 { return err_wrong_args("ZSCAN"); }
-    let key = match extract_bytes(&args[0]) { Some(k) => k, None => return err_wrong_args("ZSCAN") };
-    let cursor_bytes = match extract_bytes(&args[1]) { Some(b) => b, None => return err_wrong_args("ZSCAN") };
-    let cursor: usize = match std::str::from_utf8(cursor_bytes).ok().and_then(|s| s.parse().ok()) {
+    if args.len() < 2 {
+        return err_wrong_args("ZSCAN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZSCAN"),
+    };
+    let cursor_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZSCAN"),
+    };
+    let cursor: usize = match std::str::from_utf8(cursor_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(c) => c,
         None => return err("ERR invalid cursor"),
     };
@@ -1852,22 +2254,40 @@ pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut scan_count: usize = 10;
     let mut i = 2;
     while i < args.len() {
-        let opt = match extract_bytes(&args[i]) { Some(b) => b.as_ref(), None => { i += 1; continue; } };
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
         if opt.eq_ignore_ascii_case(b"MATCH") {
             if i + 1 < args.len() {
                 pattern = extract_bytes(&args[i + 1]).map(|b| b.as_ref());
                 i += 2;
-            } else { return err_wrong_args("ZSCAN"); }
+            } else {
+                return err_wrong_args("ZSCAN");
+            }
         } else if opt.eq_ignore_ascii_case(b"COUNT") {
             if i + 1 < args.len() {
-                let count_b = match extract_bytes(&args[i + 1]) { Some(b) => b, None => return err_wrong_args("ZSCAN") };
-                scan_count = match std::str::from_utf8(count_b).ok().and_then(|s| s.parse().ok()) {
+                let count_b = match extract_bytes(&args[i + 1]) {
+                    Some(b) => b,
+                    None => return err_wrong_args("ZSCAN"),
+                };
+                scan_count = match std::str::from_utf8(count_b)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                {
                     Some(c) => c,
                     None => return err("ERR value is not an integer or out of range"),
                 };
                 i += 2;
-            } else { return err_wrong_args("ZSCAN"); }
-        } else { i += 1; }
+            } else {
+                return err_wrong_args("ZSCAN");
+            }
+        } else {
+            i += 1;
+        }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
@@ -1881,7 +2301,10 @@ pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             let mut returned = 0;
             while pos < all_members.len() && returned < scan_count {
                 let (ref member, score) = all_members[pos];
-                let matches = match pattern { Some(p) => glob_match(p, member), None => true };
+                let matches = match pattern {
+                    Some(p) => glob_match(p, member),
+                    None => true,
+                };
                 if matches {
                     result_items.push(Frame::BulkString(member.clone()));
                     result_items.push(Frame::BulkString(Bytes::from(format_score(score))));
@@ -1889,10 +2312,20 @@ pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 }
                 pos += 1;
             }
-            let next_cursor = if pos >= all_members.len() { Bytes::from_static(b"0") } else { Bytes::from(pos.to_string()) };
-            Frame::Array(framevec![Frame::BulkString(next_cursor), Frame::Array(result_items.into())])
+            let next_cursor = if pos >= all_members.len() {
+                Bytes::from_static(b"0")
+            } else {
+                Bytes::from(pos.to_string())
+            };
+            Frame::Array(framevec![
+                Frame::BulkString(next_cursor),
+                Frame::Array(result_items.into())
+            ])
         }
-        Ok(None) => Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"0")), Frame::Array(framevec![])]),
+        Ok(None) => Frame::Array(framevec![
+            Frame::BulkString(Bytes::from_static(b"0")),
+            Frame::Array(framevec![])
+        ]),
         Err(e) => e,
     }
 }
@@ -2388,7 +2821,11 @@ mod tests {
     #[test]
     fn test_zrange_byscore() {
         let mut db = Database::new();
-        setup_zset(&mut db, b"zs", &[(b"1", b"a"), (b"2", b"b"), (b"3", b"c"), (b"4", b"d")]);
+        setup_zset(
+            &mut db,
+            b"zs",
+            &[(b"1", b"a"), (b"2", b"b"), (b"3", b"c"), (b"4", b"d")],
+        );
 
         let result = run_zrange(&mut db, &[b"zs", b"2", b"3", b"BYSCORE"]);
         match result {
@@ -2494,7 +2931,11 @@ mod tests {
     #[test]
     fn test_zrangebyscore_limit() {
         let mut db = Database::new();
-        setup_zset(&mut db, b"zs", &[(b"1", b"a"), (b"2", b"b"), (b"3", b"c"), (b"4", b"d")]);
+        setup_zset(
+            &mut db,
+            b"zs",
+            &[(b"1", b"a"), (b"2", b"b"), (b"3", b"c"), (b"4", b"d")],
+        );
 
         let result = run_zrangebyscore(&mut db, &[b"zs", b"-inf", b"+inf", b"LIMIT", b"1", b"2"]);
         match result {
@@ -2534,16 +2975,28 @@ mod tests {
         let mut db = Database::new();
         setup_zset(&mut db, b"zs", &[(b"1", b"a"), (b"2", b"b"), (b"3", b"c")]);
 
-        assert_eq!(run_zcount(&mut db, &[b"zs", b"-inf", b"+inf"]), Frame::Integer(3));
+        assert_eq!(
+            run_zcount(&mut db, &[b"zs", b"-inf", b"+inf"]),
+            Frame::Integer(3)
+        );
         assert_eq!(run_zcount(&mut db, &[b"zs", b"1", b"2"]), Frame::Integer(2));
-        assert_eq!(run_zcount(&mut db, &[b"zs", b"(1", b"3"]), Frame::Integer(2));
-        assert_eq!(run_zcount(&mut db, &[b"zs", b"(1", b"(3"]), Frame::Integer(1));
+        assert_eq!(
+            run_zcount(&mut db, &[b"zs", b"(1", b"3"]),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            run_zcount(&mut db, &[b"zs", b"(1", b"(3"]),
+            Frame::Integer(1)
+        );
     }
 
     #[test]
     fn test_zcount_empty() {
         let mut db = Database::new();
-        assert_eq!(run_zcount(&mut db, &[b"zs", b"-inf", b"+inf"]), Frame::Integer(0));
+        assert_eq!(
+            run_zcount(&mut db, &[b"zs", b"-inf", b"+inf"]),
+            Frame::Integer(0)
+        );
     }
 
     // ---- ZLEXCOUNT tests ----
@@ -2552,11 +3005,24 @@ mod tests {
     fn test_zlexcount() {
         let mut db = Database::new();
         // All same score for lex operations
-        setup_zset(&mut db, b"zs", &[(b"0", b"a"), (b"0", b"b"), (b"0", b"c"), (b"0", b"d")]);
+        setup_zset(
+            &mut db,
+            b"zs",
+            &[(b"0", b"a"), (b"0", b"b"), (b"0", b"c"), (b"0", b"d")],
+        );
 
-        assert_eq!(run_zlexcount(&mut db, &[b"zs", b"-", b"+"]), Frame::Integer(4));
-        assert_eq!(run_zlexcount(&mut db, &[b"zs", b"[b", b"[c"]), Frame::Integer(2));
-        assert_eq!(run_zlexcount(&mut db, &[b"zs", b"(a", b"[c"]), Frame::Integer(2));
+        assert_eq!(
+            run_zlexcount(&mut db, &[b"zs", b"-", b"+"]),
+            Frame::Integer(4)
+        );
+        assert_eq!(
+            run_zlexcount(&mut db, &[b"zs", b"[b", b"[c"]),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            run_zlexcount(&mut db, &[b"zs", b"(a", b"[c"]),
+            Frame::Integer(2)
+        );
     }
 
     // ---- ZUNIONSTORE tests ----
@@ -2581,7 +3047,10 @@ mod tests {
         setup_zset(&mut db, b"z1", &[(b"1", b"a")]);
         setup_zset(&mut db, b"z2", &[(b"2", b"a")]);
 
-        run_zunionstore(&mut db, &[b"out", b"2", b"z1", b"z2", b"WEIGHTS", b"2", b"3"]);
+        run_zunionstore(
+            &mut db,
+            &[b"out", b"2", b"z1", b"z2", b"WEIGHTS", b"2", b"3"],
+        );
         // a = 1*2 + 2*3 = 8
         let score = run_zscore(&mut db, &[b"out", b"a"]);
         assert_eq!(score, Frame::BulkString(Bytes::from("8")));
@@ -2630,7 +3099,10 @@ mod tests {
         setup_zset(&mut db, b"z1", &[(b"1", b"a")]);
         setup_zset(&mut db, b"z2", &[(b"2", b"a")]);
 
-        run_zinterstore(&mut db, &[b"out", b"2", b"z1", b"z2", b"WEIGHTS", b"2", b"3"]);
+        run_zinterstore(
+            &mut db,
+            &[b"out", b"2", b"z1", b"z2", b"WEIGHTS", b"2", b"3"],
+        );
         // a = 1*2 + 2*3 = 8
         let score = run_zscore(&mut db, &[b"out", b"a"]);
         assert_eq!(score, Frame::BulkString(Bytes::from("8")));

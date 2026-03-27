@@ -167,7 +167,10 @@ impl CompactValue {
 
         let boxed = Box::new(value);
         let raw_ptr = Box::into_raw(boxed) as usize;
-        debug_assert!(raw_ptr & HEAP_TAG_MASK == 0, "Box pointer insufficiently aligned");
+        debug_assert!(
+            raw_ptr & HEAP_TAG_MASK == 0,
+            "Box pointer insufficiently aligned"
+        );
         let tagged_ptr = raw_ptr | heap_tag;
 
         let mut payload = [0u8; 12];
@@ -193,7 +196,10 @@ impl CompactValue {
 
         let hs = Box::new(HeapString(data.to_vec()));
         let raw_ptr = Box::into_raw(hs) as usize;
-        debug_assert!(raw_ptr & HEAP_TAG_MASK == 0, "HeapString pointer insufficiently aligned");
+        debug_assert!(
+            raw_ptr & HEAP_TAG_MASK == 0,
+            "HeapString pointer insufficiently aligned"
+        );
         let tagged_ptr = raw_ptr | HEAP_TAG_STRING;
 
         let mut payload = [0u8; 12];
@@ -410,10 +416,14 @@ impl Drop for CompactValue {
         if !self.is_inline() {
             if self.heap_type_tag() == HEAP_TAG_STRING {
                 // SAFETY: heap strings are Box<HeapString>
-                unsafe { drop(Box::from_raw(self.heap_string_ptr())); }
+                unsafe {
+                    drop(Box::from_raw(self.heap_string_ptr()));
+                }
             } else {
                 // SAFETY: collections are Box<RedisValue>
-                unsafe { drop(Box::from_raw(self.heap_collection_ptr())); }
+                unsafe {
+                    drop(Box::from_raw(self.heap_collection_ptr()));
+                }
             }
         }
     }
@@ -441,7 +451,11 @@ impl fmt::Debug for CompactValue {
         if self.is_inline() {
             let len = self.inline_len();
             let data = &self.payload[..len];
-            write!(f, "CompactValue::Inline({:?})", String::from_utf8_lossy(data))
+            write!(
+                f,
+                "CompactValue::Inline({:?})",
+                String::from_utf8_lossy(data)
+            )
         } else {
             write!(f, "CompactValue::Heap({})", self.type_name())
         }

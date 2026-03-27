@@ -1,8 +1,8 @@
 pub mod invalidation;
 
+use crate::runtime::channel;
 use bytes::Bytes;
 use std::collections::HashMap;
-use crate::runtime::channel;
 
 use crate::protocol::Frame;
 
@@ -103,7 +103,11 @@ impl TrackingTable {
     /// Invalidate a key: collect all clients that tracked this key (normal mode)
     /// and all BCAST clients whose prefixes match. Returns list of channels to notify.
     /// Removes the key from the tracking table after collection.
-    pub fn invalidate_key(&mut self, key: &Bytes, writer_client_id: u64) -> Vec<channel::MpscSender<Frame>> {
+    pub fn invalidate_key(
+        &mut self,
+        key: &Bytes,
+        writer_client_id: u64,
+    ) -> Vec<channel::MpscSender<Frame>> {
         let mut to_notify: Vec<channel::MpscSender<Frame>> = Vec::new();
 
         // Normal mode: check key_clients

@@ -10,7 +10,7 @@ use std::cell::Cell;
 
 use mlua::prelude::*;
 
-use crate::command::{dispatch, DispatchResult};
+use crate::command::{DispatchResult, dispatch};
 use crate::protocol::Frame;
 
 thread_local! {
@@ -66,7 +66,7 @@ pub fn make_redis_call_fn(lua: &Lua, propagate_errors: bool) -> mlua::Result<Lua
             _ => {
                 return Err(mlua::Error::RuntimeError(
                     "ERR Invalid command name".to_string(),
-                ))
+                ));
             }
         };
 

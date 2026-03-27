@@ -8,7 +8,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
-use super::traits::{FileIo, FileSync, RuntimeFactory, RuntimeInterval, RuntimeSpawn, RuntimeTimer};
+use super::traits::{
+    FileIo, FileSync, RuntimeFactory, RuntimeInterval, RuntimeSpawn, RuntimeTimer,
+};
 
 /// Tokio-based timer implementation.
 pub struct TokioTimer;

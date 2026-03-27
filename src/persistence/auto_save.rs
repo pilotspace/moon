@@ -1,13 +1,13 @@
 //! Auto-save timer: triggers BGSAVE based on configured rules (N changes in M seconds).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
-use crate::command::persistence::{bgsave_start, SAVE_IN_PROGRESS, SNAPSHOT_EPOCH};
+use crate::command::persistence::{SAVE_IN_PROGRESS, SNAPSHOT_EPOCH, bgsave_start};
 use crate::storage::Database;
 
 /// Type alias for the per-database RwLock container.
@@ -89,9 +89,9 @@ pub async fn run_auto_save(
             sleep.await;
             let elapsed = last_save.elapsed().as_secs();
             let changes = change_counter.load(Ordering::Relaxed);
-            let should_save = rules.iter().any(|&(secs, threshold)| {
-                elapsed >= secs && changes >= threshold
-            });
+            let should_save = rules
+                .iter()
+                .any(|&(secs, threshold)| elapsed >= secs && changes >= threshold);
             if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
                 info!("Auto-save triggered: {} changes in {}s", changes, elapsed);
                 let _ = bgsave_start(db.clone(), dir.clone(), dbfilename.clone());
@@ -154,12 +154,15 @@ pub async fn run_auto_save_sharded(
             sleep.await;
             let elapsed = last_save.elapsed().as_secs();
             let changes = change_counter.load(Ordering::Relaxed);
-            let should_save = rules.iter().any(|&(secs, threshold)| {
-                elapsed >= secs && changes >= threshold
-            });
+            let should_save = rules
+                .iter()
+                .any(|&(secs, threshold)| elapsed >= secs && changes >= threshold);
             if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
                 let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-                info!("Auto-save triggered: {} changes in {}s, epoch {}", changes, elapsed, epoch);
+                info!(
+                    "Auto-save triggered: {} changes in {}s, epoch {}",
+                    changes, elapsed, epoch
+                );
                 let _ = snapshot_trigger.send(epoch);
                 change_counter.store(0, Ordering::Relaxed);
                 last_save = Instant::now();

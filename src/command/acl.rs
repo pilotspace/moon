@@ -2,11 +2,11 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
-use crate::acl::{AclLog, AclLogEntry, AclTable, CommandPermissions};
 use crate::acl::rules::get_category_commands;
+use crate::acl::{AclLog, AclLogEntry, AclTable, CommandPermissions};
 use crate::config::RuntimeConfig;
-use crate::protocol::Frame;
 use crate::framevec;
+use crate::protocol::Frame;
 fn extract_str(frame: &Frame) -> Option<&str> {
     match frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => std::str::from_utf8(b).ok(),
@@ -33,7 +33,7 @@ pub fn handle_acl(
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR wrong number of arguments for 'ACL' command",
-            ))
+            ));
         }
     };
     let args = if sub_and_args.len() > 1 {
@@ -64,7 +64,7 @@ pub fn handle_acl(
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR wrong number of arguments for 'ACL|GETUSER' command",
-                    ))
+                    ));
                 }
             };
             let table = acl_table.read().unwrap();
@@ -148,7 +148,7 @@ pub fn handle_acl(
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR wrong number of arguments for 'ACL|SETUSER' command",
-                    ))
+                    ));
                 }
             };
             let rules: Vec<&str> = args[1..].iter().filter_map(|f| extract_str(f)).collect();
@@ -286,9 +286,7 @@ pub fn handle_acl(
                         .and_then(|_| std::fs::rename(&tmp, &path))
                     {
                         Ok(_) => Frame::SimpleString(Bytes::from_static(b"OK")),
-                        Err(e) => {
-                            Frame::Error(Bytes::from(format!("ERR ACL save failed: {}", e)))
-                        }
+                        Err(e) => Frame::Error(Bytes::from(format!("ERR ACL save failed: {}", e))),
                     }
                 }
             }
@@ -299,15 +297,11 @@ pub fn handle_acl(
             match aclfile {
                 None => Frame::Error(Bytes::from_static(b"ERR ACL file not configured")),
                 Some(path) => match std::fs::read_to_string(&path) {
-                    Err(e) => {
-                        Frame::Error(Bytes::from(format!("ERR ACL load failed: {}", e)))
-                    }
+                    Err(e) => Frame::Error(Bytes::from(format!("ERR ACL load failed: {}", e))),
                     Ok(content) => {
                         let mut new_table = AclTable::new_empty();
                         for line in content.lines() {
-                            if let Some(user) =
-                                crate::acl::io::parse_acl_line(line)
-                            {
+                            if let Some(user) = crate::acl::io::parse_acl_line(line) {
                                 new_table.set_user(user.username.clone(), user);
                             }
                         }
@@ -365,10 +359,7 @@ mod tests {
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"WHOAMI"))];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
-        assert_eq!(
-            result,
-            Frame::BulkString(Bytes::from_static(b"default"))
-        );
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"default")));
     }
 
     #[test]
@@ -387,10 +378,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"+@all")),
         ];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
-        assert_eq!(
-            result,
-            Frame::SimpleString(Bytes::from_static(b"OK"))
-        );
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // GETUSER alice
         let args = vec![
@@ -406,10 +394,7 @@ mod tests {
                     fields[0],
                     Frame::BulkString(Bytes::from_static(b"username"))
                 );
-                assert_eq!(
-                    fields[1],
-                    Frame::BulkString(Bytes::from_static(b"alice"))
-                );
+                assert_eq!(fields[1], Frame::BulkString(Bytes::from_static(b"alice")));
             }
             _ => panic!("Expected Array from GETUSER, got {:?}", result),
         }
@@ -557,10 +542,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"RESET")),
         ];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
-        assert_eq!(
-            result,
-            Frame::SimpleString(Bytes::from_static(b"OK"))
-        );
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify log is empty
         let args = vec![Frame::BulkString(Bytes::from_static(b"LOG"))];
@@ -647,10 +629,7 @@ mod tests {
         // SAVE
         let args = vec![Frame::BulkString(Bytes::from_static(b"SAVE"))];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
-        assert_eq!(
-            result,
-            Frame::SimpleString(Bytes::from_static(b"OK"))
-        );
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify file exists
         assert!(aclfile.exists());
@@ -658,10 +637,7 @@ mod tests {
         // LOAD into a fresh table
         let args = vec![Frame::BulkString(Bytes::from_static(b"LOAD"))];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
-        assert_eq!(
-            result,
-            Frame::SimpleString(Bytes::from_static(b"OK"))
-        );
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify alice still exists after load
         let loaded_table = table.read().unwrap();

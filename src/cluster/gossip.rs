@@ -9,13 +9,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::runtime::cancel::CancellationToken;
+#[cfg(feature = "runtime-monoio")]
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
-#[cfg(feature = "runtime-monoio")]
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use crate::runtime::cancel::CancellationToken;
 use tracing::warn;
 
 use crate::cluster::bus::SharedVoteTx;
@@ -277,22 +277,19 @@ pub fn merge_gossip_into_state(state: &mut ClusterState, msg: &GossipMessage) {
     }
 
     // Update or insert sender node
-    let entry = state
-        .nodes
-        .entry(node_id_str.clone())
-        .or_insert_with(|| {
-            let ip_str = std::str::from_utf8(&msg.sender_ip)
-                .unwrap_or("127.0.0.1")
-                .trim_end_matches('\0');
-            let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-            let addr = SocketAddr::new(ip, msg.sender_port);
-            ClusterNode::new(
-                node_id_str.clone(),
-                addr,
-                NodeFlags::Master,
-                msg.config_epoch,
-            )
-        });
+    let entry = state.nodes.entry(node_id_str.clone()).or_insert_with(|| {
+        let ip_str = std::str::from_utf8(&msg.sender_ip)
+            .unwrap_or("127.0.0.1")
+            .trim_end_matches('\0');
+        let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let addr = SocketAddr::new(ip, msg.sender_port);
+        ClusterNode::new(
+            node_id_str.clone(),
+            addr,
+            NodeFlags::Master,
+            msg.config_epoch,
+        )
+    });
     entry.pong_recv_ms = now_ms();
     if msg.config_epoch > entry.epoch {
         entry.epoch = msg.config_epoch;

@@ -26,7 +26,7 @@ pub mod simd;
 use super::compact_key::CompactKey;
 
 use iter::{Iter, IterMut, Keys, Values};
-use segment::{h2, home_buckets, InsertResult, Segment};
+use segment::{InsertResult, Segment, h2, home_buckets};
 
 /// Compute the xxh64 hash of a byte slice.
 #[inline]
@@ -189,8 +189,7 @@ impl<V> DashTable<CompactKey, V> {
         if cap == 0 {
             return Self::new();
         }
-        let num_segments =
-            (cap + segment::LOAD_THRESHOLD - 1) / segment::LOAD_THRESHOLD;
+        let num_segments = (cap + segment::LOAD_THRESHOLD - 1) / segment::LOAD_THRESHOLD;
         let depth = if num_segments <= 1 {
             0
         } else {
@@ -292,7 +291,11 @@ impl<V> DashTable<CompactKey, V> {
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        match self.segments.get_mut(seg_idx).insert(h2_val, key, value, ba, bb) {
+        match self
+            .segments
+            .get_mut(seg_idx)
+            .insert(h2_val, key, value, ba, bb)
+        {
             InsertResult::Inserted => {
                 self.len += 1;
                 None
@@ -320,7 +323,8 @@ impl<V> DashTable<CompactKey, V> {
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        self.segments.get_mut(seg_idx)
+        self.segments
+            .get_mut(seg_idx)
             .remove(h2_val, key, ba, bb)
             .map(|(_k, v)| {
                 self.len -= 1;
@@ -341,7 +345,8 @@ impl<V> DashTable<CompactKey, V> {
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        self.segments.get_mut(seg_idx)
+        self.segments
+            .get_mut(seg_idx)
             .remove(h2_val, key, ba, bb)
             .map(|(k, v)| {
                 self.len -= 1;
@@ -429,8 +434,8 @@ impl<'a, V> IntoIterator for &'a DashTable<CompactKey, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::segment::TOTAL_SLOTS;
+    use super::*;
 
     fn test_value(n: u32) -> String {
         format!("value_{}", n)
@@ -720,7 +725,11 @@ mod tests {
         }
 
         let occupied: Vec<_> = seg.iter_occupied().collect();
-        assert_eq!(occupied.len(), 5, "iter_occupied should yield exactly 5 pairs");
+        assert_eq!(
+            occupied.len(),
+            5,
+            "iter_occupied should yield exactly 5 pairs"
+        );
 
         // Verify all keys are present
         let keys: Vec<String> = occupied

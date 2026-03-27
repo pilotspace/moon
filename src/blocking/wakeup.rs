@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
 use crate::blocking::{BlockedCommand, BlockingRegistry, Direction};
+use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::framevec;
 /// Called after LPUSH/RPUSH successfully adds elements to a list key.
 /// Pops the first waiter (FIFO) and executes the appropriate pop operation.
 /// Returns true if a blocked client was woken (element was consumed by the waiter).
@@ -155,19 +155,24 @@ pub fn try_wake_stream_waiter(
         let result = match &waiter.cmd {
             BlockedCommand::XRead { streams, count } => {
                 // Find this key's last_seen_id in the streams list
-                let last_seen = streams.iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, id)| *id);
+                let last_seen = streams.iter().find(|(k, _)| k == key).map(|(_, id)| *id);
                 if let Some(last_id) = last_seen {
                     if let Ok(Some(stream)) = db.get_stream(key) {
                         let start = if last_id.seq == u64::MAX {
-                            StreamId { ms: last_id.ms.saturating_add(1), seq: 0 }
+                            StreamId {
+                                ms: last_id.ms.saturating_add(1),
+                                seq: 0,
+                            }
                         } else {
-                            StreamId { ms: last_id.ms, seq: last_id.seq.saturating_add(1) }
+                            StreamId {
+                                ms: last_id.ms,
+                                seq: last_id.seq.saturating_add(1),
+                            }
                         };
                         let entries = stream.range(start, StreamId::MAX, *count);
                         if !entries.is_empty() {
-                            let entry_frames: Vec<crate::protocol::Frame> = entries.iter()
+                            let entry_frames: Vec<crate::protocol::Frame> = entries
+                                .iter()
                                 .map(|(id, fields)| format_entry(*id, fields))
                                 .collect();
                             Some(crate::protocol::Frame::Array(framevec![
@@ -176,15 +181,28 @@ pub fn try_wake_stream_waiter(
                                     crate::protocol::Frame::Array(entry_frames.into()),
                                 ])
                             ]))
-                        } else { None }
-                    } else { None }
-                } else { None }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
-            BlockedCommand::XReadGroup { group, consumer, count, noack, .. } => {
+            BlockedCommand::XReadGroup {
+                group,
+                consumer,
+                count,
+                noack,
+                ..
+            } => {
                 if let Ok(Some(stream)) = db.get_stream_mut(key) {
                     match stream.read_group_new(group, consumer, *count, *noack) {
                         Ok(entries) if !entries.is_empty() => {
-                            let entry_frames: Vec<crate::protocol::Frame> = entries.iter()
+                            let entry_frames: Vec<crate::protocol::Frame> = entries
+                                .iter()
                                 .map(|(id, fields)| format_entry(*id, fields))
                                 .collect();
                             Some(crate::protocol::Frame::Array(framevec![
@@ -196,7 +214,9 @@ pub fn try_wake_stream_waiter(
                         }
                         _ => None,
                     }
-                } else { None }
+                } else {
+                    None
+                }
             }
             _ => None, // List/zset commands don't watch stream keys
         };

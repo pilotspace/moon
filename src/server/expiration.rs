@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::seq::IndexedRandom;
 use crate::runtime::cancel::CancellationToken;
+use rand::seq::IndexedRandom;
 #[cfg(feature = "runtime-tokio")]
 use tracing::info;
 
@@ -19,10 +19,7 @@ type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 /// Every 100ms, iterates all databases and runs a probabilistic expiration
 /// cycle on each. Shuts down gracefully when the cancellation token fires.
 #[cfg(feature = "runtime-tokio")]
-pub async fn run_active_expiration(
-    db: SharedDatabases,
-    shutdown: CancellationToken,
-) {
+pub async fn run_active_expiration(db: SharedDatabases, shutdown: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
@@ -66,7 +63,10 @@ fn expire_cycle(db: &mut Database) {
         }
 
         let sample_size = keys.len().min(20);
-        let sampled: Vec<_> = keys.choose_multiple(&mut rng, sample_size).cloned().collect();
+        let sampled: Vec<_> = keys
+            .choose_multiple(&mut rng, sample_size)
+            .cloned()
+            .collect();
 
         let mut expired_count = 0;
         for key in &sampled {
@@ -86,8 +86,8 @@ fn expire_cycle(db: &mut Database) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::entry::{Entry, current_time_ms};
     use bytes::Bytes;
-    use crate::storage::entry::{current_time_ms, Entry};
 
     #[test]
     fn test_expire_cycle_removes_expired_keys() {
@@ -98,14 +98,20 @@ mod tests {
         // Add 10 expired keys
         for i in 0..10 {
             let key = Bytes::from(format!("expired_{}", i));
-            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts));
+            db.set(
+                key,
+                Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms, base_ts),
+            );
         }
 
         // Add 5 non-expired keys
         let future_ms = current_time_ms() + 3_600_000;
         for i in 0..5 {
             let key = Bytes::from(format!("alive_{}", i));
-            db.set(key, Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms, base_ts));
+            db.set(
+                key,
+                Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms, base_ts),
+            );
         }
 
         // Add 3 keys without expiry
@@ -119,13 +125,21 @@ mod tests {
         // All expired keys should be removed
         for i in 0..10 {
             let key = format!("expired_{}", i);
-            assert!(!db.is_key_expired(key.as_bytes()), "Key {} should have been removed", key);
+            assert!(
+                !db.is_key_expired(key.as_bytes()),
+                "Key {} should have been removed",
+                key
+            );
         }
 
         // Non-expired keys should remain
         for i in 0..5 {
             let key = crate::storage::compact_key::CompactKey::from(format!("alive_{}", i));
-            assert!(db.keys_with_expiry().contains(&key), "Key alive_{} should still exist", i);
+            assert!(
+                db.keys_with_expiry().contains(&key),
+                "Key alive_{} should still exist",
+                i
+            );
         }
 
         // Keys without expiry should remain

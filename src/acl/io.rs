@@ -157,7 +157,10 @@ mod tests {
         assert_eq!(user.username, "alice");
         assert!(user.enabled);
         assert!(user.nopass);
-        assert!(matches!(user.allowed_commands, CommandPermissions::AllAllowed));
+        assert!(matches!(
+            user.allowed_commands,
+            CommandPermissions::AllAllowed
+        ));
     }
 
     #[test]
@@ -180,7 +183,10 @@ mod tests {
         assert_eq!(parsed.username, user.username);
         assert_eq!(parsed.enabled, user.enabled);
         assert_eq!(parsed.nopass, user.nopass);
-        assert!(matches!(parsed.allowed_commands, CommandPermissions::AllAllowed));
+        assert!(matches!(
+            parsed.allowed_commands,
+            CommandPermissions::AllAllowed
+        ));
     }
 
     #[test]

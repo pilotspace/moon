@@ -2,8 +2,8 @@ pub mod wakeup;
 
 use std::collections::{HashMap, VecDeque};
 
-use bytes::Bytes;
 use crate::protocol::Frame;
+use bytes::Bytes;
 
 /// Direction for LMOVE/BLMOVE pop/push operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,15 +146,14 @@ impl BlockingRegistry {
     /// Two-pass approach: first collect timed-out entries, then clean up.
     pub fn expire_timed_out(&mut self, now: std::time::Instant) {
         // Pass 1: collect timed-out (wait_id, reply_tx) pairs
-        let mut timed_out: Vec<(u64, crate::runtime::channel::OneshotSender<Option<Frame>>)> = Vec::new();
+        let mut timed_out: Vec<(u64, crate::runtime::channel::OneshotSender<Option<Frame>>)> =
+            Vec::new();
         let mut timed_out_ids: Vec<u64> = Vec::new();
 
         for queue in self.waiters.values_mut() {
             let mut i = 0;
             while i < queue.len() {
-                let is_expired = queue[i]
-                    .deadline
-                    .map_or(false, |d| d <= now);
+                let is_expired = queue[i].deadline.map_or(false, |d| d <= now);
                 if is_expired {
                     let entry = queue.remove(i).unwrap();
                     timed_out_ids.push(entry.wait_id);
@@ -221,21 +220,29 @@ mod tests {
 
         let id1 = reg.next_wait_id();
         let (tx1, _rx1) = crate::runtime::channel::oneshot();
-        reg.register(0, key.clone(), WaitEntry {
-            wait_id: id1,
-            cmd: BlockedCommand::BLPop,
-            reply_tx: tx1,
-            deadline: None,
-        });
+        reg.register(
+            0,
+            key.clone(),
+            WaitEntry {
+                wait_id: id1,
+                cmd: BlockedCommand::BLPop,
+                reply_tx: tx1,
+                deadline: None,
+            },
+        );
 
         let id2 = reg.next_wait_id();
         let (tx2, _rx2) = crate::runtime::channel::oneshot();
-        reg.register(0, key.clone(), WaitEntry {
-            wait_id: id2,
-            cmd: BlockedCommand::BRPop,
-            reply_tx: tx2,
-            deadline: None,
-        });
+        reg.register(
+            0,
+            key.clone(),
+            WaitEntry {
+                wait_id: id2,
+                cmd: BlockedCommand::BRPop,
+                reply_tx: tx2,
+                deadline: None,
+            },
+        );
 
         let first = reg.pop_front(0, &key).unwrap();
         assert_eq!(first.wait_id, id1);
@@ -251,19 +258,27 @@ mod tests {
         let key2 = Bytes::from_static(b"list2");
 
         let (tx1, _rx1) = crate::runtime::channel::oneshot();
-        reg.register(0, key1.clone(), WaitEntry {
-            wait_id: id,
-            cmd: BlockedCommand::BLPop,
-            reply_tx: tx1,
-            deadline: None,
-        });
+        reg.register(
+            0,
+            key1.clone(),
+            WaitEntry {
+                wait_id: id,
+                cmd: BlockedCommand::BLPop,
+                reply_tx: tx1,
+                deadline: None,
+            },
+        );
         let (tx2, _rx2) = crate::runtime::channel::oneshot();
-        reg.register(0, key2.clone(), WaitEntry {
-            wait_id: id,
-            cmd: BlockedCommand::BLPop,
-            reply_tx: tx2,
-            deadline: None,
-        });
+        reg.register(
+            0,
+            key2.clone(),
+            WaitEntry {
+                wait_id: id,
+                cmd: BlockedCommand::BLPop,
+                reply_tx: tx2,
+                deadline: None,
+            },
+        );
 
         assert!(reg.has_waiters(0, &key1));
         assert!(reg.has_waiters(0, &key2));

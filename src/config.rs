@@ -203,8 +203,7 @@ mod tests {
 
     #[test]
     fn test_requirepass() {
-        let config =
-            ServerConfig::parse_from(["rust-redis", "--requirepass", "mysecret"]);
+        let config = ServerConfig::parse_from(["rust-redis", "--requirepass", "mysecret"]);
         assert_eq!(config.requirepass, Some("mysecret".to_string()));
     }
 
@@ -229,12 +228,18 @@ mod tests {
     fn test_persistence_custom_values() {
         let config = ServerConfig::parse_from([
             "rust-redis",
-            "--dir", "/data",
-            "--dbfilename", "my.rdb",
-            "--appendonly", "yes",
-            "--appendfsync", "always",
-            "--save", "3600 1 300 100",
-            "--appendfilename", "my.aof",
+            "--dir",
+            "/data",
+            "--dbfilename",
+            "my.rdb",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--save",
+            "3600 1 300 100",
+            "--appendfilename",
+            "my.aof",
         ]);
         assert_eq!(config.dir, "/data");
         assert_eq!(config.dbfilename, "my.rdb");
@@ -256,9 +261,12 @@ mod tests {
     fn test_maxmemory_custom() {
         let config = ServerConfig::parse_from([
             "rust-redis",
-            "--maxmemory", "1048576",
-            "--maxmemory-policy", "allkeys-lru",
-            "--maxmemory-samples", "10",
+            "--maxmemory",
+            "1048576",
+            "--maxmemory-policy",
+            "allkeys-lru",
+            "--maxmemory-samples",
+            "10",
         ]);
         assert_eq!(config.maxmemory, 1048576);
         assert_eq!(config.maxmemory_policy, "allkeys-lru");
@@ -269,8 +277,10 @@ mod tests {
     fn test_to_runtime_config() {
         let config = ServerConfig::parse_from([
             "rust-redis",
-            "--maxmemory", "1024",
-            "--maxmemory-policy", "allkeys-lfu",
+            "--maxmemory",
+            "1024",
+            "--maxmemory-policy",
+            "allkeys-lfu",
         ]);
         let rt = config.to_runtime_config();
         assert_eq!(rt.maxmemory, 1024);

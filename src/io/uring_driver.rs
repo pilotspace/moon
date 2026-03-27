@@ -16,18 +16,18 @@ use std::collections::HashMap;
 use std::os::fd::RawFd;
 
 use bytes::BytesMut;
+use io_uring::IoUring;
 use io_uring::cqueue;
 use io_uring::opcode;
 use io_uring::squeue::Flags;
 use io_uring::types;
-use io_uring::IoUring;
 
 use super::buf_ring::{BufRingConfig, BufRingManager};
 use super::fd_table::FdTable;
 use super::static_responses;
 use super::{
-    decode_user_data, encode_user_data, EVENT_ACCEPT, EVENT_RECV, EVENT_SEND, EVENT_TIMEOUT,
-    EVENT_WAKEUP,
+    EVENT_ACCEPT, EVENT_RECV, EVENT_SEND, EVENT_TIMEOUT, EVENT_WAKEUP, decode_user_data,
+    encode_user_data,
 };
 
 /// Default ring size (SQ entries). CQ is 2x automatically.
@@ -321,16 +321,11 @@ impl UringDriver {
     }
 
     /// Submit multishot recv for a connection using the provided buffer ring.
-    fn submit_multishot_recv(
-        &mut self,
-        conn_id: u32,
-        fixed_fd_idx: u32,
-    ) -> std::io::Result<()> {
-        let entry =
-            opcode::RecvMulti::new(types::Fixed(fixed_fd_idx), self.buf_ring.group_id())
-                .build()
-                .user_data(encode_user_data(EVENT_RECV, conn_id, 0))
-                .flags(Flags::BUFFER_SELECT);
+    fn submit_multishot_recv(&mut self, conn_id: u32, fixed_fd_idx: u32) -> std::io::Result<()> {
+        let entry = opcode::RecvMulti::new(types::Fixed(fixed_fd_idx), self.buf_ring.group_id())
+            .build()
+            .user_data(encode_user_data(EVENT_RECV, conn_id, 0))
+            .flags(Flags::BUFFER_SELECT);
 
         unsafe {
             self.ring.submission().push(&entry).map_err(|_| {
@@ -361,13 +356,9 @@ impl UringDriver {
             std::io::Error::new(std::io::ErrorKind::NotFound, "connection not found")
         })?;
 
-        let entry = opcode::Writev::new(
-            types::Fixed(conn.fixed_fd_idx),
-            iovecs,
-            iovec_count,
-        )
-        .build()
-        .user_data(encode_user_data(EVENT_SEND, conn_id, 0));
+        let entry = opcode::Writev::new(types::Fixed(conn.fixed_fd_idx), iovecs, iovec_count)
+            .build()
+            .user_data(encode_user_data(EVENT_SEND, conn_id, 0));
 
         unsafe {
             self.ring.submission().push(&entry).map_err(|_| {
@@ -379,12 +370,7 @@ impl UringDriver {
     }
 
     /// Submit a single send with raw bytes.
-    pub fn submit_send(
-        &mut self,
-        conn_id: u32,
-        data: *const u8,
-        len: u32,
-    ) -> std::io::Result<()> {
+    pub fn submit_send(&mut self, conn_id: u32, data: *const u8, len: u32) -> std::io::Result<()> {
         let conn = self.connections.get(&conn_id).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "connection not found")
         })?;
@@ -422,14 +408,9 @@ impl UringDriver {
         })?;
 
         let ptr = self.send_buf_pool.buf_ptr(buf_idx);
-        let entry = opcode::WriteFixed::new(
-            types::Fixed(conn.fixed_fd_idx),
-            ptr,
-            len,
-            buf_idx,
-        )
-        .build()
-        .user_data(encode_user_data(EVENT_SEND, conn_id, buf_idx as u32));
+        let entry = opcode::WriteFixed::new(types::Fixed(conn.fixed_fd_idx), ptr, len, buf_idx)
+            .build()
+            .user_data(encode_user_data(EVENT_SEND, conn_id, buf_idx as u32));
 
         unsafe {
             self.ring.submission().push(&entry).map_err(|_| {
@@ -476,10 +457,7 @@ impl UringDriver {
 
         unsafe {
             self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "SQ full: cannot submit timeout",
-                )
+                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit timeout")
             })?;
         }
         self.pending_sqes += 1;
@@ -614,9 +592,9 @@ impl UringDriver {
     /// Close a connection: unregister FD, close socket, remove state.
     pub fn close_connection(&mut self, conn_id: u32) -> std::io::Result<()> {
         if let Some(conn) = self.connections.remove(&conn_id) {
-            let raw_fd =
-                self.fd_table
-                    .remove_and_register(conn.fixed_fd_idx, &self.ring)?;
+            let raw_fd = self
+                .fd_table
+                .remove_and_register(conn.fixed_fd_idx, &self.ring)?;
             unsafe {
                 libc::close(raw_fd);
             }

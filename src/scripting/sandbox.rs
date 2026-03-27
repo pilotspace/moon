@@ -1,5 +1,5 @@
-use mlua::prelude::*;
 use mlua::VmState;
+use mlua::prelude::*;
 use std::time::{Duration, Instant};
 
 /// Restrict the Lua VM to a safe sandbox.
@@ -172,10 +172,7 @@ mod tests {
         // string, math, table should be available
         let _: String = lua.load("return string.upper('hello')").eval().unwrap();
         let _: f64 = lua.load("return math.floor(3.5)").eval().unwrap();
-        let _: i64 = lua
-            .load("local t = {1,2,3}; return #t")
-            .eval()
-            .unwrap();
+        let _: i64 = lua.load("local t = {1,2,3}; return #t").eval().unwrap();
     }
 
     #[test]

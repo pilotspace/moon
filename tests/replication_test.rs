@@ -3,8 +3,8 @@
 //! Tests REPLICAOF, REPLCONF, INFO replication, READONLY enforcement,
 //! and REPLICAOF NO ONE promotion -- using real TCP connections.
 
-use tokio::net::TcpListener;
 use rust_redis::runtime::cancel::CancellationToken;
+use tokio::net::TcpListener;
 
 use rust_redis::config::ServerConfig;
 use rust_redis::server::listener;
@@ -62,10 +62,7 @@ async fn start_server() -> (u16, CancellationToken) {
 /// Create an async connection.
 async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client
-        .get_multiplexed_tokio_connection()
-        .await
-        .unwrap()
+    client.get_multiplexed_tokio_connection().await.unwrap()
 }
 
 #[tokio::test]

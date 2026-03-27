@@ -6,18 +6,18 @@
 
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "runtime-tokio")]
-use tokio::io::AsyncWriteExt;
-#[cfg(feature = "runtime-tokio")]
-use tokio::net::tcp::OwnedWriteHalf;
 #[cfg(feature = "runtime-monoio")]
 use std::cell::RefCell;
 #[cfg(feature = "runtime-monoio")]
 use std::rc::Rc;
+#[cfg(feature = "runtime-tokio")]
+use tokio::io::AsyncWriteExt;
+#[cfg(feature = "runtime-tokio")]
+use tokio::net::tcp::OwnedWriteHalf;
 use tracing::info;
 
 use crate::replication::backlog::ReplicationBacklog;
-use crate::replication::handshake::{evaluate_psync, PsyncDecision};
+use crate::replication::handshake::{PsyncDecision, evaluate_psync};
 use crate::replication::state::{ReplicaInfo, ReplicationState};
 
 /// Master-side PSYNC handler: evaluate the request, respond, and wire up replication.
@@ -79,7 +79,8 @@ pub async fn handle_psync_on_master(
                 .as_secs();
 
             let num_shards = shard_producers.len();
-            let mut snap_rxs: Vec<crate::runtime::channel::OneshotReceiver<Result<(), String>>> = Vec::new();
+            let mut snap_rxs: Vec<crate::runtime::channel::OneshotReceiver<Result<(), String>>> =
+                Vec::new();
 
             for (shard_id, prod) in shard_producers.iter_mut().enumerate() {
                 use ringbuf::traits::Producer;
@@ -112,17 +113,19 @@ pub async fn handle_psync_on_master(
             // module (from Plan 43-01) provides the conversion primitives when needed.
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                let data = tokio::fs::read(&snap_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read shard {} snapshot at {:?}: {}", shard_id, snap_path, e))?;
+                let data = tokio::fs::read(&snap_path).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read shard {} snapshot at {:?}: {}",
+                        shard_id,
+                        snap_path,
+                        e
+                    )
+                })?;
                 let header = format!("${}\r\n", data.len());
                 write_half.write_all(header.as_bytes()).await?;
                 write_half.write_all(&data).await?;
                 write_half.write_all(b"\r\n").await?;
-                info!(
-                    "Master: sent shard {} RDB ({} bytes)",
-                    shard_id,
-                    data.len()
-                );
+                info!("Master: sent shard {} RDB ({} bytes)", shard_id, data.len());
             }
 
             // Stream backlog bytes accumulated since snapshot_start_offset
@@ -272,8 +275,14 @@ pub async fn handle_psync_on_master(
             // send RRDSHARD format which our own replicas understand natively.
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                let file_data = std::fs::read(&snap_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read shard {} snapshot at {:?}: {}", shard_id, snap_path, e))?;
+                let file_data = std::fs::read(&snap_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read shard {} snapshot at {:?}: {}",
+                        shard_id,
+                        snap_path,
+                        e
+                    )
+                })?;
                 let header = format!("${}\r\n", file_data.len());
                 let (wr, _) = stream.write_all(header.into_bytes()).await;
                 wr.map_err(|e| anyhow::anyhow!(e))?;
@@ -367,8 +376,7 @@ async fn register_replica_with_shards(
     use ringbuf::traits::Producer;
     use std::sync::atomic::Ordering;
 
-    static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(1);
+    static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let replica_id = NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed);
 
     // Share the write_half across per-shard sender tasks
@@ -385,10 +393,7 @@ async fn register_replica_with_shards(
 
         // Send RegisterReplica to the shard's SPSC
         if let Some(prod) = shard_producers.get_mut(shard_id) {
-            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
-                replica_id,
-                tx,
-            };
+            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica { replica_id, tx };
             let _ = prod.try_push(msg);
         }
 
@@ -446,15 +451,13 @@ async fn register_replica_with_shards(
     use ringbuf::traits::Producer;
     use std::sync::atomic::Ordering;
 
-    static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(1);
+    static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let replica_id = NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed);
 
     // Share the stream across per-shard sender tasks.
     // monoio's write_all takes &mut self + owned buffer, so RefCell<TcpStream> suffices.
     // Single-threaded cooperative scheduling ensures no concurrent borrows.
-    let shared_stream: Rc<RefCell<monoio::net::TcpStream>> =
-        Rc::new(RefCell::new(stream));
+    let shared_stream: Rc<RefCell<monoio::net::TcpStream>> = Rc::new(RefCell::new(stream));
 
     let channel_capacity = 1024;
     let mut shard_txs = Vec::with_capacity(num_shards);
@@ -467,10 +470,7 @@ async fn register_replica_with_shards(
 
         // Send RegisterReplica to the shard's SPSC
         if let Some(prod) = shard_producers.get_mut(shard_id) {
-            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica {
-                replica_id,
-                tx,
-            };
+            let msg = crate::shard::dispatch::ShardMessage::RegisterReplica { replica_id, tx };
             let _ = prod.try_push(msg);
         }
 
@@ -528,8 +528,7 @@ pub async fn wait_for_replicas(
         rs.total_offset()
     };
 
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
 
     loop {
         let acked_count = {

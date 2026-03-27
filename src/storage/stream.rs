@@ -124,10 +124,7 @@ impl Stream {
     pub fn next_auto_id(&mut self) -> StreamId {
         let now_ms = current_time_ms();
         if now_ms > self.last_id.ms {
-            StreamId {
-                ms: now_ms,
-                seq: 0,
-            }
+            StreamId { ms: now_ms, seq: 0 }
         } else {
             StreamId {
                 ms: self.last_id.ms,
@@ -217,11 +214,7 @@ impl Stream {
     /// Trim by MINID -- remove entries with ID < minid.
     /// If approximate, may keep some entries below minid.
     pub fn trim_minid(&mut self, minid: StreamId, approximate: bool) -> u64 {
-        let to_remove: Vec<StreamId> = self
-            .entries
-            .range(..minid)
-            .map(|(&id, _)| id)
-            .collect();
+        let to_remove: Vec<StreamId> = self.entries.range(..minid).map(|(&id, _)| id).collect();
         if approximate && to_remove.len() <= 1 {
             return 0;
         }
@@ -248,15 +241,22 @@ impl Stream {
     // ---- Consumer group methods (Plan 02) ----
 
     /// Create a consumer group. Returns Err if group already exists.
-    pub fn create_group(&mut self, name: Bytes, last_delivered_id: StreamId) -> Result<(), &'static str> {
+    pub fn create_group(
+        &mut self,
+        name: Bytes,
+        last_delivered_id: StreamId,
+    ) -> Result<(), &'static str> {
         if self.groups.contains_key(&name) {
             return Err("BUSYGROUP Consumer Group name already exists");
         }
-        self.groups.insert(name, ConsumerGroup {
-            last_delivered_id,
-            pel: BTreeMap::new(),
-            consumers: HashMap::new(),
-        });
+        self.groups.insert(
+            name,
+            ConsumerGroup {
+                last_delivered_id,
+                pel: BTreeMap::new(),
+                consumers: HashMap::new(),
+            },
+        );
         Ok(())
     }
 
@@ -277,24 +277,39 @@ impl Stream {
     }
 
     /// Create a consumer in a group. Returns true if created, false if already exists.
-    pub fn create_consumer(&mut self, group_name: &[u8], consumer_name: Bytes) -> Result<bool, &'static str> {
-        let group = self.groups.get_mut(group_name)
+    pub fn create_consumer(
+        &mut self,
+        group_name: &[u8],
+        consumer_name: Bytes,
+    ) -> Result<bool, &'static str> {
+        let group = self
+            .groups
+            .get_mut(group_name)
             .ok_or("NOGROUP No such consumer group for key name")?;
         if group.consumers.contains_key(&consumer_name) {
             Ok(false)
         } else {
-            group.consumers.insert(consumer_name.clone(), Consumer {
-                name: consumer_name,
-                pending: BTreeMap::new(),
-                seen_time: current_time_ms(),
-            });
+            group.consumers.insert(
+                consumer_name.clone(),
+                Consumer {
+                    name: consumer_name,
+                    pending: BTreeMap::new(),
+                    seen_time: current_time_ms(),
+                },
+            );
             Ok(true)
         }
     }
 
     /// Delete a consumer from a group. Returns the number of pending entries that were dropped.
-    pub fn delete_consumer(&mut self, group_name: &[u8], consumer_name: &[u8]) -> Result<u64, &'static str> {
-        let group = self.groups.get_mut(group_name)
+    pub fn delete_consumer(
+        &mut self,
+        group_name: &[u8],
+        consumer_name: &[u8],
+    ) -> Result<u64, &'static str> {
+        let group = self
+            .groups
+            .get_mut(group_name)
             .ok_or("NOGROUP No such consumer group for key name")?;
         match group.consumers.remove(consumer_name) {
             Some(consumer) => {
@@ -312,11 +327,14 @@ impl Stream {
     /// Ensure a consumer exists in a group, auto-creating if needed.
     fn ensure_consumer(group: &mut ConsumerGroup, consumer_name: &Bytes) {
         if !group.consumers.contains_key(consumer_name) {
-            group.consumers.insert(consumer_name.clone(), Consumer {
-                name: consumer_name.clone(),
-                pending: BTreeMap::new(),
-                seen_time: current_time_ms(),
-            });
+            group.consumers.insert(
+                consumer_name.clone(),
+                Consumer {
+                    name: consumer_name.clone(),
+                    pending: BTreeMap::new(),
+                    seen_time: current_time_ms(),
+                },
+            );
         } else {
             group.consumers.get_mut(consumer_name).unwrap().seen_time = current_time_ms();
         }
@@ -325,19 +343,34 @@ impl Stream {
     /// Read new entries for a consumer group (> semantics).
     /// Auto-creates consumer. Adds entries to PEL. Updates last_delivered_id.
     pub fn read_group_new(
-        &mut self, group_name: &Bytes, consumer_name: &Bytes, count: Option<usize>, noack: bool,
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        count: Option<usize>,
+        noack: bool,
     ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
-        let group = self.groups.get_mut(group_name.as_ref())
+        let group = self
+            .groups
+            .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
         Self::ensure_consumer(group, consumer_name);
 
         let start = StreamId {
             ms: group.last_delivered_id.ms,
-            seq: if group.last_delivered_id == StreamId::ZERO { 0 } else { group.last_delivered_id.seq.saturating_add(1) },
+            seq: if group.last_delivered_id == StreamId::ZERO {
+                0
+            } else {
+                group.last_delivered_id.seq.saturating_add(1)
+            },
         };
         // Handle wrap
-        let start = if group.last_delivered_id != StreamId::ZERO && group.last_delivered_id.seq == u64::MAX {
-            StreamId { ms: group.last_delivered_id.ms.saturating_add(1), seq: 0 }
+        let start = if group.last_delivered_id != StreamId::ZERO
+            && group.last_delivered_id.seq == u64::MAX
+        {
+            StreamId {
+                ms: group.last_delivered_id.ms.saturating_add(1),
+                seq: 0,
+            }
         } else {
             start
         };
@@ -346,7 +379,9 @@ impl Stream {
         let now = current_time_ms();
         for (&id, fields) in self.entries.range(start..=StreamId::MAX) {
             if let Some(c) = count {
-                if results.len() >= c { break; }
+                if results.len() >= c {
+                    break;
+                }
             }
             results.push((id, fields.clone()));
 
@@ -355,11 +390,14 @@ impl Stream {
 
             if !noack {
                 // Add to group PEL
-                group.pel.insert(id, PendingEntry {
-                    consumer: consumer_name.clone(),
-                    delivery_time: now,
-                    delivery_count: 1,
-                });
+                group.pel.insert(
+                    id,
+                    PendingEntry {
+                        consumer: consumer_name.clone(),
+                        delivery_time: now,
+                        delivery_count: 1,
+                    },
+                );
                 // Add to consumer's pending set
                 if let Some(c) = group.consumers.get_mut(consumer_name) {
                     c.pending.insert(id, ());
@@ -372,9 +410,15 @@ impl Stream {
     /// Read pending entries for a consumer (0 or explicit ID semantics).
     /// Does NOT add to PEL, just replays what consumer already has pending.
     pub fn read_group_pending(
-        &mut self, group_name: &Bytes, consumer_name: &Bytes, start: StreamId, count: Option<usize>,
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        start: StreamId,
+        count: Option<usize>,
     ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
-        let group = self.groups.get(group_name.as_ref())
+        let group = self
+            .groups
+            .get(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
 
         let consumer = match group.consumers.get(consumer_name.as_ref()) {
@@ -385,7 +429,9 @@ impl Stream {
         let mut results = Vec::new();
         for (&id, _) in consumer.pending.range(start..) {
             if let Some(c) = count {
-                if results.len() >= c { break; }
+                if results.len() >= c {
+                    break;
+                }
             }
             if let Some(fields) = self.entries.get(&id) {
                 results.push((id, fields.clone()));
@@ -396,7 +442,9 @@ impl Stream {
 
     /// Acknowledge entries. Returns count of successfully acknowledged.
     pub fn xack(&mut self, group_name: &Bytes, ids: &[StreamId]) -> Result<u64, &'static str> {
-        let group = self.groups.get_mut(group_name.as_ref())
+        let group = self
+            .groups
+            .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
 
         let mut count = 0u64;
@@ -413,8 +461,13 @@ impl Stream {
     }
 
     /// Get pending entries summary: [count, min_id, max_id, [[consumer, count], ...]]
-    pub fn xpending_summary(&self, group_name: &Bytes) -> Result<Vec<(Bytes, StreamId, StreamId, Vec<(Bytes, u64)>)>, &'static str> {
-        let group = self.groups.get(group_name.as_ref())
+    pub fn xpending_summary(
+        &self,
+        group_name: &Bytes,
+    ) -> Result<Vec<(Bytes, StreamId, StreamId, Vec<(Bytes, u64)>)>, &'static str> {
+        let group = self
+            .groups
+            .get(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
 
         if group.pel.is_empty() {
@@ -437,17 +490,28 @@ impl Stream {
 
     /// Get pending entries detail.
     pub fn xpending_detail(
-        &self, group_name: &Bytes, start: StreamId, end: StreamId, count: usize, consumer_filter: Option<&Bytes>,
+        &self,
+        group_name: &Bytes,
+        start: StreamId,
+        end: StreamId,
+        count: usize,
+        consumer_filter: Option<&Bytes>,
     ) -> Result<Vec<(StreamId, Bytes, u64, u64)>, &'static str> {
-        let group = self.groups.get(group_name.as_ref())
+        let group = self
+            .groups
+            .get(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
 
         let now = current_time_ms();
         let mut results = Vec::new();
         for (&id, pe) in group.pel.range(start..=end) {
-            if results.len() >= count { break; }
+            if results.len() >= count {
+                break;
+            }
             if let Some(filter) = consumer_filter {
-                if &pe.consumer != filter { continue; }
+                if &pe.consumer != filter {
+                    continue;
+                }
             }
             let idle = now.saturating_sub(pe.delivery_time);
             results.push((id, pe.consumer.clone(), idle, pe.delivery_count));
@@ -457,9 +521,15 @@ impl Stream {
 
     /// Claim pending entries for a different consumer.
     pub fn xclaim(
-        &mut self, group_name: &Bytes, consumer_name: &Bytes, min_idle_time: u64, ids: &[StreamId],
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        min_idle_time: u64,
+        ids: &[StreamId],
     ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
-        let group = self.groups.get_mut(group_name.as_ref())
+        let group = self
+            .groups
+            .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
         Self::ensure_consumer(group, consumer_name);
 
@@ -468,7 +538,9 @@ impl Stream {
         for id in ids {
             if let Some(pe) = group.pel.get_mut(id) {
                 let idle = now.saturating_sub(pe.delivery_time);
-                if idle < min_idle_time { continue; }
+                if idle < min_idle_time {
+                    continue;
+                }
 
                 // Remove from old consumer's pending
                 let old_consumer = pe.consumer.clone();
@@ -498,10 +570,23 @@ impl Stream {
     /// Auto-claim idle pending entries SCAN-style.
     /// Returns (next_cursor_id, claimed_entries, deleted_ids).
     pub fn xautoclaim(
-        &mut self, group_name: &Bytes, consumer_name: &Bytes, min_idle_time: u64,
-        start: StreamId, count: usize,
-    ) -> Result<(StreamId, Vec<(StreamId, Vec<(Bytes, Bytes)>)>, Vec<StreamId>), &'static str> {
-        let group = self.groups.get_mut(group_name.as_ref())
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        min_idle_time: u64,
+        start: StreamId,
+        count: usize,
+    ) -> Result<
+        (
+            StreamId,
+            Vec<(StreamId, Vec<(Bytes, Bytes)>)>,
+            Vec<StreamId>,
+        ),
+        &'static str,
+    > {
+        let group = self
+            .groups
+            .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
         Self::ensure_consumer(group, consumer_name);
 
@@ -512,7 +597,9 @@ impl Stream {
         let mut scanned = 0;
 
         // Collect IDs to claim first to avoid borrow issues
-        let candidates: Vec<(StreamId, Bytes)> = group.pel.range(start..)
+        let candidates: Vec<(StreamId, Bytes)> = group
+            .pel
+            .range(start..)
             .filter(|(_, pe)| now.saturating_sub(pe.delivery_time) >= min_idle_time)
             .take(count + 1) // take one extra to know the next cursor
             .map(|(&id, pe)| (id, pe.consumer.clone()))
@@ -648,18 +735,9 @@ mod tests {
         let id2 = StreamId { ms: 2, seq: 0 };
         let id3 = StreamId { ms: 3, seq: 0 };
 
-        s.add(
-            id1,
-            vec![(Bytes::from("f1"), Bytes::from("v1"))],
-        );
-        s.add(
-            id2,
-            vec![(Bytes::from("f2"), Bytes::from("v2"))],
-        );
-        s.add(
-            id3,
-            vec![(Bytes::from("f3"), Bytes::from("v3"))],
-        );
+        s.add(id1, vec![(Bytes::from("f1"), Bytes::from("v1"))]);
+        s.add(id2, vec![(Bytes::from("f2"), Bytes::from("v2"))]);
+        s.add(id3, vec![(Bytes::from("f3"), Bytes::from("v3"))]);
 
         assert_eq!(s.length, 3);
         assert_eq!(s.last_id, id3);

@@ -32,21 +32,11 @@ pub fn config_get(
             b"maxmemory-samples",
             runtime_config.maxmemory_samples.to_string(),
         ),
-        (
-            b"lfu-log-factor",
-            runtime_config.lfu_log_factor.to_string(),
-        ),
-        (
-            b"lfu-decay-time",
-            runtime_config.lfu_decay_time.to_string(),
-        ),
+        (b"lfu-log-factor", runtime_config.lfu_log_factor.to_string()),
+        (b"lfu-decay-time", runtime_config.lfu_decay_time.to_string()),
         (
             b"save",
-            runtime_config
-                .save
-                .as_deref()
-                .unwrap_or("")
-                .to_string(),
+            runtime_config.save.as_deref().unwrap_or("").to_string(),
         ),
         (b"appendonly", runtime_config.appendonly.clone()),
         (b"appendfsync", runtime_config.appendfsync.clone()),
@@ -60,10 +50,7 @@ pub fn config_get(
             b"protected-mode" as &[u8],
             runtime_config.protected_mode.clone(),
         ),
-        (
-            b"acllog-max-len",
-            runtime_config.acllog_max_len.to_string(),
-        ),
+        (b"acllog-max-len", runtime_config.acllog_max_len.to_string()),
     ];
 
     let mut result = Vec::new();
@@ -223,7 +210,10 @@ mod tests {
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 2);
-                assert_eq!(items[0], Frame::BulkString(Bytes::from_static(b"maxmemory")));
+                assert_eq!(
+                    items[0],
+                    Frame::BulkString(Bytes::from_static(b"maxmemory"))
+                );
                 assert_eq!(items[1], Frame::BulkString(Bytes::from_static(b"0")));
             }
             _ => panic!("Expected array"),

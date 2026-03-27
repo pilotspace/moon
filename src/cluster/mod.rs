@@ -150,8 +150,15 @@ impl SlotRoute {
 #[derive(Clone, Debug, PartialEq)]
 pub enum FailoverState {
     None,
-    WaitingDelay { start_ms: u64, delay_ms: u64 },
-    WaitingVotes { epoch: u64, votes_received: u32, votes_needed: u32 },
+    WaitingDelay {
+        start_ms: u64,
+        delay_ms: u64,
+    },
+    WaitingVotes {
+        epoch: u64,
+        votes_received: u32,
+        votes_needed: u32,
+    },
 }
 
 // --- ClusterState ----------------------------------------------------------------
@@ -306,8 +313,7 @@ mod tests {
         let peer_id = "b".repeat(40);
         let mut state = ClusterState::new(my_id.clone(), test_addr(6379));
 
-        let mut peer =
-            ClusterNode::new(peer_id.clone(), test_addr(6380), NodeFlags::Master, 0);
+        let mut peer = ClusterNode::new(peer_id.clone(), test_addr(6380), NodeFlags::Master, 0);
         // Peer owns slots 8193-16383
         for slot in 8193..=16383u16 {
             peer.set_slot(slot);

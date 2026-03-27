@@ -8,10 +8,10 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
-use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeFlags};
 use crate::cluster::slots::slot_for_key;
-use crate::protocol::Frame;
+use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeFlags};
 use crate::framevec;
+use crate::protocol::Frame;
 /// Entry point: dispatch CLUSTER <subcommand> [args...] to the correct handler.
 ///
 /// Returns a Frame response, or Frame::Error if the subcommand is unknown or args invalid.
@@ -23,7 +23,9 @@ pub fn handle_cluster_command(
     let subcmd = match args.first() {
         Some(Frame::BulkString(b)) | Some(Frame::SimpleString(b)) => b.clone(),
         _ => {
-            return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for CLUSTER"));
+            return Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for CLUSTER",
+            ));
         }
     };
     let subcmd_upper = subcmd.to_ascii_uppercase();
@@ -52,7 +54,11 @@ pub fn handle_cluster_command(
 /// CLUSTER INFO -- return a bulk string with cluster statistics in Redis format.
 pub fn handle_cluster_info(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAddr) -> Frame {
     let state = cs.read().unwrap();
-    let cluster_state_str = if state.status == ClusterStatus::Ok { "ok" } else { "fail" };
+    let cluster_state_str = if state.status == ClusterStatus::Ok {
+        "ok"
+    } else {
+        "fail"
+    };
     let assigned = state.assigned_slot_count();
     let known_nodes = state.nodes.len();
     let size = state.master_count();
@@ -114,7 +120,11 @@ pub fn handle_cluster_nodes(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAd
 
         // Build slot ranges from bitmap
         let slot_ranges = bitmap_to_ranges(&node.slots);
-        let link_state = if matches!(node.flags, NodeFlags::Fail) { "disconnected" } else { "connected" };
+        let link_state = if matches!(node.flags, NodeFlags::Fail) {
+            "disconnected"
+        } else {
+            "connected"
+        };
 
         output.push_str(&format!(
             "{} {}:{}@{} {} {} {} {} {} {} {}\n",
@@ -186,12 +196,12 @@ pub fn handle_cluster_slots(cs: &Arc<RwLock<ClusterState>>) -> Frame {
 /// Here we add the node entry with a placeholder ID (will be filled by gossip).
 pub fn handle_cluster_meet(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Frame {
     if args.len() < 2 {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for CLUSTER MEET"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER MEET",
+        ));
     }
     let ip = match &args[0] {
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            String::from_utf8_lossy(b).to_string()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => String::from_utf8_lossy(b).to_string(),
         _ => return Frame::Error(Bytes::from_static(b"ERR invalid IP")),
     };
     let port: u16 = match &args[1] {
@@ -223,7 +233,9 @@ pub fn handle_cluster_meet(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
 /// CLUSTER ADDSLOTS <slot> [slot ...] -- assign slots to this node.
 pub fn handle_cluster_addslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Frame {
     if args.is_empty() {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for CLUSTER ADDSLOTS"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER ADDSLOTS",
+        ));
     }
     let slots = match parse_slots(args) {
         Ok(s) => s,
@@ -239,7 +251,9 @@ pub fn handle_cluster_addslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
 /// CLUSTER DELSLOTS <slot> [slot ...] -- remove slot ownership from this node.
 pub fn handle_cluster_delslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Frame {
     if args.is_empty() {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for CLUSTER DELSLOTS"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER DELSLOTS",
+        ));
     }
     let slots = match parse_slots(args) {
         Ok(s) => s,
@@ -255,7 +269,9 @@ pub fn handle_cluster_delslots(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -
 /// CLUSTER SETSLOT <slot> MIGRATING|IMPORTING|NODE|STABLE [node-id]
 pub fn handle_cluster_setslot(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Frame {
     if args.len() < 2 {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for CLUSTER SETSLOT"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER SETSLOT",
+        ));
     }
     let slot: u16 = match extract_u16(&args[0]) {
         Some(s) if s < 16384 => s,
@@ -312,7 +328,9 @@ pub fn handle_cluster_setslot(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) ->
 /// CLUSTER KEYSLOT <key> -- return the hash slot for a key.
 pub fn handle_cluster_keyslot(args: &[Frame]) -> Frame {
     if args.is_empty() {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for CLUSTER KEYSLOT"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER KEYSLOT",
+        ));
     }
     let key = match &args[0] {
         Frame::BulkString(b) | Frame::SimpleString(b) => b.clone(),
@@ -397,7 +415,7 @@ fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
             _ => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR CLUSTER FAILOVER only accepts FORCE or TAKEOVER",
-                ))
+                ));
             }
         }
     } else {
@@ -412,7 +430,7 @@ fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
         _ => {
             return Frame::Error(Bytes::from_static(
                 b"ERR CLUSTER FAILOVER can only be called on a replica node",
-            ))
+            ));
         }
     };
 
@@ -453,9 +471,7 @@ fn parse_slots(args: &[Frame]) -> Result<Vec<u16>, String> {
 
 fn extract_u16(frame: &Frame) -> Option<u16> {
     match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            std::str::from_utf8(b).ok()?.parse().ok()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => std::str::from_utf8(b).ok()?.parse().ok(),
         Frame::Integer(n) if *n >= 0 && *n <= 16383 => Some(*n as u16),
         _ => None,
     }
@@ -463,9 +479,7 @@ fn extract_u16(frame: &Frame) -> Option<u16> {
 
 fn extract_string(frame: &Frame) -> String {
     match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            String::from_utf8_lossy(b).to_string()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => String::from_utf8_lossy(b).to_string(),
         _ => String::new(),
     }
 }
@@ -501,7 +515,7 @@ fn bitmap_to_ranges(bitmap: &[u8; 2048]) -> String {
     }
 
     if ranges.is_empty() {
-        "-".to_string()  // no slots assigned
+        "-".to_string() // no slots assigned
     } else {
         ranges.join(" ")
     }
@@ -553,7 +567,12 @@ mod tests {
         };
         for line in s.trim().lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            assert!(fields.len() >= 9, "expected >= 9 fields, got {}: {}", fields.len(), line);
+            assert!(
+                fields.len() >= 9,
+                "expected >= 9 fields, got {}: {}",
+                fields.len(),
+                line
+            );
         }
     }
 
@@ -604,16 +623,10 @@ mod tests {
     fn test_delslots() {
         let cs = make_cs();
         // Add slot 5 first
-        handle_cluster_addslots(
-            &[Frame::BulkString(bytes::Bytes::from_static(b"5"))],
-            &cs,
-        );
+        handle_cluster_addslots(&[Frame::BulkString(bytes::Bytes::from_static(b"5"))], &cs);
         assert!(cs.read().unwrap().my_node().owns_slot(5));
         // Delete it
-        handle_cluster_delslots(
-            &[Frame::BulkString(bytes::Bytes::from_static(b"5"))],
-            &cs,
-        );
+        handle_cluster_delslots(&[Frame::BulkString(bytes::Bytes::from_static(b"5"))], &cs);
         assert!(!cs.read().unwrap().my_node().owns_slot(5));
     }
 
@@ -623,10 +636,7 @@ mod tests {
         let cs = make_cs();
         let my_id = "a".repeat(40);
         // First add slot to self and mark it as migrating
-        handle_cluster_addslots(
-            &[Frame::BulkString(bytes::Bytes::from_static(b"42"))],
-            &cs,
-        );
+        handle_cluster_addslots(&[Frame::BulkString(bytes::Bytes::from_static(b"42"))], &cs);
         let args = vec![
             Frame::BulkString(bytes::Bytes::from_static(b"42")),
             Frame::BulkString(bytes::Bytes::from_static(b"MIGRATING")),

@@ -16,8 +16,8 @@ use atomic_waker::AtomicWaker;
 // --- mpsc ---
 // flume provides unbounded + bounded async-capable mpsc channels that work on any runtime.
 pub use flume::{
-    bounded as mpsc_bounded, unbounded as mpsc_unbounded, Receiver as MpscReceiver,
-    Sender as MpscSender,
+    Receiver as MpscReceiver, Sender as MpscSender, bounded as mpsc_bounded,
+    unbounded as mpsc_unbounded,
 };
 
 // --- oneshot ---
@@ -62,9 +62,7 @@ pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
             inner: inner.clone(),
             sent: false,
         },
-        OneshotReceiver {
-            inner,
-        },
+        OneshotReceiver { inner },
     )
 }
 
@@ -84,12 +82,11 @@ impl<T> OneshotSender<T> {
 
         // Attempt state transition EMPTY -> VALUE.
         // Release ordering ensures the value write is visible to the receiver's Acquire load.
-        match self.inner.state.compare_exchange(
-            EMPTY,
-            VALUE,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
+        match self
+            .inner
+            .state
+            .compare_exchange(EMPTY, VALUE, Ordering::Release, Ordering::Acquire)
+        {
             Ok(_) => {
                 // Successfully stored value. Wake the receiver if it's waiting.
                 self.inner.waker.wake();
@@ -202,12 +199,10 @@ impl<T> Drop for OneshotReceiver<T> {
     fn drop(&mut self) {
         // If EMPTY, transition to CLOSED so sender's send returns Err.
         // Use compare_exchange to avoid clobbering VALUE state.
-        let _ = self.inner.state.compare_exchange(
-            EMPTY,
-            CLOSED,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
+        let _ =
+            self.inner
+                .state
+                .compare_exchange(EMPTY, CLOSED, Ordering::Release, Ordering::Relaxed);
         // If state was VALUE, the value remains in the inner and will be dropped
         // by OneshotInner::drop.
     }
@@ -235,10 +230,7 @@ pub fn watch<T: Clone + Send + Sync + 'static>(initial: T) -> (WatchSender<T>, W
             shared: shared.clone(),
             notify_tx,
         },
-        WatchReceiver {
-            shared,
-            notify_rx,
-        },
+        WatchReceiver { shared, notify_rx },
     )
 }
 
@@ -300,9 +292,9 @@ impl Default for Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use futures::executor::block_on;
     use futures::stream::FuturesUnordered;
-    use futures::StreamExt;
 
     #[test]
     fn test_oneshot_send_then_recv() {

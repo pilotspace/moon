@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use ringbuf::traits::Split;
 use ringbuf::HeapCons;
 use ringbuf::HeapProd;
 use ringbuf::HeapRb;
+use ringbuf::traits::Split;
 
 use crate::runtime::channel;
 
@@ -118,7 +118,10 @@ impl ChannelMesh {
     /// Take the connection receiver for a specific shard (call once during setup).
     ///
     /// Panics if called more than once for the same shard.
-    pub fn take_conn_rx(&mut self, shard_id: usize) -> channel::MpscReceiver<(crate::runtime::TcpStream, bool)> {
+    pub fn take_conn_rx(
+        &mut self,
+        shard_id: usize,
+    ) -> channel::MpscReceiver<(crate::runtime::TcpStream, bool)> {
         self.conn_rxs[shard_id]
             .take()
             .expect("conn_rx already taken")
@@ -127,7 +130,10 @@ impl ChannelMesh {
     /// Get a clone of the connection sender for a specific shard.
     ///
     /// The listener uses this to distribute new connections to shards.
-    pub fn conn_tx(&self, shard_id: usize) -> channel::MpscSender<(crate::runtime::TcpStream, bool)> {
+    pub fn conn_tx(
+        &self,
+        shard_id: usize,
+    ) -> channel::MpscSender<(crate::runtime::TcpStream, bool)> {
         self.conn_txs[shard_id].clone()
     }
 

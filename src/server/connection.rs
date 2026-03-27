@@ -1,35 +1,35 @@
 #![allow(unused_imports, dead_code, unused_variables)]
+use crate::runtime::TcpStream;
+use crate::runtime::cancel::CancellationToken;
+use crate::runtime::channel;
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
+use parking_lot::Mutex;
+use ringbuf::HeapProd;
+use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use parking_lot::Mutex;
-use ringbuf::traits::Producer;
-use ringbuf::HeapProd;
-use crate::runtime::TcpStream;
 #[cfg(feature = "runtime-tokio")]
 use tokio_util::codec::Framed;
-use crate::runtime::cancel::CancellationToken;
-use crate::runtime::channel;
 
 use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
-use crate::command::{dispatch, dispatch_read, DispatchResult};
+use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
-use crate::pubsub::{self, PubSubRegistry};
 use crate::pubsub::subscriber::Subscriber;
-use crate::shard::dispatch::{key_to_shard, ShardMessage};
+use crate::pubsub::{self, PubSubRegistry};
+use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
+use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
-use crate::storage::Database;
 use crate::tracking::{TrackingState, TrackingTable};
 
 /// Type alias for the per-database RwLock container.
@@ -120,7 +120,10 @@ pub async fn handle_connection(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let acl_max_len = runtime_config
+        .read()
+        .map(|cfg| cfg.acllog_max_len)
+        .unwrap_or(128);
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Pub/Sub connection-local state
@@ -1192,9 +1195,7 @@ fn handle_config(
         Frame::BulkString(s) => s.as_ref(),
         Frame::SimpleString(s) => s.as_ref(),
         _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR unknown subcommand for CONFIG",
-            ));
+            return Frame::Error(Bytes::from_static(b"ERR unknown subcommand for CONFIG"));
         }
     };
 
@@ -1297,7 +1298,9 @@ fn execute_transaction(
 fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
     // Fast check: is this command keyless? Uses (length, first_byte) dispatch.
     let len = cmd.len();
-    if len == 0 { return None; }
+    if len == 0 {
+        return None;
+    }
     let b0 = cmd[0] | 0x20;
 
     let is_keyless = match (len, b0) {
@@ -1348,7 +1351,9 @@ fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&'a Bytes> {
 /// Single-arg DEL/UNLINK/EXISTS are NOT multi-key (handled as single-key fast path).
 fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
     let len = cmd.len();
-    if len == 0 { return false; }
+    if len == 0 {
+        return false;
+    }
     let b0 = cmd[0] | 0x20;
     match (len, b0) {
         (4, b'm') => cmd.eq_ignore_ascii_case(b"MGET") || cmd.eq_ignore_ascii_case(b"MSET"),
@@ -1405,13 +1410,31 @@ pub async fn handle_connection_sharded(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     handle_connection_sharded_inner(
-        stream, peer_addr, databases, shard_id, num_shards,
-        dispatch_tx, pubsub_registry, blocking_registry, shutdown,
-        requirepass, aof_tx, tracking_table, client_id,
-        repl_state, cluster_state, lua, script_cache, config_port,
-        acl_table, runtime_config, config, spsc_notifiers,
+        stream,
+        peer_addr,
+        databases,
+        shard_id,
+        num_shards,
+        dispatch_tx,
+        pubsub_registry,
+        blocking_registry,
+        shutdown,
+        requirepass,
+        aof_tx,
+        tracking_table,
+        client_id,
+        repl_state,
+        cluster_state,
+        lua,
+        script_cache,
+        config_port,
+        acl_table,
+        runtime_config,
+        config,
+        spsc_notifiers,
         cached_clock,
-    ).await;
+    )
+    .await;
 }
 
 /// Generic inner handler for sharded connections (Tokio runtime).
@@ -1419,7 +1442,9 @@ pub async fn handle_connection_sharded(
 /// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
 /// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
 #[cfg(feature = "runtime-tokio")]
-pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+pub async fn handle_connection_sharded_inner<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+>(
     stream: S,
     peer_addr: String,
     databases: Rc<RefCell<Vec<Database>>>,
@@ -1455,7 +1480,10 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let acl_max_len = runtime_config
+        .read()
+        .map(|cfg| cfg.acllog_max_len)
+        .unwrap_or(128);
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Transaction (MULTI/EXEC) connection-local state
@@ -2947,7 +2975,9 @@ async fn handle_blocking_command_monoio(
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
     let frame = if let Some(dl) = deadline {
-        let mut sleep = std::pin::pin!(monoio::time::sleep(dl.saturating_duration_since(std::time::Instant::now())));
+        let mut sleep = std::pin::pin!(monoio::time::sleep(
+            dl.saturating_duration_since(std::time::Instant::now())
+        ));
         let mut result_frame = Frame::Null;
         loop {
             monoio::select! {
@@ -3016,12 +3046,22 @@ fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, Frame> {
     let timeout_frame = args.last().unwrap();
     let timeout_bytes = match timeout_frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => b,
-        _ => return Err(Frame::Error(Bytes::from_static(b"ERR timeout is not a float or out of range"))),
+        _ => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR timeout is not a float or out of range",
+            )));
+        }
     };
-    let timeout_str = std::str::from_utf8(timeout_bytes)
-        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")))?;
-    let timeout: f64 = timeout_str.parse()
-        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")))?;
+    let timeout_str = std::str::from_utf8(timeout_bytes).map_err(|_| {
+        Frame::Error(Bytes::from_static(
+            b"ERR timeout is not a float or out of range",
+        ))
+    })?;
+    let timeout: f64 = timeout_str.parse().map_err(|_| {
+        Frame::Error(Bytes::from_static(
+            b"ERR timeout is not a float or out of range",
+        ))
+    })?;
     if timeout < 0.0 {
         return Err(Frame::Error(Bytes::from_static(b"ERR timeout is negative")));
     }
@@ -3073,18 +3113,14 @@ fn parse_blocking_args(
                 b"ERR wrong number of arguments for 'blmove' command",
             )));
         }
-        let source = extract_bytes(&args[0]).ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR invalid source key"))
-        })?;
-        let destination = extract_bytes(&args[1]).ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR invalid destination key"))
-        })?;
-        let wherefrom_bytes = extract_bytes(&args[2]).ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR syntax error"))
-        })?;
-        let whereto_bytes = extract_bytes(&args[3]).ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR syntax error"))
-        })?;
+        let source = extract_bytes(&args[0])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR invalid source key")))?;
+        let destination = extract_bytes(&args[1])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR invalid destination key")))?;
+        let wherefrom_bytes = extract_bytes(&args[2])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+        let whereto_bytes = extract_bytes(&args[3])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
         let wherefrom = if wherefrom_bytes.eq_ignore_ascii_case(b"LEFT") {
             crate::blocking::Direction::Left
         } else if wherefrom_bytes.eq_ignore_ascii_case(b"RIGHT") {
@@ -3140,34 +3176,44 @@ fn parse_blocking_args(
         }
         Ok((keys, Box::new(|| crate::blocking::BlockedCommand::BZPopMax)))
     } else {
-        Err(Frame::Error(Bytes::from_static(b"ERR unknown blocking command")))
+        Err(Frame::Error(Bytes::from_static(
+            b"ERR unknown blocking command",
+        )))
     }
 }
 
 /// Try to pop data immediately (non-blocking fast path).
 fn try_immediate_pop(cmd: &[u8], db: &mut Database, key: &Bytes, args: &[Frame]) -> Option<Frame> {
     if cmd.eq_ignore_ascii_case(b"BLPOP") {
-        db.list_pop_front(key).map(|v| Frame::Array(framevec![
-            Frame::BulkString(key.clone()),
-            Frame::BulkString(v),
-        ]))
+        db.list_pop_front(key).map(|v| {
+            Frame::Array(framevec![
+                Frame::BulkString(key.clone()),
+                Frame::BulkString(v),
+            ])
+        })
     } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
-        db.list_pop_back(key).map(|v| Frame::Array(framevec![
-            Frame::BulkString(key.clone()),
-            Frame::BulkString(v),
-        ]))
+        db.list_pop_back(key).map(|v| {
+            Frame::Array(framevec![
+                Frame::BulkString(key.clone()),
+                Frame::BulkString(v),
+            ])
+        })
     } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
-        db.zset_pop_min(key).map(|(member, score)| Frame::Array(framevec![
-            Frame::BulkString(key.clone()),
-            Frame::BulkString(member),
-            Frame::BulkString(Bytes::from(format_blocking_score(score))),
-        ]))
+        db.zset_pop_min(key).map(|(member, score)| {
+            Frame::Array(framevec![
+                Frame::BulkString(key.clone()),
+                Frame::BulkString(member),
+                Frame::BulkString(Bytes::from(format_blocking_score(score))),
+            ])
+        })
     } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
-        db.zset_pop_max(key).map(|(member, score)| Frame::Array(framevec![
-            Frame::BulkString(key.clone()),
-            Frame::BulkString(member),
-            Frame::BulkString(Bytes::from(format_blocking_score(score))),
-        ]))
+        db.zset_pop_max(key).map(|(member, score)| {
+            Frame::Array(framevec![
+                Frame::BulkString(key.clone()),
+                Frame::BulkString(member),
+                Frame::BulkString(Bytes::from(format_blocking_score(score))),
+            ])
+        })
     } else if cmd.eq_ignore_ascii_case(b"BLMOVE") {
         // BLMOVE: try immediate LMOVE
         // args: [source, destination, wherefrom, whereto, timeout]
@@ -3429,7 +3475,9 @@ fn try_inline_dispatch_loop(
 /// read since monoio's IoBufMut is implemented for Vec<u8>, then copy into BytesMut
 /// for codec parsing.
 #[cfg(feature = "runtime-monoio")]
-pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent>(
+pub async fn handle_connection_sharded_monoio<
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent,
+>(
     mut stream: S,
     peer_addr: String,
     databases: Rc<RefCell<Vec<Database>>>,
@@ -3467,7 +3515,10 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
     let mut protocol_version: u8 = 2;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let acl_max_len = runtime_config
+        .read()
+        .map(|cfg| cfg.acllog_max_len)
+        .unwrap_or(128);
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
@@ -3491,7 +3542,10 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
-    let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>> = HashMap::with_capacity(num_shards);
+    let mut remote_groups: HashMap<
+        usize,
+        Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>,
+    > = HashMap::with_capacity(num_shards);
     let mut reply_futures: Vec<(
         Vec<(usize, Option<Bytes>, Vec<u8>)>,
         channel::OneshotReceiver<Vec<Frame>>,
@@ -3733,7 +3787,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
         // We only use returned_buf[..n] after the read, never uninitialized bytes.
         if tmp_buf.len() < 8192 {
             tmp_buf.reserve(8192 - tmp_buf.len());
-            unsafe { tmp_buf.set_len(8192); }
+            unsafe {
+                tmp_buf.set_len(8192);
+            }
         }
         let (result, returned_buf) = stream.read(tmp_buf).await;
         tmp_buf = returned_buf;
@@ -3755,7 +3811,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                 dbs[selected_db].refresh_now_from_cache(&cached_clock);
             }
             let inlined = try_inline_dispatch_loop(
-                &mut read_buf, &mut write_buf, &databases, selected_db, &aof_tx,
+                &mut read_buf,
+                &mut write_buf,
+                &databases,
+                selected_db,
+                &aof_tx,
             );
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
@@ -3826,7 +3886,8 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                                 timestamp_ms: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_millis() as u64,
+                                    .as_millis()
+                                    as u64,
                             });
                         }
                         responses.push(response);
@@ -3834,7 +3895,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     }
                     Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
                         let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                            cmd_args, protocol_version, client_id, &acl_table, &mut authenticated,
+                            cmd_args,
+                            protocol_version,
+                            client_id,
+                            &acl_table,
+                            &mut authenticated,
                         );
                         if !matches!(&response, Frame::Error(_)) {
                             protocol_version = new_proto;
@@ -3854,9 +3919,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                         break;
                     }
                     _ => {
-                        responses.push(Frame::Error(
-                            Bytes::from_static(b"NOAUTH Authentication required.")
-                        ));
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"NOAUTH Authentication required.",
+                        )));
                         continue;
                     }
                 }
@@ -3865,7 +3930,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             let (cmd, cmd_args) = match extract_command(&frame) {
                 Some(pair) => pair,
                 None => {
-                    responses.push(Frame::Error(Bytes::from_static(b"ERR invalid command format")));
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"ERR invalid command format",
+                    )));
                     continue;
                 }
             };
@@ -3887,13 +3954,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // --- CLUSTER subcommands ---
             if cmd.eq_ignore_ascii_case(b"CLUSTER") {
                 if let Some(ref cs) = cluster_state {
-                    let self_addr: std::net::SocketAddr =
-                        format!("127.0.0.1:{}", config_port)
-                            .parse()
-                            .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
-                    let resp = crate::cluster::command::handle_cluster_command(
-                        cmd_args, cs, self_addr,
-                    );
+                    let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", config_port)
+                        .parse()
+                        .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
+                    let resp =
+                        crate::cluster::command::handle_cluster_command(cmd_args, cs, self_addr);
                     responses.push(resp);
                 } else {
                     responses.push(Frame::Error(Bytes::from_static(
@@ -3910,8 +3975,14 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     let db_count = dbs.len();
                     let db = &mut dbs[selected_db];
                     crate::scripting::handle_evalsha(
-                        &lua, &script_cache, cmd_args, db,
-                        shard_id, num_shards, selected_db, db_count,
+                        &lua,
+                        &script_cache,
+                        cmd_args,
+                        db,
+                        shard_id,
+                        num_shards,
+                        selected_db,
+                        db_count,
                     )
                 };
                 responses.push(response);
@@ -3925,8 +3996,14 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     let db_count = dbs.len();
                     let db = &mut dbs[selected_db];
                     crate::scripting::handle_eval(
-                        &lua, &script_cache, cmd_args, db,
-                        shard_id, num_shards, selected_db, db_count,
+                        &lua,
+                        &script_cache,
+                        cmd_args,
+                        db,
+                        shard_id,
+                        num_shards,
+                        selected_db,
+                        db_count,
                     )
                 };
                 responses.push(response);
@@ -3935,7 +4012,8 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
 
             // --- SCRIPT subcommands: LOAD, EXISTS, FLUSH ---
             if cmd.eq_ignore_ascii_case(b"SCRIPT") {
-                let (response, fanout) = crate::scripting::handle_script_subcommand(&script_cache, cmd_args);
+                let (response, fanout) =
+                    crate::scripting::handle_script_subcommand(&script_cache, cmd_args);
                 if let Some((sha1, script_bytes)) = fanout {
                     let mut producers = dispatch_tx.borrow_mut();
                     for target in 0..num_shards {
@@ -4015,7 +4093,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // --- HELLO (protocol negotiation, ACL-aware) ---
             if cmd.eq_ignore_ascii_case(b"HELLO") {
                 let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                    cmd_args, protocol_version, client_id, &acl_table, &mut authenticated,
+                    cmd_args,
+                    protocol_version,
+                    client_id,
+                    &acl_table,
+                    &mut authenticated,
                 );
                 if !matches!(&response, Frame::Error(_)) {
                     protocol_version = new_proto;
@@ -4033,7 +4115,12 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // --- ACL command (intercepted at connection level) ---
             if cmd.eq_ignore_ascii_case(b"ACL") {
                 let response = crate::command::acl::handle_acl(
-                    cmd_args, &acl_table, &mut acl_log, &current_user, &peer_addr, &runtime_config,
+                    cmd_args,
+                    &acl_table,
+                    &mut acl_log,
+                    &current_user,
+                    &peer_addr,
+                    &runtime_config,
                 );
                 responses.push(response);
                 continue;
@@ -4046,10 +4133,8 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             }
 
             // --- REPLICAOF / SLAVEOF ---
-            if cmd.eq_ignore_ascii_case(b"REPLICAOF")
-                || cmd.eq_ignore_ascii_case(b"SLAVEOF")
-            {
-                use crate::command::connection::{replicaof, ReplicaofAction};
+            if cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"SLAVEOF") {
+                use crate::command::connection::{ReplicaofAction, replicaof};
                 let (resp, action) = replicaof(cmd_args);
                 if let Some(action) = action {
                     if let Some(ref rs) = repl_state {
@@ -4078,7 +4163,8 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                                 if let Ok(mut rs_guard) = rs.write() {
                                     rs_guard.repl_id2 = rs_guard.repl_id.clone();
                                     rs_guard.repl_id = generate_repl_id();
-                                    rs_guard.role = crate::replication::state::ReplicationRole::Master;
+                                    rs_guard.role =
+                                        crate::replication::state::ReplicationRole::Master;
                                 }
                             }
                             ReplicaofAction::NoOp => {}
@@ -4183,15 +4269,21 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                                                 table.set_redirect(client_id, target);
                                             }
                                             for prefix in &config_parsed.prefixes {
-                                                table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
+                                                table.register_prefix(
+                                                    client_id,
+                                                    prefix.clone(),
+                                                    config_parsed.noloop,
+                                                );
                                             }
                                         }
-                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        responses
+                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     } else {
                                         tracking_state = TrackingState::default();
                                         tracking_table.borrow_mut().untrack_all(client_id);
                                         tracking_rx = None;
-                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        responses
+                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     }
                                     continue;
                                 }
@@ -4209,18 +4301,18 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                         continue;
                     }
                 }
-                responses.push(Frame::Error(
-                    Bytes::from_static(b"ERR wrong number of arguments for 'client' command"),
-                ));
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR wrong number of arguments for 'client' command",
+                )));
                 continue;
             }
 
             // --- PUBLISH: local delivery + cross-shard fan-out ---
             if cmd.eq_ignore_ascii_case(b"PUBLISH") {
                 if cmd_args.len() != 2 {
-                    responses.push(Frame::Error(
-                        Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
-                    ));
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"ERR wrong number of arguments for 'publish' command",
+                    )));
                 } else {
                     let channel = extract_bytes(&cmd_args[0]);
                     let message = extract_bytes(&cmd_args[1]);
@@ -4244,9 +4336,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                             drop(producers);
                             responses.push(Frame::Integer(local_count));
                         }
-                        _ => responses.push(Frame::Error(
-                            Bytes::from_static(b"ERR invalid channel or message"),
-                        )),
+                        _ => responses.push(Frame::Error(Bytes::from_static(
+                            b"ERR invalid channel or message",
+                        ))),
                     }
                 }
                 continue;
@@ -4256,9 +4348,14 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
                 let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                 if cmd_args.is_empty() {
-                    let cmd_name = if is_pattern { "psubscribe" } else { "subscribe" };
+                    let cmd_name = if is_pattern {
+                        "psubscribe"
+                    } else {
+                        "subscribe"
+                    };
                     let err = Frame::Error(Bytes::from(format!(
-                        "ERR wrong number of arguments for '{}' command", cmd_name
+                        "ERR wrong number of arguments for '{}' command",
+                        cmd_name
                     )));
                     responses.push(err);
                     continue;
@@ -4281,9 +4378,12 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                         // ACL channel permission check
                         {
                             let acl_guard = acl_table.read().unwrap();
-                            if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
+                            if let Some(deny_reason) =
+                                acl_guard.check_channel_permission(&current_user, ch.as_ref())
+                            {
                                 drop(acl_guard);
-                                let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                let err =
+                                    Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
                                 codec.encode_frame(&err, &mut write_buf);
                                 continue;
                             }
@@ -4306,15 +4406,19 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                 // Flush responses and re-enter loop (next iteration enters subscriber mode)
                 if !write_buf.is_empty() {
                     let data = write_buf.split().freeze();
-                    let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                    if result.is_err() { return; }
+                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
+                        stream.write_all(data).await;
+                    if result.is_err() {
+                        return;
+                    }
                 }
                 responses.clear();
                 break; // break out of frame loop to re-enter main loop in subscriber mode
             }
 
             // --- UNSUBSCRIBE / PUNSUBSCRIBE (in normal mode, no-op if not subscribed) ---
-            if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+            if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE")
+            {
                 let is_pattern = cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE");
                 let resp = if is_pattern {
                     pubsub::punsubscribe_response(&Bytes::from_static(b""), 0)
@@ -4351,9 +4455,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
             {
                 let acl_guard = acl_table.read().unwrap();
-                if let Some(deny_reason) = acl_guard.check_command_permission(
-                    &current_user, cmd, cmd_args,
-                ) {
+                if let Some(deny_reason) =
+                    acl_guard.check_command_permission(&current_user, cmd, cmd_args)
+                {
                     drop(acl_guard);
                     acl_log.push(crate::acl::AclLogEntry {
                         reason: "command".to_string(),
@@ -4365,17 +4469,15 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                             .unwrap_or_default()
                             .as_millis() as u64,
                     });
-                    responses.push(Frame::Error(Bytes::from(format!(
-                        "NOPERM {}", deny_reason
-                    ))));
+                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                     continue;
                 }
 
                 // === ACL key pattern check (same lock guard) ===
                 let is_write_for_acl = crate::persistence::aof::is_write_command(cmd);
-                if let Some(deny_reason) = acl_guard.check_key_permission(
-                    &current_user, cmd, cmd_args, is_write_for_acl,
-                ) {
+                if let Some(deny_reason) =
+                    acl_guard.check_key_permission(&current_user, cmd, cmd_args, is_write_for_acl)
+                {
                     drop(acl_guard);
                     acl_log.push(crate::acl::AclLogEntry {
                         reason: "command".to_string(),
@@ -4387,9 +4489,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                             .unwrap_or_default()
                             .as_millis() as u64,
                     });
-                    responses.push(Frame::Error(Bytes::from(format!(
-                        "NOPERM {}", deny_reason
-                    ))));
+                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                     continue;
                 }
             }
@@ -4397,7 +4497,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // --- MULTI ---
             if cmd.eq_ignore_ascii_case(b"MULTI") {
                 if in_multi {
-                    responses.push(Frame::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"ERR MULTI calls can not be nested",
+                    )));
                 } else {
                     in_multi = true;
                     command_queue.clear();
@@ -4412,7 +4514,12 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                 } else {
                     in_multi = false;
-                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db, &cached_clock);
+                    let result = execute_transaction_sharded(
+                        &databases,
+                        &command_queue,
+                        selected_db,
+                        &cached_clock,
+                    );
                     command_queue.clear();
                     responses.push(result);
                 }
@@ -4422,7 +4529,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // --- DISCARD ---
             if cmd.eq_ignore_ascii_case(b"DISCARD") {
                 if !in_multi {
-                    responses.push(Frame::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"ERR DISCARD without MULTI",
+                    )));
                 } else {
                     in_multi = false;
                     command_queue.clear();
@@ -4452,14 +4561,26 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                 }
                 if !write_buf.is_empty() {
                     let data = write_buf.split().freeze();
-                    let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                    if result.is_err() { return; }
+                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
+                        stream.write_all(data).await;
+                    if result.is_err() {
+                        return;
+                    }
                 }
 
                 let blocking_response = handle_blocking_command_monoio(
-                    cmd, cmd_args, selected_db, &databases, &blocking_registry,
-                    shard_id, num_shards, &dispatch_tx, &shutdown, &spsc_notifiers,
-                ).await;
+                    cmd,
+                    cmd_args,
+                    selected_db,
+                    &databases,
+                    &blocking_registry,
+                    shard_id,
+                    num_shards,
+                    &dispatch_tx,
+                    &shutdown,
+                    &spsc_notifiers,
+                )
+                .await;
 
                 // Encode blocking response directly
                 codec.encode_frame(&blocking_response, &mut write_buf);
@@ -4478,27 +4599,44 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             if num_shards > 1 {
                 if cmd.eq_ignore_ascii_case(b"KEYS") {
                     let response = crate::shard::coordinator::coordinate_keys(
-                        cmd_args, shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx, &spsc_notifiers,
+                        cmd_args,
+                        shard_id,
+                        num_shards,
+                        selected_db,
+                        &databases,
+                        &dispatch_tx,
+                        &spsc_notifiers,
                         &cached_clock,
-                    ).await;
+                    )
+                    .await;
                     responses.push(response);
                     continue;
                 }
                 if cmd.eq_ignore_ascii_case(b"SCAN") {
                     let response = crate::shard::coordinator::coordinate_scan(
-                        cmd_args, shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx, &spsc_notifiers,
+                        cmd_args,
+                        shard_id,
+                        num_shards,
+                        selected_db,
+                        &databases,
+                        &dispatch_tx,
+                        &spsc_notifiers,
                         &cached_clock,
-                    ).await;
+                    )
+                    .await;
                     responses.push(response);
                     continue;
                 }
                 if cmd.eq_ignore_ascii_case(b"DBSIZE") {
                     let response = crate::shard::coordinator::coordinate_dbsize(
-                        shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx, &spsc_notifiers,
-                    ).await;
+                        shard_id,
+                        num_shards,
+                        selected_db,
+                        &databases,
+                        &dispatch_tx,
+                        &spsc_notifiers,
+                    )
+                    .await;
                     responses.push(response);
                     continue;
                 }
@@ -4506,18 +4644,25 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                 // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
                 if is_multi_key_command(cmd, cmd_args) {
                     let response = crate::shard::coordinator::coordinate_multi_key(
-                        cmd, cmd_args, shard_id, num_shards, selected_db,
-                        &databases, &dispatch_tx, &spsc_notifiers,
+                        cmd,
+                        cmd_args,
+                        shard_id,
+                        num_shards,
+                        selected_db,
+                        &databases,
+                        &dispatch_tx,
+                        &spsc_notifiers,
                         &cached_clock,
-                    ).await;
+                    )
+                    .await;
                     responses.push(response);
                     continue;
                 }
             }
 
             // --- Routing: keyless, local, or remote ---
-            let target_shard = extract_primary_key(cmd, cmd_args)
-                .map(|key| key_to_shard(key, num_shards));
+            let target_shard =
+                extract_primary_key(cmd, cmd_args).map(|key| key_to_shard(key, num_shards));
 
             let is_local = match target_shard {
                 None => true,
@@ -4548,8 +4693,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                 let mut dbs = databases.borrow_mut();
                 // No refresh_now here — called once per batch before the loop
                 let result = dispatch(
-                    &mut dbs[selected_db], cmd, cmd_args,
-                    &mut selected_db, db_count,
+                    &mut dbs[selected_db],
+                    cmd,
+                    cmd_args,
+                    &mut selected_db,
+                    db_count,
                 );
 
                 let response = match result {
@@ -4582,11 +4730,17 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                    &mut reg,
+                                    &mut dbs[selected_db],
+                                    selected_db,
+                                    &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut dbs[selected_db], selected_db, &key,
+                                    &mut reg,
+                                    &mut dbs[selected_db],
+                                    selected_db,
+                                    &key,
                                 );
                             }
                         }
@@ -4600,9 +4754,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     if is_write {
                         if !matches!(response, Frame::Error(_)) {
                             if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                                let senders =
+                                    tracking_table.borrow_mut().invalidate_key(&key, client_id);
                                 if !senders.is_empty() {
-                                    let push = crate::tracking::invalidation::invalidation_push(&[key]);
+                                    let push =
+                                        crate::tracking::invalidation::invalidation_push(&[key]);
                                     for tx in senders {
                                         let _ = tx.try_send(push.clone());
                                     }
@@ -4611,7 +4767,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                         }
                     } else if !tracking_state.bcast {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
+                            tracking_table.borrow_mut().track_key(
+                                client_id,
+                                &key,
+                                tracking_state.noloop,
+                            );
                         }
                     }
                 }
@@ -4630,10 +4790,12 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     None
                 };
                 let cmd_name = cmd.to_vec();
-                remote_groups
-                    .entry(target)
-                    .or_default()
-                    .push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_name));
+                remote_groups.entry(target).or_default().push((
+                    resp_idx,
+                    std::sync::Arc::new(frame),
+                    aof_bytes,
+                    cmd_name,
+                ));
             }
         }
 
@@ -4644,8 +4806,13 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
 
             for (target, entries) in remote_groups.drain() {
                 let (reply_tx, reply_rx) = channel::oneshot();
-                let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
-                    entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
+                let (meta, commands): (
+                    Vec<(usize, Option<Bytes>, Vec<u8>)>,
+                    Vec<std::sync::Arc<Frame>>,
+                ) = entries
+                    .into_iter()
+                    .map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame))
+                    .unzip();
 
                 let msg = ShardMessage::PipelineBatch {
                     db_index: selected_db,
@@ -4679,7 +4846,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             for (meta, reply_rx) in reply_futures.drain(..) {
                 match reply_rx.recv().await {
                     Ok(shard_responses) => {
-                        for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((resp_idx, aof_bytes, cmd_name), resp) in
+                            meta.into_iter().zip(shard_responses)
+                        {
                             // AOF logging for successful remote writes
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(resp, Frame::Error(_)) {
@@ -4694,9 +4863,9 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     }
                     Err(_) => {
                         for (resp_idx, _, _) in meta {
-                            responses[resp_idx] = Frame::Error(
-                                Bytes::from_static(b"ERR cross-shard dispatch failed"),
-                            );
+                            responses[resp_idx] = Frame::Error(Bytes::from_static(
+                                b"ERR cross-shard dispatch failed",
+                            ));
                         }
                     }
                 }
@@ -4711,7 +4880,8 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
         // Write all responses in one batch using ownership I/O
         if !write_buf.is_empty() {
             let data = write_buf.split().freeze();
-            let (result, _data): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+            let (result, _data): (std::io::Result<usize>, bytes::Bytes) =
+                stream.write_all(data).await;
             if result.is_err() {
                 break;
             }
@@ -4746,11 +4916,11 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod inline_dispatch_tests {
     use super::*;
+    use crate::storage::Database;
+    use crate::storage::entry::Entry;
     use bytes::{Bytes, BytesMut};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use crate::storage::Database;
-    use crate::storage::entry::Entry;
 
     /// Helper: create a single-database Rc<RefCell<Vec<Database>>> for testing.
     fn make_dbs() -> Rc<RefCell<Vec<Database>>> {
@@ -4762,7 +4932,10 @@ mod inline_dispatch_tests {
         let dbs = make_dbs();
         {
             let mut d = dbs.borrow_mut();
-            d[0].set(Bytes::from_static(b"foo"), Entry::new_string(Bytes::from_static(b"bar")));
+            d[0].set(
+                Bytes::from_static(b"foo"),
+                Entry::new_string(Bytes::from_static(b"bar")),
+            );
         }
         let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
         let mut write_buf = BytesMut::new();
@@ -4825,7 +4998,10 @@ mod inline_dispatch_tests {
         let dbs = make_dbs();
         {
             let mut d = dbs.borrow_mut();
-            d[0].set(Bytes::from_static(b"foo"), Entry::new_string(Bytes::from_static(b"bar")));
+            d[0].set(
+                Bytes::from_static(b"foo"),
+                Entry::new_string(Bytes::from_static(b"bar")),
+            );
         }
         // GET foo followed by PING
         let mut read_buf = BytesMut::new();
@@ -4846,7 +5022,10 @@ mod inline_dispatch_tests {
         let dbs = make_dbs();
         {
             let mut d = dbs.borrow_mut();
-            d[0].set(Bytes::from_static(b"foo"), Entry::new_string(Bytes::from_static(b"baz")));
+            d[0].set(
+                Bytes::from_static(b"foo"),
+                Entry::new_string(Bytes::from_static(b"baz")),
+            );
         }
         let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n"[..]);
         let mut write_buf = BytesMut::new();
@@ -4901,8 +5080,14 @@ mod inline_dispatch_tests {
         let dbs = make_dbs();
         {
             let mut d = dbs.borrow_mut();
-            d[0].set(Bytes::from_static(b"a"), Entry::new_string(Bytes::from_static(b"1")));
-            d[0].set(Bytes::from_static(b"b"), Entry::new_string(Bytes::from_static(b"2")));
+            d[0].set(
+                Bytes::from_static(b"a"),
+                Entry::new_string(Bytes::from_static(b"1")),
+            );
+            d[0].set(
+                Bytes::from_static(b"b"),
+                Entry::new_string(Bytes::from_static(b"2")),
+            );
         }
         let mut read_buf = BytesMut::new();
         read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n");

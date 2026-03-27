@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
+use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::framevec;
 /// Global monotonic client ID counter.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -71,7 +71,7 @@ pub fn select(args: &[Frame], selected_db: &mut usize, db_count: usize) -> Frame
         _ => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let index_str = match std::str::from_utf8(index_str) {
@@ -79,7 +79,7 @@ pub fn select(args: &[Frame], selected_db: &mut usize, db_count: usize) -> Frame
         Err(_) => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let index: usize = match index_str.parse() {
@@ -87,7 +87,7 @@ pub fn select(args: &[Frame], selected_db: &mut usize, db_count: usize) -> Frame
         Err(_) => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     if index >= db_count {
@@ -140,9 +140,20 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          rdb_last_bgsave_status:{}\r\n\
          aof_enabled:0\r\n\
          aof_rewrite_in_progress:0\r\n",
-        if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 },
+        if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1
+        } else {
+            0
+        },
         crate::command::persistence::LAST_SAVE_TIME.load(std::sync::atomic::Ordering::Relaxed),
-        if crate::command::persistence::BGSAVE_LAST_STATUS.load(std::sync::atomic::Ordering::Relaxed) { "ok" } else { "err" },
+        if crate::command::persistence::BGSAVE_LAST_STATUS
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            "ok"
+        } else {
+            "err"
+        },
     ));
     sections.push_str("\r\n");
 
@@ -190,9 +201,7 @@ pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
         Frame::BulkString(s) => s,
         Frame::SimpleString(s) => s,
         _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR invalid password type",
-            ));
+            return Frame::Error(Bytes::from_static(b"ERR invalid password type"));
         }
     };
 
@@ -217,10 +226,18 @@ pub fn auth_acl(
         1 => {
             let password = match extract_bytes_ref(&args[0]) {
                 Some(p) => String::from_utf8_lossy(p).to_string(),
-                None => return (Frame::Error(Bytes::from_static(b"ERR invalid password")), None),
+                None => {
+                    return (
+                        Frame::Error(Bytes::from_static(b"ERR invalid password")),
+                        None,
+                    );
+                }
             };
             match acl_table.read().unwrap().authenticate("default", &password) {
-                Some(username) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(username)),
+                Some(username) => (
+                    Frame::SimpleString(Bytes::from_static(b"OK")),
+                    Some(username),
+                ),
                 None => (
                     Frame::Error(Bytes::from_static(
                         b"WRONGPASS invalid username-password pair or user is disabled.",
@@ -232,11 +249,21 @@ pub fn auth_acl(
         2 => {
             let username = match extract_bytes_ref(&args[0]) {
                 Some(u) => String::from_utf8_lossy(u).to_string(),
-                None => return (Frame::Error(Bytes::from_static(b"ERR invalid username")), None),
+                None => {
+                    return (
+                        Frame::Error(Bytes::from_static(b"ERR invalid username")),
+                        None,
+                    );
+                }
             };
             let password = match extract_bytes_ref(&args[1]) {
                 Some(p) => String::from_utf8_lossy(p).to_string(),
-                None => return (Frame::Error(Bytes::from_static(b"ERR invalid password")), None),
+                None => {
+                    return (
+                        Frame::Error(Bytes::from_static(b"ERR invalid password")),
+                        None,
+                    );
+                }
             };
             match acl_table.read().unwrap().authenticate(&username, &password) {
                 Some(uname) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(uname)),
@@ -318,7 +345,7 @@ pub fn hello_acl(
                             current_proto,
                             None,
                             None,
-                        )
+                        );
                     }
                 };
                 let password = match extract_bytes_ref(&args[i + 2]) {
@@ -329,7 +356,7 @@ pub fn hello_acl(
                             current_proto,
                             None,
                             None,
-                        )
+                        );
                     }
                 };
                 match acl_table.read().unwrap().authenticate(&username, &password) {
@@ -461,7 +488,7 @@ pub fn replicaof(args: &[Frame]) -> (Frame, Option<ReplicaofAction>) {
                     b"ERR value is not an integer or out of range",
                 )),
                 None,
-            )
+            );
         }
     };
 
@@ -628,19 +655,13 @@ mod tests {
     #[test]
     fn test_ping_no_args() {
         let result = ping(&[]);
-        assert_eq!(
-            result,
-            Frame::SimpleString(Bytes::from_static(b"PONG"))
-        );
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"PONG")));
     }
 
     #[test]
     fn test_ping_with_arg() {
         let result = ping(&[Frame::BulkString(Bytes::from_static(b"hello"))]);
-        assert_eq!(
-            result,
-            Frame::BulkString(Bytes::from_static(b"hello"))
-        );
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"hello")));
     }
 
     #[test]
@@ -655,10 +676,7 @@ mod tests {
     #[test]
     fn test_echo() {
         let result = echo(&[Frame::BulkString(Bytes::from_static(b"hello"))]);
-        assert_eq!(
-            result,
-            Frame::BulkString(Bytes::from_static(b"hello"))
-        );
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"hello")));
     }
 
     #[test]
@@ -687,7 +705,9 @@ mod tests {
             &mut selected,
             16,
         );
-        assert!(matches!(result, Frame::Error(ref s) if s.as_ref() == b"ERR DB index is out of range"));
+        assert!(
+            matches!(result, Frame::Error(ref s) if s.as_ref() == b"ERR DB index is out of range")
+        );
         assert_eq!(selected, 0); // unchanged
     }
 
@@ -765,20 +785,14 @@ mod tests {
     #[test]
     fn test_auth_wrong_password() {
         let pass = Some("secret123".to_string());
-        let result = auth(
-            &[Frame::BulkString(Bytes::from_static(b"wrong"))],
-            &pass,
-        );
+        let result = auth(&[Frame::BulkString(Bytes::from_static(b"wrong"))], &pass);
         assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
     }
 
     #[test]
     fn test_auth_no_password_configured() {
         let pass: Option<String> = None;
-        let result = auth(
-            &[Frame::BulkString(Bytes::from_static(b"anything"))],
-            &pass,
-        );
+        let result = auth(&[Frame::BulkString(Bytes::from_static(b"anything"))], &pass);
         assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR Client sent AUTH")));
     }
 
@@ -1015,17 +1029,17 @@ mod tests {
     fn make_acl_table_with_password() -> std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>> {
         use crate::acl::{AclTable, AclUser};
         let mut table = AclTable::new();
-        table.set_user("default".to_string(), AclUser::new_default_with_password("secret"));
+        table.set_user(
+            "default".to_string(),
+            AclUser::new_default_with_password("secret"),
+        );
         std::sync::Arc::new(std::sync::RwLock::new(table))
     }
 
     #[test]
     fn test_auth_acl_1arg_nopass() {
         let table = make_acl_table();
-        let (resp, user) = auth_acl(
-            &[Frame::BulkString(Bytes::from_static(b"anypass"))],
-            &table,
-        );
+        let (resp, user) = auth_acl(&[Frame::BulkString(Bytes::from_static(b"anypass"))], &table);
         assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(user, Some("default".to_string()));
     }
@@ -1033,10 +1047,7 @@ mod tests {
     #[test]
     fn test_auth_acl_1arg_wrong_password() {
         let table = make_acl_table_with_password();
-        let (resp, user) = auth_acl(
-            &[Frame::BulkString(Bytes::from_static(b"wrong"))],
-            &table,
-        );
+        let (resp, user) = auth_acl(&[Frame::BulkString(Bytes::from_static(b"wrong"))], &table);
         assert!(matches!(resp, Frame::Error(ref s) if s.starts_with(b"WRONGPASS")));
         assert!(user.is_none());
     }
@@ -1044,10 +1055,7 @@ mod tests {
     #[test]
     fn test_auth_acl_1arg_correct_password() {
         let table = make_acl_table_with_password();
-        let (resp, user) = auth_acl(
-            &[Frame::BulkString(Bytes::from_static(b"secret"))],
-            &table,
-        );
+        let (resp, user) = auth_acl(&[Frame::BulkString(Bytes::from_static(b"secret"))], &table);
         assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(user, Some("default".to_string()));
     }

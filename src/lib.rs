@@ -55,7 +55,7 @@
     clippy::only_used_in_recursion,
     clippy::let_and_return,
     clippy::filter_next,
-    clippy::unwrap_or_default,
+    clippy::unwrap_or_default
 )]
 
 pub mod acl;
@@ -68,6 +68,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod pubsub;
 pub mod replication;
+pub mod runtime;
 pub mod scripting;
 pub mod server;
 pub mod shard;
@@ -75,4 +76,3 @@ pub mod storage;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-monoio"))]
 pub mod tls;
 pub mod tracking;
-pub mod runtime;

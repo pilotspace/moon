@@ -75,11 +75,7 @@ impl FdTable {
     }
 
     /// Insert fd and update kernel registration in one call.
-    pub fn insert_and_register(
-        &mut self,
-        fd: i32,
-        ring: &IoUring,
-    ) -> std::io::Result<Option<u32>> {
+    pub fn insert_and_register(&mut self, fd: i32, ring: &IoUring) -> std::io::Result<Option<u32>> {
         match self.insert(fd) {
             Some(idx) => {
                 self.update_registration(ring, idx)?;

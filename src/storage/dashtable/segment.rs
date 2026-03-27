@@ -18,7 +18,7 @@ use std::borrow::Borrow;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use super::simd::{Group, DELETED, EMPTY};
+use super::simd::{DELETED, EMPTY, Group};
 
 /// Number of regular (home) bucket slots per segment.
 pub const REGULAR_SLOTS: usize = 56;
@@ -71,7 +71,7 @@ pub enum InsertResult<K, V> {
 #[repr(C, align(64))]
 pub struct Segment<K, V> {
     // --- Cache line 0: control bytes (hot, read on every lookup) ---
-    ctrl: [Group; NUM_GROUPS],    // 64 bytes exactly = 1 cache line
+    ctrl: [Group; NUM_GROUPS], // 64 bytes exactly = 1 cache line
     // --- Cache line 1+: metadata ---
     count: u32,
     depth: u32,
@@ -92,7 +92,7 @@ const _: () = {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn prefetch_ptr(ptr: *const u8) {
-    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
     _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
 }
 
@@ -184,7 +184,12 @@ impl<K, V> Segment<K, V> {
         (0..TOTAL_SLOTS).filter_map(move |slot| {
             if Self::is_full_ctrl(self.ctrl_byte(slot)) {
                 // SAFETY: slot is FULL, so key and value are initialized.
-                Some(unsafe { (self.keys[slot].assume_init_ref(), self.values[slot].assume_init_ref()) })
+                Some(unsafe {
+                    (
+                        self.keys[slot].assume_init_ref(),
+                        self.values[slot].assume_init_ref(),
+                    )
+                })
             } else {
                 None
             }
@@ -223,7 +228,13 @@ impl<K, V> Segment<K, V> {
     /// Search order: group containing bucket_a, group containing bucket_b, then stash.
     /// Returns `Some(slot_index)` if found, `None` otherwise.
     #[allow(unused_unsafe)] // prefetch_ptr is unsafe on x86_64 but safe on aarch64
-    pub fn find<Q: ?Sized>(&self, h2: u8, key: &Q, bucket_a: usize, bucket_b: usize) -> Option<usize>
+    pub fn find<Q: ?Sized>(
+        &self,
+        h2: u8,
+        key: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+    ) -> Option<usize>
     where
         K: Borrow<Q>,
         Q: Eq,
@@ -241,7 +252,9 @@ impl<K, V> Segment<K, V> {
         if let Some(first_pos) = mask_a.lowest_set_bit() {
             let prefetch_slot = base_a + first_pos;
             if prefetch_slot < TOTAL_SLOTS {
-                unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+                unsafe {
+                    prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
+                }
             }
         }
 
@@ -270,7 +283,9 @@ impl<K, V> Segment<K, V> {
             if let Some(first_pos) = mask_b.lowest_set_bit() {
                 let prefetch_slot = base_b + first_pos;
                 if prefetch_slot < TOTAL_SLOTS {
-                    unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+                    unsafe {
+                        prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
+                    }
                 }
             }
 
@@ -547,14 +562,7 @@ impl<K, V> Segment<K, V> {
     }
 
     /// Insert during split -- panics if no room (should never happen during split).
-    fn insert_during_split(
-        &mut self,
-        h2: u8,
-        key: K,
-        value: V,
-        bucket_a: usize,
-        bucket_b: usize,
-    ) {
+    fn insert_during_split(&mut self, h2: u8, key: K, value: V, bucket_a: usize, bucket_b: usize) {
         // Try bucket_a's group first
         if let Some(slot) = self.find_free_slot_in_group(bucket_a / 16) {
             self.write_slot(slot, h2, key, value);

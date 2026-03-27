@@ -1,12 +1,12 @@
 #![allow(unused_imports)]
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
-use parking_lot::Mutex;
 #[cfg(feature = "runtime-tokio")]
 use crate::runtime::TcpListener;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
+use parking_lot::Mutex;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info};
 
 #[cfg(feature = "runtime-tokio")]
@@ -75,12 +75,19 @@ pub async fn run_with_shutdown(
 
     if config.appendonly == "yes" && aof_path.exists() {
         // Lock each db individually for AOF replay
-        let mut dbs_vec: Vec<Database> = db.iter().map(|lock| {
-            let mut guard = lock.write();
-            std::mem::replace(&mut *guard, Database::new())
-        }).collect();
+        let mut dbs_vec: Vec<Database> = db
+            .iter()
+            .map(|lock| {
+                let mut guard = lock.write();
+                std::mem::replace(&mut *guard, Database::new())
+            })
+            .collect();
         match aof::replay_aof(&mut dbs_vec, &aof_path) {
-            Ok(n) => info!("AOF loaded: {} commands replayed from {}", n, aof_path.display()),
+            Ok(n) => info!(
+                "AOF loaded: {} commands replayed from {}",
+                n,
+                aof_path.display()
+            ),
             Err(e) => error!("AOF load failed: {}. Starting with empty database.", e),
         }
         // Put databases back
@@ -88,10 +95,13 @@ pub async fn run_with_shutdown(
             *lock.write() = restored_db;
         }
     } else if rdb_path.exists() {
-        let mut dbs_vec: Vec<Database> = db.iter().map(|lock| {
-            let mut guard = lock.write();
-            std::mem::replace(&mut *guard, Database::new())
-        }).collect();
+        let mut dbs_vec: Vec<Database> = db
+            .iter()
+            .map(|lock| {
+                let mut guard = lock.write();
+                std::mem::replace(&mut *guard, Database::new())
+            })
+            .collect();
         match rdb::load(&mut dbs_vec, &rdb_path) {
             Ok(count) => info!("RDB loaded: {} keys from {}", count, rdb_path.display()),
             Err(e) => error!("Failed to load RDB: {}. Starting with empty database.", e),
@@ -155,14 +165,14 @@ pub async fn run_with_shutdown(
     let tracking_table = Arc::new(Mutex::new(TrackingTable::new()));
 
     // Create replication state -- load persisted repl_id or generate new one.
-    let (repl_id, repl_id2) = crate::replication::state::load_replication_state(
-        std::path::Path::new(&config.dir),
-    );
-    let repl_state = Arc::new(RwLock::new(crate::replication::state::ReplicationState::new(
-        1, // non-sharded mode uses 1 shard
-        repl_id,
-        repl_id2,
-    )));
+    let (repl_id, repl_id2) =
+        crate::replication::state::load_replication_state(std::path::Path::new(&config.dir));
+    let repl_state = Arc::new(RwLock::new(
+        crate::replication::state::ReplicationState::new(
+            1, // non-sharded mode uses 1 shard
+            repl_id, repl_id2,
+        ),
+    ));
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
     let acl_table: Arc<RwLock<crate::acl::AclTable>> = {
@@ -249,9 +259,8 @@ pub async fn run_sharded(
     // changes RuntimeConfig on the shard side but does not propagate to the listener.
     // This matches Redis behavior where listener-level checks use startup config.
     // To disable protected mode at runtime, clients must connect via loopback first.
-    let protected_mode_active = config.protected_mode == "yes"
-        && config.requirepass.is_none()
-        && config.aclfile.is_none();
+    let protected_mode_active =
+        config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none();
 
     let mut next_shard: usize = 0;
 
@@ -370,9 +379,8 @@ pub async fn run_sharded(
     info!("Listening on {} ({} shards, monoio)", addr, num_shards);
 
     // Note: protected_mode_active is evaluated once at startup (see tokio listener comment).
-    let protected_mode_active = config.protected_mode == "yes"
-        && config.requirepass.is_none()
-        && config.aclfile.is_none();
+    let protected_mode_active =
+        config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none();
 
     let mut next_shard: usize = 0;
 
@@ -388,7 +396,10 @@ pub async fn run_sharded(
     let tls_listener = if config.tls_port > 0 {
         let tls_addr = format!("{}:{}", config.bind, config.tls_port);
         let tl = monoio::net::TcpListener::bind(&tls_addr)?;
-        info!("TLS listening on {} ({} shards, monoio)", tls_addr, num_shards);
+        info!(
+            "TLS listening on {} ({} shards, monoio)",
+            tls_addr, num_shards
+        );
         Some(tl)
     } else {
         None

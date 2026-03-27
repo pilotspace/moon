@@ -54,10 +54,8 @@ impl CachedClock {
     /// Update the cached clock. Called once per shard tick (1ms).
     #[inline]
     pub fn update(&self) {
-        self.secs.store(
-            current_secs() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.secs
+            .store(current_secs() as u64, std::sync::atomic::Ordering::Relaxed);
         self.ms
             .store(current_time_ms(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -154,22 +152,12 @@ impl RedisValue {
     pub fn estimate_memory(&self) -> usize {
         match self {
             RedisValue::String(b) => b.len(),
-            RedisValue::Hash(map) => map
-                .iter()
-                .map(|(k, v)| k.len() + v.len() + 64)
-                .sum(),
-            RedisValue::List(list) => list
-                .iter()
-                .map(|elem| elem.len() + 24)
-                .sum(),
-            RedisValue::Set(set) => set
-                .iter()
-                .map(|member| member.len() + 24)
-                .sum(),
-            RedisValue::SortedSet { members, .. } => members
-                .iter()
-                .map(|(member, _)| member.len() + 80)
-                .sum(),
+            RedisValue::Hash(map) => map.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
+            RedisValue::List(list) => list.iter().map(|elem| elem.len() + 24).sum(),
+            RedisValue::Set(set) => set.iter().map(|member| member.len() + 24).sum(),
+            RedisValue::SortedSet { members, .. } => {
+                members.iter().map(|(member, _)| member.len() + 80).sum()
+            }
             RedisValue::HashListpack(lp)
             | RedisValue::ListListpack(lp)
             | RedisValue::SetListpack(lp)
@@ -178,10 +166,7 @@ impl RedisValue {
             RedisValue::SortedSetBPTree { tree, members } => {
                 // BPTree nodes + member HashMap
                 let tree_mem = tree.len() * 80; // approximate per-entry overhead
-                let member_mem: usize = members
-                    .iter()
-                    .map(|(member, _)| member.len() + 40)
-                    .sum();
+                let member_mem: usize = members.iter().map(|(member, _)| member.len() + 40).sum();
                 tree_mem + member_mem
             }
             RedisValue::Stream(s) => s.estimate_memory(),
@@ -200,11 +185,7 @@ pub fn lfu_log_incr(counter: u8, lfu_log_factor: u8) -> u8 {
     let r: f64 = rand::rng().random();
     let base_val = (counter as f64 - LFU_INIT_VAL as f64).max(0.0);
     let p = 1.0 / (base_val * lfu_log_factor as f64 + 1.0);
-    if r < p {
-        counter + 1
-    } else {
-        counter
-    }
+    if r < p { counter + 1 } else { counter }
 }
 
 /// Time-based decay for LFU counter.
@@ -564,11 +545,21 @@ mod tests {
 
     #[test]
     fn test_type_name() {
-        assert_eq!(RedisValue::String(Bytes::from_static(b"")).type_name(), "string");
+        assert_eq!(
+            RedisValue::String(Bytes::from_static(b"")).type_name(),
+            "string"
+        );
         assert_eq!(RedisValue::Hash(HashMap::new()).type_name(), "hash");
         assert_eq!(RedisValue::List(VecDeque::new()).type_name(), "list");
         assert_eq!(RedisValue::Set(HashSet::new()).type_name(), "set");
-        assert_eq!(RedisValue::SortedSet { members: HashMap::new(), scores: BTreeMap::new() }.type_name(), "zset");
+        assert_eq!(
+            RedisValue::SortedSet {
+                members: HashMap::new(),
+                scores: BTreeMap::new()
+            }
+            .type_name(),
+            "zset"
+        );
     }
 
     #[test]

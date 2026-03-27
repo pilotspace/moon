@@ -69,7 +69,8 @@ impl Intset {
                 let byte_pos = insert_pos * width;
                 let encoded = encode_value(value, self.encoding);
                 // Insert bytes at position
-                self.data.splice(byte_pos..byte_pos, encoded.iter().cloned());
+                self.data
+                    .splice(byte_pos..byte_pos, encoded.iter().cloned());
                 true
             }
         }
@@ -247,20 +248,23 @@ fn read_at(data: &[u8], encoding: IntsetEncoding, index: usize) -> i64 {
     let width = encoding.width();
     let offset = index * width;
     match encoding {
-        IntsetEncoding::Int16 => {
-            i16::from_le_bytes([data[offset], data[offset + 1]]) as i64
-        }
-        IntsetEncoding::Int32 => {
-            i32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-            ]) as i64
-        }
-        IntsetEncoding::Int64 => {
-            i64::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
-            ])
-        }
+        IntsetEncoding::Int16 => i16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
+        IntsetEncoding::Int32 => i32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as i64,
+        IntsetEncoding::Int64 => i64::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]),
     }
 }
 

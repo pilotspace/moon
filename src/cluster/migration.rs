@@ -12,8 +12,8 @@ use std::path::Path;
 
 use bytes::Bytes;
 
-use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
 use crate::cluster::slots::slot_for_key;
+use crate::cluster::{ClusterNode, ClusterState, NodeFlags};
 
 // --- nodes.conf persistence ---
 
@@ -263,7 +263,10 @@ mod tests {
         assert_eq!(new_state.epoch, 5);
 
         // Find the loaded node with our original ID
-        let loaded = new_state.nodes.get(&my_id).expect("original node not found");
+        let loaded = new_state
+            .nodes
+            .get(&my_id)
+            .expect("original node not found");
         assert!(loaded.owns_slot(0));
         assert!(loaded.owns_slot(100));
         assert!(!loaded.owns_slot(50));

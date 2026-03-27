@@ -3,9 +3,9 @@ use rand::seq::IndexedRandom;
 
 use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
+use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::lfu_decay;
-use crate::storage::Database;
 
 /// Compare two LRU timestamps with u16 wraparound handling.
 /// Uses signed-distance comparison: treats the 16-bit clock as circular.
@@ -206,8 +206,7 @@ fn evict_one_lfu(
                 Some(lowest) => {
                     effective_counter < lowest
                         || (effective_counter == lowest
-                            && oldest_access_for_tie
-                                .map_or(true, |t| lru_is_older(la, t)))
+                            && oldest_access_for_tie.map_or(true, |t| lru_is_older(la, t)))
                 }
             };
 
@@ -299,7 +298,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::{current_secs, current_time_ms, Entry};
+    use crate::storage::entry::{Entry, current_secs, current_time_ms};
 
     fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
         RuntimeConfig {
@@ -321,16 +320,46 @@ mod tests {
 
     #[test]
     fn test_eviction_policy_from_str() {
-        assert_eq!(EvictionPolicy::from_str("noeviction"), EvictionPolicy::NoEviction);
-        assert_eq!(EvictionPolicy::from_str("allkeys-lru"), EvictionPolicy::AllKeysLru);
-        assert_eq!(EvictionPolicy::from_str("allkeys-lfu"), EvictionPolicy::AllKeysLfu);
-        assert_eq!(EvictionPolicy::from_str("allkeys-random"), EvictionPolicy::AllKeysRandom);
-        assert_eq!(EvictionPolicy::from_str("volatile-lru"), EvictionPolicy::VolatileLru);
-        assert_eq!(EvictionPolicy::from_str("volatile-lfu"), EvictionPolicy::VolatileLfu);
-        assert_eq!(EvictionPolicy::from_str("volatile-random"), EvictionPolicy::VolatileRandom);
-        assert_eq!(EvictionPolicy::from_str("volatile-ttl"), EvictionPolicy::VolatileTtl);
-        assert_eq!(EvictionPolicy::from_str("ALLKEYS-LRU"), EvictionPolicy::AllKeysLru);
-        assert_eq!(EvictionPolicy::from_str("unknown"), EvictionPolicy::NoEviction);
+        assert_eq!(
+            EvictionPolicy::from_str("noeviction"),
+            EvictionPolicy::NoEviction
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("allkeys-lru"),
+            EvictionPolicy::AllKeysLru
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("allkeys-lfu"),
+            EvictionPolicy::AllKeysLfu
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("allkeys-random"),
+            EvictionPolicy::AllKeysRandom
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("volatile-lru"),
+            EvictionPolicy::VolatileLru
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("volatile-lfu"),
+            EvictionPolicy::VolatileLfu
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("volatile-random"),
+            EvictionPolicy::VolatileRandom
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("volatile-ttl"),
+            EvictionPolicy::VolatileTtl
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("ALLKEYS-LRU"),
+            EvictionPolicy::AllKeysLru
+        );
+        assert_eq!(
+            EvictionPolicy::from_str("unknown"),
+            EvictionPolicy::NoEviction
+        );
     }
 
     #[test]
@@ -414,7 +443,10 @@ mod tests {
     fn test_volatile_only_skips_persistent() {
         let mut db = Database::new();
         // Persistent key (no TTL)
-        db.set_string(Bytes::from_static(b"persistent"), Bytes::from_static(b"value"));
+        db.set_string(
+            Bytes::from_static(b"persistent"),
+            Bytes::from_static(b"value"),
+        );
         // Volatile key (has TTL)
         let future_ms = current_time_ms() + 3_600_000;
         db.set_string_with_expiry(

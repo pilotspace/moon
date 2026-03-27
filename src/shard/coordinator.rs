@@ -11,17 +11,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
+use ringbuf::traits::Producer;
 
-use crate::command::{dispatch as cmd_dispatch, DispatchResult};
+use crate::command::{DispatchResult, dispatch as cmd_dispatch};
+use crate::framevec;
 use crate::protocol::Frame;
 use crate::runtime::channel;
-use crate::shard::dispatch::{key_to_shard, ShardMessage};
+use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::entry::CachedClock;
 use crate::storage::Database;
-use crate::framevec;
+use crate::storage::entry::CachedClock;
 /// Coordinate a multi-key command across shards.
 ///
 /// Routes MGET, MSET, DEL (multi), UNLINK (multi), and EXISTS (multi)
@@ -38,9 +38,29 @@ pub async fn coordinate_multi_key(
     cached_clock: &CachedClock,
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
-        coordinate_mget(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers, cached_clock).await
+        coordinate_mget(
+            args,
+            my_shard,
+            num_shards,
+            db_index,
+            databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+        )
+        .await
     } else if cmd.eq_ignore_ascii_case(b"MSET") {
-        coordinate_mset(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers, cached_clock).await
+        coordinate_mset(
+            args,
+            my_shard,
+            num_shards,
+            db_index,
+            databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+        )
+        .await
     } else {
         // DEL, UNLINK, EXISTS with multiple keys
         coordinate_multi_del_or_exists(
@@ -239,7 +259,7 @@ async fn coordinate_mset(
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR wrong number of arguments for 'mset' command",
-                ))
+                ));
             }
         };
         let value = match extract_key(&pair[1]) {
@@ -247,7 +267,7 @@ async fn coordinate_mset(
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR wrong number of arguments for 'mset' command",
-                ))
+                ));
             }
         };
         let shard = key_to_shard(&key, num_shards);
@@ -348,8 +368,7 @@ async fn coordinate_multi_del_or_exists(
             dbs[db_index].refresh_now_from_cache(cached_clock);
             let db_count = dbs.len();
             let mut selected = db_index;
-            let result =
-                cmd_dispatch(&mut dbs[db_index], cmd, key_args, &mut selected, db_count);
+            let result = cmd_dispatch(&mut dbs[db_index], cmd, key_args, &mut selected, db_count);
             if let DispatchResult::Response(Frame::Integer(n)) = result {
                 total_count += n;
             }
@@ -479,12 +498,10 @@ pub async fn coordinate_scan(
 
     // Parse the composite cursor from the first arg
     let cursor_val: i64 = match &args[0] {
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0)
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0),
         Frame::Integer(n) => *n,
         _ => 0,
     };
@@ -510,7 +527,13 @@ pub async fn coordinate_scan(
         dbs[db_index].refresh_now_from_cache(cached_clock);
         let db_count = dbs.len();
         let mut selected = db_index;
-        let result = cmd_dispatch(&mut dbs[db_index], b"SCAN", &scan_args, &mut selected, db_count);
+        let result = cmd_dispatch(
+            &mut dbs[db_index],
+            b"SCAN",
+            &scan_args,
+            &mut selected,
+            db_count,
+        );
         match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
@@ -560,7 +583,8 @@ pub async fn coordinate_scan(
                 }
             } else {
                 // Continue on current shard
-                ((target_shard_id as u64) << 48) | (next_shard_cursor as u64 & 0x0000_FFFF_FFFF_FFFF)
+                ((target_shard_id as u64) << 48)
+                    | (next_shard_cursor as u64 & 0x0000_FFFF_FFFF_FFFF)
             };
 
             Frame::Array(framevec![
@@ -681,8 +705,17 @@ mod tests {
         // With num_shards=1, all keys are local
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
-        let result =
-            coordinate_mget(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers, &cached_clock).await;
+        let result = coordinate_mget(
+            &args,
+            0,
+            1,
+            0,
+            &databases,
+            &dispatch_tx,
+            &notifiers,
+            &cached_clock,
+        )
+        .await;
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 2);
@@ -710,7 +743,17 @@ mod tests {
 
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
-        let result = coordinate_mset(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers, &cached_clock).await;
+        let result = coordinate_mset(
+            &args,
+            0,
+            1,
+            0,
+            &databases,
+            &dispatch_tx,
+            &notifiers,
+            &cached_clock,
+        )
+        .await;
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify keys were set
@@ -740,8 +783,18 @@ mod tests {
 
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
-        let result =
-            coordinate_multi_del_or_exists(b"DEL", &args, 0, 1, 0, &databases, &dispatch_tx, &notifiers, &cached_clock).await;
+        let result = coordinate_multi_del_or_exists(
+            b"DEL",
+            &args,
+            0,
+            1,
+            0,
+            &databases,
+            &dispatch_tx,
+            &notifiers,
+            &cached_clock,
+        )
+        .await;
         assert_eq!(result, Frame::Integer(2)); // a and b deleted, nonexistent = 0
     }
 }

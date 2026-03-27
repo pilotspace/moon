@@ -12,7 +12,7 @@ pub mod buf_ring;
 pub mod uring_driver;
 
 #[cfg(target_os = "linux")]
-pub use uring_driver::{build_get_response_iovecs, IoEvent, UringConfig, UringDriver, WritevGuard};
+pub use uring_driver::{IoEvent, UringConfig, UringDriver, WritevGuard, build_get_response_iovecs};
 
 // Event type constants for io_uring user_data encoding.
 pub const EVENT_ACCEPT: u8 = 1;
@@ -92,7 +92,13 @@ mod tests {
 
     #[test]
     fn test_event_constants_unique() {
-        let constants = [EVENT_ACCEPT, EVENT_RECV, EVENT_SEND, EVENT_TIMEOUT, EVENT_WAKEUP];
+        let constants = [
+            EVENT_ACCEPT,
+            EVENT_RECV,
+            EVENT_SEND,
+            EVENT_TIMEOUT,
+            EVENT_WAKEUP,
+        ];
         for i in 0..constants.len() {
             for j in (i + 1)..constants.len() {
                 assert_ne!(
@@ -107,7 +113,13 @@ mod tests {
     #[test]
     fn test_encode_decode_all_event_types() {
         // Verify roundtrip for each event type constant
-        for &et in &[EVENT_ACCEPT, EVENT_RECV, EVENT_SEND, EVENT_TIMEOUT, EVENT_WAKEUP] {
+        for &et in &[
+            EVENT_ACCEPT,
+            EVENT_RECV,
+            EVENT_SEND,
+            EVENT_TIMEOUT,
+            EVENT_WAKEUP,
+        ] {
             let encoded = encode_user_data(et, 100, 200);
             let (dec_et, dec_cid, dec_aux) = decode_user_data(encoded);
             assert_eq!(dec_et, et, "event type roundtrip failed for {}", et);

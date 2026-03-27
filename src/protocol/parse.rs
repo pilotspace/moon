@@ -54,7 +54,10 @@ fn parse_single_frame_zc(
 ) -> Result<Frame, ParseError> {
     if depth > config.max_array_depth {
         return Err(ParseError::Invalid {
-            message: format!("array nesting depth {} exceeds maximum {}", depth, config.max_array_depth),
+            message: format!(
+                "array nesting depth {} exceeds maximum {}",
+                depth, config.max_array_depth
+            ),
             offset: *pos,
         });
     }
@@ -89,7 +92,9 @@ fn parse_single_frame_zc(
         }
         b'$' => {
             let len = read_decimal_zc(buf, pos)?;
-            if len == -1 { return Ok(Frame::Null); }
+            if len == -1 {
+                return Ok(Frame::Null);
+            }
             if len < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid bulk string length: {}", len),
@@ -99,7 +104,10 @@ fn parse_single_frame_zc(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
-                    message: format!("bulk string size {} exceeds maximum {}", len, config.max_bulk_string_size),
+                    message: format!(
+                        "bulk string size {} exceeds maximum {}",
+                        len, config.max_bulk_string_size
+                    ),
                     offset: *pos,
                 });
             }
@@ -114,7 +122,9 @@ fn parse_single_frame_zc(
         }
         b'*' => {
             let count = read_decimal_zc(buf, pos)?;
-            if count == -1 { return Ok(Frame::Null); }
+            if count == -1 {
+                return Ok(Frame::Null);
+            }
             if count < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid array count: {}", count),
@@ -124,7 +134,10 @@ fn parse_single_frame_zc(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
-                    message: format!("array length {} exceeds maximum {}", count, config.max_array_length),
+                    message: format!(
+                        "array length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
                     offset: *pos,
                 });
             }
@@ -136,7 +149,12 @@ fn parse_single_frame_zc(
         }
         b'%' => {
             let count = read_decimal_zc(buf, pos)?;
-            if count < 0 { return Err(ParseError::Invalid { message: "invalid map count".into(), offset: *pos }); }
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: "invalid map count".into(),
+                    offset: *pos,
+                });
+            }
             let count = count as usize;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
@@ -159,18 +177,26 @@ fn parse_single_frame_zc(
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
             let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
-                message: "invalid UTF-8 in double".into(), offset: *pos,
+                message: "invalid UTF-8 in double".into(),
+                offset: *pos,
             })?;
-            let f = if s == "inf" { f64::INFINITY }
-            else if s == "-inf" { f64::NEG_INFINITY }
-            else { s.parse::<f64>().map_err(|_| ParseError::Invalid {
-                message: format!("invalid double: {}", s), offset: *pos,
-            })? };
+            let f = if s == "inf" {
+                f64::INFINITY
+            } else if s == "-inf" {
+                f64::NEG_INFINITY
+            } else {
+                s.parse::<f64>().map_err(|_| ParseError::Invalid {
+                    message: format!("invalid double: {}", s),
+                    offset: *pos,
+                })?
+            };
             *pos = crlf + 2;
             Ok(Frame::Double(f))
         }
         b'#' => {
-            if *pos + 2 >= buf.len() { return Err(ParseError::Incomplete); }
+            if *pos + 2 >= buf.len() {
+                return Err(ParseError::Incomplete);
+            }
             let val = buf[*pos];
             // Boolean format: #t\r\n or #f\r\n — exactly 1 char then CRLF
             if (val != b't' && val != b'f') || buf[*pos + 1] != b'\r' || buf[*pos + 2] != b'\n' {
@@ -189,7 +215,9 @@ fn parse_single_frame_zc(
         b'=' => {
             let len = read_decimal_zc(buf, pos)? as usize;
             let remaining = buf.len() - *pos;
-            if remaining < len + 2 { return Err(ParseError::Incomplete); }
+            if remaining < len + 2 {
+                return Err(ParseError::Incomplete);
+            }
             let payload = &buf[*pos..*pos + len];
             let encoding = Bytes::copy_from_slice(&payload[..3]);
             let data = buf.slice(*pos + 4..*pos + len);
@@ -232,12 +260,7 @@ fn read_decimal_zc(buf: &Bytes, pos: &mut usize) -> Result<i64, ParseError> {
 /// Zero-copy frame extraction from a frozen `Bytes` buffer.
 /// Called AFTER validation succeeds, so all bounds are guaranteed safe.
 /// Uses `bytes.slice(start..end)` for zero-copy sub-slicing (Arc refcount bump only).
-fn parse_frame_zerocopy(
-    buf: &Bytes,
-    pos: &mut usize,
-    config: &ParseConfig,
-    depth: usize,
-) -> Frame {
+fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, depth: usize) -> Frame {
     let type_byte = buf[*pos];
     *pos += 1;
 
@@ -322,9 +345,13 @@ fn parse_frame_zerocopy(
             let crlf = find_crlf(buf, *pos).unwrap();
             let line = &buf[*pos..crlf];
             let s = std::str::from_utf8(line).unwrap();
-            let f = if s == "inf" { f64::INFINITY }
-            else if s == "-inf" { f64::NEG_INFINITY }
-            else { s.parse::<f64>().unwrap() };
+            let f = if s == "inf" {
+                f64::INFINITY
+            } else if s == "-inf" {
+                f64::NEG_INFINITY
+            } else {
+                s.parse::<f64>().unwrap()
+            };
             *pos = crlf + 2;
             Frame::Double(f)
         }
@@ -424,7 +451,10 @@ fn validate_frame(
 ) -> Result<(), ParseError> {
     if depth > config.max_array_depth {
         return Err(ParseError::Invalid {
-            message: format!("array nesting depth {} exceeds maximum {}", depth, config.max_array_depth),
+            message: format!(
+                "array nesting depth {} exceeds maximum {}",
+                depth, config.max_array_depth
+            ),
             offset: *pos,
         });
     }
@@ -496,7 +526,9 @@ fn validate_frame(
         }
         b'$' => {
             let len = read_decimal(buf, pos)?;
-            if len == -1 { return Ok(()); } // Null bulk string
+            if len == -1 {
+                return Ok(());
+            } // Null bulk string
             if len < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid bulk string length: {}", len),
@@ -506,7 +538,10 @@ fn validate_frame(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
-                    message: format!("bulk string size {} exceeds maximum {}", len, config.max_bulk_string_size),
+                    message: format!(
+                        "bulk string size {} exceeds maximum {}",
+                        len, config.max_bulk_string_size
+                    ),
                     offset: *pos,
                 });
             }
@@ -529,7 +564,10 @@ fn validate_frame(
             let len = len as usize;
             if len > config.max_bulk_string_size {
                 return Err(ParseError::Invalid {
-                    message: format!("verbatim string size {} exceeds maximum {}", len, config.max_bulk_string_size),
+                    message: format!(
+                        "verbatim string size {} exceeds maximum {}",
+                        len, config.max_bulk_string_size
+                    ),
                     offset: *pos,
                 });
             }
@@ -549,7 +587,9 @@ fn validate_frame(
         b'*' | b'~' | b'>' => {
             // Array, Set, Push: count + elements
             let count = read_decimal(buf, pos)?;
-            if count == -1 { return Ok(()); } // Null array
+            if count == -1 {
+                return Ok(());
+            } // Null array
             if count < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid array/set/push length: {}", count),
@@ -559,7 +599,10 @@ fn validate_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
-                    message: format!("length {} exceeds maximum {}", count, config.max_array_length),
+                    message: format!(
+                        "length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
                     offset: *pos,
                 });
             }
@@ -580,7 +623,10 @@ fn validate_frame(
             let count = count as usize;
             if count > config.max_array_length {
                 return Err(ParseError::Invalid {
-                    message: format!("map length {} exceeds maximum {}", count, config.max_array_length),
+                    message: format!(
+                        "map length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
                     offset: *pos,
                 });
             }
@@ -971,10 +1017,7 @@ mod tests {
     fn test_parse_binary_data_in_bulk_string() {
         // $4\r\n\r\n\r\n\r\n -- data is \r\n\r\n (4 bytes)
         let result = parse_bytes(b"$4\r\n\r\n\r\n\r\n").unwrap().unwrap();
-        assert_eq!(
-            result,
-            Frame::BulkString(Bytes::from_static(b"\r\n\r\n"))
-        );
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"\r\n\r\n")));
     }
 
     // === Null Array tests ===

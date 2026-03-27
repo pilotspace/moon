@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
-use crate::protocol::Frame;
-use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
-use crate::storage::Database;
 use crate::framevec;
+use crate::protocol::Frame;
+use crate::storage::Database;
+use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -29,11 +29,7 @@ fn parse_i64(frame: &Frame) -> Option<i64> {
 /// Helper: resolve a Redis index (possibly negative) to a usize position within a list of given length.
 /// Returns None if the resolved index is out of bounds.
 fn resolve_index(index: i64, len: usize) -> Option<usize> {
-    let resolved = if index < 0 {
-        len as i64 + index
-    } else {
-        index
-    };
+    let resolved = if index < 0 { len as i64 + index } else { index };
     if resolved < 0 || resolved >= len as i64 {
         None
     } else {
@@ -173,12 +169,12 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
             Some(_) => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
         }
     } else {
@@ -211,7 +207,12 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // If list is now empty, remove the key
-    if db.get_list(&key).ok().flatten().map_or(false, |l| l.is_empty()) {
+    if db
+        .get_list(&key)
+        .ok()
+        .flatten()
+        .map_or(false, |l| l.is_empty())
+    {
         db.remove(&key);
     }
 
@@ -246,12 +247,12 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
             Some(_) => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
         }
     } else {
@@ -280,7 +281,12 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    if db.get_list(&key).ok().flatten().map_or(false, |l| l.is_empty()) {
+    if db
+        .get_list(&key)
+        .ok()
+        .flatten()
+        .map_or(false, |l| l.is_empty())
+    {
         db.remove(&key);
     }
 
@@ -317,7 +323,7 @@ pub fn lrange(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let stop = match parse_i64(&args[2]) {
@@ -325,7 +331,7 @@ pub fn lrange(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
 
@@ -372,7 +378,7 @@ pub fn lindex(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
 
@@ -402,7 +408,7 @@ pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let element = match extract_bytes(&args[2]) {
@@ -455,9 +461,7 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
     } else if position.eq_ignore_ascii_case(b"AFTER") {
         false
     } else {
-        return Frame::Error(Bytes::from_static(
-            b"ERR syntax error",
-        ));
+        return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     };
 
     // If key doesn't exist, return 0
@@ -501,7 +505,7 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let element = match extract_bytes(&args[2]) {
@@ -572,7 +576,7 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let stop = match parse_i64(&args[2]) {
@@ -580,7 +584,7 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
 
@@ -663,7 +667,7 @@ pub fn lpos(db: &mut Database, args: &[Frame]) -> Frame {
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
         };
         i += 1;
@@ -676,16 +680,12 @@ pub fn lpos(db: &mut Database, args: &[Frame]) -> Frame {
             rank = val;
         } else if opt.eq_ignore_ascii_case(b"COUNT") {
             if val < 0 {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR COUNT can't be negative",
-                ));
+                return Frame::Error(Bytes::from_static(b"ERR COUNT can't be negative"));
             }
             count = Some(val as usize);
         } else if opt.eq_ignore_ascii_case(b"MAXLEN") {
             if val < 0 {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR MAXLEN can't be negative",
-                ));
+                return Frame::Error(Bytes::from_static(b"ERR MAXLEN can't be negative"));
             }
             maxlen = val as usize;
         } else {
@@ -802,7 +802,7 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let stop = match parse_i64(&args[2]) {
@@ -810,7 +810,7 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let lref = match db.get_list_ref_if_alive(key, now_ms) {
@@ -821,12 +821,17 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let len = lref.len() as i64;
     let mut s = if start < 0 { len + start } else { start };
     let mut e = if stop < 0 { len + stop } else { stop };
-    if s < 0 { s = 0; }
-    if e >= len { e = len - 1; }
+    if s < 0 {
+        s = 0;
+    }
+    if e >= len {
+        e = len - 1;
+    }
     if s > e || s >= len {
         return Frame::Array(framevec![]);
     }
-    let items: Vec<Frame> = lref.range(s as usize, e as usize)
+    let items: Vec<Frame> = lref
+        .range(s as usize, e as usize)
         .into_iter()
         .map(Frame::BulkString)
         .collect();
@@ -847,7 +852,7 @@ pub fn lindex_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let lref = match db.get_list_ref_if_alive(key, now_ms) {
@@ -895,7 +900,7 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
         };
         i += 1;
@@ -950,7 +955,9 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 } else {
                     matches.push(idx as i64);
                     match_count += 1;
-                    if match_count >= max_count { break; }
+                    if match_count >= max_count {
+                        break;
+                    }
                 }
             }
         }
@@ -959,7 +966,9 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         let scan_limit = if maxlen > 0 { maxlen.min(len) } else { len };
         let mut scanned = 0;
         for idx in (0..len).rev() {
-            if scanned >= scan_limit { break; }
+            if scanned >= scan_limit {
+                break;
+            }
             scanned += 1;
             if all_elements[idx] == element {
                 if skip > 0 {
@@ -967,7 +976,9 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 } else {
                     matches.push(idx as i64);
                     match_count += 1;
-                    if match_count >= max_count { break; }
+                    if match_count >= max_count {
+                        break;
+                    }
                 }
             }
         }
@@ -975,7 +986,11 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if count.is_some() {
         Frame::Array(matches.into_iter().map(Frame::Integer).collect())
     } else {
-        matches.first().copied().map(Frame::Integer).unwrap_or(Frame::Null)
+        matches
+            .first()
+            .copied()
+            .map(Frame::Integer)
+            .unwrap_or(Frame::Null)
     }
 }
 
@@ -1027,7 +1042,7 @@ pub fn lmove(db: &mut Database, args: &[Frame]) -> Frame {
     // If destination exists, type check it too (unless same as source)
     if source != destination {
         match db.get_list(&destination) {
-            Ok(_) => {}     // exists as list or missing -- both OK
+            Ok(_) => {}         // exists as list or missing -- both OK
             Err(e) => return e, // WRONGTYPE
         }
     }
@@ -1073,10 +1088,7 @@ mod tests {
         assert_eq!(result, Frame::Integer(3));
         // LPUSH a b c -> [c, b, a] (each pushed to front in order)
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(
-            range,
-            Frame::Array(framevec![bs(b"c"), bs(b"b"), bs(b"a")])
-        );
+        assert_eq!(range, Frame::Array(framevec![bs(b"c"), bs(b"b"), bs(b"a")]));
     }
 
     #[test]
@@ -1094,10 +1106,7 @@ mod tests {
         let result = rpush(&mut db, &[bs(b"mylist"), bs(b"a"), bs(b"b"), bs(b"c")]);
         assert_eq!(result, Frame::Integer(3));
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(
-            range,
-            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")])
-        );
+        assert_eq!(range, Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")]));
     }
 
     // --- LPOP tests ---
@@ -1115,10 +1124,7 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c"]);
         let result = lpop(&mut db, &[bs(b"mylist"), bs(b"2")]);
-        assert_eq!(
-            result,
-            Frame::Array(framevec![bs(b"a"), bs(b"b")])
-        );
+        assert_eq!(result, Frame::Array(framevec![bs(b"a"), bs(b"b")]));
     }
 
     #[test]
@@ -1151,10 +1157,7 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c"]);
         let result = rpop(&mut db, &[bs(b"mylist"), bs(b"2")]);
-        assert_eq!(
-            result,
-            Frame::Array(framevec![bs(b"c"), bs(b"b")])
-        );
+        assert_eq!(result, Frame::Array(framevec![bs(b"c"), bs(b"b")]));
     }
 
     #[test]
@@ -1188,10 +1191,7 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c", b"d"]);
         let result = lrange(&mut db, &[bs(b"mylist"), bs(b"1"), bs(b"2")]);
-        assert_eq!(
-            result,
-            Frame::Array(framevec![bs(b"b"), bs(b"c")])
-        );
+        assert_eq!(result, Frame::Array(framevec![bs(b"b"), bs(b"c")]));
     }
 
     #[test]
@@ -1266,7 +1266,9 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c"]);
         let result = lset(&mut db, &[bs(b"mylist"), bs(b"10"), bs(b"x")]);
-        assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"ERR index out of range")));
+        assert!(
+            matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"ERR index out of range"))
+        );
     }
 
     // --- LINSERT tests ---
@@ -1301,20 +1303,14 @@ mod tests {
     fn test_linsert_pivot_not_found() {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c"]);
-        let result = linsert(
-            &mut db,
-            &[bs(b"mylist"), bs(b"BEFORE"), bs(b"z"), bs(b"x")],
-        );
+        let result = linsert(&mut db, &[bs(b"mylist"), bs(b"BEFORE"), bs(b"z"), bs(b"x")]);
         assert_eq!(result, Frame::Integer(-1));
     }
 
     #[test]
     fn test_linsert_missing_key() {
         let mut db = Database::new();
-        let result = linsert(
-            &mut db,
-            &[bs(b"mylist"), bs(b"BEFORE"), bs(b"a"), bs(b"x")],
-        );
+        let result = linsert(&mut db, &[bs(b"mylist"), bs(b"BEFORE"), bs(b"a"), bs(b"x")]);
         assert_eq!(result, Frame::Integer(0));
     }
 
@@ -1327,10 +1323,7 @@ mod tests {
         let result = lrem(&mut db, &[bs(b"mylist"), bs(b"2"), bs(b"a")]);
         assert_eq!(result, Frame::Integer(2));
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(
-            range,
-            Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"a")])
-        );
+        assert_eq!(range, Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"a")]));
     }
 
     #[test]
@@ -1340,10 +1333,7 @@ mod tests {
         let result = lrem(&mut db, &[bs(b"mylist"), bs(b"-2"), bs(b"a")]);
         assert_eq!(result, Frame::Integer(2));
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(
-            range,
-            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")])
-        );
+        assert_eq!(range, Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")]));
     }
 
     #[test]
@@ -1373,10 +1363,7 @@ mod tests {
         let result = ltrim(&mut db, &[bs(b"mylist"), bs(b"1"), bs(b"3")]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         let range = lrange(&mut db, &[bs(b"mylist"), bs(b"0"), bs(b"-1")]);
-        assert_eq!(
-            range,
-            Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"d")])
-        );
+        assert_eq!(range, Frame::Array(framevec![bs(b"b"), bs(b"c"), bs(b"d")]));
     }
 
     #[test]
@@ -1439,7 +1426,14 @@ mod tests {
         // MAXLEN 2 only scans first 2 elements
         let result = lpos(
             &mut db,
-            &[bs(b"mylist"), bs(b"b"), bs(b"MAXLEN"), bs(b"2"), bs(b"COUNT"), bs(b"0")],
+            &[
+                bs(b"mylist"),
+                bs(b"b"),
+                bs(b"MAXLEN"),
+                bs(b"2"),
+                bs(b"COUNT"),
+                bs(b"0"),
+            ],
         );
         assert_eq!(result, Frame::Array(framevec![Frame::Integer(1)]));
     }
@@ -1474,14 +1468,20 @@ mod tests {
     fn test_lmove_right_right() {
         let mut db = Database::new();
         setup_list(&mut db, b"src", &[b"a", b"b", b"c"]);
-        let result = lmove(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"RIGHT"), bs(b"RIGHT")]);
+        let result = lmove(
+            &mut db,
+            &[bs(b"src"), bs(b"dst"), bs(b"RIGHT"), bs(b"RIGHT")],
+        );
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"c")));
     }
 
     #[test]
     fn test_lmove_empty_source() {
         let mut db = Database::new();
-        let result = lmove(&mut db, &[bs(b"nosrc"), bs(b"dst"), bs(b"LEFT"), bs(b"RIGHT")]);
+        let result = lmove(
+            &mut db,
+            &[bs(b"nosrc"), bs(b"dst"), bs(b"LEFT"), bs(b"RIGHT")],
+        );
         assert_eq!(result, Frame::Null);
     }
 
@@ -1490,7 +1490,10 @@ mod tests {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"a", b"b", b"c"]);
         // Rotate: pop right, push left -> c moves to front
-        let result = lmove(&mut db, &[bs(b"mylist"), bs(b"mylist"), bs(b"RIGHT"), bs(b"LEFT")]);
+        let result = lmove(
+            &mut db,
+            &[bs(b"mylist"), bs(b"mylist"), bs(b"RIGHT"), bs(b"LEFT")],
+        );
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"c")));
         let list = db.get_list(b"mylist").unwrap().unwrap();
         assert_eq!(list[0], Bytes::from_static(b"c"));

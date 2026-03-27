@@ -543,7 +543,10 @@ mod tests {
         let hash = hash_password("password");
         assert_eq!(hash.len(), 64); // 256 bits = 64 hex chars
         // Verify it's lowercase hex
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         // Known SHA256 of "password"
         assert_eq!(
             hash,
@@ -638,7 +641,10 @@ mod tests {
     fn test_apply_rule_commands() {
         let mut user = AclUser::default_deny("test".to_string());
         apply_rule(&mut user, "+@all");
-        assert!(matches!(user.allowed_commands, CommandPermissions::AllAllowed));
+        assert!(matches!(
+            user.allowed_commands,
+            CommandPermissions::AllAllowed
+        ));
 
         apply_rule(&mut user, "-@all");
         assert!(matches!(

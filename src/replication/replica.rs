@@ -8,15 +8,15 @@
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
-use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::replication::handshake::ReplicaHandshakeState;
-use crate::replication::state::{save_replication_state, ReplicationRole, ReplicationState};
+use crate::replication::state::{ReplicationRole, ReplicationState, save_replication_state};
 
 /// Configuration for the replica outbound connection task.
 pub struct ReplicaTaskConfig {
@@ -78,8 +78,8 @@ async fn run_handshake_and_stream(
     mut stream: TcpStream,
     cfg: &ReplicaTaskConfig,
 ) -> anyhow::Result<()> {
-    use crate::protocol::serialize;
     use crate::protocol::Frame;
+    use crate::protocol::serialize;
 
     let mut write_buf = BytesMut::new();
 
@@ -115,11 +115,7 @@ async fn run_handshake_and_stream(
     send_cmd!(
         &mut stream,
         &mut write_buf,
-        &[
-            b"REPLCONF" as &[u8],
-            b"listening-port",
-            port_str.as_bytes()
-        ]
+        &[b"REPLCONF" as &[u8], b"listening-port", port_str.as_bytes()]
     )?;
     let _ = read_line(&mut stream).await?; // +OK
 
@@ -127,13 +123,7 @@ async fn run_handshake_and_stream(
     send_cmd!(
         &mut stream,
         &mut write_buf,
-        &[
-            b"REPLCONF" as &[u8],
-            b"capa",
-            b"eof",
-            b"capa",
-            b"psync2"
-        ]
+        &[b"REPLCONF" as &[u8], b"capa", b"eof", b"capa", b"psync2"]
     )?;
     let _ = read_line(&mut stream).await?; // +OK
 
@@ -190,8 +180,11 @@ async fn run_handshake_and_stream(
                 }
                 // Persist new repl_id
                 if let Some(ref dir) = cfg.persistence_dir {
-                    let _ =
-                        save_replication_state(std::path::Path::new(dir), &rs.repl_id, &rs.repl_id2);
+                    let _ = save_replication_state(
+                        std::path::Path::new(dir),
+                        &rs.repl_id,
+                        &rs.repl_id2,
+                    );
                 }
             }
         }
@@ -234,10 +227,7 @@ async fn run_handshake_and_stream(
 /// Master sends RESP-encoded commands in the same format as the WAL (RESP Array frames).
 /// We parse each frame and route it to the correct shard via key_to_shard.
 #[cfg(feature = "runtime-tokio")]
-async fn stream_commands(
-    stream: &mut TcpStream,
-    cfg: &ReplicaTaskConfig,
-) -> anyhow::Result<()> {
+async fn stream_commands(stream: &mut TcpStream, cfg: &ReplicaTaskConfig) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(65536);
 
     loop {
@@ -248,8 +238,7 @@ async fn stream_commands(
 
         // Update local replication offset
         if let Ok(rs) = cfg.repl_state.read() {
-            rs.master_repl_offset
-                .fetch_add(n as u64, Ordering::Relaxed);
+            rs.master_repl_offset.fetch_add(n as u64, Ordering::Relaxed);
         }
 
         // Parse and dispatch commands from the received bytes
@@ -310,9 +299,9 @@ async fn run_handshake_and_stream(
     mut stream: monoio::net::TcpStream,
     cfg: &ReplicaTaskConfig,
 ) -> anyhow::Result<()> {
-    use monoio::io::AsyncWriteRentExt;
-    use crate::protocol::serialize;
     use crate::protocol::Frame;
+    use crate::protocol::serialize;
+    use monoio::io::AsyncWriteRentExt;
 
     let mut write_buf = BytesMut::new();
 
@@ -350,11 +339,7 @@ async fn run_handshake_and_stream(
     send_cmd!(
         &mut stream,
         &mut write_buf,
-        &[
-            b"REPLCONF" as &[u8],
-            b"listening-port",
-            port_str.as_bytes()
-        ]
+        &[b"REPLCONF" as &[u8], b"listening-port", port_str.as_bytes()]
     )?;
     let _ = read_line(&mut stream).await?;
 
@@ -362,13 +347,7 @@ async fn run_handshake_and_stream(
     send_cmd!(
         &mut stream,
         &mut write_buf,
-        &[
-            b"REPLCONF" as &[u8],
-            b"capa",
-            b"eof",
-            b"capa",
-            b"psync2"
-        ]
+        &[b"REPLCONF" as &[u8], b"capa", b"eof", b"capa", b"psync2"]
     )?;
     let _ = read_line(&mut stream).await?;
 
@@ -422,8 +401,11 @@ async fn run_handshake_and_stream(
                     };
                 }
                 if let Some(ref dir) = cfg.persistence_dir {
-                    let _ =
-                        save_replication_state(std::path::Path::new(dir), &rs.repl_id, &rs.repl_id2);
+                    let _ = save_replication_state(
+                        std::path::Path::new(dir),
+                        &rs.repl_id,
+                        &rs.repl_id2,
+                    );
                 }
             }
         }
@@ -478,8 +460,7 @@ async fn stream_commands(
         buf.extend_from_slice(&tmp[..n]);
 
         if let Ok(rs) = cfg.repl_state.read() {
-            rs.master_repl_offset
-                .fetch_add(n as u64, Ordering::Relaxed);
+            rs.master_repl_offset.fetch_add(n as u64, Ordering::Relaxed);
         }
 
         buf.clear();

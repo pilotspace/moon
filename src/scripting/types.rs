@@ -21,9 +21,7 @@ pub fn lua_value_to_frame(lua: &Lua, value: &LuaValue) -> mlua::Result<Frame> {
         LuaValue::Boolean(true) => Ok(Frame::Integer(1)),
         LuaValue::Integer(n) => Ok(Frame::Integer(*n)),
         LuaValue::Number(f) => Ok(Frame::Integer(*f as i64)), // truncate -- Redis behavior
-        LuaValue::String(s) => {
-            Ok(Frame::BulkString(Bytes::copy_from_slice(&s.as_bytes())))
-        }
+        LuaValue::String(s) => Ok(Frame::BulkString(Bytes::copy_from_slice(&s.as_bytes()))),
         LuaValue::Table(t) => {
             // Check for {ok = string} status reply
             if let Ok(LuaValue::String(s)) = t.get::<LuaValue>("ok") {
@@ -214,7 +212,8 @@ mod tests {
     #[test]
     fn test_frame_bulk_string_to_lua() {
         let lua = Lua::new();
-        let val = frame_to_lua_value(&lua, &Frame::BulkString(Bytes::from_static(b"hello"))).unwrap();
+        let val =
+            frame_to_lua_value(&lua, &Frame::BulkString(Bytes::from_static(b"hello"))).unwrap();
         match val {
             LuaValue::String(s) => assert_eq!(&*s.as_bytes(), b"hello"),
             _ => panic!("Expected String"),
@@ -224,7 +223,8 @@ mod tests {
     #[test]
     fn test_frame_simple_string_to_lua() {
         let lua = Lua::new();
-        let val = frame_to_lua_value(&lua, &Frame::SimpleString(Bytes::from_static(b"OK"))).unwrap();
+        let val =
+            frame_to_lua_value(&lua, &Frame::SimpleString(Bytes::from_static(b"OK"))).unwrap();
         match val {
             LuaValue::Table(t) => {
                 let ok: LuaValue = t.get("ok").unwrap();

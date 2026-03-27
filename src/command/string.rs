@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
-use crate::storage::entry::{current_time_ms, Entry};
 use crate::storage::Database;
+use crate::storage::entry::{Entry, current_time_ms};
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -36,7 +36,9 @@ pub fn get(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get(key) {
         Some(entry) => match entry.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         None => Frame::Null,
     }
@@ -90,7 +92,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"PX") {
@@ -103,7 +105,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"EXAT") {
@@ -118,7 +120,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"PXAT") {
@@ -133,7 +135,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"NX") {
@@ -154,7 +156,9 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     let old_value = if get_old {
         db.get(&key).map(|e| match e.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         })
     } else {
         None
@@ -180,11 +184,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
 
     // XX: only set if exists
     if xx && !db.exists(&key) {
-        return if get_old {
-            Frame::Null
-        } else {
-            Frame::Null
-        };
+        return if get_old { Frame::Null } else { Frame::Null };
     }
 
     // Determine final expiry
@@ -297,7 +297,7 @@ pub fn incrby(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     incrby_internal(db, key, delta)
@@ -317,7 +317,7 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     incrby_internal(db, key, -delta)
@@ -337,7 +337,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                         Err(_) => {
                             return Frame::Error(Bytes::from_static(
                                 b"ERR value is not an integer or out of range",
-                            ))
+                            ));
                         }
                     };
                     match s.parse::<i64>() {
@@ -345,14 +345,14 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                         Err(_) => {
                             return Frame::Error(Bytes::from_static(
                                 b"ERR value is not an integer or out of range",
-                            ))
+                            ));
                         }
                     }
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
+                    ));
                 }
             }
         }
@@ -364,13 +364,17 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR increment or decrement would overflow",
-            ))
+            ));
         }
     };
 
     // Store new value preserving existing TTL
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(Bytes::from(new_val.to_string()), existing_expiry_ms, base_ts)
+        Entry::new_string_with_expiry(
+            Bytes::from(new_val.to_string()),
+            existing_expiry_ms,
+            base_ts,
+        )
     } else {
         Entry::new_string(Bytes::from(new_val.to_string()))
     };
@@ -392,11 +396,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let increment = match parse_f64(&args[1]) {
         Some(f) => f,
-        None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR value is not a valid float",
-            ))
-        }
+        None => return Frame::Error(Bytes::from_static(b"ERR value is not a valid float")),
     };
     if increment.is_nan() {
         return Frame::Error(Bytes::from_static(
@@ -416,7 +416,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                         Err(_) => {
                             return Frame::Error(Bytes::from_static(
                                 b"ERR value is not a valid float",
-                            ))
+                            ));
                         }
                     };
                     match s.parse::<f64>() {
@@ -424,14 +424,14 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                         Err(_) => {
                             return Frame::Error(Bytes::from_static(
                                 b"ERR value is not a valid float",
-                            ))
+                            ));
                         }
                     }
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
+                    ));
                 }
             }
         }
@@ -483,7 +483,7 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
+                    ));
                 }
             }
         }
@@ -525,7 +525,9 @@ pub fn strlen(db: &mut Database, args: &[Frame]) -> Frame {
     match db.get(key) {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => Frame::Integer(v.len() as i64),
-            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         None => Frame::Integer(0),
     }
@@ -567,7 +569,7 @@ pub fn setex(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     if seconds <= 0 {
@@ -598,7 +600,7 @@ pub fn psetex(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     if millis <= 0 {
@@ -630,7 +632,9 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
 
     let old = db.get(&key).map(|e| match e.value.as_bytes_owned() {
         Some(v) => Frame::BulkString(v),
-        None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        None => Frame::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
     });
 
     // GETSET removes TTL (sets new entry without expiry)
@@ -651,7 +655,9 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
     match db.remove(key) {
         Some(entry) => match entry.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         None => Frame::Null,
     }
@@ -674,7 +680,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                ))
+                ));
             }
         },
         None => return Frame::Null,
@@ -704,7 +710,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"PX") {
@@ -720,7 +726,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"EXAT") {
@@ -736,7 +742,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else if opt.eq_ignore_ascii_case(b"PXAT") {
@@ -752,7 +758,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -775,11 +781,7 @@ fn parse_i64(frame: &Frame) -> Option<i64> {
 /// Parse a Frame argument as positive i64 (> 0).
 fn parse_positive_i64(frame: &Frame) -> Option<i64> {
     let v = parse_i64(frame)?;
-    if v > 0 {
-        Some(v)
-    } else {
-        None
-    }
+    if v > 0 { Some(v) } else { None }
 }
 
 /// Parse a Frame argument as f64.
@@ -817,7 +819,9 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_if_alive(key, now_ms) {
         Some(entry) => match entry.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         None => Frame::Null,
     }
@@ -860,7 +864,9 @@ pub fn strlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_if_alive(key, now_ms) {
         Some(entry) => match entry.value.as_bytes() {
             Some(v) => Frame::Integer(v.len() as i64),
-            None => Frame::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         None => Frame::Integer(0),
     }
@@ -972,10 +978,7 @@ mod tests {
     #[test]
     fn test_set_px() {
         let mut db = make_db();
-        let result = set(
-            &mut db,
-            &[bs(b"key"), bs(b"val"), bs(b"PX"), bs(b"10000")],
-        );
+        let result = set(&mut db, &[bs(b"key"), bs(b"val"), bs(b"PX"), bs(b"10000")]);
         assert_eq!(result, ok());
         let entry = db.get(b"key").unwrap();
         assert!(entry.has_expiry());
@@ -1048,7 +1051,14 @@ mod tests {
         let mut db = make_db();
         let result = mset(
             &mut db,
-            &[bs(b"k1"), bs(b"v1"), bs(b"k2"), bs(b"v2"), bs(b"k3"), bs(b"v3")],
+            &[
+                bs(b"k1"),
+                bs(b"v1"),
+                bs(b"k2"),
+                bs(b"v2"),
+                bs(b"k3"),
+                bs(b"v3"),
+            ],
         );
         assert_eq!(result, ok());
         assert_eq!(

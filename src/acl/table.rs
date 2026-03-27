@@ -221,16 +221,13 @@ impl AclTable {
     /// Apply ACL SETUSER rules to create or modify a user.
     /// Creates user if not exists (default-deny for new non-default users).
     pub fn apply_setuser(&mut self, username: &str, rules: &[&str]) {
-        let user = self
-            .users
-            .entry(username.to_string())
-            .or_insert_with(|| {
-                if username == "default" {
-                    AclUser::new_default_nopass()
-                } else {
-                    AclUser::default_deny(username.to_string())
-                }
-            });
+        let user = self.users.entry(username.to_string()).or_insert_with(|| {
+            if username == "default" {
+                AclUser::new_default_nopass()
+            } else {
+                AclUser::default_deny(username.to_string())
+            }
+        });
         for rule in rules {
             apply_rule(user, rule);
         }
@@ -264,9 +261,7 @@ impl AclTable {
         if !user.enabled {
             return Some(format!("User {} is disabled", username));
         }
-        let cmd_str = std::str::from_utf8(cmd)
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let cmd_str = std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase();
         if !user.is_command_allowed(&cmd_str) {
             return Some(format!(
                 "User {} has no permissions to run the '{}' command",
@@ -315,17 +310,10 @@ impl AclTable {
     }
 
     /// Check channel access for pub/sub.
-    pub fn check_channel_permission(
-        &self,
-        username: &str,
-        channel: &[u8],
-    ) -> Option<String> {
+    pub fn check_channel_permission(&self, username: &str, channel: &[u8]) -> Option<String> {
         let user = self.users.get(username)?;
         if user.channel_patterns.is_empty() {
-            return Some(format!(
-                "User {} has no channel permissions",
-                username
-            ));
+            return Some(format!("User {} has no channel permissions", username));
         }
         let channel_str = std::str::from_utf8(channel).unwrap_or("");
         let allowed = user
@@ -356,18 +344,17 @@ fn extract_command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Vec<&'a [u8]> {
         // Single key commands: key is args[0]
         b"get" | b"set" | b"incr" | b"decr" | b"incrby" | b"decrby" | b"incrbyfloat"
         | b"append" | b"strlen" | b"setnx" | b"setex" | b"psetex" | b"getset" | b"getdel"
-        | b"getex" | b"hget" | b"hset" | b"hdel" | b"hmget" | b"hmset" | b"hgetall"
-        | b"hkeys" | b"hvals" | b"hlen" | b"hexists" | b"hincrby" | b"hincrbyfloat"
-        | b"hscan" | b"lpush" | b"rpush" | b"lpop" | b"rpop" | b"lrange" | b"llen"
-        | b"linsert" | b"lindex" | b"lset" | b"ltrim" | b"lpos" | b"sadd" | b"srem"
-        | b"smembers" | b"sismember" | b"smismember" | b"scard" | b"srandmember" | b"spop"
-        | b"sscan" | b"smove" | b"zadd" | b"zrem" | b"zscore" | b"zrange" | b"zrangebyscore"
-        | b"zrangebylex" | b"zrevrange" | b"zrevrangebyscore" | b"zrevrangebylex" | b"zrank"
-        | b"zrevrank" | b"zcard" | b"zincrby" | b"zcount" | b"zlexcount" | b"zpopmin"
-        | b"zpopmax" | b"bzpopmin" | b"bzpopmax" | b"zscan" | b"zmscore" | b"xadd"
-        | b"xread" | b"xlen" | b"xrange" | b"xrevrange" | b"xtrim" | b"xdel" | b"xinfo"
-        | b"xpending" | b"expire" | b"pexpire" | b"ttl" | b"pttl" | b"persist" | b"type"
-        | b"unlink" | b"object" => {
+        | b"getex" | b"hget" | b"hset" | b"hdel" | b"hmget" | b"hmset" | b"hgetall" | b"hkeys"
+        | b"hvals" | b"hlen" | b"hexists" | b"hincrby" | b"hincrbyfloat" | b"hscan" | b"lpush"
+        | b"rpush" | b"lpop" | b"rpop" | b"lrange" | b"llen" | b"linsert" | b"lindex" | b"lset"
+        | b"ltrim" | b"lpos" | b"sadd" | b"srem" | b"smembers" | b"sismember" | b"smismember"
+        | b"scard" | b"srandmember" | b"spop" | b"sscan" | b"smove" | b"zadd" | b"zrem"
+        | b"zscore" | b"zrange" | b"zrangebyscore" | b"zrangebylex" | b"zrevrange"
+        | b"zrevrangebyscore" | b"zrevrangebylex" | b"zrank" | b"zrevrank" | b"zcard"
+        | b"zincrby" | b"zcount" | b"zlexcount" | b"zpopmin" | b"zpopmax" | b"bzpopmin"
+        | b"bzpopmax" | b"zscan" | b"zmscore" | b"xadd" | b"xread" | b"xlen" | b"xrange"
+        | b"xrevrange" | b"xtrim" | b"xdel" | b"xinfo" | b"xpending" | b"expire" | b"pexpire"
+        | b"ttl" | b"pttl" | b"persist" | b"type" | b"unlink" | b"object" => {
             if let Some(frame) = args.first() {
                 extract_key_bytes(frame)
                     .map(|k| vec![k])
@@ -403,17 +390,13 @@ fn extract_command_keys<'a>(cmd: &[u8], args: &'a [Frame]) -> Vec<&'a [u8]> {
         // LMOVE, BLMOVE: first two args are keys
         b"lmove" | b"blmove" => args.iter().take(2).filter_map(extract_key_bytes).collect(),
         // SINTER, SUNION, SDIFF: all args are keys
-        b"sinter" | b"sunion" | b"sdiff" => {
-            args.iter().filter_map(extract_key_bytes).collect()
-        }
+        b"sinter" | b"sunion" | b"sdiff" => args.iter().filter_map(extract_key_bytes).collect(),
         // SINTERSTORE, SUNIONSTORE, SDIFFSTORE: all args (dest + sources)
         b"sinterstore" | b"sunionstore" | b"sdiffstore" => {
             args.iter().filter_map(extract_key_bytes).collect()
         }
         // ZUNIONSTORE, ZINTERSTORE: all key args
-        b"zunionstore" | b"zinterstore" => {
-            args.iter().filter_map(extract_key_bytes).collect()
-        }
+        b"zunionstore" | b"zinterstore" => args.iter().filter_map(extract_key_bytes).collect(),
         // No key extraction for admin/connection commands
         _ => vec![],
     }
@@ -446,9 +429,16 @@ mod tests {
         let user = table.get_user("default").unwrap();
         assert!(user.enabled);
         assert!(user.nopass);
-        assert!(user.key_patterns.iter().any(|kp| kp.pattern == "*" && kp.read && kp.write));
+        assert!(
+            user.key_patterns
+                .iter()
+                .any(|kp| kp.pattern == "*" && kp.read && kp.write)
+        );
         assert!(user.channel_patterns.contains(&"*".to_string()));
-        assert!(matches!(user.allowed_commands, CommandPermissions::AllAllowed));
+        assert!(matches!(
+            user.allowed_commands,
+            CommandPermissions::AllAllowed
+        ));
     }
 
     #[test]
@@ -465,8 +455,16 @@ mod tests {
     fn test_check_command_permission_allallowed() {
         let table = AclTable::load_or_default(&make_config(None));
         let args: Vec<Frame> = vec![Frame::BulkString(Bytes::from_static(b"key"))];
-        assert!(table.check_command_permission("default", b"SET", &args).is_none());
-        assert!(table.check_command_permission("default", b"GET", &args).is_none());
+        assert!(
+            table
+                .check_command_permission("default", b"SET", &args)
+                .is_none()
+        );
+        assert!(
+            table
+                .check_command_permission("default", b"GET", &args)
+                .is_none()
+        );
     }
 
     #[test]
@@ -475,9 +473,17 @@ mod tests {
         table.apply_setuser("alice", &["on", "nopass", "~*", "+@all", "-set"]);
         let args: Vec<Frame> = vec![Frame::BulkString(Bytes::from_static(b"key"))];
         // SET denied
-        assert!(table.check_command_permission("alice", b"SET", &args).is_some());
+        assert!(
+            table
+                .check_command_permission("alice", b"SET", &args)
+                .is_some()
+        );
         // GET still allowed (+@all -set means everything except set)
-        assert!(table.check_command_permission("alice", b"GET", &args).is_none());
+        assert!(
+            table
+                .check_command_permission("alice", b"GET", &args)
+                .is_none()
+        );
     }
 
     #[test]
@@ -491,7 +497,11 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"v2")),
         ];
         // Both keys match ~cache:*
-        assert!(table.check_key_permission("alice", b"MSET", &args, true).is_none());
+        assert!(
+            table
+                .check_key_permission("alice", b"MSET", &args, true)
+                .is_none()
+        );
 
         // Now try with a key that doesn't match
         let args2 = vec![
@@ -500,13 +510,20 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"other:k2")),
             Frame::BulkString(Bytes::from_static(b"v2")),
         ];
-        assert!(table.check_key_permission("alice", b"MSET", &args2, true).is_some());
+        assert!(
+            table
+                .check_key_permission("alice", b"MSET", &args2, true)
+                .is_some()
+        );
     }
 
     #[test]
     fn test_authenticate_success() {
         let table = AclTable::load_or_default(&make_config(Some("secret")));
-        assert_eq!(table.authenticate("default", "secret"), Some("default".to_string()));
+        assert_eq!(
+            table.authenticate("default", "secret"),
+            Some("default".to_string())
+        );
     }
 
     #[test]
@@ -518,7 +535,10 @@ mod tests {
     #[test]
     fn test_authenticate_nopass() {
         let table = AclTable::load_or_default(&make_config(None));
-        assert_eq!(table.authenticate("default", "anypass"), Some("default".to_string()));
+        assert_eq!(
+            table.authenticate("default", "anypass"),
+            Some("default".to_string())
+        );
     }
 
     #[test]
@@ -558,23 +578,50 @@ mod tests {
     fn test_check_channel_permission() {
         let mut table = AclTable::load_or_default(&make_config(None));
         table.apply_setuser("alice", &["on", "nopass", "&events:*", "+@all", "~*"]);
-        assert!(table.check_channel_permission("alice", b"events:foo").is_none());
-        assert!(table.check_channel_permission("alice", b"other:foo").is_some());
+        assert!(
+            table
+                .check_channel_permission("alice", b"events:foo")
+                .is_none()
+        );
+        assert!(
+            table
+                .check_channel_permission("alice", b"other:foo")
+                .is_some()
+        );
     }
 
     #[test]
     fn test_check_key_permission_read_write_patterns() {
         let mut table = AclTable::load_or_default(&make_config(None));
-        table.apply_setuser("alice", &["on", "nopass", "%R~data:*", "%W~write:*", "+@all"]);
+        table.apply_setuser(
+            "alice",
+            &["on", "nopass", "%R~data:*", "%W~write:*", "+@all"],
+        );
         let args_r = vec![Frame::BulkString(Bytes::from_static(b"data:foo"))];
         let args_w = vec![Frame::BulkString(Bytes::from_static(b"write:bar"))];
         // Read access to data:* should work
-        assert!(table.check_key_permission("alice", b"GET", &args_r, false).is_none());
+        assert!(
+            table
+                .check_key_permission("alice", b"GET", &args_r, false)
+                .is_none()
+        );
         // Write access to data:* should fail (read-only pattern)
-        assert!(table.check_key_permission("alice", b"SET", &args_r, true).is_some());
+        assert!(
+            table
+                .check_key_permission("alice", b"SET", &args_r, true)
+                .is_some()
+        );
         // Write access to write:* should work
-        assert!(table.check_key_permission("alice", b"SET", &args_w, true).is_none());
+        assert!(
+            table
+                .check_key_permission("alice", b"SET", &args_w, true)
+                .is_none()
+        );
         // Read access to write:* should fail (write-only pattern)
-        assert!(table.check_key_permission("alice", b"GET", &args_w, false).is_some());
+        assert!(
+            table
+                .check_key_permission("alice", b"GET", &args_w, false)
+                .is_some()
+        );
     }
 }

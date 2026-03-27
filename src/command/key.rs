@@ -1,10 +1,10 @@
 use bytes::Bytes;
 
+use crate::framevec;
 use crate::protocol::Frame;
+use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::current_time_ms;
-use crate::storage::Database;
-use crate::framevec;
 /// Helper: build an ERR frame for wrong number of arguments.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -24,9 +24,7 @@ fn extract_key(frame: &Frame) -> Option<&[u8]> {
 /// Parse an integer argument from a Frame.
 fn parse_int(frame: &Frame) -> Option<i64> {
     match frame {
-        Frame::BulkString(s) | Frame::SimpleString(s) => {
-            std::str::from_utf8(s).ok()?.parse().ok()
-        }
+        Frame::BulkString(s) | Frame::SimpleString(s) => std::str::from_utf8(s).ok()?.parse().ok(),
         Frame::Integer(n) => Some(*n),
         _ => None,
     }
@@ -86,7 +84,7 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     if seconds <= 0 {
@@ -118,7 +116,7 @@ pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     if millis <= 0 {
@@ -276,14 +274,14 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
     } else if subcommand.eq_ignore_ascii_case(b"HELP") {
         Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
-            Frame::BulkString(Bytes::from_static(b"  Return the encoding of the object stored at <key>.")),
+            Frame::BulkString(Bytes::from_static(
+                b"  Return the encoding of the object stored at <key>."
+            )),
             Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
             Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
         ])
     } else {
-        Frame::Error(Bytes::from_static(
-            b"ERR unknown OBJECT subcommand",
-        ))
+        Frame::Error(Bytes::from_static(b"ERR unknown OBJECT subcommand"))
     }
 }
 
@@ -569,11 +567,7 @@ pub fn scan(db: &mut Database, args: &[Frame]) -> Frame {
         .and_then(|s| s.parse().ok())
     {
         Some(c) => c,
-        None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR invalid cursor",
-            ))
-        }
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
 
     // Parse optional arguments
@@ -796,9 +790,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         .and_then(|s| s.parse().ok())
     {
         Some(c) => c,
-        None => {
-            return Frame::Error(Bytes::from_static(b"ERR invalid cursor"))
-        }
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
     };
 
     let mut match_pattern: Option<&[u8]> = None;
@@ -838,7 +830,8 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 
     // Collect all non-expired keys sorted for deterministic iteration
-    let mut sorted_keys: Vec<CompactKey> = db.keys()
+    let mut sorted_keys: Vec<CompactKey> = db
+        .keys()
         .filter(|k| db.exists_if_alive(k.as_bytes(), now_ms))
         .cloned()
         .collect();
@@ -891,7 +884,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::{current_time_ms, Entry};
+    use crate::storage::entry::{Entry, current_time_ms};
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
@@ -929,9 +922,18 @@ mod tests {
     #[test]
     fn test_del_multiple() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"a"), Entry::new_string(Bytes::from_static(b"1")));
-        db.set(Bytes::from_static(b"b"), Entry::new_string(Bytes::from_static(b"2")));
-        db.set(Bytes::from_static(b"c"), Entry::new_string(Bytes::from_static(b"3")));
+        db.set(
+            Bytes::from_static(b"a"),
+            Entry::new_string(Bytes::from_static(b"1")),
+        );
+        db.set(
+            Bytes::from_static(b"b"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
+        db.set(
+            Bytes::from_static(b"c"),
+            Entry::new_string(Bytes::from_static(b"3")),
+        );
         let result = del(&mut db, &[bs(b"a"), bs(b"c")]);
         assert_eq!(result, Frame::Integer(2));
         assert!(db.exists(b"b"));
@@ -1039,11 +1041,7 @@ mod tests {
 
     #[test]
     fn test_persist_removes_ttl() {
-        let mut db = setup_db_with_expiry(
-            b"foo",
-            b"bar",
-            current_time_ms() + 3_600_000,
-        );
+        let mut db = setup_db_with_expiry(b"foo", b"bar", current_time_ms() + 3_600_000);
         // Verify TTL exists
         let t = ttl(&mut db, &[bs(b"foo")]);
         match t {
@@ -1142,9 +1140,18 @@ mod tests {
     #[test]
     fn test_keys_all() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"foo"), Entry::new_string(Bytes::from_static(b"1")));
-        db.set(Bytes::from_static(b"bar"), Entry::new_string(Bytes::from_static(b"2")));
-        db.set(Bytes::from_static(b"baz"), Entry::new_string(Bytes::from_static(b"3")));
+        db.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"1")),
+        );
+        db.set(
+            Bytes::from_static(b"bar"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
+        db.set(
+            Bytes::from_static(b"baz"),
+            Entry::new_string(Bytes::from_static(b"3")),
+        );
         let result = keys(&mut db, &[bs(b"*")]);
         match result {
             Frame::Array(arr) => assert_eq!(arr.len(), 3),
@@ -1155,9 +1162,18 @@ mod tests {
     #[test]
     fn test_keys_pattern() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"hello"), Entry::new_string(Bytes::from_static(b"1")));
-        db.set(Bytes::from_static(b"hallo"), Entry::new_string(Bytes::from_static(b"2")));
-        db.set(Bytes::from_static(b"world"), Entry::new_string(Bytes::from_static(b"3")));
+        db.set(
+            Bytes::from_static(b"hello"),
+            Entry::new_string(Bytes::from_static(b"1")),
+        );
+        db.set(
+            Bytes::from_static(b"hallo"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
+        db.set(
+            Bytes::from_static(b"world"),
+            Entry::new_string(Bytes::from_static(b"3")),
+        );
         let result = keys(&mut db, &[bs(b"h?llo")]);
         match result {
             Frame::Array(arr) => assert_eq!(arr.len(), 2),
@@ -1231,8 +1247,14 @@ mod tests {
     #[test]
     fn test_rename_overwrites_dest() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"src"), Entry::new_string(Bytes::from_static(b"srcval")));
-        db.set(Bytes::from_static(b"dst"), Entry::new_string(Bytes::from_static(b"dstval")));
+        db.set(
+            Bytes::from_static(b"src"),
+            Entry::new_string(Bytes::from_static(b"srcval")),
+        );
+        db.set(
+            Bytes::from_static(b"dst"),
+            Entry::new_string(Bytes::from_static(b"dstval")),
+        );
         rename(&mut db, &[bs(b"src"), bs(b"dst")]);
         assert!(!db.exists(b"src"));
         let entry = db.get(b"dst").unwrap();
@@ -1253,8 +1275,14 @@ mod tests {
     #[test]
     fn test_renamenx_dest_exists() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"src"), Entry::new_string(Bytes::from_static(b"1")));
-        db.set(Bytes::from_static(b"dst"), Entry::new_string(Bytes::from_static(b"2")));
+        db.set(
+            Bytes::from_static(b"src"),
+            Entry::new_string(Bytes::from_static(b"1")),
+        );
+        db.set(
+            Bytes::from_static(b"dst"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
         let result = renamenx(&mut db, &[bs(b"src"), bs(b"dst")]);
         assert_eq!(result, Frame::Integer(0));
         // Both keys should still exist
@@ -1275,9 +1303,18 @@ mod tests {
     #[test]
     fn test_unlink_multiple() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"a"), Entry::new_string(Bytes::from_static(b"1")));
-        db.set(Bytes::from_static(b"b"), Entry::new_string(Bytes::from_static(b"2")));
-        db.set(Bytes::from_static(b"c"), Entry::new_string(Bytes::from_static(b"3")));
+        db.set(
+            Bytes::from_static(b"a"),
+            Entry::new_string(Bytes::from_static(b"1")),
+        );
+        db.set(
+            Bytes::from_static(b"b"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
+        db.set(
+            Bytes::from_static(b"c"),
+            Entry::new_string(Bytes::from_static(b"3")),
+        );
         let result = unlink(&mut db, &[bs(b"a"), bs(b"c"), bs(b"missing")]);
         assert_eq!(result, Frame::Integer(2));
         assert!(db.exists(b"b"));
@@ -1329,9 +1366,18 @@ mod tests {
     #[test]
     fn test_scan_basic() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"key1"), Entry::new_string(Bytes::from_static(b"v1")));
-        db.set(Bytes::from_static(b"key2"), Entry::new_string(Bytes::from_static(b"v2")));
-        db.set(Bytes::from_static(b"key3"), Entry::new_string(Bytes::from_static(b"v3")));
+        db.set(
+            Bytes::from_static(b"key1"),
+            Entry::new_string(Bytes::from_static(b"v1")),
+        );
+        db.set(
+            Bytes::from_static(b"key2"),
+            Entry::new_string(Bytes::from_static(b"v2")),
+        );
+        db.set(
+            Bytes::from_static(b"key3"),
+            Entry::new_string(Bytes::from_static(b"v3")),
+        );
 
         let result = scan(&mut db, &[bs(b"0")]);
         match result {
@@ -1381,18 +1427,25 @@ mod tests {
     #[test]
     fn test_scan_with_match() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"user:1"), Entry::new_string(Bytes::from_static(b"v")));
-        db.set(Bytes::from_static(b"user:2"), Entry::new_string(Bytes::from_static(b"v")));
-        db.set(Bytes::from_static(b"post:1"), Entry::new_string(Bytes::from_static(b"v")));
+        db.set(
+            Bytes::from_static(b"user:1"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+        db.set(
+            Bytes::from_static(b"user:2"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+        db.set(
+            Bytes::from_static(b"post:1"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
 
         let result = scan(&mut db, &[bs(b"0"), bs(b"MATCH"), bs(b"user:*")]);
         match result {
-            Frame::Array(ref arr) => {
-                match &arr[1] {
-                    Frame::Array(keys) => assert_eq!(keys.len(), 2),
-                    _ => panic!("Expected keys array"),
-                }
-            }
+            Frame::Array(ref arr) => match &arr[1] {
+                Frame::Array(keys) => assert_eq!(keys.len(), 2),
+                _ => panic!("Expected keys array"),
+            },
             _ => panic!("Expected array"),
         }
     }
@@ -1400,21 +1453,22 @@ mod tests {
     #[test]
     fn test_scan_with_type_filter() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"str"), Entry::new_string(Bytes::from_static(b"v")));
+        db.set(
+            Bytes::from_static(b"str"),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
         db.set(Bytes::from_static(b"hash"), Entry::new_hash());
         db.set(Bytes::from_static(b"list"), Entry::new_list());
 
         let result = scan(&mut db, &[bs(b"0"), bs(b"TYPE"), bs(b"hash")]);
         match result {
-            Frame::Array(ref arr) => {
-                match &arr[1] {
-                    Frame::Array(keys) => {
-                        assert_eq!(keys.len(), 1);
-                        assert_eq!(keys[0], Frame::BulkString(Bytes::from_static(b"hash")));
-                    }
-                    _ => panic!("Expected keys array"),
+            Frame::Array(ref arr) => match &arr[1] {
+                Frame::Array(keys) => {
+                    assert_eq!(keys.len(), 1);
+                    assert_eq!(keys[0], Frame::BulkString(Bytes::from_static(b"hash")));
                 }
-            }
+                _ => panic!("Expected keys array"),
+            },
             _ => panic!("Expected array"),
         }
     }

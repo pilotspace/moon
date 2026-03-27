@@ -14,23 +14,41 @@ fn resolve_cipher_suites(names: &str) -> io::Result<Vec<rustls::SupportedCipherS
             "TLS_AES_128_GCM_SHA256" => cipher_suite::TLS13_AES_128_GCM_SHA256,
             "TLS_CHACHA20_POLY1305_SHA256" => cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
             // TLS 1.2 suites (if tls12 feature enabled)
-            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            }
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            }
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+                cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            }
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+                cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            }
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            }
             unknown => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Unknown cipher suite: '{}'. Valid: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, etc.", unknown),
+                    format!(
+                        "Unknown cipher suite: '{}'. Valid: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, etc.",
+                        unknown
+                    ),
                 ));
             }
         };
         suites.push(suite);
     }
     if suites.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No valid cipher suites specified"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No valid cipher suites specified",
+        ));
     }
     Ok(suites)
 }
@@ -56,7 +74,9 @@ pub fn build_tls_config(
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS cert parse: {}", e)))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("TLS cert parse: {}", e))
+            })?;
 
     // Load private key
     let key_file = std::fs::File::open(key_path)
@@ -64,7 +84,12 @@ pub fn build_tls_config(
     let mut key_reader = io::BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS key parse: {}", e)))?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No private key found in TLS key file"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No private key found in TLS key file",
+            )
+        })?;
 
     // Build server config -- with or without cipher suite filtering
     let config_builder = if let Some(suite_names) = ciphersuites {
@@ -76,30 +101,44 @@ pub fn build_tls_config(
         };
         rustls::ServerConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS protocol versions: {}", e)))?
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("TLS protocol versions: {}", e),
+                )
+            })?
     } else {
         rustls::ServerConfig::builder()
     };
 
     let config = if let Some(ca_path) = ca_cert_path {
         // mTLS: require client certificates
-        let ca_file = std::fs::File::open(ca_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("TLS CA cert file: {}", e)))?;
+        let ca_file = std::fs::File::open(ca_path).map_err(|e| {
+            io::Error::new(io::ErrorKind::NotFound, format!("TLS CA cert file: {}", e))
+        })?;
         let mut ca_reader = io::BufReader::new(ca_file);
         let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
             rustls_pemfile::certs(&mut ca_reader)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("CA cert parse: {}", e)))?;
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("CA cert parse: {}", e))
+                })?;
 
         let mut root_store = rustls::RootCertStore::empty();
         for cert in ca_certs {
-            root_store.add(cert)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("CA cert add: {}", e)))?;
+            root_store.add(cert).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("CA cert add: {}", e))
+            })?;
         }
 
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
             .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Client verifier: {}", e)))?;
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Client verifier: {}", e),
+                )
+            })?;
 
         config_builder
             .with_client_cert_verifier(verifier)
@@ -122,7 +161,8 @@ mod tests {
 
     #[test]
     fn test_resolve_cipher_suites_tls13() {
-        let suites = resolve_cipher_suites("TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256").unwrap();
+        let suites =
+            resolve_cipher_suites("TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256").unwrap();
         assert_eq!(suites.len(), 2);
     }
 
@@ -136,7 +176,12 @@ mod tests {
     fn test_resolve_cipher_suites_unknown() {
         let result = resolve_cipher_suites("TLS_INVALID_SUITE");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown cipher suite"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown cipher suite")
+        );
     }
 
     #[test]
@@ -160,7 +205,12 @@ mod tests {
         let cert_path = dir.join("test.crt");
         std::fs::write(&cert_path, "not a real cert").unwrap();
 
-        let result = build_tls_config(cert_path.to_str().unwrap(), "/nonexistent/key.pem", None, None);
+        let result = build_tls_config(
+            cert_path.to_str().unwrap(),
+            "/nonexistent/key.pem",
+            None,
+            None,
+        );
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -169,8 +219,10 @@ mod tests {
     #[test]
     fn test_build_tls_config_missing_ca() {
         let result = build_tls_config(
-            "/nonexistent/cert.pem", "/nonexistent/key.pem",
-            Some("/nonexistent/ca.pem"), None,
+            "/nonexistent/cert.pem",
+            "/nonexistent/key.pem",
+            Some("/nonexistent/ca.pem"),
+            None,
         );
         assert!(result.is_err());
     }

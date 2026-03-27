@@ -17,16 +17,16 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "runtime-monoio")]
+use monoio::io::AsyncWriteRentExt;
 use rand::Rng;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "runtime-tokio")]
 use tokio::net::TcpStream;
-#[cfg(feature = "runtime-monoio")]
-use monoio::io::AsyncWriteRentExt;
 use tracing::{info, warn};
 
-use crate::cluster::gossip::{build_message, serialize_gossip, GossipMsgType};
+use crate::cluster::gossip::{GossipMsgType, build_message, serialize_gossip};
 use crate::cluster::{ClusterState, FailoverState, NodeFlags};
 
 /// Check if we should initiate failover.

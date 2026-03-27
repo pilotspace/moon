@@ -18,9 +18,7 @@ compile_error!(
 );
 
 #[cfg(not(any(feature = "runtime-tokio", feature = "runtime-monoio")))]
-compile_error!(
-    "No runtime selected. Enable either `runtime-tokio` or `runtime-monoio` feature."
-);
+compile_error!("No runtime selected. Enable either `runtime-tokio` or `runtime-monoio` feature.");
 
 pub mod cancel;
 pub mod channel;

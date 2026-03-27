@@ -6,18 +6,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
+use bytes::{Bytes, BytesMut};
 use tracing::{error, info, warn};
 
-use crate::command::{dispatch, DispatchResult};
+use crate::command::{DispatchResult, dispatch};
+use crate::framevec;
 use crate::protocol::{Frame, ParseConfig, parse, serialize};
 use crate::storage::compact_key::CompactKey;
-use crate::storage::db::Database;
 use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::{current_time_ms, Entry};
-use crate::framevec;
+use crate::storage::db::Database;
+use crate::storage::entry::{Entry, current_time_ms};
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
@@ -58,18 +58,55 @@ pub enum AofMessage {
 /// The actual check is done via (length, first_byte) match in `is_write_command`.
 #[allow(dead_code)]
 const WRITE_COMMANDS: &[&[u8]] = &[
-    b"SET", b"MSET", b"SETNX", b"SETEX", b"PSETEX",
-    b"GETSET", b"GETDEL", b"GETEX",
-    b"INCR", b"DECR", b"INCRBY", b"DECRBY", b"INCRBYFLOAT",
-    b"APPEND", b"DEL", b"UNLINK",
-    b"EXPIRE", b"PEXPIRE", b"PERSIST",
-    b"RENAME", b"RENAMENX",
-    b"HSET", b"HMSET", b"HDEL", b"HSETNX", b"HINCRBY", b"HINCRBYFLOAT",
-    b"LPUSH", b"RPUSH", b"LPOP", b"RPOP", b"LSET", b"LINSERT", b"LREM", b"LTRIM", b"LMOVE",
-    b"SADD", b"SREM", b"SPOP",
-    b"SINTERSTORE", b"SUNIONSTORE", b"SDIFFSTORE",
-    b"ZADD", b"ZREM", b"ZINCRBY", b"ZPOPMIN", b"ZPOPMAX",
-    b"ZUNIONSTORE", b"ZINTERSTORE",
+    b"SET",
+    b"MSET",
+    b"SETNX",
+    b"SETEX",
+    b"PSETEX",
+    b"GETSET",
+    b"GETDEL",
+    b"GETEX",
+    b"INCR",
+    b"DECR",
+    b"INCRBY",
+    b"DECRBY",
+    b"INCRBYFLOAT",
+    b"APPEND",
+    b"DEL",
+    b"UNLINK",
+    b"EXPIRE",
+    b"PEXPIRE",
+    b"PERSIST",
+    b"RENAME",
+    b"RENAMENX",
+    b"HSET",
+    b"HMSET",
+    b"HDEL",
+    b"HSETNX",
+    b"HINCRBY",
+    b"HINCRBYFLOAT",
+    b"LPUSH",
+    b"RPUSH",
+    b"LPOP",
+    b"RPOP",
+    b"LSET",
+    b"LINSERT",
+    b"LREM",
+    b"LTRIM",
+    b"LMOVE",
+    b"SADD",
+    b"SREM",
+    b"SPOP",
+    b"SINTERSTORE",
+    b"SUNIONSTORE",
+    b"SDIFFSTORE",
+    b"ZADD",
+    b"ZREM",
+    b"ZINCRBY",
+    b"ZPOPMIN",
+    b"ZPOPMAX",
+    b"ZUNIONSTORE",
+    b"ZINTERSTORE",
     b"SELECT",
 ];
 
@@ -79,7 +116,9 @@ const WRITE_COMMANDS: &[&[u8]] = &[
 #[inline]
 pub fn is_write_command(name: &[u8]) -> bool {
     let len = name.len();
-    if len == 0 { return false; }
+    if len == 0 {
+        return false;
+    }
     let b0 = name[0] | 0x20;
     match (len, b0) {
         // 3-letter
@@ -90,12 +129,24 @@ pub fn is_write_command(name: &[u8]) -> bool {
         (4, b'd') => name.eq_ignore_ascii_case(b"DECR"),
         (4, b'm') => name.eq_ignore_ascii_case(b"MSET"),
         (4, b'h') => name.eq_ignore_ascii_case(b"HSET") || name.eq_ignore_ascii_case(b"HDEL"),
-        (4, b'l') => name.eq_ignore_ascii_case(b"LSET") || name.eq_ignore_ascii_case(b"LREM") || name.eq_ignore_ascii_case(b"LPOP"),
+        (4, b'l') => {
+            name.eq_ignore_ascii_case(b"LSET")
+                || name.eq_ignore_ascii_case(b"LREM")
+                || name.eq_ignore_ascii_case(b"LPOP")
+        }
         (4, b'r') => name.eq_ignore_ascii_case(b"RPOP"),
-        (4, b's') => name.eq_ignore_ascii_case(b"SADD") || name.eq_ignore_ascii_case(b"SREM") || name.eq_ignore_ascii_case(b"SPOP"),
+        (4, b's') => {
+            name.eq_ignore_ascii_case(b"SADD")
+                || name.eq_ignore_ascii_case(b"SREM")
+                || name.eq_ignore_ascii_case(b"SPOP")
+        }
         (4, b'z') => name.eq_ignore_ascii_case(b"ZADD") || name.eq_ignore_ascii_case(b"ZREM"),
         // 5-letter
-        (5, b'l') => name.eq_ignore_ascii_case(b"LPUSH") || name.eq_ignore_ascii_case(b"LTRIM") || name.eq_ignore_ascii_case(b"LMOVE"),
+        (5, b'l') => {
+            name.eq_ignore_ascii_case(b"LPUSH")
+                || name.eq_ignore_ascii_case(b"LTRIM")
+                || name.eq_ignore_ascii_case(b"LMOVE")
+        }
         (5, b'r') => name.eq_ignore_ascii_case(b"RPUSH"),
         (5, b'h') => name.eq_ignore_ascii_case(b"HMSET"),
         (5, b's') => name.eq_ignore_ascii_case(b"SETNX") || name.eq_ignore_ascii_case(b"SETEX"),
@@ -114,15 +165,23 @@ pub fn is_write_command(name: &[u8]) -> bool {
         (7, b'h') => name.eq_ignore_ascii_case(b"HINCRBY"),
         (7, b'l') => name.eq_ignore_ascii_case(b"LINSERT"),
         (7, b'p') => name.eq_ignore_ascii_case(b"PEXPIRE") || name.eq_ignore_ascii_case(b"PERSIST"),
-        (7, b'z') => name.eq_ignore_ascii_case(b"ZINCRBY") || name.eq_ignore_ascii_case(b"ZPOPMIN") || name.eq_ignore_ascii_case(b"ZPOPMAX"),
+        (7, b'z') => {
+            name.eq_ignore_ascii_case(b"ZINCRBY")
+                || name.eq_ignore_ascii_case(b"ZPOPMIN")
+                || name.eq_ignore_ascii_case(b"ZPOPMAX")
+        }
         // 5-letter GETEX
         (5, b'g') => name.eq_ignore_ascii_case(b"GETEX"),
         // 8-letter
         (8, b'r') => name.eq_ignore_ascii_case(b"RENAMENX"),
         // 11-letter
         (11, b'i') => name.eq_ignore_ascii_case(b"INCRBYFLOAT"),
-        (11, b's') => name.eq_ignore_ascii_case(b"SINTERSTORE") || name.eq_ignore_ascii_case(b"SUNIONSTORE"),
-        (11, b'z') => name.eq_ignore_ascii_case(b"ZUNIONSTORE") || name.eq_ignore_ascii_case(b"ZINTERSTORE"),
+        (11, b's') => {
+            name.eq_ignore_ascii_case(b"SINTERSTORE") || name.eq_ignore_ascii_case(b"SUNIONSTORE")
+        }
+        (11, b'z') => {
+            name.eq_ignore_ascii_case(b"ZUNIONSTORE") || name.eq_ignore_ascii_case(b"ZINTERSTORE")
+        }
         // 10-letter
         (10, b's') => name.eq_ignore_ascii_case(b"SDIFFSTORE"),
         // 12-letter
@@ -310,11 +369,17 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
                         let name = match &arr[0] {
                             Frame::BulkString(s) => s.as_ref(),
                             Frame::SimpleString(s) => s.as_ref(),
-                            _ => { count += 1; continue; }
+                            _ => {
+                                count += 1;
+                                continue;
+                            }
                         };
                         (name as &[u8], &arr[1..])
                     }
-                    _ => { count += 1; continue; }
+                    _ => {
+                        count += 1;
+                        continue;
+                    }
                 };
                 let result = dispatch(
                     &mut databases[selected_db],
@@ -341,7 +406,10 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
                 break;
             }
             Err(e) => {
-                warn!("AOF parse error after {} commands: {}. Partial replay.", count, e);
+                warn!(
+                    "AOF parse error after {} commands: {}. Partial replay.",
+                    count, e
+                );
                 break;
             }
         }
@@ -612,22 +680,63 @@ mod tests {
     #[test]
     fn test_write_commands_list_includes_all_known_write_commands() {
         let known_writes = [
-            b"SET" as &[u8], b"MSET", b"SETNX", b"SETEX", b"PSETEX",
-            b"GETSET", b"GETDEL", b"GETEX",
-            b"INCR", b"DECR", b"INCRBY", b"DECRBY", b"INCRBYFLOAT",
-            b"APPEND", b"DEL", b"UNLINK",
-            b"EXPIRE", b"PEXPIRE", b"PERSIST",
-            b"RENAME", b"RENAMENX",
-            b"HSET", b"HMSET", b"HDEL", b"HSETNX", b"HINCRBY", b"HINCRBYFLOAT",
-            b"LPUSH", b"RPUSH", b"LPOP", b"RPOP", b"LSET", b"LINSERT", b"LREM", b"LTRIM", b"LMOVE",
-            b"SADD", b"SREM", b"SPOP",
-            b"SINTERSTORE", b"SUNIONSTORE", b"SDIFFSTORE",
-            b"ZADD", b"ZREM", b"ZINCRBY", b"ZPOPMIN", b"ZPOPMAX",
-            b"ZUNIONSTORE", b"ZINTERSTORE",
+            b"SET" as &[u8],
+            b"MSET",
+            b"SETNX",
+            b"SETEX",
+            b"PSETEX",
+            b"GETSET",
+            b"GETDEL",
+            b"GETEX",
+            b"INCR",
+            b"DECR",
+            b"INCRBY",
+            b"DECRBY",
+            b"INCRBYFLOAT",
+            b"APPEND",
+            b"DEL",
+            b"UNLINK",
+            b"EXPIRE",
+            b"PEXPIRE",
+            b"PERSIST",
+            b"RENAME",
+            b"RENAMENX",
+            b"HSET",
+            b"HMSET",
+            b"HDEL",
+            b"HSETNX",
+            b"HINCRBY",
+            b"HINCRBYFLOAT",
+            b"LPUSH",
+            b"RPUSH",
+            b"LPOP",
+            b"RPOP",
+            b"LSET",
+            b"LINSERT",
+            b"LREM",
+            b"LTRIM",
+            b"LMOVE",
+            b"SADD",
+            b"SREM",
+            b"SPOP",
+            b"SINTERSTORE",
+            b"SUNIONSTORE",
+            b"SDIFFSTORE",
+            b"ZADD",
+            b"ZREM",
+            b"ZINCRBY",
+            b"ZPOPMIN",
+            b"ZPOPMAX",
+            b"ZUNIONSTORE",
+            b"ZINTERSTORE",
             b"SELECT",
         ];
         for cmd in &known_writes {
-            assert!(is_write_command(cmd), "Expected {} to be a write command", String::from_utf8_lossy(cmd));
+            assert!(
+                is_write_command(cmd),
+                "Expected {} to be a write command",
+                String::from_utf8_lossy(cmd)
+            );
         }
     }
 
@@ -669,7 +778,9 @@ mod tests {
         let frame = make_command(&[b"HSET", b"myhash", b"f1", b"v1"]);
         let serialized = serialize_command(&frame);
         let mut buf = BytesMut::from(&serialized[..]);
-        let parsed = parse::parse(&mut buf, &ParseConfig::default()).unwrap().unwrap();
+        let parsed = parse::parse(&mut buf, &ParseConfig::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed, frame);
     }
 
@@ -703,13 +814,25 @@ mod tests {
 
         let mut aof_data = BytesMut::new();
         // HSET
-        serialize::serialize(&make_command(&[b"HSET", b"myhash", b"f1", b"v1"]), &mut aof_data);
+        serialize::serialize(
+            &make_command(&[b"HSET", b"myhash", b"f1", b"v1"]),
+            &mut aof_data,
+        );
         // LPUSH
-        serialize::serialize(&make_command(&[b"LPUSH", b"mylist", b"a", b"b"]), &mut aof_data);
+        serialize::serialize(
+            &make_command(&[b"LPUSH", b"mylist", b"a", b"b"]),
+            &mut aof_data,
+        );
         // SADD
-        serialize::serialize(&make_command(&[b"SADD", b"myset", b"x", b"y"]), &mut aof_data);
+        serialize::serialize(
+            &make_command(&[b"SADD", b"myset", b"x", b"y"]),
+            &mut aof_data,
+        );
         // ZADD
-        serialize::serialize(&make_command(&[b"ZADD", b"myzset", b"1.5", b"alice"]), &mut aof_data);
+        serialize::serialize(
+            &make_command(&[b"ZADD", b"myzset", b"1.5", b"alice"]),
+            &mut aof_data,
+        );
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
@@ -718,7 +841,10 @@ mod tests {
 
         // Check hash
         let hash = dbs[0].get_hash(b"myhash").unwrap().unwrap();
-        assert_eq!(hash.get(&Bytes::from_static(b"f1")).unwrap().as_ref(), b"v1");
+        assert_eq!(
+            hash.get(&Bytes::from_static(b"f1")).unwrap().as_ref(),
+            b"v1"
+        );
 
         // Check list
         let list = dbs[0].get_list(b"mylist").unwrap().unwrap();
@@ -740,7 +866,10 @@ mod tests {
 
         let mut aof_data = BytesMut::new();
         serialize::serialize(&make_command(&[b"SET", b"mykey", b"myval"]), &mut aof_data);
-        serialize::serialize(&make_command(&[b"PEXPIRE", b"mykey", b"60000"]), &mut aof_data);
+        serialize::serialize(
+            &make_command(&[b"PEXPIRE", b"mykey", b"60000"]),
+            &mut aof_data,
+        );
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
@@ -856,7 +985,10 @@ mod tests {
         assert!(count >= 5, "Expected at least 5 commands, got {}", count);
 
         // Verify each type restored
-        assert_eq!(loaded_dbs[0].get(b"str").unwrap().value.type_name(), "string");
+        assert_eq!(
+            loaded_dbs[0].get(b"str").unwrap().value.type_name(),
+            "string"
+        );
         assert!(loaded_dbs[0].get_hash(b"h").unwrap().is_some());
         assert!(loaded_dbs[0].get_list(b"l").unwrap().is_some());
         assert!(loaded_dbs[0].get_set(b"s").unwrap().is_some());

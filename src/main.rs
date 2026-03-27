@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use clap::Parser;
 use rust_redis::config::ServerConfig;
 use rust_redis::persistence::aof::{self, AofMessage, FsyncPolicy};
-use rust_redis::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
-use rust_redis::server;
-use rust_redis::shard::mesh::{ChannelMesh, CHANNEL_BUFFER_SIZE};
-use rust_redis::shard::Shard;
 use rust_redis::runtime::cancel::CancellationToken;
 use rust_redis::runtime::channel;
+use rust_redis::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
+use rust_redis::server;
+use rust_redis::shard::Shard;
+use rust_redis::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -40,16 +40,25 @@ fn main() -> anyhow::Result<()> {
 
     // Build TLS configuration if tls_port is set
     let tls_config: Option<std::sync::Arc<rustls::ServerConfig>> = if config.tls_port > 0 {
-        let cert = config.tls_cert_file.as_ref()
+        let cert = config
+            .tls_cert_file
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--tls-cert-file required when --tls-port is set"))?;
-        let key = config.tls_key_file.as_ref()
+        let key = config
+            .tls_key_file
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--tls-key-file required when --tls-port is set"))?;
         let tls_cfg = rust_redis::tls::build_tls_config(
-            cert, key,
+            cert,
+            key,
             config.tls_ca_cert_file.as_deref(),
             config.tls_ciphersuites.as_deref(),
-        ).map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
-        info!("TLS enabled on port {} (TLS 1.3, rustls + aws-lc-rs)", config.tls_port);
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
+        info!(
+            "TLS enabled on port {} (TLS 1.3, rustls + aws-lc-rs)",
+            config.tls_port
+        );
         Some(tls_cfg)
     } else {
         None
@@ -94,7 +103,10 @@ fn main() -> anyhow::Result<()> {
                 );
             })
             .expect("failed to spawn AOF writer thread");
-        info!("AOF enabled with fsync policy: {:?}", FsyncPolicy::from_str(&config.appendfsync));
+        info!(
+            "AOF enabled with fsync policy: {:?}",
+            FsyncPolicy::from_str(&config.appendfsync)
+        );
         Some(tx)
     } else {
         None
@@ -116,32 +128,31 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Create replication state -- load persisted repl_id or generate new one.
-    let (repl_id, repl_id2) = rust_redis::replication::state::load_replication_state(
-        std::path::Path::new(&config.dir),
-    );
+    let (repl_id, repl_id2) =
+        rust_redis::replication::state::load_replication_state(std::path::Path::new(&config.dir));
     let repl_state = std::sync::Arc::new(std::sync::RwLock::new(
         rust_redis::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
     ));
 
     // Cluster mode initialization
-    let cluster_state: Option<std::sync::Arc<std::sync::RwLock<rust_redis::cluster::ClusterState>>> =
-        if config.cluster_enabled {
-            rust_redis::cluster::CLUSTER_ENABLED
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
-                .parse()
-                .expect("invalid bind address");
-            let node_id = rust_redis::replication::state::generate_repl_id();
-            let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
-            let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
-            info!(
-                "Cluster mode enabled, node ID: {}",
-                cs.read().unwrap().node_id
-            );
-            Some(cs)
-        } else {
-            None
-        };
+    let cluster_state: Option<
+        std::sync::Arc<std::sync::RwLock<rust_redis::cluster::ClusterState>>,
+    > = if config.cluster_enabled {
+        rust_redis::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
+            .parse()
+            .expect("invalid bind address");
+        let node_id = rust_redis::replication::state::generate_repl_id();
+        let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
+        let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
+        info!(
+            "Cluster mode enabled, node ID: {}",
+            cs.read().unwrap().node_id
+        );
+        Some(cs)
+    } else {
+        None
+    };
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
     let acl_table: std::sync::Arc<std::sync::RwLock<rust_redis::acl::AclTable>> = {
@@ -150,12 +161,11 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Build shared runtime config for sharded handlers
-    let runtime_config_shared: std::sync::Arc<std::sync::RwLock<rust_redis::config::RuntimeConfig>> = {
-        std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config()))
-    };
-    let server_config_shared: std::sync::Arc<rust_redis::config::ServerConfig> = {
-        std::sync::Arc::new(config.clone())
-    };
+    let runtime_config_shared: std::sync::Arc<
+        std::sync::RwLock<rust_redis::config::RuntimeConfig>,
+    > = { std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config())) };
+    let server_config_shared: std::sync::Arc<rust_redis::config::ServerConfig> =
+        { std::sync::Arc::new(config.clone()) };
 
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
@@ -201,10 +211,9 @@ fn main() -> anyhow::Result<()> {
                     shard.restore_from_persistence(dir);
                 }
 
-                RuntimeFactoryImpl::block_on_local(
-                    format!("shard-{}", id),
-                    async move {
-                        shard.run(
+                RuntimeFactoryImpl::block_on_local(format!("shard-{}", id), async move {
+                    shard
+                        .run(
                             conn_rx,
                             shard_tls_config,
                             consumers,
@@ -223,9 +232,9 @@ fn main() -> anyhow::Result<()> {
                             shard_server_config,
                             shard_spsc_notify,
                             shard_all_notifiers,
-                        ).await;
-                    },
-                );
+                        )
+                        .await;
+                });
             })
             .expect("failed to spawn shard thread");
 
@@ -352,16 +361,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        RuntimeFactoryImpl::block_on_local(
-            "listener".to_string(),
-            async move {
-                if let Err(e) =
-                    server::listener::run_sharded(config, conn_txs, listener_cancel).await
-                {
-                    tracing::error!("Listener error: {}", e);
-                }
-            },
-        );
+        RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
+            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel).await {
+                tracing::error!("Listener error: {}", e);
+            }
+        });
     }
 
     // After listener exits, send AOF shutdown and cancel all shards

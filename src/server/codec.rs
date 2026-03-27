@@ -92,7 +92,8 @@ impl Encoder<Frame> for RespCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framevec;    use bytes::Bytes;
+    use crate::framevec;
+    use bytes::Bytes;
 
     #[test]
     fn test_decode_frame_simple_string() {

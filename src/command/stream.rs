@@ -2,10 +2,10 @@
 
 use bytes::Bytes;
 
+use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::db::Database;
 use crate::storage::stream::StreamId;
-use crate::framevec;
 fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
     match frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
@@ -377,11 +377,15 @@ pub fn xtrim(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(s) => match s.parse::<u64>() {
                 Ok(maxlen) => stream.trim_maxlen(maxlen, approximate),
                 Err(_) => {
-                    return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range"))
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ));
                 }
             },
             Err(_) => {
-                return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range"))
+                return Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                ));
             }
         }
     } else if strategy.eq_ignore_ascii_case(b"MINID") {
@@ -470,9 +474,7 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
             idx += 1;
             break;
         } else {
-            return Frame::Error(Bytes::from_static(
-                b"ERR Unrecognized XREAD option",
-            ));
+            return Frame::Error(Bytes::from_static(b"ERR Unrecognized XREAD option"));
         }
     }
 
@@ -595,8 +597,7 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
         };
 
         let mkstream = args.len() > 4
-            && extract_bytes(&args[4])
-                .map_or(false, |a| a.eq_ignore_ascii_case(b"MKSTREAM"));
+            && extract_bytes(&args[4]).map_or(false, |a| a.eq_ignore_ascii_case(b"MKSTREAM"));
 
         // Resolve $ to last_id
         let last_delivered_id = if id_arg.as_ref() == b"$" {
@@ -690,7 +691,11 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
 
         let stream = match db.get_stream_mut(key) {
             Ok(Some(s)) => s,
-            Ok(None) => return Frame::Error(Bytes::from_static(b"ERR The XGROUP subcommand requires the key to exist.")),
+            Ok(None) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR The XGROUP subcommand requires the key to exist.",
+                ));
+            }
             Err(e) => return e,
         };
         match stream.set_group_id(group_name, id) {
@@ -715,7 +720,11 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
         };
         let stream = match db.get_stream_mut(key) {
             Ok(Some(s)) => s,
-            Ok(None) => return Frame::Error(Bytes::from_static(b"ERR The XGROUP subcommand requires the key to exist.")),
+            Ok(None) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR The XGROUP subcommand requires the key to exist.",
+                ));
+            }
             Err(e) => return e,
         };
         match stream.create_consumer(group_name, consumer_name) {
@@ -741,7 +750,11 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
         };
         let stream = match db.get_stream_mut(key) {
             Ok(Some(s)) => s,
-            Ok(None) => return Frame::Error(Bytes::from_static(b"ERR The XGROUP subcommand requires the key to exist.")),
+            Ok(None) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR The XGROUP subcommand requires the key to exist.",
+                ));
+            }
             Err(e) => return e,
         };
         match stream.delete_consumer(group_name, consumer_name) {
@@ -769,9 +782,7 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("XREADGROUP"),
     };
     if !first.eq_ignore_ascii_case(b"GROUP") {
-        return Frame::Error(Bytes::from_static(
-            b"ERR 'GROUP' keyword expected",
-        ));
+        return Frame::Error(Bytes::from_static(b"ERR 'GROUP' keyword expected"));
     }
     idx += 1;
 
@@ -824,9 +835,7 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
             idx += 1;
             break;
         } else {
-            return Frame::Error(Bytes::from_static(
-                b"ERR Unrecognized XREADGROUP option",
-            ));
+            return Frame::Error(Bytes::from_static(b"ERR Unrecognized XREADGROUP option"));
         }
     }
 
@@ -963,9 +972,7 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some(s)) => s,
         Ok(None) => {
             // No stream => no group
-            return Frame::Error(Bytes::from_static(
-                b"ERR no such key",
-            ));
+            return Frame::Error(Bytes::from_static(b"ERR no such key"));
         }
         Err(e) => return e,
     };
@@ -1052,9 +1059,17 @@ pub fn xpending(db: &mut Database, args: &[Frame]) -> Frame {
         let count = match std::str::from_utf8(count_bytes) {
             Ok(s) => match s.parse::<usize>() {
                 Ok(c) => c,
-                Err(_) => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+                Err(_) => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ));
+                }
             },
-            Err(_) => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                ));
+            }
         };
 
         let consumer_filter = if detail_idx + 3 < args.len() {
@@ -1109,9 +1124,17 @@ pub fn xclaim(db: &mut Database, args: &[Frame]) -> Frame {
     let min_idle = match std::str::from_utf8(min_idle_bytes) {
         Ok(s) => match s.parse::<u64>() {
             Ok(v) => v,
-            Err(_) => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                ));
+            }
         },
-        Err(_) => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        Err(_) => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        }
     };
 
     let mut ids = Vec::new();
@@ -1168,9 +1191,17 @@ pub fn xautoclaim(db: &mut Database, args: &[Frame]) -> Frame {
     let min_idle = match std::str::from_utf8(min_idle_bytes) {
         Ok(s) => match s.parse::<u64>() {
             Ok(v) => v,
-            Err(_) => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                ));
+            }
         },
-        Err(_) => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        Err(_) => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        }
     };
     let start_bytes = match extract_bytes(&args[4]) {
         Some(b) => b,
@@ -1243,12 +1274,16 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
             Err(e) => return e,
         };
 
-        let first_entry = stream.entries.iter().next().map(|(&id, fields)| {
-            format_entry(id, fields)
-        });
-        let last_entry = stream.entries.iter().next_back().map(|(&id, fields)| {
-            format_entry(id, fields)
-        });
+        let first_entry = stream
+            .entries
+            .iter()
+            .next()
+            .map(|(&id, fields)| format_entry(id, fields));
+        let last_entry = stream
+            .entries
+            .iter()
+            .next_back()
+            .map(|(&id, fields)| format_entry(id, fields));
 
         Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"length")),
@@ -1273,18 +1308,22 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
             Err(e) => return e,
         };
 
-        let groups: Vec<Frame> = stream.groups.iter().map(|(name, group)| {
-            Frame::Array(framevec![
-                Frame::BulkString(Bytes::from_static(b"name")),
-                Frame::BulkString(name.clone()),
-                Frame::BulkString(Bytes::from_static(b"consumers")),
-                Frame::Integer(group.consumers.len() as i64),
-                Frame::BulkString(Bytes::from_static(b"pending")),
-                Frame::Integer(group.pel.len() as i64),
-                Frame::BulkString(Bytes::from_static(b"last-delivered-id")),
-                Frame::BulkString(group.last_delivered_id.to_bytes()),
-            ])
-        }).collect();
+        let groups: Vec<Frame> = stream
+            .groups
+            .iter()
+            .map(|(name, group)| {
+                Frame::Array(framevec![
+                    Frame::BulkString(Bytes::from_static(b"name")),
+                    Frame::BulkString(name.clone()),
+                    Frame::BulkString(Bytes::from_static(b"consumers")),
+                    Frame::Integer(group.consumers.len() as i64),
+                    Frame::BulkString(Bytes::from_static(b"pending")),
+                    Frame::Integer(group.pel.len() as i64),
+                    Frame::BulkString(Bytes::from_static(b"last-delivered-id")),
+                    Frame::BulkString(group.last_delivered_id.to_bytes()),
+                ])
+            })
+            .collect();
         Frame::Array(groups.into())
     } else if subcmd.eq_ignore_ascii_case(b"CONSUMERS") {
         if args.len() < 3 {
@@ -1301,21 +1340,29 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
         };
         let group = match stream.groups.get(group_name) {
             Some(g) => g,
-            None => return Frame::Error(Bytes::from_static(b"NOGROUP No such consumer group for key name")),
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"NOGROUP No such consumer group for key name",
+                ));
+            }
         };
 
         let now = crate::storage::entry::current_time_ms();
-        let consumers: Vec<Frame> = group.consumers.iter().map(|(name, c)| {
-            let idle = now.saturating_sub(c.seen_time);
-            Frame::Array(framevec![
-                Frame::BulkString(Bytes::from_static(b"name")),
-                Frame::BulkString(name.clone()),
-                Frame::BulkString(Bytes::from_static(b"pending")),
-                Frame::Integer(c.pending.len() as i64),
-                Frame::BulkString(Bytes::from_static(b"idle")),
-                Frame::Integer(idle as i64),
-            ])
-        }).collect();
+        let consumers: Vec<Frame> = group
+            .consumers
+            .iter()
+            .map(|(name, c)| {
+                let idle = now.saturating_sub(c.seen_time);
+                Frame::Array(framevec![
+                    Frame::BulkString(Bytes::from_static(b"name")),
+                    Frame::BulkString(name.clone()),
+                    Frame::BulkString(Bytes::from_static(b"pending")),
+                    Frame::Integer(c.pending.len() as i64),
+                    Frame::BulkString(Bytes::from_static(b"idle")),
+                    Frame::Integer(idle as i64),
+                ])
+            })
+            .collect();
         Frame::Array(consumers.into())
     } else {
         Frame::Error(Bytes::from_static(
@@ -1653,7 +1700,10 @@ mod tests {
         xadd(&mut db, &args);
 
         let args = make_args(&[b"CREATE", b"mystream", b"mygroup", b"0", b"MKSTREAM"]);
-        assert_eq!(xgroup(&mut db, &args), Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(
+            xgroup(&mut db, &args),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
 
         // Creating same group again should error
         let args = make_args(&[b"CREATE", b"mystream", b"mygroup", b"0", b"MKSTREAM"]);
@@ -1682,7 +1732,10 @@ mod tests {
         }
         // With MKSTREAM on nonexistent key
         let args = make_args(&[b"CREATE", b"nostream", b"mygroup", b"0", b"MKSTREAM"]);
-        assert_eq!(xgroup(&mut db, &args), Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(
+            xgroup(&mut db, &args),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
     }
 
     #[test]
@@ -1931,7 +1984,9 @@ mod tests {
         setup_stream_with_group(&mut db, b"s", 5, b"g");
 
         // Read with COUNT 2
-        let args = make_args(&[b"GROUP", b"g", b"alice", b"COUNT", b"2", b"STREAMS", b"s", b">"]);
+        let args = make_args(&[
+            b"GROUP", b"g", b"alice", b"COUNT", b"2", b"STREAMS", b"s", b">",
+        ]);
         let result = xreadgroup(&mut db, &args);
         match &result {
             Frame::Array(streams) => {
@@ -1953,12 +2008,17 @@ mod tests {
         setup_stream_with_group(&mut db, b"s", 5, b"g");
 
         // Read 2 entries
-        let args = make_args(&[b"GROUP", b"g", b"alice", b"COUNT", b"2", b"STREAMS", b"s", b">"]);
+        let args = make_args(&[
+            b"GROUP", b"g", b"alice", b"COUNT", b"2", b"STREAMS", b"s", b">",
+        ]);
         xreadgroup(&mut db, &args);
 
         // Set ID back to 0, so next > read delivers all again
         let args = make_args(&[b"SETID", b"s", b"g", b"0"]);
-        assert_eq!(xgroup(&mut db, &args), Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(
+            xgroup(&mut db, &args),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
 
         // Reading > should deliver from 1-0 again
         let args = make_args(&[b"GROUP", b"g", b"bob", b"STREAMS", b"s", b">"]);

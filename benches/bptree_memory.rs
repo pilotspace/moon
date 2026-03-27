@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 use std::hint::black_box;

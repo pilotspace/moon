@@ -1,8 +1,8 @@
 //! Persistence command handlers (BGSAVE, BGREWRITEAOF).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tracing::{error, info};
@@ -39,11 +39,7 @@ pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 /// to serialize and write the RDB file. Returns immediately with a status message.
 ///
 /// Returns an error frame if a save is already in progress.
-pub fn bgsave_start(
-    db: SharedDatabases,
-    dir: String,
-    dbfilename: String,
-) -> Frame {
+pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Frame {
     // Check if a save is already running
     if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Frame::Error(Bytes::from_static(
@@ -53,7 +49,13 @@ pub fn bgsave_start(
 
     // Clone snapshot: lock each db individually with read lock
     // Include base_timestamp for TTL delta resolution during serialization
-    let snapshot: Vec<(Vec<(crate::storage::compact_key::CompactKey, crate::storage::entry::Entry)>, u32)> = db
+    let snapshot: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
@@ -146,7 +148,10 @@ pub fn bgsave_start_sharded(
     // Each shard picks this up on its next timer tick and starts its snapshot.
     let _ = snapshot_trigger.send(epoch);
 
-    info!("BGSAVE triggered: epoch {} across {} shards", epoch, num_shards);
+    info!(
+        "BGSAVE triggered: epoch {} across {} shards",
+        epoch, num_shards
+    );
     Frame::SimpleString(Bytes::from_static(b"Background saving started"))
 }
 
@@ -196,10 +201,7 @@ pub fn bgsave_shard_done(success: bool) {
 ///
 /// Sends a Rewrite message to the AOF writer task, which will generate
 /// synthetic commands from current database state and replace the AOF file.
-pub fn bgrewriteaof_start(
-    aof_tx: &channel::MpscSender<AofMessage>,
-    db: SharedDatabases,
-) -> Frame {
+pub fn bgrewriteaof_start(aof_tx: &channel::MpscSender<AofMessage>, db: SharedDatabases) -> Frame {
     match aof_tx.try_send(AofMessage::Rewrite(db)) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
@@ -214,11 +216,7 @@ pub fn bgrewriteaof_start(
 ///
 /// Clones all entries under read locks (same as BGSAVE), then serializes
 /// synchronously. Not supported in sharded mode -- use BGSAVE instead.
-pub fn handle_save(
-    db: &SharedDatabases,
-    dir: &str,
-    dbfilename: &str,
-) -> Frame {
+pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
     if SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
         return Frame::Error(Bytes::from_static(
             b"ERR Background save already in progress",
@@ -226,7 +224,13 @@ pub fn handle_save(
     }
 
     // Clone snapshot: lock each db individually with read lock (same pattern as bgsave_start)
-    let snapshot: Vec<(Vec<(crate::storage::compact_key::CompactKey, crate::storage::entry::Entry)>, u32)> = db
+    let snapshot: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();

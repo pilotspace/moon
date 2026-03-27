@@ -66,7 +66,9 @@ pub fn evaluate_psync(
     let offset = client_offset as u64;
     // Per-shard granularity: ALL backlogs must cover the offset.
     if per_shard_backlogs.iter().all(|b| b.contains_offset(offset)) {
-        PsyncDecision::PartialResync { from_offset: offset }
+        PsyncDecision::PartialResync {
+            from_offset: offset,
+        }
     } else {
         PsyncDecision::FullResync
     }
@@ -163,7 +165,13 @@ mod tests {
     fn test_evaluate_psync_id_mismatch() {
         let mut backlogs = make_backlogs(1, 1024);
         backlogs[0].append(b"data");
-        let result = evaluate_psync("wrong_id_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0, "server_id_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "server_id2_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &backlogs);
+        let result = evaluate_psync(
+            "wrong_id_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0,
+            "server_id_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "server_id2_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &backlogs,
+        );
         assert_eq!(result, PsyncDecision::FullResync);
     }
 

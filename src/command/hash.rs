@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
-use crate::protocol::Frame;
-use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
-use crate::storage::Database;
 use crate::framevec;
+use crate::protocol::Frame;
+use crate::storage::Database;
+use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -370,10 +370,7 @@ pub fn hkeys(db: &mut Database, args: &[Frame]) -> Frame {
     };
     match db.get_hash(key) {
         Ok(Some(map)) => {
-            let fields: Vec<Frame> = map
-                .keys()
-                .map(|k| Frame::BulkString(k.clone()))
-                .collect();
+            let fields: Vec<Frame> = map.keys().map(|k| Frame::BulkString(k.clone())).collect();
             Frame::Array(fields.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -394,10 +391,7 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
     };
     match db.get_hash(key) {
         Ok(Some(map)) => {
-            let values: Vec<Frame> = map
-                .values()
-                .map(|v| Frame::BulkString(v.clone()))
-                .collect();
+            let values: Vec<Frame> = map.values().map(|v| Frame::BulkString(v.clone())).collect();
             Frame::Array(values.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -426,7 +420,7 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
             None => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR value is not an integer or out of range",
-                ))
+                ));
             }
         },
         None => return err_wrong_args("HINCRBY"),
@@ -436,13 +430,12 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
     let current = match map.get(&field) {
-        Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+        Some(v) => match std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             Some(n) => n,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR hash value is not an integer",
-                ))
-            }
+            None => return Frame::Error(Bytes::from_static(b"ERR hash value is not an integer")),
         },
         None => 0,
     };
@@ -470,11 +463,7 @@ pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     let increment: f64 = match extract_bytes(&args[2]) {
         Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not a valid float",
-                ))
-            }
+            None => return Frame::Error(Bytes::from_static(b"ERR value is not a valid float")),
         },
         None => return err_wrong_args("HINCRBYFLOAT"),
     };
@@ -486,9 +475,7 @@ pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
             None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR hash value is not a valid float",
-                ))
+                return Frame::Error(Bytes::from_static(b"ERR hash value is not a valid float"));
             }
         },
         None => 0.0,
@@ -565,9 +552,7 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     let cursor: usize = match extract_bytes(&args[1]) {
         Some(c) => match std::str::from_utf8(c).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
-            None => {
-                return Frame::Error(Bytes::from_static(b"ERR invalid cursor"))
-            }
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
         },
         None => return err_wrong_args("HSCAN"),
     };
@@ -769,7 +754,11 @@ pub fn hkeys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(href)) => {
-            let fields: Vec<Frame> = href.entries().into_iter().map(|(k, _)| Frame::BulkString(k)).collect();
+            let fields: Vec<Frame> = href
+                .entries()
+                .into_iter()
+                .map(|(k, _)| Frame::BulkString(k))
+                .collect();
             Frame::Array(fields.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -788,7 +777,11 @@ pub fn hvals_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(href)) => {
-            let values: Vec<Frame> = href.entries().into_iter().map(|(_, v)| Frame::BulkString(v)).collect();
+            let values: Vec<Frame> = href
+                .entries()
+                .into_iter()
+                .map(|(_, v)| Frame::BulkString(v))
+                .collect();
             Frame::Array(values.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -811,7 +804,11 @@ pub fn hexists_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(href)) => {
-            if href.get_field(field).is_some() { Frame::Integer(1) } else { Frame::Integer(0) }
+            if href.get_field(field).is_some() {
+                Frame::Integer(1)
+            } else {
+                Frame::Integer(0)
+            }
         }
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
@@ -840,7 +837,10 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(o) => o.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
         if opt.eq_ignore_ascii_case(b"MATCH") {
             i += 1;
@@ -851,8 +851,13 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             i += 1;
             if i < args.len() {
                 if let Some(v) = extract_bytes(&args[i]) {
-                    if let Some(c) = std::str::from_utf8(v).ok().and_then(|s| s.parse::<usize>().ok()) {
-                        if c > 0 { count = c; }
+                    if let Some(c) = std::str::from_utf8(v)
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if c > 0 {
+                            count = c;
+                        }
                     }
                 }
             }
@@ -1194,18 +1199,12 @@ mod tests {
         // Increment non-existing field
         let args = make_args(&[b"myhash", b"price", b"10.5"]);
         let result = hincrbyfloat(&mut db, &args);
-        assert_eq!(
-            result,
-            Frame::BulkString(Bytes::from("10.5"))
-        );
+        assert_eq!(result, Frame::BulkString(Bytes::from("10.5")));
 
         // Increment again
         let args = make_args(&[b"myhash", b"price", b"0.5"]);
         let result = hincrbyfloat(&mut db, &args);
-        assert_eq!(
-            result,
-            Frame::BulkString(Bytes::from("11"))
-        );
+        assert_eq!(result, Frame::BulkString(Bytes::from("11")));
     }
 
     #[test]
@@ -1297,7 +1296,13 @@ mod tests {
     fn test_hscan_with_match() {
         let mut db = Database::new();
         let args = make_args(&[
-            b"myhash", b"name", b"alice", b"age", b"30", b"nickname", b"ali",
+            b"myhash",
+            b"name",
+            b"alice",
+            b"age",
+            b"30",
+            b"nickname",
+            b"ali",
         ]);
         hset(&mut db, &args);
 

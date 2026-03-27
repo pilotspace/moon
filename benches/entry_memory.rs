@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -78,8 +78,7 @@ fn bench_entry_size_report(c: &mut Criterion) {
             //   expires_at_ms: u64 = 8 bytes
             //   metadata (version, last_access, counter): ~8 bytes
             let old_size: usize = 88;
-            let reduction_pct =
-                ((old_size - compact_size) as f64 / old_size as f64) * 100.0;
+            let reduction_pct = ((old_size - compact_size) as f64 / old_size as f64) * 100.0;
             assert!(
                 reduction_pct >= 40.0,
                 "Reduction {:.1}% is less than 40% target",

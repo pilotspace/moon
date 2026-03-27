@@ -75,9 +75,7 @@ pub enum ShardMessage {
         reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
     },
     /// Cancel a blocked client registration (woken by another shard or timed out).
-    BlockCancel {
-        wait_id: u64,
-    },
+    BlockCancel { wait_id: u64 },
     /// Register a connected replica's per-shard sender channel with this shard.
     /// Called once per shard per replica when a new replica connection is established.
     /// The shard adds `tx` to its replica_txs list for WAL fan-out.
@@ -87,9 +85,7 @@ pub enum ShardMessage {
     },
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
-    UnregisterReplica {
-        replica_id: u64,
-    },
+    UnregisterReplica { replica_id: u64 },
     /// Return keys in a specific hash slot (for CLUSTER GETKEYSINSLOT).
     GetKeysInSlot {
         db_index: usize,
@@ -104,10 +100,7 @@ pub enum ShardMessage {
     },
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
     /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
-    ScriptLoad {
-        sha1: String,
-        script: bytes::Bytes,
-    },
+    ScriptLoad { sha1: String, script: bytes::Bytes },
     /// Graceful shutdown signal.
     Shutdown,
 }
@@ -138,13 +131,20 @@ mod tests {
             seen.insert(key_to_shard(key.as_bytes(), num_shards));
         }
         // With 100 keys across 8 shards, we should see most shards used
-        assert!(seen.len() >= 4, "Expected at least 4 shards used, got {}", seen.len());
+        assert!(
+            seen.len() >= 4,
+            "Expected at least 4 shards used, got {}",
+            seen.len()
+        );
     }
 
     #[test]
     fn test_extract_hash_tag_basic() {
         assert_eq!(extract_hash_tag(b"{user}.name"), Some(b"user".as_slice()));
-        assert_eq!(extract_hash_tag(b"prefix{tag}suffix"), Some(b"tag".as_slice()));
+        assert_eq!(
+            extract_hash_tag(b"prefix{tag}suffix"),
+            Some(b"tag".as_slice())
+        );
     }
 
     #[test]

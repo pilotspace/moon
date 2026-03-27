@@ -4,14 +4,14 @@
 //! `redis` crate client, exercises commands over real TCP, and shuts down cleanly.
 
 use redis::AsyncCommands;
-use tokio::net::TcpListener;
 use rust_redis::runtime::cancel::CancellationToken;
 use rust_redis::runtime::channel;
+use tokio::net::TcpListener;
 
 use rust_redis::config::ServerConfig;
 use rust_redis::server::listener;
-use rust_redis::shard::mesh::{ChannelMesh, CHANNEL_BUFFER_SIZE};
 use rust_redis::shard::Shard;
+use rust_redis::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 
 /// Start a server on a random port and return the port + shutdown token.
 async fn start_server() -> (u16, CancellationToken) {
@@ -112,10 +112,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
 /// Create a multiplexed async connection to the server on the given port.
 async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client
-        .get_multiplexed_tokio_connection()
-        .await
-        .unwrap()
+    client.get_multiplexed_tokio_connection().await.unwrap()
 }
 
 /// Create a non-multiplexed async connection (needed for SELECT).
@@ -232,7 +229,10 @@ async fn test_mget_mset() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    assert_eq!(result, vec![Some("mv1".to_string()), Some("mv2".to_string()), None]);
+    assert_eq!(
+        result,
+        vec![Some("mv1".to_string()), Some("mv2".to_string()), None]
+    );
 
     shutdown.cancel();
 }
@@ -1054,10 +1054,8 @@ async fn test_auth_required() {
     let mut conn = client.get_tokio_connection().await.unwrap();
 
     // GET before AUTH -> NOAUTH error
-    let result: redis::RedisResult<Option<String>> = redis::cmd("GET")
-        .arg("anykey")
-        .query_async(&mut conn)
-        .await;
+    let result: redis::RedisResult<Option<String>> =
+        redis::cmd("GET").arg("anykey").query_async(&mut conn).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -1162,9 +1160,7 @@ async fn test_hscan() {
 /// Issue BGSAVE, retrying if another test's save is still in progress (global AtomicBool).
 async fn bgsave_with_retry(conn: &mut redis::aio::MultiplexedConnection) {
     for attempt in 0..20 {
-        let result: Result<String, _> = redis::cmd("BGSAVE")
-            .query_async(conn)
-            .await;
+        let result: Result<String, _> = redis::cmd("BGSAVE").query_async(conn).await;
         match result {
             Ok(msg) => {
                 assert_eq!(msg, "Background saving started");
@@ -1379,8 +1375,7 @@ async fn test_aof_logging() {
     let dir = tmp_dir.path().to_path_buf();
 
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         let _: () = conn.set("foo", "bar").await.unwrap();
@@ -1414,10 +1409,7 @@ async fn test_aof_logging() {
         content.contains("SET") || content.contains("set"),
         "AOF should contain SET command"
     );
-    assert!(
-        content.contains("foo"),
-        "AOF should contain key 'foo'"
-    );
+    assert!(content.contains("foo"), "AOF should contain key 'foo'");
     assert!(
         content.contains("HSET") || content.contains("hset"),
         "AOF should contain HSET command"
@@ -1435,8 +1427,7 @@ async fn test_aof_restore_on_startup() {
 
     // --- Server 1: write data with AOF ---
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         let _: () = conn.set("aof_key1", "aof_val1").await.unwrap();
@@ -1456,8 +1447,7 @@ async fn test_aof_restore_on_startup() {
 
     // --- Server 2: restart with AOF and verify restore ---
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         let val: String = conn.get("aof_key1").await.unwrap();
@@ -1483,8 +1473,7 @@ async fn test_aof_priority_over_rdb() {
 
     // --- Server 1: create both RDB and AOF with different values ---
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         // Set initial value and BGSAVE (RDB snapshot)
@@ -1501,8 +1490,7 @@ async fn test_aof_priority_over_rdb() {
 
     // --- Server 2: restart with AOF enabled -> should use AOF (priority) ---
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         let val: String = conn.get("key1").await.unwrap();
@@ -1521,8 +1509,7 @@ async fn test_bgrewriteaof() {
     let dir = tmp_dir.path().to_path_buf();
 
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         // Write key1 many times to bloat the AOF
@@ -1560,12 +1547,14 @@ async fn test_bgrewriteaof() {
 
     // Verify data survives restart after rewrite
     {
-        let (port, shutdown) =
-            start_server_with_persistence("yes", "always", &dir).await;
+        let (port, shutdown) = start_server_with_persistence("yes", "always", &dir).await;
         let mut conn = connect(port).await;
 
         let val: String = conn.get("key1").await.unwrap();
-        assert_eq!(val, "value_19", "key1 should have final value after rewrite + restart");
+        assert_eq!(
+            val, "value_19",
+            "key1 should have final value after rewrite + restart"
+        );
 
         shutdown.cancel();
     }
@@ -1772,10 +1761,7 @@ async fn test_multi_exec_basic() {
     let mut conn = connect_single(port).await;
 
     // MULTI
-    let ok: String = redis::cmd("MULTI")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let ok: String = redis::cmd("MULTI").query_async(&mut conn).await.unwrap();
     assert_eq!(ok, "OK");
 
     // SET key1 val1 -> QUEUED
@@ -1805,10 +1791,7 @@ async fn test_multi_exec_basic() {
     assert_eq!(queued, "QUEUED");
 
     // EXEC -> returns array of results
-    let results: redis::Value = redis::cmd("EXEC")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let results: redis::Value = redis::cmd("EXEC").query_async(&mut conn).await.unwrap();
 
     // Verify we got an array with 3 results
     match results {
@@ -1835,10 +1818,7 @@ async fn test_multi_discard() {
     let mut conn = connect_single(port).await;
 
     // MULTI
-    let _: String = redis::cmd("MULTI")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let _: String = redis::cmd("MULTI").query_async(&mut conn).await.unwrap();
 
     // SET key1 val1 -> QUEUED
     let _: String = redis::cmd("SET")
@@ -1849,10 +1829,7 @@ async fn test_multi_discard() {
         .unwrap();
 
     // DISCARD
-    let ok: String = redis::cmd("DISCARD")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let ok: String = redis::cmd("DISCARD").query_async(&mut conn).await.unwrap();
     assert_eq!(ok, "OK");
 
     // GET key1 -> should be nil (key was never set)
@@ -1872,9 +1849,8 @@ async fn test_exec_without_multi() {
     let mut conn = connect_single(port).await;
 
     // EXEC without MULTI -> should return error
-    let result: Result<redis::Value, redis::RedisError> = redis::cmd("EXEC")
-        .query_async(&mut conn)
-        .await;
+    let result: Result<redis::Value, redis::RedisError> =
+        redis::cmd("EXEC").query_async(&mut conn).await;
     assert!(result.is_err(), "EXEC without MULTI should fail");
     let err = result.unwrap_err();
     assert!(
@@ -1892,9 +1868,8 @@ async fn test_discard_without_multi() {
     let mut conn = connect_single(port).await;
 
     // DISCARD without MULTI -> should return error
-    let result: Result<redis::Value, redis::RedisError> = redis::cmd("DISCARD")
-        .query_async(&mut conn)
-        .await;
+    let result: Result<redis::Value, redis::RedisError> =
+        redis::cmd("DISCARD").query_async(&mut conn).await;
     assert!(result.is_err(), "DISCARD without MULTI should fail");
     let err = result.unwrap_err();
     assert!(
@@ -1912,22 +1887,15 @@ async fn test_nested_multi() {
     let mut conn = connect_single(port).await;
 
     // First MULTI
-    let _: String = redis::cmd("MULTI")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let _: String = redis::cmd("MULTI").query_async(&mut conn).await.unwrap();
 
     // Second MULTI -> should return error
-    let result: Result<redis::Value, redis::RedisError> = redis::cmd("MULTI")
-        .query_async(&mut conn)
-        .await;
+    let result: Result<redis::Value, redis::RedisError> =
+        redis::cmd("MULTI").query_async(&mut conn).await;
     assert!(result.is_err(), "nested MULTI should fail");
 
     // Clean up: DISCARD the first MULTI
-    let _: String = redis::cmd("DISCARD")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let _: String = redis::cmd("DISCARD").query_async(&mut conn).await.unwrap();
 
     shutdown.cancel();
 }
@@ -1946,10 +1914,7 @@ async fn test_watch_success() {
     assert_eq!(ok, "OK");
 
     // MULTI
-    let _: String = redis::cmd("MULTI")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let _: String = redis::cmd("MULTI").query_async(&mut conn).await.unwrap();
 
     // SET watchkey "new" -> QUEUED
     let _: String = redis::cmd("SET")
@@ -1960,10 +1925,7 @@ async fn test_watch_success() {
         .unwrap();
 
     // EXEC -> should succeed (no interference)
-    let result: redis::Value = redis::cmd("EXEC")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    let result: redis::Value = redis::cmd("EXEC").query_async(&mut conn).await.unwrap();
     match result {
         redis::Value::Array(ref items) => {
             assert_eq!(items.len(), 1, "EXEC should return 1 result");
@@ -2008,10 +1970,7 @@ async fn test_watch_abort() {
         .unwrap();
 
     // conn_a: MULTI
-    let _: String = redis::cmd("MULTI")
-        .query_async(&mut conn_a)
-        .await
-        .unwrap();
+    let _: String = redis::cmd("MULTI").query_async(&mut conn_a).await.unwrap();
 
     // conn_b: interfere by modifying the watched key
     let _: () = redis::cmd("SET")
@@ -2030,11 +1989,12 @@ async fn test_watch_abort() {
         .unwrap();
 
     // conn_a: EXEC -> should return Null (transaction aborted)
-    let result: redis::Value = redis::cmd("EXEC")
-        .query_async(&mut conn_a)
-        .await
-        .unwrap();
-    assert_eq!(result, redis::Value::Nil, "EXEC should return Nil when WATCH detects modification");
+    let result: redis::Value = redis::cmd("EXEC").query_async(&mut conn_a).await.unwrap();
+    assert_eq!(
+        result,
+        redis::Value::Nil,
+        "EXEC should return Nil when WATCH detects modification"
+    );
 
     // Verify: the key has conn_b's value
     let val: String = redis::cmd("GET")
@@ -2042,7 +2002,10 @@ async fn test_watch_abort() {
         .query_async(&mut conn_b)
         .await
         .unwrap();
-    assert_eq!(val, "modified", "conn_b's SET should persist after conn_a's transaction was aborted");
+    assert_eq!(
+        val, "modified",
+        "conn_b's SET should persist after conn_a's transaction was aborted"
+    );
 
     shutdown.cancel();
 }
@@ -2153,7 +2116,12 @@ async fn test_config_get_glob_pattern() {
         .await
         .unwrap();
     // Should have 3 param-value pairs = 6 elements
-    assert_eq!(result.len(), 6, "Expected 3 maxmemory params, got: {:?}", result);
+    assert_eq!(
+        result.len(),
+        6,
+        "Expected 3 maxmemory params, got: {:?}",
+        result
+    );
     // Verify all expected param names are present
     assert!(result.contains(&"maxmemory".to_string()));
     assert!(result.contains(&"maxmemory-policy".to_string()));
@@ -2184,7 +2152,10 @@ async fn test_config_set_maxmemory_policy() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    assert_eq!(result, vec!["maxmemory-policy".to_string(), "allkeys-lru".to_string()]);
+    assert_eq!(
+        result,
+        vec!["maxmemory-policy".to_string(), "allkeys-lru".to_string()]
+    );
 
     shutdown.cancel();
 }
@@ -2217,7 +2188,10 @@ async fn test_eviction_noeviction_rejects_writes() {
         .arg(&val2)
         .query_async(&mut conn)
         .await;
-    assert!(result.is_ok(), "Second SET should succeed (pre-check sees 232 < 400)");
+    assert!(
+        result.is_ok(),
+        "Second SET should succeed (pre-check sees 232 < 400)"
+    );
 
     // Third SET: eviction check runs BEFORE this write, memory is 464 > 400,
     // noeviction policy means OOM error
@@ -2226,7 +2200,10 @@ async fn test_eviction_noeviction_rejects_writes() {
         .arg("val")
         .query_async(&mut conn)
         .await;
-    assert!(result.is_err(), "Third SET should fail with OOM when memory (464) > maxmemory (400)");
+    assert!(
+        result.is_err(),
+        "Third SET should fail with OOM when memory (464) > maxmemory (400)"
+    );
     let err = result.unwrap_err();
     assert!(
         err.to_string().contains("OOM"),
@@ -2295,7 +2272,10 @@ async fn test_eviction_allkeys_lru() {
         .arg("val")
         .query_async(&mut conn)
         .await;
-    assert!(result.is_ok(), "SET should succeed with allkeys-lru (eviction frees space)");
+    assert!(
+        result.is_ok(),
+        "SET should succeed with allkeys-lru (eviction frees space)"
+    );
 
     // Count how many of the original keys survived
     let mut after_count = 0i64;
@@ -2470,9 +2450,24 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                     let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
                         shard_config.to_runtime_config(),
                     ));
-                    rt.block_on(local.run_until(
-                        shard.run(conn_rx, None, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0, acl_t, rt_cfg, shard_spsc_notify, shard_all_notifiers),
-                    ));
+                    rt.block_on(local.run_until(shard.run(
+                        conn_rx,
+                        None,
+                        consumers,
+                        producers,
+                        shard_cancel,
+                        None,
+                        None,
+                        None,
+                        snap_rx,
+                        None,
+                        None,
+                        0,
+                        acl_t,
+                        rt_cfg,
+                        shard_spsc_notify,
+                        shard_all_notifiers,
+                    )));
                 })
                 .expect("failed to spawn shard thread");
             shard_handles.push(handle);
@@ -2580,10 +2575,14 @@ async fn test_sharded_mset_cross_shard() {
 
     // MSET keys that will hash to different shards
     let _: () = redis::cmd("MSET")
-        .arg("ms_a").arg("v1")
-        .arg("ms_b").arg("v2")
-        .arg("ms_c").arg("v3")
-        .arg("ms_d").arg("v4")
+        .arg("ms_a")
+        .arg("v1")
+        .arg("ms_b")
+        .arg("v2")
+        .arg("ms_c")
+        .arg("v3")
+        .arg("ms_d")
+        .arg("v4")
         .query_async(&mut conn)
         .await
         .unwrap();
@@ -2608,7 +2607,10 @@ async fn test_sharded_hash_tag_co_location() {
 
     // Hash tags: {user:1}.name and {user:1}.email should be on the same shard
     let _: () = conn.set("{user:1}.name", "Alice").await.unwrap();
-    let _: () = conn.set("{user:1}.email", "alice@example.com").await.unwrap();
+    let _: () = conn
+        .set("{user:1}.email", "alice@example.com")
+        .await
+        .unwrap();
 
     // MGET both -- should work efficiently (same shard)
     let result: Vec<String> = redis::cmd("MGET")
@@ -2680,7 +2682,11 @@ async fn test_sharded_keys_pattern_all_shards() {
         .await
         .unwrap();
     keys.sort();
-    assert_eq!(keys.len(), 20, "KEYS should find all 20 kptest: keys across shards");
+    assert_eq!(
+        keys.len(),
+        20,
+        "KEYS should find all 20 kptest: keys across shards"
+    );
 
     shutdown.cancel();
 }
@@ -2758,7 +2764,11 @@ async fn test_sharded_concurrent_clients() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    assert_eq!(keys.len(), 100, "All 100 keys from concurrent clients should exist");
+    assert_eq!(
+        keys.len(),
+        100,
+        "All 100 keys from concurrent clients should exist"
+    );
 
     shutdown.cancel();
 }
@@ -2945,8 +2955,12 @@ async fn test_sharded_transaction_same_shard() {
     // Test MULTI/EXEC via pipe().atomic() with hash-tagged keys
     let result: (String, String) = redis::pipe()
         .atomic()
-        .cmd("SET").arg("{txn}.c").arg("3")
-        .cmd("SET").arg("{txn}.d").arg("4")
+        .cmd("SET")
+        .arg("{txn}.c")
+        .arg("3")
+        .cmd("SET")
+        .arg("{txn}.d")
+        .arg("4")
         .query_async(&mut conn)
         .await
         .unwrap();
@@ -3078,9 +3092,17 @@ async fn blpop_timeout() {
         .unwrap();
     let elapsed = start.elapsed();
 
-    assert!(result.is_none(), "expected nil on timeout, got {:?}", result);
+    assert!(
+        result.is_none(),
+        "expected nil on timeout, got {:?}",
+        result
+    );
     // Should have taken ~200ms
-    assert!(elapsed.as_millis() >= 150, "returned too quickly: {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() >= 150,
+        "returned too quickly: {:?}",
+        elapsed
+    );
     assert!(elapsed.as_millis() < 1000, "took too long: {:?}", elapsed);
 
     shutdown.cancel();
@@ -3145,13 +3167,10 @@ async fn blpop_cross_shard_wakeup() {
         .await
         .unwrap();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        blpop_handle,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(4), blpop_handle)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(result.0, "xshard_b2");
     assert_eq!(result.1, "woke");
@@ -3220,13 +3239,10 @@ async fn blpop_multi_key_all_local_regression() {
         .await
         .unwrap();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        blpop_handle,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(4), blpop_handle)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(result.0, "localB");
     assert_eq!(result.1, "found_it");
@@ -3477,14 +3493,11 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
         // Initialize cluster state
-        rust_redis::cluster::CLUSTER_ENABLED
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let self_addr: std::net::SocketAddr =
-            format!("127.0.0.1:{}", config.port).parse().unwrap();
+        rust_redis::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", config.port).parse().unwrap();
         let node_id = rust_redis::replication::state::generate_repl_id();
         let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
-        let cluster_state =
-            Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
+        let cluster_state = Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
 
         let all_notifiers = mesh.all_notifiers();
 
@@ -4081,8 +4094,16 @@ async fn test_acl_setuser_and_getuser() {
 
     // Flatten to string for inspection
     let s = format!("{:?}", r);
-    assert!(s.contains("alice"), "GETUSER should contain username alice, got: {}", s);
-    assert!(s.contains("on"), "GETUSER flags should contain 'on', got: {}", s);
+    assert!(
+        s.contains("alice"),
+        "GETUSER should contain username alice, got: {}",
+        s
+    );
+    assert!(
+        s.contains("on"),
+        "GETUSER flags should contain 'on', got: {}",
+        s
+    );
 
     shutdown.cancel();
 }
@@ -4221,7 +4242,11 @@ async fn test_acl_auth_two_arg() {
         .await;
     assert!(r.is_err());
     let err = format!("{}", r.unwrap_err());
-    assert!(err.contains("WRONGPASS"), "Expected WRONGPASS, got: {}", err);
+    assert!(
+        err.contains("WRONGPASS"),
+        "Expected WRONGPASS, got: {}",
+        err
+    );
 
     // AUTH nonexistent pass -> WRONGPASS
     let r: redis::RedisResult<String> = redis::cmd("AUTH")
@@ -4270,7 +4295,11 @@ async fn test_acl_default_user_compat() {
         .await;
     assert!(r.is_err());
     let err = format!("{}", r.unwrap_err());
-    assert!(err.contains("WRONGPASS"), "Expected WRONGPASS, got: {}", err);
+    assert!(
+        err.contains("WRONGPASS"),
+        "Expected WRONGPASS, got: {}",
+        err
+    );
 
     shutdown.cancel();
 }
@@ -4303,10 +4332,8 @@ async fn test_acl_noperm_denied_write() {
         .unwrap();
 
     // GET should work (returns nil since key doesn't exist)
-    let r: redis::RedisResult<Option<String>> = redis::cmd("GET")
-        .arg("somekey")
-        .query_async(&mut con)
-        .await;
+    let r: redis::RedisResult<Option<String>> =
+        redis::cmd("GET").arg("somekey").query_async(&mut con).await;
     assert!(r.is_ok(), "GET should be allowed for bob, got: {:?}", r);
 
     // SET should fail with NOPERM
@@ -4556,7 +4583,11 @@ async fn test_acl_log_reset_and_count() {
         .query_async(&mut con)
         .await
         .unwrap();
-    assert!(log.is_empty(), "ACL LOG should be empty after RESET, got {} entries", log.len());
+    assert!(
+        log.is_empty(),
+        "ACL LOG should be empty after RESET, got {} entries",
+        log.len()
+    );
 
     shutdown.cancel();
 }

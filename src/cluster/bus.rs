@@ -8,19 +8,19 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
+use crate::runtime::cancel::CancellationToken;
+#[cfg(feature = "runtime-monoio")]
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "runtime-tokio")]
 use tokio::net::{TcpListener, TcpStream};
-#[cfg(feature = "runtime-monoio")]
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use crate::runtime::cancel::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::cluster::gossip::{
-    build_message, deserialize_gossip, merge_gossip_into_state, serialize_gossip, GossipMsgType,
-};
 use crate::cluster::ClusterState;
+use crate::cluster::gossip::{
+    GossipMsgType, build_message, deserialize_gossip, merge_gossip_into_state, serialize_gossip,
+};
 
 /// Shared vote sender: set by gossip ticker when election starts, cleared when election ends.
 /// Bus handler forwards FailoverAuthAck votes through this channel.

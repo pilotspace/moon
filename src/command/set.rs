@@ -2,10 +2,10 @@ use bytes::Bytes;
 use rand::seq::IndexedRandom;
 use std::collections::HashSet;
 
-use crate::protocol::Frame;
-use crate::storage::entry::Entry;
-use crate::storage::Database;
 use crate::framevec;
+use crate::protocol::Frame;
+use crate::storage::Database;
+use crate::storage::entry::Entry;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -322,10 +322,7 @@ pub fn smismember(db: &mut Database, args: &[Frame]) -> Frame {
 /// Returns Err(WRONGTYPE) if any key is the wrong type.
 /// `missing_as_empty`: if true, treat missing keys as empty sets; if false,
 /// return None for that key.
-fn collect_sets(
-    db: &mut Database,
-    keys: &[&Bytes],
-) -> Result<Vec<Option<HashSet<Bytes>>>, Frame> {
+fn collect_sets(db: &mut Database, keys: &[&Bytes]) -> Result<Vec<Option<HashSet<Bytes>>>, Frame> {
     let mut sets = Vec::with_capacity(keys.len());
     for key in keys {
         match db.get_set(key) {
@@ -675,7 +672,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
 
@@ -688,8 +685,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         let n = std::cmp::min(count as usize, members.len());
         let chosen: Vec<Frame> = members
             .choose_multiple(&mut rng, n)
-            .map(|m| Frame::BulkString((*m).clone())
-            )
+            .map(|m| Frame::BulkString((*m).clone()))
             .collect();
         Frame::Array(chosen.into())
     } else {
@@ -760,12 +756,12 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         Some(_) => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
 
@@ -774,10 +770,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let n = std::cmp::min(count, members.len());
-    let chosen: Vec<Bytes> = members
-        .choose_multiple(&mut rng, n)
-        .cloned()
-        .collect();
+    let chosen: Vec<Bytes> = members.choose_multiple(&mut rng, n).cloned().collect();
 
     // Remove chosen members from the set
     let set = db.get_or_create_set(&key).unwrap();
@@ -965,7 +958,11 @@ pub fn sismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     match db.get_set_ref_if_alive(key, now_ms) {
         Ok(Some(sref)) => {
-            if sref.contains(member) { Frame::Integer(1) } else { Frame::Integer(0) }
+            if sref.contains(member) {
+                Frame::Integer(1)
+            } else {
+                Frame::Integer(0)
+            }
         }
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
@@ -989,7 +986,11 @@ pub fn smismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
                     let member = extract_bytes(arg);
                     match (&maybe_sref, member) {
                         (Some(sref), Some(m)) => {
-                            if sref.contains(m) { Frame::Integer(1) } else { Frame::Integer(0) }
+                            if sref.contains(m) {
+                                Frame::Integer(1)
+                            } else {
+                                Frame::Integer(0)
+                            }
                         }
                         _ => Frame::Integer(0),
                     }
@@ -1094,12 +1095,20 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     let set_members = match db.get_set_ref_if_alive(key, now_ms) {
         Ok(Some(sref)) => sref.members(),
         Ok(None) => {
-            return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
+            return if args.len() == 1 {
+                Frame::Null
+            } else {
+                Frame::Array(framevec![])
+            };
         }
         Err(e) => return e,
     };
     if set_members.is_empty() {
-        return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
+        return if args.len() == 1 {
+            Frame::Null
+        } else {
+            Frame::Array(framevec![])
+        };
     }
     let members: Vec<&Bytes> = set_members.iter().collect();
     let mut rng = rand::rng();
@@ -1112,7 +1121,7 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     if count == 0 {
@@ -1120,7 +1129,8 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     }
     if count > 0 {
         let n = std::cmp::min(count as usize, members.len());
-        let chosen: Vec<Frame> = members.choose_multiple(&mut rng, n)
+        let chosen: Vec<Frame> = members
+            .choose_multiple(&mut rng, n)
             .map(|m| Frame::BulkString((*m).clone()))
             .collect();
         Frame::Array(chosen.into())
@@ -1157,7 +1167,10 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     while i < args.len() {
         let opt = match extract_bytes(&args[i]) {
             Some(o) => o.as_ref(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
         if opt.eq_ignore_ascii_case(b"MATCH") {
             i += 1;
@@ -1168,7 +1181,9 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             i += 1;
             if i < args.len() {
                 if let Some(c) = parse_int(&args[i]) {
-                    if c > 0 { count = c as usize; }
+                    if c > 0 {
+                        count = c as usize;
+                    }
                 }
             }
         }
@@ -1192,7 +1207,9 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         pos += 1;
         checked += 1;
         if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, member) { continue; }
+            if !glob_match(pattern, member) {
+                continue;
+            }
         }
         results.push(Frame::BulkString(member.clone()));
     }
@@ -1278,9 +1295,18 @@ mod tests {
         let mut db = Database::new();
         setup_set(&mut db, b"myset", &[b"a", b"b"]);
 
-        assert_eq!(sismember(&mut db, &[bs(b"myset"), bs(b"a")]), Frame::Integer(1));
-        assert_eq!(sismember(&mut db, &[bs(b"myset"), bs(b"c")]), Frame::Integer(0));
-        assert_eq!(sismember(&mut db, &[bs(b"missing"), bs(b"a")]), Frame::Integer(0));
+        assert_eq!(
+            sismember(&mut db, &[bs(b"myset"), bs(b"a")]),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            sismember(&mut db, &[bs(b"myset"), bs(b"c")]),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            sismember(&mut db, &[bs(b"missing"), bs(b"a")]),
+            Frame::Integer(0)
+        );
     }
 
     #[test]
@@ -1291,7 +1317,11 @@ mod tests {
         let result = smismember(&mut db, &[bs(b"myset"), bs(b"a"), bs(b"c"), bs(b"b")]);
         assert_eq!(
             result,
-            Frame::Array(framevec![Frame::Integer(1), Frame::Integer(0), Frame::Integer(1)])
+            Frame::Array(framevec![
+                Frame::Integer(1),
+                Frame::Integer(0),
+                Frame::Integer(1)
+            ])
         );
     }
 
@@ -1545,19 +1575,14 @@ mod tests {
         let mut db = Database::new();
         setup_set(&mut db, b"myset", &[b"apple", b"banana", b"apricot"]);
 
-        let result = sscan(
-            &mut db,
-            &[bs(b"myset"), bs(b"0"), bs(b"MATCH"), bs(b"ap*")],
-        );
+        let result = sscan(&mut db, &[bs(b"myset"), bs(b"0"), bs(b"MATCH"), bs(b"ap*")]);
         match result {
-            Frame::Array(arr) => {
-                match &arr[1] {
-                    Frame::Array(members) => {
-                        assert_eq!(members.len(), 2);
-                    }
-                    _ => panic!("expected inner array"),
+            Frame::Array(arr) => match &arr[1] {
+                Frame::Array(members) => {
+                    assert_eq!(members.len(), 2);
                 }
-            }
+                _ => panic!("expected inner array"),
+            },
             _ => panic!("expected array"),
         }
     }
