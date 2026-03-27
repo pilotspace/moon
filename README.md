@@ -1,8 +1,33 @@
-# Moon
+<p align="center">
+  <img src="assets/banner.png" alt="Moon Banner" width="100%">
+</p>
 
-A high-performance, Redis-compatible in-memory data store written in Rust from scratch.
+<p align="center">
+  <strong>A high-performance, Redis-compatible in-memory data store written in Rust from scratch.</strong>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#features">Features</a> &bull;
+  <a href="#architecture">Architecture</a> &bull;
+  <a href="BENCHMARK.md">Benchmarks</a> &bull;
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+---
+
+> **Warning**
+> This project is **experimental** and under active development. It is NOT recommended for production use. APIs, storage formats, and configuration options may change without notice between releases. Use at your own risk. If you encounter issues, please [open an issue](https://github.com/pilotspace/moon/issues).
+
+---
 
 Moon implements 200+ Redis commands with a thread-per-core shared-nothing architecture, dual-runtime support (Tokio + Monoio), SIMD-accelerated parsing, forkless persistence, and memory-optimized data structures. It consistently outperforms Redis 8.x by **1.5-3x** on throughput while using **27-35% less memory** for real-world value sizes.
+
+## Moon vs Redis Architecture
+
+<p align="center">
+  <img src="assets/architecture-comparison.png" alt="Moon vs Redis Architecture" width="100%">
+</p>
 
 ## Performance Highlights
 
