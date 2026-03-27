@@ -506,7 +506,7 @@ impl UringDriver {
 
         // Collect CQEs first to release the mutable borrow on self.ring,
         // allowing return_buf to access the ring's submission queue below.
-        let cqes: Vec<(u8, u32, u16, i32, u32)> = self
+        let cqes: Vec<(u8, u32, u32, i32, u32)> = self
             .ring
             .completion()
             .map(|cqe| {
