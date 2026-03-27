@@ -273,7 +273,17 @@ pub async fn run_sharded(
                 tokio::select! {
                     result = tls_listener.accept() => {
                         match result {
-                            Ok((stream, addr)) => {
+                            Ok((mut stream, addr)) => {
+                                // Protected mode: reject non-loopback connections when no auth configured
+                                if protected_mode_active && !addr.ip().is_loopback() {
+                                    tracing::warn!(
+                                        "Protected mode: rejected TLS connection from {} (no password set)",
+                                        addr
+                                    );
+                                    let err_msg = b"-DENIED Redis is running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface.\r\n";
+                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, err_msg).await;
+                                    continue;
+                                }
                                 debug!("New TLS connection from {} -> shard {}", addr, tls_next_shard);
                                 let tx = &tls_txs[tls_next_shard];
                                 if tx.send_async((stream, true)).await.is_err() {
@@ -413,7 +423,17 @@ pub async fn run_sharded(
                 }
                 result = tls_listener.accept() => {
                     match result {
-                        Ok((stream, addr)) => {
+                        Ok((mut stream, addr)) => {
+                            // Protected mode: reject non-loopback connections when no auth configured
+                            if protected_mode_active && !addr.ip().is_loopback() {
+                                tracing::warn!(
+                                    "Protected mode: rejected TLS connection from {} (no password set)",
+                                    addr
+                                );
+                                let err_msg: Vec<u8> = b"-DENIED Redis is running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface.\r\n".to_vec();
+                                let _ = monoio::io::AsyncWriteRentExt::write_all(&mut stream, err_msg).await;
+                                continue;
+                            }
                             debug!("New TLS connection from {} -> shard {}", addr, tls_next_shard);
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
