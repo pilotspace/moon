@@ -1,0 +1,259 @@
+# Requirements: Rust Redis
+
+**Defined:** 2026-03-23
+**Core Value:** Simple, easy to use, high performance, effectively memory-efficient -- a Redis-compatible server that does fewer things but does them exceptionally well.
+
+## v1 Requirements
+
+Requirements for initial release. Each maps to roadmap phases.
+
+### Protocol
+
+- [x] **PROTO-01**: Server parses and serializes RESP2 protocol (Simple Strings, Errors, Integers, Bulk Strings, Arrays, Null)
+- [x] **PROTO-02**: Server handles inline commands (plain text commands from telnet/redis-cli)
+- [x] **PROTO-03**: Server supports command pipelining (multiple commands without waiting for responses)
+
+### Networking
+
+- [x] **NET-01**: Server accepts concurrent TCP connections via Tokio async runtime
+- [x] **NET-02**: Server handles graceful shutdown (SIGTERM/SIGINT) closing connections cleanly
+- [x] **NET-03**: Server supports configurable bind address and port (default 6379)
+
+### Connection Commands
+
+- [x] **CONN-01**: User can PING the server and receive PONG
+- [x] **CONN-02**: User can ECHO a message back
+- [x] **CONN-03**: User can QUIT to close connection
+- [x] **CONN-04**: User can SELECT a database (0-15)
+- [x] **CONN-05**: Server responds to COMMAND/COMMAND DOCS without error
+- [x] **CONN-06**: User can AUTH with a single password (requirepass)
+- [x] **CONN-07**: Server returns INFO with minimal sections (server, clients, memory, keyspace)
+
+### String Commands
+
+- [x] **STR-01**: User can GET and SET string values
+- [x] **STR-02**: SET supports EX (seconds), PX (milliseconds), NX (not exists), XX (exists only) options
+- [x] **STR-03**: User can MGET and MSET multiple keys atomically
+- [x] **STR-04**: User can INCR, DECR, INCRBY, DECRBY for atomic integer operations
+- [x] **STR-05**: User can INCRBYFLOAT for atomic float operations
+- [x] **STR-06**: User can APPEND to a string value
+- [x] **STR-07**: User can get STRLEN of a value
+- [x] **STR-08**: User can SETNX, SETEX, PSETEX (legacy commands)
+- [x] **STR-09**: User can GETSET, GETDEL, GETEX for atomic get-and-modify
+
+### Key Management
+
+- [x] **KEY-01**: User can DEL one or more keys
+- [x] **KEY-02**: User can check if keys EXISTS
+- [x] **KEY-03**: User can set EXPIRE/PEXPIRE and query TTL/PTTL on keys
+- [x] **KEY-04**: User can PERSIST a key (remove TTL)
+- [x] **KEY-05**: User can check TYPE of a key
+- [x] **KEY-06**: User can find keys matching a pattern with KEYS
+- [x] **KEY-07**: User can safely iterate keys with SCAN (cursor-based)
+- [x] **KEY-08**: User can RENAME/RENAMENX keys
+- [x] **KEY-09**: User can UNLINK keys (async non-blocking delete)
+
+### Expiration Engine
+
+- [x] **EXP-01**: Server performs lazy expiration (check TTL on every key access, delete if expired)
+- [x] **EXP-02**: Server performs active expiration (background probabilistic sampling -- 20 random keys, repeat if >25% expired, 1ms budget per cycle)
+
+### Hash Commands
+
+- [x] **HASH-01**: User can HSET/HGET/HDEL fields in a hash
+- [x] **HASH-02**: User can HMSET/HMGET for batch hash operations
+- [x] **HASH-03**: User can HGETALL to retrieve all fields and values
+- [x] **HASH-04**: User can HEXISTS/HLEN to check fields and hash size
+- [x] **HASH-05**: User can HKEYS/HVALS to get field names or values
+- [x] **HASH-06**: User can HINCRBY/HINCRBYFLOAT for atomic hash field increment
+- [x] **HASH-07**: User can HSETNX to set field only if not exists
+- [x] **HASH-08**: User can HSCAN to iterate hash fields with cursor
+
+### List Commands
+
+- [x] **LIST-01**: User can LPUSH/RPUSH/LPOP/RPOP elements
+- [x] **LIST-02**: User can LLEN/LRANGE/LINDEX to inspect lists
+- [x] **LIST-03**: User can LSET/LINSERT to modify list elements
+- [x] **LIST-04**: User can LREM to remove elements by value
+- [x] **LIST-05**: User can LTRIM to trim list to a range
+- [x] **LIST-06**: User can LPOS to find element position
+
+### Set Commands
+
+- [x] **SET-01**: User can SADD/SREM/SMEMBERS/SCARD for basic set operations
+- [x] **SET-02**: User can SISMEMBER/SMISMEMBER to check membership
+- [x] **SET-03**: User can SINTER/SUNION/SDIFF for set algebra
+- [x] **SET-04**: User can SINTERSTORE/SUNIONSTORE/SDIFFSTORE to store results
+- [x] **SET-05**: User can SRANDMEMBER/SPOP for random element retrieval
+- [x] **SET-06**: User can SSCAN to iterate set members with cursor
+
+### Sorted Set Commands
+
+- [x] **ZSET-01**: User can ZADD/ZREM/ZSCORE/ZCARD for basic sorted set operations
+- [x] **ZSET-02**: User can ZRANGE/ZREVRANGE with BYSCORE, BYLEX, REV, LIMIT options
+- [x] **ZSET-03**: User can ZRANGEBYSCORE/ZREVRANGEBYSCORE (legacy range queries)
+- [x] **ZSET-04**: User can ZRANK/ZREVRANK to get member rank
+- [x] **ZSET-05**: User can ZINCRBY for atomic score increment
+- [x] **ZSET-06**: User can ZCOUNT/ZLEXCOUNT for range counting
+- [x] **ZSET-07**: User can ZUNIONSTORE/ZINTERSTORE to aggregate sorted sets
+- [x] **ZSET-08**: User can ZPOPMIN/ZPOPMAX to pop by score
+- [x] **ZSET-09**: User can ZSCAN to iterate sorted set members with cursor
+
+### Persistence
+
+- [x] **PERS-01**: Server supports RDB persistence (point-in-time snapshots to disk)
+- [x] **PERS-02**: Server supports AOF persistence (append-only file with configurable fsync: always/everysec/no)
+- [x] **PERS-03**: Server can restore data from RDB or AOF on startup
+- [x] **PERS-04**: User can trigger BGSAVE for manual RDB snapshot
+- [x] **PERS-05**: User can trigger BGREWRITEAOF for AOF compaction
+
+### Pub/Sub
+
+- [x] **PUB-01**: User can SUBSCRIBE to channels and receive messages
+- [x] **PUB-02**: User can PUBLISH messages to channels
+- [x] **PUB-03**: User can PSUBSCRIBE for pattern-based subscriptions
+- [x] **PUB-04**: User can UNSUBSCRIBE/PUNSUBSCRIBE from channels
+
+### Eviction
+
+- [x] **EVIC-01**: Server supports LRU eviction policy (approximated, sampled) when maxmemory is reached
+- [x] **EVIC-02**: Server supports LFU eviction policy with Morris counter and decay
+- [x] **EVIC-03**: User can configure maxmemory and eviction policy via CONFIG SET
+
+### Transactions
+
+- [x] **TXN-01**: User can MULTI/EXEC/DISCARD for atomic command execution
+- [x] **TXN-02**: User can WATCH keys for optimistic locking (CAS)
+
+## v2 Requirements
+
+Deferred to future release. Tracked but not in current roadmap.
+
+### Blocking Commands
+
+- **BLOCK-01**: User can BLPOP/BRPOP for blocking list pops with timeout
+- **BLOCK-02**: User can BZPOPMIN/BZPOPMAX for blocking sorted set pops
+
+### Advanced Protocol
+
+- **ADVP-01**: Server supports RESP3 protocol negotiation via HELLO command
+- **ADVP-02**: Server returns rich types (maps, sets, booleans) in RESP3 mode
+
+### Memory Optimization
+
+- [x] **MEM-01**: Server uses memory-efficient encodings for small collections (Rust equivalents of ziplist/listpack)
+- **MEM-02**: Server uses intset encoding for small integer-only sets
+
+### Runtime Configuration
+
+- **CONF-01**: User can CONFIG GET/SET for runtime parameter changes
+- **CONF-02**: User can CONFIG REWRITE to persist changes
+
+### Introspection
+
+- **INTRO-01**: User can use OBJECT ENCODING/REFCOUNT/IDLETIME
+- **INTRO-02**: Server supports DUMP/RESTORE for key serialization
+
+## Out of Scope
+
+| Feature | Reason |
+|---------|--------|
+| Cluster mode / sharding | Massive complexity (gossip protocol, hash slots, resharding). Single-node focus. |
+| Lua scripting (EVAL/EVALSHA) | Embedding Lua VM adds large dependency and attack surface. MULTI/EXEC covers atomicity needs. |
+| Redis Modules API | Designing stable plugin API is extremely hard. Build features natively. |
+| Streams (XADD/XREAD/XGROUP) | Most complex Redis data type. Essentially building a message broker. |
+| Sentinel / High Availability | Distributed systems problem. Single-node focus for v1. |
+| Full ACL system | Disproportionate complexity. Single-password AUTH sufficient. |
+| Client-side caching (tracking) | Complex protocol extension. Not needed for v1. |
+| Redis Functions | Even more complex than Lua scripting. Defer indefinitely. |
+| Replication (WAIT/SLAVEOF) | Requires full replication protocol. Single-node focus. |
+
+## Traceability
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| PROTO-01 | Phase 1 | Complete |
+| PROTO-02 | Phase 1 | Complete |
+| PROTO-03 | Phase 2 | Complete |
+| NET-01 | Phase 2 | Complete |
+| NET-02 | Phase 2 | Complete |
+| NET-03 | Phase 2 | Complete |
+| CONN-01 | Phase 2 | Complete |
+| CONN-02 | Phase 2 | Complete |
+| CONN-03 | Phase 2 | Complete |
+| CONN-04 | Phase 2 | Complete |
+| CONN-05 | Phase 2 | Complete |
+| CONN-06 | Phase 3 | Complete |
+| CONN-07 | Phase 2 | Complete |
+| STR-01 | Phase 2 | Complete |
+| STR-02 | Phase 2 | Complete |
+| STR-03 | Phase 2 | Complete |
+| STR-04 | Phase 2 | Complete |
+| STR-05 | Phase 2 | Complete |
+| STR-06 | Phase 2 | Complete |
+| STR-07 | Phase 2 | Complete |
+| STR-08 | Phase 2 | Complete |
+| STR-09 | Phase 2 | Complete |
+| KEY-01 | Phase 2 | Complete |
+| KEY-02 | Phase 2 | Complete |
+| KEY-03 | Phase 2 | Complete |
+| KEY-04 | Phase 2 | Complete |
+| KEY-05 | Phase 2 | Complete |
+| KEY-06 | Phase 2 | Complete |
+| KEY-07 | Phase 3 | Complete |
+| KEY-08 | Phase 2 | Complete |
+| KEY-09 | Phase 3 | Complete |
+| EXP-01 | Phase 2 | Complete |
+| EXP-02 | Phase 3 | Complete |
+| HASH-01 | Phase 3 | Complete |
+| HASH-02 | Phase 3 | Complete |
+| HASH-03 | Phase 3 | Complete |
+| HASH-04 | Phase 3 | Complete |
+| HASH-05 | Phase 3 | Complete |
+| HASH-06 | Phase 3 | Complete |
+| HASH-07 | Phase 3 | Complete |
+| HASH-08 | Phase 3 | Complete |
+| LIST-01 | Phase 3 | Complete |
+| LIST-02 | Phase 3 | Complete |
+| LIST-03 | Phase 3 | Complete |
+| LIST-04 | Phase 3 | Complete |
+| LIST-05 | Phase 3 | Complete |
+| LIST-06 | Phase 3 | Complete |
+| SET-01 | Phase 3 | Complete |
+| SET-02 | Phase 3 | Complete |
+| SET-03 | Phase 3 | Complete |
+| SET-04 | Phase 3 | Complete |
+| SET-05 | Phase 3 | Complete |
+| SET-06 | Phase 3 | Complete |
+| ZSET-01 | Phase 3 | Complete |
+| ZSET-02 | Phase 3 | Complete |
+| ZSET-03 | Phase 3 | Complete |
+| ZSET-04 | Phase 3 | Complete |
+| ZSET-05 | Phase 3 | Complete |
+| ZSET-06 | Phase 3 | Complete |
+| ZSET-07 | Phase 3 | Complete |
+| ZSET-08 | Phase 3 | Complete |
+| ZSET-09 | Phase 3 | Complete |
+| PERS-01 | Phase 4 | Complete |
+| PERS-02 | Phase 4 | Complete |
+| PERS-03 | Phase 4 | Complete |
+| PERS-04 | Phase 4 | Complete |
+| PERS-05 | Phase 4 | Complete |
+| PUB-01 | Phase 5 | Complete |
+| PUB-02 | Phase 5 | Complete |
+| PUB-03 | Phase 5 | Complete |
+| PUB-04 | Phase 5 | Complete |
+| TXN-01 | Phase 5 | Complete |
+| TXN-02 | Phase 5 | Complete |
+| EVIC-01 | Phase 5 | Complete |
+| EVIC-02 | Phase 5 | Complete |
+| EVIC-03 | Phase 5 | Complete |
+
+**Coverage:**
+- v1 requirements: 76 total
+- Mapped to phases: 76
+- Unmapped: 0
+
+---
+*Requirements defined: 2026-03-23*
+*Last updated: 2026-03-23 after roadmap creation*
