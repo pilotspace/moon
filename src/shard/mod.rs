@@ -402,6 +402,7 @@ impl Shard {
                                                 tls_stream, peer_addr, dbs, shard_id, num_shards,
                                                 dtx, psr, blk, sd, reqpass, aof, trk, cid,
                                                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                snap_tx,
                                                 clk,
                                             ).await;
                                         }

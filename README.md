@@ -131,10 +131,10 @@ cargo build --release
 
 ```bash
 # Default: binds to 127.0.0.1:6379, auto-detects CPU count for shards
-./target/release/rust-redis
+./target/release/moon
 
 # With specific options
-./target/release/rust-redis --port 6380 --shards 4 --requirepass mysecret
+./target/release/moon --port 6380 --shards 4 --requirepass mysecret
 ```
 
 ### Connect
@@ -169,11 +169,11 @@ docker run -p 6379:6379 moon
 
 # Run with persistence
 docker run -p 6379:6379 -v moon-data:/data moon \
-  rust-redis --bind 0.0.0.0 --dir /data --appendonly yes
+  moon --bind 0.0.0.0 --dir /data --appendonly yes
 
 # Run with password and TLS
 docker run -p 6379:6379 -p 6380:6380 moon \
-  rust-redis --bind 0.0.0.0 --requirepass secret \
+  moon --bind 0.0.0.0 --requirepass secret \
   --tls-port 6380 --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key
 ```
 
@@ -240,7 +240,7 @@ All options are available as command-line flags. See `--help` for the full list.
 ### Example: Production Configuration
 
 ```bash
-./target/release/rust-redis \
+./target/release/moon \
   --bind 0.0.0.0 \
   --port 6379 \
   --tls-port 6380 \
@@ -316,7 +316,7 @@ See [BENCHMARK.md](BENCHMARK.md) for detailed methodology and [BENCHMARK-RESOURC
 cargo test --lib
 
 # With logging
-RUST_LOG=rust_redis=debug cargo test --lib
+RUST_LOG=moon=debug cargo test --lib
 
 # Data consistency tests (132 tests vs Redis as ground truth)
 ./scripts/test-consistency.sh

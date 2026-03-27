@@ -6,9 +6,9 @@
 use bytes::Bytes;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use rust_redis::protocol::{self, Frame, ParseConfig};
-use rust_redis::storage::Database;
-use rust_redis::storage::entry::CompactEntry;
+use moon::protocol::{self, Frame, ParseConfig};
+use moon::storage::Database;
+use moon::storage::entry::CompactEntry;
 
 fn bench_get_hotpath(c: &mut Criterion) {
     // Setup: create DB with 10K keys of 256 bytes
@@ -111,7 +111,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
     c.bench_function("7_full_get_dispatch", |b| {
         let args = &[Frame::BulkString(lookup_key.clone())];
         b.iter(|| {
-            let frame = rust_redis::command::string::get(&mut db, black_box(args));
+            let frame = moon::command::string::get(&mut db, black_box(args));
             black_box(frame);
         })
     });
@@ -121,7 +121,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
         let cmd = b"GET";
         let args: &[Frame] = &[Frame::BulkString(lookup_key.clone())];
         b.iter(|| {
-            let result = rust_redis::command::dispatch(
+            let result = moon::command::dispatch(
                 &mut db,
                 black_box(cmd),
                 black_box(args),
@@ -153,12 +153,12 @@ fn bench_get_hotpath(c: &mut Criterion) {
             };
 
             // Dispatch
-            let result = rust_redis::command::dispatch(&mut db, cmd, args, &mut 0usize, 16);
+            let result = moon::command::dispatch(&mut db, cmd, args, &mut 0usize, 16);
 
             // Serialize response
             buf.clear();
             match result {
-                rust_redis::command::DispatchResult::Response(f) => {
+                moon::command::DispatchResult::Response(f) => {
                     protocol::serialize(&f, &mut buf);
                 }
                 _ => {}
@@ -170,7 +170,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
     // ─── Stage 10: is_write_command check ───
     c.bench_function("10_is_write_command_get", |b| {
         b.iter(|| {
-            let result = rust_redis::persistence::aof::is_write_command(black_box(b"GET"));
+            let result = moon::persistence::aof::is_write_command(black_box(b"GET"));
             black_box(result);
         })
     });
@@ -179,7 +179,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
     c.bench_function("11_xxhash_key_route", |b| {
         b.iter(|| {
             let shard =
-                rust_redis::shard::dispatch::key_to_shard(black_box(lookup_key.as_ref()), 12);
+                moon::shard::dispatch::key_to_shard(black_box(lookup_key.as_ref()), 12);
             black_box(shard);
         })
     });

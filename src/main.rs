@@ -9,21 +9,21 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::path::PathBuf;
 
 use clap::Parser;
-use rust_redis::config::ServerConfig;
-use rust_redis::persistence::aof::{self, AofMessage, FsyncPolicy};
-use rust_redis::runtime::cancel::CancellationToken;
-use rust_redis::runtime::channel;
-use rust_redis::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
-use rust_redis::server;
-use rust_redis::shard::Shard;
-use rust_redis::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
+use moon::config::ServerConfig;
+use moon::persistence::aof::{self, AofMessage, FsyncPolicy};
+use moon::runtime::cancel::CancellationToken;
+use moon::runtime::channel;
+use moon::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
+use moon::server;
+use moon::shard::Shard;
+use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rust_redis=info".into()),
+                .unwrap_or_else(|_| "moon=info".into()),
         )
         .init();
 
@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
             .tls_key_file
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--tls-key-file required when --tls-port is set"))?;
-        let tls_cfg = rust_redis::tls::build_tls_config(
+        let tls_cfg = moon::tls::build_tls_config(
             cert,
             key,
             config.tls_ca_cert_file.as_deref(),
@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
-    let (snapshot_trigger_tx, snapshot_trigger_rx) = rust_redis::runtime::channel::watch(0u64);
+    let (snapshot_trigger_tx, snapshot_trigger_rx) = moon::runtime::channel::watch(0u64);
 
     // Persistence directory for per-shard WAL and snapshots.
     // Only set when persistence is actually enabled (appendonly=yes or save rules exist)
@@ -129,21 +129,21 @@ fn main() -> anyhow::Result<()> {
 
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =
-        rust_redis::replication::state::load_replication_state(std::path::Path::new(&config.dir));
+        moon::replication::state::load_replication_state(std::path::Path::new(&config.dir));
     let repl_state = std::sync::Arc::new(std::sync::RwLock::new(
-        rust_redis::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
+        moon::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
     ));
 
     // Cluster mode initialization
     let cluster_state: Option<
-        std::sync::Arc<std::sync::RwLock<rust_redis::cluster::ClusterState>>,
+        std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>,
     > = if config.cluster_enabled {
-        rust_redis::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
         let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
             .parse()
             .expect("invalid bind address");
-        let node_id = rust_redis::replication::state::generate_repl_id();
-        let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
+        let node_id = moon::replication::state::generate_repl_id();
+        let state = moon::cluster::ClusterState::new(node_id, self_addr);
         let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
         info!(
             "Cluster mode enabled, node ID: {}",
@@ -155,16 +155,16 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
-    let acl_table: std::sync::Arc<std::sync::RwLock<rust_redis::acl::AclTable>> = {
-        let table = rust_redis::acl::AclTable::load_or_default(&config);
+    let acl_table: std::sync::Arc<std::sync::RwLock<moon::acl::AclTable>> = {
+        let table = moon::acl::AclTable::load_or_default(&config);
         std::sync::Arc::new(std::sync::RwLock::new(table))
     };
 
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<
-        std::sync::RwLock<rust_redis::config::RuntimeConfig>,
+        std::sync::RwLock<moon::config::RuntimeConfig>,
     > = { std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config())) };
-    let server_config_shared: std::sync::Arc<rust_redis::config::ServerConfig> =
+    let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 
     // Collect all notifiers before spawning shard threads
@@ -197,7 +197,7 @@ fn main() -> anyhow::Result<()> {
             .name(format!("shard-{}", id))
             .spawn(move || {
                 // Pin shard thread to core BEFORE any allocations (NUMA locality)
-                rust_redis::shard::numa::pin_to_core(id);
+                moon::shard::numa::pin_to_core(id);
 
                 let mut shard = Shard::new(
                     id,
@@ -260,11 +260,11 @@ fn main() -> anyhow::Result<()> {
         listener_rt.block_on(async {
             // Set up auto-save timer if save rules are configured (sharded mode)
             if config.save.is_some() {
-                let rules = rust_redis::persistence::auto_save::parse_save_rules(&config.save);
+                let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
                 if !rules.is_empty() {
                     let auto_save_token = cancel_token.child_token();
                     let auto_save_counter = change_counter.clone();
-                    tokio::spawn(rust_redis::persistence::auto_save::run_auto_save_sharded(
+                    tokio::spawn(moon::persistence::auto_save::run_auto_save_sharded(
                         rules,
                         auto_save_counter,
                         auto_save_token,
@@ -285,12 +285,12 @@ fn main() -> anyhow::Result<()> {
 
                 // Shared vote channel: gossip ticker sets sender when election starts,
                 // bus handler forwards FailoverAuthAck votes through it.
-                let failover_vote_tx: rust_redis::cluster::bus::SharedVoteTx =
+                let failover_vote_tx: moon::cluster::bus::SharedVoteTx =
                     std::sync::Arc::new(parking_lot::Mutex::new(None));
 
                 let bus_vote_tx = failover_vote_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = rust_redis::cluster::bus::run_cluster_bus(
+                    if let Err(e) = moon::cluster::bus::run_cluster_bus(
                         &bind2,
                         cluster_port,
                         self_addr,
@@ -312,7 +312,7 @@ fn main() -> anyhow::Result<()> {
                 let gossip_vote_tx = failover_vote_tx.clone();
                 let gossip_repl_state = repl_state.clone();
                 tokio::spawn(async move {
-                    rust_redis::cluster::gossip::run_gossip_ticker(
+                    moon::cluster::gossip::run_gossip_ticker(
                         self_addr2,
                         cs_gossip,
                         node_timeout,
@@ -338,7 +338,7 @@ fn main() -> anyhow::Result<()> {
 
         // Auto-save runs on a dedicated thread (same pattern as AOF writer).
         if config.save.is_some() {
-            let rules = rust_redis::persistence::auto_save::parse_save_rules(&config.save);
+            let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
             if !rules.is_empty() {
                 let auto_save_token = cancel_token.child_token();
                 let auto_save_counter = change_counter.clone();
@@ -348,7 +348,7 @@ fn main() -> anyhow::Result<()> {
                     .spawn(move || {
                         RuntimeFactoryImpl::block_on_local(
                             "auto-save".to_string(),
-                            rust_redis::persistence::auto_save::run_auto_save_sharded(
+                            moon::persistence::auto_save::run_auto_save_sharded(
                                 rules,
                                 auto_save_counter,
                                 auto_save_token,

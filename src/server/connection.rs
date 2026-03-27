@@ -1432,6 +1432,7 @@ pub async fn handle_connection_sharded(
         runtime_config,
         config,
         spsc_notifiers,
+        snapshot_trigger_tx,
         cached_clock,
     )
     .await;
@@ -1467,6 +1468,7 @@ pub async fn handle_connection_sharded_inner<
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+    snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

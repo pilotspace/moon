@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_build_tls_config_missing_key() {
         // Create a temp cert file but no key
-        let dir = std::env::temp_dir().join("rust-redis-tls-test");
+        let dir = std::env::temp_dir().join("moon-tls-test");
         let _ = std::fs::create_dir_all(&dir);
         let cert_path = dir.join("test.crt");
         std::fs::write(&cert_path, "not a real cert").unwrap();

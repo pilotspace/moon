@@ -2,7 +2,7 @@ use clap::Parser;
 
 /// Server configuration parsed from command-line arguments.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "rust-redis", about = "A Redis-compatible server")]
+#[command(name = "moon", about = "A Redis-compatible server")]
 pub struct ServerConfig {
     /// Bind address
     #[arg(long, default_value = "127.0.0.1")]
@@ -189,21 +189,21 @@ mod tests {
 
     #[test]
     fn test_custom_port() {
-        let config = ServerConfig::parse_from(["rust-redis", "--port", "6380"]);
+        let config = ServerConfig::parse_from(["moon", "--port", "6380"]);
         assert_eq!(config.port, 6380);
     }
 
     #[test]
     fn test_custom_bind_and_databases() {
         let config =
-            ServerConfig::parse_from(["rust-redis", "--bind", "0.0.0.0", "--databases", "4"]);
+            ServerConfig::parse_from(["moon", "--bind", "0.0.0.0", "--databases", "4"]);
         assert_eq!(config.bind, "0.0.0.0");
         assert_eq!(config.databases, 4);
     }
 
     #[test]
     fn test_requirepass() {
-        let config = ServerConfig::parse_from(["rust-redis", "--requirepass", "mysecret"]);
+        let config = ServerConfig::parse_from(["moon", "--requirepass", "mysecret"]);
         assert_eq!(config.requirepass, Some("mysecret".to_string()));
     }
 
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn test_persistence_custom_values() {
         let config = ServerConfig::parse_from([
-            "rust-redis",
+            "moon",
             "--dir",
             "/data",
             "--dbfilename",
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn test_maxmemory_custom() {
         let config = ServerConfig::parse_from([
-            "rust-redis",
+            "moon",
             "--maxmemory",
             "1048576",
             "--maxmemory-policy",
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn test_to_runtime_config() {
         let config = ServerConfig::parse_from([
-            "rust-redis",
+            "moon",
             "--maxmemory",
             "1024",
             "--maxmemory-policy",
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_shards_custom() {
-        let config = ServerConfig::parse_from(["rust-redis", "--shards", "4"]);
+        let config = ServerConfig::parse_from(["moon", "--shards", "4"]);
         assert_eq!(config.shards, 4);
     }
 
@@ -318,13 +318,13 @@ mod tests {
 
     #[test]
     fn test_aclfile_custom() {
-        let config = ServerConfig::parse_from(["rust-redis", "--aclfile", "/tmp/test.acl"]);
+        let config = ServerConfig::parse_from(["moon", "--aclfile", "/tmp/test.acl"]);
         assert_eq!(config.aclfile, Some("/tmp/test.acl".to_string()));
     }
 
     #[test]
     fn test_to_runtime_config_aclfile() {
-        let config = ServerConfig::parse_from(["rust-redis", "--aclfile", "/data/users.acl"]);
+        let config = ServerConfig::parse_from(["moon", "--aclfile", "/data/users.acl"]);
         let rt = config.to_runtime_config();
         assert_eq!(rt.aclfile, Some("/data/users.acl".to_string()));
     }

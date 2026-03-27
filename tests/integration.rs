@@ -1,17 +1,17 @@
-//! Integration tests for the rust-redis server.
+//! Integration tests for the moon server.
 //!
 //! Each test spawns a real TCP server on an OS-assigned port, connects with the
 //! `redis` crate client, exercises commands over real TCP, and shuts down cleanly.
 
 use redis::AsyncCommands;
-use rust_redis::runtime::cancel::CancellationToken;
-use rust_redis::runtime::channel;
+use moon::runtime::cancel::CancellationToken;
+use moon::runtime::channel;
 use tokio::net::TcpListener;
 
-use rust_redis::config::ServerConfig;
-use rust_redis::server::listener;
-use rust_redis::shard::Shard;
-use rust_redis::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
+use moon::config::ServerConfig;
+use moon::server::listener;
+use moon::shard::Shard;
+use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 
 /// Start a server on a random port and return the port + shutdown token.
 async fn start_server() -> (u16, CancellationToken) {
@@ -1254,11 +1254,11 @@ async fn test_bgsave_creates_rdb_file() {
     let rdb_path = dir.join("dump.rdb");
     assert!(rdb_path.exists(), "dump.rdb should exist after BGSAVE");
 
-    // Verify file starts with RUSTREDIS magic bytes
+    // Verify file starts with MOON magic bytes
     let data = std::fs::read(&rdb_path).unwrap();
     assert!(
-        data.starts_with(b"RUSTREDIS"),
-        "RDB file should start with RUSTREDIS magic bytes"
+        data.starts_with(b"MOON"),
+        "RDB file should start with MOON magic bytes"
     );
 
     shutdown.cancel();
@@ -2443,9 +2443,9 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     );
 
-                    let (_, snap_rx) = channel::watch(0u64);
+                    let (snap_tx, snap_rx) = channel::watch(0u64);
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
-                        rust_redis::acl::AclTable::load_or_default(&shard_config),
+                        moon::acl::AclTable::load_or_default(&shard_config),
                     ));
                     let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
                         shard_config.to_runtime_config(),
@@ -2460,11 +2460,13 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         None,
                         None,
                         snap_rx,
+                        snap_tx,
                         None,
                         None,
                         0,
                         acl_t,
                         rt_cfg,
+                        std::sync::Arc::new(shard_config),
                         shard_spsc_notify,
                         shard_all_notifiers,
                     )));
@@ -3493,10 +3495,10 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
         // Initialize cluster state
-        rust_redis::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
         let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", config.port).parse().unwrap();
-        let node_id = rust_redis::replication::state::generate_repl_id();
-        let state = rust_redis::cluster::ClusterState::new(node_id, self_addr);
+        let node_id = moon::replication::state::generate_repl_id();
+        let state = moon::cluster::ClusterState::new(node_id, self_addr);
         let cluster_state = Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
 
         let all_notifiers = mesh.all_notifiers();
@@ -3529,9 +3531,9 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     );
 
-                    let (_, snap_rx) = channel::watch(0u64);
+                    let (snap_tx, snap_rx) = channel::watch(0u64);
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
-                        rust_redis::acl::AclTable::load_or_default(&shard_config),
+                        moon::acl::AclTable::load_or_default(&shard_config),
                     ));
                     let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
                         shard_config.to_runtime_config(),
@@ -3546,11 +3548,13 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         None,
                         None,
                         snap_rx,
+                        snap_tx,
                         None,
                         shard_cs,
                         shard_config.port,
                         acl_t,
                         rt_cfg,
+                        std::sync::Arc::new(shard_config),
                         shard_spsc_notify,
                         shard_all_notifiers,
                     )));

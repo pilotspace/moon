@@ -2,14 +2,14 @@
 set -euo pipefail
 
 ###############################################################################
-# bench-resources.sh -- CPU & Memory comparison: rust-redis vs Redis
+# bench-resources.sh -- CPU & Memory comparison: moon vs Redis
 #
 # Starts fresh server instances per test for accurate RSS measurement.
 # Measures absolute RSS, per-key memory, throughput, and CPU efficiency.
 #
 # Usage:
 #   ./scripts/bench-resources.sh                       # Run all tests
-#   ./scripts/bench-resources.sh --shards N            # rust-redis shard count
+#   ./scripts/bench-resources.sh --shards N            # moon shard count
 #   ./scripts/bench-resources.sh --skip-build          # Skip cargo build
 #   ./scripts/bench-resources.sh --output FILE         # Output file path
 #   ./scripts/bench-resources.sh --quick               # Smaller test matrix
@@ -20,7 +20,7 @@ PORT_RUST=6400
 SHARDS=0
 SKIP_BUILD=false
 OUTPUT_FILE="BENCHMARK-RESOURCES.md"
-RUST_BINARY="./target/release/rust-redis"
+RUST_BINARY="./target/release/moon"
 QUICK=false
 
 RUST_PID=""
@@ -43,7 +43,7 @@ cleanup() {
     kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "rust-redis.*${PORT_RUST}" 2>/dev/null || true
+    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -76,7 +76,7 @@ human_kb() {
 start_servers() {
     # Kill any lingering instances
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "rust-redis.*${PORT_RUST}" 2>/dev/null || true
+    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
     sleep 0.3
 
     redis-server --port "$PORT_REDIS" --save "" --appendonly no \
@@ -136,7 +136,7 @@ bench_memory_row() {
     redis_db=${redis_db:-0}
     rust_db=${rust_db:-0}
 
-    # used_memory from INFO (Redis reports this; rust-redis may not)
+    # used_memory from INFO (Redis reports this; moon may not)
     local redis_used
     redis_used=$(redis-cli -p "$PORT_REDIS" INFO memory 2>/dev/null | grep "^used_memory:" | cut -d: -f2 | tr -d '\r') || true
     redis_used=${redis_used:-0}
@@ -230,7 +230,7 @@ bench_ttl_overhead() {
 
     stop_servers
 
-    echo "| Metric | Redis | rust-redis | Notes |"
+    echo "| Metric | Redis | moon | Notes |"
     echo "|--------|-------|------------|-------|"
     echo "| Keys loaded (SETEX) | ${redis_db_ttl:-?} | ${rust_db_ttl:-?} | |"
     echo "| RSS data (no TTL) | $(human_kb "$redis_data_no") | $(human_kb "$rust_data_no") | Fresh server, 500K x 64B SET |"
@@ -270,7 +270,7 @@ bench_cpu_efficiency() {
         rrps=$(redis-benchmark -p "$PORT_REDIS" -t get -n 500000 -r 200000 -P "$pipeline" -c 50 --csv -q 2>&1 \
             | tr '\r' '\n' | grep -i '"GET"' | head -1 | cut -d, -f2 | tr -d '"') || true
 
-        # rust-redis
+        # moon
         redis-benchmark -p "$PORT_RUST" -t get,set -n 1000000 -r 200000 -P "$pipeline" -c 50 -q &>/dev/null &
         bp=$!
         sleep 3
@@ -309,11 +309,11 @@ bench_cpu_efficiency() {
 
 main() {
     log "============================================"
-    log "  Resource Benchmark: rust-redis vs Redis"
+    log "  Resource Benchmark: moon vs Redis"
     log "============================================"
 
     if [[ "$SKIP_BUILD" == false ]]; then
-        log "Building rust-redis (release)..."
+        log "Building moon (release)..."
         cargo build --release 2>&1 | tail -3
     fi
 
@@ -345,12 +345,12 @@ main() {
     fi
 
     {
-        echo "# Resource Benchmark: rust-redis vs Redis"
+        echo "# Resource Benchmark: moon vs Redis"
         echo ""
         echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')"
         echo "**System:** ${os_info}, ${nproc} cores"
         echo "**Redis:** ${redis_ver}"
-        echo "**rust-redis shards:** ${SHARDS} (0=auto)"
+        echo "**moon shards:** ${SHARDS} (0=auto)"
         echo "**Method:** Fresh server per data point (accurate RSS, no allocator hysteresis)"
         echo ""
 
@@ -377,7 +377,7 @@ main() {
         bench_ttl_overhead
         echo ""
         echo "> Redis stores TTL in a separate \`expires\` dict (extra dictEntry per key)."
-        echo "> rust-redis packs TTL as a 4-byte delta inside CompactEntry (zero extra allocation)."
+        echo "> moon packs TTL as a 4-byte delta inside CompactEntry (zero extra allocation)."
         echo ""
 
         # --- CPU efficiency ---

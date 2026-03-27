@@ -3,11 +3,11 @@
 //! Tests REPLICAOF, REPLCONF, INFO replication, READONLY enforcement,
 //! and REPLICAOF NO ONE promotion -- using real TCP connections.
 
-use rust_redis::runtime::cancel::CancellationToken;
+use moon::runtime::cancel::CancellationToken;
 use tokio::net::TcpListener;
 
-use rust_redis::config::ServerConfig;
-use rust_redis::server::listener;
+use moon::config::ServerConfig;
+use moon::server::listener;
 
 /// Start a server on a random port with replication support and return port + shutdown token.
 async fn start_server() -> (u16, CancellationToken) {

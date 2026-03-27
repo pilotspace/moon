@@ -123,7 +123,7 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
 
     sections.push_str("# Server\r\n");
     sections.push_str("redis_version:0.1.0\r\n");
-    sections.push_str("rust_redis:true\r\n");
+    sections.push_str("moon:true\r\n");
     sections.push_str("\r\n");
 
     sections.push_str("# Clients\r\n");
@@ -409,7 +409,7 @@ pub fn hello_acl(
     let response = Frame::Map(vec![
         (
             Frame::BulkString(Bytes::from_static(b"server")),
-            Frame::BulkString(Bytes::from_static(b"rustredis")),
+            Frame::BulkString(Bytes::from_static(b"moon")),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"version")),
@@ -617,7 +617,7 @@ pub fn hello(
     let response = Frame::Map(vec![
         (
             Frame::BulkString(Bytes::from_static(b"server")),
-            Frame::BulkString(Bytes::from_static(b"rustredis")),
+            Frame::BulkString(Bytes::from_static(b"moon")),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"version")),

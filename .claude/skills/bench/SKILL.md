@@ -1,9 +1,9 @@
 ---
 name: bench
-description: Run rust-redis benchmarks. Args: micro|production|resources|profile|all (default: micro). Optional: --shards N, --duration SEC, --scenario NAME.
+description: Run moon benchmarks. Args: micro|production|resources|profile|all (default: micro). Optional: --shards N, --duration SEC, --scenario NAME.
 ---
 
-Run the specified benchmark for rust-redis.
+Run the specified benchmark for moon.
 
 ## Argument Handling
 
@@ -19,7 +19,7 @@ Pass through any extra flags (e.g. `--shards 4`, `--duration 60`, `--scenario se
 
 ## Steps
 
-1. Check that the release binary exists at `./target/release/rust-redis`. If not, build first:
+1. Check that the release binary exists at `./target/release/moon`. If not, build first:
    ```bash
    cargo build --release --no-default-features --features runtime-tokio
    ```
