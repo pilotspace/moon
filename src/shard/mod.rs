@@ -229,9 +229,9 @@ impl Shard {
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
         let num_shards = self.num_shards;
 
-        // Initialize per-shard Lua VM (created inside run() because Lua is !Send -- Pitfall 1)
-        let lua_rc: Rc<mlua::Lua> = crate::scripting::setup_lua_vm()
-            .expect("Lua VM initialization failed");
+        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
+        // Lua is !Send so it must be created on the shard thread (inside run()).
+        let lua_rc: Rc<RefCell<Option<Rc<mlua::Lua>>>> = Rc::new(RefCell::new(None));
         let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
 
         // Per-shard snapshot state (None when no snapshot is active)
@@ -266,10 +266,9 @@ impl Shard {
         };
 
         // Per-shard replication backlog (in-memory, 1MB capacity, for partial resync).
+        // Lazy: allocated on first RegisterReplica to save 1MB/shard at baseline.
         // IMPORTANT: monotonic offsets here are independent of WAL file size.
-        let backlog_capacity = 1024 * 1024; // 1MB per shard
-        let mut repl_backlog: Option<ReplicationBacklog> =
-            Some(ReplicationBacklog::new(backlog_capacity));
+        let mut repl_backlog: Option<ReplicationBacklog> = None;
 
         // Per-shard replica sender channels: (replica_id, Sender<Bytes>).
         // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
@@ -346,7 +345,14 @@ impl Shard {
                             let rs = repl_state.clone();
                             let cs = cluster_state.clone();
                             let cp = config_port;
-                            let lua = lua_rc.clone();
+                            let lua = {
+                                let mut lua_opt = lua_rc.borrow_mut();
+                                if lua_opt.is_none() {
+                                    *lua_opt = Some(crate::scripting::setup_lua_vm()
+                                        .expect("Lua VM initialization failed"));
+                                }
+                                lua_opt.as_ref().unwrap().clone()
+                            };
                             let sc = script_cache_rc.clone();
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
@@ -572,7 +578,14 @@ impl Shard {
                                     let rs = repl_state.clone();
                                     let cs = cluster_state.clone();
                                     let cp = config_port;
-                                    let lua = lua_rc.clone();
+                                    let lua = {
+                                        let mut lua_opt = lua_rc.borrow_mut();
+                                        if lua_opt.is_none() {
+                                            *lua_opt = Some(crate::scripting::setup_lua_vm()
+                                                .expect("Lua VM initialization failed"));
+                                        }
+                                        lua_opt.as_ref().unwrap().clone()
+                                    };
                                     let sc = script_cache_rc.clone();
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
@@ -1137,6 +1150,10 @@ impl Shard {
                 info!("Received shutdown via SPSC");
             }
             ShardMessage::RegisterReplica { replica_id, tx } => {
+                // Lazy-init replication backlog on first replica registration (saves 1MB/shard)
+                if repl_backlog.is_none() {
+                    *repl_backlog = Some(ReplicationBacklog::new(1024 * 1024));
+                }
                 replica_txs.push((replica_id, tx));
             }
             ShardMessage::UnregisterReplica { replica_id } => {

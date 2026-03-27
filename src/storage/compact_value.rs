@@ -31,6 +31,7 @@ const SSO_MAX_LEN: usize = 12;
 const TAG_STRING: u32 = 0x00000000; // 0 in high nibble
 
 // Heap type tags (low 3 bits of pointer)
+// Tag 0 = raw string stored as Box<[u8]> (NOT Box<RedisValue>!)
 const HEAP_TAG_STRING: usize = 0;
 const HEAP_TAG_HASH: usize = 1;
 const HEAP_TAG_LIST: usize = 2;
@@ -38,6 +39,11 @@ const HEAP_TAG_SET: usize = 3;
 const HEAP_TAG_ZSET: usize = 4;
 const HEAP_TAG_STREAM: usize = 5;
 const HEAP_TAG_MASK: usize = 0x7;
+
+/// Thin wrapper for heap-allocated strings.
+/// At 24 bytes (Vec<u8>), this is smaller than RedisValue::String(Bytes) (~40 bytes)
+/// and avoids the enum discriminant overhead.
+struct HeapString(Vec<u8>);
 
 /// Borrowed view of a CompactValue, for zero-copy read access.
 pub enum RedisValueRef<'a> {
@@ -128,6 +134,10 @@ impl CompactValue {
     }
 
     /// Create a CompactValue from a RedisValue.
+    ///
+    /// Strings > 12 bytes are stored as `Box<[u8]>` (raw bytes) to eliminate the
+    /// `RedisValue` enum wrapper (~40B savings per heap string).
+    /// Collections are still stored as `Box<RedisValue>`.
     pub fn from_redis_value(value: RedisValue) -> Self {
         match &value {
             RedisValue::String(s) if s.len() <= SSO_MAX_LEN => {
@@ -135,32 +145,56 @@ impl CompactValue {
             }
             _ => {}
         }
-        // Heap path: box the value, extract raw pointer, tag it
-        let (heap_tag, str_len) = match &value {
-            RedisValue::String(s) => (HEAP_TAG_STRING, s.len()),
-            RedisValue::Hash(_) | RedisValue::HashListpack(_) => (HEAP_TAG_HASH, 0),
-            RedisValue::List(_) | RedisValue::ListListpack(_) => (HEAP_TAG_LIST, 0),
+
+        // String heap path: store as Box<[u8]> directly (no RedisValue wrapper)
+        if let RedisValue::String(s) = &value {
+            return Self::heap_string(s);
+        }
+
+        // Collection heap path: store as Box<RedisValue>
+        let heap_tag = match &value {
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) => HEAP_TAG_HASH,
+            RedisValue::List(_) | RedisValue::ListListpack(_) => HEAP_TAG_LIST,
             RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => {
-                (HEAP_TAG_SET, 0)
+                HEAP_TAG_SET
             }
             RedisValue::SortedSet { .. }
             | RedisValue::SortedSetBPTree { .. }
-            | RedisValue::SortedSetListpack(_) => (HEAP_TAG_ZSET, 0),
-            RedisValue::Stream(_) => (HEAP_TAG_STREAM, 0),
+            | RedisValue::SortedSetListpack(_) => HEAP_TAG_ZSET,
+            RedisValue::Stream(_) => HEAP_TAG_STREAM,
+            RedisValue::String(_) => unreachable!(),
         };
-
-        // Get prefix bytes for strings
-        let mut prefix = [0u8; 4];
-        if let RedisValue::String(s) = &value {
-            let copy_len = s.len().min(4);
-            prefix[..copy_len].copy_from_slice(&s[..copy_len]);
-        }
 
         let boxed = Box::new(value);
         let raw_ptr = Box::into_raw(boxed) as usize;
-        // Verify alignment allows tagging (Box alignment >= 8 for these types)
         debug_assert!(raw_ptr & HEAP_TAG_MASK == 0, "Box pointer insufficiently aligned");
         let tagged_ptr = raw_ptr | heap_tag;
+
+        let mut payload = [0u8; 12];
+        // No prefix for collections
+        payload[4..12].copy_from_slice(&tagged_ptr.to_ne_bytes());
+
+        CompactValue {
+            len_and_tag: HEAP_MARKER,
+            payload,
+        }
+    }
+
+    /// Create a heap-allocated string CompactValue from byte data.
+    /// Stores as `Box<HeapString>` — eliminates RedisValue enum wrapper.
+    /// HeapString is 24 bytes (Vec<u8>) vs RedisValue::String(Bytes) at ~40 bytes.
+    pub fn heap_string(data: &[u8]) -> Self {
+        debug_assert!(data.len() > SSO_MAX_LEN);
+        let str_len = data.len();
+
+        let mut prefix = [0u8; 4];
+        let copy_len = str_len.min(4);
+        prefix[..copy_len].copy_from_slice(&data[..copy_len]);
+
+        let hs = Box::new(HeapString(data.to_vec()));
+        let raw_ptr = Box::into_raw(hs) as usize;
+        debug_assert!(raw_ptr & HEAP_TAG_MASK == 0, "HeapString pointer insufficiently aligned");
+        let tagged_ptr = raw_ptr | HEAP_TAG_STRING;
 
         let mut payload = [0u8; 12];
         payload[..4].copy_from_slice(&prefix);
@@ -179,10 +213,26 @@ impl CompactValue {
         usize::from_ne_bytes(self.payload[4..12].try_into().unwrap())
     }
 
-    /// Get the raw (untagged) pointer to the heap RedisValue.
+    /// Get the raw (untagged) pointer.
+    /// For strings (tag 0): points to HeapString.
+    /// For collections: points to RedisValue.
     #[inline]
-    fn heap_raw_ptr(&self) -> *mut RedisValue {
-        (self.heap_tagged_ptr() & !HEAP_TAG_MASK) as *mut RedisValue
+    fn heap_raw_usize(&self) -> usize {
+        self.heap_tagged_ptr() & !HEAP_TAG_MASK
+    }
+
+    /// Get the raw pointer to a heap RedisValue (collections only — NOT strings).
+    #[inline]
+    fn heap_collection_ptr(&self) -> *mut RedisValue {
+        debug_assert!(self.heap_type_tag() != HEAP_TAG_STRING);
+        self.heap_raw_usize() as *mut RedisValue
+    }
+
+    /// Get the raw pointer to a HeapString (strings only).
+    #[inline]
+    fn heap_string_ptr(&self) -> *mut HeapString {
+        debug_assert!(self.heap_type_tag() == HEAP_TAG_STRING);
+        self.heap_raw_usize() as *mut HeapString
     }
 
     /// Get the heap type tag from the low 3 bits.
@@ -196,11 +246,14 @@ impl CompactValue {
         if self.is_inline() {
             let len = self.inline_len();
             RedisValueRef::String(&self.payload[..len])
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // String path: HeapString (no RedisValue wrapper)
+            let hs = unsafe { &*self.heap_string_ptr() };
+            RedisValueRef::String(&hs.0)
         } else {
-            // SAFETY: We created this pointer via Box::into_raw and it hasn't been freed
-            let rv = unsafe { &*self.heap_raw_ptr() };
+            // Collection path: Box<RedisValue>
+            let rv = unsafe { &*self.heap_collection_ptr() };
             match rv {
-                RedisValue::String(s) => RedisValueRef::String(s),
                 RedisValue::Hash(map) => RedisValueRef::Hash(map),
                 RedisValue::List(list) => RedisValueRef::List(list),
                 RedisValue::Set(set) => RedisValueRef::Set(set),
@@ -216,6 +269,7 @@ impl CompactValue {
                 }
                 RedisValue::SortedSetListpack(lp) => RedisValueRef::SortedSetListpack(lp),
                 RedisValue::Stream(s) => RedisValueRef::Stream(s),
+                RedisValue::String(_) => unreachable!("strings use HeapString path"),
             }
         }
     }
@@ -226,62 +280,71 @@ impl CompactValue {
             let len = self.inline_len();
             Some(&self.payload[..len])
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            let rv = unsafe { &*self.heap_raw_ptr() };
-            match rv {
-                RedisValue::String(s) => Some(s),
-                _ => None,
-            }
+            let hs = unsafe { &*self.heap_string_ptr() };
+            Some(&hs.0)
         } else {
             None
         }
     }
 
     /// Fast path: get string bytes as owned Bytes.
-    /// For heap strings, this clones the Bytes (Arc refcount bump, no memcpy).
-    /// For inline SSO strings (<=12 bytes), this copies from the inline buffer.
+    /// For heap strings, copies from HeapString (Vec<u8> → Bytes).
+    /// For inline SSO strings (<=12 bytes), copies from inline buffer.
     /// Returns None for non-string types.
     pub fn as_bytes_owned(&self) -> Option<Bytes> {
         if self.is_inline() {
             let len = self.inline_len();
             Some(Bytes::copy_from_slice(&self.payload[..len]))
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: pointer created via Box::into_raw, not yet freed
-            let rv = unsafe { &*self.heap_raw_ptr() };
-            match rv {
-                RedisValue::String(s) => Some(s.clone()), // Arc bump, NOT memcpy
-                _ => None,
-            }
+            let hs = unsafe { &*self.heap_string_ptr() };
+            Some(Bytes::copy_from_slice(&hs.0))
         } else {
             None
         }
     }
 
     /// Get a mutable reference to the underlying heap RedisValue.
-    /// Returns None for inline (SSO) values.
+    /// Returns None for inline (SSO) values and for heap strings (use string-specific mutators).
     pub fn as_redis_value_mut(&mut self) -> Option<&mut RedisValue> {
-        if self.is_inline() {
+        if self.is_inline() || self.heap_type_tag() == HEAP_TAG_STRING {
             None
         } else {
             // SAFETY: We own this pointer uniquely (no aliasing since we have &mut self)
-            Some(unsafe { &mut *self.heap_raw_ptr() })
+            Some(unsafe { &mut *self.heap_collection_ptr() })
+        }
+    }
+
+    /// Get a mutable reference to the heap string bytes.
+    /// Returns None for non-string types and inline values.
+    pub fn as_bytes_mut(&mut self) -> Option<&mut Vec<u8>> {
+        if self.is_inline() {
+            None
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            let hs = unsafe { &mut *self.heap_string_ptr() };
+            Some(&mut hs.0)
+        } else {
+            None
         }
     }
 
     /// Consuming conversion: returns the owned RedisValue.
     /// For inline strings, allocates a new Bytes.
-    /// For heap values, reconstructs the Box and extracts the value.
+    /// For heap strings, converts HeapString → Bytes.
+    /// For collections, reconstructs the Box and extracts the value.
     pub fn into_redis_value(self) -> RedisValue {
         if self.is_inline() {
             let len = self.inline_len();
             let data = Bytes::copy_from_slice(&self.payload[..len]);
-            // Don't run Drop (nothing to free for inline)
             std::mem::forget(self);
             RedisValue::String(data)
-        } else {
-            let ptr = self.heap_raw_ptr();
-            // Prevent Drop from also freeing the pointer
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            let ptr = self.heap_string_ptr();
             std::mem::forget(self);
-            // SAFETY: we created this via Box::into_raw, and we're the sole owner
+            let hs = unsafe { *Box::from_raw(ptr) };
+            RedisValue::String(Bytes::from(hs.0))
+        } else {
+            let ptr = self.heap_collection_ptr();
+            std::mem::forget(self);
             let boxed = unsafe { Box::from_raw(ptr) };
             *boxed
         }
@@ -292,8 +355,11 @@ impl CompactValue {
         if self.is_inline() {
             let len = self.inline_len();
             RedisValue::String(Bytes::copy_from_slice(&self.payload[..len]))
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            let hs = unsafe { &*self.heap_string_ptr() };
+            RedisValue::String(Bytes::from(hs.0.clone()))
         } else {
-            let rv = unsafe { &*self.heap_raw_ptr() };
+            let rv = unsafe { &*self.heap_collection_ptr() };
             rv.clone()
         }
     }
@@ -328,8 +394,12 @@ impl CompactValue {
     pub fn estimate_memory(&self) -> usize {
         if self.is_inline() {
             self.inline_len()
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            let hs = unsafe { &*self.heap_string_ptr() };
+            // HeapString overhead: Box(8) + Vec header(24) + data
+            32 + hs.0.len()
         } else {
-            let rv = unsafe { &*self.heap_raw_ptr() };
+            let rv = unsafe { &*self.heap_collection_ptr() };
             rv.estimate_memory()
         }
     }
@@ -338,10 +408,12 @@ impl CompactValue {
 impl Drop for CompactValue {
     fn drop(&mut self) {
         if !self.is_inline() {
-            let ptr = self.heap_raw_ptr();
-            // SAFETY: we created this via Box::into_raw, we own it
-            unsafe {
-                drop(Box::from_raw(ptr));
+            if self.heap_type_tag() == HEAP_TAG_STRING {
+                // SAFETY: heap strings are Box<HeapString>
+                unsafe { drop(Box::from_raw(self.heap_string_ptr())); }
+            } else {
+                // SAFETY: collections are Box<RedisValue>
+                unsafe { drop(Box::from_raw(self.heap_collection_ptr())); }
             }
         }
     }
@@ -350,14 +422,15 @@ impl Drop for CompactValue {
 impl Clone for CompactValue {
     fn clone(&self) -> Self {
         if self.is_inline() {
-            // Bitwise copy is safe for inline values
             CompactValue {
                 len_and_tag: self.len_and_tag,
                 payload: self.payload,
             }
+        } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            let hs = unsafe { &*self.heap_string_ptr() };
+            Self::heap_string(&hs.0)
         } else {
-            // Clone the underlying RedisValue and create a new heap CompactValue
-            let rv = unsafe { &*self.heap_raw_ptr() };
+            let rv = unsafe { &*self.heap_collection_ptr() };
             Self::from_redis_value(rv.clone())
         }
     }
