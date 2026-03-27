@@ -153,6 +153,9 @@ fn main() -> anyhow::Result<()> {
     let runtime_config_shared: std::sync::Arc<std::sync::RwLock<rust_redis::config::RuntimeConfig>> = {
         std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config()))
     };
+    let server_config_shared: std::sync::Arc<rust_redis::config::ServerConfig> = {
+        std::sync::Arc::new(config.clone())
+    };
 
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
@@ -174,6 +177,7 @@ fn main() -> anyhow::Result<()> {
         let shard_cluster_state = cluster_state.clone();
         let shard_acl_table = acl_table.clone();
         let shard_runtime_config = runtime_config_shared.clone();
+        let shard_server_config = server_config_shared.clone();
         let shard_spsc_notify = mesh.take_notify(id);
         let shard_all_notifiers = all_notifiers.clone();
         let shard_tls_config = tls_config.clone();
@@ -214,6 +218,7 @@ fn main() -> anyhow::Result<()> {
                             config_port,
                             shard_acl_table,
                             shard_runtime_config,
+                            shard_server_config,
                             shard_spsc_notify,
                             shard_all_notifiers,
                         ).await;

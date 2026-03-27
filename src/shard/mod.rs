@@ -157,6 +157,7 @@ impl Shard {
         config_port: u16,
         acl_table: Arc<RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<RwLock<RuntimeConfig>>,
+        server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
     ) {
@@ -352,6 +353,7 @@ impl Shard {
                             let sc = script_cache_rc.clone();
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
+                            let scfg = server_config.clone();
                             let notifiers = all_notifiers.clone();
                             let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
 
@@ -368,7 +370,7 @@ impl Shard {
                                             handle_connection_sharded_inner(
                                                 tls_stream, peer_addr, dbs, shard_id, num_shards,
                                                 dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                                rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                                             ).await;
                                         }
                                         Err(e) => {
@@ -399,6 +401,7 @@ impl Shard {
                                         cp,
                                         acl,
                                         rtcfg,
+                                        scfg,
                                         notifiers,
                                     ).await;
                                 });
@@ -606,6 +609,7 @@ impl Shard {
                                     let sc = script_cache_rc.clone();
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
+                                    let scfg = server_config.clone();
                                     let notifiers = all_notifiers.clone();
 
                                     let peer_addr = tcp_stream.peer_addr()
@@ -623,7 +627,7 @@ impl Shard {
                                                     handle_connection_sharded_monoio(
                                                         tls_stream, peer_addr, dbs, shard_id, num_shards,
                                                         dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                                        rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                                        rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                                                     ).await;
                                                 }
                                                 Err(e) => {
@@ -638,7 +642,7 @@ impl Shard {
                                             handle_connection_sharded_monoio(
                                                 tcp_stream, peer_addr, dbs, shard_id, num_shards,
                                                 dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                                rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
+                                                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                                             ).await;
                                         });
                                     }

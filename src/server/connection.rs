@@ -1378,6 +1378,7 @@ pub async fn handle_connection_sharded(
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
 ) {
     let peer_addr = stream
@@ -1389,7 +1390,7 @@ pub async fn handle_connection_sharded(
         dispatch_tx, pubsub_registry, blocking_registry, shutdown,
         requirepass, aof_tx, tracking_table, client_id,
         repl_state, cluster_state, lua, script_cache, config_port,
-        acl_table, runtime_config, spsc_notifiers,
+        acl_table, runtime_config, config, spsc_notifiers,
     ).await;
 }
 
@@ -1419,6 +1420,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1738,6 +1740,12 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
                             &runtime_config,
                         );
                         responses.push(response);
+                        continue;
+                    }
+
+                    // --- CONFIG GET/SET ---
+                    if cmd.eq_ignore_ascii_case(b"CONFIG") {
+                        responses.push(handle_config(cmd_args, &runtime_config, &config));
                         continue;
                     }
 
@@ -3405,6 +3413,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    config: Arc<ServerConfig>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -3988,6 +3997,12 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     cmd_args, &acl_table, &mut acl_log, &current_user, &peer_addr, &runtime_config,
                 );
                 responses.push(response);
+                continue;
+            }
+
+            // --- CONFIG GET/SET ---
+            if cmd.eq_ignore_ascii_case(b"CONFIG") {
+                responses.push(handle_config(cmd_args, &runtime_config, &config));
                 continue;
             }
 

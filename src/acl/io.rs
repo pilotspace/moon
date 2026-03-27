@@ -100,7 +100,7 @@ pub fn acl_load(path: &str) -> std::io::Result<AclTable> {
 }
 
 /// Load AclTable from config: uses aclfile if configured, otherwise bootstraps from requirepass.
-/// Non-fatal: if aclfile missing, falls back to load_or_default.
+/// Non-fatal: if aclfile missing or unreadable, falls back to requirepass-based defaults.
 pub fn acl_table_from_config(config: &crate::config::ServerConfig) -> AclTable {
     if let Some(ref path) = config.aclfile {
         match acl_load(path) {
@@ -115,7 +115,14 @@ pub fn acl_table_from_config(config: &crate::config::ServerConfig) -> AclTable {
             }
         }
     }
-    AclTable::load_or_default(config)
+    // Bootstrap default user from requirepass (NOT load_or_default to avoid recursion)
+    let mut table = AclTable::new();
+    let default_user = match &config.requirepass {
+        Some(p) if !p.is_empty() => AclUser::new_default_with_password(p),
+        _ => AclUser::new_default_nopass(),
+    };
+    table.set_user("default".to_string(), default_user);
+    table
 }
 
 #[cfg(test)]
