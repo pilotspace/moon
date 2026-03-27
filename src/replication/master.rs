@@ -479,6 +479,7 @@ async fn register_replica_with_shards(
         // This is safe because monoio is single-threaded and cooperative —
         // only one sender task runs at a time, so no concurrent borrows occur.
         let wh = Rc::clone(&shared_stream);
+        #[allow(clippy::await_holding_refcell_ref)]
         monoio::spawn(async move {
             while let Ok(data) = rx.recv_async().await {
                 let data_vec = data.to_vec();

@@ -244,7 +244,7 @@ impl UringDriver {
     /// Must be called once after construction, before any I/O operations.
     pub fn init(&mut self) -> std::io::Result<()> {
         self.fd_table.register_with_ring(&self.ring)?;
-        self.buf_ring.setup_ring(&self.ring)?;
+        self.buf_ring.setup_ring(&mut self.ring)?;
 
         // Register send buffers with the kernel (IORING_REGISTER_BUFFERS).
         // This pins pages once at init so WRITE_FIXED skips get_user_pages() per I/O.
@@ -536,12 +536,12 @@ impl UringDriver {
                         self.buf_ring.mark_in_use(buf_id);
 
                         // Return buffer immediately since data is copied
-                        let _ = self.buf_ring.return_buf(&self.ring, buf_id);
+                        let _ = self.buf_ring.return_buf(&mut self.ring, buf_id);
 
                         events.push(IoEvent::Recv { conn_id, data });
 
                         // Check if multishot recv was cancelled (MORE flag absent)
-                        if flags & cqueue::more() == 0 {
+                        if !cqueue::more(flags) {
                             if let Some(conn) = self.connections.get_mut(&conn_id) {
                                 conn.recv_active = false;
                             }

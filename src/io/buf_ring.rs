@@ -62,7 +62,7 @@ impl BufRingManager {
     /// Registers all buffers with the kernel under the configured `group_id`
     /// using `IORING_OP_PROVIDE_BUFFERS`. Must be called once after ring creation,
     /// before any multishot recv is submitted.
-    pub fn setup_ring(&mut self, ring: &IoUring) -> std::io::Result<()> {
+    pub fn setup_ring(&mut self, ring: &mut IoUring) -> std::io::Result<()> {
         use io_uring::opcode;
 
         let entry = opcode::ProvideBuffers::new(
@@ -113,7 +113,7 @@ impl BufRingManager {
     /// Must be called after processing recv data, before the buffer can be reused.
     /// The SQE is batched (not submitted immediately) -- it will go out with the
     /// next `submit_and_wait` call.
-    pub fn return_buf(&mut self, ring: &IoUring, buf_id: u16) -> std::io::Result<()> {
+    pub fn return_buf(&mut self, ring: &mut IoUring, buf_id: u16) -> std::io::Result<()> {
         self.in_use[buf_id as usize] = false;
 
         let offset = buf_id as usize * self.config.buf_size;

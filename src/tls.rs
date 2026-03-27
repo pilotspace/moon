@@ -142,13 +142,13 @@ pub fn build_tls_config(
 
         config_builder
             .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key.into())
+            .with_single_cert(certs, key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config: {}", e)))?
     } else {
         // No mTLS: accept any client
         config_builder
             .with_no_client_auth()
-            .with_single_cert(certs, key.into())
+            .with_single_cert(certs, key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config: {}", e)))?
     };
 

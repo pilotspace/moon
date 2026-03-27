@@ -3,9 +3,9 @@
 //! Each test spawns a real TCP server on an OS-assigned port, connects with the
 //! `redis` crate client, exercises commands over real TCP, and shuts down cleanly.
 
-use redis::AsyncCommands;
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
+use redis::AsyncCommands;
 use tokio::net::TcpListener;
 
 use moon::config::ServerConfig;

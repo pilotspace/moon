@@ -121,13 +121,8 @@ fn bench_get_hotpath(c: &mut Criterion) {
         let cmd = b"GET";
         let args: &[Frame] = &[Frame::BulkString(lookup_key.clone())];
         b.iter(|| {
-            let result = moon::command::dispatch(
-                &mut db,
-                black_box(cmd),
-                black_box(args),
-                &mut 0usize,
-                16,
-            );
+            let result =
+                moon::command::dispatch(&mut db, black_box(cmd), black_box(args), &mut 0usize, 16);
             black_box(result);
         })
     });
@@ -178,8 +173,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
     // ─── Stage 11: xxhash key routing ───
     c.bench_function("11_xxhash_key_route", |b| {
         b.iter(|| {
-            let shard =
-                moon::shard::dispatch::key_to_shard(black_box(lookup_key.as_ref()), 12);
+            let shard = moon::shard::dispatch::key_to_shard(black_box(lookup_key.as_ref()), 12);
             black_box(shard);
         })
     });

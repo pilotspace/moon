@@ -195,8 +195,7 @@ mod tests {
 
     #[test]
     fn test_custom_bind_and_databases() {
-        let config =
-            ServerConfig::parse_from(["moon", "--bind", "0.0.0.0", "--databases", "4"]);
+        let config = ServerConfig::parse_from(["moon", "--bind", "0.0.0.0", "--databases", "4"]);
         assert_eq!(config.bind, "0.0.0.0");
         assert_eq!(config.databases, 4);
     }

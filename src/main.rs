@@ -135,24 +135,23 @@ fn main() -> anyhow::Result<()> {
     ));
 
     // Cluster mode initialization
-    let cluster_state: Option<
-        std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>,
-    > = if config.cluster_enabled {
-        moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
-            .parse()
-            .expect("invalid bind address");
-        let node_id = moon::replication::state::generate_repl_id();
-        let state = moon::cluster::ClusterState::new(node_id, self_addr);
-        let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
-        info!(
-            "Cluster mode enabled, node ID: {}",
-            cs.read().unwrap().node_id
-        );
-        Some(cs)
-    } else {
-        None
-    };
+    let cluster_state: Option<std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>> =
+        if config.cluster_enabled {
+            moon::cluster::CLUSTER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            let self_addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
+                .parse()
+                .expect("invalid bind address");
+            let node_id = moon::replication::state::generate_repl_id();
+            let state = moon::cluster::ClusterState::new(node_id, self_addr);
+            let cs = std::sync::Arc::new(std::sync::RwLock::new(state));
+            info!(
+                "Cluster mode enabled, node ID: {}",
+                cs.read().unwrap().node_id
+            );
+            Some(cs)
+        } else {
+            None
+        };
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
     let acl_table: std::sync::Arc<std::sync::RwLock<moon::acl::AclTable>> = {
@@ -161,9 +160,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Build shared runtime config for sharded handlers
-    let runtime_config_shared: std::sync::Arc<
-        std::sync::RwLock<moon::config::RuntimeConfig>,
-    > = { std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config())) };
+    let runtime_config_shared: std::sync::Arc<std::sync::RwLock<moon::config::RuntimeConfig>> =
+        { std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config())) };
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 

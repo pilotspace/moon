@@ -388,9 +388,9 @@ impl Shard {
                             let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
                             let clk = cached_clock.clone();
 
-                            if is_tls && tls_config.is_some() {
+                            if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
                                 // TLS handshake before handler spawn (wrap-before-spawn pattern)
-                                let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                let tls_cfg = tls_cfg_ref.clone();
                                 let peer_addr = tcp_stream.peer_addr()
                                     .map(|a| a.to_string())
                                     .unwrap_or_else(|_| "unknown".to_string());
@@ -537,9 +537,10 @@ impl Shard {
 
                     // Advance snapshot one segment per tick (cooperative)
                     if let Some(ref mut snap) = snapshot_state {
-                        let dbs = databases.borrow();
-                        let done = snap.advance_one_segment(&dbs);
-                        drop(dbs);
+                        let done = {
+                            let dbs = databases.borrow();
+                            snap.advance_one_segment(&dbs)
+                        };
                         if done {
                             let epoch = snap.epoch;
                             if let Err(e) = snap.finalize_async().await {
@@ -666,9 +667,9 @@ impl Shard {
                                         .map(|a| a.to_string())
                                         .unwrap_or_else(|_| "unknown".to_string());
 
-                                    if is_tls && tls_config.is_some() {
+                                    if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
                                         // Monoio TLS handshake before handler spawn
-                                        let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                        let tls_cfg = tls_cfg_ref.clone();
                                         monoio::spawn(async move {
                                             let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                                             match acceptor.accept(tcp_stream).await {
@@ -796,9 +797,10 @@ impl Shard {
 
                     // Advance snapshot one segment per tick (cooperative)
                     if let Some(ref mut snap) = snapshot_state {
-                        let dbs = databases.borrow();
-                        let done = snap.advance_one_segment(&dbs);
-                        drop(dbs);
+                        let done = {
+                            let dbs = databases.borrow();
+                            snap.advance_one_segment(&dbs)
+                        };
                         if done {
                             let epoch = snap.epoch;
                             if let Err(e) = snap.finalize_async().await {

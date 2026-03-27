@@ -171,7 +171,7 @@ pub async fn handle_connection(
                                                 // ACL channel permission check
                                                 let deny = {
                                                     let acl_guard = acl_table.read().unwrap();
-                                                    acl_guard.check_channel_permission(&current_user, channel.as_ref()).map(|r| r.to_string())
+                                                    acl_guard.check_channel_permission(&current_user, channel.as_ref())
                                                 };
                                                 if let Some(deny_reason) = deny {
                                                     let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
@@ -229,7 +229,7 @@ pub async fn handle_connection(
                                                 // ACL channel permission check
                                                 let deny = {
                                                     let acl_guard = acl_table.read().unwrap();
-                                                    acl_guard.check_channel_permission(&current_user, pattern.as_ref()).map(|r| r.to_string())
+                                                    acl_guard.check_channel_permission(&current_user, pattern.as_ref())
                                                 };
                                                 if let Some(deny_reason) = deny {
                                                     let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
@@ -2818,6 +2818,7 @@ async fn handle_blocking_command(
 ///
 /// CRITICAL: RefCell borrows MUST be dropped before any .await point.
 #[cfg(feature = "runtime-monoio")]
+#[allow(clippy::await_holding_refcell_ref)]
 async fn handle_blocking_command_monoio(
     cmd: &[u8],
     args: &[Frame],
@@ -3587,17 +3588,18 @@ pub async fn handle_connection_sharded_monoio<
                                                     for arg in cmd_args {
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             // ACL channel permission check
-                                                            {
+                                                            let denied = {
                                                                 let acl_guard = acl_table.read().unwrap();
-                                                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
-                                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
-                                                                    let mut resp_buf = BytesMut::new();
-                                                                    codec.encode_frame(&err, &mut resp_buf);
-                                                                    let data = resp_buf.freeze();
-                                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                    if wr.is_err() { break; }
-                                                                    continue;
-                                                                }
+                                                                acl_guard.check_channel_permission(&current_user, channel.as_ref())
+                                                            };
+                                                            if let Some(deny_reason) = denied {
+                                                                let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&err, &mut resp_buf);
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                if wr.is_err() { break; }
+                                                                continue;
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.borrow_mut().subscribe(channel.clone(), sub);
@@ -3661,17 +3663,18 @@ pub async fn handle_connection_sharded_monoio<
                                                     for arg in cmd_args {
                                                         if let Some(pattern) = extract_bytes(arg) {
                                                             // ACL channel permission check
-                                                            {
+                                                            let denied = {
                                                                 let acl_guard = acl_table.read().unwrap();
-                                                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, pattern.as_ref()) {
-                                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
-                                                                    let mut resp_buf = BytesMut::new();
-                                                                    codec.encode_frame(&err, &mut resp_buf);
-                                                                    let data = resp_buf.freeze();
-                                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                    if wr.is_err() { break; }
-                                                                    continue;
-                                                                }
+                                                                acl_guard.check_channel_permission(&current_user, pattern.as_ref())
+                                                            };
+                                                            if let Some(deny_reason) = denied {
+                                                                let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                let mut resp_buf = BytesMut::new();
+                                                                codec.encode_frame(&err, &mut resp_buf);
+                                                                let data = resp_buf.freeze();
+                                                                let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                if wr.is_err() { break; }
+                                                                continue;
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.borrow_mut().psubscribe(pattern.clone(), sub);
@@ -3783,15 +3786,9 @@ pub async fn handle_connection_sharded_monoio<
         }
 
         // Read data from stream using monoio ownership I/O.
-        // Reuse pre-allocated buffer; restore length without zero-fill overhead.
-        // SAFETY: monoio will overwrite the buffer contents on read; the buffer was
-        // initially allocated as vec![0u8; 8192] so the allocation is valid.
-        // We only use returned_buf[..n] after the read, never uninitialized bytes.
+        // Reuse pre-allocated buffer; restore length to 8192 for the read.
         if tmp_buf.len() < 8192 {
-            tmp_buf.reserve(8192 - tmp_buf.len());
-            unsafe {
-                tmp_buf.set_len(8192);
-            }
+            tmp_buf.resize(8192, 0);
         }
         let (result, returned_buf) = stream.read(tmp_buf).await;
         tmp_buf = returned_buf;
