@@ -2034,10 +2034,12 @@ pub async fn handle_connection_sharded(
 
                     // --- BGSAVE: trigger per-shard cooperative snapshot ---
                     if cmd.eq_ignore_ascii_case(b"BGSAVE") {
+                        let snap_dir = runtime_config.read().unwrap().dir.clone();
                         let response = crate::command::persistence::bgsave_start_sharded(
                             &dispatch_tx,
-                            ".",  // Use current dir; proper path from config
+                            &snap_dir,
                             num_shards,
+                            &spsc_notifiers,
                         );
                         responses.push(response);
                         continue;
@@ -4194,8 +4196,9 @@ pub async fn handle_connection_sharded_monoio(
 
             // --- BGSAVE: trigger per-shard cooperative snapshot ---
             if cmd.eq_ignore_ascii_case(b"BGSAVE") {
+                let snap_dir = runtime_config.read().unwrap().dir.clone();
                 let response = crate::command::persistence::bgsave_start_sharded(
-                    &dispatch_tx, ".", num_shards,
+                    &dispatch_tx, &snap_dir, num_shards, &spsc_notifiers,
                 );
                 responses.push(response);
                 continue;

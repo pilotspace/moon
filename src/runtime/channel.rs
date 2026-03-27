@@ -34,6 +34,10 @@ impl<T> OneshotReceiver<T> {
     pub async fn recv(self) -> Result<T, flume::RecvError> {
         self.0.into_recv_async().await
     }
+    /// Blocking receive for use from non-async contexts (e.g., OS thread watchers).
+    pub fn recv_blocking(self) -> Result<T, flume::RecvError> {
+        self.0.recv()
+    }
 }
 
 // Implement Future for OneshotReceiver so it can be used in FuturesUnordered.

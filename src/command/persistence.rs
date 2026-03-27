@@ -31,6 +31,10 @@ pub static SAVE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Unix timestamp of last successful save (SAVE or BGSAVE).
 pub static LAST_SAVE_TIME: AtomicU64 = AtomicU64::new(0);
 
+/// Counter for shards that have completed the current snapshot.
+/// When this reaches `num_shards`, SAVE_IN_PROGRESS is cleared.
+pub static BGSAVE_SHARDS_REMAINING: AtomicU64 = AtomicU64::new(0);
+
 /// Whether the last BGSAVE completed successfully.
 pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 
@@ -129,6 +133,7 @@ pub fn bgsave_start_sharded(
     producers: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     snapshot_dir: &str,
     num_shards: usize,
+    spsc_notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
 ) -> Frame {
     if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Frame::Error(Bytes::from_static(
@@ -141,14 +146,28 @@ pub fn bgsave_start_sharded(
 
     let mut receivers = Vec::with_capacity(num_shards);
     let mut prods = producers.borrow_mut();
-    for prod in prods.iter_mut() {
+    for (i, prod) in prods.iter_mut().enumerate() {
         let (tx, rx) = crate::runtime::channel::oneshot();
-        let _ = prod.try_push(ShardMessage::SnapshotBegin {
+        match prod.try_push(ShardMessage::SnapshotBegin {
             epoch,
             snapshot_dir: snap_dir.clone(),
             reply_tx: tx,
-        });
-        receivers.push(rx);
+        }) {
+            Ok(()) => {
+                receivers.push(rx);
+            }
+            Err(_msg) => {
+                error!("BGSAVE: SPSC full for shard {}, SnapshotBegin dropped!", i);
+                // Push a receiver that will never resolve — the watcher thread will
+                // detect this as a dropped channel and mark failure.
+                let (_tx2, rx2) = crate::runtime::channel::oneshot();
+                receivers.push(rx2);
+            }
+        }
+        // Wake the shard's event loop to drain SPSC
+        if i < spsc_notifiers.len() {
+            spsc_notifiers[i].notify_one();
+        }
     }
     drop(prods);
 
@@ -183,23 +202,54 @@ pub fn bgsave_start_sharded(
         info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
     });
 
+    // Under Monoio's thread-per-core model, monoio::spawn on the listener thread
+    // cannot properly await cross-thread oneshot replies. Use a dedicated OS thread
+    // to block on the flume receivers synchronously.
     #[cfg(feature = "runtime-monoio")]
-    monoio::spawn(async move {
-        let mut all_ok = true;
-        for rx in receivers {
-            match rx.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error!("Shard snapshot failed: {}", e);
-                    all_ok = false;
-                }
-                Err(_) => {
-                    error!("Shard snapshot channel dropped");
-                    all_ok = false;
+    {
+        std::thread::spawn(move || {
+            let mut all_ok = true;
+            for rx in receivers {
+                match rx.recv_blocking() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!("Shard snapshot failed: {}", e);
+                        all_ok = false;
+                    }
+                    Err(_) => {
+                        error!("Shard snapshot channel dropped");
+                        all_ok = false;
+                    }
                 }
             }
-        }
-        BGSAVE_LAST_STATUS.store(all_ok, Ordering::Relaxed);
+            BGSAVE_LAST_STATUS.store(all_ok, Ordering::Relaxed);
+            SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            LAST_SAVE_TIME.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Ordering::Relaxed,
+            );
+            info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
+        });
+    }
+
+    info!("BGSAVE triggered: epoch {} across {} shards", epoch, num_shards);
+    Frame::SimpleString(Bytes::from_static(b"Background saving started"))
+}
+
+/// Called by each shard after its snapshot completes (monoio runtime).
+///
+/// Decrements the shared counter. When the last shard finishes,
+/// clears SAVE_IN_PROGRESS and updates LAST_SAVE_TIME.
+pub fn bgsave_shard_done(success: bool) {
+    if !success {
+        BGSAVE_LAST_STATUS.store(false, Ordering::Relaxed);
+    }
+    let prev = BGSAVE_SHARDS_REMAINING.fetch_sub(1, Ordering::SeqCst);
+    if prev == 1 {
+        // Last shard to finish
         SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
         LAST_SAVE_TIME.store(
             std::time::SystemTime::now()
@@ -208,11 +258,8 @@ pub fn bgsave_start_sharded(
                 .as_secs(),
             Ordering::Relaxed,
         );
-        info!("BGSAVE complete: epoch {} all {} shards finished", epoch, num_shards);
-    });
-
-    info!("BGSAVE triggered: epoch {} across {} shards", epoch, num_shards);
-    Frame::SimpleString(Bytes::from_static(b"Background saving started"))
+        info!("BGSAVE complete: all shards finished");
+    }
 }
 
 /// Start a background AOF rewrite (BGREWRITEAOF command).

@@ -674,6 +674,7 @@ impl Shard {
                                 if let Some(tx) = snapshot_reply_tx.take() {
                                     let _ = tx.send(Err(format!("finalize failed: {}", e)));
                                 }
+                                crate::command::persistence::bgsave_shard_done(false);
                             } else {
                                 info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
                                 if let Some(ref mut wal) = wal_writer {
@@ -682,6 +683,7 @@ impl Shard {
                                 if let Some(tx) = snapshot_reply_tx.take() {
                                     let _ = tx.send(Ok(()));
                                 }
+                                crate::command::persistence::bgsave_shard_done(true);
                             }
                             snapshot_state = None;
                         }

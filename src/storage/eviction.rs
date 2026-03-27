@@ -294,6 +294,7 @@ mod tests {
             appendonly: "no".to_string(),
             appendfsync: "everysec".to_string(),
             aclfile: None,
+            dir: ".".to_string(),
         }
     }
 

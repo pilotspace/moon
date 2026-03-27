@@ -86,6 +86,7 @@ impl ServerConfig {
             appendonly: self.appendonly.clone(),
             appendfsync: self.appendfsync.clone(),
             aclfile: self.aclfile.clone(),
+            dir: self.dir.clone(),
         }
     }
 }
@@ -113,6 +114,8 @@ pub struct RuntimeConfig {
     pub appendfsync: String,
     /// ACL file path (mutable via CONFIG SET).
     pub aclfile: Option<String>,
+    /// Data directory for persistence files (snapshot, WAL).
+    pub dir: String,
 }
 
 impl Default for RuntimeConfig {
@@ -127,6 +130,7 @@ impl Default for RuntimeConfig {
             appendonly: "no".to_string(),
             appendfsync: "everysec".to_string(),
             aclfile: None,
+            dir: ".".to_string(),
         }
     }
 }
