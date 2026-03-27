@@ -24,6 +24,7 @@ use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
+use crate::storage::entry::CachedClock;
 use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
 #[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
@@ -232,9 +233,9 @@ impl Shard {
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
         let num_shards = self.num_shards;
 
-        // Initialize per-shard Lua VM (created inside run() because Lua is !Send -- Pitfall 1)
-        let lua_rc: Rc<mlua::Lua> = crate::scripting::setup_lua_vm()
-            .expect("Lua VM initialization failed");
+        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
+        // Lua is !Send so it must be created on the shard thread (inside run()).
+        let lua_rc: Rc<RefCell<Option<Rc<mlua::Lua>>>> = Rc::new(RefCell::new(None));
         let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
 
         // Per-shard snapshot state (None when no snapshot is active)
@@ -269,10 +270,9 @@ impl Shard {
         };
 
         // Per-shard replication backlog (in-memory, 1MB capacity, for partial resync).
+        // Lazy: allocated on first RegisterReplica to save 1MB/shard at baseline.
         // IMPORTANT: monotonic offsets here are independent of WAL file size.
-        let backlog_capacity = 1024 * 1024; // 1MB per shard
-        let mut repl_backlog: Option<ReplicationBacklog> =
-            Some(ReplicationBacklog::new(backlog_capacity));
+        let mut repl_backlog: Option<ReplicationBacklog> = None;
 
         // Per-shard replica sender channels: (replica_id, Sender<Bytes>).
         // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
@@ -297,6 +297,10 @@ impl Shard {
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
         // Local reference to this shard's SPSC Notify (for the select! arm).
         let spsc_notify_local = spsc_notify;
+
+        // Per-shard cached clock: updated once per 1ms tick, read by all
+        // connection handlers on this shard via Relaxed atomic loads.
+        let cached_clock = CachedClock::new();
 
         loop {
             #[cfg(feature = "runtime-tokio")]
@@ -349,13 +353,21 @@ impl Shard {
                             let rs = repl_state.clone();
                             let cs = cluster_state.clone();
                             let cp = config_port;
-                            let lua = lua_rc.clone();
+                            let lua = {
+                                let mut lua_opt = lua_rc.borrow_mut();
+                                if lua_opt.is_none() {
+                                    *lua_opt = Some(crate::scripting::setup_lua_vm()
+                                        .expect("Lua VM initialization failed"));
+                                }
+                                lua_opt.as_ref().unwrap().clone()
+                            };
                             let sc = script_cache_rc.clone();
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
                             let scfg = server_config.clone();
                             let notifiers = all_notifiers.clone();
                             let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                            let clk = cached_clock.clone();
 
                             if is_tls && tls_config.is_some() {
                                 // TLS handshake before handler spawn (wrap-before-spawn pattern)
@@ -371,6 +383,7 @@ impl Shard {
                                                 tls_stream, peer_addr, dbs, shard_id, num_shards,
                                                 dtx, psr, blk, sd, reqpass, aof, trk, cid,
                                                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                clk,
                                             ).await;
                                         }
                                         Err(e) => {
@@ -403,6 +416,7 @@ impl Shard {
                                         rtcfg,
                                         scfg,
                                         notifiers,
+                                        clk,
                                     ).await;
                                 });
                             }
@@ -430,6 +444,7 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
                     // Handle pending SnapshotBegin from SPSC
@@ -448,6 +463,9 @@ impl Shard {
                 // Arm 2: Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll.
                 // Also drains SPSC as a safety net in case a notify was missed.
                 _ = periodic_interval.tick() => {
+                    // Refresh the per-shard cached clock once per tick (1ms).
+                    cached_clock.update();
+
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -462,9 +480,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (tokio arm 2)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -540,6 +559,7 @@ impl Shard {
                                 &mut uring_parse_bufs,
                                 &mut inflight_sends,
                                 uring_listener_fd,
+                                &cached_clock,
                             );
                         }
                     }
@@ -605,12 +625,20 @@ impl Shard {
                                     let rs = repl_state.clone();
                                     let cs = cluster_state.clone();
                                     let cp = config_port;
-                                    let lua = lua_rc.clone();
+                                    let lua = {
+                                        let mut lua_opt = lua_rc.borrow_mut();
+                                        if lua_opt.is_none() {
+                                            *lua_opt = Some(crate::scripting::setup_lua_vm()
+                                                .expect("Lua VM initialization failed"));
+                                        }
+                                        lua_opt.as_ref().unwrap().clone()
+                                    };
                                     let sc = script_cache_rc.clone();
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
                                     let scfg = server_config.clone();
                                     let notifiers = all_notifiers.clone();
+                                    let clk = cached_clock.clone();
 
                                     let peer_addr = tcp_stream.peer_addr()
                                         .map(|a| a.to_string())
@@ -628,6 +656,7 @@ impl Shard {
                                                         tls_stream, peer_addr, dbs, shard_id, num_shards,
                                                         dtx, psr, blk, sd, reqpass, aof, trk, cid,
                                                         rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                        clk,
                                                     ).await;
                                                 }
                                                 Err(e) => {
@@ -643,6 +672,7 @@ impl Shard {
                                                 tcp_stream, peer_addr, dbs, shard_id, num_shards,
                                                 dtx, psr, blk, sd, reqpass, aof, trk, cid,
                                                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                clk,
                                             ).await;
                                         });
                                     }
@@ -674,9 +704,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (monoio notify arm)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -691,6 +722,9 @@ impl Shard {
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
                 _ = periodic_interval.tick() => {
+                    // Refresh the per-shard cached clock once per tick (1ms).
+                    cached_clock.update();
+
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -705,9 +739,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (monoio periodic arm)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -847,6 +882,7 @@ impl Shard {
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+        cached_clock: &CachedClock,
     ) {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
@@ -895,6 +931,7 @@ impl Shard {
                     repl_state,
                     shard_id,
                     script_cache,
+                    cached_clock,
                 );
             }
         }
@@ -914,6 +951,7 @@ impl Shard {
                 repl_state,
                 shard_id,
                 script_cache,
+                cached_clock,
             );
         }
     }
@@ -935,6 +973,7 @@ impl Shard {
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+        cached_clock: &CachedClock,
     ) {
         match msg {
             ShardMessage::Execute {
@@ -946,7 +985,7 @@ impl Shard {
                     let mut dbs = databases.borrow_mut();
                     let db_count = dbs.len();
                     let db_idx = db_index.min(db_count.saturating_sub(1));
-                    dbs[db_idx].refresh_now();
+                    dbs[db_idx].refresh_now_from_cache(cached_clock);
                     let (cmd, args) = match Self::extract_command_static(&command) {
                         Some(pair) => pair,
                         None => {
@@ -1021,7 +1060,7 @@ impl Shard {
                 let mut dbs = databases.borrow_mut();
                 let db_count = dbs.len();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now();
+                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 for (_key, cmd_frame) in &commands {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -1068,7 +1107,7 @@ impl Shard {
                 let mut dbs = databases.borrow_mut();
                 let db_count = dbs.len();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now();
+                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 for cmd_frame in &commands {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -1198,6 +1237,10 @@ impl Shard {
                 info!("Received shutdown via SPSC");
             }
             ShardMessage::RegisterReplica { replica_id, tx } => {
+                // Lazy-init replication backlog on first replica registration (saves 1MB/shard)
+                if repl_backlog.is_none() {
+                    *repl_backlog = Some(ReplicationBacklog::new(1024 * 1024));
+                }
                 replica_txs.push((replica_id, tx));
             }
             ShardMessage::UnregisterReplica { replica_id } => {
@@ -1290,6 +1333,7 @@ impl Shard {
         parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
         inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
         uring_listener_fd: Option<std::os::fd::RawFd>,
+        cached_clock: &CachedClock,
     ) {
         match event {
             IoEvent::Recv { conn_id, data } => {
@@ -1338,7 +1382,7 @@ impl Shard {
                 let responses: Vec<crate::protocol::Frame> = {
                     let mut dbs = databases.borrow_mut();
                     let db_count = dbs.len();
-                    dbs[0].refresh_now();
+                    dbs[0].refresh_now_from_cache(cached_clock);
                     let mut selected = 0usize;
                     batch.iter().map(|frame| {
                         let (cmd, args) = match Self::extract_command_static(frame) {
@@ -1666,7 +1710,8 @@ mod tests {
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache);
+        let clock = CachedClock::new();
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache, &clock);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -1705,7 +1750,8 @@ mod tests {
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache);
+        let clock = CachedClock::new();
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache, &clock);
     }
 
     #[test]
@@ -1762,6 +1808,8 @@ mod tests {
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
+        let clock = CachedClock::new();
+
         // Process disconnect event -- should clean up parse buffer and inflight sends
         Shard::handle_uring_event(
             IoEvent::Disconnect { conn_id: 42 },
@@ -1770,6 +1818,7 @@ mod tests {
             &mut parse_bufs,
             &mut inflight_sends,
             None,
+            &clock,
         );
 
         assert!(!parse_bufs.contains_key(&42), "parse buffer should be removed on disconnect");
@@ -1790,6 +1839,8 @@ mod tests {
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
+        let clock = CachedClock::new();
+
         // SendComplete should clean up oldest in-flight send (no panic if empty)
         Shard::handle_uring_event(
             IoEvent::SendComplete { conn_id: 1 },
@@ -1798,6 +1849,7 @@ mod tests {
             &mut parse_bufs,
             &mut inflight_sends,
             None,
+            &clock,
         );
     }
 }

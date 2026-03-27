@@ -9,8 +9,10 @@ use crate::runtime::channel;
 
 use super::dispatch::ShardMessage;
 
-/// Default SPSC buffer size (entries, not bytes). 4096 entries.
-pub const CHANNEL_BUFFER_SIZE: usize = 4096;
+/// Default SPSC buffer size (entries, not bytes).
+/// 256 entries is sufficient for burst absorption while saving ~6MB at 12 shards
+/// vs the previous 4096 (132 channels × 4096 entries was heavily over-provisioned).
+pub const CHANNEL_BUFFER_SIZE: usize = 256;
 
 /// Connection channel capacity for listener -> shard.
 pub const CONN_CHANNEL_CAPACITY: usize = 4096;

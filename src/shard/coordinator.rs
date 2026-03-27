@@ -19,6 +19,7 @@ use crate::protocol::Frame;
 use crate::runtime::channel;
 use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
+use crate::storage::entry::CachedClock;
 use crate::storage::Database;
 use crate::framevec;
 /// Coordinate a multi-key command across shards.
@@ -34,11 +35,12 @@ pub async fn coordinate_multi_key(
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
-        coordinate_mget(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers).await
+        coordinate_mget(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers, cached_clock).await
     } else if cmd.eq_ignore_ascii_case(b"MSET") {
-        coordinate_mset(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers).await
+        coordinate_mset(args, my_shard, num_shards, db_index, databases, dispatch_tx, spsc_notifiers, cached_clock).await
     } else {
         // DEL, UNLINK, EXISTS with multiple keys
         coordinate_multi_del_or_exists(
@@ -50,6 +52,7 @@ pub async fn coordinate_multi_key(
             databases,
             dispatch_tx,
             spsc_notifiers,
+            cached_clock,
         )
         .await
     }
@@ -111,6 +114,7 @@ async fn coordinate_mget(
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -130,7 +134,7 @@ async fn coordinate_mget(
     // Fast path: all keys on local shard -- use mget directly
     if groups.len() == 1 && groups.contains_key(&my_shard) {
         let mut dbs = databases.borrow_mut();
-        dbs[db_index].refresh_now();
+        dbs[db_index].refresh_now_from_cache(cached_clock);
         return crate::command::string::mget(&mut dbs[db_index], args);
     }
 
@@ -145,7 +149,7 @@ async fn coordinate_mget(
         if *shard_id == my_shard {
             // Local execution: GET each key directly
             let mut dbs = databases.borrow_mut();
-            dbs[db_index].refresh_now();
+            dbs[db_index].refresh_now_from_cache(cached_clock);
             for (orig_idx, key) in indexed_keys {
                 let entry = dbs[db_index].get(key);
                 let frame = match entry {
@@ -219,6 +223,7 @@ async fn coordinate_mset(
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
 ) -> Frame {
     if args.is_empty() || args.len() % 2 != 0 {
         return Frame::Error(Bytes::from_static(
@@ -252,7 +257,7 @@ async fn coordinate_mset(
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
         let mut dbs = databases.borrow_mut();
-        dbs[db_index].refresh_now();
+        dbs[db_index].refresh_now_from_cache(cached_clock);
         return crate::command::string::mset(&mut dbs[db_index], args);
     }
 
@@ -261,7 +266,7 @@ async fn coordinate_mset(
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
             let mut dbs = databases.borrow_mut();
-            dbs[db_index].refresh_now();
+            dbs[db_index].refresh_now_from_cache(cached_clock);
             for (key, value) in kv_pairs {
                 dbs[db_index].set_string(key.clone(), value.clone());
             }
@@ -308,6 +313,7 @@ async fn coordinate_multi_del_or_exists(
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
 ) -> Frame {
     let cmd_upper = cmd.to_ascii_uppercase();
 
@@ -323,7 +329,7 @@ async fn coordinate_multi_del_or_exists(
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
         let mut dbs = databases.borrow_mut();
-        dbs[db_index].refresh_now();
+        dbs[db_index].refresh_now_from_cache(cached_clock);
         let mut selected = db_index;
         let db_count = dbs.len();
         let result = cmd_dispatch(&mut dbs[db_index], cmd, args, &mut selected, db_count);
@@ -339,7 +345,7 @@ async fn coordinate_multi_del_or_exists(
     for (shard_id, key_args) in &groups {
         if *shard_id == my_shard {
             let mut dbs = databases.borrow_mut();
-            dbs[db_index].refresh_now();
+            dbs[db_index].refresh_now_from_cache(cached_clock);
             let db_count = dbs.len();
             let mut selected = db_index;
             let result =
@@ -394,6 +400,7 @@ pub async fn coordinate_keys(
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -407,7 +414,7 @@ pub async fn coordinate_keys(
     // Execute locally on this shard
     {
         let mut dbs = databases.borrow_mut();
-        dbs[db_index].refresh_now();
+        dbs[db_index].refresh_now_from_cache(cached_clock);
         let db_count = dbs.len();
         let mut selected = db_index;
         let result = cmd_dispatch(&mut dbs[db_index], b"KEYS", args, &mut selected, db_count);
@@ -462,6 +469,7 @@ pub async fn coordinate_scan(
     databases: &Rc<RefCell<Vec<Database>>>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -499,7 +507,7 @@ pub async fn coordinate_scan(
     // Execute SCAN on the target shard
     let scan_result = if target_shard_id == my_shard {
         let mut dbs = databases.borrow_mut();
-        dbs[db_index].refresh_now();
+        dbs[db_index].refresh_now_from_cache(cached_clock);
         let db_count = dbs.len();
         let mut selected = db_index;
         let result = cmd_dispatch(&mut dbs[db_index], b"SCAN", &scan_args, &mut selected, db_count);
@@ -671,8 +679,9 @@ mod tests {
 
         // With num_shards=1, all keys are local
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
+        let cached_clock = CachedClock::new();
         let result =
-            coordinate_mget(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers).await;
+            coordinate_mget(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers, &cached_clock).await;
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 2);
@@ -698,12 +707,13 @@ mod tests {
         ];
 
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
-        let result = coordinate_mset(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers).await;
+        let cached_clock = CachedClock::new();
+        let result = coordinate_mset(&args, 0, 1, 0, &databases, &dispatch_tx, &notifiers, &cached_clock).await;
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify keys were set
         let mut dbs = databases.borrow_mut();
-        dbs[0].refresh_now();
+        dbs[0].refresh_now_from_cache(&cached_clock);
         let entry = dbs[0].get(b"x");
         assert!(entry.is_some());
     }
@@ -726,8 +736,9 @@ mod tests {
         ];
 
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
+        let cached_clock = CachedClock::new();
         let result =
-            coordinate_multi_del_or_exists(b"DEL", &args, 0, 1, 0, &databases, &dispatch_tx, &notifiers).await;
+            coordinate_multi_del_or_exists(b"DEL", &args, 0, 1, 0, &databases, &dispatch_tx, &notifiers, &cached_clock).await;
         assert_eq!(result, Frame::Integer(2)); // a and b deleted, nonexistent = 0
     }
 }

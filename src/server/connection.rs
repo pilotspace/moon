@@ -27,6 +27,7 @@ use crate::pubsub::{self, PubSubRegistry};
 use crate::pubsub::subscriber::Subscriber;
 use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
+use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::storage::Database;
 use crate::tracking::{TrackingState, TrackingTable};
@@ -1380,6 +1381,7 @@ pub async fn handle_connection_sharded(
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+    cached_clock: CachedClock,
 ) {
     let peer_addr = stream
         .peer_addr()
@@ -1391,6 +1393,7 @@ pub async fn handle_connection_sharded(
         requirepass, aof_tx, tracking_table, client_id,
         repl_state, cluster_state, lua, script_cache, config_port,
         acl_table, runtime_config, config, spsc_notifiers,
+        cached_clock,
     ).await;
 }
 
@@ -1422,6 +1425,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+    cached_clock: CachedClock,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1947,6 +1951,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
                                 &databases,
                                 &command_queue,
                                 selected_db,
+                                &cached_clock,
                             );
                             command_queue.clear();
                             responses.push(result);
@@ -2163,6 +2168,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2176,6 +2182,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2204,6 +2211,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2248,7 +2256,7 @@ pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io
                         }
                         let mut dbs = databases.borrow_mut();
                         let db_count = dbs.len();
-                        dbs[selected_db].refresh_now();
+                        dbs[selected_db].refresh_now_from_cache(&cached_clock);
                         let result = dispatch(
                             &mut dbs[selected_db],
                             cmd,
@@ -2467,10 +2475,11 @@ fn execute_transaction_sharded(
     databases: &Rc<RefCell<Vec<Database>>>,
     command_queue: &[Frame],
     selected_db: usize,
+    cached_clock: &CachedClock,
 ) -> Frame {
     let mut dbs = databases.borrow_mut();
     let db_count = dbs.len();
-    dbs[selected_db].refresh_now();
+    dbs[selected_db].refresh_now_from_cache(cached_clock);
 
     let mut results = Vec::with_capacity(command_queue.len());
     let mut selected = selected_db;
@@ -3415,6 +3424,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
+    cached_clock: CachedClock,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
@@ -3713,7 +3723,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
             // Refresh time once before inline dispatch (same as batch refresh below)
             {
                 let mut dbs = databases.borrow_mut();
-                dbs[selected_db].refresh_now();
+                dbs[selected_db].refresh_now_from_cache(&cached_clock);
             }
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf, &mut write_buf, &databases, selected_db, &aof_tx,
@@ -3766,7 +3776,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         {
             let mut dbs = databases.borrow_mut();
-            dbs[selected_db].refresh_now();
+            dbs[selected_db].refresh_now_from_cache(&cached_clock);
         }
 
         for frame in frames.drain(..) {
@@ -4360,7 +4370,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                 } else {
                     in_multi = false;
-                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db);
+                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db, &cached_clock);
                     command_queue.clear();
                     responses.push(result);
                 }
@@ -4428,6 +4438,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     let response = crate::shard::coordinator::coordinate_keys(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4436,6 +4447,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     let response = crate::shard::coordinator::coordinate_scan(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4454,6 +4466,7 @@ pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + mon
                     let response = crate::shard::coordinator::coordinate_multi_key(
                         cmd, cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
