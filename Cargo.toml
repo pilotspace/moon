@@ -67,7 +67,7 @@ runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustl
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
-nix = { version = "0.29", features = ["net", "socket"] }
+nix = { version = "0.31", features = ["net", "socket"] }
 libc = "0.2"
 
 [dev-dependencies]
