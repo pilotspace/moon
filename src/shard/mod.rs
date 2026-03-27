@@ -70,6 +70,7 @@ pub struct Shard {
 /// Keeps buffers alive until the corresponding io_uring SendComplete CQE arrives,
 /// replacing the previous std::mem::forget memory leak.
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+#[allow(dead_code)] // Fields hold buffers alive for RAII until SendComplete CQE
 enum InFlightSend {
     /// Serialized response buffer for non-BulkString frames (heap fallback).
     Buf(bytes::BytesMut),
