@@ -41,14 +41,14 @@ fn main() -> anyhow::Result<()> {
     // Build TLS configuration if tls_port is set
     let tls_config: Option<std::sync::Arc<rustls::ServerConfig>> = if config.tls_port > 0 {
         let cert = config.tls_cert_file.as_ref()
-            .expect("--tls-cert-file required when --tls-port is set");
+            .ok_or_else(|| anyhow::anyhow!("--tls-cert-file required when --tls-port is set"))?;
         let key = config.tls_key_file.as_ref()
-            .expect("--tls-key-file required when --tls-port is set");
+            .ok_or_else(|| anyhow::anyhow!("--tls-key-file required when --tls-port is set"))?;
         let tls_cfg = rust_redis::tls::build_tls_config(
             cert, key,
             config.tls_ca_cert_file.as_deref(),
             config.tls_ciphersuites.as_deref(),
-        ).expect("Failed to build TLS config");
+        ).map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
         info!("TLS enabled on port {} (TLS 1.3, rustls + aws-lc-rs)", config.tls_port);
         Some(tls_cfg)
     } else {

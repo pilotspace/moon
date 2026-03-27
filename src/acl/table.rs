@@ -431,8 +431,6 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use clap::Parser;
-    use crate::acl::rules::apply_rule;
-
     fn make_config(requirepass: Option<&str>) -> ServerConfig {
         let mut args = vec!["rust-redis"];
         if let Some(p) = requirepass {

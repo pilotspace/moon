@@ -252,8 +252,6 @@ impl Default for ParseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framevec;
-
     #[test]
     fn frame_size_measurement() {
         let size = std::mem::size_of::<Frame>();

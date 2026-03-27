@@ -1703,7 +1703,7 @@ mod tests {
         pubsub.subscribe(Bytes::from_static(b"news"), sub);
 
         let rb = HeapRb::new(64);
-        let (mut prod, mut cons) = rb.split();
+        let (mut prod, cons) = rb.split();
         prod.try_push(ShardMessage::PubSubFanOut {
             channel: Bytes::from_static(b"news"),
             message: Bytes::from_static(b"hello from shard 1"),
@@ -1740,7 +1740,7 @@ mod tests {
         let databases = Rc::new(RefCell::new(vec![Database::new()]));
 
         let rb = HeapRb::new(512);
-        let (mut prod, mut cons) = rb.split();
+        let (mut prod, cons) = rb.split();
 
         for _ in 0..300 {
             prod.try_push(ShardMessage::PubSubFanOut {

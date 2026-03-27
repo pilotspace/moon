@@ -113,7 +113,7 @@ pub async fn handle_psync_on_master(
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
                 let data = tokio::fs::read(&snap_path).await
-                    .unwrap_or_default();
+                    .map_err(|e| anyhow::anyhow!("Failed to read shard {} snapshot at {:?}: {}", shard_id, snap_path, e))?;
                 let header = format!("${}\r\n", data.len());
                 write_half.write_all(header.as_bytes()).await?;
                 write_half.write_all(&data).await?;
@@ -272,7 +272,8 @@ pub async fn handle_psync_on_master(
             // send RRDSHARD format which our own replicas understand natively.
             for shard_id in 0..num_shards {
                 let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                let file_data = std::fs::read(&snap_path).unwrap_or_default();
+                let file_data = std::fs::read(&snap_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read shard {} snapshot at {:?}: {}", shard_id, snap_path, e))?;
                 let header = format!("${}\r\n", file_data.len());
                 let (wr, _) = stream.write_all(header.into_bytes()).await;
                 wr.map_err(|e| anyhow::anyhow!(e))?;

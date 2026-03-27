@@ -1054,9 +1054,6 @@ pub fn lmove(db: &mut Database, args: &[Frame]) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::Entry;
-    use crate::storage::entry::RedisValue;
-
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
     }

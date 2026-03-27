@@ -3,7 +3,6 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::storage::entry::{current_time_ms, Entry};
 use crate::storage::Database;
-use crate::framevec;
 /// Helper: return ERR wrong number of arguments for a given command.
 fn err_wrong_args(cmd: &str) -> Frame {
     Frame::Error(Bytes::from(format!(
@@ -870,6 +869,7 @@ pub fn strlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framevec;
     use crate::storage::entry::current_time_ms;
 
     fn bs(s: &[u8]) -> Frame {

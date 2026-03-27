@@ -2,7 +2,6 @@ use bytes::Bytes;
 use mlua::prelude::*;
 
 use crate::protocol::{Frame, FrameVec};
-use crate::framevec;
 /// Convert a Lua value to a Redis Frame (Lua -> RESP2 conversion).
 ///
 /// Redis-compatible conversion table:
@@ -110,6 +109,7 @@ pub fn frame_to_lua_value(lua: &Lua, frame: &Frame) -> mlua::Result<LuaValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framevec;
 
     #[test]
     fn test_lua_nil_to_frame() {

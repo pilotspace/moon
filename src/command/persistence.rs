@@ -158,18 +158,37 @@ pub fn bgsave_shard_done(success: bool) {
     if !success {
         BGSAVE_LAST_STATUS.store(false, Ordering::Relaxed);
     }
-    let prev = BGSAVE_SHARDS_REMAINING.fetch_sub(1, Ordering::SeqCst);
-    if prev == 1 {
-        // Last shard to finish
-        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
-        LAST_SAVE_TIME.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            Ordering::Relaxed,
-        );
-        info!("BGSAVE complete: all shards finished");
+    // Use compare-exchange loop to prevent underflow below zero.
+    // If the counter is already 0 (spurious call), do nothing.
+    loop {
+        let current = BGSAVE_SHARDS_REMAINING.load(Ordering::SeqCst);
+        if current == 0 {
+            tracing::warn!("BGSAVE shard done called with counter already at 0 -- ignoring");
+            return;
+        }
+        match BGSAVE_SHARDS_REMAINING.compare_exchange(
+            current,
+            current - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(prev) => {
+                if prev == 1 {
+                    // Last shard to finish
+                    SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                    LAST_SAVE_TIME.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        Ordering::Relaxed,
+                    );
+                    info!("BGSAVE complete: all shards finished");
+                }
+                return;
+            }
+            Err(_) => continue, // CAS retry
+        }
     }
 }
 

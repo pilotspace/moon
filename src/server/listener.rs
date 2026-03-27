@@ -245,6 +245,10 @@ pub async fn run_sharded(
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards)", addr, num_shards);
 
+    // Note: protected_mode_active is evaluated once at startup. CONFIG SET protected-mode
+    // changes RuntimeConfig on the shard side but does not propagate to the listener.
+    // This matches Redis behavior where listener-level checks use startup config.
+    // To disable protected mode at runtime, clients must connect via loopback first.
     let protected_mode_active = config.protected_mode == "yes"
         && config.requirepass.is_none()
         && config.aclfile.is_none();
@@ -365,6 +369,7 @@ pub async fn run_sharded(
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards, monoio)", addr, num_shards);
 
+    // Note: protected_mode_active is evaluated once at startup (see tokio listener comment).
     let protected_mode_active = config.protected_mode == "yes"
         && config.requirepass.is_none()
         && config.aclfile.is_none();

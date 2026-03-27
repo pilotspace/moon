@@ -115,3 +115,63 @@ pub fn build_tls_config(
 
     Ok(Arc::new(config))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_cipher_suites_tls13() {
+        let suites = resolve_cipher_suites("TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256").unwrap();
+        assert_eq!(suites.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_cipher_suites_tls12() {
+        let suites = resolve_cipher_suites("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384").unwrap();
+        assert_eq!(suites.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_cipher_suites_unknown() {
+        let result = resolve_cipher_suites("TLS_INVALID_SUITE");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown cipher suite"));
+    }
+
+    #[test]
+    fn test_resolve_cipher_suites_empty() {
+        let result = resolve_cipher_suites("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_tls_config_missing_cert() {
+        let result = build_tls_config("/nonexistent/cert.pem", "/nonexistent/key.pem", None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("TLS cert file"));
+    }
+
+    #[test]
+    fn test_build_tls_config_missing_key() {
+        // Create a temp cert file but no key
+        let dir = std::env::temp_dir().join("rust-redis-tls-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cert_path = dir.join("test.crt");
+        std::fs::write(&cert_path, "not a real cert").unwrap();
+
+        let result = build_tls_config(cert_path.to_str().unwrap(), "/nonexistent/key.pem", None, None);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_tls_config_missing_ca() {
+        let result = build_tls_config(
+            "/nonexistent/cert.pem", "/nonexistent/key.pem",
+            Some("/nonexistent/ca.pem"), None,
+        );
+        assert!(result.is_err());
+    }
+}

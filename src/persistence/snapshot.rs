@@ -189,8 +189,10 @@ impl SnapshotState {
             if entry.has_expiry() && entry.is_expired_at(base_ts, now_ms) {
                 continue;
             }
-            rdb::write_entry(&mut segment_entries, key, entry, base_ts)
-                .expect("segment entry serialization failed");
+            if let Err(e) = rdb::write_entry(&mut segment_entries, key, entry, base_ts) {
+                tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
+                continue;
+            }
             entry_count += 1;
         }
 
@@ -202,8 +204,10 @@ impl SnapshotState {
             if entry.has_expiry() && entry.is_expired_at(base_ts, now_ms) {
                 continue;
             }
-            rdb::write_entry(&mut segment_entries, key.as_bytes(), entry, base_ts)
-                .expect("segment entry serialization failed");
+            if let Err(e) = rdb::write_entry(&mut segment_entries, key.as_bytes(), entry, base_ts) {
+                tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
+                continue;
+            }
             entry_count += 1;
         }
 
