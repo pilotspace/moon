@@ -41,9 +41,7 @@ use crate::tracking::TrackingTable;
 use std::sync::{Arc, RwLock};
 
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use crate::io::{IoEvent, WritevGuard};
-#[cfg(target_os = "linux")]
-use crate::io::{UringConfig, UringDriver};
+use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
 
 use self::dispatch::ShardMessage;
 
@@ -169,9 +167,10 @@ impl Shard {
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
     ) {
-        // On Linux, attempt to initialize io_uring for high-performance I/O.
+        // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
-        #[cfg(target_os = "linux")]
+        // Skipped for monoio runtime (monoio has its own io_uring integration).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
             match UringDriver::new(UringConfig::default()) {
                 Ok(mut d) => match d.init() {
@@ -192,9 +191,9 @@ impl Shard {
         };
 
         // Wire multishot accept: create per-shard SO_REUSEPORT listener socket
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_listener_fd: Option<std::os::fd::RawFd> = None;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         if let Some(ref mut d) = uring_state {
             if let Some(ref addr) = bind_addr {
                 match Self::create_reuseport_listener(addr) {
@@ -235,9 +234,9 @@ impl Shard {
         let mut inflight_sends: std::collections::HashMap<u32, Vec<InFlightSend>> =
             std::collections::HashMap::new();
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", feature = "runtime-tokio")))]
         {
-            let _ = &bind_addr; // Suppress unused warning on non-Linux
+            let _ = &bind_addr; // Suppress unused warning when io_uring path inactive
             info!("Shard {} started", self.id);
         }
 
@@ -870,8 +869,8 @@ impl Shard {
             }
         }
 
-        // Close per-shard SO_REUSEPORT listener fd if created (Linux only).
-        #[cfg(target_os = "linux")]
+        // Close per-shard SO_REUSEPORT listener fd if created (Linux + tokio only).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         if let Some(lfd) = uring_listener_fd {
             unsafe {
                 libc::close(lfd);
@@ -1625,7 +1624,7 @@ impl Shard {
     ///
     /// Each shard binds to the same address with SO_REUSEPORT, allowing the kernel
     /// to distribute incoming connections across shard threads without a shared listener.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
         use std::net::SocketAddr;
         let sock_addr: SocketAddr = addr
