@@ -236,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_and_publish() {
         let mut registry = PubSubRegistry::new();
-        let (tx, mut rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, rx) = channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -255,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn test_psubscribe_glob() {
         let mut registry = PubSubRegistry::new();
-        let (tx, mut rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, rx) = channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 1);
         let pattern = Bytes::from_static(b"news.*");
 

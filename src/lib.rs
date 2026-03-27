@@ -2,6 +2,7 @@
 // over 23 phases of incremental development. Fixing all of these across the
 // entire codebase risks logic regressions with no correctness benefit.
 // Substantive lints (correctness, performance) remain enabled.
+#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(
     clippy::collapsible_if,
     clippy::collapsible_match,

@@ -62,7 +62,7 @@ impl BufRingManager {
     /// Registers all buffers with the kernel under the configured `group_id`
     /// using `IORING_OP_PROVIDE_BUFFERS`. Must be called once after ring creation,
     /// before any multishot recv is submitted.
-    pub fn setup_ring(&mut self, ring: &IoUring) -> std::io::Result<()> {
+    pub fn setup_ring(&mut self, ring: &mut IoUring) -> std::io::Result<()> {
         use io_uring::opcode;
 
         let entry = opcode::ProvideBuffers::new(
@@ -113,6 +113,10 @@ impl BufRingManager {
     /// Must be called after processing recv data, before the buffer can be reused.
     /// The SQE is batched (not submitted immediately) -- it will go out with the
     /// next `submit_and_wait` call.
+    /// # Safety
+    /// Caller must ensure no other mutable submission queue access is concurrent.
+    /// This uses `submission_shared()` to avoid borrowing the ring mutably,
+    /// which is necessary when called inside a `completion()` iteration loop.
     pub fn return_buf(&mut self, ring: &IoUring, buf_id: u16) -> std::io::Result<()> {
         self.in_use[buf_id as usize] = false;
 
@@ -128,7 +132,7 @@ impl BufRingManager {
         .user_data(0);
 
         unsafe {
-            ring.submission().push(&entry).map_err(|_| {
+            ring.submission_shared().push(&entry).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::Other, "SQ full during buffer return")
             })?;
         }

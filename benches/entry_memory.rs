@@ -3,7 +3,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::hint::black_box;
 
-use rust_redis::storage::entry::CompactEntry;
+use moon::storage::entry::CompactEntry;
 
 /// Benchmark: Create 1M CompactEntry instances with 8-byte string values.
 /// These fit in SSO (<=12 bytes), so no heap allocation for the value itself.

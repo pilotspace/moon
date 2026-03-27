@@ -280,7 +280,7 @@ mod tests {
         rt.block_on(async {
             let mut mesh = ChannelMesh::new(4, 64);
             // Take conn_rx for shard 0
-            let mut rx = mesh.take_conn_rx(0);
+            let rx = mesh.take_conn_rx(0);
             // Get conn_tx for shard 0
             let tx = mesh.conn_tx(0);
 

@@ -17,7 +17,7 @@ use crate::storage::entry::{Entry, RedisValue, current_secs, current_time_ms};
 use crate::storage::stream::{Stream as StreamData, StreamId};
 
 // Format constants
-const RDB_MAGIC: &[u8] = b"RUSTREDIS";
+const RDB_MAGIC: &[u8] = b"MOON";
 const RDB_VERSION: u8 = 1;
 
 // Type tags
@@ -165,7 +165,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
     let mut cursor = Cursor::new(payload);
 
     // Verify magic
-    let mut magic = [0u8; 9]; // "RUSTREDIS" is 9 bytes
+    let mut magic = [0u8; 4]; // "MOON" is 4 bytes
     cursor.read_exact(&mut magic)?;
     if &magic != RDB_MAGIC {
         bail!("Invalid RDB magic header");

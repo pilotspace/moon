@@ -1,9 +1,9 @@
-# Resource Benchmark: rust-redis vs Redis
+# Resource Benchmark: moon vs Redis
 
 **Date:** 2026-03-27 10:26:37
 **System:** Darwin 24.6.0 arm64, 12 cores
 **Redis:** 8.6.1
-**rust-redis shards:** 1 (0=auto)
+**moon shards:** 1 (0=auto)
 **Method:** Fresh server per data point (accurate RSS, no allocator hysteresis)
 
 ## String Keys: Memory & Throughput
@@ -25,7 +25,7 @@
 
 ## TTL Memory Overhead (500K keys x 64B)
 
-| Metric | Redis | rust-redis | Notes |
+| Metric | Redis | moon | Notes |
 |--------|-------|------------|-------|
 | Keys loaded (SETEX) | 1 | 1 | |
 | RSS data (no TTL) | 50.0MB | 55.0MB | Fresh server, 500K x 64B SET |
@@ -34,7 +34,7 @@
 | TTL overhead % | -96.7% | -96.4% | % of base data |
 
 > Redis stores TTL in a separate `expires` dict (extra dictEntry per key).
-> rust-redis packs TTL as a 4-byte delta inside CompactEntry (zero extra allocation).
+> moon packs TTL as a 4-byte delta inside CompactEntry (zero extra allocation).
 
 ## CPU Efficiency (200K pre-loaded keys, GET+SET mixed)
 

@@ -19,15 +19,15 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN groupadd -r rustredis && useradd -r -g rustredis -d /data -s /sbin/nologin rustredis
-RUN mkdir -p /data && chown rustredis:rustredis /data
+RUN groupadd -r moon && useradd -r -g moon -d /data -s /sbin/nologin moon
+RUN mkdir -p /data && chown moon:moon /data
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/rust-redis /usr/local/bin/rust-redis
+COPY --from=builder /app/target/release/moon /usr/local/bin/moon
 
-USER rustredis
+USER moon
 WORKDIR /data
 
 EXPOSE 6379
 
-CMD ["rust-redis", "--bind", "0.0.0.0"]
+CMD ["moon", "--bind", "0.0.0.0"]

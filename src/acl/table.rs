@@ -415,7 +415,7 @@ mod tests {
     use bytes::Bytes;
     use clap::Parser;
     fn make_config(requirepass: Option<&str>) -> ServerConfig {
-        let mut args = vec!["rust-redis"];
+        let mut args = vec!["moon"];
         if let Some(p) = requirepass {
             args.push("--requirepass");
             args.push(p);

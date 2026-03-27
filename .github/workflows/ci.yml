@@ -10,14 +10,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
 
   clippy:
     name: Clippy
@@ -28,17 +29,22 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
+      - name: Clippy (default features)
+        run: cargo clippy -- -D warnings
+      - name: Clippy (tokio runtime)
+        run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
 
-  fmt:
-    name: Format
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features --features runtime-tokio,jemalloc
+        timeout-minutes: 10
+        env:
+          MOON_NO_URING: "1"
 
   msrv:
     name: MSRV (1.85)
