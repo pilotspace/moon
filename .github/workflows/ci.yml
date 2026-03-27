@@ -20,24 +20,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Build both runtimes so downstream jobs hit cache
-      - run: cargo build --no-default-features --features runtime-tokio,jemalloc
-      - run: cargo build
-
   clippy:
     name: Clippy
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,8 +29,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: false
       - name: Clippy (default features)
         run: cargo clippy -- -D warnings
       - name: Clippy (tokio runtime)
@@ -54,14 +36,11 @@ jobs:
 
   test:
     name: Test
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: false
       - run: cargo test --no-default-features --features runtime-tokio,jemalloc
 
   msrv:
