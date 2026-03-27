@@ -27,6 +27,7 @@ use crate::pubsub::{self, PubSubRegistry};
 use crate::pubsub::subscriber::Subscriber;
 use crate::shard::dispatch::{key_to_shard, ShardMessage};
 use crate::shard::mesh::ChannelMesh;
+use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::storage::Database;
 use crate::tracking::{TrackingState, TrackingTable};
@@ -119,7 +120,8 @@ pub async fn handle_connection(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let mut acl_log = crate::acl::AclLog::new(128);
+    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
@@ -163,6 +165,15 @@ pub async fn handle_connection(
                                         }
                                         for arg in cmd_args {
                                             if let Some(channel) = extract_bytes(arg) {
+                                                // ACL channel permission check
+                                                let deny = {
+                                                    let acl_guard = acl_table.read().unwrap();
+                                                    acl_guard.check_channel_permission(&current_user, channel.as_ref()).map(|r| r.to_string())
+                                                };
+                                                if let Some(deny_reason) = deny {
+                                                    let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                    continue;
+                                                }
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().subscribe(channel.clone(), sub);
                                                 subscription_count += 1;
@@ -212,6 +223,15 @@ pub async fn handle_connection(
                                         }
                                         for arg in cmd_args {
                                             if let Some(pattern) = extract_bytes(arg) {
+                                                // ACL channel permission check
+                                                let deny = {
+                                                    let acl_guard = acl_table.read().unwrap();
+                                                    acl_guard.check_channel_permission(&current_user, pattern.as_ref()).map(|r| r.to_string())
+                                                };
+                                                if let Some(deny_reason) = deny {
+                                                    let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                                    continue;
+                                                }
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().psubscribe(pattern.clone(), sub);
                                                 subscription_count += 1;
@@ -755,6 +775,15 @@ pub async fn handle_connection(
                                 let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                                 for arg in cmd_args {
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
+                                        // ACL channel permission check
+                                        let deny = {
+                                            let acl_guard = acl_table.read().unwrap();
+                                            acl_guard.check_channel_permission(&current_user, channel_or_pattern.as_ref()).map(|r| r.to_string())
+                                        };
+                                        if let Some(deny_reason) = deny {
+                                            let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
+                                            continue;
+                                        }
                                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                         {
                                             let mut registry = pubsub_registry.lock();
@@ -1366,16 +1395,56 @@ pub async fn handle_connection_sharded(
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
+    cached_clock: CachedClock,
 ) {
-    use tokio::io::AsyncWriteExt;
-
-    // Capture peer address before we start using the stream
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    handle_connection_sharded_inner(
+        stream, peer_addr, databases, shard_id, num_shards,
+        dispatch_tx, pubsub_registry, blocking_registry, shutdown,
+        requirepass, aof_tx, tracking_table, client_id,
+        repl_state, cluster_state, lua, script_cache, config_port,
+        acl_table, runtime_config, config, spsc_notifiers,
+        cached_clock,
+    ).await;
+}
+
+/// Generic inner handler for sharded connections (Tokio runtime).
+///
+/// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
+/// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
+#[cfg(feature = "runtime-tokio")]
+pub async fn handle_connection_sharded_inner<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: S,
+    peer_addr: String,
+    databases: Rc<RefCell<Vec<Database>>>,
+    shard_id: usize,
+    num_shards: usize,
+    dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    shutdown: CancellationToken,
+    requirepass: Option<String>,
+    aof_tx: Option<channel::MpscSender<AofMessage>>,
+    tracking_table: Rc<RefCell<TrackingTable>>,
+    client_id: u64,
+    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    lua: std::rc::Rc<mlua::Lua>,
+    script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
+    config_port: u16,
+    acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    config: Arc<ServerConfig>,
+    spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
+    cached_clock: CachedClock,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Direct buffer I/O: bypass Framed/codec for the hot path.
     let mut stream = stream;
@@ -1386,7 +1455,8 @@ pub async fn handle_connection_sharded(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let mut acl_log = crate::acl::AclLog::new(128);
+    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
@@ -1409,23 +1479,11 @@ pub async fn handle_connection_sharded(
     let mut break_outer = false;
     loop {
         tokio::select! {
-            result = stream.readable() => {
-                if result.is_err() { break; }
-
-                // Read all available data from socket into read_buf
-                match stream.try_read_buf(&mut read_buf) {
+            result = stream.read_buf(&mut read_buf) => {
+                match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(_) => break,
-                }
-                // Drain socket buffer: read more if available
-                loop {
-                    match stream.try_read_buf(&mut read_buf) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
                 }
 
                 // Parse all complete frames from buffer
@@ -1706,6 +1764,12 @@ pub async fn handle_connection_sharded(
                         continue;
                     }
 
+                    // --- CONFIG GET/SET ---
+                    if cmd.eq_ignore_ascii_case(b"CONFIG") {
+                        responses.push(handle_config(cmd_args, &runtime_config, &config));
+                        continue;
+                    }
+
                     // --- REPLICAOF / SLAVEOF ---
                     if cmd.eq_ignore_ascii_case(b"REPLICAOF")
                         || cmd.eq_ignore_ascii_case(b"SLAVEOF")
@@ -1904,6 +1968,7 @@ pub async fn handle_connection_sharded(
                                 &databases,
                                 &command_queue,
                                 selected_db,
+                                &cached_clock,
                             );
                             command_queue.clear();
                             responses.push(result);
@@ -2020,6 +2085,17 @@ pub async fn handle_connection_sharded(
                     // TODO: Full subscriber mode support (Plan 06+ or future enhancement).
                     // For now, handle basic subscribe/unsubscribe responses.
                     if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                        // ACL channel permission check for Tokio sharded handler
+                        for arg in cmd_args {
+                            if let Some(channel) = extract_bytes(arg) {
+                                let acl_guard = acl_table.read().unwrap();
+                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
+                                    drop(acl_guard);
+                                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                                    continue;
+                                }
+                            }
+                        }
                         // Stub: subscriber mode in sharded handler is deferred
                         responses.push(Frame::Error(
                             Bytes::from_static(b"ERR SUBSCRIBE not yet supported in sharded mode"),
@@ -2120,6 +2196,7 @@ pub async fn handle_connection_sharded(
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2133,6 +2210,7 @@ pub async fn handle_connection_sharded(
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2161,6 +2239,7 @@ pub async fn handle_connection_sharded(
                             &databases,
                             &dispatch_tx,
                             &spsc_notifiers,
+                            &cached_clock,
                         ).await;
                         responses.push(response);
                         continue;
@@ -2192,9 +2271,20 @@ pub async fn handle_connection_sharded(
 
                     if is_local {
                         // LOCAL FAST PATH: zero cross-shard overhead
+                        // Eviction check before write dispatch
+                        if aof::is_write_command(cmd) {
+                            let rt = runtime_config.read().unwrap();
+                            let mut dbs_ev = databases.borrow_mut();
+                            if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
+                                drop(dbs_ev);
+                                responses.push(oom_frame);
+                                continue;
+                            }
+                            drop(dbs_ev);
+                        }
                         let mut dbs = databases.borrow_mut();
                         let db_count = dbs.len();
-                        dbs[selected_db].refresh_now();
+                        dbs[selected_db].refresh_now_from_cache(&cached_clock);
                         let result = dispatch(
                             &mut dbs[selected_db],
                             cmd,
@@ -2413,10 +2503,11 @@ fn execute_transaction_sharded(
     databases: &Rc<RefCell<Vec<Database>>>,
     command_queue: &[Frame],
     selected_db: usize,
+    cached_clock: &CachedClock,
 ) -> Frame {
     let mut dbs = databases.borrow_mut();
     let db_count = dbs.len();
-    dbs[selected_db].refresh_now();
+    dbs[selected_db].refresh_now_from_cache(cached_clock);
 
     let mut results = Vec::with_capacity(command_queue.len());
     let mut selected = selected_db;
@@ -3338,8 +3429,9 @@ fn try_inline_dispatch_loop(
 /// read since monoio's IoBufMut is implemented for Vec<u8>, then copy into BytesMut
 /// for codec parsing.
 #[cfg(feature = "runtime-monoio")]
-pub async fn handle_connection_sharded_monoio(
-    mut stream: monoio::net::TcpStream,
+pub async fn handle_connection_sharded_monoio<S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent>(
+    mut stream: S,
+    peer_addr: String,
     databases: Rc<RefCell<Vec<Database>>>,
     shard_id: usize,
     num_shards: usize,
@@ -3358,15 +3450,12 @@ pub async fn handle_connection_sharded_monoio(
     config_port: u16,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    config: Arc<ServerConfig>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
+    cached_clock: CachedClock,
 ) {
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-
-    let peer_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
 
     let mut read_buf = BytesMut::with_capacity(8192);
     let mut write_buf = BytesMut::with_capacity(8192);
@@ -3378,7 +3467,8 @@ pub async fn handle_connection_sharded_monoio(
     let mut protocol_version: u8 = 2;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let mut acl_log = crate::acl::AclLog::new(128);
+    let acl_max_len = runtime_config.read().map(|cfg| cfg.acllog_max_len).unwrap_or(128);
+    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
     let mut client_name: Option<Bytes> = None;
@@ -3440,6 +3530,19 @@ pub async fn handle_connection_sharded_monoio(
                                                     }
                                                     for arg in cmd_args {
                                                         if let Some(channel) = extract_bytes(arg) {
+                                                            // ACL channel permission check
+                                                            {
+                                                                let acl_guard = acl_table.read().unwrap();
+                                                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
+                                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                    let mut resp_buf = BytesMut::new();
+                                                                    codec.encode_frame(&err, &mut resp_buf);
+                                                                    let data = resp_buf.freeze();
+                                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                    if wr.is_err() { break; }
+                                                                    continue;
+                                                                }
+                                                            }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.borrow_mut().subscribe(channel.clone(), sub);
                                                             subscription_count += 1;
@@ -3501,6 +3604,19 @@ pub async fn handle_connection_sharded_monoio(
                                                     }
                                                     for arg in cmd_args {
                                                         if let Some(pattern) = extract_bytes(arg) {
+                                                            // ACL channel permission check
+                                                            {
+                                                                let acl_guard = acl_table.read().unwrap();
+                                                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, pattern.as_ref()) {
+                                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                                                    let mut resp_buf = BytesMut::new();
+                                                                    codec.encode_frame(&err, &mut resp_buf);
+                                                                    let data = resp_buf.freeze();
+                                                                    let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                                                                    if wr.is_err() { break; }
+                                                                    continue;
+                                                                }
+                                                            }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.borrow_mut().psubscribe(pattern.clone(), sub);
                                                             subscription_count += 1;
@@ -3636,7 +3752,7 @@ pub async fn handle_connection_sharded_monoio(
             // Refresh time once before inline dispatch (same as batch refresh below)
             {
                 let mut dbs = databases.borrow_mut();
-                dbs[selected_db].refresh_now();
+                dbs[selected_db].refresh_now_from_cache(&cached_clock);
             }
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf, &mut write_buf, &databases, selected_db, &aof_tx,
@@ -3689,7 +3805,7 @@ pub async fn handle_connection_sharded_monoio(
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         {
             let mut dbs = databases.borrow_mut();
-            dbs[selected_db].refresh_now();
+            dbs[selected_db].refresh_now_from_cache(&cached_clock);
         }
 
         for frame in frames.drain(..) {
@@ -3920,6 +4036,12 @@ pub async fn handle_connection_sharded_monoio(
                     cmd_args, &acl_table, &mut acl_log, &current_user, &peer_addr, &runtime_config,
                 );
                 responses.push(response);
+                continue;
+            }
+
+            // --- CONFIG GET/SET ---
+            if cmd.eq_ignore_ascii_case(b"CONFIG") {
+                responses.push(handle_config(cmd_args, &runtime_config, &config));
                 continue;
             }
 
@@ -4156,6 +4278,16 @@ pub async fn handle_connection_sharded_monoio(
                 }
                 for arg in cmd_args {
                     if let Some(ch) = extract_bytes(arg) {
+                        // ACL channel permission check
+                        {
+                            let acl_guard = acl_table.read().unwrap();
+                            if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
+                                drop(acl_guard);
+                                let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                                codec.encode_frame(&err, &mut write_buf);
+                                continue;
+                            }
+                        }
                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                         if is_pattern {
                             pubsub_registry.borrow_mut().psubscribe(ch.clone(), sub);
@@ -4280,7 +4412,7 @@ pub async fn handle_connection_sharded_monoio(
                     responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                 } else {
                     in_multi = false;
-                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db);
+                    let result = execute_transaction_sharded(&databases, &command_queue, selected_db, &cached_clock);
                     command_queue.clear();
                     responses.push(result);
                 }
@@ -4348,6 +4480,7 @@ pub async fn handle_connection_sharded_monoio(
                     let response = crate::shard::coordinator::coordinate_keys(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4356,6 +4489,7 @@ pub async fn handle_connection_sharded_monoio(
                     let response = crate::shard::coordinator::coordinate_scan(
                         cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4374,6 +4508,7 @@ pub async fn handle_connection_sharded_monoio(
                     let response = crate::shard::coordinator::coordinate_multi_key(
                         cmd, cmd_args, shard_id, num_shards, selected_db,
                         &databases, &dispatch_tx, &spsc_notifiers,
+                        &cached_clock,
                     ).await;
                     responses.push(response);
                     continue;
@@ -4399,6 +4534,17 @@ pub async fn handle_connection_sharded_monoio(
 
             if is_local {
                 // LOCAL FAST PATH: single borrow_mut covers dispatch + wakeup (no per-command acquire/release)
+                // Eviction check before write dispatch
+                if crate::persistence::aof::is_write_command(cmd) {
+                    let rt = runtime_config.read().unwrap();
+                    let mut dbs_ev = databases.borrow_mut();
+                    if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
+                        drop(dbs_ev);
+                        responses.push(oom_frame);
+                        continue;
+                    }
+                    drop(dbs_ev);
+                }
                 let mut dbs = databases.borrow_mut();
                 // No refresh_now here — called once per batch before the loop
                 let result = dispatch(

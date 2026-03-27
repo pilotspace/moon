@@ -56,6 +56,14 @@ pub fn config_get(
         (b"dir", server_config.dir.clone()),
         (b"dbfilename", server_config.dbfilename.clone()),
         (b"appendfilename", server_config.appendfilename.clone()),
+        (
+            b"protected-mode" as &[u8],
+            runtime_config.protected_mode.clone(),
+        ),
+        (
+            b"acllog-max-len",
+            runtime_config.acllog_max_len.to_string(),
+        ),
     ];
 
     let mut result = Vec::new();
@@ -156,6 +164,26 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
             "save" => runtime_config.save = Some(value_str.to_string()),
             "appendonly" => runtime_config.appendonly = value_str.to_string(),
             "appendfsync" => runtime_config.appendfsync = value_str.to_string(),
+            "protected-mode" => {
+                let lower = value_str.to_ascii_lowercase();
+                if lower == "yes" || lower == "no" {
+                    runtime_config.protected_mode = lower;
+                } else {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR Invalid argument '{}' for CONFIG SET 'protected-mode'",
+                        value_str
+                    )));
+                }
+            }
+            "acllog-max-len" => match value_str.parse::<usize>() {
+                Ok(v) => runtime_config.acllog_max_len = v,
+                Err(_) => {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR Invalid argument '{}' for CONFIG SET 'acllog-max-len'",
+                        value_str
+                    )));
+                }
+            },
             _ => {
                 return Frame::Error(Bytes::from(format!(
                     "ERR Unsupported CONFIG parameter: {}",

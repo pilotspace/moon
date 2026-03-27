@@ -24,9 +24,12 @@ use crate::blocking::BlockingRegistry;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
+use crate::storage::entry::CachedClock;
 use crate::runtime::{TimerImpl, traits::{RuntimeTimer, RuntimeInterval}};
 #[cfg(feature = "runtime-tokio")]
 use crate::server::connection::handle_connection_sharded;
+#[cfg(feature = "runtime-tokio")]
+use crate::server::connection::handle_connection_sharded_inner;
 #[cfg(feature = "runtime-monoio")]
 use crate::server::connection::handle_connection_sharded_monoio;
 use crate::storage::Database;
@@ -141,7 +144,8 @@ impl Shard {
     /// Runs cooperative active expiry. Shuts down gracefully on cancellation.
     pub async fn run(
         &mut self,
-        conn_rx: channel::MpscReceiver<crate::runtime::TcpStream>,
+        conn_rx: channel::MpscReceiver<(crate::runtime::TcpStream, bool)>,
+        tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
@@ -155,6 +159,7 @@ impl Shard {
         config_port: u16,
         acl_table: Arc<RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<RwLock<RuntimeConfig>>,
+        server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
     ) {
@@ -229,9 +234,9 @@ impl Shard {
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
         let num_shards = self.num_shards;
 
-        // Initialize per-shard Lua VM (created inside run() because Lua is !Send -- Pitfall 1)
-        let lua_rc: Rc<mlua::Lua> = crate::scripting::setup_lua_vm()
-            .expect("Lua VM initialization failed");
+        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
+        // Lua is !Send so it must be created on the shard thread (inside run()).
+        let lua_rc: Rc<RefCell<Option<Rc<mlua::Lua>>>> = Rc::new(RefCell::new(None));
         let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
 
         // Per-shard snapshot state (None when no snapshot is active)
@@ -266,10 +271,9 @@ impl Shard {
         };
 
         // Per-shard replication backlog (in-memory, 1MB capacity, for partial resync).
+        // Lazy: allocated on first RegisterReplica to save 1MB/shard at baseline.
         // IMPORTANT: monotonic offsets here are independent of WAL file size.
-        let backlog_capacity = 1024 * 1024; // 1MB per shard
-        let mut repl_backlog: Option<ReplicationBacklog> =
-            Some(ReplicationBacklog::new(backlog_capacity));
+        let mut repl_backlog: Option<ReplicationBacklog> = None;
 
         // Per-shard replica sender channels: (replica_id, Sender<Bytes>).
         // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
@@ -283,6 +287,7 @@ impl Shard {
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
 
         let mut expiry_interval = TimerImpl::interval(Duration::from_millis(100));
+        let mut eviction_interval = TimerImpl::interval(Duration::from_millis(100));
         // Periodic timer for WAL flush, snapshot advance, io_uring poll (1ms).
         // SPSC drain now uses event-driven Notify instead of polling.
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
@@ -294,41 +299,48 @@ impl Shard {
         // Local reference to this shard's SPSC Notify (for the select! arm).
         let spsc_notify_local = spsc_notify;
 
+        // Per-shard cached clock: updated once per 1ms tick, read by all
+        // connection handlers on this shard via Relaxed atomic loads.
+        let cached_clock = CachedClock::new();
+
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
                 // Accept new connections from listener
                 stream = conn_rx.recv_async() => {
                     match stream {
-                        Ok(tcp_stream) => {
+                        Ok((tcp_stream, is_tls)) => {
                             // On Linux with io_uring: extract raw fd, register with
                             // UringDriver for io_uring-based recv/send. Skip Tokio task.
+                            // Note: io_uring path does not support TLS (plain TCP only).
                             #[cfg(target_os = "linux")]
                             {
-                                if let Some(ref mut driver) = uring_state {
-                                    match tcp_stream.into_std() {
-                                        Ok(std_stream) => {
-                                            use std::os::unix::io::IntoRawFd;
-                                            let raw_fd = std_stream.into_raw_fd();
-                                            match driver.register_connection(raw_fd) {
-                                                Ok(Some(_conn_id)) => {
-                                                    // Connection registered, io_uring handles I/O
-                                                }
-                                                Ok(None) => {
-                                                    // FD table full, connection rejected (close handled inside)
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
+                                if !is_tls {
+                                    if let Some(ref mut driver) = uring_state {
+                                        match tcp_stream.into_std() {
+                                            Ok(std_stream) => {
+                                                use std::os::unix::io::IntoRawFd;
+                                                let raw_fd = std_stream.into_raw_fd();
+                                                match driver.register_connection(raw_fd) {
+                                                    Ok(Some(_conn_id)) => {
+                                                        // Connection registered, io_uring handles I/O
+                                                    }
+                                                    Ok(None) => {
+                                                        // FD table full, connection rejected (close handled inside)
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
+                                                    }
                                                 }
                                             }
+                                            Err(e) => {
+                                                tracing::warn!("Shard {}: into_std failed: {}", shard_id, e);
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("Shard {}: into_std failed: {}", shard_id, e);
-                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
-                                // Fallthrough: uring_state is None, use Tokio path below
+                                // Fallthrough: uring_state is None or is_tls, use Tokio path below
                             }
 
                             let dbs = databases.clone();
@@ -342,37 +354,75 @@ impl Shard {
                             let rs = repl_state.clone();
                             let cs = cluster_state.clone();
                             let cp = config_port;
-                            let lua = lua_rc.clone();
+                            let lua = {
+                                let mut lua_opt = lua_rc.borrow_mut();
+                                if lua_opt.is_none() {
+                                    *lua_opt = Some(crate::scripting::setup_lua_vm()
+                                        .expect("Lua VM initialization failed"));
+                                }
+                                lua_opt.as_ref().unwrap().clone()
+                            };
                             let sc = script_cache_rc.clone();
                             let acl = acl_table.clone();
                             let rtcfg = runtime_config.clone();
+                            let scfg = server_config.clone();
                             let notifiers = all_notifiers.clone();
                             let snap_tx = snapshot_trigger_tx.clone();
-                            tokio::task::spawn_local(async move {
-                                handle_connection_sharded(
-                                    tcp_stream,
-                                    dbs,
-                                    shard_id,
-                                    num_shards,
-                                    dtx,
-                                    psr,
-                                    blk,
-                                    sd,
-                                    None, // requirepass: TODO wire from shard config
-                                    aof,
-                                    trk,
-                                    cid,
-                                    rs,
-                                    cs,
-                                    lua,
-                                    sc,
-                                    cp,
-                                    acl,
-                                    rtcfg,
-                                    notifiers,
-                                    snap_tx,
-                                ).await;
-                            });
+                            let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                            let clk = cached_clock.clone();
+
+                            if is_tls && tls_config.is_some() {
+                                // TLS handshake before handler spawn (wrap-before-spawn pattern)
+                                let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                let peer_addr = tcp_stream.peer_addr()
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                tokio::task::spawn_local(async move {
+                                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                                    match acceptor.accept(tcp_stream).await {
+                                        Ok(tls_stream) => {
+                                            handle_connection_sharded_inner(
+                                                tls_stream, peer_addr, dbs, shard_id, num_shards,
+                                                dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                                                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                clk,
+                                            ).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Shard {}: TLS handshake failed: {}", shard_id, e);
+                                        }
+                                    }
+                                });
+                            } else {
+                                // Plain TCP connection
+                                tokio::task::spawn_local(async move {
+                                    handle_connection_sharded(
+                                        tcp_stream,
+                                        dbs,
+                                        shard_id,
+                                        num_shards,
+                                        dtx,
+                                        psr,
+                                        blk,
+                                        sd,
+                                        reqpass,
+                                        aof,
+                                        trk,
+                                        cid,
+                                        rs,
+                                        cs,
+                                        lua,
+                                        sc,
+                                        cp,
+                                        acl,
+                                        rtcfg,
+                                        scfg,
+                                        notifiers,
+                                        snap_tx,
+                                        clk,
+                                    ).await;
+                                });
+                            }
                         }
                         Err(_) => {
                             info!("Shard {} connection channel closed", self.id);
@@ -397,6 +447,7 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
                     // Handle pending SnapshotBegin from SPSC
@@ -415,6 +466,9 @@ impl Shard {
                 // Arm 2: Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll.
                 // Also drains SPSC as a safety net in case a notify was missed.
                 _ = periodic_interval.tick() => {
+                    // Refresh the per-shard cached clock once per tick (1ms).
+                    cached_clock.update();
+
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -429,9 +483,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (tokio arm 2)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -507,6 +562,7 @@ impl Shard {
                                 &mut uring_parse_bufs,
                                 &mut inflight_sends,
                                 uring_listener_fd,
+                                &cached_clock,
                             );
                         }
                     }
@@ -530,6 +586,16 @@ impl Shard {
                         crate::server::expiration::expire_cycle_direct(db);
                     }
                 }
+                // Background eviction timer -- proactive memory reclaim every 100ms
+                _ = eviction_interval.tick() => {
+                    let rt = runtime_config.read().unwrap();
+                    if rt.maxmemory > 0 {
+                        let mut dbs = databases.borrow_mut();
+                        for db in dbs.iter_mut() {
+                            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
+                        }
+                    }
+                }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
                     // Flush and shutdown WAL writer
@@ -547,7 +613,7 @@ impl Shard {
                 // Accept new connections from listener
                 stream = conn_rx.recv_async() => {
                     match stream {
-                        Ok(std_tcp_stream) => {
+                        Ok((std_tcp_stream, is_tls)) => {
                             // Convert std::net::TcpStream to monoio::net::TcpStream
                             match monoio::net::TcpStream::from_std(std_tcp_stream) {
                                 Ok(tcp_stream) => {
@@ -562,20 +628,58 @@ impl Shard {
                                     let rs = repl_state.clone();
                                     let cs = cluster_state.clone();
                                     let cp = config_port;
-                                    let lua = lua_rc.clone();
+                                    let lua = {
+                                        let mut lua_opt = lua_rc.borrow_mut();
+                                        if lua_opt.is_none() {
+                                            *lua_opt = Some(crate::scripting::setup_lua_vm()
+                                                .expect("Lua VM initialization failed"));
+                                        }
+                                        lua_opt.as_ref().unwrap().clone()
+                                    };
                                     let sc = script_cache_rc.clone();
                                     let acl = acl_table.clone();
                                     let rtcfg = runtime_config.clone();
+                                    let scfg = server_config.clone();
                                     let notifiers = all_notifiers.clone();
                                     let snap_tx = snapshot_trigger_tx.clone();
-                                    monoio::spawn(async move {
-                                        handle_connection_sharded_monoio(
-                                            tcp_stream, dbs, shard_id, num_shards,
-                                            dtx, psr, blk, sd, None, aof, trk, cid,
-                                            rs, cs, lua, sc, cp, acl, rtcfg, notifiers,
-                                            snap_tx,
-                                        ).await;
-                                    });
+                                    let clk = cached_clock.clone();
+
+                                    let peer_addr = tcp_stream.peer_addr()
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|_| "unknown".to_string());
+
+                                    if is_tls && tls_config.is_some() {
+                                        // Monoio TLS handshake before handler spawn
+                                        let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                        monoio::spawn(async move {
+                                            let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
+                                            match acceptor.accept(tcp_stream).await {
+                                                Ok(tls_stream) => {
+                                                    let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                                                    handle_connection_sharded_monoio(
+                                                        tls_stream, peer_addr, dbs, shard_id, num_shards,
+                                                        dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                                                        rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                        snap_tx, clk,
+                                                    ).await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("Shard {}: Monoio TLS handshake failed: {}", shard_id, e);
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        // Plain TCP connection
+                                        monoio::spawn(async move {
+                                            let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
+                                            handle_connection_sharded_monoio(
+                                                tcp_stream, peer_addr, dbs, shard_id, num_shards,
+                                                dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                                                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                snap_tx, clk,
+                                            ).await;
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("Shard {}: from_std failed: {}", shard_id, e);
@@ -604,9 +708,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (monoio notify arm)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -621,6 +726,9 @@ impl Shard {
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
                 _ = periodic_interval.tick() => {
+                    // Refresh the per-shard cached clock once per tick (1ms).
+                    cached_clock.update();
+
                     let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
                     Self::drain_spsc_shared(
                         &databases,
@@ -635,9 +743,10 @@ impl Shard {
                         &repl_state,
                         shard_id,
                         &script_cache_rc,
+                        &cached_clock,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC
+                    // Handle pending SnapshotBegin from SPSC (monoio periodic arm)
                     if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
                         if snapshot_state.is_some() {
                             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
@@ -717,6 +826,16 @@ impl Shard {
                         crate::server::expiration::expire_cycle_direct(db);
                     }
                 }
+                // Background eviction timer -- proactive memory reclaim every 100ms
+                _ = eviction_interval.tick() => {
+                    let rt = runtime_config.read().unwrap();
+                    if rt.maxmemory > 0 {
+                        let mut dbs = databases.borrow_mut();
+                        for db in dbs.iter_mut() {
+                            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
+                        }
+                    }
+                }
                 // Shutdown
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down (monoio)", self.id);
@@ -769,6 +888,7 @@ impl Shard {
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+        cached_clock: &CachedClock,
     ) {
         const MAX_DRAIN_PER_CYCLE: usize = 256;
         let mut drained = 0;
@@ -817,6 +937,7 @@ impl Shard {
                     repl_state,
                     shard_id,
                     script_cache,
+                    cached_clock,
                 );
             }
         }
@@ -836,6 +957,7 @@ impl Shard {
                 repl_state,
                 shard_id,
                 script_cache,
+                cached_clock,
             );
         }
     }
@@ -857,6 +979,7 @@ impl Shard {
         repl_state: &Option<Arc<RwLock<ReplicationState>>>,
         shard_id: usize,
         script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
+        cached_clock: &CachedClock,
     ) {
         match msg {
             ShardMessage::Execute {
@@ -868,7 +991,7 @@ impl Shard {
                     let mut dbs = databases.borrow_mut();
                     let db_count = dbs.len();
                     let db_idx = db_index.min(db_count.saturating_sub(1));
-                    dbs[db_idx].refresh_now();
+                    dbs[db_idx].refresh_now_from_cache(cached_clock);
                     let (cmd, args) = match Self::extract_command_static(&command) {
                         Some(pair) => pair,
                         None => {
@@ -943,7 +1066,7 @@ impl Shard {
                 let mut dbs = databases.borrow_mut();
                 let db_count = dbs.len();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now();
+                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 for (_key, cmd_frame) in &commands {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -990,7 +1113,7 @@ impl Shard {
                 let mut dbs = databases.borrow_mut();
                 let db_count = dbs.len();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now();
+                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 for cmd_frame in &commands {
                     let (cmd, args) = match Self::extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -1120,6 +1243,10 @@ impl Shard {
                 info!("Received shutdown via SPSC");
             }
             ShardMessage::RegisterReplica { replica_id, tx } => {
+                // Lazy-init replication backlog on first replica registration (saves 1MB/shard)
+                if repl_backlog.is_none() {
+                    *repl_backlog = Some(ReplicationBacklog::new(1024 * 1024));
+                }
                 replica_txs.push((replica_id, tx));
             }
             ShardMessage::UnregisterReplica { replica_id } => {
@@ -1212,6 +1339,7 @@ impl Shard {
         parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
         inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
         uring_listener_fd: Option<std::os::fd::RawFd>,
+        cached_clock: &CachedClock,
     ) {
         match event {
             IoEvent::Recv { conn_id, data } => {
@@ -1260,7 +1388,7 @@ impl Shard {
                 let responses: Vec<crate::protocol::Frame> = {
                     let mut dbs = databases.borrow_mut();
                     let db_count = dbs.len();
-                    dbs[0].refresh_now();
+                    dbs[0].refresh_now_from_cache(cached_clock);
                     let mut selected = 0usize;
                     batch.iter().map(|frame| {
                         let (cmd, args) = match Self::extract_command_static(frame) {
@@ -1588,7 +1716,8 @@ mod tests {
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache);
+        let clock = CachedClock::new();
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache, &clock);
 
         let msg = rx.try_recv().expect("subscriber should receive message");
         match msg {
@@ -1627,7 +1756,8 @@ mod tests {
         let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
-        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache);
+        let clock = CachedClock::new();
+        Shard::drain_spsc_shared(&databases, &mut [cons], &mut pubsub, &blocking, &mut pending_snap, &mut snap_state, &mut wal_w, &mut None, &mut Vec::new(), &None, 0, &script_cache, &clock);
     }
 
     #[test]
@@ -1684,6 +1814,8 @@ mod tests {
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
+        let clock = CachedClock::new();
+
         // Process disconnect event -- should clean up parse buffer and inflight sends
         Shard::handle_uring_event(
             IoEvent::Disconnect { conn_id: 42 },
@@ -1692,6 +1824,7 @@ mod tests {
             &mut parse_bufs,
             &mut inflight_sends,
             None,
+            &clock,
         );
 
         assert!(!parse_bufs.contains_key(&42), "parse buffer should be removed on disconnect");
@@ -1712,6 +1845,8 @@ mod tests {
         let mut driver = UringDriver::new(UringConfig::default()).unwrap();
         driver.init().unwrap();
 
+        let clock = CachedClock::new();
+
         // SendComplete should clean up oldest in-flight send (no panic if empty)
         Shard::handle_uring_event(
             IoEvent::SendComplete { conn_id: 1 },
@@ -1720,6 +1855,7 @@ mod tests {
             &mut parse_bufs,
             &mut inflight_sends,
             None,
+            &clock,
         );
     }
 }

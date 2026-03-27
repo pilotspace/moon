@@ -71,6 +71,34 @@ pub struct ServerConfig {
     /// Cluster node timeout in milliseconds (PFAIL detection threshold)
     #[arg(long, default_value_t = 15000)]
     pub cluster_node_timeout: u64,
+
+    /// Enable protected mode (reject non-loopback connections when no password set)
+    #[arg(long, default_value = "yes")]
+    pub protected_mode: String,
+
+    /// Maximum number of entries in the ACL log
+    #[arg(long, default_value_t = 128)]
+    pub acllog_max_len: usize,
+
+    /// TLS port (0 = TLS disabled)
+    #[arg(long, default_value_t = 0)]
+    pub tls_port: u16,
+
+    /// Path to TLS certificate file (PEM format)
+    #[arg(long)]
+    pub tls_cert_file: Option<String>,
+
+    /// Path to TLS private key file (PEM format)
+    #[arg(long)]
+    pub tls_key_file: Option<String>,
+
+    /// Path to CA certificate for client authentication (mTLS)
+    #[arg(long)]
+    pub tls_ca_cert_file: Option<String>,
+
+    /// TLS 1.3 cipher suites (comma-separated, e.g., "TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256")
+    #[arg(long)]
+    pub tls_ciphersuites: Option<String>,
 }
 
 impl ServerConfig {
@@ -87,6 +115,9 @@ impl ServerConfig {
             appendfsync: self.appendfsync.clone(),
             aclfile: self.aclfile.clone(),
             dir: self.dir.clone(),
+            requirepass: self.requirepass.clone(),
+            protected_mode: self.protected_mode.clone(),
+            acllog_max_len: self.acllog_max_len,
         }
     }
 }
@@ -116,6 +147,12 @@ pub struct RuntimeConfig {
     pub aclfile: Option<String>,
     /// Data directory for persistence files (snapshot, WAL).
     pub dir: String,
+    /// Require clients to authenticate with this password (mutable via CONFIG SET).
+    pub requirepass: Option<String>,
+    /// Protected mode setting (mutable via CONFIG SET).
+    pub protected_mode: String,
+    /// Maximum number of entries in the ACL log (mutable via CONFIG SET).
+    pub acllog_max_len: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -131,6 +168,9 @@ impl Default for RuntimeConfig {
             appendfsync: "everysec".to_string(),
             aclfile: None,
             dir: ".".to_string(),
+            requirepass: None,
+            protected_mode: "yes".to_string(),
+            acllog_max_len: 128,
         }
     }
 }

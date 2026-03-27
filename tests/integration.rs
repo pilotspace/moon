@@ -41,6 +41,13 @@ async fn start_server() -> (u16, CancellationToken) {
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     tokio::spawn(async move {
@@ -82,6 +89,13 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     tokio::spawn(async move {
@@ -1199,6 +1213,13 @@ async fn start_server_with_persistence(
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     tokio::spawn(async move {
@@ -2055,6 +2076,13 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     tokio::spawn(async move {
@@ -2390,6 +2418,13 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     let cancel = token.clone();
@@ -2397,7 +2432,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
     // Build the channel mesh and spawn shards on std threads (like main.rs)
     std::thread::spawn(move || {
         let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
-        let conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>> =
+        let conn_txs: Vec<channel::MpscSender<(tokio::net::TcpStream, bool)>> =
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
         let all_notifiers = mesh.all_notifiers();
 
@@ -2436,7 +2471,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_config.to_runtime_config(),
                     ));
                     rt.block_on(local.run_until(
-                        shard.run(conn_rx, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0, acl_t, rt_cfg, shard_spsc_notify, shard_all_notifiers),
+                        shard.run(conn_rx, None, consumers, producers, shard_cancel, None, None, None, snap_rx, None, None, 0, acl_t, rt_cfg, shard_spsc_notify, shard_all_notifiers),
                     ));
                 })
                 .expect("failed to spawn shard thread");
@@ -3426,12 +3461,19 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         cluster_enabled: true,
         cluster_node_timeout: 15000,
         aclfile: None,
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     std::thread::spawn(move || {
         let num_shards = 1;
         let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
-        let conn_txs: Vec<channel::MpscSender<tokio::net::TcpStream>> =
+        let conn_txs: Vec<channel::MpscSender<(tokio::net::TcpStream, bool)>> =
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
         // Initialize cluster state
@@ -3483,6 +3525,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                     ));
                     rt.block_on(local.run_until(shard.run(
                         conn_rx,
+                        None,
                         consumers,
                         producers,
                         shard_cancel,
@@ -3989,6 +4032,13 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         cluster_enabled: false,
         cluster_node_timeout: 15000,
         aclfile: Some(acl_path.to_string()),
+        protected_mode: "yes".to_string(),
+        acllog_max_len: 128,
+        tls_port: 0,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_ca_cert_file: None,
+        tls_ciphersuites: None,
     };
 
     tokio::spawn(async move {

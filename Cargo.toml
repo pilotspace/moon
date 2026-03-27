@@ -18,6 +18,7 @@ thiserror = "2.0"
 mimalloc = { version = "0.1", default-features = false }
 crossbeam-utils = "0.8"
 flume = "0.11"
+atomic-waker = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs"], optional = true }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 clap = { version = "4", features = ["derive"] }
@@ -40,6 +41,11 @@ sha1_smol = { version = "1.0", features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
 ctrlc = "3.4"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+aws-lc-rs = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+monoio-rustls = { version = "0.4", optional = true }
 
 tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
@@ -55,8 +61,8 @@ monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
-runtime-tokio = ["dep:tokio", "dep:tokio-util"]
-runtime-monoio = ["dep:monoio"]
+runtime-tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
+runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
