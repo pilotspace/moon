@@ -262,6 +262,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[test]
     fn test_conn_channels() {
         let rt = tokio::runtime::Builder::new_current_thread()

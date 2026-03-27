@@ -654,6 +654,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_coordinate_mget_all_local() {
         let mut dbs = vec![Database::new()];
@@ -683,6 +684,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_coordinate_mset_all_local() {
         let dbs = vec![Database::new()];
@@ -708,6 +710,7 @@ mod tests {
         assert!(entry.is_some());
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_coordinate_del_all_local() {
         let mut dbs = vec![Database::new()];

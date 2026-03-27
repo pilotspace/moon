@@ -563,6 +563,7 @@ pub async fn wait_for_replicas(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_wait_for_replicas_no_replicas() {
         let state = Arc::new(RwLock::new(ReplicationState::new(
@@ -574,6 +575,7 @@ mod tests {
         assert_eq!(count, 0, "No replicas connected, should return 0");
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_wait_for_replicas_zero_required() {
         let state = Arc::new(RwLock::new(ReplicationState::new(
