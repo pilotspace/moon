@@ -504,11 +504,18 @@ impl UringDriver {
     pub fn drain_completions(&mut self) -> Vec<IoEvent> {
         let mut events = Vec::new();
 
-        for cqe in self.ring.completion() {
-            let (event_type, conn_id, _aux) = decode_user_data(cqe.user_data());
-            let result = cqe.result();
-            let flags = cqe.flags();
+        // Collect CQEs first to release the mutable borrow on self.ring,
+        // allowing return_buf to access the ring's submission queue below.
+        let cqes: Vec<(u8, u32, u16, i32, u32)> = self
+            .ring
+            .completion()
+            .map(|cqe| {
+                let (event_type, conn_id, aux) = decode_user_data(cqe.user_data());
+                (event_type, conn_id, aux, cqe.result(), cqe.flags())
+            })
+            .collect();
 
+        for (event_type, conn_id, _aux, result, flags) in cqes {
             match event_type {
                 EVENT_ACCEPT => {
                     if result >= 0 {
