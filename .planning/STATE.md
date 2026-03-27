@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: completed
-stopped_at: Completed 43-01-PLAN.md
-last_updated: "2026-03-26T17:21:39.143Z"
-last_activity: 2026-03-27 -- Completed 43-03 TLS Support (rustls + aws-lc-rs, dual-port, Tokio+Monoio)
+milestone: v0.1.0
+milestone_name: Core Redis Server
+status: shipped
+stopped_at: v0.1.0 milestone complete
+last_updated: "2026-03-27T14:00:00.000Z"
+last_activity: 2026-03-27 -- v0.1.0 shipped, milestone archived
 progress:
   total_phases: 43
   completed_phases: 43
-  total_plans: 127
-  completed_plans: 127
+  total_plans: 132
+  completed_plans: 132
   percent: 100
 ---
 
@@ -18,16 +18,15 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-23)
+See: .planning/PROJECT.md (updated 2026-03-27)
 
-**Core value:** Simple, easy to use, high performance, effectively memory-efficient -- a Redis-compatible server that does fewer things but does them exceptionally well.
-**Current focus:** Phase 43: Lock-Free Oneshot Channels and Timestamp Caching -- P0 profiling fixes
+**Core value:** Simple, easy to use, high performance, effectively memory-efficient — a Redis-compatible server that does fewer things but does them exceptionally well.
+**Current focus:** v0.1.0 shipped. Planning next milestone.
 
 ## Current Position
 
-Phase: 43 of 43 (Security Hardening: TLS, ACL Bug Fixes, Protected Mode, Eviction Fixes)
-Plan: 3 of 3 in current phase (43-01 COMPLETE, 43-02 COMPLETE, 43-03 COMPLETE)
-Status: Phase 43 complete. All 3 plans done: auth bypass fix, eviction, ACL channel enforcement, protected mode, TLS 1.3.
+Milestone: v0.1.0 Core Redis Server — SHIPPED 2026-03-27
+Status: All 43 phases complete, 132 plans executed, 77/77 requirements validated.
 Last activity: 2026-03-27 -- Completed 43-03 TLS Support (rustls + aws-lc-rs, dual-port, Tokio+Monoio)
 
 Progress: [██████████] 100%
