@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    open-pull-requests-limit: 5
+    groups:
+      async-runtime:
+        patterns: ["tokio*", "monoio*", "futures*"]
+      crypto-tls:
+        patterns: ["rustls*", "aws-lc-rs*", "rustls-pemfile*"]
+      tracing:
+        patterns: ["tracing*"]
+    ignore:
+      # mlua vendored — major bumps need manual testing of Lua sandbox
+      - dependency-name: mlua
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    open-pull-requests-limit: 3
