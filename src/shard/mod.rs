@@ -170,22 +170,28 @@ impl Shard {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
         // Skipped for monoio runtime (monoio has its own io_uring integration).
+        // Can be disabled via MOON_NO_URING=1 (used in CI/test environments).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
-            match UringDriver::new(UringConfig::default()) {
-                Ok(mut d) => match d.init() {
-                    Ok(()) => {
-                        info!("Shard {} started (io_uring mode)", self.id);
-                        Some(d)
-                    }
+            if std::env::var("MOON_NO_URING").is_ok() {
+                info!("Shard {} io_uring disabled via MOON_NO_URING", self.id);
+                None
+            } else {
+                match UringDriver::new(UringConfig::default()) {
+                    Ok(mut d) => match d.init() {
+                        Ok(()) => {
+                            info!("Shard {} started (io_uring mode)", self.id);
+                            Some(d)
+                        }
+                        Err(e) => {
+                            info!("Shard {} io_uring init failed: {}, using Tokio", self.id, e);
+                            None
+                        }
+                    },
                     Err(e) => {
-                        info!("Shard {} io_uring init failed: {}, using Tokio", self.id, e);
+                        info!("Shard {} io_uring unavailable: {}, using Tokio", self.id, e);
                         None
                     }
-                },
-                Err(e) => {
-                    info!("Shard {} io_uring unavailable: {}, using Tokio", self.id, e);
-                    None
                 }
             }
         };

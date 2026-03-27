@@ -41,8 +41,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-default-features --features runtime-tokio,jemalloc -- --test-threads=2
+      - run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 10
+        env:
+          MOON_NO_URING: "1"
 
   msrv:
     name: MSRV (1.85)
