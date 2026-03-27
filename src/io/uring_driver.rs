@@ -536,7 +536,7 @@ impl UringDriver {
                         self.buf_ring.mark_in_use(buf_id);
 
                         // Return buffer immediately since data is copied
-                        let _ = self.buf_ring.return_buf(&mut self.ring, buf_id);
+                        let _ = self.buf_ring.return_buf(&self.ring, buf_id);
 
                         events.push(IoEvent::Recv { conn_id, data });
 

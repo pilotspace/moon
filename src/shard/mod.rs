@@ -221,14 +221,14 @@ impl Shard {
             }
         }
 
-        // Track per-connection parse state for io_uring path (Linux only).
-        #[cfg(target_os = "linux")]
+        // Track per-connection parse state for io_uring path (Linux + tokio only).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_parse_bufs: std::collections::HashMap<u32, bytes::BytesMut> =
             std::collections::HashMap::new();
 
-        // Track in-flight send buffers for proper RAII cleanup (Linux only).
+        // Track in-flight send buffers for proper RAII cleanup (Linux + tokio only).
         // Replaces the previous std::mem::forget leak.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut inflight_sends: std::collections::HashMap<u32, Vec<InFlightSend>> =
             std::collections::HashMap::new();
 
