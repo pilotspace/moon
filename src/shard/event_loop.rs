@@ -4,7 +4,6 @@
 //! (spsc_handler, persistence_tick, conn_accept, timers, uring_handler).
 
 use std::cell::RefCell;
-use std::os::unix::io::FromRawFd;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -277,11 +276,33 @@ impl super::Shard {
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
-                    for (fd, _state) in pending_migrations.drain(..) {
-                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
-                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
-                        // Close the FD via OwnedFd drop to avoid leaking.
-                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
                     }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
@@ -300,11 +321,33 @@ impl super::Shard {
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
-                    for (fd, _state) in pending_migrations.drain(..) {
-                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
-                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
-                        // Close the FD via OwnedFd drop to avoid leaking.
-                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
                     }
 
                     persistence_tick::check_auto_save_trigger(
@@ -409,11 +452,33 @@ impl super::Shard {
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
-                    for (fd, _state) in pending_migrations.drain(..) {
-                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
-                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
-                        // Close the FD via OwnedFd drop to avoid leaking.
-                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
                     }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
@@ -432,11 +497,33 @@ impl super::Shard {
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
-                    for (fd, _state) in pending_migrations.drain(..) {
-                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
-                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
-                        // Close the FD via OwnedFd drop to avoid leaking.
-                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
                     }
 
                     persistence_tick::check_auto_save_trigger(

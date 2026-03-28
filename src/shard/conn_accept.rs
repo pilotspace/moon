@@ -32,7 +32,6 @@ use super::shared_databases::ShardDatabases;
 /// `CLIENT SETNAME {name}`. The original `read_buf_remainder` is appended after the
 /// synthetic commands so the handler processes state restoration before any pending
 /// client data.
-#[allow(dead_code)]
 fn build_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
     let mut buf = BytesMut::new();
 
@@ -187,7 +186,7 @@ pub(crate) fn spawn_tokio_connection(
 /// TLS connections cannot be migrated because TLS session state lives in userspace and
 /// cannot be reconstructed from a raw FD. Only plain TCP connections should be migrated.
 #[cfg(feature = "runtime-tokio")]
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_tokio_connection(
     fd: std::os::unix::io::RawFd,
     mut state: MigratedConnectionState,
