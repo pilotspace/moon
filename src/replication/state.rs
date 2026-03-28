@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rand::Rng;
+use rand::RngExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::replication::handshake::ReplicaHandshakeState;

@@ -112,13 +112,13 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
 /// Create a multiplexed async connection to the server on the given port.
 async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client.get_multiplexed_tokio_connection().await.unwrap()
+    client.get_multiplexed_async_connection().await.unwrap()
 }
 
 /// Create a non-multiplexed async connection (needed for SELECT).
-async fn connect_single(port: u16) -> redis::aio::Connection {
+async fn connect_single(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client.get_tokio_connection().await.unwrap()
+    client.get_multiplexed_async_connection().await.unwrap()
 }
 
 #[tokio::test]
@@ -1051,7 +1051,7 @@ async fn test_auth_required() {
     // Connect without auth -- use a single (non-multiplexed) connection
     // so we control the auth flow precisely
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut conn = client.get_tokio_connection().await.unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
 
     // GET before AUTH -> NOAUTH error
     let result: redis::RedisResult<Option<String>> =
@@ -1798,12 +1798,13 @@ async fn test_multi_exec_basic() {
         redis::Value::Array(ref items) => {
             assert_eq!(items.len(), 3, "EXEC should return 3 results");
             // First two are OK from SET commands
-            let set1: String = redis::FromRedisValue::from_redis_value(&items[0]).unwrap();
+            let set1: String = redis::FromRedisValue::from_redis_value(items[0].clone()).unwrap();
             assert_eq!(set1, "OK");
-            let set2: String = redis::FromRedisValue::from_redis_value(&items[1]).unwrap();
+            let set2: String = redis::FromRedisValue::from_redis_value(items[1].clone()).unwrap();
             assert_eq!(set2, "OK");
             // Third is the GET result
-            let get_val: String = redis::FromRedisValue::from_redis_value(&items[2]).unwrap();
+            let get_val: String =
+                redis::FromRedisValue::from_redis_value(items[2].clone()).unwrap();
             assert_eq!(get_val, "txval1");
         }
         _ => panic!("EXEC should return an array, got: {:?}", results),
@@ -1929,7 +1930,8 @@ async fn test_watch_success() {
     match result {
         redis::Value::Array(ref items) => {
             assert_eq!(items.len(), 1, "EXEC should return 1 result");
-            let set_result: String = redis::FromRedisValue::from_redis_value(&items[0]).unwrap();
+            let set_result: String =
+                redis::FromRedisValue::from_redis_value(items[0].clone()).unwrap();
             assert_eq!(set_result, "OK");
         }
         _ => panic!("EXEC should return an array, got: {:?}", result),
@@ -3044,7 +3046,7 @@ async fn blpop_blocks_then_wakes() {
 
     // Use non-multiplexed connection for blocking
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_tokio_connection().await.unwrap();
+    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
 
     let mut con2 = connect(port).await;
 
@@ -3085,7 +3087,7 @@ async fn blpop_timeout() {
     let (port, shutdown) = start_sharded_server(1).await;
 
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut conn = client.get_tokio_connection().await.unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
 
     let start = std::time::Instant::now();
     // BLPOP on empty key with short timeout
@@ -3148,7 +3150,7 @@ async fn blpop_cross_shard_wakeup() {
     let (port, shutdown) = start_sharded_server(4).await;
 
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_tokio_connection().await.unwrap();
+    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
     let mut con2 = connect(port).await;
 
     // BLPOP blocks on two keys; push to the second key from another connection
@@ -3190,7 +3192,7 @@ async fn blpop_cross_shard_timeout() {
     let (port, shutdown) = start_sharded_server(4).await;
 
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut conn = client.get_tokio_connection().await.unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
 
     let start = std::time::Instant::now();
     let result: Option<(String, String)> = redis::cmd("BLPOP")
@@ -3223,7 +3225,7 @@ async fn blpop_multi_key_all_local_regression() {
     let (port, shutdown) = start_sharded_server(1).await;
 
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_tokio_connection().await.unwrap();
+    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
     let mut con2 = connect(port).await;
 
     let blpop_handle = tokio::spawn(async move {
@@ -3354,7 +3356,7 @@ async fn bzpopmin_blocks_then_wakes() {
     let (port, shutdown) = start_sharded_server(1).await;
 
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_tokio_connection().await.unwrap();
+    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
 
     let mut con2 = connect(port).await;
 
@@ -3977,7 +3979,10 @@ async fn test_script_timeout() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("BUSY") || err_msg.contains("timeout") || err_msg.contains("script"),
+        err_msg.contains("BUSY")
+            || err_msg.contains("timeout")
+            || err_msg.contains("timed out")
+            || err_msg.contains("script"),
         "expected timeout error, got: {err_msg}"
     );
 
@@ -4359,7 +4364,7 @@ async fn test_acl_noperm_denied_write() {
     assert!(r.is_err());
     let err = format!("{}", r.unwrap_err());
     assert!(
-        err.contains("NOPERM"),
+        err.contains("NOPERM") || err.contains("NoPerm"),
         "Expected NOPERM error for SET, got: {}",
         err
     );
@@ -4419,7 +4424,7 @@ async fn test_acl_key_pattern_single() {
     assert!(r.is_err());
     let err = format!("{}", r.unwrap_err());
     assert!(
-        err.contains("NOPERM"),
+        err.contains("NOPERM") || err.contains("NoPerm"),
         "Expected NOPERM for key outside pattern, got: {}",
         err
     );
@@ -4464,7 +4469,7 @@ async fn test_acl_key_pattern_mset() {
     assert!(r.is_err());
     let err = format!("{}", r.unwrap_err());
     assert!(
-        err.contains("NOPERM"),
+        err.contains("NOPERM") || err.contains("NoPerm"),
         "Expected NOPERM for MSET with mixed keys, got: {}",
         err
     );

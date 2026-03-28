@@ -62,7 +62,7 @@ async fn start_server() -> (u16, CancellationToken) {
 /// Create an async connection.
 async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client.get_multiplexed_tokio_connection().await.unwrap()
+    client.get_multiplexed_async_connection().await.unwrap()
 }
 
 #[tokio::test]

@@ -136,7 +136,7 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
 
     let mut rng = rand::rng();
     let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.choose_multiple(&mut rng, sample_size).collect();
+    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
 
     let mut oldest_key: Option<CompactKey> = None;
     let mut oldest_access = None;
@@ -190,7 +190,7 @@ fn evict_one_lfu(
 
     let mut rng = rand::rng();
     let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.choose_multiple(&mut rng, sample_size).collect();
+    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
 
     let mut evict_key: Option<CompactKey> = None;
     let mut lowest_counter: Option<u8> = None;
@@ -267,7 +267,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
 
     let mut rng = rand::rng();
     let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.choose_multiple(&mut rng, sample_size).collect();
+    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
 
     let mut evict_key: Option<CompactKey> = None;
     let mut soonest_expiry: Option<u64> = None;

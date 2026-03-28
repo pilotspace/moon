@@ -671,7 +671,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         // Distinct elements
         let n = std::cmp::min(count as usize, members.len());
         let chosen: Vec<Frame> = members
-            .choose_multiple(&mut rng, n)
+            .sample(&mut rng, n)
             .map(|m| Frame::BulkString((*m).clone()))
             .collect();
         Frame::Array(chosen.into())
@@ -757,7 +757,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let n = std::cmp::min(count, members.len());
-    let chosen: Vec<Bytes> = members.choose_multiple(&mut rng, n).cloned().collect();
+    let chosen: Vec<Bytes> = members.sample(&mut rng, n).cloned().collect();
 
     // Remove chosen members from the set
     let set = db.get_or_create_set(&key).unwrap();
@@ -1117,7 +1117,7 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     if count > 0 {
         let n = std::cmp::min(count as usize, members.len());
         let chosen: Vec<Frame> = members
-            .choose_multiple(&mut rng, n)
+            .sample(&mut rng, n)
             .map(|m| Frame::BulkString((*m).clone()))
             .collect();
         Frame::Array(chosen.into())
