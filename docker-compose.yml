@@ -1,0 +1,48 @@
+# Moon - Docker Compose
+#
+# Usage:
+#   docker compose up -d               # Start in background
+#   docker compose down                # Stop and remove containers
+#   docker compose logs -f             # Follow logs
+#
+# Build with tokio runtime instead of monoio:
+#   docker compose build --build-arg FEATURES=runtime-tokio,jemalloc
+#
+# Enable AOF persistence: add to command below:
+#   --appendonly yes --appendfsync everysec
+#
+# Enable TLS: mount certs into /data and add to command:
+#   --tls-port 6443 --tls-cert-file /data/cert.pem --tls-key-file /data/key.pem
+
+services:
+  moon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Override to use tokio runtime: runtime-tokio,jemalloc
+        FEATURES: runtime-monoio,jemalloc
+    container_name: moon
+    ports:
+      - "6379:6379"   # Redis protocol
+      - "6443:6443"   # TLS (optional, only active when --tls-port is set)
+    volumes:
+      - moon-data:/data   # Named volume for AOF persistence files
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    # --shards 0 auto-detects CPU core count
+    command: ["moon", "--bind", "0.0.0.0", "--port", "6379", "--shards", "0"]
+    healthcheck:
+      test: ["CMD", "moon", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2G
+
+volumes:
+  moon-data:
