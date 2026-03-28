@@ -1,5 +1,15 @@
 //! Append-Only File (AOF) persistence: logs every write command in RESP format
 //! for crash recovery. Supports three fsync policies and AOF rewriting for compaction.
+//!
+//! ## Unwrap Classification
+//!
+//! | Context | Classification | Rationale |
+//! |---------|---------------|-----------|
+//! | `AofWriter::append` (hot path) | **fire-and-forget** | Channel send; no Result needed |
+//! | `aof_writer_task` | **must-panic** | Writer task; errors logged inline |
+//! | `replay_aof` | **should-recover** (`Result<_, MoonError>`) | Startup replay; log+skip on corruption |
+//! | `rewrite_aof` | **should-recover** (`Result<_, MoonError>`) | Background rewrite; caller logs error |
+//! | `#[cfg(test)]` code (55 unwraps) | **test-only** | Panics are appropriate in tests |
 #![allow(unused_imports, unused_variables, unreachable_code, clippy::empty_loop)]
 
 use std::path::{Path, PathBuf};
@@ -12,6 +22,7 @@ use bytes::{Bytes, BytesMut};
 use tracing::{error, info, warn};
 
 use crate::command::{DispatchResult, dispatch};
+use crate::error::{AofError, MoonError};
 use crate::framevec;
 use crate::protocol::{Frame, ParseConfig, parse, serialize};
 use crate::storage::compact_key::CompactKey;
@@ -206,17 +217,23 @@ pub async fn aof_writer_task(
 /// Replay an AOF file by parsing RESP commands and dispatching them.
 ///
 /// Returns the number of commands successfully replayed.
-/// On parse error, logs a warning and returns what was loaded so far (partial replay).
-pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
+///
+/// **Corruption recovery:** On mid-stream parse errors, logs a warning with the
+/// byte offset, skips to the next RESP array marker (`*`), and continues replay.
+/// At EOF, reports total corrupted entries skipped. Truncated tails are handled
+/// gracefully (warn + stop).
+pub fn replay_aof(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
     }
 
+    let total_len = data.len();
     let mut buf = BytesMut::from(&data[..]);
     let config = ParseConfig::default();
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
+    let mut corruption_count: usize = 0;
     let db_count = databases.len();
 
     loop {
@@ -264,18 +281,44 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
             Ok(None) => {
                 // Incomplete frame at end of file - truncated AOF
                 if !buf.is_empty() {
-                    warn!("AOF truncated: {} unparseable bytes at end", buf.len());
+                    let offset = total_len - buf.len();
+                    warn!(
+                        "AOF truncated: {} unparseable bytes at offset {} (end of file)",
+                        buf.len(),
+                        offset
+                    );
                 }
                 break;
             }
             Err(e) => {
+                let error_offset = total_len - buf.len();
                 warn!(
-                    "AOF parse error after {} commands: {}. Partial replay.",
-                    count, e
+                    "AOF parse error at byte offset {} after {} commands: {}. Attempting skip.",
+                    error_offset, count, e
                 );
-                break;
+                corruption_count += 1;
+
+                // Skip to the next RESP array marker ('*') to attempt recovery
+                if let Some(pos) = buf.iter().position(|&b| b == b'*') {
+                    let _ = buf.split_to(pos);
+                    // Continue parsing from the next '*'
+                } else {
+                    // No more RESP array markers found; stop replay
+                    warn!(
+                        "AOF: no recoverable RESP frame found after offset {}; stopping",
+                        error_offset
+                    );
+                    break;
+                }
             }
         }
+    }
+
+    if corruption_count > 0 {
+        warn!(
+            "AOF replay completed with {} corrupted entries skipped, {} commands replayed",
+            corruption_count, count
+        );
     }
 
     Ok(count)
@@ -486,7 +529,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 ///
 /// Writes to a temporary file first, then atomically renames for crash safety.
 #[cfg(feature = "runtime-tokio")]
-pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result<()> {
+pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
     // Clone database state: lock each db individually with read lock
     let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db
         .iter()
@@ -516,8 +559,20 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result
 
     // Write to temp file, then atomic rename
     let tmp_path = aof_path.with_extension("aof.tmp");
-    std::fs::write(&tmp_path, &commands)?;
-    std::fs::rename(&tmp_path, aof_path)?;
+    std::fs::write(&tmp_path, &commands).map_err(|e| AofError::Io {
+        path: tmp_path.clone(),
+        source: e,
+    })?;
+    std::fs::rename(&tmp_path, aof_path).map_err(|e| {
+        AofError::RewriteFailed {
+            detail: format!(
+                "rename {} -> {}: {}",
+                tmp_path.display(),
+                aof_path.display(),
+                e
+            ),
+        }
+    })?;
 
     info!("AOF rewrite complete: {} bytes", commands.len());
     Ok(())

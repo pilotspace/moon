@@ -332,9 +332,7 @@ pub fn replay_wal(databases: &mut [Database], path: &Path) -> Result<usize, Moon
         replay_wal_v2(databases, &data)
     } else {
         // V1 fallback: delegate to AOF replay (raw RESP)
-        // Note: temporary map_err until aof.rs is migrated to MoonError (Task 2)
         crate::persistence::aof::replay_aof(databases, path)
-            .map_err(|e| MoonError::Other(e.to_string()))
     }
 }
 
