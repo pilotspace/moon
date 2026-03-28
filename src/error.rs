@@ -117,3 +117,74 @@ pub enum SnapshotError {
 
 /// Convenience type alias for Results using MoonError.
 pub type MoonResult<T> = std::result::Result<T, MoonError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn moon_error_from_wal_error() {
+        let wal_err = WalError::Corrupted {
+            offset: 42,
+            detail: "bad magic".to_string(),
+        };
+        let moon_err: MoonError = wal_err.into();
+        assert!(matches!(
+            moon_err,
+            MoonError::Wal(WalError::Corrupted { offset: 42, .. })
+        ));
+        assert!(moon_err.to_string().contains("bad magic"));
+    }
+
+    #[test]
+    fn moon_error_from_aof_error() {
+        let aof_err = AofError::Io {
+            path: PathBuf::from("/tmp/test.aof"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        let moon_err: MoonError = aof_err.into();
+        assert!(matches!(moon_err, MoonError::Aof(AofError::Io { .. })));
+    }
+
+    #[test]
+    fn moon_error_from_rdb_error() {
+        let rdb_err = RdbError::UnsupportedType { type_tag: 0xFF };
+        let moon_err: MoonError = rdb_err.into();
+        assert!(matches!(
+            moon_err,
+            MoonError::Rdb(RdbError::UnsupportedType { type_tag: 0xFF })
+        ));
+    }
+
+    #[test]
+    fn moon_error_from_snapshot_error() {
+        let snap_err = SnapshotError::VersionMismatch {
+            expected: 2,
+            actual: 1,
+        };
+        let moon_err: MoonError = snap_err.into();
+        assert!(matches!(
+            moon_err,
+            MoonError::Snapshot(SnapshotError::VersionMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn moon_error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let moon_err: MoonError = io_err.into();
+        assert!(matches!(moon_err, MoonError::Io(_)));
+    }
+
+    #[test]
+    fn moon_result_alias_works() {
+        fn example() -> MoonResult<u32> {
+            Ok(42)
+        }
+        assert_eq!(example().unwrap(), 42);
+    }
+}
