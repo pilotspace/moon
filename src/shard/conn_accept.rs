@@ -364,10 +364,11 @@ pub(crate) fn spawn_monoio_connection(
                                 Ok(cfg) => cfg.requirepass.clone(),
                                 Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                             };
-                            handle_connection_sharded_monoio(
+                            let _ = handle_connection_sharded_monoio(
                                 tls_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk,
                                 sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
                                 notifiers, snap_tx, clk,
+                                false, // can_migrate: TLS connections cannot transfer session state
                             )
                             .await;
                         }
@@ -382,17 +383,63 @@ pub(crate) fn spawn_monoio_connection(
                 });
             } else {
                 // Plain TCP connection
+                #[cfg(target_os = "linux")]
+                let dtx2 = dispatch_tx.clone();
+                #[cfg(target_os = "linux")]
+                let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
                     let reqpass = match rtcfg.read() {
                         Ok(cfg) => cfg.requirepass.clone(),
                         Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                     };
-                    handle_connection_sharded_monoio(
+                    let _result = handle_connection_sharded_monoio(
                         tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
                         reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                         snap_tx, clk,
+                        cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                     )
                     .await;
+
+                    // Handle migration result: extract FD via dup() and send via SPSC.
+                    // libc::dup is only available on Linux (target-specific dependency).
+                    #[cfg(target_os = "linux")]
+                    if let (crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (_result.0, _result.1) {
+                        use std::os::unix::io::{AsRawFd, FromRawFd};
+                        use ringbuf::traits::Producer;
+                        use crate::shard::mesh::ChannelMesh;
+
+                        let raw_fd = stream.as_raw_fd();
+                        let dup_fd = unsafe { libc::dup(raw_fd) };
+                        drop(stream); // closes original fd
+                        if dup_fd < 0 {
+                            tracing::warn!("Shard {}: migration dup() failed: {}", shard_id, std::io::Error::last_os_error());
+                        } else {
+                            let msg = ShardMessage::MigrateConnection { fd: dup_fd, state };
+                            let target_idx = ChannelMesh::target_index(shard_id, target_shard);
+                            let push_result = {
+                                let mut producers = dtx2.borrow_mut();
+                                producers[target_idx].try_push(msg)
+                            };
+                            match push_result {
+                                Ok(()) => {
+                                    notifiers2[target_shard].notify_one();
+                                    tracing::info!(
+                                        "Shard {}: migrated connection {} to shard {} (monoio)",
+                                        shard_id, cid, target_shard
+                                    );
+                                }
+                                Err(returned_msg) => {
+                                    if let ShardMessage::MigrateConnection { fd, .. } = returned_msg {
+                                        drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+                                    }
+                                    tracing::warn!(
+                                        "Shard {}: migration SPSC full, connection {} lost (monoio)",
+                                        shard_id, cid
+                                    );
+                                }
+                            }
+                        }
+                    }
                 });
             }
         }
@@ -492,11 +539,12 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let _migration_buf = build_migration_read_buf(&mut state);
 
             monoio::spawn(async move {
-                handle_connection_sharded_monoio(
+                let _ = handle_connection_sharded_monoio(
                     tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
                     None, // requirepass: None = pre-authenticated
                     aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                     snap_tx, clk,
+                    false, // can_migrate: already-migrated connections skip re-migration sampling
                 )
                 .await;
             });
