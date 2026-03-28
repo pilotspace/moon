@@ -239,12 +239,10 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
             EOF_MARKER => break,
             DB_SELECTOR => {
                 let mut db_idx = [0u8; 1];
-                cursor
-                    .read_exact(&mut db_idx)
-                    .map_err(|e| RdbError::Io {
-                        path: path.to_path_buf(),
-                        source: e,
-                    })?;
+                cursor.read_exact(&mut db_idx).map_err(|e| RdbError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
                 current_db = db_idx[0] as usize;
                 if current_db >= databases.len() {
                     return Err(RdbError::Corrupted {

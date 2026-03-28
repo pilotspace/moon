@@ -29,12 +29,12 @@ use crate::storage::Database;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
-use crate::server::codec::RespCodec;
 use super::{
-    SharedDatabases, apply_resp3_conversion, convert_blocking_to_nonblocking, extract_command,
-    execute_transaction, extract_bytes, extract_primary_key, handle_config,
+    SharedDatabases, apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction,
+    extract_bytes, extract_command, extract_primary_key, handle_config,
 };
 use crate::framevec;
+use crate::server::codec::RespCodec;
 
 /// Handle a single client connection.
 ///

@@ -392,10 +392,12 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
 
     // Verify magic
     let mut magic = [0u8; 8];
-    cursor.read_exact(&mut magic).map_err(|e| SnapshotError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    cursor
+        .read_exact(&mut magic)
+        .map_err(|e| SnapshotError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
     if &magic != SHARD_RDB_MAGIC {
         return Err(SnapshotError::Corrupted {
             detail: "invalid RRDSHARD magic header".into(),
@@ -779,9 +781,15 @@ mod tests {
         // Per-segment CRC mismatch now uses log+skip recovery:
         // the corrupted segment is skipped but loading continues successfully.
         let result = shard_snapshot_load(&mut loaded, &path);
-        assert!(result.is_ok(), "Per-segment CRC mismatch should log+skip, not hard-fail");
+        assert!(
+            result.is_ok(),
+            "Per-segment CRC mismatch should log+skip, not hard-fail"
+        );
         let count = result.unwrap();
-        assert_eq!(count, 0, "Corrupted segment should be skipped, yielding 0 keys");
+        assert_eq!(
+            count, 0,
+            "Corrupted segment should be skipped, yielding 0 keys"
+        );
     }
 
     #[test]

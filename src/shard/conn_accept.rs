@@ -70,9 +70,8 @@ pub(crate) fn spawn_tokio_connection(
     let lua = {
         let mut lua_opt = lua_rc.borrow_mut();
         if lua_opt.is_none() {
-            *lua_opt = Some(
-                crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
-            );
+            *lua_opt =
+                Some(crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"));
         }
         lua_opt.as_ref().unwrap().clone()
     };
@@ -101,9 +100,9 @@ pub(crate) fn spawn_tokio_connection(
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     handle_connection_sharded_inner(
-                        tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk,
-                        sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
-                        notifiers, snap_tx, clk,
+                        tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
+                        reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                        snap_tx, clk,
                     )
                     .await;
                 }
@@ -116,8 +115,8 @@ pub(crate) fn spawn_tokio_connection(
         // Plain TCP connection
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
-                tcp_stream, dbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof,
-                trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk,
+                tcp_stream, dbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk,
             )
             .await;
         });
@@ -204,9 +203,9 @@ pub(crate) fn spawn_monoio_connection(
                                 .ok()
                                 .flatten();
                             handle_connection_sharded_monoio(
-                                tls_stream, peer_addr, dbs, shard_id, num_shards, dtx,
-                                psr, blk, sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp,
-                                acl, rtcfg, scfg, notifiers, snap_tx, clk,
+                                tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk,
+                                sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
+                                notifiers, snap_tx, clk,
                             )
                             .await;
                         }
@@ -228,9 +227,9 @@ pub(crate) fn spawn_monoio_connection(
                         .ok()
                         .flatten();
                     handle_connection_sharded_monoio(
-                        tcp_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk,
-                        sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
-                        notifiers, snap_tx, clk,
+                        tcp_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
+                        reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                        snap_tx, clk,
                     )
                     .await;
                 });

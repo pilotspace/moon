@@ -16,8 +16,8 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::scripting::ScriptCache;
 use crate::shard::dispatch::ShardMessage;
-use crate::storage::entry::CachedClock;
 use crate::storage::Database;
+use crate::storage::entry::CachedClock;
 use crate::tracking::{TrackingState, TrackingTable};
 
 /// Shared immutable state provided to each connection handler by the shard.

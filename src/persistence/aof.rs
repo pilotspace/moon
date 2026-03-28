@@ -22,8 +22,8 @@ use bytes::{Bytes, BytesMut};
 use tracing::{error, info, warn};
 
 use crate::error::{AofError, MoonError};
-use crate::persistence::replay::CommandReplayEngine;
 use crate::framevec;
+use crate::persistence::replay::CommandReplayEngine;
 use crate::protocol::{Frame, ParseConfig, parse, serialize};
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
@@ -222,7 +222,11 @@ pub async fn aof_writer_task(
 /// byte offset, skips to the next RESP array marker (`*`), and continues replay.
 /// At EOF, reports total corrupted entries skipped. Truncated tails are handled
 /// gracefully (warn + stop).
-pub fn replay_aof(databases: &mut [Database], path: &Path, engine: &dyn CommandReplayEngine) -> Result<usize, MoonError> {
+pub fn replay_aof(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn CommandReplayEngine,
+) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
@@ -548,15 +552,13 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), Moo
         path: tmp_path.clone(),
         source: e,
     })?;
-    std::fs::rename(&tmp_path, aof_path).map_err(|e| {
-        AofError::RewriteFailed {
-            detail: format!(
-                "rename {} -> {}: {}",
-                tmp_path.display(),
-                aof_path.display(),
-                e
-            ),
-        }
+    std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
+        detail: format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            aof_path.display(),
+            e
+        ),
     })?;
 
     info!("AOF rewrite complete: {} bytes", commands.len());

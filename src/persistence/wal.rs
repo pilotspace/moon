@@ -322,7 +322,11 @@ impl WalWriter {
 /// by checking whether the first 6 bytes match the WAL_MAGIC signature.
 ///
 /// Returns the number of commands successfully replayed.
-pub fn replay_wal(databases: &mut [Database], path: &Path, engine: &dyn crate::persistence::replay::CommandReplayEngine) -> Result<usize, MoonError> {
+pub fn replay_wal(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
@@ -340,7 +344,11 @@ pub fn replay_wal(databases: &mut [Database], path: &Path, engine: &dyn crate::p
 ///
 /// Parses the 32-byte header, then iterates over CRC32-checksummed block frames.
 /// Stops on first corrupted or truncated block, returning commands replayed so far.
-fn replay_wal_v2(databases: &mut [Database], data: &[u8], engine: &dyn crate::persistence::replay::CommandReplayEngine) -> Result<usize, MoonError> {
+fn replay_wal_v2(
+    databases: &mut [Database],
+    data: &[u8],
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<usize, MoonError> {
     // Parse and validate header
     if data.len() < WAL_HEADER_SIZE {
         return Err(WalError::Corrupted {
@@ -357,14 +365,12 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8], engine: &dyn crate::pe
         .into());
     }
     let shard_id = u16::from_le_bytes([data[7], data[8]]);
-    let epoch = u64::from_le_bytes(
-        data[9..17].try_into().map_err(|_| {
-            MoonError::from(WalError::Corrupted {
-                offset: 9,
-                detail: "invalid epoch bytes at header offset 9..17".into(),
-            })
-        })?,
-    );
+    let epoch = u64::from_le_bytes(data[9..17].try_into().map_err(|_| {
+        MoonError::from(WalError::Corrupted {
+            offset: 9,
+            detail: "invalid epoch bytes at header offset 9..17".into(),
+        })
+    })?);
     info!("Replaying WAL v2: shard={}, epoch={}", shard_id, epoch);
 
     let mut offset = WAL_HEADER_SIZE;
@@ -378,14 +384,12 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8], engine: &dyn crate::pe
             warn!("WAL v2: truncated block_len at offset {}, stopping", offset);
             break;
         }
-        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(
-            |_| {
-                MoonError::from(WalError::Corrupted {
-                    offset: offset as u64,
-                    detail: format!("invalid block_len bytes at offset {}", offset),
-                })
-            },
-        )?) as usize;
+        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+            MoonError::from(WalError::Corrupted {
+                offset: offset as u64,
+                detail: format!("invalid block_len bytes at offset {}", offset),
+            })
+        })?) as usize;
         offset += 4;
 
         // Minimum block content: cmd_count(2) + db_idx(1) + crc32(4) = 7

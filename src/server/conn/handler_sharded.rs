@@ -33,12 +33,12 @@ use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
-use crate::server::codec::RespCodec;
 use super::{
-    SharedDatabases, apply_resp3_conversion, convert_blocking_to_nonblocking, extract_command,
-    execute_transaction_sharded, extract_bytes, extract_primary_key, handle_config,
-    is_multi_key_command, handle_blocking_command,
+    SharedDatabases, apply_resp3_conversion, convert_blocking_to_nonblocking,
+    execute_transaction_sharded, extract_bytes, extract_command, extract_primary_key,
+    handle_blocking_command, handle_config, is_multi_key_command,
 };
+use crate::server::codec::RespCodec;
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
 ///

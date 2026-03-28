@@ -47,7 +47,9 @@ pub enum WalError {
     #[error("WAL corrupted at offset {offset}: {detail}")]
     Corrupted { offset: u64, detail: String },
 
-    #[error("WAL entry checksum mismatch at offset {offset}: expected {expected:#010x}, got {actual:#010x}")]
+    #[error(
+        "WAL entry checksum mismatch at offset {offset}: expected {expected:#010x}, got {actual:#010x}"
+    )]
     ChecksumMismatch {
         offset: u64,
         expected: u32,
