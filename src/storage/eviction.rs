@@ -14,10 +14,11 @@ use crate::storage::entry::lfu_decay;
 pub fn lru_is_older(a: u32, b: u32) -> bool {
     let a16 = a as i16;
     let b16 = b as i16;
-    // Signed difference handles wraparound: if b recently wrapped past 0
-    // and a is near 65535, (a16 - b16) will be a large positive number,
-    // meaning a is "older" (further in the past).
-    a16.wrapping_sub(b16) > 0
+    // Signed difference handles wraparound: if a was accessed before b,
+    // (a16 - b16) is negative (a < b in time), meaning a is older.
+    // Wraparound case: a=65400 (pre-wrap), b=100 (post-wrap):
+    //   a16=-136, b16=100, -136-100=-236 < 0 → correctly identifies a as older.
+    a16.wrapping_sub(b16) < 0
 }
 
 /// Sum used_memory across all databases for aggregate eviction decisions.

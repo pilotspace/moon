@@ -1,0 +1,88 @@
+---
+title: "Command reference"
+description: "All 200+ supported Redis commands grouped by data type."
+keywords: ["commands", "redis", "api", "reference"]
+mode: "wide"
+---
+
+Moon implements 200+ Redis commands. All commands follow [Redis command semantics](https://redis.io/docs/latest/commands/).
+
+## Connection (7)
+
+`PING`, `ECHO`, `QUIT`, `SELECT`, `COMMAND`, `INFO`, `AUTH`
+
+## Strings (18)
+
+`GET`, `SET`, `MGET`, `MSET`, `MSETNX`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`, `APPEND`, `STRLEN`, `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETDEL`, `GETEX`
+
+<Tip>
+SET supports `EX`, `PX`, `NX`, `XX`, and `KEEPTTL` options, matching Redis 7+ behavior.
+</Tip>
+
+## Keys (15)
+
+`DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `UNLINK`, `SCAN`, `KEYS`, `RENAME`, `RENAMENX`
+
+## Hashes (14)
+
+`HSET`, `HGET`, `HDEL`, `HMSET`, `HMGET`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HINCRBY`, `HINCRBYFLOAT`, `HSETNX`, `HSCAN`
+
+## Lists (16)
+
+`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LINSERT`, `LREM`, `LTRIM`, `LPOS`, `LMOVE`, `BLPOP`, `BRPOP`, `BLMOVE`
+
+<Note>
+Blocking commands (`BLPOP`, `BRPOP`, `BLMOVE`) support timeouts and cross-shard wakeup.
+</Note>
+
+## Sets (15)
+
+`SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SRANDMEMBER`, `SPOP`, `SSCAN`
+
+## Sorted sets (21)
+
+`ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZUNIONSTORE`, `ZINTERSTORE`, `BZPOPMIN`, `BZPOPMAX`
+
+## Streams (14)
+
+`XADD`, `XLEN`, `XRANGE`, `XREVRANGE`, `XREAD`, `XTRIM`, `XDEL`, `XGROUP`, `XREADGROUP`, `XACK`, `XPENDING`, `XCLAIM`, `XAUTOCLAIM`, `XINFO`
+
+## Pub/sub (5)
+
+`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
+
+## Transactions (5)
+
+`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
+
+## Scripting (5)
+
+`EVAL`, `EVALSHA`, `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH`
+
+<Note>
+Lua 5.4 VM via mlua. Sandboxed with `redis.call()` and `redis.pcall()` API bindings. The VM is lazy-initialized on first use to save ~18 MB baseline memory.
+</Note>
+
+## Persistence (2)
+
+`BGSAVE`, `BGREWRITEAOF`
+
+## Replication (5)
+
+`REPLICAOF`, `SLAVEOF`, `REPLCONF`, `PSYNC`, `WAIT`
+
+## Cluster (9)
+
+`CLUSTER INFO`, `CLUSTER NODES`, `CLUSTER SLOTS`, `CLUSTER MEET`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER SETSLOT`, `CLUSTER FAILOVER`, `CLUSTER MYID`
+
+## ACL (8)
+
+`ACL SETUSER`, `ACL GETUSER`, `ACL DELUSER`, `ACL LIST`, `ACL WHOAMI`, `ACL LOG`, `ACL SAVE`, `ACL LOAD`
+
+## Server (12)
+
+`CONFIG GET`, `CONFIG SET`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `HELLO`, `CLIENT`, `OBJECT`, `DEBUG`, `SLOWLOG`, `WAIT`, `COMMAND DOCS`
+
+## Known limitations
+
+- `GETRANGE` / `SETRANGE` are not yet implemented.

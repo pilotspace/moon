@@ -40,8 +40,8 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 struct ConnState {
     /// Fixed FD index in the registered table.
     fixed_fd_idx: u32,
-    /// Raw file descriptor.
-    raw_fd: RawFd,
+    /// Raw file descriptor (kept for future diagnostic/close use).
+    _raw_fd: RawFd,
     /// Accumulation buffer for partial RESP frames spanning multiple recvs.
     read_buf: BytesMut,
     /// Whether this connection has an active multishot recv.
@@ -108,10 +108,7 @@ impl SendBufPool {
         let mut free_list = Vec::with_capacity(count as usize);
 
         for i in 0..count {
-            let mut buf = Vec::with_capacity(size);
-            // Set length to capacity so the entire buffer is valid memory
-            // that can be registered with the kernel.
-            unsafe { buf.set_len(size) };
+            let buf = vec![0u8; size];
             buffers.push(buf);
             free_list.push(i);
         }
@@ -244,7 +241,7 @@ impl UringDriver {
     /// Must be called once after construction, before any I/O operations.
     pub fn init(&mut self) -> std::io::Result<()> {
         self.fd_table.register_with_ring(&self.ring)?;
-        self.buf_ring.setup_ring(&self.ring)?;
+        self.buf_ring.setup_ring(&mut self.ring)?;
 
         // Register send buffers with the kernel (IORING_REGISTER_BUFFERS).
         // This pins pages once at init so WRITE_FIXED skips get_user_pages() per I/O.
@@ -308,7 +305,7 @@ impl UringDriver {
             conn_id,
             ConnState {
                 fixed_fd_idx: fixed_idx,
-                raw_fd,
+                _raw_fd: raw_fd,
                 read_buf: BytesMut::with_capacity(0), // allocated on-demand for partial frames
                 recv_active: false,
             },
@@ -476,7 +473,7 @@ impl UringDriver {
     pub fn submit_and_wait(&mut self) -> std::io::Result<usize> {
         if self.pending_sqes == 0 {
             // Nothing to submit, but still check for CQEs
-            return self.ring.submit_and_wait(1).map_err(Into::into);
+            return self.ring.submit_and_wait(1);
         }
         let n = self.ring.submit_and_wait(1)?;
         self.pending_sqes = 0;
@@ -504,11 +501,18 @@ impl UringDriver {
     pub fn drain_completions(&mut self) -> Vec<IoEvent> {
         let mut events = Vec::new();
 
-        for cqe in self.ring.completion() {
-            let (event_type, conn_id, _aux) = decode_user_data(cqe.user_data());
-            let result = cqe.result();
-            let flags = cqe.flags();
+        // Collect CQEs first to release the mutable borrow on self.ring,
+        // allowing return_buf to access the ring's submission queue below.
+        let cqes: Vec<(u8, u32, u32, i32, u32)> = self
+            .ring
+            .completion()
+            .map(|cqe| {
+                let (event_type, conn_id, aux) = decode_user_data(cqe.user_data());
+                (event_type, conn_id, aux, cqe.result(), cqe.flags())
+            })
+            .collect();
 
+        for (event_type, conn_id, _aux, result, flags) in cqes {
             match event_type {
                 EVENT_ACCEPT => {
                     if result >= 0 {
@@ -541,7 +545,7 @@ impl UringDriver {
                         events.push(IoEvent::Recv { conn_id, data });
 
                         // Check if multishot recv was cancelled (MORE flag absent)
-                        if flags & cqueue::more() == 0 {
+                        if !cqueue::more(flags) {
                             if let Some(conn) = self.connections.get_mut(&conn_id) {
                                 conn.recv_active = false;
                             }

@@ -5,7 +5,7 @@ set -euo pipefail
 # profile.sh -- Automated CPU & Memory Profiling Suite
 #
 # Measures per-key memory overhead, RSS growth, memory fragmentation, and CPU
-# efficiency for rust-redis (Tokio & Monoio) vs Redis. Runs Criterion micro-
+# efficiency for moon (Tokio & Monoio) vs Redis. Runs Criterion micro-
 # benchmarks. Generates PROFILING-REPORT.md.
 #
 # Usage:
@@ -24,8 +24,8 @@ set -euo pipefail
 PORT_REDIS=6399
 PORT_RUST_TOKIO=6400
 PORT_RUST_MONOIO=6401
-RUST_BINARY="./target/release/rust-redis"
-RUST_BINARY_MONOIO="./target/release/rust-redis-monoio"
+RUST_BINARY="./target/release/moon"
+RUST_BINARY_MONOIO="./target/release/moon-monoio"
 OUTPUT_FILE="PROFILING-REPORT.md"
 SIZES=(10000 50000 100000 500000 1000000)
 SKIP_MONOIO=false
@@ -66,8 +66,8 @@ cleanup() {
     [[ -n "${MONOIO_PID:-}" ]] && kill "$MONOIO_PID" 2>/dev/null; wait "$MONOIO_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]]  && kill "$REDIS_PID"  2>/dev/null; wait "$REDIS_PID"  2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "rust-redis.*${PORT_RUST_TOKIO}" 2>/dev/null || true
-    pkill -f "rust-redis.*${PORT_RUST_MONOIO}" 2>/dev/null || true
+    pkill -f "moon.*${PORT_RUST_TOKIO}" 2>/dev/null || true
+    pkill -f "moon.*${PORT_RUST_MONOIO}" 2>/dev/null || true
     [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]] && rm -rf "$RESULTS_DIR"
 }
 trap cleanup EXIT
@@ -145,10 +145,10 @@ start_redis() {
 }
 
 start_rust_tokio() {
-    log "Starting rust-redis (Tokio) on port $PORT_RUST_TOKIO..."
+    log "Starting moon (Tokio) on port $PORT_RUST_TOKIO..."
     "$RUST_BINARY" --port "$PORT_RUST_TOKIO" --shards 1 &>/dev/null &
     TOKIO_PID=$!
-    wait_for_server "$PORT_RUST_TOKIO" "rust-redis (Tokio)"
+    wait_for_server "$PORT_RUST_TOKIO" "moon (Tokio)"
 }
 
 start_rust_monoio() {
@@ -160,10 +160,10 @@ start_rust_monoio() {
         log "Monoio binary not found at $RUST_BINARY_MONOIO, skipping"
         return 1
     fi
-    log "Starting rust-redis (Monoio) on port $PORT_RUST_MONOIO..."
+    log "Starting moon (Monoio) on port $PORT_RUST_MONOIO..."
     "$RUST_BINARY_MONOIO" --port "$PORT_RUST_MONOIO" --shards 1 &>/dev/null &
     MONOIO_PID=$!
-    wait_for_server "$PORT_RUST_MONOIO" "rust-redis (Monoio)"
+    wait_for_server "$PORT_RUST_MONOIO" "moon (Monoio)"
 }
 
 stop_server() {
@@ -188,11 +188,11 @@ stop_all() {
 # ===========================================================================
 
 build_binaries() {
-    log "Building rust-redis (Tokio, release)..."
+    log "Building moon (Tokio, release)..."
     cargo build --release --features runtime-tokio 2>&1 | tail -3
 
     if [[ "$SKIP_MONOIO" != "true" ]]; then
-        log "Building rust-redis (Monoio, release)..."
+        log "Building moon (Monoio, release)..."
         if cargo build --release --features runtime-monoio --no-default-features 2>&1 | tail -3; then
             cp "$RUST_BINARY" "$RUST_BINARY_MONOIO"
         else
@@ -210,13 +210,13 @@ build_binaries() {
 
 # measure_per_server callback_fn
 # Calls callback_fn with args: server_label port pid
-# for Redis and rust-redis (Tokio).
+# for Redis and moon (Tokio).
 measure_per_server() {
     local callback=$1
     # Redis
     "$callback" "Redis" "$PORT_REDIS" "$REDIS_PID"
-    # rust-redis (Tokio)
-    "$callback" "rust-redis" "$PORT_RUST_TOKIO" "$TOKIO_PID"
+    # moon (Tokio)
+    "$callback" "moon" "$PORT_RUST_TOKIO" "$TOKIO_PID"
 }
 
 # ===========================================================================
@@ -455,15 +455,15 @@ section_cpu() {
     _measure_cpu_for_server "Redis" "$PORT_REDIS" "$REDIS_PID"
     stop_all
 
-    # rust-redis (Tokio)
+    # moon (Tokio)
     start_rust_tokio
-    _measure_cpu_for_server "rust-redis-Tokio" "$PORT_RUST_TOKIO" "$TOKIO_PID"
+    _measure_cpu_for_server "moon-Tokio" "$PORT_RUST_TOKIO" "$TOKIO_PID"
     stop_all
 
     # Monoio (optional)
     if [[ "$SKIP_MONOIO" != "true" ]]; then
         if start_rust_monoio; then
-            _measure_cpu_for_server "rust-redis-Monoio" "$PORT_RUST_MONOIO" "$MONOIO_PID"
+            _measure_cpu_for_server "moon-Monoio" "$PORT_RUST_MONOIO" "$MONOIO_PID"
             stop_all
         fi
     fi
@@ -518,7 +518,7 @@ generate_report() {
 **Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 **Hardware:** ${hw_ncpu} cores, ${hw_mem_gb}GB RAM
 **OS:** macOS ${os_version}
-**rust-redis version:** $(git describe --tags --always 2>/dev/null || echo "dev")
+**moon version:** $(git describe --tags --always 2>/dev/null || echo "dev")
 **Redis version:** $(redis-server --version 2>/dev/null | awk '{print $3}' | sed 's/v=//' || echo "unknown")
 
 ---
@@ -530,21 +530,21 @@ HEADER
         cat >> "$OUTPUT_FILE" <<'SECTION'
 ## Per-Key Memory Overhead
 
-Measures RSS growth per key inserted, comparing Redis vs rust-redis across data types and dataset sizes.
+Measures RSS growth per key inserted, comparing Redis vs moon across data types and dataset sizes.
 
 SECTION
 
-        echo "| Keys | Type | Redis (B/key) | rust-redis (B/key) | Ratio |" >> "$OUTPUT_FILE"
+        echo "| Keys | Type | Redis (B/key) | moon (B/key) | Ratio |" >> "$OUTPUT_FILE"
         echo "|-----:|------|-------------:|-----------------:|------:|" >> "$OUTPUT_FILE"
 
-        # Parse CSV results: each type has Redis line followed by rust-redis line
+        # Parse CSV results: each type has Redis line followed by moon line
         while IFS=, read -r size dtype server rss_per_key mem_per_key; do
             [[ "$size" == "size" ]] && continue  # skip header
             if [[ "$server" == "Redis" ]]; then
                 local redis_val="$rss_per_key"
-                # Read next line for rust-redis
+                # Read next line for moon
                 IFS=, read -r _ _ server2 rust_val _ || true
-                if [[ "$server2" == "rust-redis" ]]; then
+                if [[ "$server2" == "moon" ]]; then
                     local r
                     r=$(ratio "${rust_val%%.*}" "${redis_val%%.*}")
                     printf "| %s | %s | %s | %s | %s |\n" \
@@ -558,7 +558,7 @@ SECTION
         # RSS Growth Curve
         echo "### RSS Growth Curve (Strings, ${VALUE_SIZE}B values)" >> "$OUTPUT_FILE"
         echo "" >> "$OUTPUT_FILE"
-        echo "| Keys | Redis RSS (MB) | rust-redis RSS (MB) | Ratio |" >> "$OUTPUT_FILE"
+        echo "| Keys | Redis RSS (MB) | moon RSS (MB) | Ratio |" >> "$OUTPUT_FILE"
         echo "|-----:|--------------:|-------------------:|------:|" >> "$OUTPUT_FILE"
 
         grep ",string," "$MEMORY_RESULTS_FILE" | while IFS=, read -r size dtype server rss_per_key mem_per_key; do
@@ -587,7 +587,7 @@ Insert 1M keys, delete 500K, measure RSS vs used_memory ratio.
 
 SECTION
 
-        echo "| Phase | Metric | Redis | rust-redis |" >> "$OUTPUT_FILE"
+        echo "| Phase | Metric | Redis | moon |" >> "$OUTPUT_FILE"
         echo "|-------|--------|------:|-----------:|" >> "$OUTPUT_FILE"
 
         local redis_insert_rss="" redis_insert_mem="" redis_insert_frag=""
@@ -599,9 +599,9 @@ SECTION
             [[ "$phase" == "phase" ]] && continue
             case "${phase}_${server}" in
                 after_insert_Redis)        redis_insert_rss=$rss; redis_insert_mem=$mem; redis_insert_frag=$frag ;;
-                after_insert_rust-redis)   rust_insert_rss=$rss;  rust_insert_mem=$mem;  rust_insert_frag=$frag ;;
+                after_insert_moon)   rust_insert_rss=$rss;  rust_insert_mem=$mem;  rust_insert_frag=$frag ;;
                 after_delete_Redis)        redis_delete_rss=$rss; redis_delete_mem=$mem; redis_delete_frag=$frag ;;
-                after_delete_rust-redis)   rust_delete_rss=$rss;  rust_delete_mem=$mem;  rust_delete_frag=$frag ;;
+                after_delete_moon)   rust_delete_rss=$rss;  rust_delete_mem=$mem;  rust_delete_frag=$frag ;;
             esac
         done < "$FRAGMENTATION_RESULTS_FILE"
 
@@ -656,7 +656,7 @@ SECTION
 
 Based on profiling results:
 
-1. **Per-key overhead:** Compare RSS/key between Redis and rust-redis. If rust-redis uses more, investigate CompactEntry/CompactKey overhead vs jemalloc metadata.
+1. **Per-key overhead:** Compare RSS/key between Redis and moon. If moon uses more, investigate CompactEntry/CompactKey overhead vs jemalloc metadata.
 2. **Fragmentation:** If fragmentation ratio > 1.5 after deletes, consider implementing active defragmentation or memory compaction.
 3. **CPU efficiency:** Higher ops/sec per CPU% indicates better instruction-level efficiency. Monoio should show improvement over Tokio due to reduced async runtime overhead.
 4. **Inline key threshold:** CompactKey SSO threshold is 23 bytes. If most keys exceed this, consider increasing inline capacity (trade struct size for fewer allocations).

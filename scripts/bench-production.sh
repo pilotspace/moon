@@ -6,13 +6,13 @@ set -euo pipefail
 #
 # Tests real-world Redis patterns: session stores, rate limiting, leaderboards,
 # caching layers, pub/sub fanout, time-series ingest, and mixed workloads.
-# Compares rust-redis vs Redis side-by-side with latency percentiles.
+# Compares moon vs Redis side-by-side with latency percentiles.
 #
 # Usage:
 #   ./bench-production.sh                  # Run all scenarios
 #   ./bench-production.sh --scenario NAME  # Run single scenario
 #   ./bench-production.sh --list           # List available scenarios
-#   ./bench-production.sh --shards N       # rust-redis shard count (default: 1)
+#   ./bench-production.sh --shards N       # moon shard count (default: 1)
 #   ./bench-production.sh --duration SEC   # Test duration per scenario (default: 30)
 #   ./bench-production.sh --output FILE    # Output file (default: BENCHMARK-PRODUCTION.md)
 ###############################################################################
@@ -27,7 +27,7 @@ SHARDS=1
 DURATION=30
 REQUESTS=200000
 OUTPUT_FILE="BENCHMARK-PRODUCTION.md"
-RUST_BINARY="./target/release/rust-redis"
+RUST_BINARY="./target/release/moon"
 SCENARIO_FILTER=""
 RESULTS_DIR=""
 
@@ -45,7 +45,7 @@ cleanup() {
     [[ -n "${RUST_PID:-}" ]] && kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "rust-redis.*${PORT_RUST}" 2>/dev/null || true
+    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
     [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]] && rm -rf "$RESULTS_DIR"
 }
 trap cleanup EXIT
@@ -151,7 +151,7 @@ scenario_session_store() {
     local get8_redis=$(echo "$out_redis" | parse_rps)
     local get8_rust=$(echo "$out_rust" | parse_rps)
 
-    echo "| Operation | Redis | rust-redis | Ratio |"
+    echo "| Operation | Redis | moon | Ratio |"
     echo "|-----------|------:|----------:|------:|"
     printf "| GET (session check, p=1) | %s | %s | %s |\n" \
         "$(format_number "${get_redis%%.*}")" "$(format_number "${get_rust%%.*}")" "$(ratio "${get_rust%%.*}" "${get_redis%%.*}")"
@@ -196,7 +196,7 @@ scenario_rate_limiter() {
     local incr200_redis=$(echo "$out_redis" | parse_rps)
     local incr200_rust=$(echo "$out_rust" | parse_rps)
 
-    echo "| Operation | Redis | rust-redis | Ratio |"
+    echo "| Operation | Redis | moon | Ratio |"
     echo "|-----------|------:|----------:|------:|"
     printf "| INCR (p=1, 100 clients) | %s | %s | %s |\n" \
         "$(format_number "${incr_redis%%.*}")" "$(format_number "${incr_rust%%.*}")" "$(ratio "${incr_rust%%.*}" "${incr_redis%%.*}")"
@@ -244,7 +244,7 @@ scenario_leaderboard() {
     local zrange_p50_redis=$(echo "$out_redis" | parse_p50)
     local zrange_p50_rust=$(echo "$out_rust" | parse_p50)
 
-    echo "| Operation | Redis | rust-redis | Ratio |"
+    echo "| Operation | Redis | moon | Ratio |"
     echo "|-----------|------:|----------:|------:|"
     printf "| ZADD (score update, p=1) | %s | %s | %s |\n" \
         "$(format_number "${zadd_redis%%.*}")" "$(format_number "${zadd_rust%%.*}")" "$(ratio "${zadd_rust%%.*}" "${zadd_redis%%.*}")"
@@ -298,7 +298,7 @@ scenario_cache_layer() {
     local mset_redis=$(echo "$out_redis" | parse_rps)
     local mset_rust=$(echo "$out_rust" | parse_rps)
 
-    echo "| Operation | Redis | rust-redis | Ratio |"
+    echo "| Operation | Redis | moon | Ratio |"
     echo "|-----------|------:|----------:|------:|"
     printf "| GET 1KB (cache hit, p=1) | %s | %s | %s |\n" \
         "$(format_number "${get1k_redis%%.*}")" "$(format_number "${get1k_rust%%.*}")" "$(ratio "${get1k_rust%%.*}" "${get1k_redis%%.*}")"
@@ -348,7 +348,7 @@ scenario_queue() {
     local rpop16_redis=$(echo "$out_redis" | parse_rps)
     local rpop16_rust=$(echo "$out_rust" | parse_rps)
 
-    echo "| Operation | Redis | rust-redis | Ratio |"
+    echo "| Operation | Redis | moon | Ratio |"
     echo "|-----------|------:|----------:|------:|"
     printf "| LPUSH (enqueue 256B, p=1) | %s | %s | %s |\n" \
         "$(format_number "${lpush_redis%%.*}")" "$(format_number "${lpush_rust%%.*}")" "$(ratio "${lpush_rust%%.*}" "${lpush_redis%%.*}")"
@@ -391,7 +391,7 @@ scenario_hash_objects() {
     local spop_redis=$(echo "$out_redis" | parse_rps)
     local spop_rust=$(echo "$out_rust" | parse_rps)
 
-    echo "| Operation | Redis | rust-redis | Ratio |"
+    echo "| Operation | Redis | moon | Ratio |"
     echo "|-----------|------:|----------:|------:|"
     printf "| HSET (field update, p=1) | %s | %s | %s |\n" \
         "$(format_number "${hset_redis%%.*}")" "$(format_number "${hset_rust%%.*}")" "$(ratio "${hset_rust%%.*}" "${hset_redis%%.*}")"
@@ -412,7 +412,7 @@ scenario_connection_storm() {
     echo "### $name"
     echo ""
 
-    echo "| Clients | Redis SET/s | rust-redis SET/s | Ratio | Redis p50 | rust-redis p50 |"
+    echo "| Clients | Redis SET/s | moon SET/s | Ratio | Redis p50 | moon p50 |"
     echo "|--------:|----------:|----------------:|------:|----------:|---------------:|"
 
     for clients in 1 10 50 100 200 500; do
@@ -444,7 +444,7 @@ scenario_data_sizes() {
     echo "### $name"
     echo ""
 
-    echo "| Value Size | Redis SET/s | rust-redis SET/s | Ratio | Redis GET/s | rust-redis GET/s | Ratio |"
+    echo "| Value Size | Redis SET/s | moon SET/s | Ratio | Redis GET/s | moon GET/s | Ratio |"
     echo "|-----------:|----------:|----------------:|------:|----------:|----------------:|------:|"
 
     for size in 8 64 256 1024 4096 16384 65536; do
@@ -490,7 +490,7 @@ scenario_memory_efficiency() {
     echo "### $name"
     echo ""
 
-    echo "| Dataset | Redis RSS | rust-redis RSS | Ratio | Per-Key Redis | Per-Key rust-redis |"
+    echo "| Dataset | Redis RSS | moon RSS | Ratio | Per-Key Redis | Per-Key moon |"
     echo "|--------:|----------:|---------------:|------:|--------------:|-------------------:|"
 
     for count in 10000 50000 100000; do
@@ -546,7 +546,7 @@ scenario_pipeline_scaling() {
     echo "### $name"
     echo ""
 
-    echo "| Pipeline | Redis SET/s | rust-redis SET/s | Ratio | Redis GET/s | rust-redis GET/s | Ratio |"
+    echo "| Pipeline | Redis SET/s | moon SET/s | Ratio | Redis GET/s | moon GET/s | Ratio |"
     echo "|---------:|----------:|----------------:|------:|----------:|----------------:|------:|"
 
     for p in 1 2 4 8 16 32 64 128; do
@@ -605,35 +605,35 @@ done
 # Main
 # ===========================================================================
 
-log "Building rust-redis..."
+log "Building moon..."
 if [[ ! -x "$RUST_BINARY" ]]; then
     cargo build --release 2>&1 | tail -3
 fi
 
 # Kill any existing instances
 pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-pkill -f "rust-redis.*${PORT_RUST}" 2>/dev/null || true
+pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
 sleep 1
 
 log "Starting Redis on port $PORT_REDIS..."
 redis-server --port "$PORT_REDIS" --save "" --appendonly no --daemonize yes --loglevel warning
 wait_for_server "$PORT_REDIS" "Redis"
 
-log "Starting rust-redis on port $PORT_RUST ($SHARDS shards)..."
+log "Starting moon on port $PORT_RUST ($SHARDS shards)..."
 $RUST_BINARY --port "$PORT_RUST" --shards "$SHARDS" &
 RUST_PID=$!
-wait_for_server "$PORT_RUST" "rust-redis"
+wait_for_server "$PORT_RUST" "moon"
 
 REDIS_VERSION=$(redis-cli -p "$PORT_REDIS" INFO server 2>/dev/null | grep redis_version | tr -d '\r' | cut -d: -f2)
 
 # Generate report
 {
-    echo "# Production Benchmark: rust-redis vs Redis ${REDIS_VERSION}"
+    echo "# Production Benchmark: moon vs Redis ${REDIS_VERSION}"
     echo ""
     echo "**Date:** $(date '+%Y-%m-%d %H:%M')"
     echo "**Machine:** $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
     echo "**Redis:** ${REDIS_VERSION}"
-    echo "**rust-redis:** ${SHARDS} shard(s), Tokio runtime"
+    echo "**moon:** ${SHARDS} shard(s), Tokio runtime"
     echo "**Tool:** redis-benchmark (co-located)"
     echo "**Requests:** $(format_number $REQUESTS) per test"
     echo ""

@@ -1,9 +1,9 @@
 ---
 name: test-consistency
-description: Run the rust-redis consistency test suite, comparing output against Redis as ground truth. Requires redis-server on PATH. Args: --shards N (default 1), --skip-build, --port-rust N.
+description: Run the moon consistency test suite, comparing output against Redis as ground truth. Requires redis-server on PATH. Args: --shards N (default 1), --skip-build, --port-rust N.
 ---
 
-Run the consistency test suite for rust-redis.
+Run the consistency test suite for moon.
 
 ## Steps
 
@@ -31,6 +31,6 @@ Run the consistency test suite for rust-redis.
 
 ## Notes
 
-- Tests compare rust-redis output against Redis on all data types: strings (SSO inline, heap small, heap large, binary), hash, list, set, zset
-- Uses port 6399 for Redis and 6400 for rust-redis by default
+- Tests compare moon output against Redis on all data types: strings (SSO inline, heap small, heap large, binary), hash, list, set, zset
+- Uses port 6399 for Redis and 6400 for moon by default
 - If ports are in use, suggest `--port-rust 6401`
