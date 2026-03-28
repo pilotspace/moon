@@ -28,6 +28,8 @@ use crate::runtime::{
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
+use super::shared_databases::ShardDatabases;
+
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{UringConfig, UringDriver};
 
@@ -66,6 +68,7 @@ impl super::Shard {
         server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
+        shard_databases: Arc<ShardDatabases>,
     ) {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -144,9 +147,12 @@ impl super::Shard {
             info!("Shard {} started", self.id);
         }
 
-        // Wrap databases and pubsub_registry in Rc<RefCell> for sharing with spawned
-        // connection tasks. Safe: single-threaded runtime guarantees no concurrent access.
-        let databases = Rc::new(RefCell::new(std::mem::take(&mut self.databases)));
+        // Temporary compatibility shim: extract this shard's databases from the
+        // centralized ShardDatabases into Rc<RefCell<Vec<Database>>> for downstream code.
+        // Plan 02 removes this shim when all call sites migrate to Arc<ShardDatabases>.
+        let databases = Rc::new(RefCell::new(shard_databases.take_shard(self.id)));
+        // Keep Arc for future cross-shard reads (Plan 03 will use this)
+        let _shard_databases = shard_databases;
         let dispatch_tx = Rc::new(RefCell::new(producers));
         let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));

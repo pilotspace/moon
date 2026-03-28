@@ -17,6 +17,7 @@ use moon::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
 use moon::server;
 use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
+use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -168,14 +169,32 @@ fn main() -> anyhow::Result<()> {
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
 
+    // Create and restore all shards on main thread, then extract databases
+    // into centralized ShardDatabases for cross-shard direct read access.
+    let mut shards: Vec<Shard> = (0..num_shards)
+        .map(|id| {
+            let mut shard = Shard::new(id, num_shards, config.databases, config.to_runtime_config());
+            if let Some(ref dir) = persistence_dir {
+                shard.restore_from_persistence(dir);
+            }
+            shard
+        })
+        .collect();
+
+    // Extract databases from all shards and wrap in ShardDatabases
+    let all_dbs: Vec<Vec<moon::storage::Database>> = shards
+        .iter_mut()
+        .map(|s| std::mem::take(&mut s.databases))
+        .collect();
+    let shard_databases = ShardDatabases::new(all_dbs);
+
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);
     let config_port = config.port;
-    for id in 0..num_shards {
+    for (id, mut shard) in shards.into_iter().enumerate() {
         let producers = mesh.take_producers(id);
         let consumers = mesh.take_consumers(id);
         let conn_rx = mesh.take_conn_rx(id);
-        let shard_config = config.clone();
         let shard_cancel = cancel_token.clone();
         let shard_aof_tx = aof_tx.clone();
         let shard_bind_addr = bind_addr.clone();
@@ -190,24 +209,13 @@ fn main() -> anyhow::Result<()> {
         let shard_spsc_notify = mesh.take_notify(id);
         let shard_all_notifiers = all_notifiers.clone();
         let shard_tls_config = tls_config.clone();
+        let shard_dbs = shard_databases.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
             .spawn(move || {
                 // Pin shard thread to core BEFORE any allocations (NUMA locality)
                 moon::shard::numa::pin_to_core(id);
-
-                let mut shard = Shard::new(
-                    id,
-                    num_shards,
-                    shard_config.databases,
-                    shard_config.to_runtime_config(),
-                );
-
-                // Restore shard state from per-shard snapshot + WAL
-                if let Some(ref dir) = shard_persistence_dir {
-                    shard.restore_from_persistence(dir);
-                }
 
                 RuntimeFactoryImpl::block_on_local(format!("shard-{}", id), async move {
                     shard
@@ -230,6 +238,7 @@ fn main() -> anyhow::Result<()> {
                             shard_server_config,
                             shard_spsc_notify,
                             shard_all_notifiers,
+                            shard_dbs,
                         )
                         .await;
                 });
