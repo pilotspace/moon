@@ -94,10 +94,19 @@ pub async fn handle_connection_sharded_monoio<
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
     can_migrate: bool,
+    initial_read_buf: BytesMut,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
-    let mut read_buf = BytesMut::with_capacity(8192);
+    let mut read_buf = if initial_read_buf.is_empty() {
+        BytesMut::with_capacity(8192)
+    } else {
+        // Migration buffer contains synthetic SELECT/CLIENT SETNAME + leftover bytes.
+        // Reserve extra capacity for incoming data beyond the initial commands.
+        let mut buf = initial_read_buf;
+        buf.reserve(8192);
+        buf
+    };
     let mut write_buf = BytesMut::with_capacity(8192);
     let mut codec = RespCodec::default();
     let mut selected_db: usize = 0;

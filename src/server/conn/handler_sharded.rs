@@ -126,6 +126,7 @@ pub async fn handle_connection_sharded(
         snapshot_trigger_tx,
         cached_clock,
         true, // can_migrate: plain TCP supports FD extraction
+        BytesMut::new(),
     )
     .await;
 
@@ -209,12 +210,21 @@ pub async fn handle_connection_sharded_inner<
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
     can_migrate: bool,
+    initial_read_buf: BytesMut,
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Direct buffer I/O: bypass Framed/codec for the hot path.
     let mut stream = stream;
-    let mut read_buf = BytesMut::with_capacity(8192);
+    let mut read_buf = if initial_read_buf.is_empty() {
+        BytesMut::with_capacity(8192)
+    } else {
+        // Migration buffer contains synthetic SELECT/CLIENT SETNAME + leftover bytes.
+        // Reserve extra capacity for incoming data beyond the initial commands.
+        let mut buf = initial_read_buf;
+        buf.reserve(8192);
+        buf
+    };
     let mut write_buf = BytesMut::with_capacity(8192);
     let parse_config = crate::protocol::ParseConfig::default();
     let mut protocol_version: u8 = 2;

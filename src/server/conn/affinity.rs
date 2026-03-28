@@ -25,7 +25,6 @@ const REMIGRATION_TRIGGER: u16 = 64;
 ///
 /// Tracks which shard owns the keys accessed by this connection. After
 /// `SAMPLE_SIZE` samples, decides whether to recommend migration.
-#[allow(dead_code)]
 pub(crate) struct AffinityTracker {
     /// Per-shard hit counts during the sampling window.
     shard_counts: [u16; 64],
@@ -40,7 +39,6 @@ pub(crate) struct AffinityTracker {
     consecutive_remote: u16,
 }
 
-#[allow(dead_code)]
 impl AffinityTracker {
     /// Create a new tracker for a connection on `my_shard`.
     pub fn new(my_shard: usize) -> Self {
