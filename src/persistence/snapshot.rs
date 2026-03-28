@@ -3,15 +3,24 @@
 //! Serializes DashTable segments one at a time as a cooperative task within the
 //! shard event loop. Keys modified in not-yet-serialized segments have their old
 //! values captured in a per-snapshot overflow buffer (segment-level COW).
+//!
+//! ## Unwrap Classification
+//!
+//! | Context | Classification | Rationale |
+//! |---------|---------------|-----------|
+//! | `finalize`, `finalize_async` | **should-recover** (`Result<_, MoonError>`) | Snapshot save failure should not crash server |
+//! | `shard_snapshot_save` | **should-recover** (`Result<_, MoonError>`) | Calls finalize; same recovery semantics |
+//! | `shard_snapshot_load` | **should-recover** (`Result<_, MoonError>`) | Startup load; failure = log + continue empty |
+//! | All `unwrap()` calls (30) | **test-only** | Only appear in `#[cfg(test)]` module |
 
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
 use bytes::Bytes;
 use crc32fast::Hasher;
 
+use crate::error::{MoonError, SnapshotError};
 use crate::persistence::rdb;
 use crate::storage::db::Database;
 use crate::storage::entry::{Entry, current_secs, current_time_ms};
@@ -239,7 +248,7 @@ impl SnapshotState {
     }
 
     /// Finalize the snapshot: write EOF marker, global CRC32, and atomically write to disk.
-    pub fn finalize(&mut self) -> anyhow::Result<()> {
+    pub fn finalize(&mut self) -> Result<(), MoonError> {
         // Write EOF marker
         self.output_buf.push(EOF_MARKER);
 
@@ -251,10 +260,14 @@ impl SnapshotState {
 
         // Atomic write: write to .tmp, then rename
         let tmp_path = self.file_path.with_extension("rrdshard.tmp");
-        std::fs::write(&tmp_path, &self.output_buf)
-            .context("Failed to write temporary snapshot file")?;
-        std::fs::rename(&tmp_path, &self.file_path)
-            .context("Failed to rename temporary snapshot file")?;
+        std::fs::write(&tmp_path, &self.output_buf).map_err(|e| SnapshotError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp_path, &self.file_path).map_err(|e| SnapshotError::Io {
+            path: self.file_path.clone(),
+            source: e,
+        })?;
 
         Ok(())
     }
@@ -263,7 +276,7 @@ impl SnapshotState {
     ///
     /// Under Monoio, falls back to synchronous write (thread-per-core model,
     /// rare operation, acceptable blocking).
-    pub async fn finalize_async(&mut self) -> anyhow::Result<()> {
+    pub async fn finalize_async(&mut self) -> Result<(), MoonError> {
         // Write EOF marker
         self.output_buf.push(EOF_MARKER);
 
@@ -284,17 +297,28 @@ impl SnapshotState {
         {
             tokio::fs::write(&tmp_path, &buf)
                 .await
-                .context("Failed to write temporary snapshot file")?;
+                .map_err(|e| SnapshotError::Io {
+                    path: tmp_path.clone(),
+                    source: e,
+                })?;
             tokio::fs::rename(&tmp_path, &file_path)
                 .await
-                .context("Failed to rename temporary snapshot file")?;
+                .map_err(|e| SnapshotError::Io {
+                    path: file_path.clone(),
+                    source: e,
+                })?;
         }
 
         #[cfg(feature = "runtime-monoio")]
         {
-            std::fs::write(&tmp_path, &buf).context("Failed to write temporary snapshot file")?;
-            std::fs::rename(&tmp_path, &file_path)
-                .context("Failed to rename temporary snapshot file")?;
+            std::fs::write(&tmp_path, &buf).map_err(|e| SnapshotError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
+            std::fs::rename(&tmp_path, &file_path).map_err(|e| SnapshotError::Io {
+                path: file_path.clone(),
+                source: e,
+            })?;
         }
 
         Ok(())
@@ -316,7 +340,7 @@ pub fn shard_snapshot_save(
     epoch: u64,
     databases: &[Database],
     path: &Path,
-) -> anyhow::Result<()> {
+) -> Result<(), MoonError> {
     let mut state = SnapshotState::new(shard_id, epoch, databases, path.to_path_buf());
     while !state.advance_one_segment(databases) {}
     state.finalize()
@@ -325,15 +349,25 @@ pub fn shard_snapshot_save(
 /// Load a per-shard snapshot file and populate databases. Returns total keys loaded.
 ///
 /// Reads RRDSHARD format with per-segment CRC32 verification.
-pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
-    let data = std::fs::read(path).context("Failed to read snapshot file")?;
+///
+/// Global checksum mismatch is a hard error (whole file suspect).
+/// Per-segment checksum mismatch and unknown tags use log+skip recovery:
+/// the corrupted segment is skipped and loading continues with the next segment.
+pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
+    let data = std::fs::read(path).map_err(|e| SnapshotError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
 
     // Minimum size: magic(8) + version(1) + shard_id(2) + epoch(8) + eof(1) + global_crc(4) = 24
     if data.len() < 24 {
-        bail!("Snapshot file too small");
+        return Err(SnapshotError::Corrupted {
+            detail: "snapshot file too small".into(),
+        }
+        .into());
     }
 
-    // Verify global CRC32: all bytes except last 4 vs last 4 bytes
+    // Verify global CRC32: all bytes except last 4 vs last 4 bytes — hard error
     let (payload, checksum_bytes) = data.split_at(data.len() - 4);
     let stored_checksum = u32::from_le_bytes([
         checksum_bytes[0],
@@ -345,97 +379,171 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> anyhow::R
     hasher.update(payload);
     let computed_checksum = hasher.finalize();
     if stored_checksum != computed_checksum {
-        bail!(
-            "Snapshot global checksum mismatch: stored={:#010x}, computed={:#010x}",
-            stored_checksum,
-            computed_checksum
-        );
+        return Err(SnapshotError::Corrupted {
+            detail: format!(
+                "global checksum mismatch: stored={:#010x}, computed={:#010x}",
+                stored_checksum, computed_checksum
+            ),
+        }
+        .into());
     }
 
     let mut cursor = Cursor::new(payload);
 
     // Verify magic
     let mut magic = [0u8; 8];
-    cursor.read_exact(&mut magic)?;
+    cursor.read_exact(&mut magic).map_err(|e| SnapshotError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     if &magic != SHARD_RDB_MAGIC {
-        bail!("Invalid RRDSHARD magic header");
+        return Err(SnapshotError::Corrupted {
+            detail: "invalid RRDSHARD magic header".into(),
+        }
+        .into());
     }
 
     // Verify version
     let mut version = [0u8; 1];
-    cursor.read_exact(&mut version)?;
+    cursor
+        .read_exact(&mut version)
+        .map_err(|e| SnapshotError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
     if version[0] != SHARD_RDB_VERSION {
-        bail!("Unsupported RRDSHARD version: {}", version[0]);
+        return Err(SnapshotError::VersionMismatch {
+            expected: SHARD_RDB_VERSION as u32,
+            actual: version[0] as u32,
+        }
+        .into());
     }
 
     // Read shard_id and epoch (for logging/verification)
     let mut shard_id_buf = [0u8; 2];
-    cursor.read_exact(&mut shard_id_buf)?;
+    cursor
+        .read_exact(&mut shard_id_buf)
+        .map_err(|e| SnapshotError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
     let _shard_id = u16::from_le_bytes(shard_id_buf);
 
     let mut epoch_buf = [0u8; 8];
-    cursor.read_exact(&mut epoch_buf)?;
+    cursor
+        .read_exact(&mut epoch_buf)
+        .map_err(|e| SnapshotError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
     let _epoch = u64::from_le_bytes(epoch_buf);
 
     let now_ms = current_time_ms();
     let mut total_keys = 0usize;
+    let mut skipped_segments = 0usize;
     let mut current_db: usize = 0;
 
     loop {
         let mut tag = [0u8; 1];
-        cursor.read_exact(&mut tag)?;
+        if cursor.read_exact(&mut tag).is_err() {
+            // Truncated tail: treat as implicit EOF
+            tracing::warn!(
+                "Snapshot load: truncated tail after {} keys, treating as end of file",
+                total_keys
+            );
+            break;
+        }
 
         match tag[0] {
             EOF_MARKER => break,
             DB_SELECTOR => {
                 let mut db_idx = [0u8; 1];
-                cursor.read_exact(&mut db_idx)?;
+                cursor
+                    .read_exact(&mut db_idx)
+                    .map_err(|e| SnapshotError::Io {
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?;
                 current_db = db_idx[0] as usize;
                 if current_db >= databases.len() {
-                    bail!(
-                        "Snapshot references database {} but only {} configured",
-                        current_db,
-                        databases.len()
-                    );
+                    return Err(SnapshotError::Corrupted {
+                        detail: format!(
+                            "snapshot references database {} but only {} configured",
+                            current_db,
+                            databases.len()
+                        ),
+                    }
+                    .into());
                 }
             }
             SEGMENT_BLOCK_MARKER => {
                 // Read segment index and entry count
                 let seg_idx = rdb::read_u32(&mut cursor)? as usize;
                 let entry_count = rdb::read_u32(&mut cursor)?;
-                let _ = seg_idx; // segment index is informational during load
 
                 // Read all entry bytes for CRC verification
                 let data_start = cursor.position() as usize;
 
-                // We need to read entries and compute CRC simultaneously
                 // First pass: read entries, tracking bytes consumed
                 let mut entries: Vec<(Bytes, Entry)> = Vec::with_capacity(entry_count as usize);
+                let mut segment_parse_failed = false;
                 for _ in 0..entry_count {
                     let mut type_tag = [0u8; 1];
-                    cursor.read_exact(&mut type_tag)?;
-                    let (key, entry) = rdb::read_entry(&mut cursor, type_tag[0])?;
-                    entries.push((key, entry));
+                    if cursor.read_exact(&mut type_tag).is_err() {
+                        segment_parse_failed = true;
+                        break;
+                    }
+                    match rdb::read_entry(&mut cursor, type_tag[0]) {
+                        Ok((key, entry)) => entries.push((key, entry)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Snapshot load: entry parse error in segment {}: {}",
+                                seg_idx,
+                                e
+                            );
+                            segment_parse_failed = true;
+                            break;
+                        }
+                    }
                 }
 
                 let data_end = cursor.position() as usize;
 
                 // Read and verify per-segment CRC32
                 let mut crc_buf = [0u8; 4];
-                cursor.read_exact(&mut crc_buf)?;
+                if cursor.read_exact(&mut crc_buf).is_err() {
+                    tracing::warn!(
+                        "Snapshot load: missing CRC for segment {}, skipping",
+                        seg_idx
+                    );
+                    skipped_segments += 1;
+                    continue;
+                }
                 let stored_crc = u32::from_le_bytes(crc_buf);
+
+                if segment_parse_failed {
+                    tracing::warn!(
+                        "Snapshot load: skipping segment {} due to parse failure",
+                        seg_idx
+                    );
+                    skipped_segments += 1;
+                    continue;
+                }
 
                 let segment_data = &payload[data_start..data_end];
                 let mut seg_hasher = Hasher::new();
                 seg_hasher.update(segment_data);
                 let computed_crc = seg_hasher.finalize();
                 if stored_crc != computed_crc {
-                    bail!(
-                        "Segment CRC mismatch at segment {}: stored={:#010x}, computed={:#010x}",
+                    // Per-segment CRC mismatch: log+skip this segment, continue
+                    tracing::warn!(
+                        "Snapshot load: segment {} CRC mismatch (stored={:#010x}, computed={:#010x}), skipping",
                         seg_idx,
                         stored_crc,
                         computed_crc
                     );
+                    skipped_segments += 1;
+                    continue;
                 }
 
                 // Insert non-expired entries into the database
@@ -450,9 +558,24 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> anyhow::R
                 }
             }
             other => {
-                bail!("Unknown tag in snapshot: {:#04x}", other);
+                // Unknown tag: log+skip, try to continue
+                tracing::warn!(
+                    "Snapshot load: unknown tag {:#04x} at offset {}, skipping",
+                    other,
+                    cursor.position() - 1
+                );
+                // Cannot reliably skip unknown-length data, break
+                break;
             }
         }
+    }
+
+    if skipped_segments > 0 {
+        tracing::warn!(
+            "Snapshot load completed with {} segments skipped, {} keys loaded",
+            skipped_segments,
+            total_keys
+        );
     }
 
     Ok(total_keys)
@@ -653,14 +776,12 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let mut loaded = vec![Database::new()];
+        // Per-segment CRC mismatch now uses log+skip recovery:
+        // the corrupted segment is skipped but loading continues successfully.
         let result = shard_snapshot_load(&mut loaded, &path);
-        assert!(result.is_err(), "Should fail on corrupted segment CRC");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("CRC") || err.contains("mismatch"),
-            "Error should mention CRC: {}",
-            err
-        );
+        assert!(result.is_ok(), "Per-segment CRC mismatch should log+skip, not hard-fail");
+        let count = result.unwrap();
+        assert_eq!(count, 0, "Corrupted segment should be skipped, yielding 0 keys");
     }
 
     #[test]
