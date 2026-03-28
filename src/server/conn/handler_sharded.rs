@@ -282,6 +282,13 @@ pub async fn handle_connection_sharded_inner<
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
 
+    // Pub/Sub subscriber mode state
+    use crate::pubsub::{self, subscriber::Subscriber};
+    let mut pubsub_tx: Option<channel::MpscSender<Frame>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<Frame>> = None;
+    let mut subscriber_id: u64 = 0;
+    let mut subscription_count: usize = 0;
+
     // RESP3/HELLO connection-local state
     let mut client_name: Option<Bytes> = client_name_restored;
 
@@ -307,6 +314,270 @@ pub async fn handle_connection_sharded_inner<
     // Migration target: set when AffinityTracker triggers, acted on after batch response flush.
     let mut migration_target: Option<usize> = None;
     loop {
+        // --- Subscriber mode: bidirectional select on client commands + published messages ---
+        if subscription_count > 0 {
+            let rx = pubsub_rx.as_mut().unwrap();
+            tokio::select! {
+                n = stream.read_buf(&mut read_buf) => {
+                    match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let mut sub_break = false;
+                    loop {
+                        match crate::protocol::parse(&mut read_buf, &parse_config) {
+                            Ok(Some(frame)) => {
+                                if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                                    if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"));
+                                            write_buf.clear();
+                                            crate::protocol::serialize(&err, &mut write_buf);
+                                            if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            continue;
+                                        }
+                                        for arg in cmd_args {
+                                            if let Some(ch) = extract_bytes(arg) {
+                                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
+                                                if let Some(reason) = acl_deny {
+                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&err, &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                    continue;
+                                                }
+                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                { pubsub_registry.borrow_mut().subscribe(ch.clone(), sub); }
+                                                subscription_count += 1;
+                                                {
+                                                    let mut producers = dispatch_tx.borrow_mut();
+                                                    for target in 0..num_shards {
+                                                        if target == shard_id { continue; }
+                                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                                        let msg = ShardMessage::PubSubSubscribe {
+                                                            source_shard: shard_id,
+                                                            channel: ch.clone(),
+                                                            is_pattern: false,
+                                                        };
+                                                        if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                                    }
+                                                }
+                                                write_buf.clear();
+                                                let resp = pubsub::subscribe_response(&ch, subscription_count);
+                                                crate::protocol::serialize(&resp, &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'psubscribe' command"));
+                                            write_buf.clear();
+                                            crate::protocol::serialize(&err, &mut write_buf);
+                                            if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            continue;
+                                        }
+                                        for arg in cmd_args {
+                                            if let Some(pat) = extract_bytes(arg) {
+                                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, pat.as_ref()) };
+                                                if let Some(reason) = acl_deny {
+                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&err, &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                    continue;
+                                                }
+                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                { pubsub_registry.borrow_mut().psubscribe(pat.clone(), sub); }
+                                                subscription_count += 1;
+                                                {
+                                                    let mut producers = dispatch_tx.borrow_mut();
+                                                    for target in 0..num_shards {
+                                                        if target == shard_id { continue; }
+                                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                                        let msg = ShardMessage::PubSubSubscribe {
+                                                            source_shard: shard_id,
+                                                            channel: pat.clone(),
+                                                            is_pattern: true,
+                                                        };
+                                                        if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                                    }
+                                                }
+                                                write_buf.clear();
+                                                let resp = pubsub::psubscribe_response(&pat, subscription_count);
+                                                crate::protocol::serialize(&resp, &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let removed = { pubsub_registry.borrow_mut().unsubscribe_all(subscriber_id) };
+                                            if removed.is_empty() {
+                                                subscription_count = pubsub_registry.borrow().total_subscription_count(subscriber_id);
+                                                write_buf.clear();
+                                                crate::protocol::serialize(&pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count), &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            } else {
+                                                for ch in &removed {
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    {
+                                                        let mut producers = dispatch_tx.borrow_mut();
+                                                        for target in 0..num_shards {
+                                                            if target == shard_id { continue; }
+                                                            let idx = ChannelMesh::target_index(shard_id, target);
+                                                            let msg = ShardMessage::PubSubUnsubscribe {
+                                                                source_shard: shard_id,
+                                                                channel: ch.clone(),
+                                                                is_pattern: false,
+                                                            };
+                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                                        }
+                                                    }
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(ch, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        } else {
+                                            for arg in cmd_args {
+                                                if let Some(ch) = extract_bytes(arg) {
+                                                    { pubsub_registry.borrow_mut().unsubscribe(ch.as_ref(), subscriber_id); }
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    {
+                                                        let mut producers = dispatch_tx.borrow_mut();
+                                                        for target in 0..num_shards {
+                                                            if target == shard_id { continue; }
+                                                            let idx = ChannelMesh::target_index(shard_id, target);
+                                                            let msg = ShardMessage::PubSubUnsubscribe {
+                                                                source_shard: shard_id,
+                                                                channel: ch.clone(),
+                                                                is_pattern: false,
+                                                            };
+                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                                        }
+                                                    }
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(&ch, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let removed = { pubsub_registry.borrow_mut().punsubscribe_all(subscriber_id) };
+                                            if removed.is_empty() {
+                                                subscription_count = pubsub_registry.borrow().total_subscription_count(subscriber_id);
+                                                write_buf.clear();
+                                                crate::protocol::serialize(&pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count), &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            } else {
+                                                for pat in &removed {
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    {
+                                                        let mut producers = dispatch_tx.borrow_mut();
+                                                        for target in 0..num_shards {
+                                                            if target == shard_id { continue; }
+                                                            let idx = ChannelMesh::target_index(shard_id, target);
+                                                            let msg = ShardMessage::PubSubUnsubscribe {
+                                                                source_shard: shard_id,
+                                                                channel: pat.clone(),
+                                                                is_pattern: true,
+                                                            };
+                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                                        }
+                                                    }
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(pat, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        } else {
+                                            for arg in cmd_args {
+                                                if let Some(pat) = extract_bytes(arg) {
+                                                    { pubsub_registry.borrow_mut().punsubscribe(pat.as_ref(), subscriber_id); }
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    {
+                                                        let mut producers = dispatch_tx.borrow_mut();
+                                                        for target in 0..num_shards {
+                                                            if target == shard_id { continue; }
+                                                            let idx = ChannelMesh::target_index(shard_id, target);
+                                                            let msg = ShardMessage::PubSubUnsubscribe {
+                                                                source_shard: shard_id,
+                                                                channel: pat.clone(),
+                                                                is_pattern: true,
+                                                            };
+                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                                        }
+                                                    }
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(&pat, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"PING") {
+                                        write_buf.clear();
+                                        let resp = Frame::Array(crate::framevec![
+                                            Frame::BulkString(Bytes::from_static(b"pong")),
+                                            Frame::BulkString(Bytes::from_static(b"")),
+                                        ]);
+                                        crate::protocol::serialize(&resp, &mut write_buf);
+                                        if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                    } else if cmd.eq_ignore_ascii_case(b"QUIT") {
+                                        write_buf.clear();
+                                        crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"OK")), &mut write_buf);
+                                        let _ = stream.write_all(&write_buf).await;
+                                        sub_break = true;
+                                        break;
+                                    } else if cmd.eq_ignore_ascii_case(b"RESET") {
+                                        { pubsub_registry.borrow_mut().unsubscribe_all(subscriber_id); }
+                                        { pubsub_registry.borrow_mut().punsubscribe_all(subscriber_id); }
+                                        subscription_count = 0;
+                                        write_buf.clear();
+                                        crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"RESET")), &mut write_buf);
+                                        if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                    } else {
+                                        let cmd_str = String::from_utf8_lossy(cmd);
+                                        let err = Frame::Error(Bytes::from(format!(
+                                            "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+                                            cmd_str.to_lowercase()
+                                        )));
+                                        write_buf.clear();
+                                        crate::protocol::serialize(&err, &mut write_buf);
+                                        if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                    }
+                                }
+                                if subscription_count == 0 { break; }
+                            }
+                            Ok(None) => break,
+                            Err(_) => { return; }
+                        }
+                    }
+                    if sub_break { break; }
+                    if subscription_count == 0 { continue; }
+                }
+                msg = rx.recv_async() => {
+                    match msg {
+                        Ok(frame) => {
+                            write_buf.clear();
+                            if protocol_version >= 3 {
+                                crate::protocol::serialize_resp3(&frame, &mut write_buf);
+                            } else {
+                                crate::protocol::serialize(&frame, &mut write_buf);
+                            }
+                            if stream.write_all(&write_buf).await.is_err() { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    write_buf.clear();
+                    crate::protocol::serialize(&Frame::Error(Bytes::from_static(b"ERR server shutting down")), &mut write_buf);
+                    let _ = stream.write_all(&write_buf).await;
+                    break;
+                }
+            }
+            continue;
+        }
         tokio::select! {
             result = stream.read_buf(&mut read_buf) => {
                 match result {
@@ -810,10 +1081,10 @@ pub async fn handle_connection_sharded_inner<
                         if cmd_args.len() != 2 {
                             responses.push(Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'publish' command")));
                         } else {
-                            let channel = extract_bytes(&cmd_args[0]);
-                            let message = extract_bytes(&cmd_args[1]);
+                            let channel_arg = extract_bytes(&cmd_args[0]);
+                            let message_arg = extract_bytes(&cmd_args[1]);
                             // ACL channel permission check for PUBLISH
-                            if let Some(ref ch) = channel {
+                            if let Some(ref ch) = channel_arg {
                                 let acl_guard = acl_table.read().unwrap();
                                 if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
                                     drop(acl_guard);
@@ -821,18 +1092,36 @@ pub async fn handle_connection_sharded_inner<
                                     continue;
                                 }
                             }
-                            match (channel, message) {
+                            match (channel_arg, message_arg) {
                                 (Some(ch), Some(msg)) => {
-                                    let local_count = pubsub_registry.borrow_mut().publish(&ch, &msg);
-                                    let mut producers = dispatch_tx.borrow_mut();
-                                    for target in 0..num_shards {
-                                        if target == shard_id { continue; }
-                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                        let fanout_msg = ShardMessage::PubSubFanOut { channel: ch.clone(), message: msg.clone() };
-                                        if producers[idx].try_push(fanout_msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                    let local_count = { pubsub_registry.borrow_mut().publish(&ch, &msg) };
+                                    // Send to other shards with reply channels for accurate count
+                                    let mut reply_rxs = Vec::new();
+                                    {
+                                        let mut producers = dispatch_tx.borrow_mut();
+                                        for target in 0..num_shards {
+                                            if target == shard_id { continue; }
+                                            let (tx, rx) = channel::oneshot();
+                                            let idx = ChannelMesh::target_index(shard_id, target);
+                                            let publish_msg = ShardMessage::PubSubPublish {
+                                                channel: ch.clone(),
+                                                message: msg.clone(),
+                                                reply_tx: tx,
+                                            };
+                                            if producers[idx].try_push(publish_msg).is_ok() {
+                                                spsc_notifiers[target].notify_one();
+                                                reply_rxs.push(rx);
+                                            }
+                                        }
                                     }
-                                    drop(producers);
-                                    responses.push(Frame::Integer(local_count));
+                                    // Await all replies (PUBLISH is not latency-critical)
+                                    let mut total = local_count;
+                                    for rx in reply_rxs {
+                                        if let Ok(count) = rx.await {
+                                            total += count;
+                                        }
+                                    }
+                                    responses.push(Frame::Integer(total));
                                 }
                                 _ => responses.push(Frame::Error(Bytes::from_static(b"ERR invalid channel or message"))),
                             }
@@ -842,21 +1131,196 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- SUBSCRIBE / PSUBSCRIBE ---
                     if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
-                        for arg in cmd_args {
-                            if let Some(channel) = extract_bytes(arg) {
-                                let acl_guard = acl_table.read().unwrap();
-                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
-                                    drop(acl_guard);
-                                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                                    continue;
+                        let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
+                        let cmd_name = if is_pattern { "psubscribe" } else { "subscribe" };
+                        if cmd_args.is_empty() {
+                            responses.push(Frame::Error(Bytes::from(format!(
+                                "ERR wrong number of arguments for '{}' command", cmd_name
+                            ))));
+                            continue;
+                        }
+                        // Allocate pubsub channel if not yet created
+                        if pubsub_tx.is_none() {
+                            let (tx, rx) = channel::mpsc_bounded(256);
+                            pubsub_tx = Some(tx);
+                            pubsub_rx = Some(rx);
+                        }
+                        if subscriber_id == 0 {
+                            subscriber_id = crate::pubsub::next_subscriber_id();
+                        }
+                        // Flush accumulated responses before entering subscriber mode
+                        if !responses.is_empty() {
+                            write_buf.clear();
+                            for resp in &responses {
+                                if protocol_version >= 3 {
+                                    crate::protocol::serialize_resp3(resp, &mut write_buf);
+                                } else {
+                                    crate::protocol::serialize(resp, &mut write_buf);
                                 }
                             }
+                            if stream.write_all(&write_buf).await.is_err() { return; }
+                            responses.clear();
                         }
-                        responses.push(Frame::Error(Bytes::from_static(b"ERR SUBSCRIBE not yet supported in sharded mode")));
+                        // Process subscribe arguments
+                        for arg in cmd_args {
+                            if let Some(ch) = extract_bytes(arg) {
+                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
+                                if let Some(reason) = acl_deny {
+                                    write_buf.clear();
+                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                    crate::protocol::serialize(&err, &mut write_buf);
+                                    if stream.write_all(&write_buf).await.is_err() { return; }
+                                    continue;
+                                }
+                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                if is_pattern {
+                                    { pubsub_registry.borrow_mut().psubscribe(ch.clone(), sub); }
+                                } else {
+                                    { pubsub_registry.borrow_mut().subscribe(ch.clone(), sub); }
+                                }
+                                subscription_count += 1;
+                                // Propagate to other shards
+                                {
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    for target in 0..num_shards {
+                                        if target == shard_id { continue; }
+                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                        let msg = ShardMessage::PubSubSubscribe {
+                                            source_shard: shard_id,
+                                            channel: ch.clone(),
+                                            is_pattern,
+                                        };
+                                        if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                    }
+                                }
+                                write_buf.clear();
+                                let resp = if is_pattern {
+                                    pubsub::psubscribe_response(&ch, subscription_count)
+                                } else {
+                                    pubsub::subscribe_response(&ch, subscription_count)
+                                };
+                                crate::protocol::serialize(&resp, &mut write_buf);
+                                if stream.write_all(&write_buf).await.is_err() { return; }
+                            }
+                        }
+                        break; // break out of frame batch loop to re-enter main loop in subscriber mode
+                    }
+                    // UNSUBSCRIBE/PUNSUBSCRIBE in normal mode (not subscribed)
+                    if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                        let is_pattern = cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE");
+                        let resp = if is_pattern {
+                            pubsub::punsubscribe_response(&Bytes::from_static(b""), 0)
+                        } else {
+                            pubsub::unsubscribe_response(&Bytes::from_static(b""), 0)
+                        };
+                        responses.push(resp);
                         continue;
                     }
-                    if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-                        responses.push(Frame::Error(Bytes::from_static(b"ERR UNSUBSCRIBE not yet supported in sharded mode")));
+
+                    // --- PUBSUB introspection ---
+                    if cmd.eq_ignore_ascii_case(b"PUBSUB") {
+                        use crate::shard::dispatch::{PubSubQuery, PubSubQueryResult};
+                        if cmd_args.is_empty() {
+                            responses.push(Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'pubsub' command")));
+                            continue;
+                        }
+                        let subcmd = extract_bytes(&cmd_args[0]);
+                        match subcmd {
+                            Some(ref sc) if sc.eq_ignore_ascii_case(b"CHANNELS") => {
+                                let pattern = if cmd_args.len() > 1 { extract_bytes(&cmd_args[1]) } else { None };
+                                let local = { pubsub_registry.borrow().active_channels(pattern.as_deref()) };
+                                let mut reply_rxs = Vec::new();
+                                {
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    for target in 0..num_shards {
+                                        if target == shard_id { continue; }
+                                        let (tx, rx) = channel::oneshot();
+                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                        let msg = ShardMessage::PubSubIntrospect {
+                                            query: PubSubQuery::Channels(pattern.clone()),
+                                            reply_tx: tx,
+                                        };
+                                        if producers[idx].try_push(msg).is_ok() {
+                                            spsc_notifiers[target].notify_one();
+                                            reply_rxs.push(rx);
+                                        }
+                                    }
+                                }
+                                let mut all_channels: std::collections::HashSet<Bytes> = local.into_iter().collect();
+                                for rx in reply_rxs {
+                                    if let Ok(PubSubQueryResult::Channels(chs)) = rx.await {
+                                        all_channels.extend(chs);
+                                    }
+                                }
+                                let arr: Vec<Frame> = all_channels.into_iter().map(Frame::BulkString).collect();
+                                responses.push(Frame::Array(arr.into()));
+                            }
+                            Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
+                                let channels: Vec<Bytes> = cmd_args[1..].iter().filter_map(|a| extract_bytes(a)).collect();
+                                let local = { pubsub_registry.borrow().numsub(&channels) };
+                                let mut reply_rxs = Vec::new();
+                                {
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    for target in 0..num_shards {
+                                        if target == shard_id { continue; }
+                                        let (tx, rx) = channel::oneshot();
+                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                        let msg = ShardMessage::PubSubIntrospect {
+                                            query: PubSubQuery::NumSub(channels.clone()),
+                                            reply_tx: tx,
+                                        };
+                                        if producers[idx].try_push(msg).is_ok() {
+                                            spsc_notifiers[target].notify_one();
+                                            reply_rxs.push(rx);
+                                        }
+                                    }
+                                }
+                                let mut counts: HashMap<Bytes, i64> = local.into_iter().collect();
+                                for rx in reply_rxs {
+                                    if let Ok(PubSubQueryResult::NumSub(pairs)) = rx.await {
+                                        for (ch, c) in pairs {
+                                            *counts.entry(ch).or_insert(0) += c;
+                                        }
+                                    }
+                                }
+                                let mut arr = Vec::with_capacity(channels.len() * 2);
+                                for ch in &channels {
+                                    arr.push(Frame::BulkString(ch.clone()));
+                                    arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));
+                                }
+                                responses.push(Frame::Array(arr.into()));
+                            }
+                            Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
+                                let local = { pubsub_registry.borrow().numpat() };
+                                let mut reply_rxs = Vec::new();
+                                {
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    for target in 0..num_shards {
+                                        if target == shard_id { continue; }
+                                        let (tx, rx) = channel::oneshot();
+                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                        let msg = ShardMessage::PubSubIntrospect {
+                                            query: PubSubQuery::NumPat,
+                                            reply_tx: tx,
+                                        };
+                                        if producers[idx].try_push(msg).is_ok() {
+                                            spsc_notifiers[target].notify_one();
+                                            reply_rxs.push(rx);
+                                        }
+                                    }
+                                }
+                                let mut total = local;
+                                for rx in reply_rxs {
+                                    if let Ok(PubSubQueryResult::NumPat(n)) = rx.await {
+                                        total += n;
+                                    }
+                                }
+                                responses.push(Frame::Integer(total as i64));
+                            }
+                            _ => {
+                                responses.push(Frame::Error(Bytes::from_static(b"ERR unknown subcommand or wrong number of arguments for 'pubsub' command")));
+                            }
+                        }
                         continue;
                     }
 
@@ -1135,6 +1599,38 @@ pub async fn handle_connection_sharded_inner<
                 }
                 let _ = stream.write_all(&write_buf).await;
                 break;
+            }
+        }
+    }
+
+    // Clean up pub/sub subscriptions on disconnect
+    if subscriber_id > 0 {
+        let removed_channels = { pubsub_registry.borrow_mut().unsubscribe_all(subscriber_id) };
+        let removed_patterns = { pubsub_registry.borrow_mut().punsubscribe_all(subscriber_id) };
+        // Propagate unsubscribe to other shards
+        let mut producers = dispatch_tx.borrow_mut();
+        for ch in removed_channels {
+            for target in 0..num_shards {
+                if target == shard_id { continue; }
+                let idx = ChannelMesh::target_index(shard_id, target);
+                let msg = ShardMessage::PubSubUnsubscribe {
+                    source_shard: shard_id,
+                    channel: ch.clone(),
+                    is_pattern: false,
+                };
+                if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+            }
+        }
+        for pat in removed_patterns {
+            for target in 0..num_shards {
+                if target == shard_id { continue; }
+                let idx = ChannelMesh::target_index(shard_id, target);
+                let msg = ShardMessage::PubSubUnsubscribe {
+                    source_shard: shard_id,
+                    channel: pat.clone(),
+                    is_pattern: true,
+                };
+                if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
             }
         }
     }
