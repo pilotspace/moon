@@ -32,6 +32,7 @@ use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
+use crate::server::response_slot::ResponseSlotPool;
 
 /// Result of `handle_connection_sharded_inner` execution.
 ///
@@ -262,6 +263,9 @@ pub async fn handle_connection_sharded_inner<
     } else {
         None
     };
+
+    // Pre-allocated response slots for zero-allocation cross-shard dispatch.
+    let response_pool = ResponseSlotPool::new(num_shards, shard_id);
 
     let mut break_outer = false;
     // Migration target: set when AffinityTracker triggers, acted on after batch response flush.
@@ -985,14 +989,14 @@ pub async fn handle_connection_sharded_inner<
                     }
                 }
 
-                // Phase 2: Dispatch deferred remote commands
+                // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::with_capacity(remote_groups.len());
+                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
-                        let (reply_tx, reply_rx) = channel::oneshot();
+                        let slot_ptr = response_pool.slot_ptr(target);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatch { db_index: selected_db, commands, reply_tx };
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: slot_ptr };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
                         {
                             let mut pending = msg;
@@ -1004,26 +1008,18 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                         }
-                        reply_futures.push((meta, reply_rx));
+                        reply_futures.push((meta, target));
                     }
                     let proto_ver = protocol_version;
-                    for (meta, reply_rx) in reply_futures {
-                        match reply_rx.await {
-                            Ok(shard_responses) => {
-                                for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
-                                    if let Some(bytes) = aof_bytes {
-                                        if !matches!(resp, Frame::Error(_)) {
-                                            if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
-                                        }
-                                    }
-                                    responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                    for (meta, target) in reply_futures {
+                        let shard_responses = response_pool.future_for(target).await;
+                        for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                            if let Some(bytes) = aof_bytes {
+                                if !matches!(resp, Frame::Error(_)) {
+                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
                                 }
                             }
-                            Err(_) => {
-                                for (resp_idx, _, _) in meta {
-                                    responses[resp_idx] = Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed"));
-                                }
-                            }
+                            responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
                         }
                     }
                 }

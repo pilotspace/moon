@@ -36,6 +36,7 @@ use super::{
 use super::affinity::{AffinityTracker, MigratedConnectionState};
 use crate::framevec;
 use crate::server::codec::RespCodec;
+use crate::server::response_slot::ResponseSlotPool;
 
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
@@ -149,11 +150,14 @@ pub async fn handle_connection_sharded_monoio<
     > = HashMap::with_capacity(num_shards);
     let mut reply_futures: Vec<(
         Vec<(usize, Option<Bytes>, Vec<u8>)>,
-        channel::OneshotReceiver<Vec<Frame>>,
+        usize,
     )> = Vec::with_capacity(num_shards);
 
     // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
+
+    // Pre-allocated response slots for zero-allocation cross-shard dispatch.
+    let response_pool = ResponseSlotPool::new(num_shards, shard_id);
 
     // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
     // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
@@ -1472,7 +1476,7 @@ pub async fn handle_connection_sharded_monoio<
             reply_futures.clear();
 
             for (target, entries) in remote_groups.drain() {
-                let (reply_tx, reply_rx) = channel::oneshot();
+                let slot_ptr = response_pool.slot_ptr(target);
                 let (meta, commands): (
                     Vec<(usize, Option<Bytes>, Vec<u8>)>,
                     Vec<std::sync::Arc<Frame>>,
@@ -1481,10 +1485,10 @@ pub async fn handle_connection_sharded_monoio<
                     .map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame))
                     .unzip();
 
-                let msg = ShardMessage::PipelineBatch {
+                let msg = ShardMessage::PipelineBatchSlotted {
                     db_index: selected_db,
                     commands,
-                    reply_tx,
+                    response_slot: slot_ptr,
                 };
                 let target_idx = ChannelMesh::target_index(shard_id, target);
                 {
@@ -1506,35 +1510,25 @@ pub async fn handle_connection_sharded_monoio<
                         }
                     }
                 }
-                reply_futures.push((meta, reply_rx));
+                reply_futures.push((meta, target));
             }
 
             // Await all shard responses (they execute in parallel on different shards)
-            for (meta, reply_rx) in reply_futures.drain(..) {
-                match reply_rx.recv().await {
-                    Ok(shard_responses) => {
-                        for ((resp_idx, aof_bytes, cmd_name), resp) in
-                            meta.into_iter().zip(shard_responses)
-                        {
-                            // AOF logging for successful remote writes
-                            if let Some(bytes) = aof_bytes {
-                                if !matches!(resp, Frame::Error(_)) {
-                                    if let Some(ref tx) = aof_tx {
-                                        let _ = tx.try_send(AofMessage::Append(bytes));
-                                    }
-                                }
+            for (meta, target) in reply_futures.drain(..) {
+                let shard_responses = response_pool.future_for(target).await;
+                for ((resp_idx, aof_bytes, cmd_name), resp) in
+                    meta.into_iter().zip(shard_responses)
+                {
+                    // AOF logging for successful remote writes
+                    if let Some(bytes) = aof_bytes {
+                        if !matches!(resp, Frame::Error(_)) {
+                            if let Some(ref tx) = aof_tx {
+                                let _ = tx.try_send(AofMessage::Append(bytes));
                             }
-                            let resp = apply_resp3_conversion(&cmd_name, resp, protocol_version);
-                            responses[resp_idx] = resp;
                         }
                     }
-                    Err(_) => {
-                        for (resp_idx, _, _) in meta {
-                            responses[resp_idx] = Frame::Error(Bytes::from_static(
-                                b"ERR cross-shard dispatch failed",
-                            ));
-                        }
-                    }
+                    let resp = apply_resp3_conversion(&cmd_name, resp, protocol_version);
+                    responses[resp_idx] = resp;
                 }
             }
         }
