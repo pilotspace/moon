@@ -10,8 +10,8 @@ use std::cell::Cell;
 
 use mlua::prelude::*;
 
-use crate::command::{DispatchResult, dispatch};
 use crate::protocol::Frame;
+use crate::storage::engine::StorageEngine;
 
 thread_local! {
     /// Raw pointer to the current shard's Database during script execution.
@@ -89,10 +89,8 @@ pub fn make_redis_call_fn(lua: &Lua, propagate_errors: bool) -> mlua::Result<Lua
                 SCRIPT_HAD_WRITE.with(|c| c.set(true));
             }
 
-            let r = dispatch(db, &cmd_bytes, &frames[1..], &mut db_idx, db_count);
-            Ok(match r {
-                DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
-            })
+            let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
+            Ok(frame)
         })?;
 
         // redis.call: propagate errors as Lua errors
