@@ -149,25 +149,23 @@ impl super::Shard {
             if uring_state.is_none() {
                 if let Some(ref addr) = bind_addr {
                     match conn_accept::create_reuseport_socket(addr) {
-                        Ok(std_listener) => {
-                            match tokio::net::TcpListener::from_std(std_listener) {
-                                Ok(tl) => {
-                                    info!(
-                                        "Shard {}: per-shard SO_REUSEPORT listener on {}",
-                                        self.id, addr
-                                    );
-                                    Some(tl)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Shard {}: tokio listener from_std failed: {}, using conn_rx",
-                                        self.id,
-                                        e
-                                    );
-                                    None
-                                }
+                        Ok(std_listener) => match tokio::net::TcpListener::from_std(std_listener) {
+                            Ok(tl) => {
+                                info!(
+                                    "Shard {}: per-shard SO_REUSEPORT listener on {}",
+                                    self.id, addr
+                                );
+                                Some(tl)
                             }
-                        }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Shard {}: tokio listener from_std failed: {}, using conn_rx",
+                                    self.id,
+                                    e
+                                );
+                                None
+                            }
+                        },
                         Err(e) => {
                             tracing::warn!(
                                 "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
@@ -191,25 +189,23 @@ impl super::Shard {
         let per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
             if let Some(ref addr) = bind_addr {
                 match conn_accept::create_reuseport_socket(addr) {
-                    Ok(std_listener) => {
-                        match monoio::net::TcpListener::from_std(std_listener) {
-                            Ok(ml) => {
-                                info!(
-                                    "Shard {}: per-shard SO_REUSEPORT listener on {} (monoio)",
-                                    self.id, addr
-                                );
-                                Some(ml)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Shard {}: monoio listener from_std failed: {}, using conn_rx",
-                                    self.id,
-                                    e
-                                );
-                                None
-                            }
+                    Ok(std_listener) => match monoio::net::TcpListener::from_std(std_listener) {
+                        Ok(ml) => {
+                            info!(
+                                "Shard {}: per-shard SO_REUSEPORT listener on {} (monoio)",
+                                self.id, addr
+                            );
+                            Some(ml)
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: monoio listener from_std failed: {}, using conn_rx",
+                                self.id,
+                                e
+                            );
+                            None
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
