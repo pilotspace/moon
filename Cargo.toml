@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = "1"
 futures = "0.3"
 ordered-float = "5"
+phf = { version = "0.11", features = ["macros"] }
 rand = "0.9"
 crc16 = "0.4"
 crc32fast = "1"

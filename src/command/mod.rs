@@ -6,6 +6,7 @@ pub mod hash;
 pub mod helpers;
 pub mod key;
 pub mod list;
+pub mod metadata;
 pub mod persistence;
 pub mod set;
 pub mod sorted_set;
