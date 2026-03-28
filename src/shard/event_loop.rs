@@ -185,10 +185,59 @@ impl super::Shard {
             }
         };
 
-        #[cfg(not(all(target_os = "linux", feature = "runtime-tokio")))]
+        // Per-shard SO_REUSEPORT listener (Linux + monoio).
+        // Each shard creates its own listener; the kernel distributes connections via SO_REUSEPORT.
+        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        let per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
+            if let Some(ref addr) = bind_addr {
+                match conn_accept::create_reuseport_socket(addr) {
+                    Ok(std_listener) => {
+                        match monoio::net::TcpListener::from_std(std_listener) {
+                            Ok(ml) => {
+                                info!(
+                                    "Shard {}: per-shard SO_REUSEPORT listener on {} (monoio)",
+                                    self.id, addr
+                                );
+                                Some(ml)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Shard {}: monoio listener from_std failed: {}, using conn_rx",
+                                    self.id,
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
+                            self.id,
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "runtime-tokio"),
+            all(target_os = "linux", feature = "runtime-monoio"),
+        )))]
         {
-            let _ = &bind_addr; // Suppress unused warning when io_uring path inactive
+            let _ = &bind_addr; // Suppress unused warning when per-shard accept inactive
             info!("Shard {} started", self.id);
+        }
+
+        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        {
+            if per_shard_monoio_listener.is_none() {
+                info!("Shard {} started (monoio, conn_rx fallback)", self.id);
+            }
         }
 
         let dispatch_tx = Rc::new(RefCell::new(producers));
@@ -488,7 +537,38 @@ impl super::Shard {
             // Monoio runtime: full event loop mirroring the tokio path.
             #[cfg(feature = "runtime-monoio")]
             monoio::select! {
-                // Accept new connections from listener
+                // Per-shard SO_REUSEPORT accept (Linux only, monoio path)
+                result = async {
+                    #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+                    if let Some(ref listener) = per_shard_monoio_listener {
+                        return listener.accept().await;
+                    }
+                    // Never resolves on non-Linux or when per_shard_monoio_listener is None
+                    std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
+                } => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            // Convert monoio TcpStream -> std::net::TcpStream (same pattern as listener.rs)
+                            let std_stream = {
+                                use std::os::unix::io::{IntoRawFd, FromRawFd};
+                                let fd = stream.into_raw_fd();
+                                unsafe { std::net::TcpStream::from_raw_fd(fd) }
+                            };
+                            conn_accept::spawn_monoio_connection(
+                                std_stream, false, &tls_config,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Shard {}: per-shard accept error (monoio): {}", shard_id, e);
+                        }
+                    }
+                }
+                // Accept new connections from listener (MPSC fallback, always active on non-Linux)
                 stream = conn_rx.recv_async() => {
                     match stream {
                         Ok((std_tcp_stream, is_tls)) => {
