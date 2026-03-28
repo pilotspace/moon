@@ -81,7 +81,10 @@ pub(crate) fn drain_spsc_shared(
                     match msg {
                         ShardMessage::Execute { .. }
                         | ShardMessage::PipelineBatch { .. }
-                        | ShardMessage::MultiExecute { .. } => {
+                        | ShardMessage::MultiExecute { .. }
+                        | ShardMessage::ExecuteSlotted { .. }
+                        | ShardMessage::PipelineBatchSlotted { .. }
+                        | ShardMessage::MultiExecuteSlotted { .. } => {
                             execute_batch.push(msg);
                         }
                         ShardMessage::MigrateConnection { fd, state } => {
@@ -459,6 +462,299 @@ pub(crate) fn handle_shard_message_shared(
             }
             drop(guard);
             let _ = reply_tx.send(results);
+        }
+        ShardMessage::ExecuteSlotted {
+            db_index,
+            command,
+            response_slot,
+        } => {
+            let response = {
+                let db_count = shard_databases.db_count();
+                let db_idx = db_index.min(db_count.saturating_sub(1));
+                let (cmd, args) = match extract_command_static(&command) {
+                    Some(pair) => pair,
+                    None => {
+                        // SAFETY: response_slot points to a valid ResponseSlot owned by the
+                        // connection's ResponseSlotPool, which outlives all dispatched messages.
+                        let slot = unsafe { &*response_slot };
+                        slot.fill(vec![crate::protocol::Frame::Error(
+                            bytes::Bytes::from_static(b"ERR invalid command format"),
+                        )]);
+                        return;
+                    }
+                };
+
+                let is_write = metadata::is_write(cmd);
+                if is_write {
+                    let db_guard = shard_databases.read_db(shard_id, db_idx);
+                    cow_intercept(snapshot_state, &db_guard, db_idx, &command);
+                    drop(db_guard);
+                }
+
+                let mut guard = shard_databases.write_db(shard_id, db_idx);
+                guard.refresh_now_from_cache(cached_clock);
+                let mut selected = db_idx;
+                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                let frame = match result {
+                    DispatchResult::Response(f) => f,
+                    DispatchResult::Quit(f) => f,
+                };
+
+                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    let serialized = aof::serialize_command(&command);
+                    wal_append_and_fanout(
+                        &serialized,
+                        wal_writer,
+                        repl_backlog,
+                        replica_txs,
+                        repl_state,
+                        shard_id,
+                    );
+                }
+
+                if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        || cmd.eq_ignore_ascii_case(b"ZADD")
+                        || cmd.eq_ignore_ascii_case(b"XADD");
+                    if needs_wake {
+                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                            args.get(1)
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        } else {
+                            args.first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        };
+                        if let Some(key) = wake_key {
+                            let mut reg = blocking_registry.borrow_mut();
+                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            {
+                                crate::blocking::wakeup::try_wake_list_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            } else {
+                                crate::blocking::wakeup::try_wake_stream_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                drop(guard);
+                frame
+            };
+            // SAFETY: response_slot points to a valid ResponseSlot (see above).
+            let slot = unsafe { &*response_slot };
+            slot.fill(vec![response]);
+        }
+        ShardMessage::MultiExecuteSlotted {
+            db_index,
+            commands,
+            response_slot,
+        } => {
+            let mut results = Vec::with_capacity(commands.len());
+            let db_count = shard_databases.db_count();
+            let db_idx = db_index.min(db_count.saturating_sub(1));
+            let mut guard = shard_databases.write_db(shard_id, db_idx);
+            guard.refresh_now_from_cache(cached_clock);
+            for (_key, cmd_frame) in &commands {
+                let (cmd, args) = match extract_command_static(cmd_frame) {
+                    Some(pair) => pair,
+                    None => {
+                        results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR invalid command format",
+                        )));
+                        continue;
+                    }
+                };
+
+                let is_write = metadata::is_write(cmd);
+                if is_write {
+                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
+                }
+
+                let mut selected = db_idx;
+                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                let frame = match result {
+                    DispatchResult::Response(f) => f,
+                    DispatchResult::Quit(f) => f,
+                };
+
+                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    let serialized = aof::serialize_command(cmd_frame);
+                    wal_append_and_fanout(
+                        &serialized,
+                        wal_writer,
+                        repl_backlog,
+                        replica_txs,
+                        repl_state,
+                        shard_id,
+                    );
+
+                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        || cmd.eq_ignore_ascii_case(b"ZADD")
+                        || cmd.eq_ignore_ascii_case(b"XADD");
+                    if needs_wake {
+                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                            args.get(1)
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        } else {
+                            args.first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        };
+                        if let Some(key) = wake_key {
+                            let mut reg = blocking_registry.borrow_mut();
+                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            {
+                                crate::blocking::wakeup::try_wake_list_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            } else {
+                                crate::blocking::wakeup::try_wake_stream_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                results.push(frame);
+            }
+            drop(guard);
+            // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
+            let slot = unsafe { &*response_slot };
+            slot.fill(results);
+        }
+        ShardMessage::PipelineBatchSlotted {
+            db_index,
+            commands,
+            response_slot,
+        } => {
+            let mut results = Vec::with_capacity(commands.len());
+            let db_count = shard_databases.db_count();
+            let db_idx = db_index.min(db_count.saturating_sub(1));
+            let mut guard = shard_databases.write_db(shard_id, db_idx);
+            guard.refresh_now_from_cache(cached_clock);
+            for cmd_frame in &commands {
+                let (cmd, args) = match extract_command_static(cmd_frame) {
+                    Some(pair) => pair,
+                    None => {
+                        results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR invalid command format",
+                        )));
+                        continue;
+                    }
+                };
+
+                let is_write = metadata::is_write(cmd);
+                if is_write {
+                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
+                }
+
+                let mut selected = db_idx;
+                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                let frame = match result {
+                    DispatchResult::Response(f) => f,
+                    DispatchResult::Quit(f) => f,
+                };
+
+                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    let serialized = aof::serialize_command(cmd_frame);
+                    wal_append_and_fanout(
+                        &serialized,
+                        wal_writer,
+                        repl_backlog,
+                        replica_txs,
+                        repl_state,
+                        shard_id,
+                    );
+                }
+
+                if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        || cmd.eq_ignore_ascii_case(b"ZADD")
+                        || cmd.eq_ignore_ascii_case(b"XADD");
+                    if needs_wake {
+                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                            args.get(1)
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        } else {
+                            args.first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        };
+                        if let Some(key) = wake_key {
+                            let mut reg = blocking_registry.borrow_mut();
+                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            {
+                                crate::blocking::wakeup::try_wake_list_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            } else {
+                                crate::blocking::wakeup::try_wake_stream_waiter(
+                                    &mut reg,
+                                    &mut guard,
+                                    db_idx,
+                                    &key,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                results.push(frame);
+            }
+            drop(guard);
+            // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
+            let slot = unsafe { &*response_slot };
+            slot.fill(results);
         }
         ShardMessage::PubSubFanOut { channel, message } => {
             pubsub_registry.publish(&channel, &message);
