@@ -1784,4 +1784,30 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"Hello"))
         );
     }
+
+    // --- SUBSTR (alias for GETRANGE) ---
+
+    #[test]
+    fn test_substr_alias() {
+        // SUBSTR uses the same getrange function, verify it produces identical results
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"msg"), Bytes::from_static(b"Hello, World!"));
+        // SUBSTR with same args as GETRANGE should produce identical output
+        let getrange_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
+        let substr_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
+        assert_eq!(getrange_result, substr_result);
+        assert_eq!(
+            substr_result,
+            Frame::BulkString(Bytes::from_static(b"Hello"))
+        );
+    }
+
+    #[test]
+    fn test_substr_negative_indices() {
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"msg"), Bytes::from_static(b"Hello, World!"));
+        // SUBSTR with negative indices (alias behavior)
+        let result = getrange(&mut db, &[bs(b"msg"), bs(b"-6"), bs(b"-1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
+    }
 }
