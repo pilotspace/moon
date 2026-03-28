@@ -135,7 +135,18 @@ Per-shard overhead includes: DashTable segments, event loop state, SPSC channels
 | 8-shard SET P=64 c=50 | 2.19M | 1.48M | **1.48x** |
 | 8-shard SET P=16 c=1000 | 2.12M | 1.20M | **1.76x** |
 
-### 3.3 Scaling Efficiency (GET throughput vs 1-shard)
+### 3.3 String Substring Operations (1-shard, c=50, macOS)
+
+| Command | Pipeline | Redis | moon | Ratio |
+|---------|:--------:|:-----:|:----:|:-----:|
+| GETRANGE | P=1 | 71,003 | **140,292** | **1.98x** |
+| SETRANGE | P=1 | 73,954 | **139,353** | **1.88x** |
+| GETRANGE | P=16 | 814,332 | **1,620,746** | **1.99x** |
+| SETRANGE | P=16 | 998,004 | **1,459,854** | **1.46x** |
+
+GETRANGE extracts a 13-byte substring from an 85-byte string. SETRANGE overwrites 5 bytes at offset 7. SETRANGE write-path advantage narrows at high pipeline depth due to per-op allocation overhead (zero-pad check, TTL preservation).
+
+### 3.4 Scaling Efficiency (GET throughput vs 1-shard)
 
 | Shards | Scaling Factor |
 |:------:|:--------------:|
@@ -295,7 +306,7 @@ Multi-core parallelism reduces per-shard queue depth. The median request sees le
 | Category | Tests | Status |
 |----------|:-----:|:------:|
 | String SET/GET (empty, 1B, 12B SSO, 13B heap, 64B-64KB, numeric, float) | 14 | PASS |
-| String mutations (APPEND, INCR/DECR, STRLEN, GETDEL, GETSET) | 14 | PASS |
+| String mutations (APPEND, INCR/DECR, STRLEN, GETRANGE, SETRANGE, GETDEL, GETSET) | 16 | PASS |
 | APPEND crossing SSO->heap boundary (11B -> 13B) | 1 | PASS |
 | MSET / MGET (with missing keys) | 2 | PASS |
 | SET options (EX, PX, NX, XX, SETEX, SETNX, TTL verify) | 8 | PASS |
