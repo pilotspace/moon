@@ -269,6 +269,9 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_disconnect() {
+        if std::env::var("MOON_NO_URING").is_ok() {
+            return; // io_uring unavailable in this environment
+        }
         use crate::io::{IoEvent, UringConfig, UringDriver};
 
         let config = RuntimeConfig::default();
@@ -303,6 +306,9 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_send_complete() {
+        if std::env::var("MOON_NO_URING").is_ok() {
+            return; // io_uring unavailable in this environment
+        }
         use crate::io::{IoEvent, UringConfig, UringDriver};
 
         let config = RuntimeConfig::default();

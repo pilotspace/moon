@@ -733,8 +733,9 @@ pub(crate) fn try_inline_dispatch(
     let buf = &read_buf[..];
     let len = buf.len();
 
-    // Minimum valid command: *2\r\n$3\r\nGET\r\n$1\r\nX\r\n = 24 bytes
-    if len < 24 {
+    // Minimum valid command: *2\r\n$3\r\nGET\r\n$1\r\nX\r\n = 20 bytes
+    // (*2\r\n=4) + ($3\r\n=4) + (GET\r\n=5) + ($1\r\n=4) + (X\r\n=3) = 20
+    if len < 20 {
         return 0;
     }
 
