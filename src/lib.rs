@@ -64,6 +64,7 @@ pub mod blocking;
 pub mod cluster;
 pub mod command;
 pub mod config;
+pub mod error;
 pub mod io;
 pub mod persistence;
 pub mod protocol;
