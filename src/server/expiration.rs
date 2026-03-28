@@ -63,10 +63,7 @@ fn expire_cycle(db: &mut Database) {
         }
 
         let sample_size = keys.len().min(20);
-        let sampled: Vec<_> = keys
-            .sample(&mut rng, sample_size)
-            .cloned()
-            .collect();
+        let sampled: Vec<_> = keys.sample(&mut rng, sample_size).cloned().collect();
 
         let mut expired_count = 0;
         for key in &sampled {

@@ -1803,7 +1803,8 @@ async fn test_multi_exec_basic() {
             let set2: String = redis::FromRedisValue::from_redis_value(items[1].clone()).unwrap();
             assert_eq!(set2, "OK");
             // Third is the GET result
-            let get_val: String = redis::FromRedisValue::from_redis_value(items[2].clone()).unwrap();
+            let get_val: String =
+                redis::FromRedisValue::from_redis_value(items[2].clone()).unwrap();
             assert_eq!(get_val, "txval1");
         }
         _ => panic!("EXEC should return an array, got: {:?}", results),
@@ -1929,7 +1930,8 @@ async fn test_watch_success() {
     match result {
         redis::Value::Array(ref items) => {
             assert_eq!(items.len(), 1, "EXEC should return 1 result");
-            let set_result: String = redis::FromRedisValue::from_redis_value(items[0].clone()).unwrap();
+            let set_result: String =
+                redis::FromRedisValue::from_redis_value(items[0].clone()).unwrap();
             assert_eq!(set_result, "OK");
         }
         _ => panic!("EXEC should return an array, got: {:?}", result),
@@ -3977,7 +3979,10 @@ async fn test_script_timeout() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("BUSY") || err_msg.contains("timeout") || err_msg.contains("timed out") || err_msg.contains("script"),
+        err_msg.contains("BUSY")
+            || err_msg.contains("timeout")
+            || err_msg.contains("timed out")
+            || err_msg.contains("script"),
         "expected timeout error, got: {err_msg}"
     );
 
