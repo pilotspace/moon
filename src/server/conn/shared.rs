@@ -1,11 +1,15 @@
 use std::cell::RefCell;
+#[cfg(feature = "runtime-tokio")]
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(feature = "runtime-tokio")]
+use bytes::BytesMut;
 
 use crate::command::config as config_cmd;
+#[cfg(feature = "runtime-tokio")]
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
@@ -15,7 +19,8 @@ use crate::storage::entry::CachedClock;
 
 use super::util::extract_command;
 
-/// Type alias for the per-database RwLock container.
+/// Type alias for the per-database RwLock container (tokio single-thread mode only).
+#[cfg(feature = "runtime-tokio")]
 pub(crate) type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
 /// Handle CONFIG GET/SET subcommands.
@@ -61,6 +66,7 @@ pub(crate) fn handle_config(
 ///
 /// Returns the result Frame (Array of responses, or Null on abort) and a Vec of
 /// AOF byte entries for write commands that succeeded (caller sends them async).
+#[cfg(feature = "runtime-tokio")]
 pub(crate) fn execute_transaction(
     db: &SharedDatabases,
     command_queue: &[Frame],
