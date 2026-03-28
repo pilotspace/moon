@@ -359,11 +359,10 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
             warn!("WAL v2: truncated block_len at offset {}, stopping", offset);
             break;
         }
-        let block_len = u32::from_le_bytes(
-            data[offset..offset + 4]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("WAL v2: invalid block_len bytes at offset {}", offset))?,
-        ) as usize;
+        let block_len =
+            u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                anyhow::anyhow!("WAL v2: invalid block_len bytes at offset {}", offset)
+            })?) as usize;
         offset += 4;
 
         // Minimum block content: cmd_count(2) + db_idx(1) + crc32(4) = 7
@@ -391,7 +390,9 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
         let stored_crc = u32::from_le_bytes(
             block_data[block_len - 4..block_len]
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("WAL v2: invalid CRC bytes at block offset {}", offset - 4))?,
+                .map_err(|_| {
+                    anyhow::anyhow!("WAL v2: invalid CRC bytes at block offset {}", offset - 4)
+                })?,
         );
 
         // Verify CRC: covers cmd_count(2B) + db_idx(1B) + payload
