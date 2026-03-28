@@ -1,7 +1,12 @@
+pub mod conn_accept;
 pub mod coordinator;
 pub mod dispatch;
 pub mod mesh;
 pub mod numa;
+pub mod persistence_tick;
+pub mod spsc_handler;
+pub mod timers;
+pub mod uring_handler;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,15 +16,10 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use ringbuf::HeapCons;
 use ringbuf::HeapProd;
-use ringbuf::traits::Consumer;
 use tracing::info;
 
 use crate::blocking::BlockingRegistry;
-use crate::command::connection as conn_cmd;
-use crate::command::metadata;
-use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::config::RuntimeConfig;
-use crate::persistence::aof;
 use crate::persistence::replay::DispatchReplayEngine;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
@@ -30,12 +30,6 @@ use crate::runtime::{
     TimerImpl,
     traits::{RuntimeInterval, RuntimeTimer},
 };
-#[cfg(feature = "runtime-tokio")]
-use crate::server::connection::handle_connection_sharded;
-#[cfg(feature = "runtime-tokio")]
-use crate::server::connection::handle_connection_sharded_inner;
-#[cfg(feature = "runtime-monoio")]
-use crate::server::connection::handle_connection_sharded_monoio;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
@@ -43,7 +37,7 @@ use crate::tracking::TrackingTable;
 use std::sync::{Arc, RwLock};
 
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
+use crate::io::{UringConfig, UringDriver};
 
 use self::dispatch::ShardMessage;
 
@@ -64,24 +58,6 @@ pub struct Shard {
     /// Per-shard Pub/Sub registry -- no global Mutex, fully owned by shard thread.
     pub pubsub_registry: PubSubRegistry,
 }
-
-/// In-flight send buffer variants for proper RAII lifetime management (Linux + tokio only).
-///
-/// Keeps buffers alive until the corresponding io_uring SendComplete CQE arrives,
-/// replacing the previous std::mem::forget memory leak.
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(dead_code)] // Fields hold buffers alive for RAII until SendComplete CQE
-enum InFlightSend {
-    /// Serialized response buffer for non-BulkString frames (heap fallback).
-    Buf(bytes::BytesMut),
-    /// Scatter-gather writev guard for BulkString (zero-copy GET) responses.
-    Writev(WritevGuard),
-    /// Pre-registered fixed buffer index from SendBufPool.
-    /// Buffer is reclaimed to pool on SendComplete (no heap alloc/free).
-    Fixed(u16),
-}
-
-// Stub removed: Plan 02 replaced with handle_connection_sharded_monoio in connection.rs.
 
 impl Shard {
     /// Create a new shard with `num_databases` empty databases.
@@ -170,9 +146,6 @@ impl Shard {
         all_notifiers: Vec<Arc<channel::Notify>>,
     ) {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
-        // If initialization fails, fall back to the Tokio path (same as macOS).
-        // Skipped for monoio runtime (monoio has its own io_uring integration).
-        // Can be disabled via MOON_NO_URING=1 (used in CI/test environments).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
             if std::env::var("MOON_NO_URING").is_ok() {
@@ -204,7 +177,7 @@ impl Shard {
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         if let Some(ref mut d) = uring_state {
             if let Some(ref addr) = bind_addr {
-                match Self::create_reuseport_listener(addr) {
+                match uring_handler::create_reuseport_listener(addr) {
                     Ok(listener_fd) => {
                         if let Err(e) = d.submit_multishot_accept(listener_fd) {
                             tracing::warn!(
@@ -237,9 +210,8 @@ impl Shard {
             std::collections::HashMap::new();
 
         // Track in-flight send buffers for proper RAII cleanup (Linux + tokio only).
-        // Replaces the previous std::mem::forget leak.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-        let mut inflight_sends: std::collections::HashMap<u32, Vec<InFlightSend>> =
+        let mut inflight_sends: std::collections::HashMap<u32, Vec<uring_handler::InFlightSend>> =
             std::collections::HashMap::new();
 
         #[cfg(not(all(target_os = "linux", feature = "runtime-tokio")))]
@@ -259,7 +231,6 @@ impl Shard {
         let num_shards = self.num_shards;
 
         // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
-        // Lua is !Send so it must be created on the shard thread (inside run()).
         let lua_rc: Rc<RefCell<Option<Rc<mlua::Lua>>>> = Rc::new(RefCell::new(None));
         let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
 
@@ -268,8 +239,6 @@ impl Shard {
         let mut snapshot_reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
 
         // Per-shard WAL writer (created only when persistence is actually enabled).
-        // When persistence_dir is None (appendonly=no and no save rules), skip WAL
-        // entirely to avoid unnecessary fsync on every 1ms tick.
         let appendonly_enabled = runtime_config
             .read()
             .map(|cfg| cfg.appendonly != "no")
@@ -297,17 +266,9 @@ impl Shard {
             None
         };
 
-        // Per-shard replication backlog (in-memory, 1MB capacity, for partial resync).
-        // Lazy: allocated on first RegisterReplica to save 1MB/shard at baseline.
-        // IMPORTANT: monotonic offsets here are independent of WAL file size.
+        // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
-
-        // Per-shard replica sender channels: (replica_id, Sender<Bytes>).
-        // Populated by ShardMessage::RegisterReplica, cleared by UnregisterReplica.
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
-
-        // Shared ReplicationState injected from server startup.
-        // When Some, enables WAL fan-out offset tracking and replica connection handling.
         let repl_state: Option<Arc<RwLock<ReplicationState>>> = repl_state_ext;
 
         // Track last seen snapshot epoch to detect watch channel triggers
@@ -315,19 +276,12 @@ impl Shard {
 
         let mut expiry_interval = TimerImpl::interval(Duration::from_millis(100));
         let mut eviction_interval = TimerImpl::interval(Duration::from_millis(100));
-        // Periodic timer for WAL flush, snapshot advance, io_uring poll (1ms).
-        // SPSC drain now uses event-driven Notify instead of polling.
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
-        // Blocking command timeout scanner -- expire timed-out blocked clients every 10ms.
         let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
-        // WAL fsync interval -- sync to disk every 1 second (everysec policy).
-        // write_all() happens on every 1ms tick; fsync is deferred to this interval.
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
-        // Local reference to this shard's SPSC Notify (for the select! arm).
         let spsc_notify_local = spsc_notify;
 
-        // Per-shard cached clock: updated once per 1ms tick, read by all
-        // connection handlers on this shard via Relaxed atomic loads.
+        // Per-shard cached clock: updated once per 1ms tick.
         let cached_clock = CachedClock::new();
 
         loop {
@@ -337,9 +291,7 @@ impl Shard {
                 stream = conn_rx.recv_async() => {
                     match stream {
                         Ok((tcp_stream, is_tls)) => {
-                            // On Linux with io_uring: extract raw fd, register with
-                            // UringDriver for io_uring-based recv/send. Skip Tokio task.
-                            // Note: io_uring path does not support TLS (plain TCP only).
+                            // On Linux with io_uring: extract raw fd, register with UringDriver.
                             #[cfg(target_os = "linux")]
                             {
                                 if !is_tls {
@@ -349,12 +301,8 @@ impl Shard {
                                                 use std::os::unix::io::IntoRawFd;
                                                 let raw_fd = std_stream.into_raw_fd();
                                                 match driver.register_connection(raw_fd) {
-                                                    Ok(Some(_conn_id)) => {
-                                                        // Connection registered, io_uring handles I/O
-                                                    }
-                                                    Ok(None) => {
-                                                        // FD table full, connection rejected (close handled inside)
-                                                    }
+                                                    Ok(Some(_conn_id)) => {}
+                                                    Ok(None) => {}
                                                     Err(e) => {
                                                         tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
                                                     }
@@ -367,353 +315,16 @@ impl Shard {
                                         continue;
                                     }
                                 }
-                                // Fallthrough: uring_state is None or is_tls, use Tokio path below
                             }
 
-                            let dbs = databases.clone();
-                            let dtx = dispatch_tx.clone();
-                            let psr = pubsub_rc.clone();
-                            let blk = blocking_rc.clone();
-                            let sd = shutdown.clone();
-                            let aof = aof_tx.clone();
-                            let trk = tracking_rc.clone();
-                            let cid = conn_cmd::next_client_id();
-                            let rs = repl_state.clone();
-                            let cs = cluster_state.clone();
-                            let cp = config_port;
-                            let lua = {
-                                let mut lua_opt = lua_rc.borrow_mut();
-                                if lua_opt.is_none() {
-                                    *lua_opt = Some(crate::scripting::setup_lua_vm()
-                                        .expect("Lua VM initialization failed"));
-                                }
-                                lua_opt.as_ref().unwrap().clone()
-                            };
-                            let sc = script_cache_rc.clone();
-                            let acl = acl_table.clone();
-                            let rtcfg = runtime_config.clone();
-                            let scfg = server_config.clone();
-                            let notifiers = all_notifiers.clone();
-                            let snap_tx = snapshot_trigger_tx.clone();
-                            let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
-                            let clk = cached_clock.clone();
-
-                            if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
-                                // TLS handshake before handler spawn (wrap-before-spawn pattern)
-                                let tls_cfg = tls_cfg_ref.clone();
-                                let peer_addr = tcp_stream.peer_addr()
-                                    .map(|a| a.to_string())
-                                    .unwrap_or_else(|_| "unknown".to_string());
-                                tokio::task::spawn_local(async move {
-                                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
-                                    match acceptor.accept(tcp_stream).await {
-                                        Ok(tls_stream) => {
-                                            handle_connection_sharded_inner(
-                                                tls_stream, peer_addr, dbs, shard_id, num_shards,
-                                                dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                                                snap_tx,
-                                                clk,
-                                            ).await;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Shard {}: TLS handshake failed: {}", shard_id, e);
-                                        }
-                                    }
-                                });
-                            } else {
-                                // Plain TCP connection
-                                tokio::task::spawn_local(async move {
-                                    handle_connection_sharded(
-                                        tcp_stream,
-                                        dbs,
-                                        shard_id,
-                                        num_shards,
-                                        dtx,
-                                        psr,
-                                        blk,
-                                        sd,
-                                        reqpass,
-                                        aof,
-                                        trk,
-                                        cid,
-                                        rs,
-                                        cs,
-                                        lua,
-                                        sc,
-                                        cp,
-                                        acl,
-                                        rtcfg,
-                                        scfg,
-                                        notifiers,
-                                        snap_tx,
-                                        clk,
-                                    ).await;
-                                });
-                            }
-                        }
-                        Err(_) => {
-                            info!("Shard {} connection channel closed", self.id);
-                            break;
-                        }
-                    }
-                }
-                // Arm 1: Immediate SPSC wake -- event-driven, no polling delay.
-                // Producers call notify_one() after SPSC push; this wakes the shard instantly.
-                _ = spsc_notify_local.notified() => {
-                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
-                    Self::drain_spsc_shared(
-                        &databases,
-                        &mut consumers,
-                        &mut *pubsub_rc.borrow_mut(),
-                        &blocking_rc,
-                        &mut pending_snapshot,
-                        &mut snapshot_state,
-                        &mut wal_writer,
-                        &mut repl_backlog,
-                        &mut replica_txs,
-                        &repl_state,
-                        shard_id,
-                        &script_cache_rc,
-                        &cached_clock,
-                    );
-
-                    // Handle pending SnapshotBegin from SPSC
-                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
-                        if snapshot_state.is_some() {
-                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
-                        } else {
-                            let dbs = databases.borrow();
-                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
-                            snapshot_reply_tx = Some(reply_tx);
-                            drop(dbs);
-                        }
-                    }
-                }
-                // Arm 2: Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll.
-                // Also drains SPSC as a safety net in case a notify was missed.
-                _ = periodic_interval.tick() => {
-                    // Refresh the per-shard cached clock once per tick (1ms).
-                    cached_clock.update();
-
-                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
-                    Self::drain_spsc_shared(
-                        &databases,
-                        &mut consumers,
-                        &mut *pubsub_rc.borrow_mut(),
-                        &blocking_rc,
-                        &mut pending_snapshot,
-                        &mut snapshot_state,
-                        &mut wal_writer,
-                        &mut repl_backlog,
-                        &mut replica_txs,
-                        &repl_state,
-                        shard_id,
-                        &script_cache_rc,
-                        &cached_clock,
-                    );
-
-                    // Handle pending SnapshotBegin from SPSC (tokio arm 2)
-                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
-                        if snapshot_state.is_some() {
-                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
-                        } else {
-                            let dbs = databases.borrow();
-                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
-                            snapshot_reply_tx = Some(reply_tx);
-                            drop(dbs);
-                        }
-                    }
-
-                    // Check watch channel for auto-save snapshot triggers
-                    {
-                        let new_epoch = snapshot_trigger_rx.borrow();
-                        if new_epoch > last_snapshot_epoch && snapshot_state.is_none() {
-                            last_snapshot_epoch = new_epoch;
-                            if let Some(ref dir) = persistence_dir {
-                                let snap_path = std::path::PathBuf::from(dir)
-                                    .join(format!("shard-{}.rrdshard", shard_id));
-                                let dbs = databases.borrow();
-                                snapshot_state = Some(SnapshotState::new(
-                                    shard_id as u16, new_epoch, &dbs, snap_path,
-                                ));
-                                drop(dbs);
-                                // No reply_tx for auto-save triggered snapshots
-                            }
-                        }
-                    }
-
-                    // Advance snapshot one segment per tick (cooperative)
-                    if let Some(ref mut snap) = snapshot_state {
-                        let done = {
-                            let dbs = databases.borrow();
-                            snap.advance_one_segment(&dbs)
-                        };
-                        if done {
-                            let epoch = snap.epoch;
-                            if let Err(e) = snap.finalize_async().await {
-                                tracing::error!("Shard {}: snapshot finalize failed: {}", shard_id, e);
-                                if let Some(tx) = snapshot_reply_tx.take() {
-                                    let _ = tx.send(Err(format!("finalize failed: {}", e)));
-                                }
-                            } else {
-                                info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
-                                // Truncate WAL after successful snapshot
-                                if let Some(ref mut wal) = wal_writer {
-                                    let _ = wal.truncate_after_snapshot(epoch);
-                                }
-                                if let Some(tx) = snapshot_reply_tx.take() {
-                                    let _ = tx.send(Ok(()));
-                                }
-                            }
-                            snapshot_state = None;
-                        }
-                    }
-
-                    // Flush WAL on 1ms tick (write to page cache only; sync is separate)
-                    if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.flush_if_needed();
-                    }
-
-                    // On Linux: poll io_uring for completions (non-blocking)
-                    #[cfg(target_os = "linux")]
-                    if let Some(ref mut driver) = uring_state {
-                        // Non-blocking submit (flush pending SQEs without waiting)
-                        let _ = driver.submit_and_wait_nonblocking();
-                        let events = driver.drain_completions();
-                        for event in events {
-                            Self::handle_uring_event(
-                                event,
-                                driver,
-                                &databases,
-                                &mut uring_parse_bufs,
-                                &mut inflight_sends,
-                                uring_listener_fd,
-                                &cached_clock,
+                            conn_accept::spawn_tokio_connection(
+                                tcp_stream, is_tls, &tls_config,
+                                &databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
                             );
-                        }
-                    }
-                }
-                // WAL fsync on 1-second interval (everysec durability).
-                // write_all() already happened on each 1ms tick; this just does fsync.
-                _ = wal_sync_interval.tick() => {
-                    if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.sync_to_disk();
-                    }
-                }
-                // Expire timed-out blocked clients every 10ms
-                _ = block_timeout_interval.tick() => {
-                    let now = std::time::Instant::now();
-                    blocking_rc.borrow_mut().expire_timed_out(now);
-                }
-                // Cooperative active expiry
-                _ = expiry_interval.tick() => {
-                    let mut dbs = databases.borrow_mut();
-                    for db in dbs.iter_mut() {
-                        crate::server::expiration::expire_cycle_direct(db);
-                    }
-                }
-                // Background eviction timer -- proactive memory reclaim every 100ms
-                _ = eviction_interval.tick() => {
-                    let rt = runtime_config.read().unwrap();
-                    if rt.maxmemory > 0 {
-                        let mut dbs = databases.borrow_mut();
-                        for db in dbs.iter_mut() {
-                            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
-                        }
-                    }
-                }
-                _ = shutdown.cancelled() => {
-                    info!("Shard {} shutting down", self.id);
-                    // Flush and shutdown WAL writer
-                    if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.shutdown();
-                    }
-                    break;
-                }
-            }
-
-            // Monoio runtime: full event loop with monoio::select! mirroring the tokio path.
-            // Connection handling is stubbed (Plan 02 implements the real handler).
-            #[cfg(feature = "runtime-monoio")]
-            monoio::select! {
-                // Accept new connections from listener
-                stream = conn_rx.recv_async() => {
-                    match stream {
-                        Ok((std_tcp_stream, is_tls)) => {
-                            // Convert std::net::TcpStream to monoio::net::TcpStream
-                            match monoio::net::TcpStream::from_std(std_tcp_stream) {
-                                Ok(tcp_stream) => {
-                                    let dbs = databases.clone();
-                                    let dtx = dispatch_tx.clone();
-                                    let psr = pubsub_rc.clone();
-                                    let blk = blocking_rc.clone();
-                                    let sd = shutdown.clone();
-                                    let aof = aof_tx.clone();
-                                    let trk = tracking_rc.clone();
-                                    let cid = conn_cmd::next_client_id();
-                                    let rs = repl_state.clone();
-                                    let cs = cluster_state.clone();
-                                    let cp = config_port;
-                                    let lua = {
-                                        let mut lua_opt = lua_rc.borrow_mut();
-                                        if lua_opt.is_none() {
-                                            *lua_opt = Some(crate::scripting::setup_lua_vm()
-                                                .expect("Lua VM initialization failed"));
-                                        }
-                                        lua_opt.as_ref().unwrap().clone()
-                                    };
-                                    let sc = script_cache_rc.clone();
-                                    let acl = acl_table.clone();
-                                    let rtcfg = runtime_config.clone();
-                                    let scfg = server_config.clone();
-                                    let notifiers = all_notifiers.clone();
-                                    let snap_tx = snapshot_trigger_tx.clone();
-                                    let clk = cached_clock.clone();
-
-                                    let peer_addr = tcp_stream.peer_addr()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|_| "unknown".to_string());
-
-                                    if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
-                                        // Monoio TLS handshake before handler spawn
-                                        let tls_cfg = tls_cfg_ref.clone();
-                                        monoio::spawn(async move {
-                                            let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
-                                            match acceptor.accept(tcp_stream).await {
-                                                Ok(tls_stream) => {
-                                                    let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
-                                                    handle_connection_sharded_monoio(
-                                                        tls_stream, peer_addr, dbs, shard_id, num_shards,
-                                                        dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                                        rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                                                        snap_tx, clk,
-                                                    ).await;
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("Shard {}: Monoio TLS handshake failed: {}", shard_id, e);
-                                                }
-                                            }
-                                        });
-                                    } else {
-                                        // Plain TCP connection
-                                        monoio::spawn(async move {
-                                            let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
-                                            handle_connection_sharded_monoio(
-                                                tcp_stream, peer_addr, dbs, shard_id, num_shards,
-                                                dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                                                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                                                snap_tx, clk,
-                                            ).await;
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Shard {}: from_std failed: {}", shard_id, e);
-                                }
-                            }
                         }
                         Err(_) => {
                             info!("Shard {} connection channel closed", self.id);
@@ -723,148 +334,189 @@ impl Shard {
                 }
                 // SPSC notify -- event-driven cross-shard message drain
                 _ = spsc_notify_local.notified() => {
-                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
-                    Self::drain_spsc_shared(
-                        &databases,
-                        &mut consumers,
-                        &mut *pubsub_rc.borrow_mut(),
-                        &blocking_rc,
-                        &mut pending_snapshot,
-                        &mut snapshot_state,
-                        &mut wal_writer,
-                        &mut repl_backlog,
-                        &mut replica_txs,
-                        &repl_state,
-                        shard_id,
-                        &script_cache_rc,
-                        &cached_clock,
+                    let mut pending_snapshot = None;
+                    spsc_handler::drain_spsc_shared(
+                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &repl_state, shard_id, &script_cache_rc, &cached_clock,
                     );
-
-                    // Handle pending SnapshotBegin from SPSC (monoio notify arm)
-                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
-                        if snapshot_state.is_some() {
-                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
-                        } else {
-                            let dbs = databases.borrow();
-                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
-                            snapshot_reply_tx = Some(reply_tx);
-                            drop(dbs);
-                        }
-                    }
+                    persistence_tick::handle_pending_snapshot(
+                        pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
+                        &databases, shard_id,
+                    );
                 }
-                // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
+                // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.tick() => {
-                    // Refresh the per-shard cached clock once per tick (1ms).
                     cached_clock.update();
 
-                    let mut pending_snapshot: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)> = None;
-                    Self::drain_spsc_shared(
-                        &databases,
-                        &mut consumers,
-                        &mut *pubsub_rc.borrow_mut(),
-                        &blocking_rc,
-                        &mut pending_snapshot,
-                        &mut snapshot_state,
-                        &mut wal_writer,
-                        &mut repl_backlog,
-                        &mut replica_txs,
-                        &repl_state,
-                        shard_id,
-                        &script_cache_rc,
-                        &cached_clock,
+                    let mut pending_snapshot = None;
+                    spsc_handler::drain_spsc_shared(
+                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                    );
+                    persistence_tick::handle_pending_snapshot(
+                        pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
+                        &databases, shard_id,
                     );
 
-                    // Handle pending SnapshotBegin from SPSC (monoio periodic arm)
-                    if let Some((epoch, snap_dir, reply_tx)) = pending_snapshot {
-                        if snapshot_state.is_some() {
-                            let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
-                        } else {
-                            let dbs = databases.borrow();
-                            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-                            snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
-                            snapshot_reply_tx = Some(reply_tx);
-                            drop(dbs);
-                        }
-                    }
-
-                    // Check watch channel for auto-save snapshot triggers
-                    {
-                        let new_epoch = snapshot_trigger_rx.borrow();
-                        if new_epoch > last_snapshot_epoch && snapshot_state.is_none() {
-                            last_snapshot_epoch = new_epoch;
-                            if let Some(ref dir) = persistence_dir {
-                                let snap_path = std::path::PathBuf::from(dir)
-                                    .join(format!("shard-{}.rrdshard", shard_id));
-                                let dbs = databases.borrow();
-                                snapshot_state = Some(SnapshotState::new(
-                                    shard_id as u16, new_epoch, &dbs, snap_path,
-                                ));
-                                drop(dbs);
-                            }
-                        }
-                    }
+                    persistence_tick::check_auto_save_trigger(
+                        &snapshot_trigger_rx, &mut last_snapshot_epoch,
+                        &mut snapshot_state, &databases, &persistence_dir, shard_id,
+                    );
 
                     // Advance snapshot one segment per tick (cooperative)
-                    if let Some(ref mut snap) = snapshot_state {
-                        let done = {
-                            let dbs = databases.borrow();
-                            snap.advance_one_segment(&dbs)
-                        };
-                        if done {
-                            let epoch = snap.epoch;
+                    if persistence_tick::advance_snapshot_segment(&mut snapshot_state, &databases) {
+                        if let Some(snap) = snapshot_state.as_mut() {
                             if let Err(e) = snap.finalize_async().await {
-                                tracing::error!("Shard {}: snapshot finalize failed: {}", shard_id, e);
-                                if let Some(tx) = snapshot_reply_tx.take() {
-                                    let _ = tx.send(Err(format!("finalize failed: {}", e)));
-                                }
-                                crate::command::persistence::bgsave_shard_done(false);
+                                persistence_tick::finalize_snapshot_error(
+                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
+                                    &e.to_string(),
+                                );
                             } else {
-                                info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
-                                if let Some(ref mut wal) = wal_writer {
-                                    let _ = wal.truncate_after_snapshot(epoch);
-                                }
-                                if let Some(tx) = snapshot_reply_tx.take() {
-                                    let _ = tx.send(Ok(()));
-                                }
-                                crate::command::persistence::bgsave_shard_done(true);
+                                persistence_tick::finalize_snapshot_success(
+                                    &mut snapshot_state, &mut snapshot_reply_tx,
+                                    &mut wal_writer, shard_id,
+                                );
                             }
-                            snapshot_state = None;
                         }
                     }
 
-                    // Flush WAL on 1ms tick
-                    if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.flush_if_needed();
+                    persistence_tick::flush_wal_if_needed(&mut wal_writer);
+
+                    // On Linux: poll io_uring for completions (non-blocking)
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut driver) = uring_state {
+                        let _ = driver.submit_and_wait_nonblocking();
+                        let events = driver.drain_completions();
+                        for event in events {
+                            uring_handler::handle_uring_event(
+                                event, driver, &databases, &mut uring_parse_bufs,
+                                &mut inflight_sends, uring_listener_fd, &cached_clock,
+                            );
+                        }
                     }
                 }
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {
-                    if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.sync_to_disk();
-                    }
+                    timers::sync_wal(&mut wal_writer);
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.tick() => {
-                    let now = std::time::Instant::now();
-                    blocking_rc.borrow_mut().expire_timed_out(now);
+                    timers::expire_blocked_clients(&blocking_rc);
+                }
+                // Cooperative active expiry
+                _ = expiry_interval.tick() => {
+                    timers::run_active_expiry(&databases);
+                }
+                // Background eviction timer
+                _ = eviction_interval.tick() => {
+                    timers::run_eviction(&databases, &runtime_config);
+                }
+                _ = shutdown.cancelled() => {
+                    info!("Shard {} shutting down", self.id);
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.shutdown();
+                    }
+                    break;
+                }
+            }
+
+            // Monoio runtime: full event loop mirroring the tokio path.
+            #[cfg(feature = "runtime-monoio")]
+            monoio::select! {
+                // Accept new connections from listener
+                stream = conn_rx.recv_async() => {
+                    match stream {
+                        Ok((std_tcp_stream, is_tls)) => {
+                            conn_accept::spawn_monoio_connection(
+                                std_tcp_stream, is_tls, &tls_config,
+                                &databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        Err(_) => {
+                            info!("Shard {} connection channel closed", self.id);
+                            break;
+                        }
+                    }
+                }
+                // SPSC notify -- event-driven cross-shard message drain
+                _ = spsc_notify_local.notified() => {
+                    let mut pending_snapshot = None;
+                    spsc_handler::drain_spsc_shared(
+                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                    );
+                    persistence_tick::handle_pending_snapshot(
+                        pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
+                        &databases, shard_id,
+                    );
+                }
+                // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
+                _ = periodic_interval.tick() => {
+                    cached_clock.update();
+
+                    let mut pending_snapshot = None;
+                    spsc_handler::drain_spsc_shared(
+                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                    );
+                    persistence_tick::handle_pending_snapshot(
+                        pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
+                        &databases, shard_id,
+                    );
+
+                    persistence_tick::check_auto_save_trigger(
+                        &snapshot_trigger_rx, &mut last_snapshot_epoch,
+                        &mut snapshot_state, &databases, &persistence_dir, shard_id,
+                    );
+
+                    // Advance snapshot one segment per tick (cooperative)
+                    if persistence_tick::advance_snapshot_segment(&mut snapshot_state, &databases) {
+                        if let Some(snap) = snapshot_state.as_mut() {
+                            if let Err(e) = snap.finalize_async().await {
+                                persistence_tick::finalize_snapshot_error(
+                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
+                                    &e.to_string(),
+                                );
+                                crate::command::persistence::bgsave_shard_done(false);
+                            } else {
+                                persistence_tick::finalize_snapshot_success(
+                                    &mut snapshot_state, &mut snapshot_reply_tx,
+                                    &mut wal_writer, shard_id,
+                                );
+                                crate::command::persistence::bgsave_shard_done(true);
+                            }
+                        }
+                    }
+
+                    persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                }
+                // WAL fsync on 1-second interval
+                _ = wal_sync_interval.tick() => {
+                    timers::sync_wal(&mut wal_writer);
+                }
+                // Expire timed-out blocked clients every 10ms
+                _ = block_timeout_interval.tick() => {
+                    timers::expire_blocked_clients(&blocking_rc);
                 }
                 // Cooperative active expiry every 100ms
                 _ = expiry_interval.tick() => {
-                    let mut dbs = databases.borrow_mut();
-                    for db in dbs.iter_mut() {
-                        crate::server::expiration::expire_cycle_direct(db);
-                    }
+                    timers::run_active_expiry(&databases);
                 }
-                // Background eviction timer -- proactive memory reclaim every 100ms
+                // Background eviction timer
                 _ = eviction_interval.tick() => {
-                    let rt = runtime_config.read().unwrap();
-                    if rt.maxmemory > 0 {
-                        let mut dbs = databases.borrow_mut();
-                        for db in dbs.iter_mut() {
-                            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
-                        }
-                    }
+                    timers::run_eviction(&databases, &runtime_config);
                 }
                 // Shutdown
                 _ = shutdown.cancelled() => {
@@ -906,869 +558,6 @@ impl Shard {
                 PubSubRegistry::new()
             }
         };
-    }
-
-    /// Drain all SPSC consumer channels, processing cross-shard messages.
-    ///
-    /// SnapshotBegin messages are collected into `pending_snapshot` for deferred handling
-    /// (the caller has mutable access to snapshot_state). COW intercepts and WAL appends
-    /// happen inline for Execute/MultiExecute write commands.
-    fn drain_spsc_shared(
-        databases: &Rc<RefCell<Vec<Database>>>,
-        consumers: &mut [HeapCons<ShardMessage>],
-        pubsub_registry: &mut PubSubRegistry,
-        blocking_registry: &Rc<RefCell<BlockingRegistry>>,
-        pending_snapshot: &mut Option<(
-            u64,
-            std::path::PathBuf,
-            channel::OneshotSender<Result<(), String>>,
-        )>,
-        snapshot_state: &mut Option<SnapshotState>,
-        wal_writer: &mut Option<WalWriter>,
-        repl_backlog: &mut Option<ReplicationBacklog>,
-        replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
-        repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-        shard_id: usize,
-        script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
-        cached_clock: &CachedClock,
-    ) {
-        const MAX_DRAIN_PER_CYCLE: usize = 256;
-        let mut drained = 0;
-
-        // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
-        let mut execute_batch: Vec<ShardMessage> = Vec::new();
-        let mut other_messages: Vec<ShardMessage> = Vec::new();
-
-        for consumer in consumers.iter_mut() {
-            while drained < MAX_DRAIN_PER_CYCLE {
-                match consumer.try_pop() {
-                    Some(msg) => {
-                        drained += 1;
-                        match &msg {
-                            ShardMessage::Execute { .. }
-                            | ShardMessage::PipelineBatch { .. }
-                            | ShardMessage::MultiExecute { .. } => {
-                                execute_batch.push(msg);
-                            }
-                            _ => other_messages.push(msg),
-                        }
-                    }
-                    None => break,
-                }
-            }
-            if drained >= MAX_DRAIN_PER_CYCLE {
-                break;
-            }
-        }
-
-        // Process Execute/PipelineBatch/MultiExecute batch under single borrow_mut
-        if !execute_batch.is_empty() {
-            for msg in execute_batch {
-                // Each handler borrows internally, but we avoid interleaving
-                // with non-Execute messages that might also borrow differently.
-                Self::handle_shard_message_shared(
-                    databases,
-                    pubsub_registry,
-                    blocking_registry,
-                    msg,
-                    pending_snapshot,
-                    snapshot_state,
-                    wal_writer,
-                    repl_backlog,
-                    replica_txs,
-                    repl_state,
-                    shard_id,
-                    script_cache,
-                    cached_clock,
-                );
-            }
-        }
-
-        // Process other messages (PubSubFanOut, SnapshotBegin, etc.)
-        for msg in other_messages {
-            Self::handle_shard_message_shared(
-                databases,
-                pubsub_registry,
-                blocking_registry,
-                msg,
-                pending_snapshot,
-                snapshot_state,
-                wal_writer,
-                repl_backlog,
-                replica_txs,
-                repl_state,
-                shard_id,
-                script_cache,
-                cached_clock,
-            );
-        }
-    }
-
-    /// Process a single cross-shard message using shared database access.
-    ///
-    /// Performs COW intercept for write commands when a snapshot is active,
-    /// and appends write commands to the per-shard WAL writer.
-    fn handle_shard_message_shared(
-        databases: &Rc<RefCell<Vec<Database>>>,
-        pubsub_registry: &mut PubSubRegistry,
-        blocking_registry: &Rc<RefCell<BlockingRegistry>>,
-        msg: ShardMessage,
-        pending_snapshot: &mut Option<(
-            u64,
-            std::path::PathBuf,
-            channel::OneshotSender<Result<(), String>>,
-        )>,
-        snapshot_state: &mut Option<SnapshotState>,
-        wal_writer: &mut Option<WalWriter>,
-        repl_backlog: &mut Option<ReplicationBacklog>,
-        replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
-        repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-        shard_id: usize,
-        script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
-        cached_clock: &CachedClock,
-    ) {
-        match msg {
-            ShardMessage::Execute {
-                db_index,
-                command,
-                reply_tx,
-            } => {
-                let response = {
-                    let mut dbs = databases.borrow_mut();
-                    let db_count = dbs.len();
-                    let db_idx = db_index.min(db_count.saturating_sub(1));
-                    dbs[db_idx].refresh_now_from_cache(cached_clock);
-                    let (cmd, args) = match Self::extract_command_static(&command) {
-                        Some(pair) => pair,
-                        None => {
-                            let _ = reply_tx.send(crate::protocol::Frame::Error(
-                                bytes::Bytes::from_static(b"ERR invalid command format"),
-                            ));
-                            return;
-                        }
-                    };
-
-                    // COW intercept: capture old value before write if snapshot is active
-                    let is_write = metadata::is_write(cmd);
-                    if is_write {
-                        Self::cow_intercept(snapshot_state, &dbs, db_idx, &command);
-                    }
-
-                    let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
-                    let frame = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => f,
-                    };
-
-                    // WAL append + replication fan-out for successful write commands
-                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(&command);
-                        Self::wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                        );
-                    }
-
-                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
-                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            || cmd.eq_ignore_ascii_case(b"ZADD")
-                            || cmd.eq_ignore_ascii_case(b"XADD");
-                        if needs_wake {
-                            if let Some(key) = args
-                                .first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                            {
-                                let mut reg = blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg,
-                                        &mut dbs[db_idx],
-                                        db_idx,
-                                        &key,
-                                    );
-                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg,
-                                        &mut dbs[db_idx],
-                                        db_idx,
-                                        &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg,
-                                        &mut dbs[db_idx],
-                                        db_idx,
-                                        &key,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    frame
-                };
-                let _ = reply_tx.send(response);
-            }
-            ShardMessage::MultiExecute {
-                db_index,
-                commands,
-                reply_tx,
-            } => {
-                let mut results = Vec::with_capacity(commands.len());
-                let mut dbs = databases.borrow_mut();
-                let db_count = dbs.len();
-                let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now_from_cache(cached_clock);
-                for (_key, cmd_frame) in &commands {
-                    let (cmd, args) = match Self::extract_command_static(cmd_frame) {
-                        Some(pair) => pair,
-                        None => {
-                            results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR invalid command format",
-                            )));
-                            continue;
-                        }
-                    };
-
-                    // COW intercept for each write command in the batch
-                    let is_write = metadata::is_write(cmd);
-                    if is_write {
-                        Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
-                    }
-
-                    let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
-                    let frame = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => f,
-                    };
-
-                    // WAL append + replication fan-out for successful write commands
-                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        Self::wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                        );
-                    }
-
-                    results.push(frame);
-                }
-                let _ = reply_tx.send(results);
-            }
-            ShardMessage::PipelineBatch {
-                db_index,
-                commands,
-                reply_tx,
-            } => {
-                let mut results = Vec::with_capacity(commands.len());
-                let mut dbs = databases.borrow_mut();
-                let db_count = dbs.len();
-                let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now_from_cache(cached_clock);
-                for cmd_frame in &commands {
-                    let (cmd, args) = match Self::extract_command_static(cmd_frame) {
-                        Some(pair) => pair,
-                        None => {
-                            results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR invalid command format",
-                            )));
-                            continue;
-                        }
-                    };
-
-                    // COW intercept for each write command in the batch
-                    let is_write = metadata::is_write(cmd);
-                    if is_write {
-                        Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
-                    }
-
-                    let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
-                    let frame = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => f,
-                    };
-
-                    // WAL append + replication fan-out for successful write commands
-                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        Self::wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                        );
-                    }
-
-                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
-                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            || cmd.eq_ignore_ascii_case(b"ZADD")
-                            || cmd.eq_ignore_ascii_case(b"XADD");
-                        if needs_wake {
-                            if let Some(key) = args
-                                .first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                            {
-                                let mut reg = blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg,
-                                        &mut dbs[db_idx],
-                                        db_idx,
-                                        &key,
-                                    );
-                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg,
-                                        &mut dbs[db_idx],
-                                        db_idx,
-                                        &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_stream_waiter(
-                                        &mut reg,
-                                        &mut dbs[db_idx],
-                                        db_idx,
-                                        &key,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    results.push(frame);
-                }
-                let _ = reply_tx.send(results);
-            }
-            ShardMessage::PubSubFanOut { channel, message } => {
-                pubsub_registry.publish(&channel, &message);
-            }
-            ShardMessage::ScriptLoad { sha1, script } => {
-                // Fan-out: cache this script on this shard so EVALSHA works locally
-                let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
-                if computed == sha1 {
-                    script_cache.borrow_mut().load(script);
-                }
-            }
-            ShardMessage::SnapshotBegin {
-                epoch,
-                snapshot_dir,
-                reply_tx,
-            } => {
-                // Defer to main event loop where we have mutable access to snapshot_state
-                *pending_snapshot = Some((epoch, snapshot_dir, reply_tx));
-            }
-            ShardMessage::BlockRegister {
-                db_index,
-                key,
-                wait_id,
-                cmd,
-                reply_tx,
-            } => {
-                let entry = crate::blocking::WaitEntry {
-                    wait_id,
-                    cmd,
-                    reply_tx,
-                    deadline: None, // Remote registrations don't manage timeout locally
-                };
-                let mut reg = blocking_registry.borrow_mut();
-                reg.register(db_index, key.clone(), entry);
-                // Check if data is already available (race: data arrived before registration).
-                // Only attempt wakeup if the key exists -- try_wake_list_waiter
-                // destroys the waiter even when no data is available (sends None = timeout).
-                let mut dbs = databases.borrow_mut();
-                if dbs[db_index].exists(&key) {
-                    let db = &mut dbs[db_index];
-                    crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, db_index, &key);
-                    crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, db_index, &key);
-                    crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, db, db_index, &key);
-                }
-            }
-            ShardMessage::BlockCancel { wait_id } => {
-                blocking_registry.borrow_mut().remove_wait(wait_id);
-            }
-            ShardMessage::GetKeysInSlot {
-                db_index,
-                slot,
-                count,
-                reply_tx,
-            } => {
-                let keys = crate::cluster::migration::handle_get_keys_in_slot(
-                    &databases.borrow(),
-                    db_index,
-                    slot,
-                    count,
-                );
-                let _ = reply_tx.send(keys);
-            }
-            ShardMessage::SlotOwnershipUpdate {
-                add_slots: _,
-                remove_slots: _,
-            } => {
-                // Slot ownership is tracked in ClusterState, not per-shard.
-                // This message is a no-op notification for future per-shard slot caching.
-            }
-            ShardMessage::Shutdown => {
-                info!("Received shutdown via SPSC");
-            }
-            ShardMessage::RegisterReplica { replica_id, tx } => {
-                // Lazy-init replication backlog on first replica registration (saves 1MB/shard)
-                if repl_backlog.is_none() {
-                    *repl_backlog = Some(ReplicationBacklog::new(1024 * 1024));
-                }
-                replica_txs.push((replica_id, tx));
-            }
-            ShardMessage::UnregisterReplica { replica_id } => {
-                replica_txs.retain(|(id, _)| *id != replica_id);
-            }
-            ShardMessage::NewConnection(_) => {
-                // NewConnection is handled via conn_rx, not SPSC
-            }
-        }
-    }
-
-    /// COW intercept: capture old value for a key being written if its segment is pending.
-    ///
-    /// Called before cmd_dispatch to preserve snapshot consistency. Only clones the old entry
-    /// if the key's segment is actually pending serialization (fast bool check in hot path).
-    fn cow_intercept(
-        snapshot: &mut Option<SnapshotState>,
-        dbs: &[Database],
-        db_index: usize,
-        command: &crate::protocol::Frame,
-    ) {
-        let Some(snap) = snapshot else { return };
-        // Extract the primary key from the command (args[1] for Array commands)
-        let key = match command {
-            crate::protocol::Frame::Array(args) if args.len() >= 2 => match &args[1] {
-                crate::protocol::Frame::BulkString(k) => k,
-                _ => return,
-            },
-            _ => return,
-        };
-        let hash = crate::storage::dashtable::hash_key(key);
-        let seg_idx = dbs[db_index].data().segment_index_for_hash(hash);
-        if snap.is_segment_pending(db_index, seg_idx) {
-            if let Some(old_entry) = dbs[db_index].data().get(key) {
-                snap.capture_cow(db_index, seg_idx, key.clone(), old_entry.clone());
-            }
-        }
-    }
-
-    /// Send a serialized response buffer via io_uring.
-    ///
-    /// Tries the pre-registered fixed buffer pool first (zero get_user_pages overhead).
-    /// If the pool is exhausted or the response is too large for a pooled buffer,
-    /// falls back to heap-allocated BytesMut with regular submit_send.
-    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-    fn send_serialized(
-        driver: &mut UringDriver,
-        conn_id: u32,
-        resp_buf: bytes::BytesMut,
-        inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
-    ) {
-        let resp_len = resp_buf.len();
-        // Try pooled fixed buffer: must fit in pool buffer size
-        if let Some((buf_idx, pool_buf)) = driver.alloc_send_buf() {
-            if resp_len <= pool_buf.len() {
-                pool_buf[..resp_len].copy_from_slice(&resp_buf);
-                let _ = driver.submit_send_fixed(conn_id, buf_idx, resp_len as u32);
-                inflight_sends
-                    .entry(conn_id)
-                    .or_default()
-                    .push(InFlightSend::Fixed(buf_idx));
-                return;
-            }
-            // Response too large for pooled buffer -- reclaim and fall through to heap
-            driver.reclaim_send_buf(buf_idx);
-        }
-        // Fallback: heap-allocated BytesMut with regular send
-        let len = resp_len as u32;
-        let ptr = resp_buf.as_ptr();
-        let _ = driver.submit_send(conn_id, ptr, len);
-        inflight_sends
-            .entry(conn_id)
-            .or_default()
-            .push(InFlightSend::Buf(resp_buf));
-    }
-
-    /// Handles recv (parse RESP frames + execute commands + send responses),
-    /// disconnect, recv rearm, accept, and send completion events.
-    /// Command dispatch reuses the same `extract_command_static` + `cmd_dispatch`
-    /// path as the Tokio connection handler.
-    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-    fn handle_uring_event(
-        event: IoEvent,
-        driver: &mut UringDriver,
-        databases: &Rc<RefCell<Vec<Database>>>,
-        parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
-        inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
-        uring_listener_fd: Option<std::os::fd::RawFd>,
-        cached_clock: &CachedClock,
-    ) {
-        match event {
-            IoEvent::Recv { conn_id, data } => {
-                let parse_buf = parse_bufs
-                    .entry(conn_id)
-                    .or_insert_with(|| bytes::BytesMut::with_capacity(4096));
-                parse_buf.extend_from_slice(&data);
-
-                // Phase A: Parse all frames into a batch (up to 1024, matching Tokio path MAX_BATCH).
-                let parse_config = crate::protocol::ParseConfig::default();
-                let mut batch: Vec<crate::protocol::Frame> = Vec::with_capacity(16);
-                let mut parse_error = false;
-                loop {
-                    match crate::protocol::parse(parse_buf, &parse_config) {
-                        Ok(Some(frame)) => {
-                            batch.push(frame);
-                            if batch.len() >= 1024 {
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(crate::protocol::ParseError::Incomplete) => break,
-                        Err(_) => {
-                            parse_error = true;
-                            break;
-                        }
-                    }
-                }
-
-                if parse_error {
-                    // Protocol error: close connection, reclaim pooled buffers
-                    if let Some(sends) = inflight_sends.remove(&conn_id) {
-                        for send in sends {
-                            if let InFlightSend::Fixed(idx) = send {
-                                driver.reclaim_send_buf(idx);
-                            }
-                        }
-                    }
-                    let _ = driver.close_connection(conn_id);
-                    parse_bufs.remove(&conn_id);
-                    return;
-                }
-
-                if batch.is_empty() {
-                    return;
-                }
-
-                // Phase B: Dispatch all commands under a single borrow_mut (reduces
-                // RefCell overhead from N borrows to 1 per batch).
-                let responses: Vec<crate::protocol::Frame> = {
-                    let mut dbs = databases.borrow_mut();
-                    let db_count = dbs.len();
-                    dbs[0].refresh_now_from_cache(cached_clock);
-                    let mut selected = 0usize;
-                    batch
-                        .iter()
-                        .map(|frame| {
-                            let (cmd, args) = match Self::extract_command_static(frame) {
-                                Some(pair) => pair,
-                                None => {
-                                    return crate::protocol::Frame::Error(
-                                        bytes::Bytes::from_static(b"ERR invalid command"),
-                                    );
-                                }
-                            };
-                            let result =
-                                cmd_dispatch(&mut dbs[0], cmd, args, &mut selected, db_count);
-                            match result {
-                                DispatchResult::Response(f) => f,
-                                DispatchResult::Quit(f) => f,
-                            }
-                        })
-                        .collect()
-                };
-
-                // Phase C: Serialize and send all responses (outside borrow).
-                // Priority: 1) BulkString writev (zero-copy GET), 2) Fixed pool buf
-                // (no get_user_pages), 3) Heap BytesMut fallback.
-                for response in responses {
-                    match response {
-                        crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
-                            // Zero-copy path: scatter-gather via writev
-                            match driver.submit_writev_bulkstring(conn_id, value.clone()) {
-                                Ok(guard) => {
-                                    inflight_sends
-                                        .entry(conn_id)
-                                        .or_default()
-                                        .push(InFlightSend::Writev(guard));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "writev failed for conn {}: {}, falling back to send",
-                                        conn_id,
-                                        e
-                                    );
-                                    let mut resp_buf = bytes::BytesMut::new();
-                                    crate::protocol::serialize(&response, &mut resp_buf);
-                                    Self::send_serialized(
-                                        driver,
-                                        conn_id,
-                                        resp_buf,
-                                        inflight_sends,
-                                    );
-                                }
-                            }
-                        }
-                        crate::protocol::Frame::PreSerialized(ref data) if !data.is_empty() => {
-                            // Zero-copy path for PreSerialized: already RESP wire format
-                            match driver.submit_send_preserialized(conn_id, data.clone()) {
-                                Ok(guard) => {
-                                    inflight_sends
-                                        .entry(conn_id)
-                                        .or_default()
-                                        .push(InFlightSend::Writev(guard));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "writev preserialized failed for conn {}: {}, falling back",
-                                        conn_id,
-                                        e
-                                    );
-                                    let mut resp_buf = bytes::BytesMut::new();
-                                    crate::protocol::serialize(&response, &mut resp_buf);
-                                    Self::send_serialized(
-                                        driver,
-                                        conn_id,
-                                        resp_buf,
-                                        inflight_sends,
-                                    );
-                                }
-                            }
-                        }
-                        _ => {
-                            let mut resp_buf = bytes::BytesMut::new();
-                            crate::protocol::serialize(&response, &mut resp_buf);
-                            Self::send_serialized(driver, conn_id, resp_buf, inflight_sends);
-                        }
-                    }
-                }
-            }
-            IoEvent::Disconnect { conn_id } => {
-                // Reclaim all pooled Fixed buffers before removing the connection
-                if let Some(sends) = inflight_sends.remove(&conn_id) {
-                    for send in sends {
-                        if let InFlightSend::Fixed(idx) = send {
-                            driver.reclaim_send_buf(idx);
-                        }
-                    }
-                }
-                let _ = driver.close_connection(conn_id);
-                parse_bufs.remove(&conn_id);
-            }
-            IoEvent::RecvNeedsRearm { conn_id } => {
-                let _ = driver.rearm_recv(conn_id);
-            }
-            IoEvent::Accept { raw_fd } => {
-                // Direct accept from multishot (if listener fd is registered)
-                let _ = driver.register_connection(raw_fd);
-            }
-            IoEvent::AcceptError { .. } => {
-                // Multishot accept cancelled on error -- re-submit
-                if let Some(lfd) = uring_listener_fd {
-                    let _ = driver.submit_multishot_accept(lfd);
-                }
-            }
-            IoEvent::SendComplete { conn_id } => {
-                // Drop the oldest in-flight send buffer (FIFO order matches CQE order).
-                // Fixed buffers are reclaimed to pool; Buf/Writev are dropped (freed).
-                if let Some(sends) = inflight_sends.get_mut(&conn_id) {
-                    if !sends.is_empty() {
-                        let send = sends.remove(0);
-                        if let InFlightSend::Fixed(idx) = send {
-                            driver.reclaim_send_buf(idx);
-                        }
-                        // Buf and Writev variants: drop frees memory
-                    }
-                    if sends.is_empty() {
-                        inflight_sends.remove(&conn_id);
-                    }
-                }
-            }
-            IoEvent::SendError { conn_id, .. } => {
-                // Reclaim all pooled Fixed buffers before cleanup
-                if let Some(sends) = inflight_sends.remove(&conn_id) {
-                    for send in sends {
-                        if let InFlightSend::Fixed(idx) = send {
-                            driver.reclaim_send_buf(idx);
-                        }
-                    }
-                }
-                let _ = driver.close_connection(conn_id);
-                parse_bufs.remove(&conn_id);
-            }
-            IoEvent::Timeout | IoEvent::Wakeup => {
-                // Handled by the spsc_interval tick (already draining SPSC)
-            }
-        }
-    }
-
-    /// Create an SO_REUSEPORT TCP listener socket for per-shard multishot accept.
-    ///
-    /// Each shard binds to the same address with SO_REUSEPORT, allowing the kernel
-    /// to distribute incoming connections across shard threads without a shared listener.
-    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-    fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
-        use std::net::SocketAddr;
-        let sock_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-        // Create TCP socket
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_INET,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // Set SO_REUSEPORT + SO_REUSEADDR
-        let optval: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-
-        // Bind
-        match sock_addr {
-            SocketAddr::V4(v4) => {
-                let sa = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as libc::sa_family_t,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: libc::in_addr {
-                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                    },
-                    sin_zero: [0; 8],
-                };
-                let ret = unsafe {
-                    libc::bind(
-                        fd,
-                        &sa as *const libc::sockaddr_in as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                    )
-                };
-                if ret < 0 {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            SocketAddr::V6(_) => {
-                unsafe {
-                    libc::close(fd);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "IPv6 not yet supported for SO_REUSEPORT listener",
-                ));
-            }
-        }
-
-        // Listen with backlog 1024
-        let ret = unsafe { libc::listen(fd, 1024) };
-        if ret < 0 {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(std::io::Error::last_os_error());
-        }
-
-        Ok(fd)
-    }
-
-    /// Append WAL bytes, update the replication backlog, advance the monotonic shard offset,
-    /// and fan-out to all connected replica sender channels (non-blocking try_send).
-    ///
-    /// CRITICAL: shard_offset in ReplicationState is SEPARATE from WalWriter::bytes_written.
-    /// WalWriter::bytes_written resets on snapshot truncation; shard_offset NEVER resets.
-    fn wal_append_and_fanout(
-        data: &[u8],
-        wal_writer: &mut Option<WalWriter>,
-        repl_backlog: &mut Option<ReplicationBacklog>,
-        replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
-        repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-        shard_id: usize,
-    ) {
-        // 1. WAL append (disk durability, unchanged behavior)
-        if let Some(w) = wal_writer {
-            w.append(data);
-        }
-        // 2. Replication backlog (in-memory circular buffer for partial resync)
-        if let Some(backlog) = repl_backlog {
-            backlog.append(data);
-        }
-        // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
-        if let Some(rs) = repl_state {
-            if let Ok(rs) = rs.try_read() {
-                rs.increment_shard_offset(shard_id, data.len() as u64);
-            }
-        }
-        // 4. Fan-out to replica sender tasks (non-blocking: lagging replicas are skipped)
-        if !replica_txs.is_empty() {
-            let bytes = bytes::Bytes::copy_from_slice(data);
-            for (_id, tx) in replica_txs {
-                let _ = tx.try_send(bytes.clone());
-            }
-        }
-    }
-
-    /// Extract command name and args from a Frame (static helper for SPSC dispatch).
-    fn extract_command_static(
-        frame: &crate::protocol::Frame,
-    ) -> Option<(&[u8], &[crate::protocol::Frame])> {
-        match frame {
-            crate::protocol::Frame::Array(args) if !args.is_empty() => {
-                let name = match &args[0] {
-                    crate::protocol::Frame::BulkString(s) => s.as_ref(),
-                    crate::protocol::Frame::SimpleString(s) => s.as_ref(),
-                    _ => return None,
-                };
-                Some((name, &args[1..]))
-            }
-            _ => None,
-        }
     }
 }
 
@@ -1833,7 +622,7 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        Shard::drain_spsc_shared(
+        spsc_handler::drain_spsc_shared(
             &databases,
             &mut [cons],
             &mut pubsub,
@@ -1887,7 +676,7 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        Shard::drain_spsc_shared(
+        spsc_handler::drain_spsc_shared(
             &databases,
             &mut [cons],
             &mut pubsub,
@@ -1907,7 +696,7 @@ mod tests {
     #[test]
     fn test_extract_command_static_ping() {
         let frame = Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING")),]);
-        let (cmd, args) = Shard::extract_command_static(&frame).unwrap();
+        let (cmd, args) = spsc_handler::extract_command_static(&frame).unwrap();
         assert_eq!(cmd, b"PING");
         assert!(args.is_empty());
     }
@@ -1919,7 +708,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"key")),
             Frame::BulkString(Bytes::from_static(b"value")),
         ]);
-        let (cmd, args) = Shard::extract_command_static(&frame).unwrap();
+        let (cmd, args) = spsc_handler::extract_command_static(&frame).unwrap();
         assert_eq!(cmd, b"SET");
         assert_eq!(args.len(), 2);
     }
@@ -1928,19 +717,18 @@ mod tests {
     fn test_extract_command_static_invalid() {
         // Non-array frame
         let frame = Frame::SimpleString(Bytes::from_static(b"PING"));
-        assert!(Shard::extract_command_static(&frame).is_none());
+        assert!(spsc_handler::extract_command_static(&frame).is_none());
 
         // Empty array
         let frame = Frame::Array(framevec![]);
-        assert!(Shard::extract_command_static(&frame).is_none());
+        assert!(spsc_handler::extract_command_static(&frame).is_none());
 
         // Array with non-string first element
         let frame = Frame::Array(framevec![Frame::Integer(42)]);
-        assert!(Shard::extract_command_static(&frame).is_none());
+        assert!(spsc_handler::extract_command_static(&frame).is_none());
     }
 
     /// Linux-only: verify handle_uring_event processes Disconnect correctly.
-    /// This test only compiles and runs on Linux CI.
     #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_disconnect() {
@@ -1958,8 +746,7 @@ mod tests {
 
         let clock = CachedClock::new();
 
-        // Process disconnect event -- should clean up parse buffer and inflight sends
-        Shard::handle_uring_event(
+        uring_handler::handle_uring_event(
             IoEvent::Disconnect { conn_id: 42 },
             &mut driver,
             &databases,
@@ -1992,8 +779,7 @@ mod tests {
 
         let clock = CachedClock::new();
 
-        // SendComplete should clean up oldest in-flight send (no panic if empty)
-        Shard::handle_uring_event(
+        uring_handler::handle_uring_event(
             IoEvent::SendComplete { conn_id: 1 },
             &mut driver,
             &databases,
