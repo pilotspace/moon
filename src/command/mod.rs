@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod hash;
+pub mod helpers;
 pub mod key;
 pub mod list;
 pub mod persistence;

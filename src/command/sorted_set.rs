@@ -8,26 +8,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::SortedSetRef;
-/// Helper: return ERR wrong number of arguments for a given command.
-fn err_wrong_args(cmd: &str) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR wrong number of arguments for '{}' command",
-        cmd
-    )))
-}
 
-/// Helper: return a generic error.
-fn err(msg: &str) -> Frame {
-    Frame::Error(Bytes::from(msg.to_string()))
-}
-
-/// Helper: extract &Bytes from a BulkString or SimpleString frame.
-fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
-    match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
-        _ => None,
-    }
-}
+use super::helpers::{err, err_wrong_args, extract_bytes};
 
 /// Format a float score for Redis output (strip trailing zeros, but keep at least one decimal).
 fn format_score(score: f64) -> String {
