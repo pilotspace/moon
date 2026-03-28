@@ -24,6 +24,35 @@ use crate::tracking::TrackingTable;
 use super::dispatch::ShardMessage;
 use super::shared_databases::ShardDatabases;
 
+/// Create a SO_REUSEPORT TCP listener socket using socket2.
+///
+/// Returns a `std::net::TcpListener` that can be converted to
+/// `tokio::net::TcpListener::from_std()` for per-shard accept, or consumed
+/// via `into_raw_fd()` for io_uring multishot accept.
+///
+/// Each shard calls this with the same address; the kernel distributes
+/// incoming connections across all sockets bound with SO_REUSEPORT.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_reuseport_socket(addr: &str) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let domain = if sock_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&sock_addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
 /// Build a read buffer that prepends synthetic RESP commands for state restoration.
 ///
 /// Used by `spawn_migrated_*_connection` to restore selected_db and client_name.

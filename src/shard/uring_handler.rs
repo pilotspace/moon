@@ -273,90 +273,12 @@ pub(crate) fn handle_uring_event(
 
 /// Create an SO_REUSEPORT TCP listener socket for per-shard multishot accept.
 ///
-/// Each shard binds to the same address with SO_REUSEPORT, allowing the kernel
-/// to distribute incoming connections across shard threads without a shared listener.
+/// Delegates to `conn_accept::create_reuseport_socket` (socket2-based) and
+/// converts the resulting `std::net::TcpListener` into a `RawFd` for io_uring
+/// multishot accept.
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 pub(crate) fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
-    use std::net::SocketAddr;
-    let sock_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-    // Create TCP socket
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_INET,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Set SO_REUSEPORT + SO_REUSEADDR
-    let optval: libc::c_int = 1;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-
-    // Bind
-    match sock_addr {
-        SocketAddr::V4(v4) => {
-            let sa = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: v4.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            let ret = unsafe {
-                libc::bind(
-                    fd,
-                    &sa as *const libc::sockaddr_in as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            };
-            if ret < 0 {
-                unsafe {
-                    libc::close(fd);
-                }
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        SocketAddr::V6(_) => {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "IPv6 not yet supported for SO_REUSEPORT listener",
-            ));
-        }
-    }
-
-    // Listen with backlog 1024
-    let ret = unsafe { libc::listen(fd, 1024) };
-    if ret < 0 {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(fd)
+    use std::os::unix::io::IntoRawFd;
+    let std_listener = super::conn_accept::create_reuseport_socket(addr)?;
+    Ok(std_listener.into_raw_fd())
 }
