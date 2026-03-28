@@ -20,6 +20,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::config::RuntimeConfig;
 use crate::persistence::aof;
+use crate::persistence::replay::DispatchReplayEngine;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
 use crate::pubsub::PubSubRegistry;
@@ -124,7 +125,7 @@ impl Shard {
         // Replay per-shard WAL
         let wal_file = wal::wal_path(dir, self.id);
         if wal_file.exists() {
-            match wal::replay_wal(&mut self.databases, &wal_file) {
+            match wal::replay_wal(&mut self.databases, &wal_file, &DispatchReplayEngine) {
                 Ok(n) => {
                     info!("Shard {}: replayed {} WAL commands", self.id, n);
                     total_keys += n;

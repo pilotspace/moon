@@ -322,17 +322,17 @@ impl WalWriter {
 /// by checking whether the first 6 bytes match the WAL_MAGIC signature.
 ///
 /// Returns the number of commands successfully replayed.
-pub fn replay_wal(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
+pub fn replay_wal(databases: &mut [Database], path: &Path, engine: &dyn crate::persistence::replay::CommandReplayEngine) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
     }
     // Auto-detect: check if first 6 bytes match WAL_MAGIC
     if data.len() >= WAL_HEADER_SIZE && &data[..6] == WAL_MAGIC {
-        replay_wal_v2(databases, &data)
+        replay_wal_v2(databases, &data, engine)
     } else {
         // V1 fallback: delegate to AOF replay (raw RESP)
-        crate::persistence::aof::replay_aof(databases, path)
+        crate::persistence::aof::replay_aof(databases, path, engine)
     }
 }
 
@@ -340,7 +340,7 @@ pub fn replay_wal(databases: &mut [Database], path: &Path) -> Result<usize, Moon
 ///
 /// Parses the 32-byte header, then iterates over CRC32-checksummed block frames.
 /// Stops on first corrupted or truncated block, returning commands replayed so far.
-fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> Result<usize, MoonError> {
+fn replay_wal_v2(databases: &mut [Database], data: &[u8], engine: &dyn crate::persistence::replay::CommandReplayEngine) -> Result<usize, MoonError> {
     // Parse and validate header
     if data.len() < WAL_HEADER_SIZE {
         return Err(WalError::Corrupted {
@@ -370,7 +370,6 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> Result<usize, MoonE
     let mut offset = WAL_HEADER_SIZE;
     let mut total_commands: usize = 0;
     let config = crate::protocol::ParseConfig::default();
-    let db_count = databases.len();
     let mut selected_db: usize = 0;
 
     while offset < data.len() {
@@ -463,13 +462,7 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> Result<usize, MoonE
                             continue;
                         }
                     };
-                    let _ = crate::command::dispatch(
-                        &mut databases[selected_db],
-                        cmd,
-                        cmd_args,
-                        &mut selected_db,
-                        db_count,
-                    );
+                    engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                     total_commands += 1;
                 }
                 Ok(None) => {
@@ -503,6 +496,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::persistence::aof::serialize_command;
+    use crate::persistence::replay::DispatchReplayEngine;
     use crate::protocol::Frame;
     use crate::protocol::serialize;
 
@@ -565,7 +559,7 @@ mod tests {
 
         // Replay into databases
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, writer.path()).unwrap();
+        let count = replay_wal(&mut dbs, writer.path(), &DispatchReplayEngine).unwrap();
         assert_eq!(count, 3);
 
         assert_eq!(
@@ -709,7 +703,7 @@ mod tests {
 
         // Replay
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, writer.path()).unwrap();
+        let count = replay_wal(&mut dbs, writer.path(), &DispatchReplayEngine).unwrap();
         assert_eq!(count, 4);
 
         // Verify hash
@@ -813,7 +807,7 @@ mod tests {
 
         // replay_wal should auto-detect v1 (no RRDWAL magic) and delegate to replay_aof
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &path).unwrap();
+        let count = replay_wal(&mut dbs, &path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2);
         assert_eq!(
             dbs[0].get(b"oldkey1").unwrap().value.as_bytes().unwrap(),
@@ -872,7 +866,7 @@ mod tests {
 
         // Replay should stop after first block (3 commands)
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &corrupted_path).unwrap();
+        let count = replay_wal(&mut dbs, &corrupted_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 3, "should replay only first block's 3 commands");
 
         // Keys from block 1 should be set
@@ -915,7 +909,7 @@ mod tests {
 
         // Replay should return the 1 command from the valid first block
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &truncated_path).unwrap();
+        let count = replay_wal(&mut dbs, &truncated_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             dbs[0].get(b"tkey").unwrap().value.as_bytes().unwrap(),
@@ -931,7 +925,7 @@ mod tests {
         // Writer creates file with just the 32-byte header (no appends, no flush)
         let path = wal_path(dir.path(), 0);
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &path).unwrap();
+        let count = replay_wal(&mut dbs, &path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 0);
     }
 }

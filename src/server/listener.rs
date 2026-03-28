@@ -17,6 +17,8 @@ use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
 #[cfg(feature = "runtime-tokio")]
 use crate::persistence::rdb;
 #[cfg(feature = "runtime-tokio")]
+use crate::persistence::replay::DispatchReplayEngine;
+#[cfg(feature = "runtime-tokio")]
 use crate::pubsub::PubSubRegistry;
 #[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
@@ -82,7 +84,7 @@ pub async fn run_with_shutdown(
                 std::mem::replace(&mut *guard, Database::new())
             })
             .collect();
-        match aof::replay_aof(&mut dbs_vec, &aof_path) {
+        match aof::replay_aof(&mut dbs_vec, &aof_path, &DispatchReplayEngine) {
             Ok(n) => info!(
                 "AOF loaded: {} commands replayed from {}",
                 n,

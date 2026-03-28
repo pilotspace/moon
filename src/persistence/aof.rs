@@ -21,8 +21,8 @@ use crate::runtime::channel;
 use bytes::{Bytes, BytesMut};
 use tracing::{error, info, warn};
 
-use crate::command::{DispatchResult, dispatch};
 use crate::error::{AofError, MoonError};
+use crate::persistence::replay::CommandReplayEngine;
 use crate::framevec;
 use crate::protocol::{Frame, ParseConfig, parse, serialize};
 use crate::storage::compact_key::CompactKey;
@@ -222,7 +222,7 @@ pub async fn aof_writer_task(
 /// byte offset, skips to the next RESP array marker (`*`), and continues replay.
 /// At EOF, reports total corrupted entries skipped. Truncated tails are handled
 /// gracefully (warn + stop).
-pub fn replay_aof(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
+pub fn replay_aof(databases: &mut [Database], path: &Path, engine: &dyn CommandReplayEngine) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
@@ -234,7 +234,6 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> Result<usize, Moon
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
     let mut corruption_count: usize = 0;
-    let db_count = databases.len();
 
     loop {
         if buf.is_empty() {
@@ -261,22 +260,8 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> Result<usize, Moon
                         continue;
                     }
                 };
-                let result = dispatch(
-                    &mut databases[selected_db],
-                    cmd,
-                    cmd_args,
-                    &mut selected_db,
-                    db_count,
-                );
-                match result {
-                    DispatchResult::Response(_) => {
-                        count += 1;
-                    }
-                    DispatchResult::Quit(_) => {
-                        // QUIT in AOF is unexpected, skip
-                        count += 1;
-                    }
-                }
+                engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
+                count += 1;
             }
             Ok(None) => {
                 // Incomplete frame at end of file - truncated AOF
@@ -581,6 +566,7 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), Moo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::replay::DispatchReplayEngine;
     use ordered_float::OrderedFloat;
     use tempfile::tempdir;
 
@@ -631,7 +617,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2);
 
         let entry = dbs[0].get(b"k1").unwrap();
@@ -669,7 +655,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 4);
 
         // Check hash
@@ -706,7 +692,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2);
 
         let base_ts = dbs[0].base_timestamp();
@@ -728,7 +714,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new(), Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 3);
 
         assert!(dbs[0].get(b"k0").is_some());
@@ -742,7 +728,7 @@ mod tests {
         std::fs::write(&aof_path, b"").unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 0);
         assert_eq!(dbs[0].len(), 0);
     }
@@ -759,7 +745,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         // Should have loaded the first command
         assert_eq!(count, 1);
         assert!(dbs[0].get(b"k1").is_some());
@@ -814,7 +800,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded_dbs = vec![Database::new()];
-        let count = replay_aof(&mut loaded_dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert!(count >= 5, "Expected at least 5 commands, got {}", count);
 
         // Verify each type restored
@@ -846,7 +832,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded_dbs = vec![Database::new()];
-        let count = replay_aof(&mut loaded_dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2); // SET + PEXPIRE
 
         let base_ts = loaded_dbs[0].base_timestamp();
@@ -874,7 +860,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded = vec![Database::new()];
-        replay_aof(&mut loaded, &aof_path).unwrap();
+        replay_aof(&mut loaded, &aof_path, &DispatchReplayEngine).unwrap();
 
         // Check strings
         assert_eq!(loaded[0].get(b"a").unwrap().value.as_bytes().unwrap(), b"1");
