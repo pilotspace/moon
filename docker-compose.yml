@@ -21,11 +21,12 @@ services:
       dockerfile: Dockerfile
       args:
         # Override to use tokio runtime: runtime-tokio,jemalloc
+        # NOTE: monoio and tokio are mutually exclusive
         FEATURES: runtime-monoio,jemalloc
     container_name: moon
     ports:
       - "6379:6379"   # Redis protocol
-      - "6443:6443"   # TLS (optional, only active when --tls-port is set)
+      - "6443:6443"   # TLS (only active when --tls-port is set)
     volumes:
       - moon-data:/data   # Named volume for AOF persistence files
     restart: unless-stopped
@@ -34,7 +35,7 @@ services:
     # --shards 0 auto-detects CPU core count
     command: ["moon", "--bind", "0.0.0.0", "--port", "6379", "--shards", "0", "--protected-mode", "no"]
     healthcheck:
-      test: ["CMD", "moon", "--help"]
+      test: ["CMD", "/usr/local/bin/moon", "--help"]
       interval: 30s
       timeout: 5s
       retries: 3
