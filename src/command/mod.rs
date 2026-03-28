@@ -3,8 +3,10 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod hash;
+pub mod helpers;
 pub mod key;
 pub mod list;
+pub mod metadata;
 pub mod persistence;
 pub mod set;
 pub mod sorted_set;
@@ -617,76 +619,10 @@ fn err_unknown(cmd: &[u8]) -> Frame {
     )))
 }
 
-/// Check if a command is read-only (safe to execute under a shared read lock).
-///
-/// Uses (length, first_byte) dispatch for O(1) lookup.
-pub fn is_read_command(cmd: &[u8]) -> bool {
-    let len = cmd.len();
-    if len == 0 {
-        return false;
-    }
-    let b0 = cmd[0] | 0x20;
-    match (len, b0) {
-        (3, b'g') => cmd.eq_ignore_ascii_case(b"GET"),
-        (3, b't') => cmd.eq_ignore_ascii_case(b"TTL"),
-        (4, b'e') => cmd.eq_ignore_ascii_case(b"ECHO"),
-        (4, b'h') => cmd.eq_ignore_ascii_case(b"HGET") || cmd.eq_ignore_ascii_case(b"HLEN"),
-        (4, b'i') => cmd.eq_ignore_ascii_case(b"INFO"),
-        (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS"),
-        (4, b'l') => cmd.eq_ignore_ascii_case(b"LLEN") || cmd.eq_ignore_ascii_case(b"LPOS"),
-        (4, b'm') => cmd.eq_ignore_ascii_case(b"MGET"),
-        (4, b'p') => cmd.eq_ignore_ascii_case(b"PTTL") || cmd.eq_ignore_ascii_case(b"PING"),
-        (4, b's') => cmd.eq_ignore_ascii_case(b"SCAN"),
-        (4, b't') => cmd.eq_ignore_ascii_case(b"TYPE"),
-        (5, b'h') => {
-            cmd.eq_ignore_ascii_case(b"HMGET")
-                || cmd.eq_ignore_ascii_case(b"HKEYS")
-                || cmd.eq_ignore_ascii_case(b"HVALS")
-                || cmd.eq_ignore_ascii_case(b"HSCAN")
-        }
-        (5, b's') => {
-            cmd.eq_ignore_ascii_case(b"SCARD")
-                || cmd.eq_ignore_ascii_case(b"SDIFF")
-                || cmd.eq_ignore_ascii_case(b"SSCAN")
-        }
-        (5, b'z') => {
-            cmd.eq_ignore_ascii_case(b"ZCARD")
-                || cmd.eq_ignore_ascii_case(b"ZRANK")
-                || cmd.eq_ignore_ascii_case(b"ZSCAN")
-        }
-        (6, b'e') => cmd.eq_ignore_ascii_case(b"EXISTS"),
-        (6, b'l') => cmd.eq_ignore_ascii_case(b"LRANGE") || cmd.eq_ignore_ascii_case(b"LINDEX"),
-        (6, b's') => {
-            cmd.eq_ignore_ascii_case(b"STRLEN")
-                || cmd.eq_ignore_ascii_case(b"SINTER")
-                || cmd.eq_ignore_ascii_case(b"SUNION")
-        }
-        (6, b'z') => {
-            cmd.eq_ignore_ascii_case(b"ZSCORE")
-                || cmd.eq_ignore_ascii_case(b"ZRANGE")
-                || cmd.eq_ignore_ascii_case(b"ZCOUNT")
-        }
-        (7, b'c') => cmd.eq_ignore_ascii_case(b"COMMAND"),
-        (7, b'h') => cmd.eq_ignore_ascii_case(b"HGETALL") || cmd.eq_ignore_ascii_case(b"HEXISTS"),
-        (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
-        (8, b's') => cmd.eq_ignore_ascii_case(b"SMEMBERS"),
-        (8, b'z') => cmd.eq_ignore_ascii_case(b"ZREVRANK"),
-        (9, b's') => cmd.eq_ignore_ascii_case(b"SISMEMBER"),
-        (9, b'z') => {
-            cmd.eq_ignore_ascii_case(b"ZREVRANGE") || cmd.eq_ignore_ascii_case(b"ZLEXCOUNT")
-        }
-        (10, b's') => cmd.eq_ignore_ascii_case(b"SMISMEMBER"),
-        (11, b's') => cmd.eq_ignore_ascii_case(b"SRANDMEMBER"),
-        (13, b'z') => cmd.eq_ignore_ascii_case(b"ZRANGEBYSCORE"),
-        (16, b'z') => cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE"),
-        _ => false,
-    }
-}
-
 /// Dispatch a read-only command under a shared read lock.
 ///
 /// Takes `&Database` (immutable) and `now_ms` for expiry checks.
-/// Only called for commands where `is_read_command` returns true.
+/// Only called for commands where `metadata::is_read()` returns true.
 /// Uses (length, first_byte) dispatch for O(1) lookup.
 pub fn dispatch_read(
     db: &Database,
@@ -930,7 +866,7 @@ pub fn dispatch_read(
         _ => {}
     }
 
-    // Fallback: should not be reached if is_read_command is correct
+    // Fallback: should not be reached if metadata::is_read() is correct
     DispatchResult::Response(err_unknown(cmd))
 }
 

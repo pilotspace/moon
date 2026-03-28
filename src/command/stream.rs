@@ -6,19 +6,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::db::Database;
 use crate::storage::stream::StreamId;
-fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
-    match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
-        _ => None,
-    }
-}
 
-fn err_wrong_args(cmd: &str) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR wrong number of arguments for '{}' command",
-        cmd
-    )))
-}
+use super::helpers::{err_wrong_args, extract_bytes};
 
 /// Format a stream entry as a RESP nested array: [id, [field, value, ...]]
 pub(crate) fn format_entry(id: StreamId, fields: &[(Bytes, Bytes)]) -> Frame {

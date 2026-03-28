@@ -1,95 +1,16 @@
 # moon
 
-High-performance Redis-compatible server in Rust. Dual-runtime: monoio (default, io_uring/kqueue) and tokio.
+High-performance Redis-compatible server in Rust. See [README.md](README.md) for build/run/test commands, configuration flags, architecture diagram, and command reference.
 
-## Build
+## MSRV
 
-```bash
-# Default (monoio + jemalloc, Linux/macOS)
-cargo build --release
+Rust **1.85** (edition 2024). Enforced in CI.
 
-# Tokio runtime (required for macOS CI, CodeQL, GitHub Actions)
-cargo build --release --no-default-features --features runtime-tokio
+## Environment Variables
 
-# Force jemalloc with tokio
-cargo build --release --no-default-features --features runtime-tokio,jemalloc
-
-# Native CPU optimizations (for benchmarking)
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-```
-
-## Run
-
-```bash
-# Start server (default port 6379, 4 shards)
-./target/release/moon --port 6379 --shards 4
-
-# --shards 0 auto-detects CPU core count
-./target/release/moon --port 6379 --shards 0
-
-# With AOF persistence
-./target/release/moon --port 6379 --appendonly yes --appendfsync everysec
-
-# With TLS
-./target/release/moon --tls-port 6443 --tls-cert-file cert.pem --tls-key-file key.pem
-```
-
-## Test
-
-```bash
-# Unit + integration tests
-cargo test --all-features
-
-# Consistency tests (requires redis-server on PATH, compares moon vs Redis)
-./scripts/test-consistency.sh
-./scripts/test-consistency.sh --shards 4
-
-# Skip rebuild
-./scripts/test-consistency.sh --skip-build
-```
-
-## Benchmarks
-
-```bash
-# Criterion micro-benchmarks
-cargo bench --bench resp_parsing
-cargo bench --bench get_hotpath
-cargo bench --bench entry_memory
-cargo bench --bench bptree_memory
-cargo bench --bench compact_key
-
-# Production workload benchmark (compares vs Redis)
-# Use redis-benchmark 8.x (parses \r in responses), use -r flag for unique keys
-./scripts/bench-production.sh
-./scripts/bench-production.sh --shards 4 --duration 60
-
-# Resource/memory profiling
-./scripts/bench-resources.sh
-./scripts/profile.sh
-```
-
-## Architecture
-
-```
-src/
-├── server/       # TCP listener, connection handling
-├── io/           # Runtime-agnostic I/O abstractions
-├── runtime/      # tokio/monoio dual-runtime shim
-├── shard/        # Per-shard state, sharding mesh, VLL cross-shard coordinator
-├── storage/      # Data types: string, hash, list, set, zset, stream
-├── command/      # Command dispatch and parsing
-├── protocol/     # RESP2/RESP3 parser (zero-copy for large payloads)
-├── persistence/  # WAL/AOF (per-shard, no global lock)
-├── replication/  # Leader/follower replication
-├── cluster/      # Cluster mode (CRC16 slot routing)
-├── pubsub/       # Pub/sub channels
-├── scripting/    # Lua 5.4 scripting (mlua, lazy-initialized)
-├── acl/          # Access control lists
-├── blocking/     # Blocking commands (BLPOP, etc.)
-└── tracking/     # Client-side caching invalidation
-```
-
-Primary KV engine: **DashTable** (segmented Swiss-table hash map with SIMD probing). B+tree is only used for SortedSet full encoding (`storage/bptree.rs`).
+- `RUST_LOG=moon=debug` — enable tracing output (uses `tracing-subscriber` with `env-filter`)
+- `MOON_NO_URING=1` — disable io_uring at runtime; used in CI/containers/WSL where io_uring is unavailable
+- `RUSTFLAGS="-C target-cpu=native"` — enable CPU-specific optimizations for benchmarking
 
 ## Key Design Decisions
 
@@ -114,7 +35,10 @@ Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness 
 
 ## CI
 
-- `cargo test --no-default-features --features runtime-tokio,jemalloc` — runs on ubuntu-latest
-- `cargo clippy -- -D warnings` — zero warnings policy
+- `cargo test --no-default-features --features runtime-tokio,jemalloc` — runs on ubuntu-latest with `MOON_NO_URING=1`
+- `cargo clippy -- -D warnings` — zero warnings policy (default features)
+- `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings` — zero warnings policy (tokio + jemalloc profile)
 - `cargo fmt --check` — enforced formatting
+- MSRV check — `cargo build` with Rust 1.85 toolchain
 - CodeQL (Rust) — weekly + on push/PR
+- Claude Code Review — runs on PRs

@@ -5,13 +5,8 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::current_time_ms;
-/// Helper: build an ERR frame for wrong number of arguments.
-fn err_wrong_args(cmd: &str) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR wrong number of arguments for '{}' command",
-        cmd
-    )))
-}
+
+use super::helpers::err_wrong_args;
 
 /// Extract a key as &[u8] from a Frame argument.
 fn extract_key(frame: &Frame) -> Option<&[u8]> {

@@ -6,21 +6,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::entry::Entry;
-/// Helper: return ERR wrong number of arguments for a given command.
-fn err_wrong_args(cmd: &str) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR wrong number of arguments for '{}' command",
-        cmd
-    )))
-}
 
-/// Helper: extract &Bytes from a BulkString or SimpleString frame.
-fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
-    match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
-        _ => None,
-    }
-}
+use super::helpers::{err_wrong_args, extract_bytes};
 
 /// Helper: parse an integer from a frame.
 fn parse_int(frame: &Frame) -> Option<i64> {

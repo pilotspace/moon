@@ -4,26 +4,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
-/// Helper: return ERR wrong number of arguments for a given command.
-fn err_wrong_args(cmd: &str) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR wrong number of arguments for '{}' command",
-        cmd
-    )))
-}
 
-/// Helper: extract &Bytes from a BulkString or SimpleString frame.
-fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
-    match frame {
-        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
-        _ => None,
-    }
-}
-
-/// Helper: OK response.
-fn ok() -> Frame {
-    Frame::SimpleString(Bytes::from_static(b"OK"))
-}
+use super::helpers::{err_wrong_args, extract_bytes, ok};
 
 /// HSET key field value [field value ...]
 ///

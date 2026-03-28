@@ -1,5 +1,16 @@
 //! Append-Only File (AOF) persistence: logs every write command in RESP format
 //! for crash recovery. Supports three fsync policies and AOF rewriting for compaction.
+//!
+//! ## Unwrap Classification
+//!
+//! | Context | Classification | Rationale |
+//! |---------|---------------|-----------|
+//! | `AofWriter::append` (hot path) | **fire-and-forget** | Channel send; no Result needed |
+//! | `aof_writer_task` | **must-panic** | Writer task; errors logged inline |
+//! | `replay_aof` | **should-recover** (`Result<_, MoonError>`) | Startup replay; log+skip on corruption |
+//! | `rewrite_aof` | **should-recover** (`Result<_, MoonError>`) | Background rewrite; caller logs error |
+//! | `#[cfg(test)]` code (55 unwraps) | **test-only** | Panics are appropriate in tests |
+// Suppressions narrowed: only keep what's needed for conditional compilation
 #![allow(unused_imports, unused_variables, unreachable_code, clippy::empty_loop)]
 
 use std::path::{Path, PathBuf};
@@ -11,8 +22,9 @@ use crate::runtime::channel;
 use bytes::{Bytes, BytesMut};
 use tracing::{error, info, warn};
 
-use crate::command::{DispatchResult, dispatch};
+use crate::error::{AofError, MoonError};
 use crate::framevec;
+use crate::persistence::replay::CommandReplayEngine;
 use crate::protocol::{Frame, ParseConfig, parse, serialize};
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
@@ -51,143 +63,6 @@ pub enum AofMessage {
     Rewrite(SharedDatabases),
     /// Shut down the AOF writer task gracefully.
     Shutdown,
-}
-
-/// Canonical list of all write commands for AOF logging (reference/documentation).
-/// SELECT is included so replay can track database switching.
-/// The actual check is done via (length, first_byte) match in `is_write_command`.
-#[allow(dead_code)]
-const WRITE_COMMANDS: &[&[u8]] = &[
-    b"SET",
-    b"MSET",
-    b"SETNX",
-    b"SETEX",
-    b"PSETEX",
-    b"GETSET",
-    b"GETDEL",
-    b"GETEX",
-    b"INCR",
-    b"DECR",
-    b"INCRBY",
-    b"DECRBY",
-    b"INCRBYFLOAT",
-    b"APPEND",
-    b"DEL",
-    b"UNLINK",
-    b"EXPIRE",
-    b"PEXPIRE",
-    b"PERSIST",
-    b"RENAME",
-    b"RENAMENX",
-    b"HSET",
-    b"HMSET",
-    b"HDEL",
-    b"HSETNX",
-    b"HINCRBY",
-    b"HINCRBYFLOAT",
-    b"LPUSH",
-    b"RPUSH",
-    b"LPOP",
-    b"RPOP",
-    b"LSET",
-    b"LINSERT",
-    b"LREM",
-    b"LTRIM",
-    b"LMOVE",
-    b"SADD",
-    b"SREM",
-    b"SPOP",
-    b"SINTERSTORE",
-    b"SUNIONSTORE",
-    b"SDIFFSTORE",
-    b"ZADD",
-    b"ZREM",
-    b"ZINCRBY",
-    b"ZPOPMIN",
-    b"ZPOPMAX",
-    b"ZUNIONSTORE",
-    b"ZINTERSTORE",
-    b"SELECT",
-];
-
-/// Check if a command name is a write command that should be logged to AOF.
-///
-/// Uses (length, first_byte) dispatch for O(1) lookup instead of linear scan.
-#[inline]
-pub fn is_write_command(name: &[u8]) -> bool {
-    let len = name.len();
-    if len == 0 {
-        return false;
-    }
-    let b0 = name[0] | 0x20;
-    match (len, b0) {
-        // 3-letter
-        (3, b's') => name.eq_ignore_ascii_case(b"SET"),
-        (3, b'd') => name.eq_ignore_ascii_case(b"DEL"),
-        // 4-letter
-        (4, b'i') => name.eq_ignore_ascii_case(b"INCR"),
-        (4, b'd') => name.eq_ignore_ascii_case(b"DECR"),
-        (4, b'm') => name.eq_ignore_ascii_case(b"MSET"),
-        (4, b'h') => name.eq_ignore_ascii_case(b"HSET") || name.eq_ignore_ascii_case(b"HDEL"),
-        (4, b'l') => {
-            name.eq_ignore_ascii_case(b"LSET")
-                || name.eq_ignore_ascii_case(b"LREM")
-                || name.eq_ignore_ascii_case(b"LPOP")
-        }
-        (4, b'r') => name.eq_ignore_ascii_case(b"RPOP"),
-        (4, b's') => {
-            name.eq_ignore_ascii_case(b"SADD")
-                || name.eq_ignore_ascii_case(b"SREM")
-                || name.eq_ignore_ascii_case(b"SPOP")
-        }
-        (4, b'z') => name.eq_ignore_ascii_case(b"ZADD") || name.eq_ignore_ascii_case(b"ZREM"),
-        // 5-letter
-        (5, b'l') => {
-            name.eq_ignore_ascii_case(b"LPUSH")
-                || name.eq_ignore_ascii_case(b"LTRIM")
-                || name.eq_ignore_ascii_case(b"LMOVE")
-        }
-        (5, b'r') => name.eq_ignore_ascii_case(b"RPUSH"),
-        (5, b'h') => name.eq_ignore_ascii_case(b"HMSET"),
-        (5, b's') => name.eq_ignore_ascii_case(b"SETNX") || name.eq_ignore_ascii_case(b"SETEX"),
-        // 6-letter
-        (6, b'a') => name.eq_ignore_ascii_case(b"APPEND"),
-        (6, b'd') => name.eq_ignore_ascii_case(b"DECRBY"),
-        (6, b'e') => name.eq_ignore_ascii_case(b"EXPIRE"),
-        (6, b'g') => name.eq_ignore_ascii_case(b"GETSET") || name.eq_ignore_ascii_case(b"GETDEL"),
-        (6, b'h') => name.eq_ignore_ascii_case(b"HSETNX"),
-        (6, b'i') => name.eq_ignore_ascii_case(b"INCRBY"),
-        (6, b'p') => name.eq_ignore_ascii_case(b"PSETEX"),
-        (6, b'r') => name.eq_ignore_ascii_case(b"RENAME"),
-        (6, b's') => name.eq_ignore_ascii_case(b"SELECT"),
-        (6, b'u') => name.eq_ignore_ascii_case(b"UNLINK"),
-        // 7-letter
-        (7, b'h') => name.eq_ignore_ascii_case(b"HINCRBY"),
-        (7, b'l') => name.eq_ignore_ascii_case(b"LINSERT"),
-        (7, b'p') => name.eq_ignore_ascii_case(b"PEXPIRE") || name.eq_ignore_ascii_case(b"PERSIST"),
-        (7, b'z') => {
-            name.eq_ignore_ascii_case(b"ZINCRBY")
-                || name.eq_ignore_ascii_case(b"ZPOPMIN")
-                || name.eq_ignore_ascii_case(b"ZPOPMAX")
-        }
-        // 5-letter GETEX
-        (5, b'g') => name.eq_ignore_ascii_case(b"GETEX"),
-        // 8-letter
-        (8, b'r') => name.eq_ignore_ascii_case(b"RENAMENX"),
-        // 11-letter
-        (11, b'i') => name.eq_ignore_ascii_case(b"INCRBYFLOAT"),
-        (11, b's') => {
-            name.eq_ignore_ascii_case(b"SINTERSTORE") || name.eq_ignore_ascii_case(b"SUNIONSTORE")
-        }
-        (11, b'z') => {
-            name.eq_ignore_ascii_case(b"ZUNIONSTORE") || name.eq_ignore_ascii_case(b"ZINTERSTORE")
-        }
-        // 10-letter
-        (10, b's') => name.eq_ignore_ascii_case(b"SDIFFSTORE"),
-        // 12-letter
-        (12, b'h') => name.eq_ignore_ascii_case(b"HINCRBYFLOAT"),
-        _ => false,
-    }
 }
 
 /// Serialize a Frame into RESP wire format bytes.
@@ -343,18 +218,27 @@ pub async fn aof_writer_task(
 /// Replay an AOF file by parsing RESP commands and dispatching them.
 ///
 /// Returns the number of commands successfully replayed.
-/// On parse error, logs a warning and returns what was loaded so far (partial replay).
-pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
+///
+/// **Corruption recovery:** On mid-stream parse errors, logs a warning with the
+/// byte offset, skips to the next RESP array marker (`*`), and continues replay.
+/// At EOF, reports total corrupted entries skipped. Truncated tails are handled
+/// gracefully (warn + stop).
+pub fn replay_aof(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn CommandReplayEngine,
+) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
     }
 
+    let total_len = data.len();
     let mut buf = BytesMut::from(&data[..]);
     let config = ParseConfig::default();
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
-    let db_count = databases.len();
+    let mut corruption_count: usize = 0;
 
     loop {
         if buf.is_empty() {
@@ -381,38 +265,53 @@ pub fn replay_aof(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
                         continue;
                     }
                 };
-                let result = dispatch(
-                    &mut databases[selected_db],
-                    cmd,
-                    cmd_args,
-                    &mut selected_db,
-                    db_count,
-                );
-                match result {
-                    DispatchResult::Response(_) => {
-                        count += 1;
-                    }
-                    DispatchResult::Quit(_) => {
-                        // QUIT in AOF is unexpected, skip
-                        count += 1;
-                    }
-                }
+                engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
+                count += 1;
             }
             Ok(None) => {
                 // Incomplete frame at end of file - truncated AOF
                 if !buf.is_empty() {
-                    warn!("AOF truncated: {} unparseable bytes at end", buf.len());
+                    let offset = total_len - buf.len();
+                    warn!(
+                        "AOF truncated: {} unparseable bytes at offset {} (end of file)",
+                        buf.len(),
+                        offset
+                    );
                 }
                 break;
             }
             Err(e) => {
+                let error_offset = total_len - buf.len();
                 warn!(
-                    "AOF parse error after {} commands: {}. Partial replay.",
-                    count, e
+                    "AOF parse error at byte offset {} after {} commands: {}. Attempting skip.",
+                    error_offset, count, e
                 );
-                break;
+                corruption_count += 1;
+
+                // Skip past the corrupt byte(s) to the next RESP array marker ('*')
+                // Always discard at least 1 byte to guarantee forward progress.
+                let _ = buf.split_to(1);
+                if let Some(pos) = buf.iter().position(|&b| b == b'*') {
+                    let _ = buf.split_to(pos);
+                } else if buf.is_empty() {
+                    break;
+                } else {
+                    // No more RESP array markers found; stop replay
+                    warn!(
+                        "AOF: no recoverable RESP frame found after offset {}; stopping",
+                        error_offset
+                    );
+                    break;
+                }
             }
         }
+    }
+
+    if corruption_count > 0 {
+        warn!(
+            "AOF replay completed with {} corrupted entries skipped, {} commands replayed",
+            corruption_count, count
+        );
     }
 
     Ok(count)
@@ -623,7 +522,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 ///
 /// Writes to a temporary file first, then atomically renames for crash safety.
 #[cfg(feature = "runtime-tokio")]
-pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result<()> {
+pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
     // Clone database state: lock each db individually with read lock
     let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db
         .iter()
@@ -653,8 +552,18 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result
 
     // Write to temp file, then atomic rename
     let tmp_path = aof_path.with_extension("aof.tmp");
-    std::fs::write(&tmp_path, &commands)?;
-    std::fs::rename(&tmp_path, aof_path)?;
+    std::fs::write(&tmp_path, &commands).map_err(|e| AofError::Io {
+        path: tmp_path.clone(),
+        source: e,
+    })?;
+    std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
+        detail: format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            aof_path.display(),
+            e
+        ),
+    })?;
 
     info!("AOF rewrite complete: {} bytes", commands.len());
     Ok(())
@@ -663,6 +572,7 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::replay::DispatchReplayEngine;
     use ordered_float::OrderedFloat;
     use tempfile::tempdir;
 
@@ -673,91 +583,6 @@ mod tests {
                 .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
                 .collect(),
         )
-    }
-
-    // --- is_write_command tests ---
-
-    #[test]
-    fn test_write_commands_list_includes_all_known_write_commands() {
-        let known_writes = [
-            b"SET" as &[u8],
-            b"MSET",
-            b"SETNX",
-            b"SETEX",
-            b"PSETEX",
-            b"GETSET",
-            b"GETDEL",
-            b"GETEX",
-            b"INCR",
-            b"DECR",
-            b"INCRBY",
-            b"DECRBY",
-            b"INCRBYFLOAT",
-            b"APPEND",
-            b"DEL",
-            b"UNLINK",
-            b"EXPIRE",
-            b"PEXPIRE",
-            b"PERSIST",
-            b"RENAME",
-            b"RENAMENX",
-            b"HSET",
-            b"HMSET",
-            b"HDEL",
-            b"HSETNX",
-            b"HINCRBY",
-            b"HINCRBYFLOAT",
-            b"LPUSH",
-            b"RPUSH",
-            b"LPOP",
-            b"RPOP",
-            b"LSET",
-            b"LINSERT",
-            b"LREM",
-            b"LTRIM",
-            b"LMOVE",
-            b"SADD",
-            b"SREM",
-            b"SPOP",
-            b"SINTERSTORE",
-            b"SUNIONSTORE",
-            b"SDIFFSTORE",
-            b"ZADD",
-            b"ZREM",
-            b"ZINCRBY",
-            b"ZPOPMIN",
-            b"ZPOPMAX",
-            b"ZUNIONSTORE",
-            b"ZINTERSTORE",
-            b"SELECT",
-        ];
-        for cmd in &known_writes {
-            assert!(
-                is_write_command(cmd),
-                "Expected {} to be a write command",
-                String::from_utf8_lossy(cmd)
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_write_command_returns_false_for_read_commands() {
-        assert!(!is_write_command(b"GET"));
-        assert!(!is_write_command(b"PING"));
-        assert!(!is_write_command(b"ECHO"));
-        assert!(!is_write_command(b"KEYS"));
-        assert!(!is_write_command(b"HGET"));
-        assert!(!is_write_command(b"LRANGE"));
-        assert!(!is_write_command(b"SMEMBERS"));
-        assert!(!is_write_command(b"ZSCORE"));
-        assert!(!is_write_command(b"INFO"));
-    }
-
-    #[test]
-    fn test_is_write_command_case_insensitive() {
-        assert!(is_write_command(b"set"));
-        assert!(is_write_command(b"Set"));
-        assert!(is_write_command(b"hset"));
     }
 
     // --- serialize_command / generate_aof_command round-trip tests ---
@@ -798,7 +623,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2);
 
         let entry = dbs[0].get(b"k1").unwrap();
@@ -836,7 +661,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 4);
 
         // Check hash
@@ -873,7 +698,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2);
 
         let base_ts = dbs[0].base_timestamp();
@@ -895,7 +720,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new(), Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 3);
 
         assert!(dbs[0].get(b"k0").is_some());
@@ -909,7 +734,7 @@ mod tests {
         std::fs::write(&aof_path, b"").unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 0);
         assert_eq!(dbs[0].len(), 0);
     }
@@ -926,7 +751,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
         // Should have loaded the first command
         assert_eq!(count, 1);
         assert!(dbs[0].get(b"k1").is_some());
@@ -981,7 +806,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded_dbs = vec![Database::new()];
-        let count = replay_aof(&mut loaded_dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert!(count >= 5, "Expected at least 5 commands, got {}", count);
 
         // Verify each type restored
@@ -1013,7 +838,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded_dbs = vec![Database::new()];
-        let count = replay_aof(&mut loaded_dbs, &aof_path).unwrap();
+        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine).unwrap();
         assert_eq!(count, 2); // SET + PEXPIRE
 
         let base_ts = loaded_dbs[0].base_timestamp();
@@ -1041,7 +866,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded = vec![Database::new()];
-        replay_aof(&mut loaded, &aof_path).unwrap();
+        replay_aof(&mut loaded, &aof_path, &DispatchReplayEngine).unwrap();
 
         // Check strings
         assert_eq!(loaded[0].get(b"a").unwrap().value.as_bytes().unwrap(), b"1");
