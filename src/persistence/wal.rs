@@ -25,6 +25,14 @@
 //! uses std::fs as fallback.
 //!
 //! Replaces the global AOF writer from Phase 11 with per-shard locality.
+//!
+//! ## Unwrap Classification
+//!
+//! | Context | Classification | Rationale |
+//! |---------|---------------|-----------|
+//! | `WalWriter` methods (`new`, `flush_*`, `do_write`, etc.) | **must-panic** (`std::io::Result`) | Flush failure = silent data loss |
+//! | `replay_wal` / `replay_wal_v2` | **should-recover** (`Result<_, MoonError>`) | Replay is startup-only; failure logs + continues |
+//! | `#[cfg(test)]` code (81 unwraps) | **test-only** | Panics are appropriate in tests |
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,6 +40,8 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use tracing::{info, warn};
+
+use crate::error::{MoonError, WalError};
 
 use crate::runtime::{FileIoImpl, traits::FileIo};
 use crate::storage::db::Database;
@@ -312,7 +322,7 @@ impl WalWriter {
 /// by checking whether the first 6 bytes match the WAL_MAGIC signature.
 ///
 /// Returns the number of commands successfully replayed.
-pub fn replay_wal(databases: &mut [Database], path: &Path) -> anyhow::Result<usize> {
+pub fn replay_wal(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
     let data = std::fs::read(path)?;
     if data.is_empty() {
         return Ok(0);
@@ -322,7 +332,9 @@ pub fn replay_wal(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
         replay_wal_v2(databases, &data)
     } else {
         // V1 fallback: delegate to AOF replay (raw RESP)
+        // Note: temporary map_err until aof.rs is migrated to MoonError (Task 2)
         crate::persistence::aof::replay_aof(databases, path)
+            .map_err(|e| MoonError::Other(e.to_string()))
     }
 }
 
@@ -330,20 +342,30 @@ pub fn replay_wal(databases: &mut [Database], path: &Path) -> anyhow::Result<usi
 ///
 /// Parses the 32-byte header, then iterates over CRC32-checksummed block frames.
 /// Stops on first corrupted or truncated block, returning commands replayed so far.
-fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize> {
+fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> Result<usize, MoonError> {
     // Parse and validate header
     if data.len() < WAL_HEADER_SIZE {
-        anyhow::bail!("WAL v2 file too short for header");
+        return Err(WalError::Corrupted {
+            offset: 0,
+            detail: "WAL v2 file too short for header".into(),
+        }
+        .into());
     }
     let version = data[6];
     if version != WAL_VERSION {
-        anyhow::bail!("Unsupported WAL version: {}", version);
+        return Err(WalError::UnsupportedVersion {
+            version: version.into(),
+        }
+        .into());
     }
     let shard_id = u16::from_le_bytes([data[7], data[8]]);
     let epoch = u64::from_le_bytes(
-        data[9..17]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("WAL v2: invalid epoch bytes at header offset 9..17"))?,
+        data[9..17].try_into().map_err(|_| {
+            MoonError::from(WalError::Corrupted {
+                offset: 9,
+                detail: "invalid epoch bytes at header offset 9..17".into(),
+            })
+        })?,
     );
     info!("Replaying WAL v2: shard={}, epoch={}", shard_id, epoch);
 
@@ -359,10 +381,14 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
             warn!("WAL v2: truncated block_len at offset {}, stopping", offset);
             break;
         }
-        let block_len =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
-                anyhow::anyhow!("WAL v2: invalid block_len bytes at offset {}", offset)
-            })?) as usize;
+        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(
+            |_| {
+                MoonError::from(WalError::Corrupted {
+                    offset: offset as u64,
+                    detail: format!("invalid block_len bytes at offset {}", offset),
+                })
+            },
+        )?) as usize;
         offset += 4;
 
         // Minimum block content: cmd_count(2) + db_idx(1) + crc32(4) = 7
@@ -391,7 +417,10 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
             block_data[block_len - 4..block_len]
                 .try_into()
                 .map_err(|_| {
-                    anyhow::anyhow!("WAL v2: invalid CRC bytes at block offset {}", offset - 4)
+                    MoonError::from(WalError::Corrupted {
+                        offset: (offset - 4) as u64,
+                        detail: format!("invalid CRC bytes at block offset {}", offset - 4),
+                    })
                 })?,
         );
 
