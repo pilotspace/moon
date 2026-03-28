@@ -176,6 +176,7 @@ mod tests {
             0,
             &script_cache,
             &clock,
+            &mut Vec::new(),
         );
 
         let msg = rx.try_recv().expect("subscriber should receive message");
@@ -230,6 +231,7 @@ mod tests {
             0,
             &script_cache,
             &clock,
+            &mut Vec::new(),
         );
     }
 

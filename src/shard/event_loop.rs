@@ -4,6 +4,7 @@
 //! (spsc_handler, persistence_tick, conn_accept, timers, uring_handler).
 
 use std::cell::RefCell;
+use std::os::unix::io::FromRawFd;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -208,6 +209,12 @@ impl super::Shard {
         // Per-shard cached clock: updated once per 1ms tick.
         let cached_clock = CachedClock::new();
 
+        // Pending FD migrations collected from SPSC drain (spawn wired in Plan 50-02).
+        let mut pending_migrations: Vec<(
+            std::os::unix::io::RawFd,
+            crate::server::conn::affinity::MigratedConnectionState,
+        )> = Vec::new();
+
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
@@ -264,11 +271,18 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
+                    for (fd, _state) in pending_migrations.drain(..) {
+                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
+                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
+                        // Close the FD via OwnedFd drop to avoid leaking.
+                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.tick() => {
@@ -280,11 +294,18 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
+                    for (fd, _state) in pending_migrations.drain(..) {
+                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
+                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
+                        // Close the FD via OwnedFd drop to avoid leaking.
+                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    }
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
@@ -382,11 +403,18 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
+                    for (fd, _state) in pending_migrations.drain(..) {
+                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
+                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
+                        // Close the FD via OwnedFd drop to avoid leaking.
+                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
                 _ = periodic_interval.tick() => {
@@ -398,11 +426,18 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
                     );
+                    for (fd, _state) in pending_migrations.drain(..) {
+                        tracing::warn!("Shard {}: MigrateConnection received but spawn not yet wired (fd={})", shard_id, fd);
+                        // TODO: Plan 50-02 will wire spawn_migrated_connection here
+                        // Close the FD via OwnedFd drop to avoid leaking.
+                        let _ = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+                    }
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,

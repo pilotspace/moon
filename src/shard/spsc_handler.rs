@@ -50,6 +50,10 @@ pub(crate) fn drain_spsc_shared(
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
+    pending_migrations: &mut Vec<(
+        std::os::unix::io::RawFd,
+        crate::server::conn::affinity::MigratedConnectionState,
+    )>,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -74,11 +78,14 @@ pub(crate) fn drain_spsc_shared(
                         snapshot_seen = true;
                         break;
                     }
-                    match &msg {
+                    match msg {
                         ShardMessage::Execute { .. }
                         | ShardMessage::PipelineBatch { .. }
                         | ShardMessage::MultiExecute { .. } => {
                             execute_batch.push(msg);
+                        }
+                        ShardMessage::MigrateConnection { fd, state } => {
+                            pending_migrations.push((fd, state));
                         }
                         _ => other_messages.push(msg),
                     }
@@ -531,6 +538,12 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::UnregisterReplica { replica_id } => {
             replica_txs.retain(|(id, _)| *id != replica_id);
+        }
+        ShardMessage::MigrateConnection { .. } => {
+            // MigrateConnection is collected by drain_spsc_shared into pending_migrations,
+            // not dispatched through handle_shard_message_shared.
+            // If we reach here, it's a logic error — log and drop.
+            tracing::warn!("Shard {}: MigrateConnection reached handle_shard_message_shared unexpectedly", shard_id);
         }
         ShardMessage::NewConnection(_) => {
             // NewConnection is handled via conn_rx, not SPSC

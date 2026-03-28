@@ -101,6 +101,13 @@ pub enum ShardMessage {
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
     /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
     ScriptLoad { sha1: String, script: bytes::Bytes },
+    /// Migrate a connection's file descriptor to this shard.
+    /// The source shard has deregistered the FD and extracted connection state.
+    /// This shard must reconstruct the TCP stream and spawn a new handler.
+    MigrateConnection {
+        fd: std::os::unix::io::RawFd,
+        state: crate::server::conn::affinity::MigratedConnectionState,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }
