@@ -104,6 +104,7 @@ impl AffinityTracker {
     /// the primary key for shard routing). Returns `false` after a decision
     /// has been made and no re-migration is pending.
     #[inline]
+    #[allow(dead_code)] // Called from handler hot path once sampling integration lands
     pub fn should_sample(&self) -> bool {
         !self.decided
     }
