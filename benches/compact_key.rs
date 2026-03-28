@@ -7,7 +7,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use rust_redis::storage::compact_key::CompactKey;
+use moon::storage::compact_key::CompactKey;
 
 /// 10-byte key: fits inline (<=23 bytes).
 fn make_inline_key(i: u64) -> CompactKey {

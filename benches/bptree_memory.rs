@@ -4,7 +4,7 @@ use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
-use rust_redis::storage::bptree::BPTree;
+use moon::storage::bptree::BPTree;
 
 /// Benchmark: Insert 1M (score, member) pairs into BPTree.
 /// Measures throughput and provides baseline for memory comparison.

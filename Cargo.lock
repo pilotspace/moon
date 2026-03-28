@@ -223,9 +223,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.2.57"
+version = "1.2.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a0dd1ca384932ff3641c8718a02769f1698e7563dc6974ffd03346116310423"
+checksum = "e1e928d4b69e3077709075a938a05ffbedfa53a84c8f766efbf8220bb1ff60e1"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1070,9 +1070,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
+checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
  "wasi",
@@ -1163,6 +1163,57 @@ dependencies = [
  "monoio-io-wrapper",
  "rustls",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "moon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atoi",
+ "atomic-waker",
+ "aws-lc-rs",
+ "bumpalo",
+ "bytes",
+ "clap",
+ "core_affinity",
+ "crc16",
+ "crc32fast",
+ "criterion",
+ "crossbeam-utils",
+ "ctrlc",
+ "flume",
+ "futures",
+ "hex",
+ "io-uring 0.7.11",
+ "itoa",
+ "libc",
+ "memchr",
+ "mimalloc",
+ "mlua",
+ "monoio",
+ "monoio-rustls",
+ "nix 0.29.0",
+ "once_cell",
+ "ordered-float",
+ "parking_lot",
+ "rand",
+ "redis",
+ "ringbuf",
+ "rustls",
+ "rustls-pemfile",
+ "sha1_smol",
+ "sha2",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1596,57 +1647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-redis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "atoi",
- "atomic-waker",
- "aws-lc-rs",
- "bumpalo",
- "bytes",
- "clap",
- "core_affinity",
- "crc16",
- "crc32fast",
- "criterion",
- "crossbeam-utils",
- "ctrlc",
- "flume",
- "futures",
- "hex",
- "io-uring 0.7.11",
- "itoa",
- "libc",
- "memchr",
- "mimalloc",
- "mlua",
- "monoio",
- "monoio-rustls",
- "nix 0.29.0",
- "once_cell",
- "ordered-float",
- "parking_lot",
- "rand",
- "redis",
- "ringbuf",
- "rustls",
- "rustls-pemfile",
- "sha1_smol",
- "sha2",
- "smallvec",
- "tempfile",
- "thiserror 2.0.18",
- "tikv-jemallocator",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "xxhash-rust",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2028,7 +2028,7 @@ checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "bytes",
  "libc",
- "mio 1.1.1",
+ "mio 1.2.0",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.3",
@@ -2215,11 +2215,11 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
-version = "1.0.2+wasi-0.2.9"
+version = "1.0.1+wasi-0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9517f9239f02c069db75e65f174b3da828fe5f5b945c4dd26bd25d89c03ebcf5"
+checksum = "0562428422c63773dad2c345a1882263bbf4d65cf3f42e90921f787ef5ad58e7"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.46.0",
 ]
 
 [[package]]
@@ -2228,7 +2228,7 @@ version = "0.4.0+wasi-0.3.0-rc-2026-01-06"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.51.0",
 ]
 
 [[package]]
@@ -2513,6 +2513,12 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wit-bindgen"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "wit-bindgen"

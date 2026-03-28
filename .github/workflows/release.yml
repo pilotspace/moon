@@ -19,19 +19,19 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: runtime-tokio,jemalloc
-            binary: rust-redis-linux-tokio
+            binary: moon-linux-tokio
 
           - name: linux-monoio
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: runtime-monoio,jemalloc
-            binary: rust-redis-linux-monoio
+            binary: moon-linux-monoio
 
           - name: macos-tokio
             os: macos-latest
             target: aarch64-apple-darwin
             features: runtime-tokio,jemalloc
-            binary: rust-redis-macos-tokio
+            binary: moon-macos-tokio
 
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +45,7 @@ jobs:
       - name: Build
         run: |
           cargo build --release --no-default-features --features ${{ matrix.features }} --target ${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/rust-redis ${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/moon ${{ matrix.binary }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -75,8 +75,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" \
-            --title "rust-redis $TAG" \
+            --title "moon $TAG" \
             --generate-notes \
-            artifacts/rust-redis-linux-tokio \
-            artifacts/rust-redis-linux-monoio \
-            artifacts/rust-redis-macos-tokio
+            artifacts/moon-linux-tokio \
+            artifacts/moon-linux-monoio \
+            artifacts/moon-macos-tokio

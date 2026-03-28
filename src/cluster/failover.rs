@@ -376,12 +376,8 @@ pub async fn run_election_task(
                 let len = (data.len() as u32).to_be_bytes();
                 let len_vec = len.to_vec();
                 let (wr, _) = stream.write_all(len_vec).await;
-                if wr.is_err() {
-                    return;
-                }
-                let (wr, _) = stream.write_all(data).await;
-                if wr.is_err() {
-                    return;
+                if wr.is_ok() {
+                    let _ = stream.write_all(data).await;
                 }
             }
         });

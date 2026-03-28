@@ -131,10 +131,10 @@ cargo build --release
 
 ```bash
 # Default: binds to 127.0.0.1:6379, auto-detects CPU count for shards
-./target/release/rust-redis
+./target/release/moon
 
 # With specific options
-./target/release/rust-redis --port 6380 --shards 4 --requirepass mysecret
+./target/release/moon --port 6380 --shards 4 --requirepass mysecret
 ```
 
 ### Connect
@@ -160,21 +160,37 @@ OK
 
 ### Docker
 
+Moon ships a multi-stage Dockerfile with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) dependency caching and a [distroless](https://github.com/GoogleContainerTools/distroless) runtime (~41MB final image).
+
 ```bash
-# Build
+# Build (default: monoio runtime + jemalloc)
 docker build -t moon .
 
+# Build with tokio runtime
+docker build --build-arg FEATURES=runtime-tokio,jemalloc -t moon .
+
+# Multi-platform build (amd64 + arm64)
+docker buildx build --platform linux/amd64,linux/arm64 -t moon .
+
 # Run
-docker run -p 6379:6379 moon
+docker run -d -p 6379:6379 moon
 
 # Run with persistence
-docker run -p 6379:6379 -v moon-data:/data moon \
-  rust-redis --bind 0.0.0.0 --dir /data --appendonly yes
+docker run -d -p 6379:6379 -v moon-data:/data moon \
+  moon --bind 0.0.0.0 --appendonly yes --appendfsync everysec
 
-# Run with password and TLS
-docker run -p 6379:6379 -p 6380:6380 moon \
-  rust-redis --bind 0.0.0.0 --requirepass secret \
-  --tls-port 6380 --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key
+# Run with TLS
+docker run -d -p 6379:6379 -p 6443:6443 -v /path/to/certs:/data moon \
+  moon --bind 0.0.0.0 --tls-port 6443 \
+  --tls-cert-file /data/cert.pem --tls-key-file /data/key.pem
+```
+
+Or use Docker Compose:
+
+```bash
+docker compose up -d       # Start
+docker compose logs -f     # Follow logs
+docker compose down        # Stop
 ```
 
 ## Configuration
@@ -240,7 +256,7 @@ All options are available as command-line flags. See `--help` for the full list.
 ### Example: Production Configuration
 
 ```bash
-./target/release/rust-redis \
+./target/release/moon \
   --bind 0.0.0.0 \
   --port 6379 \
   --tls-port 6380 \
@@ -316,7 +332,7 @@ See [BENCHMARK.md](BENCHMARK.md) for detailed methodology and [BENCHMARK-RESOURC
 cargo test --lib
 
 # With logging
-RUST_LOG=rust_redis=debug cargo test --lib
+RUST_LOG=moon=debug cargo test --lib
 
 # Data consistency tests (132 tests vs Redis as ground truth)
 ./scripts/test-consistency.sh

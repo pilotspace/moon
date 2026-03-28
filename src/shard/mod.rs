@@ -40,7 +40,7 @@ use crate::tracking::TrackingTable;
 
 use std::sync::{Arc, RwLock};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{IoEvent, UringConfig, UringDriver, WritevGuard};
 
 use self::dispatch::ShardMessage;
@@ -63,11 +63,12 @@ pub struct Shard {
     pub pubsub_registry: PubSubRegistry,
 }
 
-/// In-flight send buffer variants for proper RAII lifetime management (Linux only).
+/// In-flight send buffer variants for proper RAII lifetime management (Linux + tokio only).
 ///
 /// Keeps buffers alive until the corresponding io_uring SendComplete CQE arrives,
 /// replacing the previous std::mem::forget memory leak.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+#[allow(dead_code)] // Fields hold buffers alive for RAII until SendComplete CQE
 enum InFlightSend {
     /// Serialized response buffer for non-BulkString frames (heap fallback).
     Buf(bytes::BytesMut),
@@ -166,32 +167,39 @@ impl Shard {
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
     ) {
-        // On Linux, attempt to initialize io_uring for high-performance I/O.
+        // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         // If initialization fails, fall back to the Tokio path (same as macOS).
-        #[cfg(target_os = "linux")]
+        // Skipped for monoio runtime (monoio has its own io_uring integration).
+        // Can be disabled via MOON_NO_URING=1 (used in CI/test environments).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
-            match UringDriver::new(UringConfig::default()) {
-                Ok(mut d) => match d.init() {
-                    Ok(()) => {
-                        info!("Shard {} started (io_uring mode)", self.id);
-                        Some(d)
-                    }
+            if std::env::var("MOON_NO_URING").is_ok() {
+                info!("Shard {} io_uring disabled via MOON_NO_URING", self.id);
+                None
+            } else {
+                match UringDriver::new(UringConfig::default()) {
+                    Ok(mut d) => match d.init() {
+                        Ok(()) => {
+                            info!("Shard {} started (io_uring mode)", self.id);
+                            Some(d)
+                        }
+                        Err(e) => {
+                            info!("Shard {} io_uring init failed: {}, using Tokio", self.id, e);
+                            None
+                        }
+                    },
                     Err(e) => {
-                        info!("Shard {} io_uring init failed: {}, using Tokio", self.id, e);
+                        info!("Shard {} io_uring unavailable: {}, using Tokio", self.id, e);
                         None
                     }
-                },
-                Err(e) => {
-                    info!("Shard {} io_uring unavailable: {}, using Tokio", self.id, e);
-                    None
                 }
             }
         };
 
         // Wire multishot accept: create per-shard SO_REUSEPORT listener socket
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_listener_fd: Option<std::os::fd::RawFd> = None;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         if let Some(ref mut d) = uring_state {
             if let Some(ref addr) = bind_addr {
                 match Self::create_reuseport_listener(addr) {
@@ -221,20 +229,20 @@ impl Shard {
             }
         }
 
-        // Track per-connection parse state for io_uring path (Linux only).
-        #[cfg(target_os = "linux")]
+        // Track per-connection parse state for io_uring path (Linux + tokio only).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_parse_bufs: std::collections::HashMap<u32, bytes::BytesMut> =
             std::collections::HashMap::new();
 
-        // Track in-flight send buffers for proper RAII cleanup (Linux only).
+        // Track in-flight send buffers for proper RAII cleanup (Linux + tokio only).
         // Replaces the previous std::mem::forget leak.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut inflight_sends: std::collections::HashMap<u32, Vec<InFlightSend>> =
             std::collections::HashMap::new();
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", feature = "runtime-tokio")))]
         {
-            let _ = &bind_addr; // Suppress unused warning on non-Linux
+            let _ = &bind_addr; // Suppress unused warning when io_uring path inactive
             info!("Shard {} started", self.id);
         }
 
@@ -388,9 +396,9 @@ impl Shard {
                             let reqpass = rtcfg.read().map(|cfg| cfg.requirepass.clone()).ok().flatten();
                             let clk = cached_clock.clone();
 
-                            if is_tls && tls_config.is_some() {
+                            if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
                                 // TLS handshake before handler spawn (wrap-before-spawn pattern)
-                                let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                let tls_cfg = tls_cfg_ref.clone();
                                 let peer_addr = tcp_stream.peer_addr()
                                     .map(|a| a.to_string())
                                     .unwrap_or_else(|_| "unknown".to_string());
@@ -402,6 +410,7 @@ impl Shard {
                                                 tls_stream, peer_addr, dbs, shard_id, num_shards,
                                                 dtx, psr, blk, sd, reqpass, aof, trk, cid,
                                                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
+                                                snap_tx,
                                                 clk,
                                             ).await;
                                         }
@@ -536,9 +545,10 @@ impl Shard {
 
                     // Advance snapshot one segment per tick (cooperative)
                     if let Some(ref mut snap) = snapshot_state {
-                        let dbs = databases.borrow();
-                        let done = snap.advance_one_segment(&dbs);
-                        drop(dbs);
+                        let done = {
+                            let dbs = databases.borrow();
+                            snap.advance_one_segment(&dbs)
+                        };
                         if done {
                             let epoch = snap.epoch;
                             if let Err(e) = snap.finalize_async().await {
@@ -665,9 +675,9 @@ impl Shard {
                                         .map(|a| a.to_string())
                                         .unwrap_or_else(|_| "unknown".to_string());
 
-                                    if is_tls && tls_config.is_some() {
+                                    if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
                                         // Monoio TLS handshake before handler spawn
-                                        let tls_cfg = tls_config.as_ref().unwrap().clone();
+                                        let tls_cfg = tls_cfg_ref.clone();
                                         monoio::spawn(async move {
                                             let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                                             match acceptor.accept(tcp_stream).await {
@@ -795,9 +805,10 @@ impl Shard {
 
                     // Advance snapshot one segment per tick (cooperative)
                     if let Some(ref mut snap) = snapshot_state {
-                        let dbs = databases.borrow();
-                        let done = snap.advance_one_segment(&dbs);
-                        drop(dbs);
+                        let done = {
+                            let dbs = databases.borrow();
+                            snap.advance_one_segment(&dbs)
+                        };
                         if done {
                             let epoch = snap.epoch;
                             if let Err(e) = snap.finalize_async().await {
@@ -864,8 +875,8 @@ impl Shard {
             }
         }
 
-        // Close per-shard SO_REUSEPORT listener fd if created (Linux only).
-        #[cfg(target_os = "linux")]
+        // Close per-shard SO_REUSEPORT listener fd if created (Linux + tokio only).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         if let Some(lfd) = uring_listener_fd {
             unsafe {
                 libc::close(lfd);
@@ -1366,14 +1377,12 @@ impl Shard {
         }
     }
 
-    /// Process a single io_uring completion event (Linux only).
-    ///
     /// Send a serialized response buffer via io_uring.
     ///
     /// Tries the pre-registered fixed buffer pool first (zero get_user_pages overhead).
     /// If the pool is exhausted or the response is too large for a pooled buffer,
     /// falls back to heap-allocated BytesMut with regular submit_send.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     fn send_serialized(
         driver: &mut UringDriver,
         conn_id: u32,
@@ -1409,7 +1418,7 @@ impl Shard {
     /// disconnect, recv rearm, accept, and send completion events.
     /// Command dispatch reuses the same `extract_command_static` + `cmd_dispatch`
     /// path as the Tokio connection handler.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     fn handle_uring_event(
         event: IoEvent,
         driver: &mut UringDriver,
@@ -1621,7 +1630,7 @@ impl Shard {
     ///
     /// Each shard binds to the same address with SO_REUSEPORT, allowing the kernel
     /// to distribute incoming connections across shard threads without a shared listener.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
         use std::net::SocketAddr;
         let sock_addr: SocketAddr = addr
@@ -1930,7 +1939,7 @@ mod tests {
 
     /// Linux-only: verify handle_uring_event processes Disconnect correctly.
     /// This test only compiles and runs on Linux CI.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_disconnect() {
         use crate::io::{IoEvent, UringConfig, UringDriver};
@@ -1965,7 +1974,7 @@ mod tests {
     }
 
     /// Linux-only: verify handle_uring_event processes SendComplete as no-op.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
     #[test]
     fn test_handle_uring_event_send_complete() {
         use crate::io::{IoEvent, UringConfig, UringDriver};

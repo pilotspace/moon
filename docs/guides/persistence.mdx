@@ -1,0 +1,79 @@
+---
+title: "Persistence"
+description: "Configure RDB snapshots and AOF write-ahead logging for durability."
+keywords: ["persistence", "aof", "rdb", "wal", "durability", "snapshots"]
+---
+
+Moon supports two persistence mechanisms: RDB point-in-time snapshots and AOF (append-only file) write-ahead logging. Both can be used together.
+
+## AOF (recommended)
+
+AOF logs every write operation to per-shard WAL files. This is the recommended persistence method for durability.
+
+```bash
+./target/release/moon --appendonly yes --appendfsync everysec --dir /var/lib/moon
+```
+
+### Fsync policies
+
+| Policy | Durability | Performance |
+|--------|-----------|-------------|
+| `always` | Every write fsynced | Highest durability, lowest throughput |
+| `everysec` | Fsync every second | Good balance (recommended) |
+| `no` | OS-controlled flush | Highest throughput, risk of data loss |
+
+### Per-shard WAL advantage
+
+Unlike Redis's single global AOF file, Moon writes a separate WAL per shard. This eliminates the global serialization bottleneck:
+
+| Pipeline depth | Moon vs Redis (with AOF) |
+|:-:|:-:|
+| p=1 | 0.95x (parity) |
+| p=16 | **2.21x** |
+| p=64 | **2.75x** |
+
+The advantage grows with pipeline depth because each shard appends independently with no lock contention.
+
+### WAL v2 format
+
+Moon uses WAL v2 with:
+- **Checksums** for corruption detection
+- **Block framing** for crash recovery
+- **Corruption isolation** per shard (one shard's corruption does not affect others)
+
+The hot-path cost of WAL append is ~5ns (`buf.extend_from_slice()`), with batch `write_all` every 1ms tick and fsync on the configured schedule.
+
+## RDB snapshots
+
+RDB creates point-in-time snapshots of the entire dataset.
+
+```bash
+# Auto-save: snapshot after 3600 seconds if at least 1 key changed,
+# or after 300 seconds if at least 100 keys changed
+./target/release/moon --save "3600 1 300 100" --dir /var/lib/moon
+
+# Manual trigger
+redis-cli BGSAVE
+```
+
+### Forkless snapshots
+
+Moon uses forkless compartmentalized snapshots instead of Redis's `fork()` approach. This means:
+
+- No copy-on-write memory spike (Redis can temporarily double memory usage during BGSAVE)
+- DashTable segments are iterated asynchronously
+- Snapshot runs alongside normal operations without blocking
+
+## Using both
+
+For maximum durability, enable both AOF and RDB:
+
+```bash
+./target/release/moon \
+  --appendonly yes \
+  --appendfsync everysec \
+  --save "3600 1 300 100" \
+  --dir /var/lib/moon
+```
+
+AOF provides point-of-failure recovery, while RDB provides compact backups for disaster recovery or cloning.

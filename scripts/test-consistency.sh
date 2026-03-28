@@ -4,9 +4,9 @@ set -euo pipefail
 ###############################################################################
 # test-consistency.sh -- Data consistency test: SET/GET, SETEX/GETEX, collections
 #
-# Verifies that data written to rust-redis can be read back identically.
+# Verifies that data written to moon can be read back identically.
 # Tests all size ranges (SSO inline, heap small, heap large, binary).
-# Compares rust-redis output against Redis as ground truth.
+# Compares moon output against Redis as ground truth.
 #
 # Usage:
 #   ./scripts/test-consistency.sh [--shards N] [--skip-build] [--port-rust N]
@@ -16,7 +16,7 @@ PORT_REDIS=6399
 PORT_RUST=6400
 SHARDS=1
 SKIP_BUILD=false
-RUST_BINARY="./target/release/rust-redis"
+RUST_BINARY="./target/release/moon"
 PASS=0
 FAIL=0
 RUST_PID=""
@@ -37,7 +37,7 @@ cleanup() {
     [[ -n "${RUST_PID:-}" ]] && kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "rust-redis.*${PORT_RUST}" 2>/dev/null || true
+    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -90,7 +90,7 @@ log "Starting Redis on :$PORT_REDIS ..."
 redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning --daemonize no &>/dev/null &
 REDIS_PID=$!
 
-log "Starting rust-redis on :$PORT_RUST (shards=$SHARDS)..."
+log "Starting moon on :$PORT_RUST (shards=$SHARDS)..."
 "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" &>/dev/null &
 RUST_PID=$!
 

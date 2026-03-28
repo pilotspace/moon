@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use criterion::{Criterion, criterion_group, criterion_main};
-use rust_redis::protocol::{Frame, ParseConfig, parse, serialize};
+use moon::protocol::{Frame, ParseConfig, parse, serialize};
 use std::hint::black_box;
 
 fn bench_parse_simple_string(c: &mut Criterion) {

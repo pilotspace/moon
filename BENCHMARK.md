@@ -1,9 +1,9 @@
-# rust-redis Benchmark Report
+# moon Benchmark Report
 
 **Date:** 2026-03-27
 **System:** Apple M4 Pro, 12 cores, 24GB RAM, macOS Darwin 24.6.0 arm64
 **Redis:** 8.6.1
-**rust-redis:** v0.1.0, Monoio runtime, fat LTO, codegen-units=1, target-cpu=native
+**moon:** v0.1.0, Monoio runtime, fat LTO, codegen-units=1, target-cpu=native
 **Methodology:** Co-located benchmarks using `redis-benchmark`. Fresh server instance per data point for memory tests. All results are conservative lower bounds (client and server share CPU/memory bandwidth).
 
 ---
@@ -26,7 +26,7 @@
 
 ## 1. Executive Summary
 
-| Metric | rust-redis vs Redis | Conditions |
+| Metric | moon vs Redis | Conditions |
 |--------|:-------------------:|------------|
 | Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS |
 | Memory (256B values) | Tied | 1-shard, per-key RSS |
@@ -50,65 +50,65 @@
 | Server | RSS | Notes |
 |--------|-----|-------|
 | Redis 8.6.1 | 7.0 MB | Single-threaded |
-| rust-redis (1 shard) | 7.0 MB | Lazy Lua VM + lazy replication backlog |
-| rust-redis (12 shards) | 15.7 MB | Per-shard overhead: ~0.7 MB |
+| moon (1 shard) | 7.0 MB | Lazy Lua VM + lazy replication backlog |
+| moon (12 shards) | 15.7 MB | Per-shard overhead: ~0.7 MB |
 
 ### 2.2 Per-Key Memory (1-Shard, String Keys)
 
 Measured with fresh server instances. `redis-benchmark -r N` for unique keys.
 
-| Value Size | Keys Loaded | Redis/Key | rust-redis/Key | Winner | Ratio |
+| Value Size | Keys Loaded | Redis/Key | moon/Key | Winner | Ratio |
 |:----------:|:-----------:|:---------:|:--------------:|:------:|:-----:|
 | 32 B | ~63K | 118 B | 147 B | Redis | 0.80x |
 | 256 B | ~63K | 412 B | 407 B | **Tied** | 1.01x |
-| 1,024 B | ~63K | 1,879 B | **1,207 B** | **rust-redis** | **1.56x** |
-| 4,096 B | ~63K | 5,131 B | **4,352 B** | **rust-redis** | **1.18x** |
+| 1,024 B | ~63K | 1,879 B | **1,207 B** | **moon** | **1.56x** |
+| 4,096 B | ~63K | 5,131 B | **4,352 B** | **moon** | **1.18x** |
 
 At 500K keys:
 
-| Value Size | Redis/Key | rust-redis/Key | Winner | Ratio |
+| Value Size | Redis/Key | moon/Key | Winner | Ratio |
 |:----------:|:---------:|:--------------:|:------:|:-----:|
 | 32 B | 118 B | 149 B | Redis | 0.79x |
 | 256 B | 379 B | 379 B | **Tied** | 1.00x |
-| 1,024 B | 1,786 B | **1,168 B** | **rust-redis** | **1.53x** |
+| 1,024 B | 1,786 B | **1,168 B** | **moon** | **1.53x** |
 
 At 1M keys:
 
-| Value Size | Redis RSS | rust-redis RSS | Redis/Key | rust-redis/Key | Winner |
+| Value Size | Redis RSS | moon RSS | Redis/Key | moon/Key | Winner |
 |:----------:|:---------:|:--------------:|:---------:|:--------------:|:------:|
 | 32 B | 78.2 MB | 95.8 MB | 118 B | 147 B | Redis |
 | 256 B | 231.5 MB | 234.4 MB | 372 B | 376 B | **Tied** |
-| 1,024 B | 954.2 MB | **703.0 MB** | 1,571 B | **1,153 B** | **rust-redis** |
+| 1,024 B | 954.2 MB | **703.0 MB** | 1,571 B | **1,153 B** | **moon** |
 
-### 2.3 Why rust-redis Uses Less Memory at Larger Values
+### 2.3 Why moon Uses Less Memory at Larger Values
 
-rust-redis stores heap strings as `HeapString(Vec<u8>)` (24 bytes + data) instead of Redis's `robj` + SDS chain:
+moon stores heap strings as `HeapString(Vec<u8>)` (24 bytes + data) instead of Redis's `robj` + SDS chain:
 
 ```
-rust-redis:  CompactValue(16B) -> Box<HeapString> -> Vec<u8>(ptr+len+cap=24B) -> data
+moon:  CompactValue(16B) -> Box<HeapString> -> Vec<u8>(ptr+len+cap=24B) -> data
              Total overhead: 16 + 8(box) + 24(vec) = 48 bytes + data
 
 Redis:       dictEntry(24B) -> robj(16B) -> SDS(header 8-17B + data) + jemalloc rounding
              Total overhead: ~64-80 bytes + data
 ```
 
-For small strings (<=12 bytes), rust-redis uses SSO (Small String Optimization) — the value is stored inline in the 16-byte `CompactValue` struct with zero heap allocation. Redis still allocates `robj` + SDS for all strings.
+For small strings (<=12 bytes), moon uses SSO (Small String Optimization) — the value is stored inline in the 16-byte `CompactValue` struct with zero heap allocation. Redis still allocates `robj` + SDS for all strings.
 
 ### 2.4 TTL Memory Overhead
 
-rust-redis packs TTL as a 4-byte delta inside `CompactEntry`. Redis maintains a separate `expires` hash table with a full `dictEntry` (24 bytes) per expiring key.
+moon packs TTL as a 4-byte delta inside `CompactEntry`. Redis maintains a separate `expires` hash table with a full `dictEntry` (24 bytes) per expiring key.
 
 | Server | TTL Implementation | Extra Memory Per Expiring Key |
 |--------|-------------------|-------------------------------|
 | Redis | Separate `expires` dict | ~24 bytes (dictEntry) |
-| rust-redis | 4-byte delta in CompactEntry | **0 bytes** (already included) |
+| moon | 4-byte delta in CompactEntry | **0 bytes** (already included) |
 
 ### 2.5 Multi-Shard Memory (12 shards, 1M keys x 64B)
 
 | Server | RSS |
 |--------|-----|
 | Redis | 107.6 MB |
-| rust-redis (12 shards) | 139.8 MB |
+| moon (12 shards) | 139.8 MB |
 
 Per-shard overhead includes: DashTable segments, event loop state, SPSC channels (256 entries each), Notify handles, timers. This is the cost of the shared-nothing multi-core architecture.
 
@@ -118,7 +118,7 @@ Per-shard overhead includes: DashTable segments, event loop state, SPSC channels
 
 ### 3.1 Single-Shard SET Throughput (P=16, c=50)
 
-| Value Size | Redis SET/s | rust-redis SET/s | Ratio |
+| Value Size | Redis SET/s | moon SET/s | Ratio |
 |:----------:|:-----------:|:----------------:|:-----:|
 | 32 B | 1,298,701 | **1,754,386** | **1.35x** |
 | 256 B | 1,219,512 | **1,639,344** | **1.34x** |
@@ -127,7 +127,7 @@ Per-shard overhead includes: DashTable segments, event loop state, SPSC channels
 
 ### 3.2 Multi-Shard Peak Throughput (Monoio runtime)
 
-| Config | rust-redis | Redis | Ratio |
+| Config | moon | Redis | Ratio |
 |--------|:----------:|:-----:|:-----:|
 | 8-shard GET P=16 c=50 | 2.60M | 1.41M | **1.84x** |
 | 8-shard SET P=16 c=50 | 2.52M | 1.27M | **1.99x** |
@@ -153,16 +153,16 @@ Scaling is sub-linear due to cross-shard SPSC dispatch overhead and shared loopb
 
 ### 4.1 CPU% and Throughput by Pipeline Depth (1-shard, 200K pre-loaded keys)
 
-| Pipeline | Redis CPU% | rust-redis CPU% | Redis RPS | rust-redis RPS | RPS Ratio | CPU/100K-ops (Redis) | CPU/100K-ops (rust-redis) |
+| Pipeline | Redis CPU% | moon CPU% | Redis RPS | moon RPS | RPS Ratio | CPU/100K-ops (Redis) | CPU/100K-ops (moon) |
 |:--------:|:----------:|:---------------:|:---------:|:--------------:|:---------:|:--------------------:|:-------------------------:|
 | P=1 | 97.2% | 91.1% | 169K | 148K | 0.87x | 57.9% | 62.0% |
 | P=8 | 100.0% | **3.3%** | 1.14M | 1.11M | 0.97x | 8.8% | **0.29%** |
 | P=16 | 100.0% | **1.9%** | 1.95M | **1.97M** | **1.01x** | 5.1% | **0.10%** |
 | P=64 | 43.9% | **1.9%** | 2.42M | **4.13M** | **1.71x** | 1.8% | **0.05%** |
 
-At P=64, rust-redis delivers **1.71x the throughput of Redis while using 23x less CPU**.
+At P=64, moon delivers **1.71x the throughput of Redis while using 23x less CPU**.
 
-### 4.2 Why rust-redis Is More CPU-Efficient
+### 4.2 Why moon Is More CPU-Efficient
 
 1. **io_uring-style batch I/O** — amortizes syscall overhead across multiple commands
 2. **DashTable SIMD probing** — 16-way parallel key matching with SSE2/NEON
@@ -210,7 +210,7 @@ At p=1, TCP loopback latency (~5000ns) dominates. Command processing (156ns) is 
 
 | Clients | Advantage |
 |:-------:|:---------:|
-| 1-10 | **1.93-3.27x** rust-redis (low contention, cache locality wins) |
+| 1-10 | **1.93-3.27x** moon (low contention, cache locality wins) |
 | 50 | ~1.0x (parity) |
 | 100-500 | 0.88-0.92x (async runtime overhead under contention) |
 
@@ -222,7 +222,7 @@ Optimal operating point: **10-50 clients per shard**.
 
 ### 6.1 With AOF Everysec, Advantage Grows
 
-| Pipeline | SET ops/s (rust-redis) | vs Redis (no AOF) | vs Redis (AOF everysec) |
+| Pipeline | SET ops/s (moon) | vs Redis (no AOF) | vs Redis (AOF everysec) |
 |:--------:|:----------------------:|:------------------:|:-----------------------:|
 | P=1 | 146K | 0.95x | 0.95x |
 | P=8 | 1,117K | 1.68x | **1.68x** |
@@ -230,9 +230,9 @@ Optimal operating point: **10-50 clients per shard**.
 | P=32 | 2,469K | — | **2.52x** |
 | P=64 | **2,778K** | 1.80x | **2.75x** |
 
-### 6.2 Why Persistence Makes rust-redis Faster (Relatively)
+### 6.2 Why Persistence Makes moon Faster (Relatively)
 
-| Aspect | Redis | rust-redis |
+| Aspect | Redis | moon |
 |--------|-------|------------|
 | AOF architecture | Global append-only file, single writer thread | Per-shard WAL files, no global lock |
 | Hot-path cost | Buffer + background rewrite | `buf.extend_from_slice()` (~5ns) |
@@ -246,7 +246,7 @@ Optimal operating point: **10-50 clients per shard**.
 
 From `scripts/bench-production.sh` (10 scenarios):
 
-| Scenario | Description | rust-redis vs Redis |
+| Scenario | Description | moon vs Redis |
 |----------|-------------|:-------------------:|
 | Session store | 80% GET / 15% SET, 512B values | **1.24x** |
 | Rate limiting | INCR with 100-200 clients | **1.15x** |
@@ -261,7 +261,7 @@ Collection commands (LPUSH, HSET, ZADD) at P=64 are 1.06-1.25x Redis because exe
 
 ### 7.1 Data Size Advantage
 
-rust-redis wins across ALL payload sizes for both SET and GET:
+moon wins across ALL payload sizes for both SET and GET:
 
 | Value Size | GET Advantage | SET Advantage |
 |:----------:|:------------:|:------------:|
@@ -278,7 +278,7 @@ Larger values amplify the io_uring zero-copy and writev scatter-gather advantage
 
 ### 8.1 p50 Latency (8-shard)
 
-| Metric | Redis | rust-redis | Improvement |
+| Metric | Redis | moon | Improvement |
 |--------|:-----:|:----------:|:-----------:|
 | p50 latency | 0.26-0.33 ms | **0.031 ms** | **8-10x lower** |
 
@@ -290,7 +290,7 @@ Multi-core parallelism reduces per-shard queue depth. The median request sees le
 
 ### 9.1 Consistency Test Suite
 
-`scripts/test-consistency.sh` runs 132 tests comparing rust-redis output against Redis as ground truth.
+`scripts/test-consistency.sh` runs 132 tests comparing moon output against Redis as ground truth.
 
 | Category | Tests | Status |
 |----------|:-----:|:------:|
@@ -406,7 +406,7 @@ redis-benchmark -p 6400 -c 50 -n 100000 -t SET,GET -P 16 -q
 
 ```bash
 # Start with AOF
-./target/release/rust-redis --port 6400 --shards 1 --appendonly yes --appendfsync everysec &
+./target/release/moon --port 6400 --shards 1 --appendonly yes --appendfsync everysec &
 redis-server --port 6399 --save "" --appendonly yes --appendfsync everysec --daemonize yes
 
 # Benchmark writes

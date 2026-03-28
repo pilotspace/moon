@@ -1,0 +1,64 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "Moon",
+  "colors": {
+    "primary": "#6366F1",
+    "light": "#A5B4FC",
+    "dark": "#4338CA"
+  },
+  "logo": {
+    "light": "/images/logo-light.png",
+    "dark": "/images/logo-dark.png"
+  },
+  "favicon": "/images/favicon.png",
+  "appearance": {
+    "default": "system"
+  },
+  "navbar": {
+    "links": [
+      {
+        "type": "github",
+        "href": "https://github.com/pilotspace/moon"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/pilotspace/moon"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": ["index", "quickstart"]
+          },
+          {
+            "group": "Core concepts",
+            "pages": ["architecture", "commands"]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/persistence",
+              "guides/clustering",
+              "guides/tls",
+              "guides/docker"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": ["configuration", "benchmarks"]
+          }
+        ]
+      }
+    ]
+  },
+  "search": {
+    "prompt": "Search Moon docs..."
+  }
+}
