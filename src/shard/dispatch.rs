@@ -143,6 +143,29 @@ pub enum ShardMessage {
         commands: Vec<std::sync::Arc<Frame>>,
         response_slot: ResponseSlotPtr,
     },
+    /// Cross-shard subscription metadata: another shard gained a subscriber.
+    PubSubSubscribe {
+        source_shard: usize,
+        channel: Bytes,
+        is_pattern: bool,
+    },
+    /// Cross-shard subscription metadata: another shard lost all subscribers for a channel.
+    PubSubUnsubscribe {
+        source_shard: usize,
+        channel: Bytes,
+        is_pattern: bool,
+    },
+    /// Cross-shard PUBLISH with reply for accurate subscriber count.
+    PubSubPublish {
+        channel: Bytes,
+        message: Bytes,
+        reply_tx: channel::OneshotSender<i64>,
+    },
+    /// Cross-shard PUBSUB introspection query with reply.
+    PubSubIntrospect {
+        query: PubSubQuery,
+        reply_tx: channel::OneshotSender<PubSubQueryResult>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }
@@ -150,6 +173,23 @@ pub enum ShardMessage {
 // ShardMessage is Send because all fields are Send. The raw pointer in
 // ResponseSlotPtr is the only non-auto-Send field, and it has its own
 // localized unsafe impl Send with documented safety invariants.
+
+/// Query types for PUBSUB introspection commands.
+pub enum PubSubQuery {
+    /// PUBSUB CHANNELS [pattern]
+    Channels(Option<Bytes>),
+    /// PUBSUB NUMSUB ch1 ch2 ...
+    NumSub(Vec<Bytes>),
+    /// PUBSUB NUMPAT
+    NumPat,
+}
+
+/// Result types for PUBSUB introspection queries.
+pub enum PubSubQueryResult {
+    Channels(Vec<Bytes>),
+    NumSub(Vec<(Bytes, i64)>),
+    NumPat(usize),
+}
 
 #[cfg(test)]
 mod tests {
