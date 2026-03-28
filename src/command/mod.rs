@@ -388,7 +388,7 @@ pub fn dispatch(
             }
         }
         (6, b's') => {
-            // SELECT STRLEN SINTER SUNION
+            // SELECT STRLEN SUBSTR SINTER SUNION
             let b1 = cmd[1] | 0x20;
             match b1 {
                 b'e' => {
@@ -409,6 +409,9 @@ pub fn dispatch(
                 b'u' => {
                     if cmd.eq_ignore_ascii_case(b"SUNION") {
                         return resp(set::sunion(db, args));
+                    }
+                    if cmd.eq_ignore_ascii_case(b"SUBSTR") {
+                        return resp(string::getrange(db, args));
                     }
                 }
                 _ => {}
@@ -491,6 +494,12 @@ pub fn dispatch(
             }
         }
         // 8-letter commands
+        (8, b'g') => {
+            // GETRANGE
+            if cmd.eq_ignore_ascii_case(b"GETRANGE") {
+                return resp(string::getrange(db, args));
+            }
+        }
         (8, b'r') => {
             // RENAMENX
             if cmd.eq_ignore_ascii_case(b"RENAMENX") {
@@ -498,9 +507,12 @@ pub fn dispatch(
             }
         }
         (8, b's') => {
-            // SMEMBERS
+            // SMEMBERS SETRANGE
             if cmd.eq_ignore_ascii_case(b"SMEMBERS") {
                 return resp(set::smembers(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"SETRANGE") {
+                return resp(string::setrange(db, args));
             }
         }
         (8, b'x') => {
@@ -774,9 +786,12 @@ pub fn dispatch_read(
             }
         }
         (6, b's') => {
-            // STRLEN SINTER SUNION
+            // STRLEN SUBSTR SINTER SUNION
             if cmd.eq_ignore_ascii_case(b"STRLEN") {
                 return resp(string::strlen_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"SUBSTR") {
+                return resp(string::getrange_readonly(db, args, now_ms));
             }
             if cmd.eq_ignore_ascii_case(b"SINTER") {
                 return resp(set::sinter_readonly(db, args, now_ms));
@@ -810,6 +825,12 @@ pub fn dispatch_read(
             }
             if cmd.eq_ignore_ascii_case(b"HEXISTS") {
                 return resp(hash::hexists_readonly(db, args, now_ms));
+            }
+        }
+        (8, b'g') => {
+            // GETRANGE
+            if cmd.eq_ignore_ascii_case(b"GETRANGE") {
+                return resp(string::getrange_readonly(db, args, now_ms));
             }
         }
         (8, b's') => {
