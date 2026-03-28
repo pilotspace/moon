@@ -6,6 +6,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(feature = "jemalloc")]
+#[unsafe(export_name = "malloc_conf")]
+pub static JEMALLOC_CONF: &[u8] = b"percpu_arena:percpu,background_thread:true,metadata_thp:auto,dirty_decay_ms:5000,muzzy_decay_ms:30000,abort_conf:true\0";
+
 use std::path::PathBuf;
 
 use clap::Parser;
