@@ -3,6 +3,7 @@ pub mod compact_key;
 pub mod compact_value;
 pub mod dashtable;
 pub mod db;
+pub mod engine;
 pub mod entry;
 pub mod eviction;
 pub mod intset;
