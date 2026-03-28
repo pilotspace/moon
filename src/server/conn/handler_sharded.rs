@@ -31,6 +31,26 @@ use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
+use super::affinity::{AffinityTracker, MigratedConnectionState};
+
+/// Result of `handle_connection_sharded_inner` execution.
+///
+/// The generic inner handler cannot perform FD extraction (requires concrete stream type).
+/// When migration is triggered, it returns `MigrateConnection` so the concrete caller
+/// can extract the raw FD and send the migration message via SPSC.
+pub enum HandlerResult {
+    /// Normal connection close (QUIT, EOF, error, shutdown).
+    Done,
+    /// AffinityTracker detected a dominant remote shard. The caller should:
+    /// 1. Extract the raw FD from the concrete stream (into_std + into_raw_fd)
+    /// 2. Send ShardMessage::MigrateConnection via SPSC to `target_shard`
+    /// 3. Drop the handler (connection ownership transferred)
+    MigrateConnection {
+        state: MigratedConnectionState,
+        target_shard: usize,
+    },
+}
+
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
@@ -80,13 +100,13 @@ pub async fn handle_connection_sharded(
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    handle_connection_sharded_inner(
+    let result = handle_connection_sharded_inner(
         stream,
         peer_addr,
         shard_databases,
         shard_id,
         num_shards,
-        dispatch_tx,
+        dispatch_tx.clone(),
         pubsub_registry,
         blocking_registry,
         shutdown,
@@ -102,17 +122,65 @@ pub async fn handle_connection_sharded(
         acl_table,
         runtime_config,
         config,
-        spsc_notifiers,
+        spsc_notifiers.clone(),
         snapshot_trigger_tx,
         cached_clock,
+        true, // can_migrate: plain TCP supports FD extraction
     )
     .await;
+
+    // Handle migration result: extract FD from the returned stream and send via SPSC
+    if let (HandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (result.0, result.1) {
+        use std::os::unix::io::IntoRawFd;
+        match stream.into_std() {
+            Ok(std_stream) => {
+                let raw_fd = std_stream.into_raw_fd();
+                let msg = ShardMessage::MigrateConnection { fd: raw_fd, state };
+                let target_idx = ChannelMesh::target_index(shard_id, target_shard);
+                let push_result = {
+                    let mut producers = dispatch_tx.borrow_mut();
+                    producers[target_idx].try_push(msg)
+                };
+                match push_result {
+                    Ok(()) => {
+                        spsc_notifiers[target_shard].notify_one();
+                        tracing::info!(
+                            "Shard {}: migrated connection {} to shard {}",
+                            shard_id, client_id, target_shard
+                        );
+                    }
+                    Err(returned_msg) => {
+                        // SPSC full -- graceful fallback: close the FD via OwnedFd drop
+                        if let ShardMessage::MigrateConnection { fd, .. } = returned_msg {
+                            use std::os::unix::io::FromRawFd;
+                            drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+                        }
+                        tracing::warn!(
+                            "Shard {}: migration SPSC full, connection {} lost",
+                            shard_id, client_id
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Shard {}: migration into_std failed: {}",
+                    shard_id, e
+                );
+                // Stream consumed by into_std attempt, connection lost either way
+            }
+        }
+    }
 }
 
 /// Generic inner handler for sharded connections (Tokio runtime).
 ///
 /// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
 /// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
+///
+/// Returns `(HandlerResult, Option<S>)`: the stream is returned when migration is triggered
+/// so the concrete caller can extract the raw FD. `can_migrate` controls whether the
+/// AffinityTracker is active (set to `false` for TLS connections).
 pub async fn handle_connection_sharded_inner<
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 >(
@@ -140,7 +208,8 @@ pub async fn handle_connection_sharded_inner<
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
-) {
+    can_migrate: bool,
+) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Direct buffer I/O: bypass Framed/codec for the hot path.
@@ -176,7 +245,17 @@ pub async fn handle_connection_sharded_inner<
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
     let mut arena = Bump::with_capacity(4096);
 
+    // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
+    // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
+    let mut affinity_tracker = if num_shards > 1 && can_migrate {
+        Some(AffinityTracker::new(shard_id))
+    } else {
+        None
+    };
+
     let mut break_outer = false;
+    // Migration target: set when AffinityTracker triggers, acted on after batch response flush.
+    let mut migration_target: Option<usize> = None;
     loop {
         tokio::select! {
             result = stream.read_buf(&mut read_buf) => {
@@ -665,7 +744,7 @@ pub async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return; }
+                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
                         let blocking_response = handle_blocking_command(
                             cmd, cmd_args, selected_db, &shard_databases, &blocking_registry,
                             shard_id, num_shards, &dispatch_tx, &shutdown,
@@ -783,6 +862,19 @@ pub async fn handle_connection_sharded_inner<
                         Some(s) if s == shard_id => true,
                         _ => false,
                     };
+
+                    // Affinity sampling: record shard target for migration decision.
+                    // Only sample when we have a concrete target shard (key-bearing command).
+                    // Migration is deferred until AFTER the current batch is fully processed
+                    // and all responses are written, ensuring no command/response desync.
+                    if let (Some(tracker), Some(target)) = (&mut affinity_tracker, target_shard) {
+                        if let Some(migrate_to) = tracker.record(target) {
+                            // Migration preconditions: not in MULTI block
+                            if !in_multi {
+                                migration_target = Some(migrate_to);
+                            }
+                        }
+                    }
 
                     let is_write = if aof_tx.is_some() || tracking_state.enabled { metadata::is_write(cmd) } else { false };
                     let aof_bytes = if is_write && aof_tx.is_some() { Some(aof::serialize_command(&frame)) } else { None };
@@ -936,7 +1028,30 @@ pub async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if stream.write_all(&write_buf).await.is_err() { return; }
+                if stream.write_all(&write_buf).await.is_err() {
+                    return (HandlerResult::Done, None);
+                }
+
+                // Check if migration was triggered during frame processing.
+                // All responses for the current batch have been written, so the
+                // client sees no interruption -- TCP socket stays open.
+                if let Some(target_shard) = migration_target {
+                    let migrated_state = MigratedConnectionState {
+                        selected_db,
+                        authenticated,
+                        client_name: client_name.clone(),
+                        protocol_version,
+                        current_user: current_user.clone(),
+                        flags: 0,
+                        read_buf_remainder: read_buf.split(),
+                        client_id,
+                        peer_addr: peer_addr.clone(),
+                    };
+                    return (
+                        HandlerResult::MigrateConnection { state: migrated_state, target_shard },
+                        Some(stream),
+                    );
+                }
 
                 if write_buf.capacity() > 65536 { write_buf = BytesMut::with_capacity(8192); }
                 if read_buf.capacity() > 65536 {
@@ -964,4 +1079,6 @@ pub async fn handle_connection_sharded_inner<
     if tracking_state.enabled {
         tracking_table.borrow_mut().untrack_all(client_id);
     }
+
+    (HandlerResult::Done, None)
 }

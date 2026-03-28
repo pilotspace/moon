@@ -146,10 +146,11 @@ pub(crate) fn spawn_tokio_connection(
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
-                    handle_connection_sharded_inner(
+                    let _ = handle_connection_sharded_inner(
                         tls_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
                         reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                         snap_tx, clk,
+                        false, // can_migrate: TLS connections cannot transfer session state
                     )
                     .await;
                 }
@@ -264,11 +265,12 @@ pub(crate) fn spawn_migrated_tokio_connection(
             // State restoration (SELECT, CLIENT SETNAME) happens via synthetic commands
             // prepended to the read buffer by the handler's normal command processing.
             tokio::task::spawn_local(async move {
-                handle_connection_sharded_inner(
+                let _ = handle_connection_sharded_inner(
                     tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
                     None, // requirepass: None = pre-authenticated
                     aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                     snap_tx, clk,
+                    false, // can_migrate: already-migrated connections skip re-migration sampling
                 )
                 .await;
             });
