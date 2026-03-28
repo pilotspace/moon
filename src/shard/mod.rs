@@ -5,6 +5,7 @@ pub mod event_loop;
 pub mod mesh;
 pub mod numa;
 pub mod persistence_tick;
+pub mod remote_subscriber_map;
 pub mod shared_databases;
 pub mod spsc_handler;
 pub mod timers;
