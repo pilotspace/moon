@@ -123,7 +123,7 @@ impl Intset {
         if len == 0 {
             return None;
         }
-        use rand::Rng;
+        use rand::RngExt;
         let idx = rand::rng().random_range(0..len);
         self.get(idx)
     }

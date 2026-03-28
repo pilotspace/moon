@@ -29,7 +29,7 @@ anyhow = "1"
 futures = "0.3"
 ordered-float = "5"
 phf = { version = "0.11", features = ["macros"] }
-rand = "0.9"
+rand = "0.10"
 crc16 = "0.4"
 crc32fast = "1"
 parking_lot = "0.12"
@@ -40,7 +40,7 @@ core_affinity = "0.8"
 once_cell = "1"
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
 sha1_smol = { version = "1.0", features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 ctrlc = "3.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
@@ -68,12 +68,12 @@ runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustl
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
-nix = { version = "0.29", features = ["net", "socket"] }
+nix = { version = "0.31", features = ["net", "socket"] }
 libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-redis = { version = "0.27", features = ["tokio-comp"] }
+redis = { version = "1.1", features = ["tokio-comp"] }
 tempfile = "3"
 
 [profile.release]

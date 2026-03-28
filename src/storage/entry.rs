@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 

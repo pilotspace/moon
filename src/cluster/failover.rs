@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "runtime-monoio")]
 use monoio::io::AsyncWriteRentExt;
-use rand::Rng;
+use rand::RngExt;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "runtime-tokio")]
