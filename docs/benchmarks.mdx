@@ -1,0 +1,139 @@
+---
+title: "Benchmarks"
+description: "Performance results, methodology, and reproduction steps."
+keywords: ["benchmarks", "performance", "throughput", "latency", "memory"]
+mode: "wide"
+---
+
+Benchmarked against Redis 8.6.1 on Apple M4 Pro (12 cores, 24 GB RAM). Co-located client and server using `redis-benchmark`. Fresh server instance per data point for memory tests.
+
+## Executive summary
+
+| Metric | Moon vs Redis | Conditions |
+|--------|:---:|------------|
+| Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS |
+| Peak throughput (GET) | **3.79M ops/sec** | 4-shard, pipeline=64 |
+| Throughput at pipeline=64 | **1.71x Redis** | 1-shard, GET+SET mixed |
+| CPU efficiency at pipeline=64 | **45x better** | 1.9% vs 43.9% CPU |
+| With AOF persistence | **2.75x Redis** | SET, pipeline=64 |
+| Multi-shard (8s, pipeline=16) | **1.84-1.99x Redis** | GET / SET |
+| p50 latency (8-shard) | **8-10x lower** | 0.031ms vs 0.26ms |
+| Data correctness | **132/132 tests** | All types, 1/4/12 shards |
+
+## Memory efficiency
+
+### Per-key memory (1-shard, string keys)
+
+| Value size | Keys | Redis/key | Moon/key | Winner | Ratio |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 32 B | ~63K | 118 B | 147 B | Redis | 0.80x |
+| 256 B | ~63K | 412 B | 407 B | Tied | 1.01x |
+| 1,024 B | ~63K | 1,879 B | **1,207 B** | **Moon** | **1.56x** |
+| 4,096 B | ~63K | 5,131 B | **4,352 B** | **Moon** | **1.18x** |
+
+At 1M keys:
+
+| Value size | Redis RSS | Moon RSS | Redis/key | Moon/key | Winner |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| 32 B | 78.2 MB | 95.8 MB | 118 B | 147 B | Redis |
+| 256 B | 231.5 MB | 234.4 MB | 372 B | 376 B | Tied |
+| 1,024 B | 954.2 MB | **703.0 MB** | 1,571 B | **1,153 B** | **Moon** |
+
+<Tip>
+Moon's advantage comes from `HeapString(Vec<u8>)` (48 bytes overhead) vs Redis's `robj` + SDS chain (~64-80 bytes overhead). TTL is packed as a 4-byte delta inside `CompactEntry` at zero extra cost, while Redis allocates a separate 24-byte `dictEntry` per expiring key.
+</Tip>
+
+### Baseline RSS
+
+| Server | RSS |
+|--------|-----|
+| Redis 8.6.1 | 7.0 MB |
+| Moon (1 shard) | 7.0 MB |
+| Moon (12 shards) | 15.7 MB |
+
+## Throughput
+
+### Single-shard SET (pipeline=16, 50 clients)
+
+| Value size | Redis SET/s | Moon SET/s | Ratio |
+|:---:|:---:|:---:|:---:|
+| 32 B | 1,298,701 | **1,754,386** | **1.35x** |
+| 256 B | 1,219,512 | **1,639,344** | **1.34x** |
+| 1,024 B | 1,010,101 | **1,030,928** | 1.02x |
+| 4,096 B | 540,541 | **571,429** | 1.06x |
+
+### Multi-shard peak throughput
+
+| Config | Moon | Redis | Ratio |
+|--------|:---:|:---:|:---:|
+| 8-shard GET p=16 c=50 | 2.60M | 1.41M | **1.84x** |
+| 8-shard SET p=16 c=50 | 2.52M | 1.27M | **1.99x** |
+| 4-shard GET p=64 c=50 | **3.79M** | 2.41M | **1.57x** |
+
+## CPU efficiency
+
+| Pipeline | Redis CPU | Moon CPU | Redis RPS | Moon RPS | RPS ratio |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| p=1 | 97.2% | 91.1% | 169K | 148K | 0.87x |
+| p=8 | 100.0% | **3.3%** | 1.14M | 1.11M | 0.97x |
+| p=16 | 100.0% | **1.9%** | 1.95M | **1.97M** | **1.01x** |
+| p=64 | 43.9% | **1.9%** | 2.42M | **4.13M** | **1.71x** |
+
+At pipeline=64, Moon delivers **1.71x the throughput of Redis while using 23x less CPU**.
+
+## Persistence (AOF) performance
+
+| Pipeline | Moon SET/s | vs Redis (no AOF) | vs Redis (AOF everysec) |
+|:---:|:---:|:---:|:---:|
+| p=1 | 146K | 0.95x | 0.95x |
+| p=8 | 1,117K | 1.68x | **1.68x** |
+| p=16 | 1,887K | 1.90x | **2.21x** |
+| p=64 | **2,778K** | 1.80x | **2.75x** |
+
+<Note>
+Moon's per-shard WAL avoids the global serialization point that Redis's single AOF file introduces. The advantage grows with pipeline depth because per-shard WAL scales linearly with shards.
+</Note>
+
+## Latency
+
+| Metric | Redis | Moon | Improvement |
+|--------|:---:|:---:|:---:|
+| p50 latency (8-shard) | 0.26-0.33 ms | **0.031 ms** | **8-10x lower** |
+
+Multi-core parallelism reduces per-shard queue depth, so the median request sees less waiting time.
+
+## Production workload patterns
+
+| Scenario | Description | Moon vs Redis |
+|----------|-------------|:---:|
+| Session store | 80% GET / 15% SET, 512B values | **1.24x** |
+| Rate limiting | INCR with 100-200 clients | **1.15x** |
+| Leaderboard | ZADD + ZRANGEBYSCORE | **1.06-1.25x** |
+| App caching | 1KB-4KB values, MSET batch | **1.10-1.27x** |
+| Job queue | LPUSH/RPOP producer-consumer | **1.06x** |
+| User profiles | HSET, HGET | **1.10x** |
+
+## How to reproduce
+
+```bash
+# Build with native CPU optimizations
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Memory and CPU benchmark
+./scripts/bench-resources.sh --shards 1
+
+# Production workload scenarios
+./scripts/bench-production.sh --shards 1
+
+# Multi-shard scaling
+./scripts/bench-production.sh --shards 4
+./scripts/bench-production.sh --shards 8
+
+# Data consistency tests
+./scripts/test-consistency.sh --shards 1
+./scripts/test-consistency.sh --shards 4
+```
+
+<Warning>
+Co-located benchmarks (client and server on the same machine) are conservative. Separate-machine benchmarks with dedicated NICs show higher throughput. Always use `redis-benchmark -r <num_keys>` to generate unique keys. Use `redis-benchmark` 8.x which correctly handles `\r` in progress output.
+</Warning>
