@@ -97,7 +97,20 @@ pub(crate) fn finalize_snapshot_success(
         info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
         // Truncate WAL after successful snapshot
         if let Some(wal) = wal_writer {
-            let _ = wal.truncate_after_snapshot(epoch);
+            if let Err(e) = wal.truncate_after_snapshot(epoch) {
+                tracing::error!(
+                    "Shard {}: WAL truncation after snapshot epoch {} failed: {}. \
+                     WAL and snapshot may be out of sync.",
+                    shard_id,
+                    epoch,
+                    e
+                );
+                if let Some(tx) = snapshot_reply_tx.take() {
+                    let _ = tx.send(Err(format!("WAL truncation failed: {}", e)));
+                }
+                *snapshot_state = None;
+                return;
+            }
         }
         if let Some(tx) = snapshot_reply_tx.take() {
             let _ = tx.send(Ok(()));
@@ -123,6 +136,8 @@ pub(crate) fn finalize_snapshot_error(
 /// Flush WAL if needed (1ms tick -- write to page cache only; sync is separate).
 pub(crate) fn flush_wal_if_needed(wal_writer: &mut Option<WalWriter>) {
     if let Some(wal) = wal_writer {
-        let _ = wal.flush_if_needed();
+        if let Err(e) = wal.flush_if_needed() {
+            tracing::error!("WAL flush failed: {}", e);
+        }
     }
 }

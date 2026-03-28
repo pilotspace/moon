@@ -57,11 +57,22 @@ pub(crate) fn drain_spsc_shared(
     let mut execute_batch: Vec<ShardMessage> = Vec::new();
     let mut other_messages: Vec<ShardMessage> = Vec::new();
 
+    let mut snapshot_seen = false;
     for consumer in consumers.iter_mut() {
+        if snapshot_seen {
+            break;
+        }
         while drained < MAX_DRAIN_PER_CYCLE {
             match consumer.try_pop() {
                 Some(msg) => {
                     drained += 1;
+                    // Stop draining once a SnapshotBegin arrives so later writes
+                    // aren't processed before the snapshot captures current state.
+                    if matches!(&msg, ShardMessage::SnapshotBegin { .. }) {
+                        other_messages.push(msg);
+                        snapshot_seen = true;
+                        break;
+                    }
                     match &msg {
                         ShardMessage::Execute { .. }
                         | ShardMessage::PipelineBatch { .. }
@@ -198,10 +209,16 @@ pub(crate) fn handle_shard_message_shared(
                         || cmd.eq_ignore_ascii_case(b"ZADD")
                         || cmd.eq_ignore_ascii_case(b"XADD");
                     if needs_wake {
-                        if let Some(key) = args
-                            .first()
-                            .and_then(|f| crate::server::connection::extract_bytes(f))
-                        {
+                        // For LMOVE, wake waiters on the destination key (args[1]),
+                        // not the source key (args[0]).
+                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                            args.get(1)
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        } else {
+                            args.first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        };
+                        if let Some(key) = wake_key {
                             let mut reg = blocking_registry.borrow_mut();
                             if cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -281,6 +298,50 @@ pub(crate) fn handle_shard_message_shared(
                         repl_state,
                         shard_id,
                     );
+
+                    // Wake blocked waiters for producer commands (same as Execute path)
+                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                        || cmd.eq_ignore_ascii_case(b"ZADD")
+                        || cmd.eq_ignore_ascii_case(b"XADD");
+                    if needs_wake {
+                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                            args.get(1)
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        } else {
+                            args.first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        };
+                        if let Some(key) = wake_key {
+                            let mut reg = blocking_registry.borrow_mut();
+                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            {
+                                crate::blocking::wakeup::try_wake_list_waiter(
+                                    &mut reg,
+                                    &mut dbs[db_idx],
+                                    db_idx,
+                                    &key,
+                                );
+                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                    &mut reg,
+                                    &mut dbs[db_idx],
+                                    db_idx,
+                                    &key,
+                                );
+                            } else {
+                                crate::blocking::wakeup::try_wake_stream_waiter(
+                                    &mut reg,
+                                    &mut dbs[db_idx],
+                                    db_idx,
+                                    &key,
+                                );
+                            }
+                        }
+                    }
                 }
 
                 results.push(frame);
@@ -342,10 +403,16 @@ pub(crate) fn handle_shard_message_shared(
                         || cmd.eq_ignore_ascii_case(b"ZADD")
                         || cmd.eq_ignore_ascii_case(b"XADD");
                     if needs_wake {
-                        if let Some(key) = args
-                            .first()
-                            .and_then(|f| crate::server::connection::extract_bytes(f))
-                        {
+                        // For LMOVE, wake waiters on the destination key (args[1]),
+                        // not the source key (args[0]).
+                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                            args.get(1)
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        } else {
+                            args.first()
+                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                        };
+                        if let Some(key) = wake_key {
                             let mut reg = blocking_registry.borrow_mut();
                             if cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -515,8 +582,9 @@ pub(crate) fn wal_append_and_fanout(
     }
     // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
     if let Some(rs) = repl_state {
-        if let Ok(rs) = rs.try_read() {
-            rs.increment_shard_offset(shard_id, data.len() as u64);
+        match rs.read() {
+            Ok(rs) => rs.increment_shard_offset(shard_id, data.len() as u64),
+            Err(_) => tracing::error!("repl_state lock poisoned, replication offset not updated"),
         }
     }
     // 4. Fan-out to replica sender tasks (non-blocking: lagging replicas are skipped)

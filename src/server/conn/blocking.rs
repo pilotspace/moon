@@ -21,22 +21,23 @@ use crate::storage::Database;
 use super::util::extract_bytes;
 
 /// Convert a blocking command to its non-blocking equivalent for MULTI/EXEC.
-/// BLPOP key [key ...] timeout -> LPOP key (first key only)
-/// BRPOP key [key ...] timeout -> RPOP key
+/// BLPOP key [key ...] timeout -> LPOP key [key ...]
+/// BRPOP key [key ...] timeout -> RPOP key [key ...]
 /// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout -> LMOVE src dst LEFT|RIGHT LEFT|RIGHT
-/// BZPOPMIN key [key ...] timeout -> ZPOPMIN key
-/// BZPOPMAX key [key ...] timeout -> ZPOPMAX key
+/// BZPOPMIN key [key ...] timeout -> ZPOPMIN key [key ...]
+/// BZPOPMAX key [key ...] timeout -> ZPOPMAX key [key ...]
 pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Frame {
     let mut new_args = Vec::new();
     if cmd.eq_ignore_ascii_case(b"BLPOP") {
         new_args.push(Frame::BulkString(Bytes::from_static(b"LPOP")));
-        if let Some(first_key) = args.first() {
-            new_args.push(first_key.clone());
+        // All args except the last (timeout)
+        for arg in args.iter().take(args.len().saturating_sub(1)) {
+            new_args.push(arg.clone());
         }
     } else if cmd.eq_ignore_ascii_case(b"BRPOP") {
         new_args.push(Frame::BulkString(Bytes::from_static(b"RPOP")));
-        if let Some(first_key) = args.first() {
-            new_args.push(first_key.clone());
+        for arg in args.iter().take(args.len().saturating_sub(1)) {
+            new_args.push(arg.clone());
         }
     } else if cmd.eq_ignore_ascii_case(b"BLMOVE") {
         new_args.push(Frame::BulkString(Bytes::from_static(b"LMOVE")));
@@ -46,13 +47,13 @@ pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Fra
         }
     } else if cmd.eq_ignore_ascii_case(b"BZPOPMIN") {
         new_args.push(Frame::BulkString(Bytes::from_static(b"ZPOPMIN")));
-        if let Some(first_key) = args.first() {
-            new_args.push(first_key.clone());
+        for arg in args.iter().take(args.len().saturating_sub(1)) {
+            new_args.push(arg.clone());
         }
     } else if cmd.eq_ignore_ascii_case(b"BZPOPMAX") {
         new_args.push(Frame::BulkString(Bytes::from_static(b"ZPOPMAX")));
-        if let Some(first_key) = args.first() {
-            new_args.push(first_key.clone());
+        for arg in args.iter().take(args.len().saturating_sub(1)) {
+            new_args.push(arg.clone());
         }
     }
     Frame::Array(new_args.into())
@@ -112,21 +113,38 @@ pub(crate) async fn handle_blocking_command(
 
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
+        let target = key_to_shard(&keys[0], num_shards);
         let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
         let wait_id = {
             let mut reg = blocking_registry.borrow_mut();
             let wait_id = reg.next_wait_id();
-            let entry = crate::blocking::WaitEntry {
-                wait_id,
-                cmd: blocked_cmd_factory(),
-                reply_tx,
-                deadline,
-            };
-            reg.register(selected_db, keys[0].clone(), entry);
+            if target == shard_id {
+                // Local registration
+                let entry = crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx,
+                    deadline,
+                };
+                reg.register(selected_db, keys[0].clone(), entry);
+            } else {
+                // Remote registration via SPSC
+                let mut producers = dispatch_tx.borrow_mut();
+                let target_idx = ChannelMesh::target_index(shard_id, target);
+                let msg = ShardMessage::BlockRegister {
+                    db_index: selected_db,
+                    key: keys[0].clone(),
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx,
+                };
+                let _ = producers[target_idx].try_push(msg);
+            }
             wait_id
         }; // reg borrow dropped
 
-        return if let Some(dl) = deadline {
+        let is_remote = target != shard_id;
+        let result = if let Some(dl) = deadline {
             tokio::select! {
                 res = reply_rx => {
                     match res {
@@ -157,6 +175,13 @@ pub(crate) async fn handle_blocking_command(
                 }
             }
         };
+        // Cleanup remote registration on timeout/shutdown
+        if is_remote && !matches!(result, Frame::Null) || matches!(result, Frame::Error(_)) {
+            let mut producers = dispatch_tx.borrow_mut();
+            let target_idx = ChannelMesh::target_index(shard_id, target);
+            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+        }
+        return result;
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
@@ -215,8 +240,7 @@ pub(crate) async fn handle_blocking_command(
                 result = receivers.next() => {
                     match result {
                         Some(Ok(Some(frame))) => { result_frame = frame; break; }
-                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
-                        Some(Err(_)) => continue, // sender dropped (cleanup race), try next
+                        Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
                         None => break, // all receivers exhausted
                     }
                 }
@@ -235,8 +259,7 @@ pub(crate) async fn handle_blocking_command(
                 result = receivers.next() => {
                     match result {
                         Some(Ok(Some(frame))) => { result_frame = frame; break; }
-                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
-                        Some(Err(_)) => continue,
+                        Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
                         None => break,
                     }
                 }
@@ -321,21 +344,51 @@ pub(crate) async fn handle_blocking_command_monoio(
 
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
+        let target = key_to_shard(&keys[0], num_shards);
         let (reply_tx, reply_rx) = channel::oneshot::<Option<Frame>>();
         let wait_id = {
             let mut reg = blocking_registry.borrow_mut();
             let wait_id = reg.next_wait_id();
-            let entry = crate::blocking::WaitEntry {
-                wait_id,
-                cmd: blocked_cmd_factory(),
-                reply_tx,
-                deadline,
-            };
-            reg.register(selected_db, keys[0].clone(), entry);
+            if target == shard_id {
+                let entry = crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx,
+                    deadline,
+                };
+                reg.register(selected_db, keys[0].clone(), entry);
+            } else {
+                drop(reg);
+                let mut producers = dispatch_tx.borrow_mut();
+                let target_idx = ChannelMesh::target_index(shard_id, target);
+                let msg = ShardMessage::BlockRegister {
+                    db_index: selected_db,
+                    key: keys[0].clone(),
+                    wait_id,
+                    cmd: blocked_cmd_factory(),
+                    reply_tx,
+                };
+                let mut msg_pending = msg;
+                loop {
+                    match producers[target_idx].try_push(msg_pending) {
+                        Ok(()) => {
+                            spsc_notifiers[target].notify_one();
+                            break;
+                        }
+                        Err(val) => {
+                            msg_pending = val;
+                            drop(producers);
+                            monoio::time::sleep(std::time::Duration::from_micros(10)).await;
+                            producers = dispatch_tx.borrow_mut();
+                        }
+                    }
+                }
+            }
             wait_id
         }; // reg borrow dropped
 
-        return if let Some(dl) = deadline {
+        let is_remote = target != shard_id;
+        let result = if let Some(dl) = deadline {
             monoio::select! {
                 res = reply_rx => {
                     match res {
@@ -366,6 +419,12 @@ pub(crate) async fn handle_blocking_command_monoio(
                 }
             }
         };
+        if is_remote {
+            let mut producers = dispatch_tx.borrow_mut();
+            let target_idx = ChannelMesh::target_index(shard_id, target);
+            let _ = producers[target_idx].try_push(ShardMessage::BlockCancel { wait_id });
+        }
+        return result;
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
@@ -443,8 +502,7 @@ pub(crate) async fn handle_blocking_command_monoio(
                 result = receivers.next() => {
                     match result {
                         Some(Ok(Some(frame))) => { result_frame = frame; break; }
-                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
-                        Some(Err(_)) => continue, // sender dropped (cleanup race), try next
+                        Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
                         None => break, // all receivers exhausted
                     }
                 }
@@ -463,8 +521,7 @@ pub(crate) async fn handle_blocking_command_monoio(
                 result = receivers.next() => {
                     match result {
                         Some(Ok(Some(frame))) => { result_frame = frame; break; }
-                        Some(Ok(None)) => { result_frame = Frame::Null; break; }
-                        Some(Err(_)) => continue,
+                        Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
                         None => break,
                     }
                 }
@@ -521,8 +578,10 @@ pub(crate) fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, 
             b"ERR timeout is not a float or out of range",
         ))
     })?;
-    if timeout < 0.0 {
-        return Err(Frame::Error(Bytes::from_static(b"ERR timeout is negative")));
+    if !timeout.is_finite() || timeout < 0.0 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR timeout is not a float or out of range",
+        )));
     }
     Ok(timeout)
 }

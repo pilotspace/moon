@@ -17,7 +17,7 @@ pub(crate) use blocking::handle_blocking_command;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) use blocking::handle_blocking_command_monoio;
 #[cfg(feature = "runtime-monoio")]
-pub(crate) use blocking::{try_inline_dispatch, try_inline_dispatch_loop};
+pub(crate) use blocking::try_inline_dispatch_loop;
 #[cfg(feature = "runtime-tokio")]
 pub(crate) use shared::{SharedDatabases, execute_transaction};
 pub(crate) use shared::{

@@ -10,6 +10,7 @@
 //! | `replay_aof` | **should-recover** (`Result<_, MoonError>`) | Startup replay; log+skip on corruption |
 //! | `rewrite_aof` | **should-recover** (`Result<_, MoonError>`) | Background rewrite; caller logs error |
 //! | `#[cfg(test)]` code (55 unwraps) | **test-only** | Panics are appropriate in tests |
+// Suppressions narrowed: only keep what's needed for conditional compilation
 #![allow(unused_imports, unused_variables, unreachable_code, clippy::empty_loop)]
 
 use std::path::{Path, PathBuf};
@@ -287,10 +288,13 @@ pub fn replay_aof(
                 );
                 corruption_count += 1;
 
-                // Skip to the next RESP array marker ('*') to attempt recovery
+                // Skip past the corrupt byte(s) to the next RESP array marker ('*')
+                // Always discard at least 1 byte to guarantee forward progress.
+                let _ = buf.split_to(1);
                 if let Some(pos) = buf.iter().position(|&b| b == b'*') {
                     let _ = buf.split_to(pos);
-                    // Continue parsing from the next '*'
+                } else if buf.is_empty() {
+                    break;
                 } else {
                     // No more RESP array markers found; stop replay
                     warn!(

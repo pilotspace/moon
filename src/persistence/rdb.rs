@@ -539,6 +539,7 @@ pub(crate) fn read_entry(
         }
         TYPE_HASH => {
             let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 8, "hash")?; // min 4+4 bytes per field+value length
             let mut map = HashMap::with_capacity(count);
             for _ in 0..count {
                 let field = read_bytes(cursor)?;
@@ -549,6 +550,7 @@ pub(crate) fn read_entry(
         }
         TYPE_LIST => {
             let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 4, "list")?; // min 4 bytes per element length
             let mut list = VecDeque::with_capacity(count);
             for _ in 0..count {
                 list.push_back(read_bytes(cursor)?);
@@ -557,6 +559,7 @@ pub(crate) fn read_entry(
         }
         TYPE_SET => {
             let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 4, "set")?; // min 4 bytes per element length
             let mut set = HashSet::with_capacity(count);
             for _ in 0..count {
                 set.insert(read_bytes(cursor)?);
@@ -565,6 +568,7 @@ pub(crate) fn read_entry(
         }
         TYPE_SORTED_SET => {
             let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 12, "sorted_set")?; // min 4 (member len) + 8 (f64 score)
             let mut members = HashMap::with_capacity(count);
             let mut tree = BPTree::new();
             for _ in 0..count {
@@ -594,6 +598,7 @@ pub(crate) fn read_entry(
             let mut stream = StreamData::new();
             stream.last_id = last_id;
 
+            validate_count(cursor, entry_count, 20, "stream_entries")?; // min 16 (id) + 4 (field_count)
             for _ in 0..entry_count {
                 let mut ms_buf = [0u8; 8];
                 let mut seq_buf = [0u8; 8];
@@ -604,6 +609,7 @@ pub(crate) fn read_entry(
                     seq: u64::from_le_bytes(seq_buf),
                 };
                 let field_count = read_u32(cursor)? as usize;
+                validate_count(cursor, field_count, 8, "stream_fields")?;
                 let mut fields = Vec::with_capacity(field_count);
                 for _ in 0..field_count {
                     let field = read_bytes(cursor)?;
@@ -724,8 +730,42 @@ pub(crate) fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), MoonErro
     Ok(())
 }
 
+/// Validate a collection count against remaining cursor data before allocating.
+/// `min_bytes_per_item` is the minimum bytes each item will read from the cursor.
+fn validate_count(
+    cursor: &Cursor<&[u8]>,
+    count: usize,
+    min_bytes_per_item: usize,
+    kind: &str,
+) -> Result<(), MoonError> {
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    if min_bytes_per_item > 0 && count > remaining / min_bytes_per_item {
+        return Err(RdbError::Corrupted {
+            detail: format!(
+                "{} count {} exceeds remaining data ({} bytes)",
+                kind, count, remaining
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Bytes, MoonError> {
     let len = read_u32(cursor)? as usize;
+    let remaining = cursor.get_ref().len() - cursor.position() as usize;
+    if len > remaining {
+        return Err(RdbError::Corrupted {
+            detail: format!(
+                "read_bytes: length field {} exceeds remaining data {}",
+                len, remaining
+            ),
+        }
+        .into());
+    }
     let mut data = vec![0u8; len];
     cursor.read_exact(&mut data)?;
     Ok(Bytes::from(data))

@@ -1,4 +1,4 @@
-#![allow(unused_imports, dead_code, unused_variables)]
+// Note: some imports/variables may be conditionally used across feature flags
 //! Single-thread tokio connection handler.
 //!
 //! Extracted from `server/connection.rs` (Plan 48-02).
@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio_util::codec::Framed;
 
-use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
@@ -25,13 +24,12 @@ use crate::persistence::aof::AofMessage;
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
-use crate::storage::Database;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::{
-    SharedDatabases, apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction,
-    extract_bytes, extract_command, extract_primary_key, handle_config,
+    SharedDatabases, apply_resp3_conversion, execute_transaction, extract_bytes, extract_command,
+    handle_config,
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
@@ -1001,10 +999,17 @@ pub async fn handle_connection(
 
                         if run_is_read {
                             // === Read run: shared read lock ===
-                            let guard = db[selected_db].read();
+                            // Re-acquire guard if selected_db changes mid-run.
+                            let mut current_db = selected_db;
+                            let mut guard = db[current_db].read();
                             let now_ms = crate::storage::entry::current_time_ms();
                             let proto = framed.codec().protocol_version();
                             for j in run_start..i {
+                                if selected_db != current_db {
+                                    drop(guard);
+                                    current_db = selected_db;
+                                    guard = db[current_db].read();
+                                }
                                 let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
                                 let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut selected_db, db_count);
@@ -1029,9 +1034,18 @@ pub async fn handle_connection(
                             // read guard dropped here
                         } else {
                             // === Write run: exclusive write lock ===
-                            let mut guard = db[selected_db].write();
+                            // Re-acquire guard if selected_db changes mid-run (e.g. SELECT).
+                            let mut current_db = selected_db;
+                            let mut guard = db[current_db].write();
                             guard.refresh_now();
                             for j in run_start..i {
+                                // Re-acquire guard if a previous SELECT changed the db
+                                if selected_db != current_db {
+                                    drop(guard);
+                                    current_db = selected_db;
+                                    guard = db[current_db].write();
+                                    guard.refresh_now();
+                                }
                                 let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
                                 let rt = runtime_config.read().unwrap();
                                 if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
@@ -1045,8 +1059,6 @@ pub async fn handle_connection(
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
                                 };
-                                if let Some(bytes) = aof_bytes {
-                                    if !matches!(&response, Frame::Error(_)) {
                                 // Invalidate tracked key on successful write
                                 if !matches!(&response, Frame::Error(_)) {
                                     if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
@@ -1058,7 +1070,7 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
-                                }
+                                    if let Some(bytes) = aof_bytes {
                                         aof_entries.push(bytes.clone());
                                     }
                                 }

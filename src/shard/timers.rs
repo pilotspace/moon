@@ -43,6 +43,8 @@ pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>
 /// WAL fsync on 1-second interval (everysec durability).
 pub(crate) fn sync_wal(wal_writer: &mut Option<WalWriter>) {
     if let Some(wal) = wal_writer {
-        let _ = wal.sync_to_disk();
+        if let Err(e) = wal.sync_to_disk() {
+            tracing::error!("WAL sync failed: {}", e);
+        }
     }
 }

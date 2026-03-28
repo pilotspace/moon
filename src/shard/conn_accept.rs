@@ -81,11 +81,18 @@ pub(crate) fn spawn_tokio_connection(
     let scfg = server_config.clone();
     let notifiers = all_notifiers.to_vec();
     let snap_tx = snapshot_trigger_tx.clone();
-    let reqpass = rtcfg
-        .read()
-        .map(|cfg| cfg.requirepass.clone())
-        .ok()
-        .flatten();
+    // Fail closed: if the config lock is poisoned, treat as requiring auth
+    // (deny by default) rather than silently disabling authentication.
+    let reqpass = match rtcfg.read() {
+        Ok(cfg) => cfg.requirepass.clone(),
+        Err(poisoned) => {
+            tracing::error!(
+                "Shard {}: RuntimeConfig lock poisoned, using last known config for auth",
+                shard_id
+            );
+            poisoned.into_inner().requirepass.clone()
+        }
+    };
     let clk = cached_clock.clone();
 
     if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
@@ -197,11 +204,10 @@ pub(crate) fn spawn_monoio_connection(
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            let reqpass = rtcfg
-                                .read()
-                                .map(|cfg| cfg.requirepass.clone())
-                                .ok()
-                                .flatten();
+                            let reqpass = match rtcfg.read() {
+                                Ok(cfg) => cfg.requirepass.clone(),
+                                Err(poisoned) => poisoned.into_inner().requirepass.clone(),
+                            };
                             handle_connection_sharded_monoio(
                                 tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk,
                                 sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
@@ -221,11 +227,10 @@ pub(crate) fn spawn_monoio_connection(
             } else {
                 // Plain TCP connection
                 monoio::spawn(async move {
-                    let reqpass = rtcfg
-                        .read()
-                        .map(|cfg| cfg.requirepass.clone())
-                        .ok()
-                        .flatten();
+                    let reqpass = match rtcfg.read() {
+                        Ok(cfg) => cfg.requirepass.clone(),
+                        Err(poisoned) => poisoned.into_inner().requirepass.clone(),
+                    };
                     handle_connection_sharded_monoio(
                         tcp_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
                         reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,

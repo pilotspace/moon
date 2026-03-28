@@ -35,6 +35,14 @@ impl CommandReplayEngine for DispatchReplayEngine {
         selected_db: &mut usize,
     ) {
         let db_count = databases.len();
+        if *selected_db >= db_count {
+            tracing::warn!(
+                "WAL replay: selected_db {} out of range (have {} databases), resetting to 0",
+                *selected_db,
+                db_count
+            );
+            *selected_db = 0;
+        }
         let _ = crate::command::dispatch(
             &mut databases[*selected_db],
             cmd,

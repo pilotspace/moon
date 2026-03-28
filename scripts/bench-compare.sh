@@ -8,6 +8,7 @@ set -euo pipefail
 #   ./scripts/bench-compare.sh                # Full run
 #   ./scripts/bench-compare.sh --requests N   # Custom request count
 #   ./scripts/bench-compare.sh --shards N     # Moon shard count
+#   ./scripts/bench-compare.sh --clients N    # Client count
 ###############################################################################
 
 PORT_REDIS=6399
@@ -22,9 +23,22 @@ MOON_PID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --requests) REQUESTS="$2"; shift 2 ;;
-        --shards)   SHARDS="$2"; shift 2 ;;
-        *) echo "Unknown: $1"; exit 1 ;;
+        --requests)
+            if [[ -z "${2:-}" ]] || [[ "$2" == --* ]]; then
+                echo "Error: --requests requires a numeric value"; exit 1
+            fi
+            REQUESTS="$2"; shift 2 ;;
+        --shards)
+            if [[ -z "${2:-}" ]] || [[ "$2" == --* ]]; then
+                echo "Error: --shards requires a numeric value"; exit 1
+            fi
+            SHARDS="$2"; shift 2 ;;
+        --clients)
+            if [[ -z "${2:-}" ]] || [[ "$2" == --* ]]; then
+                echo "Error: --clients requires a numeric value"; exit 1
+            fi
+            CLIENTS="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -40,7 +54,11 @@ cleanup() {
 trap cleanup EXIT
 
 parse_rps() {
-    tr '\r' '\n' | grep -i "requests per second" | tail -1 | sed 's/.*: \([0-9.]*\) requests.*/\1/' | sed 's/,//g'
+    tr '\r' '\n' \
+        | awk '/[Rr]equests per second/ { for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if ($i+0 == $i && $i > 0) { print $i; exit } } }' \
+        | head -1 \
+        || sed -n 's/.*[[:space:]]\([0-9][0-9.]*\)[[:space:]]*requests per second.*/\1/p' \
+        | sed 's/,//g' | tail -1
 }
 
 bench() {
@@ -77,10 +95,22 @@ log "Starting moon on port $PORT_MOON ($SHARDS shards)..."
 RUST_LOG=warn "$RUST_BINARY" --port "$PORT_MOON" --shards "$SHARDS" --protected-mode no &
 MOON_PID=$!
 
-sleep 1
+# Wait for servers with retry loop (max 10s)
+wait_for_server() {
+    local port="$1" name="$2" max_wait=10 elapsed=0
+    while (( elapsed < max_wait )); do
+        if redis-cli -p "$port" PING 2>/dev/null | grep -q PONG; then
+            return 0
+        fi
+        sleep 0.5
+        elapsed=$((elapsed + 1))
+    done
+    echo "$name failed to start on port $port within ${max_wait}s"
+    exit 1
+}
 
-redis-cli -p "$PORT_REDIS" PING >/dev/null 2>&1 || { echo "Redis failed to start"; exit 1; }
-redis-cli -p "$PORT_MOON" PING >/dev/null 2>&1 || { echo "Moon failed to start"; exit 1; }
+wait_for_server "$PORT_REDIS" "Redis"
+wait_for_server "$PORT_MOON" "Moon"
 
 log "Servers ready."
 
@@ -183,9 +213,9 @@ printf "| %-30s | %12s | %12s | %7s |\n" "Value Size" "Redis RPS" "Moon RPS" "Ra
 printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
 
 for size in 8 64 256 1024 4096 16384 65536; do
-    # Pre-populate
-    redis-cli -p "$PORT_REDIS" SET "bench:data" "$(head -c "$size" /dev/urandom | base64 | head -c "$size")" >/dev/null 2>&1
-    redis-cli -p "$PORT_MOON" SET "bench:data" "$(head -c "$size" /dev/urandom | base64 | head -c "$size")" >/dev/null 2>&1
+    # Seed data: run a quick SET pass so GET reads real values (not nils)
+    redis-benchmark -p "$PORT_REDIS" -n "$REQUESTS" -t set -d "$size" -q >/dev/null 2>&1
+    redis-benchmark -p "$PORT_MOON" -n "$REQUESTS" -t set -d "$size" -q >/dev/null 2>&1
     bench_cmd "GET ${size}B" -t get -d "$size"
 done
 
@@ -202,10 +232,7 @@ printf "| %-30s | %12s | %12s | %7s |\n" "Clients" "Redis RPS" "Moon RPS" "Ratio
 printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
 
 for c in 1 10 50 100 200 500; do
-    CLIENTS_SAVE=$CLIENTS
-    CLIENTS=$c
     bench_cmd "SET c=$c" -t set -c "$c"
-    CLIENTS=$CLIENTS_SAVE
 done
 
 # ===========================================================================

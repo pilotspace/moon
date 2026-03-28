@@ -1,4 +1,4 @@
-#![allow(unused_imports, dead_code, unused_variables)]
+// Note: some imports/variables may be conditionally used across feature flags
 //! Sharded tokio connection handlers.
 //!
 //! Extracted from `server/connection.rs` (Plan 48-02).
@@ -15,17 +15,15 @@ use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
-use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
-use crate::pubsub::{self, PubSubRegistry};
+use crate::pubsub::PubSubRegistry;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::Database;
@@ -34,11 +32,10 @@ use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::{
-    SharedDatabases, apply_resp3_conversion, convert_blocking_to_nonblocking,
-    execute_transaction_sharded, extract_bytes, extract_command, extract_primary_key,
-    handle_blocking_command, handle_config, is_multi_key_command,
+    apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
+    extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
+    is_multi_key_command,
 };
-use crate::server::codec::RespCodec;
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
 ///
@@ -422,6 +419,38 @@ pub async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // === ACL permission check ===
+                    // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
+                    // so that low-privilege users cannot reach admin commands.
+                    {
+                        let acl_guard = acl_table.read().unwrap();
+                        if let Some(deny_reason) = acl_guard.check_command_permission(&current_user, cmd, cmd_args) {
+                            drop(acl_guard);
+                            acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                            continue;
+                        }
+                        let is_write_for_acl = metadata::is_write(cmd);
+                        if let Some(deny_reason) = acl_guard.check_key_permission(&current_user, cmd, cmd_args, is_write_for_acl) {
+                            drop(acl_guard);
+                            acl_log.push(crate::acl::AclLogEntry {
+                                reason: "command".to_string(),
+                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                username: current_user.clone(),
+                                client_addr: peer_addr.clone(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                            });
+                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                            continue;
+                        }
+                    }
+
                     // --- CONFIG ---
                     if cmd.eq_ignore_ascii_case(b"CONFIG") {
                         responses.push(handle_config(cmd_args, &runtime_config, &config));
@@ -655,6 +684,15 @@ pub async fn handle_connection_sharded_inner<
                         } else {
                             let channel = extract_bytes(&cmd_args[0]);
                             let message = extract_bytes(&cmd_args[1]);
+                            // ACL channel permission check for PUBLISH
+                            if let Some(ref ch) = channel {
+                                let acl_guard = acl_table.read().unwrap();
+                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
+                                    drop(acl_guard);
+                                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
+                                    continue;
+                                }
+                            }
                             match (channel, message) {
                                 (Some(ch), Some(msg)) => {
                                     let local_count = pubsub_registry.borrow_mut().publish(&ch, &msg);
@@ -706,36 +744,6 @@ pub async fn handle_connection_sharded_inner<
                     if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
                         responses.push(crate::command::persistence::handle_lastsave());
                         continue;
-                    }
-
-                    // === ACL permission check ===
-                    {
-                        let acl_guard = acl_table.read().unwrap();
-                        if let Some(deny_reason) = acl_guard.check_command_permission(&current_user, cmd, cmd_args) {
-                            drop(acl_guard);
-                            acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                            continue;
-                        }
-                        let is_write_for_acl = metadata::is_write(cmd);
-                        if let Some(deny_reason) = acl_guard.check_key_permission(&current_user, cmd, cmd_args, is_write_for_acl) {
-                            drop(acl_guard);
-                            acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                            continue;
-                        }
                     }
 
                     // --- MULTI queue mode ---

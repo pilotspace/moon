@@ -119,15 +119,8 @@ impl WalWriter {
     ///
     /// Layout: RRDWAL(6B) + version(1B) + shard_id(2B LE) + epoch(8B LE) + reserved(15B)
     fn write_header(&mut self) -> std::io::Result<()> {
-        let mut header = [0u8; WAL_HEADER_SIZE];
-        header[0..6].copy_from_slice(WAL_MAGIC);
-        header[6] = WAL_VERSION;
-        header[7..9].copy_from_slice(&(self.shard_id as u16).to_le_bytes());
-        header[9..17].copy_from_slice(&self.epoch.to_le_bytes());
-        // bytes 17..32 remain zero (reserved)
-
         if let Some(ref mut file) = self.file {
-            file.write_all(&header)?;
+            Self::write_header_to(file, self.shard_id, self.epoch)?;
             self.write_offset += WAL_HEADER_SIZE as u64;
             self.bytes_written += WAL_HEADER_SIZE as u64;
             self.header_written = true;
@@ -138,6 +131,22 @@ impl WalWriter {
                 "WAL file handle is closed",
             ))
         }
+    }
+
+    /// Serialize and write the v2 header to a file handle.
+    /// Shared by `write_header()` and the inline fallback in `do_write()`.
+    fn write_header_to(
+        file: &mut std::fs::File,
+        shard_id: usize,
+        epoch: u64,
+    ) -> std::io::Result<()> {
+        let mut header = [0u8; WAL_HEADER_SIZE];
+        header[0..6].copy_from_slice(WAL_MAGIC);
+        header[6] = WAL_VERSION;
+        header[7..9].copy_from_slice(&(shard_id as u16).to_le_bytes());
+        header[9..17].copy_from_slice(&epoch.to_le_bytes());
+        // bytes 17..32 remain zero (reserved)
+        file.write_all(&header)
     }
 
     /// Append RESP-encoded command bytes to the in-memory buffer.
@@ -191,19 +200,17 @@ impl WalWriter {
         if let Some(ref mut file) = self.file {
             // Ensure header is written before any block data
             if !self.header_written {
-                // Can't call self.write_header() due to borrow, inline it
-                let mut header = [0u8; WAL_HEADER_SIZE];
-                header[0..6].copy_from_slice(WAL_MAGIC);
-                header[6] = WAL_VERSION;
-                header[7..9].copy_from_slice(&(self.shard_id as u16).to_le_bytes());
-                header[9..17].copy_from_slice(&self.epoch.to_le_bytes());
-                file.write_all(&header)?;
+                Self::write_header_to(file, self.shard_id, self.epoch)?;
                 self.write_offset += WAL_HEADER_SIZE as u64;
                 self.bytes_written += WAL_HEADER_SIZE as u64;
                 self.header_written = true;
             }
 
             let cmd_count_bytes = self.cmd_count.to_le_bytes();
+            // db_idx is always 0: in per-shard architecture, each shard owns its
+            // own database slice and SELECT commands are replayed from the RESP
+            // payload during recovery, so the block-level db_idx is not used for
+            // routing. The field is retained in the format for forward compatibility.
             let db_idx: u8 = 0;
 
             // Compute CRC32 over cmd_count(2B) + db_idx(1B) + payload
