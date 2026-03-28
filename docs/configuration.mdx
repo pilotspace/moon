@@ -1,0 +1,96 @@
+---
+title: "Configuration"
+description: "All command-line flags and configuration options for Moon."
+keywords: ["configuration", "flags", "options", "cli", "settings"]
+---
+
+All options are available as command-line flags. Run `moon --help` for the full list.
+
+## Server
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bind` | `127.0.0.1` | Bind address |
+| `--port` / `-p` | `6379` | Port to listen on |
+| `--shards` | `0` (auto) | Number of shards (0 = CPU count) |
+| `--databases` | `16` | Number of databases |
+| `--requirepass` | *(none)* | Require password authentication |
+| `--protected-mode` | `yes` | Reject non-loopback when no password set |
+
+## Persistence
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--appendonly` | `no` | Enable AOF persistence (`yes`/`no`) |
+| `--appendfsync` | `everysec` | AOF fsync policy (`always`/`everysec`/`no`) |
+| `--appendfilename` | `appendonly.aof` | AOF filename |
+| `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
+| `--dir` | `.` | Directory for persistence files |
+| `--dbfilename` | `dump.rdb` | RDB snapshot filename |
+
+## Memory and eviction
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--maxmemory` | `0` | Max memory in bytes (0 = unlimited) |
+| `--maxmemory-policy` | `noeviction` | Eviction policy |
+| `--maxmemory-samples` | `5` | Keys to sample for eviction |
+
+**Eviction policies:** `noeviction`, `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random`, `volatile-ttl`
+
+## TLS
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tls-port` | `0` (disabled) | TLS listener port |
+| `--tls-cert-file` | *(none)* | PEM certificate file |
+| `--tls-key-file` | *(none)* | PEM private key file |
+| `--tls-ca-cert-file` | *(none)* | CA cert for mTLS client auth |
+| `--tls-ciphersuites` | *(default)* | TLS 1.3 cipher suites |
+
+## Cluster
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cluster-enabled` | `false` | Enable cluster mode |
+| `--cluster-node-timeout` | `15000` | Node timeout in ms |
+
+## ACL
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--aclfile` | *(none)* | Path to ACL file (Redis-compatible format) |
+| `--acllog-max-len` | `128` | Max ACL log entries |
+
+## Example: production configuration
+
+```bash
+./target/release/moon \
+  --bind 0.0.0.0 \
+  --port 6379 \
+  --tls-port 6380 \
+  --tls-cert-file /etc/moon/server.crt \
+  --tls-key-file /etc/moon/server.key \
+  --shards 8 \
+  --requirepass "$REDIS_PASSWORD" \
+  --appendonly yes \
+  --appendfsync everysec \
+  --dir /var/lib/moon \
+  --maxmemory 8589934592 \
+  --maxmemory-policy allkeys-lfu \
+  --aclfile /etc/moon/users.acl
+```
+
+## Tips
+
+<Note>
+Use `--shards 0` to auto-detect CPU count. Use `--shards 1` for benchmarking or when comparing per-key memory against Redis.
+</Note>
+
+<Tip>
+Hash tags like `{tag}` in key names (e.g., `user:{1234}:name`) route all tagged keys to the same shard, eliminating cross-shard dispatch for MGET/MSET operations.
+</Tip>
+
+<Warning>
+Testing with more than 1,000 concurrent clients may require `ulimit -n 65536`. At 5,000 clients with pipelining, connection drops can occur without it.
+</Warning>
