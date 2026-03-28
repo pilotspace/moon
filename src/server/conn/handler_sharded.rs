@@ -40,7 +40,7 @@ use super::{
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
 ///
 /// Runs within a shard's single-threaded Tokio runtime. Has direct mutable access
-/// to the shard's databases via `Rc<RefCell<Vec<Database>>>` (safe: cooperative
+/// to the shard's databases via `Arc<ShardDatabases>` (thread-safe: parking_lot RwLock
 /// single-threaded scheduling means no concurrent borrows).
 ///
 /// Routing logic:
@@ -667,7 +667,7 @@ pub async fn handle_connection_sharded_inner<
                         }
                         if stream.write_all(&write_buf).await.is_err() { arena.reset(); return; }
                         let blocking_response = handle_blocking_command(
-                            cmd, cmd_args, selected_db, &shard_databases, shard_id, &blocking_registry,
+                            cmd, cmd_args, selected_db, &shard_databases, &blocking_registry,
                             shard_id, num_shards, &dispatch_tx, &shutdown,
                         ).await;
                         let blocking_response = apply_resp3_conversion(cmd, blocking_response, protocol_version);

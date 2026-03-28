@@ -24,7 +24,6 @@ use crate::pubsub::{self, PubSubRegistry};
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::shard::shared_databases::ShardDatabases;
-use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
@@ -1158,7 +1157,6 @@ pub async fn handle_connection_sharded_monoio<
                     cmd_args,
                     selected_db,
                     &shard_databases,
-                    shard_id,
                     &blocking_registry,
                     shard_id,
                     num_shards,

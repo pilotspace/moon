@@ -74,7 +74,6 @@ pub(crate) async fn handle_blocking_command(
     args: &[Frame],
     selected_db: usize,
     shard_databases: &std::sync::Arc<ShardDatabases>,
-    shard_id_param: usize,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shard_id: usize,
     num_shards: usize,
@@ -305,7 +304,6 @@ pub(crate) async fn handle_blocking_command_monoio(
     args: &[Frame],
     selected_db: usize,
     shard_databases: &std::sync::Arc<ShardDatabases>,
-    shard_id_param: usize,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shard_id: usize,
     num_shards: usize,
@@ -980,7 +978,7 @@ pub(crate) fn try_inline_dispatch_loop(
 ) -> usize {
     let mut total = 0;
     loop {
-        let n = try_inline_dispatch(read_buf, write_buf, databases, selected_db, aof_tx);
+        let n = try_inline_dispatch(read_buf, write_buf, shard_databases, shard_id, selected_db, aof_tx);
         if n == 0 {
             break;
         }

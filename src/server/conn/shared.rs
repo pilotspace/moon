@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 #[cfg(feature = "runtime-tokio")]
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
@@ -14,6 +12,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::protocol::Frame;
+#[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 
