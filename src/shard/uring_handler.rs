@@ -146,13 +146,12 @@ pub(crate) fn handle_uring_event(
                         let (cmd, args) = match extract_command_static(frame) {
                             Some(pair) => pair,
                             None => {
-                                return crate::protocol::Frame::Error(
-                                    bytes::Bytes::from_static(b"ERR invalid command"),
-                                );
+                                return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    b"ERR invalid command",
+                                ));
                             }
                         };
-                        let result =
-                            cmd_dispatch(&mut dbs[0], cmd, args, &mut selected, db_count);
+                        let result = cmd_dispatch(&mut dbs[0], cmd, args, &mut selected, db_count);
                         match result {
                             DispatchResult::Response(f) => f,
                             DispatchResult::Quit(f) => f,
@@ -181,12 +180,7 @@ pub(crate) fn handle_uring_event(
                                 );
                                 let mut resp_buf = bytes::BytesMut::new();
                                 crate::protocol::serialize(&response, &mut resp_buf);
-                                send_serialized(
-                                    driver,
-                                    conn_id,
-                                    resp_buf,
-                                    inflight_sends,
-                                );
+                                send_serialized(driver, conn_id, resp_buf, inflight_sends);
                             }
                         }
                     }
@@ -207,12 +201,7 @@ pub(crate) fn handle_uring_event(
                                 );
                                 let mut resp_buf = bytes::BytesMut::new();
                                 crate::protocol::serialize(&response, &mut resp_buf);
-                                send_serialized(
-                                    driver,
-                                    conn_id,
-                                    resp_buf,
-                                    inflight_sends,
-                                );
+                                send_serialized(driver, conn_id, resp_buf, inflight_sends);
                             }
                         }
                     }

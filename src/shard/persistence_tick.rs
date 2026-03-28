@@ -18,7 +18,11 @@ use crate::storage::Database;
 /// If a snapshot is already in progress, sends an error reply.
 /// Otherwise, creates a new SnapshotState and stores the reply_tx.
 pub(crate) fn handle_pending_snapshot(
-    pending: Option<(u64, std::path::PathBuf, channel::OneshotSender<Result<(), String>>)>,
+    pending: Option<(
+        u64,
+        std::path::PathBuf,
+        channel::OneshotSender<Result<(), String>>,
+    )>,
     snapshot_state: &mut Option<SnapshotState>,
     snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
     databases: &Rc<RefCell<Vec<Database>>>,
@@ -30,8 +34,7 @@ pub(crate) fn handle_pending_snapshot(
         } else {
             let dbs = databases.borrow();
             let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-            *snapshot_state =
-                Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
+            *snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
             *snapshot_reply_tx = Some(reply_tx);
             drop(dbs);
         }

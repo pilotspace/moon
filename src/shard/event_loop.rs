@@ -32,9 +32,9 @@ use crate::tracking::TrackingTable;
 use crate::io::{UringConfig, UringDriver};
 
 use super::dispatch::ShardMessage;
-use super::{conn_accept, persistence_tick, spsc_handler, timers};
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use super::uring_handler;
+use super::{conn_accept, persistence_tick, spsc_handler, timers};
 
 impl super::Shard {
     /// Run the shard event loop on its dedicated current_thread runtime.
@@ -81,18 +81,12 @@ impl super::Shard {
                             Some(d)
                         }
                         Err(e) => {
-                            info!(
-                                "Shard {} io_uring init failed: {}, using Tokio",
-                                self.id, e
-                            );
+                            info!("Shard {} io_uring init failed: {}, using Tokio", self.id, e);
                             None
                         }
                     },
                     Err(e) => {
-                        info!(
-                            "Shard {} io_uring unavailable: {}, using Tokio",
-                            self.id, e
-                        );
+                        info!("Shard {} io_uring unavailable: {}, using Tokio", self.id, e);
                         None
                     }
                 }
