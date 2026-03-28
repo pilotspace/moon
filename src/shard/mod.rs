@@ -107,8 +107,10 @@ mod tests {
     use ringbuf::traits::{Producer, Split};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use self::dispatch::ShardMessage;
+    use self::shared_databases::ShardDatabases;
 
     #[test]
     fn test_shard_new() {
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn test_pubsub_fanout_via_spsc() {
         let mut pubsub = PubSubRegistry::new();
-        let databases = Rc::new(RefCell::new(vec![Database::new()]));
+        let shard_databases = ShardDatabases::new(vec![vec![Database::new()]]);
 
         let (tx, rx) = rt_channel::mpsc_bounded::<Frame>(16);
         let sub = Subscriber::new(tx, 42);
@@ -161,7 +163,7 @@ mod tests {
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
         spsc_handler::drain_spsc_shared(
-            &databases,
+            &shard_databases,
             &mut [cons],
             &mut pubsub,
             &blocking,
@@ -194,7 +196,7 @@ mod tests {
     #[test]
     fn test_drain_spsc_respects_limit() {
         let mut pubsub = PubSubRegistry::new();
-        let databases = Rc::new(RefCell::new(vec![Database::new()]));
+        let shard_databases = ShardDatabases::new(vec![vec![Database::new()]]);
 
         let rb = HeapRb::new(512);
         let (mut prod, cons) = rb.split();
@@ -215,7 +217,7 @@ mod tests {
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
         spsc_handler::drain_spsc_shared(
-            &databases,
+            &shard_databases,
             &mut [cons],
             &mut pubsub,
             &blocking,
@@ -276,8 +278,8 @@ mod tests {
         use crate::io::{IoEvent, UringConfig, UringDriver};
 
         let config = RuntimeConfig::default();
-        let mut shard = Shard::new(0, 1, 1, config);
-        let databases = Rc::new(RefCell::new(std::mem::take(&mut shard.databases)));
+        let shard = Shard::new(0, 1, 1, config);
+        let shard_databases = ShardDatabases::new(vec![shard.databases]);
         let mut parse_bufs = std::collections::HashMap::new();
         parse_bufs.insert(42u32, bytes::BytesMut::from(&b"partial"[..]));
         let mut inflight_sends = std::collections::HashMap::new();
@@ -290,7 +292,8 @@ mod tests {
         uring_handler::handle_uring_event(
             IoEvent::Disconnect { conn_id: 42 },
             &mut driver,
-            &databases,
+            &shard_databases,
+            0,
             &mut parse_bufs,
             &mut inflight_sends,
             None,
@@ -313,8 +316,8 @@ mod tests {
         use crate::io::{IoEvent, UringConfig, UringDriver};
 
         let config = RuntimeConfig::default();
-        let mut shard = Shard::new(0, 1, 1, config);
-        let databases = Rc::new(RefCell::new(std::mem::take(&mut shard.databases)));
+        let shard = Shard::new(0, 1, 1, config);
+        let shard_databases = ShardDatabases::new(vec![shard.databases]);
         let mut parse_bufs = std::collections::HashMap::new();
         let mut inflight_sends = std::collections::HashMap::new();
 
@@ -326,7 +329,8 @@ mod tests {
         uring_handler::handle_uring_event(
             IoEvent::SendComplete { conn_id: 1 },
             &mut driver,
-            &databases,
+            &shard_databases,
+            0,
             &mut parse_bufs,
             &mut inflight_sends,
             None,

@@ -23,6 +23,7 @@ use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
+use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
@@ -54,7 +55,7 @@ pub async fn handle_connection_sharded_monoio<
 >(
     mut stream: S,
     peer_addr: String,
-    databases: Rc<RefCell<Vec<Database>>>,
+    shard_databases: Arc<ShardDatabases>,
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -83,7 +84,7 @@ pub async fn handle_connection_sharded_monoio<
     let mut write_buf = BytesMut::with_capacity(8192);
     let mut codec = RespCodec::default();
     let mut selected_db: usize = 0;
-    let db_count = databases.borrow().len();
+    let db_count = shard_databases.db_count();
 
     // Connection-level state (mirroring Tokio handler)
     let mut protocol_version: u8 = 2;
@@ -377,13 +378,14 @@ pub async fn handle_connection_sharded_monoio<
         if num_shards == 1 && authenticated {
             // Refresh time once before inline dispatch (same as batch refresh below)
             {
-                let mut dbs = databases.borrow_mut();
-                dbs[selected_db].refresh_now_from_cache(&cached_clock);
+                let mut guard = shard_databases.write_db(shard_id, selected_db);
+                guard.refresh_now_from_cache(&cached_clock);
             }
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
-                &databases,
+                &shard_databases,
+                shard_id,
                 selected_db,
                 &aof_tx,
             );
@@ -434,8 +436,8 @@ pub async fn handle_connection_sharded_monoio<
 
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         {
-            let mut dbs = databases.borrow_mut();
-            dbs[selected_db].refresh_now_from_cache(&cached_clock);
+            let mut guard = shard_databases.write_db(shard_id, selected_db);
+            guard.refresh_now_from_cache(&cached_clock);
         }
 
         for frame in frames.drain(..) {
@@ -541,9 +543,9 @@ pub async fn handle_connection_sharded_monoio<
             // --- Lua scripting: EVALSHA ---
             if cmd.eq_ignore_ascii_case(b"EVALSHA") {
                 let response = {
-                    let mut dbs = databases.borrow_mut();
-                    let db_count = dbs.len();
-                    let db = &mut dbs[selected_db];
+                    let mut guard = shard_databases.write_db(shard_id, selected_db);
+                    let db_count = shard_databases.db_count();
+                    let db = &mut guard;
                     crate::scripting::handle_evalsha(
                         &lua,
                         &script_cache,
@@ -562,9 +564,9 @@ pub async fn handle_connection_sharded_monoio<
             // --- Lua scripting: EVAL ---
             if cmd.eq_ignore_ascii_case(b"EVAL") {
                 let response = {
-                    let mut dbs = databases.borrow_mut();
-                    let db_count = dbs.len();
-                    let db = &mut dbs[selected_db];
+                    let mut guard = shard_databases.write_db(shard_id, selected_db);
+                    let db_count = shard_databases.db_count();
+                    let db = &mut guard;
                     crate::scripting::handle_eval(
                         &lua,
                         &script_cache,
@@ -754,15 +756,15 @@ pub async fn handle_connection_sharded_monoio<
 
             // --- INFO (with replication section) ---
             if cmd.eq_ignore_ascii_case(b"INFO") {
-                let dbs = databases.borrow();
+                let guard = shard_databases.read_db(shard_id, selected_db);
                 let response_text = {
-                    let resp_frame = conn_cmd::info_readonly(&dbs[selected_db], cmd_args);
+                    let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
                     match resp_frame {
                         Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
                         _ => String::new(),
                     }
                 };
-                drop(dbs);
+                drop(guard);
                 let mut response_text = response_text;
                 if let Some(ref rs) = repl_state {
                     if let Ok(rs_guard) = rs.try_read() {
@@ -1097,7 +1099,8 @@ pub async fn handle_connection_sharded_monoio<
                 } else {
                     in_multi = false;
                     let result = execute_transaction_sharded(
-                        &databases,
+                        &shard_databases,
+                        shard_id,
                         &command_queue,
                         selected_db,
                         &cached_clock,
@@ -1154,7 +1157,8 @@ pub async fn handle_connection_sharded_monoio<
                     cmd,
                     cmd_args,
                     selected_db,
-                    &databases,
+                    &shard_databases,
+                    shard_id,
                     &blocking_registry,
                     shard_id,
                     num_shards,
@@ -1185,7 +1189,7 @@ pub async fn handle_connection_sharded_monoio<
                         shard_id,
                         num_shards,
                         selected_db,
-                        &databases,
+                        &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
@@ -1200,7 +1204,7 @@ pub async fn handle_connection_sharded_monoio<
                         shard_id,
                         num_shards,
                         selected_db,
-                        &databases,
+                        &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
@@ -1214,7 +1218,7 @@ pub async fn handle_connection_sharded_monoio<
                         shard_id,
                         num_shards,
                         selected_db,
-                        &databases,
+                        &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
                     )
@@ -1231,7 +1235,7 @@ pub async fn handle_connection_sharded_monoio<
                         shard_id,
                         num_shards,
                         selected_db,
-                        &databases,
+                        &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
@@ -1264,18 +1268,18 @@ pub async fn handle_connection_sharded_monoio<
                 // Eviction check before write dispatch
                 if metadata::is_write(cmd) {
                     let rt = runtime_config.read().unwrap();
-                    let mut dbs_ev = databases.borrow_mut();
-                    if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
-                        drop(dbs_ev);
+                    let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
+                    if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
+                        drop(guard_ev);
                         responses.push(oom_frame);
                         continue;
                     }
-                    drop(dbs_ev);
+                    drop(guard_ev);
                 }
-                let mut dbs = databases.borrow_mut();
+                let mut guard = shard_databases.write_db(shard_id, selected_db);
                 // No refresh_now here — called once per batch before the loop
                 let result = dispatch(
-                    &mut dbs[selected_db],
+                    &mut guard,
                     cmd,
                     cmd_args,
                     &mut selected_db,
@@ -1313,14 +1317,14 @@ pub async fn handle_connection_sharded_monoio<
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
                                     &mut reg,
-                                    &mut dbs[selected_db],
+                                    &mut guard,
                                     selected_db,
                                     &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
                                     &mut reg,
-                                    &mut dbs[selected_db],
+                                    &mut guard,
                                     selected_db,
                                     &key,
                                 );
@@ -1329,7 +1333,7 @@ pub async fn handle_connection_sharded_monoio<
                     }
                 }
 
-                drop(dbs); // Single drop at end of local block
+                drop(guard); // Single drop at end of local block
 
                 // Track key on read / invalidate tracked key on write
                 if tracking_state.enabled {

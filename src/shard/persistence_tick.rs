@@ -3,15 +3,15 @@
 //! Extracted from shard/mod.rs. Contains snapshot begin handling,
 //! auto-save trigger checking, snapshot advance/finalize prep, and WAL flush.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use tracing::info;
 
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
 use crate::runtime::channel;
-use crate::storage::Database;
+
+use super::shared_databases::ShardDatabases;
 
 /// Handle a pending SnapshotBegin that was collected from SPSC drain.
 ///
@@ -25,18 +25,25 @@ pub(crate) fn handle_pending_snapshot(
     )>,
     snapshot_state: &mut Option<SnapshotState>,
     snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
 ) {
     if let Some((epoch, snap_dir, reply_tx)) = pending {
         if snapshot_state.is_some() {
             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
         } else {
-            let dbs = databases.borrow();
             let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
-            *snapshot_state = Some(SnapshotState::new(shard_id as u16, epoch, &dbs, snap_path));
+            let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
+            let db_count = shard_databases.db_count();
+            *snapshot_state = Some(SnapshotState::new_from_metadata(
+                shard_id as u16,
+                epoch,
+                db_count,
+                segment_counts,
+                base_timestamps,
+                snap_path,
+            ));
             *snapshot_reply_tx = Some(reply_tx);
-            drop(dbs);
         }
     }
 }
@@ -48,7 +55,7 @@ pub(crate) fn check_auto_save_trigger(
     snapshot_trigger_rx: &channel::WatchReceiver<u64>,
     last_snapshot_epoch: &mut u64,
     snapshot_state: &mut Option<SnapshotState>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     persistence_dir: &Option<String>,
     shard_id: usize,
 ) {
@@ -58,14 +65,16 @@ pub(crate) fn check_auto_save_trigger(
         if let Some(dir) = persistence_dir {
             let snap_path =
                 std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id));
-            let dbs = databases.borrow();
-            *snapshot_state = Some(SnapshotState::new(
+            let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
+            let db_count = shard_databases.db_count();
+            *snapshot_state = Some(SnapshotState::new_from_metadata(
                 shard_id as u16,
                 new_epoch,
-                &dbs,
+                db_count,
+                segment_counts,
+                base_timestamps,
                 snap_path,
             ));
-            drop(dbs);
         }
     }
 }
@@ -75,11 +84,19 @@ pub(crate) fn check_auto_save_trigger(
 /// Returns `true` if the snapshot is complete and ready for async finalization.
 pub(crate) fn advance_snapshot_segment(
     snapshot_state: &mut Option<SnapshotState>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
 ) -> bool {
     if let Some(snap) = snapshot_state {
-        let dbs = databases.borrow();
-        snap.advance_one_segment(&dbs)
+        let current_db = snap.current_db_index();
+        let db_count = shard_databases.db_count();
+        if current_db < db_count {
+            let guard = shard_databases.read_db(shard_id, current_db);
+            snap.advance_one_segment_db(&guard)
+        } else {
+            // All databases serialized, return true to trigger finalization
+            true
+        }
     } else {
         false
     }

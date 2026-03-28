@@ -80,6 +80,18 @@ impl SnapshotState {
             .map(|db| db.data().segment_count())
             .collect();
         let base_timestamps: Vec<u32> = databases.iter().map(|db| db.base_timestamp()).collect();
+        Self::new_from_metadata(shard_id, epoch, num_databases, segment_counts, base_timestamps, file_path)
+    }
+
+    /// Create from pre-collected metadata (for Arc<ShardDatabases> path).
+    pub fn new_from_metadata(
+        shard_id: u16,
+        epoch: u64,
+        num_databases: usize,
+        segment_counts: Vec<usize>,
+        base_timestamps: Vec<u32>,
+        file_path: PathBuf,
+    ) -> Self {
         let serialized_segments: Vec<Vec<bool>> = segment_counts
             .iter()
             .map(|&count| vec![false; count])
@@ -102,6 +114,12 @@ impl SnapshotState {
             header_written: false,
             db_selector_written: vec![false; num_databases],
         }
+    }
+
+    /// Get the current database index being serialized.
+    #[inline]
+    pub fn current_db_index(&self) -> usize {
+        self.current_db
     }
 
     /// Check if a segment in a given database has NOT yet been serialized.
@@ -141,8 +159,25 @@ impl SnapshotState {
     ///
     /// Serializes the current segment's entries (overflow first, then live data),
     /// writes per-segment CRC32, and advances to the next segment.
+    /// Advance using a single database reference (for Arc<ShardDatabases> path).
+    pub fn advance_one_segment_db(&mut self, db: &Database) -> bool {
+        self.write_header_if_needed();
+        if self.current_db >= self.num_databases {
+            return true;
+        }
+        self.advance_segment_inner(db)
+    }
+
     pub fn advance_one_segment(&mut self, databases: &[Database]) -> bool {
-        // Write header on first call
+        self.write_header_if_needed();
+        if self.current_db >= self.num_databases {
+            return true;
+        }
+        let db = &databases[self.current_db];
+        self.advance_segment_inner(db)
+    }
+
+    fn write_header_if_needed(&mut self) {
         if !self.header_written {
             self.output_buf.extend_from_slice(SHARD_RDB_MAGIC);
             self.output_buf.push(SHARD_RDB_VERSION);
@@ -151,13 +186,9 @@ impl SnapshotState {
             self.output_buf.extend_from_slice(&self.epoch.to_le_bytes());
             self.header_written = true;
         }
+    }
 
-        // Check if done
-        if self.current_db >= self.num_databases {
-            return true;
-        }
-
-        let db = &databases[self.current_db];
+    fn advance_segment_inner(&mut self, db: &Database) -> bool {
         let base_ts = self.base_timestamps[self.current_db];
         let now_ms = current_time_ms();
 

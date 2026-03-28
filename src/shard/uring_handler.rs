@@ -4,18 +4,17 @@
 //! and create_reuseport_listener.
 
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::cell::RefCell;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{IoEvent, UringDriver, WritevGuard};
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use crate::storage::Database;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::storage::entry::CachedClock;
+
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+use super::shared_databases::ShardDatabases;
 
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use super::spsc_handler::extract_command_static;
@@ -81,7 +80,8 @@ pub(crate) fn send_serialized(
 pub(crate) fn handle_uring_event(
     event: IoEvent,
     driver: &mut UringDriver,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
     parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
     inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
     uring_listener_fd: Option<std::os::fd::RawFd>,
@@ -133,14 +133,13 @@ pub(crate) fn handle_uring_event(
                 return;
             }
 
-            // Phase B: Dispatch all commands under a single borrow_mut (reduces
-            // RefCell overhead from N borrows to 1 per batch).
+            // Phase B: Dispatch all commands under a single write lock.
             let responses: Vec<crate::protocol::Frame> = {
-                let mut dbs = databases.borrow_mut();
-                let db_count = dbs.len();
-                dbs[0].refresh_now_from_cache(cached_clock);
+                let mut guard = shard_databases.write_db(shard_id, 0);
+                let db_count = shard_databases.db_count();
+                guard.refresh_now_from_cache(cached_clock);
                 let mut selected = 0usize;
-                batch
+                let result: Vec<_> = batch
                     .iter()
                     .map(|frame| {
                         let (cmd, args) = match extract_command_static(frame) {
@@ -151,13 +150,15 @@ pub(crate) fn handle_uring_event(
                                 ));
                             }
                         };
-                        let result = cmd_dispatch(&mut dbs[0], cmd, args, &mut selected, db_count);
+                        let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                         match result {
                             DispatchResult::Response(f) => f,
                             DispatchResult::Quit(f) => f,
                         }
                     })
-                    .collect()
+                    .collect();
+                drop(guard);
+                result
             };
 
             // Phase C: Serialize and send all responses (outside borrow).

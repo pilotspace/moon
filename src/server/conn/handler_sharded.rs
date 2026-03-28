@@ -26,7 +26,7 @@ use crate::protocol::Frame;
 use crate::pubsub::PubSubRegistry;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::Database;
+use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
@@ -53,7 +53,7 @@ use super::{
 /// connection level same as the non-sharded handler.
 pub async fn handle_connection_sharded(
     stream: TcpStream,
-    databases: Rc<RefCell<Vec<Database>>>,
+    shard_databases: Arc<ShardDatabases>,
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -83,7 +83,7 @@ pub async fn handle_connection_sharded(
     handle_connection_sharded_inner(
         stream,
         peer_addr,
-        databases,
+        shard_databases,
         shard_id,
         num_shards,
         dispatch_tx,
@@ -118,7 +118,7 @@ pub async fn handle_connection_sharded_inner<
 >(
     stream: S,
     peer_addr: String,
-    databases: Rc<RefCell<Vec<Database>>>,
+    shard_databases: Arc<ShardDatabases>,
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -311,17 +311,16 @@ pub async fn handle_connection_sharded_inner<
                     // --- Lua scripting: EVAL / EVALSHA ---
                     if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
                         let response = {
-                            let mut dbs = databases.borrow_mut();
-                            let db_count = dbs.len();
-                            let db = &mut dbs[selected_db];
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let db_count = shard_databases.db_count();
                             if cmd.eq_ignore_ascii_case(b"EVAL") {
                                 crate::scripting::handle_eval(
-                                    &lua, &script_cache, cmd_args, db,
+                                    &lua, &script_cache, cmd_args, &mut guard,
                                     shard_id, num_shards, selected_db, db_count,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
-                                    &lua, &script_cache, cmd_args, db,
+                                    &lua, &script_cache, cmd_args, &mut guard,
                                     shard_id, num_shards, selected_db, db_count,
                                 )
                             }
@@ -503,15 +502,15 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- INFO ---
                     if cmd.eq_ignore_ascii_case(b"INFO") {
-                        let dbs = databases.borrow();
+                        let guard = shard_databases.read_db(shard_id, selected_db);
                         let response_text = {
-                            let resp_frame = conn_cmd::info_readonly(&dbs[selected_db], cmd_args);
+                            let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
                             match resp_frame {
                                 Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
                                 _ => String::new(),
                             }
                         };
-                        drop(dbs);
+                        drop(guard);
                         let mut response_text = response_text;
                         if let Some(ref rs) = repl_state {
                             if let Ok(rs_guard) = rs.try_read() {
@@ -628,7 +627,7 @@ pub async fn handle_connection_sharded_inner<
                             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                         } else {
                             in_multi = false;
-                            let result = execute_transaction_sharded(&databases, &command_queue, selected_db, &cached_clock);
+                            let result = execute_transaction_sharded(&shard_databases, shard_id, &command_queue, selected_db, &cached_clock);
                             command_queue.clear();
                             responses.push(result);
                         }
@@ -668,7 +667,7 @@ pub async fn handle_connection_sharded_inner<
                         }
                         if stream.write_all(&write_buf).await.is_err() { arena.reset(); return; }
                         let blocking_response = handle_blocking_command(
-                            cmd, cmd_args, selected_db, &databases, &blocking_registry,
+                            cmd, cmd_args, selected_db, &shard_databases, shard_id, &blocking_registry,
                             shard_id, num_shards, &dispatch_tx, &shutdown,
                         ).await;
                         let blocking_response = apply_resp3_conversion(cmd, blocking_response, protocol_version);
@@ -755,24 +754,24 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if cmd.eq_ignore_ascii_case(b"KEYS") {
-                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SCAN") {
-                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers).await;
+                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers).await;
                         responses.push(response);
                         continue;
                     }
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
                         responses.push(response);
                         continue;
                     }
@@ -791,18 +790,18 @@ pub async fn handle_connection_sharded_inner<
                     if is_local {
                         if metadata::is_write(cmd) {
                             let rt = runtime_config.read().unwrap();
-                            let mut dbs_ev = databases.borrow_mut();
-                            if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
-                                drop(dbs_ev);
+                            let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
+                            if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
+                                drop(guard_ev);
                                 responses.push(oom_frame);
                                 continue;
                             }
-                            drop(dbs_ev);
+                            drop(guard_ev);
                         }
-                        let mut dbs = databases.borrow_mut();
-                        let db_count = dbs.len();
-                        dbs[selected_db].refresh_now_from_cache(&cached_clock);
-                        let result = dispatch(&mut dbs[selected_db], cmd, cmd_args, &mut selected_db, db_count);
+                        let mut guard = shard_databases.write_db(shard_id, selected_db);
+                        let db_count = shard_databases.db_count();
+                        guard.refresh_now_from_cache(&cached_clock);
+                        let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
                         let response = match result {
                             DispatchResult::Response(f) => f,
                             DispatchResult::Quit(f) => { should_quit = true; f }
@@ -814,14 +813,14 @@ pub async fn handle_connection_sharded_inner<
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     let mut reg = blocking_registry.borrow_mut();
                                     if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                        crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut dbs[selected_db], selected_db, &key);
+                                        crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, selected_db, &key);
                                     } else {
-                                        crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut dbs[selected_db], selected_db, &key);
+                                        crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, selected_db, &key);
                                     }
                                 }
                             }
                         }
-                        drop(dbs);
+                        drop(guard);
                         if let Some(bytes) = aof_bytes {
                             if !matches!(response, Frame::Error(_)) {
                                 if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }

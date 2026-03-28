@@ -147,12 +147,6 @@ impl super::Shard {
             info!("Shard {} started", self.id);
         }
 
-        // Temporary compatibility shim: extract this shard's databases from the
-        // centralized ShardDatabases into Rc<RefCell<Vec<Database>>> for downstream code.
-        // Plan 02 removes this shim when all call sites migrate to Arc<ShardDatabases>.
-        let databases = Rc::new(RefCell::new(shard_databases.take_shard(self.id)));
-        // Keep Arc for future cross-shard reads (Plan 03 will use this)
-        let _shard_databases = shard_databases;
         let dispatch_tx = Rc::new(RefCell::new(producers));
         let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
@@ -249,7 +243,7 @@ impl super::Shard {
 
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, is_tls, &tls_config,
-                                &databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -266,14 +260,14 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
@@ -282,25 +276,26 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
                     if persistence_tick::advance_snapshot_segment(
                         &mut snapshot_state,
-                        &databases,
+                        &shard_databases,
+                        shard_id,
                     ) {
                         if let Some(snap) = snapshot_state.as_mut() {
                             if let Err(e) = snap.finalize_async().await {
@@ -326,7 +321,7 @@ impl super::Shard {
                         let events = driver.drain_completions();
                         for event in events {
                             uring_handler::handle_uring_event(
-                                event, driver, &databases, &mut uring_parse_bufs,
+                                event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
                                 &mut inflight_sends, uring_listener_fd, &cached_clock,
                             );
                         }
@@ -342,11 +337,11 @@ impl super::Shard {
                 }
                 // Cooperative active expiry
                 _ = expiry_interval.tick() => {
-                    timers::run_active_expiry(&databases);
+                    timers::run_active_expiry(&shard_databases, shard_id);
                 }
                 // Background eviction timer
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&databases, &runtime_config);
+                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
@@ -366,7 +361,7 @@ impl super::Shard {
                         Ok((std_tcp_stream, is_tls)) => {
                             conn_accept::spawn_monoio_connection(
                                 std_tcp_stream, is_tls, &tls_config,
-                                &databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -383,14 +378,14 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
@@ -399,25 +394,26 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
                     if persistence_tick::advance_snapshot_segment(
                         &mut snapshot_state,
-                        &databases,
+                        &shard_databases,
+                        shard_id,
                     ) {
                         if let Some(snap) = snapshot_state.as_mut() {
                             if let Err(e) = snap.finalize_async().await {
@@ -448,11 +444,11 @@ impl super::Shard {
                 }
                 // Cooperative active expiry every 100ms
                 _ = expiry_interval.tick() => {
-                    timers::run_active_expiry(&databases);
+                    timers::run_active_expiry(&shard_databases, shard_id);
                 }
                 // Background eviction timer
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&databases, &runtime_config);
+                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                 }
                 // Shutdown
                 _ = shutdown.cancelled() => {
@@ -473,17 +469,8 @@ impl super::Shard {
             }
         }
 
-        // Restore databases and pubsub_registry back to self for cleanup.
-        self.databases = match Rc::try_unwrap(databases) {
-            Ok(refcell) => refcell.into_inner(),
-            Err(_) => {
-                info!(
-                    "Shard {}: could not reclaim databases (outstanding Rc references)",
-                    self.id
-                );
-                Vec::new()
-            }
-        };
+        // Databases now live in Arc<ShardDatabases>, no reclaim needed.
+        self.databases.clear();
         self.pubsub_registry = match Rc::try_unwrap(pubsub_rc) {
             Ok(refcell) => refcell.into_inner(),
             Err(_) => {

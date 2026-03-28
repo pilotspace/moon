@@ -55,15 +55,18 @@ impl ShardDatabases {
         self.db_count
     }
 
-    /// Take ownership of a shard's databases, replacing with defaults.
+    /// Collect snapshot metadata (segment counts, base timestamps) for a shard.
     ///
-    /// Only valid during initialization before any concurrent access begins.
-    /// Each `RwLock` content is swapped with a fresh `Database::default()`.
-    pub fn take_shard(&self, shard_id: usize) -> Vec<Database> {
-        self.shards[shard_id]
-            .iter()
-            .map(|lock| std::mem::take(&mut *lock.write()))
-            .collect()
+    /// Acquires brief read locks on each database to gather metadata needed
+    /// by `SnapshotState::new_from_metadata`. Called once at snapshot epoch start.
+    pub fn snapshot_metadata(&self, shard_id: usize) -> (Vec<usize>, Vec<u32>) {
+        let segment_counts: Vec<usize> = (0..self.db_count)
+            .map(|i| self.read_db(shard_id, i).data().segment_count())
+            .collect();
+        let base_timestamps: Vec<u32> = (0..self.db_count)
+            .map(|i| self.read_db(shard_id, i).base_timestamp())
+            .collect();
+        (segment_counts, base_timestamps)
     }
 }
 
@@ -109,13 +112,12 @@ mod tests {
     }
 
     #[test]
-    fn test_take_shard_extracts_databases() {
+    fn test_snapshot_metadata() {
         let dbs = vec![vec![Database::new(), Database::new()]];
         let shared = ShardDatabases::new(dbs);
-        let taken = shared.take_shard(0);
-        assert_eq!(taken.len(), 2);
-        // After take, the shard's databases should be default (empty)
-        assert_eq!(shared.db_count(), 2);
+        let (seg_counts, base_ts) = shared.snapshot_metadata(0);
+        assert_eq!(seg_counts.len(), 2);
+        assert_eq!(base_ts.len(), 2);
     }
 
     #[test]

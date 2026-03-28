@@ -25,6 +25,7 @@ use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 
 use super::dispatch::ShardMessage;
+use super::shared_databases::ShardDatabases;
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
 ///
@@ -32,7 +33,7 @@ use super::dispatch::ShardMessage;
 /// (the caller has mutable access to snapshot_state). COW intercepts and WAL appends
 /// happen inline for Execute/MultiExecute write commands.
 pub(crate) fn drain_spsc_shared(
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     consumers: &mut [HeapCons<ShardMessage>],
     pubsub_registry: &mut PubSubRegistry,
     blocking_registry: &Rc<RefCell<BlockingRegistry>>,
@@ -94,7 +95,7 @@ pub(crate) fn drain_spsc_shared(
     if !execute_batch.is_empty() {
         for msg in execute_batch {
             handle_shard_message_shared(
-                databases,
+                shard_databases,
                 pubsub_registry,
                 blocking_registry,
                 msg,
@@ -114,7 +115,7 @@ pub(crate) fn drain_spsc_shared(
     // Process other messages (PubSubFanOut, SnapshotBegin, etc.)
     for msg in other_messages {
         handle_shard_message_shared(
-            databases,
+            shard_databases,
             pubsub_registry,
             blocking_registry,
             msg,
@@ -136,7 +137,7 @@ pub(crate) fn drain_spsc_shared(
 /// Performs COW intercept for write commands when a snapshot is active,
 /// and appends write commands to the per-shard WAL writer.
 pub(crate) fn handle_shard_message_shared(
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     pubsub_registry: &mut PubSubRegistry,
     blocking_registry: &Rc<RefCell<BlockingRegistry>>,
     msg: ShardMessage,
@@ -161,10 +162,8 @@ pub(crate) fn handle_shard_message_shared(
             reply_tx,
         } => {
             let response = {
-                let mut dbs = databases.borrow_mut();
-                let db_count = dbs.len();
+                let db_count = shard_databases.db_count();
                 let db_idx = db_index.min(db_count.saturating_sub(1));
-                dbs[db_idx].refresh_now_from_cache(cached_clock);
                 let (cmd, args) = match extract_command_static(&command) {
                     Some(pair) => pair,
                     None => {
@@ -178,11 +177,15 @@ pub(crate) fn handle_shard_message_shared(
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
                 if is_write {
-                    cow_intercept(snapshot_state, &dbs, db_idx, &command);
+                    let db_guard = shard_databases.read_db(shard_id, db_idx);
+                    cow_intercept(snapshot_state, &db_guard, db_idx, &command);
+                    drop(db_guard);
                 }
 
+                let mut guard = shard_databases.write_db(shard_id, db_idx);
+                guard.refresh_now_from_cache(cached_clock);
                 let mut selected = db_idx;
-                let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
+                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                 let frame = match result {
                     DispatchResult::Response(f) => f,
                     DispatchResult::Quit(f) => f,
@@ -226,21 +229,21 @@ pub(crate) fn handle_shard_message_shared(
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
@@ -249,6 +252,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
                 }
 
+                drop(guard);
                 frame
             };
             let _ = reply_tx.send(response);
@@ -259,10 +263,10 @@ pub(crate) fn handle_shard_message_shared(
             reply_tx,
         } => {
             let mut results = Vec::with_capacity(commands.len());
-            let mut dbs = databases.borrow_mut();
-            let db_count = dbs.len();
+            let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            dbs[db_idx].refresh_now_from_cache(cached_clock);
+            let mut guard = shard_databases.write_db(shard_id, db_idx);
+            guard.refresh_now_from_cache(cached_clock);
             for (_key, cmd_frame) in &commands {
                 let (cmd, args) = match extract_command_static(cmd_frame) {
                     Some(pair) => pair,
@@ -277,11 +281,11 @@ pub(crate) fn handle_shard_message_shared(
                 // COW intercept for each write command in the batch
                 let is_write = metadata::is_write(cmd);
                 if is_write {
-                    cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
+                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
                 }
 
                 let mut selected = db_idx;
-                let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
+                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                 let frame = match result {
                     DispatchResult::Response(f) => f,
                     DispatchResult::Quit(f) => f,
@@ -321,21 +325,21 @@ pub(crate) fn handle_shard_message_shared(
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
@@ -346,6 +350,7 @@ pub(crate) fn handle_shard_message_shared(
 
                 results.push(frame);
             }
+            drop(guard);
             let _ = reply_tx.send(results);
         }
         ShardMessage::PipelineBatch {
@@ -354,10 +359,10 @@ pub(crate) fn handle_shard_message_shared(
             reply_tx,
         } => {
             let mut results = Vec::with_capacity(commands.len());
-            let mut dbs = databases.borrow_mut();
-            let db_count = dbs.len();
+            let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            dbs[db_idx].refresh_now_from_cache(cached_clock);
+            let mut guard = shard_databases.write_db(shard_id, db_idx);
+            guard.refresh_now_from_cache(cached_clock);
             for cmd_frame in &commands {
                 let (cmd, args) = match extract_command_static(cmd_frame) {
                     Some(pair) => pair,
@@ -372,11 +377,11 @@ pub(crate) fn handle_shard_message_shared(
                 // COW intercept for each write command in the batch
                 let is_write = metadata::is_write(cmd);
                 if is_write {
-                    cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
+                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
                 }
 
                 let mut selected = db_idx;
-                let result = cmd_dispatch(&mut dbs[db_idx], cmd, args, &mut selected, db_count);
+                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                 let frame = match result {
                     DispatchResult::Response(f) => f,
                     DispatchResult::Quit(f) => f,
@@ -420,21 +425,21 @@ pub(crate) fn handle_shard_message_shared(
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
                                     &mut reg,
-                                    &mut dbs[db_idx],
+                                    &mut guard,
                                     db_idx,
                                     &key,
                                 );
@@ -445,6 +450,7 @@ pub(crate) fn handle_shard_message_shared(
 
                 results.push(frame);
             }
+            drop(guard);
             let _ = reply_tx.send(results);
         }
         ShardMessage::PubSubFanOut { channel, message } => {
@@ -481,12 +487,11 @@ pub(crate) fn handle_shard_message_shared(
             let mut reg = blocking_registry.borrow_mut();
             reg.register(db_index, key.clone(), entry);
             // Check if data is already available (race: data arrived before registration).
-            let mut dbs = databases.borrow_mut();
-            if dbs[db_index].exists(&key) {
-                let db = &mut dbs[db_index];
-                crate::blocking::wakeup::try_wake_list_waiter(&mut reg, db, db_index, &key);
-                crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, db, db_index, &key);
-                crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, db, db_index, &key);
+            let mut guard = shard_databases.write_db(shard_id, db_index);
+            if guard.exists(&key) {
+                crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, db_index, &key);
+                crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, db_index, &key);
+                crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, &mut guard, db_index, &key);
             }
         }
         ShardMessage::BlockCancel { wait_id } => {
@@ -498,12 +503,14 @@ pub(crate) fn handle_shard_message_shared(
             count,
             reply_tx,
         } => {
+            let db_guard = shard_databases.read_db(shard_id, db_index);
             let keys = crate::cluster::migration::handle_get_keys_in_slot(
-                &databases.borrow(),
-                db_index,
+                std::slice::from_ref(&*db_guard),
+                0,
                 slot,
                 count,
             );
+            drop(db_guard);
             let _ = reply_tx.send(keys);
         }
         ShardMessage::SlotOwnershipUpdate {
@@ -537,7 +544,7 @@ pub(crate) fn handle_shard_message_shared(
 /// if the key's segment is actually pending serialization (fast bool check in hot path).
 pub(crate) fn cow_intercept(
     snapshot: &mut Option<SnapshotState>,
-    dbs: &[Database],
+    db: &Database,
     db_index: usize,
     command: &crate::protocol::Frame,
 ) {
@@ -551,9 +558,9 @@ pub(crate) fn cow_intercept(
         _ => return,
     };
     let hash = crate::storage::dashtable::hash_key(key);
-    let seg_idx = dbs[db_index].data().segment_index_for_hash(hash);
+    let seg_idx = db.data().segment_index_for_hash(hash);
     if snap.is_segment_pending(db_index, seg_idx) {
-        if let Some(old_entry) = dbs[db_index].data().get(key) {
+        if let Some(old_entry) = db.data().get(key) {
             snap.capture_cow(db_index, seg_idx, key.clone(), old_entry.clone());
         }
     }

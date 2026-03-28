@@ -16,6 +16,7 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
+use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::Database;
 
 use super::util::extract_bytes;
@@ -72,7 +73,8 @@ pub(crate) async fn handle_blocking_command(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &std::sync::Arc<ShardDatabases>,
+    shard_id_param: usize,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shard_id: usize,
     num_shards: usize,
@@ -95,15 +97,15 @@ pub(crate) async fn handle_blocking_command(
 
     // --- Non-blocking fast path: try to get data immediately ---
     {
-        let mut dbs = databases.borrow_mut();
-        let db = &mut dbs[selected_db];
+        let mut guard = shard_databases.write_db(shard_id, selected_db);
         for key in &keys {
-            let result = try_immediate_pop(cmd, db, key, args);
+            let result = try_immediate_pop(cmd, &mut guard, key, args);
             if let Some(frame) = result {
                 return frame;
             }
         }
-    } // dbs borrow dropped here -- CRITICAL before await
+        drop(guard); // CRITICAL before await
+    }
 
     let deadline = if timeout_secs > 0.0 {
         Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
@@ -302,7 +304,8 @@ pub(crate) async fn handle_blocking_command_monoio(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &std::sync::Arc<ShardDatabases>,
+    shard_id_param: usize,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shard_id: usize,
     num_shards: usize,
@@ -326,15 +329,15 @@ pub(crate) async fn handle_blocking_command_monoio(
 
     // --- Non-blocking fast path: try to get data immediately ---
     {
-        let mut dbs = databases.borrow_mut();
-        let db = &mut dbs[selected_db];
+        let mut guard = shard_databases.write_db(shard_id, selected_db);
         for key in &keys {
-            let result = try_immediate_pop(cmd, db, key, args);
+            let result = try_immediate_pop(cmd, &mut guard, key, args);
             if let Some(frame) = result {
                 return frame;
             }
         }
-    } // dbs borrow dropped here -- CRITICAL before await
+        drop(guard); // CRITICAL before await
+    }
 
     let deadline = if timeout_secs > 0.0 {
         Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
@@ -785,7 +788,8 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
 pub(crate) fn try_inline_dispatch(
     read_buf: &mut BytesMut,
     write_buf: &mut BytesMut,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &std::sync::Arc<ShardDatabases>,
+    shard_id: usize,
     selected_db: usize,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
 ) -> usize {
@@ -876,9 +880,8 @@ pub(crate) fn try_inline_dispatch(
         let key_bytes = &buf[key_start..key_end];
 
         // Lookup in database
-        let mut dbs = databases.borrow_mut();
-        let db = &mut dbs[selected_db];
-        match db.get(key_bytes) {
+        let mut guard = shard_databases.write_db(shard_id, selected_db);
+        match guard.get(key_bytes) {
             Some(entry) => {
                 match entry.value.as_bytes() {
                     Some(val) => {
@@ -903,7 +906,7 @@ pub(crate) fn try_inline_dispatch(
                 write_buf.extend_from_slice(b"$-1\r\n");
             }
         }
-        drop(dbs);
+        drop(guard);
         let _ = read_buf.split_to(consumed);
         return 1;
     }
@@ -953,8 +956,8 @@ pub(crate) fn try_inline_dispatch(
     // Insert into database
     {
         let entry = crate::storage::entry::Entry::new_string(val_owned);
-        let mut dbs = databases.borrow_mut();
-        dbs[selected_db].set(key_owned, entry);
+        let mut guard = shard_databases.write_db(shard_id, selected_db);
+        guard.set(key_owned, entry);
     }
 
     // +OK\r\n
@@ -970,7 +973,8 @@ pub(crate) fn try_inline_dispatch(
 pub(crate) fn try_inline_dispatch_loop(
     read_buf: &mut BytesMut,
     write_buf: &mut BytesMut,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &std::sync::Arc<ShardDatabases>,
+    shard_id: usize,
     selected_db: usize,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
 ) -> usize {

@@ -16,11 +16,11 @@ use crate::pubsub::PubSubRegistry;
 use crate::replication::state::ReplicationState;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
-use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
 use super::dispatch::ShardMessage;
+use super::shared_databases::ShardDatabases;
 
 /// Spawn a new tokio connection handler task (plain TCP or TLS).
 ///
@@ -32,7 +32,7 @@ pub(crate) fn spawn_tokio_connection(
     tcp_stream: tokio::net::TcpStream,
     is_tls: bool,
     tls_config: &Option<Arc<rustls::ServerConfig>>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
@@ -56,7 +56,7 @@ pub(crate) fn spawn_tokio_connection(
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
 
-    let dbs = databases.clone();
+    let sdbs = shard_databases.clone();
     let dtx = dispatch_tx.clone();
     let psr = pubsub_rc.clone();
     let blk = blocking_rc.clone();
@@ -107,7 +107,7 @@ pub(crate) fn spawn_tokio_connection(
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     handle_connection_sharded_inner(
-                        tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
+                        tls_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
                         reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                         snap_tx, clk,
                     )
@@ -122,7 +122,7 @@ pub(crate) fn spawn_tokio_connection(
         // Plain TCP connection
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
-                tcp_stream, dbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk,
             )
             .await;
@@ -139,7 +139,7 @@ pub(crate) fn spawn_monoio_connection(
     std_tcp_stream: crate::runtime::TcpStream,
     is_tls: bool,
     tls_config: &Option<Arc<rustls::ServerConfig>>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
@@ -164,7 +164,7 @@ pub(crate) fn spawn_monoio_connection(
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
-            let dbs = databases.clone();
+            let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
             let psr = pubsub_rc.clone();
             let blk = blocking_rc.clone();
@@ -209,7 +209,7 @@ pub(crate) fn spawn_monoio_connection(
                                 Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                             };
                             handle_connection_sharded_monoio(
-                                tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk,
+                                tls_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk,
                                 sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
                                 notifiers, snap_tx, clk,
                             )
@@ -232,7 +232,7 @@ pub(crate) fn spawn_monoio_connection(
                         Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                     };
                     handle_connection_sharded_monoio(
-                        tcp_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
+                        tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
                         reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
                         snap_tx, clk,
                     )
