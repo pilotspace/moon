@@ -32,7 +32,7 @@ services:
     environment:
       - RUST_LOG=info
     # --shards 0 auto-detects CPU core count
-    command: ["moon", "--bind", "0.0.0.0", "--port", "6379", "--shards", "0"]
+    command: ["moon", "--bind", "0.0.0.0", "--port", "6379", "--shards", "0", "--protected-mode", "no"]
     healthcheck:
       test: ["CMD", "moon", "--help"]
       interval: 30s

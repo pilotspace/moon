@@ -12,7 +12,7 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 .
 # =============================================================================
 
-ARG RUST_VERSION=1.85
+ARG RUST_VERSION=1.88
 ARG DEBIAN_VERSION=bookworm
 
 # =============================================================================
@@ -27,9 +27,10 @@ RUN cargo install cargo-chef --locked
 
 WORKDIR /app
 
-# Copy only what cargo-chef needs to prepare the recipe
+# Copy manifests and source structure (cargo-chef needs bench targets to resolve Cargo.toml)
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -74,9 +75,10 @@ RUN cargo chef cook --release --features ${FEATURES} --recipe-path recipe.json
 # =============================================================================
 FROM chef-cook AS builder
 
-# Source code only — no benches/, tests/, scripts/, docs/
+# Source code and bench targets (Cargo.toml references bench entries)
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 
 ARG FEATURES=runtime-monoio,jemalloc
 
@@ -119,4 +121,4 @@ EXPOSE 6379 6443
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD moon --help > /dev/null 2>&1 || exit 1
 
-CMD ["moon", "--bind", "0.0.0.0"]
+CMD ["moon", "--bind", "0.0.0.0", "--protected-mode", "no"]

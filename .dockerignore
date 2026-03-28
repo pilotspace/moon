@@ -4,7 +4,6 @@ target/
 .claude/
 *.md
 .planning/
-benches/
 tests/
 scripts/
 docs/
