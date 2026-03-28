@@ -531,7 +531,7 @@ pub fn getrange(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let end = match parse_i64(&args[2]) {
@@ -539,7 +539,7 @@ pub fn getrange(db: &mut Database, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     match db.get(key) {
@@ -567,7 +567,7 @@ pub fn getrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     let end = match parse_i64(&args[2]) {
@@ -575,7 +575,7 @@ pub fn getrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            ))
+            ));
         }
     };
     match db.get_if_alive(key, now_ms) {
@@ -624,11 +624,7 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let offset = match parse_i64(&args[1]) {
         Some(v) if v >= 0 => v as usize,
-        _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR offset is out of range",
-            ))
-        }
+        _ => return Frame::Error(Bytes::from_static(b"ERR offset is out of range")),
     };
     let value = match extract_bytes(&args[2]) {
         Some(v) => v,
@@ -636,12 +632,14 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Redis limits string size to 512MB
-    let required = offset + value.len();
-    if required > 512 * 1024 * 1024 {
-        return Frame::Error(Bytes::from_static(
-            b"ERR string exceeds maximum allowed size (512MB)",
-        ));
-    }
+    let required = match offset.checked_add(value.len()) {
+        Some(r) if r <= 512 * 1024 * 1024 => r,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR string exceeds maximum allowed size (512MB)",
+            ));
+        }
+    };
 
     let base_ts = db.base_timestamp();
     let (existing_data, existing_expiry_ms) = match db.get(&key) {
@@ -1593,7 +1591,10 @@ mod tests {
     #[test]
     fn test_getrange_basic() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello, World!"));
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
         let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"4")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"Hello")));
     }
@@ -1601,7 +1602,10 @@ mod tests {
     #[test]
     fn test_getrange_negative_end() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello, World!"));
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
         let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             result,
@@ -1612,7 +1616,10 @@ mod tests {
     #[test]
     fn test_getrange_negative_both() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello, World!"));
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
         // len=13, -6 = 7, -1 = 12 → "World!"
         let result = getrange(&mut db, &[bs(b"key"), bs(b"-6"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
@@ -1621,7 +1628,10 @@ mod tests {
     #[test]
     fn test_getrange_middle() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello, World!"));
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
         let result = getrange(&mut db, &[bs(b"key"), bs(b"7"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
     }
