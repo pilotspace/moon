@@ -340,7 +340,11 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
         anyhow::bail!("Unsupported WAL version: {}", version);
     }
     let shard_id = u16::from_le_bytes([data[7], data[8]]);
-    let epoch = u64::from_le_bytes(data[9..17].try_into().unwrap());
+    let epoch = u64::from_le_bytes(
+        data[9..17]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("WAL v2: invalid epoch bytes at header offset 9..17"))?,
+    );
     info!("Replaying WAL v2: shard={}, epoch={}", shard_id, epoch);
 
     let mut offset = WAL_HEADER_SIZE;
@@ -355,7 +359,11 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
             warn!("WAL v2: truncated block_len at offset {}, stopping", offset);
             break;
         }
-        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let block_len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("WAL v2: invalid block_len bytes at offset {}", offset))?,
+        ) as usize;
         offset += 4;
 
         // Minimum block content: cmd_count(2) + db_idx(1) + crc32(4) = 7
@@ -380,8 +388,11 @@ fn replay_wal_v2(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usiz
         // Extract fields
         let payload_len = block_len - 7; // minus cmd_count(2) + db_idx(1) + crc32(4)
         let payload = &block_data[3..3 + payload_len];
-        let stored_crc =
-            u32::from_le_bytes(block_data[block_len - 4..block_len].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(
+            block_data[block_len - 4..block_len]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("WAL v2: invalid CRC bytes at block offset {}", offset - 4))?,
+        );
 
         // Verify CRC: covers cmd_count(2B) + db_idx(1B) + payload
         let mut hasher = crc32fast::Hasher::new();
