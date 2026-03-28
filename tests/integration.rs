@@ -4741,3 +4741,269 @@ async fn test_acl_cat() {
 
     shutdown.cancel();
 }
+
+// ===== Phase 56: Sharded Pub/Sub Integration Tests =====
+
+#[tokio::test]
+async fn test_sharded_pubsub_subscribe() {
+    use futures::StreamExt;
+
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Subscriber
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("test-channel").await.unwrap();
+
+    // Publisher (separate connection)
+    let mut pub_conn = connect(port).await;
+
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("test-channel")
+        .arg("hello-sharded")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert!(
+        receivers >= 1,
+        "PUBLISH should return at least 1 subscriber, got {}",
+        receivers
+    );
+
+    let msg: redis::Msg = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pubsub.on_message().next(),
+    )
+    .await
+    .expect("timed out waiting for pubsub message")
+    .expect("stream ended unexpectedly");
+
+    assert_eq!(msg.get_channel_name(), "test-channel");
+    let payload: String = msg.get_payload().unwrap();
+    assert_eq!(payload, "hello-sharded");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pubsub_psubscribe() {
+    use futures::StreamExt;
+
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.psubscribe("news.*").await.unwrap();
+
+    let mut pub_conn = connect(port).await;
+
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("news.sports")
+        .arg("goal!")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert!(receivers >= 1, "PUBLISH should return at least 1");
+
+    let msg: redis::Msg = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pubsub.on_message().next(),
+    )
+    .await
+    .expect("timed out")
+    .expect("stream ended");
+
+    assert_eq!(msg.get_channel_name(), "news.sports");
+    let payload: String = msg.get_payload().unwrap();
+    assert_eq!(payload, "goal!");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pubsub_publish_count() {
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Two subscribers on same channel (may land on different shards)
+    let mut pubsub1 = client.get_async_pubsub().await.unwrap();
+    pubsub1.subscribe("shared-ch").await.unwrap();
+
+    let mut pubsub2 = client.get_async_pubsub().await.unwrap();
+    pubsub2.subscribe("shared-ch").await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut pub_conn = connect(port).await;
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("shared-ch")
+        .arg("hello")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        receivers, 2,
+        "PUBLISH should return 2 (two subscribers across shards)"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pubsub_channels() {
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Subscribe to a few channels on different connections (may hit different shards)
+    let mut ps1 = client.get_async_pubsub().await.unwrap();
+    ps1.subscribe("alpha").await.unwrap();
+
+    let mut ps2 = client.get_async_pubsub().await.unwrap();
+    ps2.subscribe("beta").await.unwrap();
+
+    let mut ps3 = client.get_async_pubsub().await.unwrap();
+    ps3.subscribe("gamma").await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut conn = connect(port).await;
+    let channels: Vec<String> = redis::cmd("PUBSUB")
+        .arg("CHANNELS")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    assert!(
+        channels.contains(&"alpha".to_string()),
+        "Missing alpha in {:?}",
+        channels
+    );
+    assert!(
+        channels.contains(&"beta".to_string()),
+        "Missing beta in {:?}",
+        channels
+    );
+    assert!(
+        channels.contains(&"gamma".to_string()),
+        "Missing gamma in {:?}",
+        channels
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pubsub_numsub() {
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    let mut ps1 = client.get_async_pubsub().await.unwrap();
+    ps1.subscribe("ch1").await.unwrap();
+
+    let mut ps2 = client.get_async_pubsub().await.unwrap();
+    ps2.subscribe("ch1").await.unwrap();
+
+    let mut ps3 = client.get_async_pubsub().await.unwrap();
+    ps3.subscribe("ch2").await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut conn = connect(port).await;
+    // PUBSUB NUMSUB returns [channel, count, channel, count, ...]
+    let result: Vec<redis::Value> = redis::cmd("PUBSUB")
+        .arg("NUMSUB")
+        .arg("ch1")
+        .arg("ch2")
+        .arg("ch3")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Parse pairs: result is [BulkString("ch1"), Int(2), BulkString("ch2"), Int(1), BulkString("ch3"), Int(0)]
+    assert_eq!(
+        result.len(),
+        6,
+        "Expected 6 elements (3 channels * 2), got {:?}",
+        result
+    );
+    // ch1 should have 2 subscribers
+    if let redis::Value::Int(count) = &result[1] {
+        assert_eq!(*count, 2, "ch1 should have 2 subscribers");
+    }
+    // ch2 should have 1 subscriber
+    if let redis::Value::Int(count) = &result[3] {
+        assert_eq!(*count, 1, "ch2 should have 1 subscriber");
+    }
+    // ch3 should have 0 subscribers
+    if let redis::Value::Int(count) = &result[5] {
+        assert_eq!(*count, 0, "ch3 should have 0 subscribers");
+    }
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pubsub_numpat() {
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    let mut ps1 = client.get_async_pubsub().await.unwrap();
+    ps1.psubscribe("news.*").await.unwrap();
+
+    let mut ps2 = client.get_async_pubsub().await.unwrap();
+    ps2.psubscribe("sports.*").await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut conn = connect(port).await;
+    let numpat: i64 = redis::cmd("PUBSUB")
+        .arg("NUMPAT")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        numpat, 2,
+        "Should have 2 pattern subscriptions, got {}",
+        numpat
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_sharded_pubsub_unsubscribe_cleanup() {
+    let (port, shutdown) = start_sharded_server(4).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
+
+    // Subscribe then unsubscribe
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("temp-ch").await.unwrap();
+    pubsub.unsubscribe("temp-ch").await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut pub_conn = connect(port).await;
+    let receivers: i64 = redis::cmd("PUBLISH")
+        .arg("temp-ch")
+        .arg("msg")
+        .query_async(&mut pub_conn)
+        .await
+        .unwrap();
+    assert_eq!(receivers, 0, "no subscribers after unsubscribe");
+
+    shutdown.cancel();
+}
