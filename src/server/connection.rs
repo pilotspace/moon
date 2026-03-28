@@ -21,6 +21,7 @@ use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
+use crate::command::metadata;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
@@ -691,7 +692,7 @@ pub async fn handle_connection(
                                     rs_guard.role,
                                     crate::replication::state::ReplicationRole::Replica { .. }
                                 ) {
-                                    if crate::persistence::aof::is_write_command(cmd) {
+                                    if metadata::is_write(cmd) {
                                         responses.push(Frame::Error(Bytes::from_static(
                                             b"READONLY You can't write against a read only replica.",
                                         )));
@@ -954,7 +955,7 @@ pub async fn handle_connection(
 
                         // === ACL key pattern check ===
                         {
-                            let is_write = crate::persistence::aof::is_write_command(cmd);
+                            let is_write = metadata::is_write(cmd);
                             if let Some(deny_reason) = acl_table.read().unwrap().check_key_permission(
                                 &current_user, cmd, cmd_args, is_write,
                             ) {
@@ -986,7 +987,7 @@ pub async fn handle_connection(
                     // --- Collect for phase 2 dispatch (needs db lock) ---
                     match extract_command(&frame) {
                         Some((cmd, _cmd_args)) => {
-                            let is_write = aof::is_write_command(cmd);
+                            let is_write = metadata::is_write(cmd);
 
                             // Serialize for AOF before dispatch
                             let aof_bytes = if is_write && aof_tx.is_some() {
@@ -1257,7 +1258,7 @@ fn execute_transaction(
         };
 
         // Check if this is a write command for AOF logging
-        let is_write = aof::is_write_command(cmd);
+        let is_write = metadata::is_write(cmd);
 
         // Serialize for AOF before dispatch
         let aof_bytes = if is_write {
@@ -1882,7 +1883,7 @@ pub async fn handle_connection_sharded_inner<
                                 rs_guard.role,
                                 crate::replication::state::ReplicationRole::Replica { .. }
                             ) {
-                                if crate::persistence::aof::is_write_command(cmd) {
+                                if metadata::is_write(cmd) {
                                     responses.push(Frame::Error(Bytes::from_static(
                                         b"READONLY You can't write against a read only replica.",
                                     )));
@@ -2187,7 +2188,7 @@ pub async fn handle_connection_sharded_inner<
                         }
 
                         // === ACL key pattern check (same lock guard) ===
-                        let is_write_for_acl = crate::persistence::aof::is_write_command(cmd);
+                        let is_write_for_acl = metadata::is_write(cmd);
                         if let Some(deny_reason) = acl_guard.check_key_permission(
                             &current_user, cmd, cmd_args, is_write_for_acl,
                         ) {
@@ -2286,10 +2287,10 @@ pub async fn handle_connection_sharded_inner<
                     };
 
                     // Pre-serialize write commands for AOF logging (before dispatch).
-                    // Skip the is_write_command string comparison entirely when neither
+                    // Skip the metadata::is_write lookup entirely when neither
                     // AOF persistence nor client tracking needs the write classification.
                     let is_write = if aof_tx.is_some() || tracking_state.enabled {
-                        aof::is_write_command(cmd)
+                        metadata::is_write(cmd)
                     } else {
                         false
                     };
@@ -2302,7 +2303,7 @@ pub async fn handle_connection_sharded_inner<
                     if is_local {
                         // LOCAL FAST PATH: zero cross-shard overhead
                         // Eviction check before write dispatch
-                        if aof::is_write_command(cmd) {
+                        if metadata::is_write(cmd) {
                             let rt = runtime_config.read().unwrap();
                             let mut dbs_ev = databases.borrow_mut();
                             if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
@@ -4211,7 +4212,7 @@ pub async fn handle_connection_sharded_monoio<
                         rs_guard.role,
                         crate::replication::state::ReplicationRole::Replica { .. }
                     ) {
-                        if crate::persistence::aof::is_write_command(cmd) {
+                        if metadata::is_write(cmd) {
                             responses.push(Frame::Error(Bytes::from_static(
                                 b"READONLY You can't write against a read only replica.",
                             )));
@@ -4473,7 +4474,7 @@ pub async fn handle_connection_sharded_monoio<
                 }
 
                 // === ACL key pattern check (same lock guard) ===
-                let is_write_for_acl = crate::persistence::aof::is_write_command(cmd);
+                let is_write_for_acl = metadata::is_write(cmd);
                 if let Some(deny_reason) =
                     acl_guard.check_key_permission(&current_user, cmd, cmd_args, is_write_for_acl)
                 {
@@ -4671,7 +4672,7 @@ pub async fn handle_connection_sharded_monoio<
 
             // Pre-classify write commands for AOF + tracking
             let is_write = if aof_tx.is_some() || tracking_state.enabled {
-                aof::is_write_command(cmd)
+                metadata::is_write(cmd)
             } else {
                 false
             };
@@ -4679,7 +4680,7 @@ pub async fn handle_connection_sharded_monoio<
             if is_local {
                 // LOCAL FAST PATH: single borrow_mut covers dispatch + wakeup (no per-command acquire/release)
                 // Eviction check before write dispatch
-                if crate::persistence::aof::is_write_command(cmd) {
+                if metadata::is_write(cmd) {
                     let rt = runtime_config.read().unwrap();
                     let mut dbs_ev = databases.borrow_mut();
                     if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
@@ -4783,7 +4784,7 @@ pub async fn handle_connection_sharded_monoio<
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
                 // Pre-compute AOF bytes before moving frame into Arc
-                let aof_bytes = if aof_tx.is_some() && aof::is_write_command(cmd) {
+                let aof_bytes = if aof_tx.is_some() && metadata::is_write(cmd) {
                     Some(aof::serialize_command(&frame))
                 } else {
                     None

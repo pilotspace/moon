@@ -85,7 +85,7 @@ pub fn make_redis_call_fn(lua: &Lua, propagate_errors: bool) -> mlua::Result<Lua
             let db_count = CURRENT_DB_COUNT.with(|c| c.get());
 
             // Track writes for SCRIPT KILL safety check
-            if crate::persistence::aof::is_write_command(&cmd_bytes) {
+            if crate::command::metadata::is_write(&cmd_bytes) {
                 SCRIPT_HAD_WRITE.with(|c| c.set(true));
             }
 

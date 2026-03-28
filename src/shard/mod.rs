@@ -18,6 +18,7 @@ use crate::blocking::BlockingRegistry;
 use crate::command::connection as conn_cmd;
 use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::config::RuntimeConfig;
+use crate::command::metadata;
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
@@ -1047,7 +1048,7 @@ impl Shard {
                     };
 
                     // COW intercept: capture old value before write if snapshot is active
-                    let is_write = aof::is_write_command(cmd);
+                    let is_write = metadata::is_write(cmd);
                     if is_write {
                         Self::cow_intercept(snapshot_state, &dbs, db_idx, &command);
                     }
@@ -1140,7 +1141,7 @@ impl Shard {
                     };
 
                     // COW intercept for each write command in the batch
-                    let is_write = aof::is_write_command(cmd);
+                    let is_write = metadata::is_write(cmd);
                     if is_write {
                         Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
                     }
@@ -1191,7 +1192,7 @@ impl Shard {
                     };
 
                     // COW intercept for each write command in the batch
-                    let is_write = aof::is_write_command(cmd);
+                    let is_write = metadata::is_write(cmd);
                     if is_write {
                         Self::cow_intercept(snapshot_state, &dbs, db_idx, cmd_frame);
                     }
