@@ -141,6 +141,50 @@ impl super::Shard {
             Vec<uring_handler::InFlightSend>,
         > = std::collections::HashMap::new();
 
+        // Per-shard SO_REUSEPORT listener (Linux + tokio, non-uring path).
+        // When io_uring is active, multishot accept handles this already.
+        // When io_uring is NOT active (MOON_NO_URING or init failure), create a tokio TcpListener.
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+        let per_shard_listener: Option<tokio::net::TcpListener> = {
+            if uring_state.is_none() {
+                if let Some(ref addr) = bind_addr {
+                    match conn_accept::create_reuseport_socket(addr) {
+                        Ok(std_listener) => {
+                            match tokio::net::TcpListener::from_std(std_listener) {
+                                Ok(tl) => {
+                                    info!(
+                                        "Shard {}: per-shard SO_REUSEPORT listener on {}",
+                                        self.id, addr
+                                    );
+                                    Some(tl)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Shard {}: tokio listener from_std failed: {}, using conn_rx",
+                                        self.id,
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
+                                self.id,
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None // io_uring handles accept via multishot
+            }
+        };
+
         #[cfg(not(all(target_os = "linux", feature = "runtime-tokio")))]
         {
             let _ = &bind_addr; // Suppress unused warning when io_uring path inactive
@@ -217,7 +261,32 @@ impl super::Shard {
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
-                // Accept new connections from listener
+                // Per-shard SO_REUSEPORT accept (Linux only, non-uring tokio path)
+                result = async {
+                    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+                    if let Some(ref listener) = per_shard_listener {
+                        return listener.accept().await;
+                    }
+                    // Never resolves on non-Linux or when per_shard_listener is None
+                    std::future::pending::<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>().await
+                } => {
+                    match result {
+                        Ok((tcp_stream, _addr)) => {
+                            conn_accept::spawn_tokio_connection(
+                                tcp_stream, false, &tls_config,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Shard {}: per-shard accept error: {}", shard_id, e);
+                        }
+                    }
+                }
+                // Accept new connections from listener (MPSC fallback, always active on non-Linux)
                 stream = conn_rx.recv_async() => {
                     match stream {
                         Ok((tcp_stream, is_tls)) => {
