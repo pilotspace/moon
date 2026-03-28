@@ -1,0 +1,108 @@
+---
+title: "Architecture"
+description: "Thread-per-core shared-nothing design, data structures, and key optimizations."
+keywords: ["architecture", "sharding", "dashtable", "simd", "io_uring", "monoio"]
+---
+
+Moon uses a thread-per-core shared-nothing architecture where each shard runs independently on its own thread with no shared mutable state.
+
+```
+                  Client Connections
+                         |
+                  TCP / TLS Listener
+                         |
+                ┌────────┴────────┐
+                │  Shard Router    │  hash(key) % N
+                └────────┬────────┘
+         ┌───────┬───────┼───────┬───────┐
+      Shard 0  Shard 1  ...   Shard N-1
+         │       │               │
+    ┌────┴────┐  │          ┌────┴────┐
+    │DashTable│  │          │DashTable│  Swiss Table SIMD
+    │  (data) │  │          │  (data) │
+    └────┬────┘  │          └────┬────┘
+         │       │               │
+      Per-Shard WAL          Per-Shard WAL
+```
+
+## Per-shard components
+
+Each shard runs on its own thread with:
+
+- **Event loop** — Tokio `current_thread` or Monoio `LocalExecutor`
+- **DashTable** — Segmented hash table with SIMD probing
+- **WAL writer** — Per-shard persistence with no global lock
+- **PubSub registry** — Cross-shard fan-out via SPSC channels
+- **Lua VM** — Lazy-initialized on first EVAL command
+
+All cross-shard communication uses lock-free message passing. No mutexes on the hot path.
+
+## DashTable
+
+The primary key-value engine is a segmented Swiss-table hash map with SIMD probing. Each segment holds 60 slots with a 90% load threshold.
+
+| Property | Value |
+|----------|-------|
+| Segment size | ~3 KB (64B ctrl + 8B meta + 60 slots) |
+| Load threshold | 90% (54/60 slots) |
+| Average fill | ~67% |
+| Probe method | 16-way SIMD parallel match (SSE2/NEON) |
+
+Keys are routed to segments via xxhash. Within a segment, SIMD control-byte matching finds the target slot in a single instruction.
+
+## Memory layout
+
+Moon uses specialized compact types to minimize per-key overhead:
+
+| Struct | Size | Description |
+|--------|------|-------------|
+| CompactKey | 24 B | Inline keys up to 22 bytes (zero heap allocation) |
+| CompactEntry | 24 B | CompactValue (16B) + TTL delta (4B) + metadata (4B) |
+| CompactValue | 16 B | SSO for values up to 12 bytes inline |
+| HeapString | 24 B | `Vec<u8>` with no Arc overhead for non-shared values |
+
+### Why Moon uses less memory at larger values
+
+```
+Moon:  CompactValue(16B) → Box<HeapString> → Vec<u8>(24B) → data
+       Total overhead: 48 bytes + data
+
+Redis: dictEntry(24B) → robj(16B) → SDS(8-17B + data) + jemalloc rounding
+       Total overhead: ~64-80 bytes + data
+```
+
+TTL is packed as a 4-byte delta inside `CompactEntry`, costing zero extra bytes per expiring key. Redis maintains a separate `expires` hash table with a full `dictEntry` (24 bytes) per expiring key.
+
+## Dual runtime
+
+Moon supports two async runtimes:
+
+| Runtime | Platform | Use case |
+|---------|----------|----------|
+| **Monoio** (default) | Linux (io_uring), macOS (kqueue) | Peak performance, production |
+| **Tokio** | All platforms | Portability, CI, GitHub Actions |
+
+Monoio's thread-per-core model avoids work-stealing overhead. On Linux, io_uring batch I/O amortizes syscall costs across multiple commands.
+
+## Key optimizations
+
+| Optimization | Impact | Component |
+|-------------|--------|-----------|
+| SIMD probing | 16-way parallel key match | DashTable segments |
+| Lock-free oneshot | 12% CPU reduction | Cross-shard dispatch |
+| CachedClock | 4% throughput gain | Per-shard event loop |
+| Lazy Lua VM | -18 MB baseline | Shard startup |
+| Lazy replication backlog | -12 MB baseline | Shard startup |
+| Per-shard WAL | Linear scaling with shards | Persistence |
+| io_uring batch I/O | Amortized syscalls | Network layer |
+| Software prefetch | Overlapped fetch + hash | DashTable lookup |
+| Zero-copy argument slicing | Eliminates parse buffer copies | RESP parser |
+| Direct GET serialization | Bypasses Frame allocation | Response path |
+
+## Design inspirations
+
+- [Dragonfly](https://github.com/dragonflydb/dragonfly) — shared-nothing thread-per-core architecture (C++)
+- [Dash (VLDB 2020)](https://www.vldb.org/pvldb/vol13/p1147-lu.pdf) — segmented hash table design
+- [Swiss Table / Abseil](https://abseil.io/about/design/swisstables) — SIMD control-byte probing
+- [VLL (VLDB 2012)](https://www.vldb.org/pvldb/vol6/p145-ren.pdf) — lightweight multi-key coordination
+- [ScyllaDB / Seastar](https://github.com/scylladb/seastar) — thread-per-core for databases

@@ -1,0 +1,138 @@
+---
+title: "Quick start"
+description: "Install, build, and run Moon in under five minutes."
+keywords: ["install", "setup", "getting started", "docker", "build"]
+---
+
+## Prerequisites
+
+- [Rust](https://rustup.rs/) stable toolchain (edition 2024)
+- cmake (required by aws-lc-rs for TLS support)
+
+## Build from source
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/pilotspace/moon.git
+    cd moon
+    ```
+  </Step>
+  <Step title="Build the release binary">
+    The default build uses the Monoio runtime with jemalloc:
+
+    ```bash
+    cargo build --release
+    ```
+
+    <AccordionGroup>
+      <Accordion title="Alternative build configurations">
+        ```bash
+        # Tokio runtime (required for macOS CI, CodeQL, GitHub Actions)
+        cargo build --release --no-default-features --features runtime-tokio
+
+        # Tokio with jemalloc
+        cargo build --release --no-default-features --features runtime-tokio,jemalloc
+
+        # Native CPU optimizations (recommended for benchmarking)
+        RUSTFLAGS="-C target-cpu=native" cargo build --release
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Step>
+  <Step title="Start the server">
+    ```bash
+    # Default: 127.0.0.1:6379, auto-detect CPU count for shards
+    ./target/release/moon
+
+    # With specific options
+    ./target/release/moon --port 6379 --shards 4
+    ```
+  </Step>
+  <Step title="Connect">
+    Any Redis client works out of the box:
+
+    ```bash
+    redis-cli -p 6379
+    127.0.0.1:6379> PING
+    PONG
+    127.0.0.1:6379> SET hello world
+    OK
+    127.0.0.1:6379> GET hello
+    "world"
+    ```
+  </Step>
+</Steps>
+
+## Docker
+
+```bash
+# Build the image
+docker build -t moon .
+
+# Run with default settings
+docker run -p 6379:6379 moon
+
+# Run with persistence
+docker run -p 6379:6379 -v moon-data:/data moon \
+  moon --bind 0.0.0.0 --dir /data --appendonly yes
+
+# Run with password and TLS
+docker run -p 6379:6379 -p 6380:6380 moon \
+  moon --bind 0.0.0.0 --requirepass secret \
+  --tls-port 6380 --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key
+```
+
+## Client libraries
+
+Moon is compatible with any Redis client. Here are a few examples:
+
+<Tabs>
+  <Tab title="Python">
+    ```python
+    import redis
+
+    r = redis.Redis(host='localhost', port=6379)
+    r.set('key', 'value')
+    print(r.get('key'))  # b'value'
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```javascript
+    import { createClient } from 'redis';
+
+    const client = createClient({ url: 'redis://localhost:6379' });
+    await client.connect();
+    await client.set('key', 'value');
+    console.log(await client.get('key')); // 'value'
+    ```
+  </Tab>
+  <Tab title="Go">
+    ```go
+    import "github.com/redis/go-redis/v9"
+
+    rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+    rdb.Set(ctx, "key", "value", 0)
+    val, _ := rdb.Get(ctx, "key").Result()
+    fmt.Println(val) // "value"
+    ```
+  </Tab>
+  <Tab title="Java">
+    ```java
+    Jedis jedis = new Jedis("localhost", 6379);
+    jedis.set("key", "value");
+    System.out.println(jedis.get("key")); // "value"
+    ```
+  </Tab>
+</Tabs>
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="Configuration" icon="gear" href="/configuration">
+    All CLI flags and options.
+  </Card>
+  <Card title="Architecture" icon="microchip" href="/architecture">
+    How Moon works under the hood.
+  </Card>
+</Columns>

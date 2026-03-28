@@ -1,0 +1,66 @@
+---
+title: "Moon"
+description: "A high-performance, Redis-compatible in-memory data store written in Rust."
+keywords: ["redis", "rust", "in-memory", "database", "key-value"]
+---
+
+Moon is a Redis-compatible in-memory data store built from scratch in Rust. It implements 200+ Redis commands with a thread-per-core shared-nothing architecture, achieving **1.5-3x Redis throughput** while using **27-35% less memory** for real-world value sizes.
+
+<Warning>
+Moon is **experimental** and under active development. APIs, storage formats, and configuration options may change without notice. Not recommended for production use.
+</Warning>
+
+## Key metrics
+
+| Metric | Result | Conditions |
+|--------|--------|------------|
+| Peak GET throughput | **3.79M ops/sec** | 4 shards, pipeline=64 |
+| Peak SET with AOF | **2.78M ops/sec** | AOF everysec, pipeline=64 |
+| vs Redis throughput | **1.84-1.99x faster** | 8 shards, pipeline=16 |
+| Memory (1KB+ values) | **27-35% less** | Per-key RSS measurement |
+| p50 latency (8 shards) | **0.031ms** | vs Redis 0.26ms (8-10x lower) |
+| Data correctness | **132/132 tests** | All types, 1/4/12 shards |
+
+## Highlights
+
+<Columns cols={2}>
+  <Card title="200+ Redis commands" icon="terminal" href="/commands">
+    Strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, and more.
+  </Card>
+  <Card title="Thread-per-core architecture" icon="microchip" href="/architecture">
+    Shared-nothing design with per-shard event loops, DashTable SIMD probing, and lock-free channels.
+  </Card>
+  <Card title="Dual runtime" icon="bolt" href="/architecture#dual-runtime">
+    Monoio (io_uring on Linux, kqueue on macOS) for peak performance. Tokio for portability.
+  </Card>
+  <Card title="Per-shard persistence" icon="hard-drive" href="/guides/persistence">
+    Forkless RDB snapshots and per-shard WAL with no global lock. AOF advantage grows with pipeline depth.
+  </Card>
+  <Card title="Cluster and replication" icon="server" href="/guides/clustering">
+    PSYNC2-compatible replication, 16,384 hash slots, gossip protocol, and automatic failover.
+  </Card>
+  <Card title="Drop-in compatible" icon="plug" href="/quickstart">
+    Works with any Redis client. Connect with redis-cli, Jedis, ioredis, or redis-py out of the box.
+  </Card>
+</Columns>
+
+## Quick start
+
+```bash
+git clone https://github.com/pilotspace/moon.git
+cd moon
+cargo build --release
+./target/release/moon --port 6379 --shards 4
+```
+
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> SET hello world
+OK
+127.0.0.1:6379> GET hello
+"world"
+```
+
+<Card title="Full quick start guide" icon="rocket" href="/quickstart">
+  Prerequisites, build options, Docker, and connecting with clients.
+</Card>

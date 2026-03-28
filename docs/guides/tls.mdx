@@ -1,0 +1,72 @@
+---
+title: "TLS"
+description: "Enable TLS 1.3 encryption and mutual TLS client authentication."
+keywords: ["tls", "ssl", "encryption", "security", "mtls", "certificates"]
+---
+
+Moon supports TLS 1.3 via [rustls](https://github.com/rustls/rustls) and [aws-lc-rs](https://github.com/aws/aws-lc-rs). You can run plaintext and TLS listeners simultaneously on different ports.
+
+## Basic TLS setup
+
+```bash
+./target/release/moon \
+  --port 6379 \
+  --tls-port 6380 \
+  --tls-cert-file /path/to/server.crt \
+  --tls-key-file /path/to/server.key
+```
+
+This serves plaintext on port 6379 and TLS on port 6380.
+
+Connect with TLS:
+
+```bash
+redis-cli -p 6380 --tls --cacert /path/to/ca.crt
+```
+
+## TLS-only mode
+
+To disable plaintext entirely, set `--port 0`:
+
+```bash
+./target/release/moon \
+  --port 0 \
+  --tls-port 6379 \
+  --tls-cert-file /path/to/server.crt \
+  --tls-key-file /path/to/server.key
+```
+
+## Mutual TLS (mTLS)
+
+Require clients to present a certificate signed by a trusted CA:
+
+```bash
+./target/release/moon \
+  --tls-port 6379 \
+  --tls-cert-file /path/to/server.crt \
+  --tls-key-file /path/to/server.key \
+  --tls-ca-cert-file /path/to/ca.crt
+```
+
+Connect with a client certificate:
+
+```bash
+redis-cli -p 6379 --tls \
+  --cacert /path/to/ca.crt \
+  --cert /path/to/client.crt \
+  --key /path/to/client.key
+```
+
+## Configuration reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tls-port` | `0` (disabled) | TLS listener port |
+| `--tls-cert-file` | *(none)* | PEM certificate file |
+| `--tls-key-file` | *(none)* | PEM private key file |
+| `--tls-ca-cert-file` | *(none)* | CA cert for mTLS client auth |
+| `--tls-ciphersuites` | *(default)* | TLS 1.3 cipher suites |
+
+<Note>
+Moon uses pure-Rust TLS (rustls) with no OpenSSL dependency. The cryptographic backend is aws-lc-rs, which is FIPS-capable and provides high-performance AES-GCM and ChaCha20.
+</Note>
