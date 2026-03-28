@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
-use crate::command::{DispatchResult, dispatch};
+use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
@@ -1364,7 +1364,42 @@ pub async fn handle_connection_sharded_monoio<
                 let response = apply_resp3_conversion(cmd, response, protocol_version);
                 responses.push(response);
             } else if let Some(target) = target_shard {
-                // DEFERRED REMOTE: collect for batch dispatch after loop
+                // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
+                // By this point in_multi is false (MULTI queuing happens earlier with `continue`).
+                // Read commands execute directly on the target shard's database via RwLock read guard,
+                // avoiding ~88us of two async scheduling hops through the SPSC channel.
+                //
+                // Guard: if there are already pending writes for this target shard in the
+                // current pipeline batch, we must NOT take the fast path -- the read would
+                // execute before the deferred writes, violating command ordering. Fall through
+                // to SPSC dispatch to preserve pipeline semantics.
+                if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) {
+                    let guard = shard_databases.read_db(target, selected_db);
+                    let now_ms = cached_clock.ms();
+                    let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                    drop(guard);
+                    let response = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => {
+                            should_quit = true;
+                            f
+                        }
+                    };
+                    // Client tracking for cross-shard reads
+                    if tracking_state.enabled && !tracking_state.bcast {
+                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                            tracking_table.borrow_mut().track_key(
+                                client_id,
+                                &key,
+                                tracking_state.noloop,
+                            );
+                        }
+                    }
+                    let response = apply_resp3_conversion(cmd, response, protocol_version);
+                    responses.push(response);
+                    continue;
+                }
+                // Cross-shard write: deferred SPSC dispatch (unchanged)
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
                 // Pre-compute AOF bytes before moving frame into Arc
