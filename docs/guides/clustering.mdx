@@ -1,0 +1,92 @@
+---
+title: "Clustering and replication"
+description: "Set up replication, cluster mode, and automatic failover."
+keywords: ["cluster", "replication", "failover", "psync", "gossip", "slots"]
+---
+
+Moon supports Redis-compatible replication and cluster mode for high availability and horizontal scaling.
+
+## Replication
+
+Moon implements PSYNC2-compatible replication with per-shard WAL streaming and partial resync support.
+
+### Set up a replica
+
+<Steps>
+  <Step title="Start the leader">
+    ```bash
+    ./target/release/moon --port 6379 --shards 4
+    ```
+  </Step>
+  <Step title="Start the replica">
+    ```bash
+    ./target/release/moon --port 6380 --shards 4
+    ```
+  </Step>
+  <Step title="Connect the replica to the leader">
+    ```bash
+    redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
+    ```
+  </Step>
+</Steps>
+
+### Replication features
+
+- **PSYNC2 protocol** — compatible with Redis replication clients
+- **Per-shard WAL streaming** — each shard streams its own WAL independently
+- **Partial resync** — reconnecting replicas resume from where they left off via the replication backlog
+- **Lazy backlog** — the replication backlog is only allocated when the first replica connects, saving ~12 MB baseline memory
+
+## Cluster mode
+
+Moon implements the Redis Cluster specification with 16,384 hash slots, gossip protocol, and automatic failover.
+
+### Start a cluster
+
+```bash
+# Start three nodes
+./target/release/moon --port 7000 --cluster-enabled true --shards 2
+./target/release/moon --port 7001 --cluster-enabled true --shards 2
+./target/release/moon --port 7002 --cluster-enabled true --shards 2
+
+# Join nodes
+redis-cli -p 7000 CLUSTER MEET 127.0.0.1 7001
+redis-cli -p 7000 CLUSTER MEET 127.0.0.1 7002
+
+# Assign slots (roughly equal distribution)
+redis-cli -p 7000 CLUSTER ADDSLOTS {0..5461}
+redis-cli -p 7001 CLUSTER ADDSLOTS {5462..10922}
+redis-cli -p 7002 CLUSTER ADDSLOTS {10923..16383}
+```
+
+### Cluster features
+
+- **16,384 hash slots** with CRC16-based routing
+- **Gossip protocol** for node discovery and failure detection
+- **MOVED/ASK redirections** for client-side routing
+- **Live slot migration** for rebalancing without downtime
+- **Majority consensus failover** with automatic promotion
+
+### Hash tags
+
+Use `{tag}` in key names to co-locate related keys on the same slot:
+
+```bash
+# All these keys route to the same slot
+SET user:{1234}:name "Alice"
+SET user:{1234}:email "alice@example.com"
+MGET user:{1234}:name user:{1234}:email
+```
+
+This eliminates cross-shard dispatch overhead for multi-key operations like MGET and MSET.
+
+### Cluster commands
+
+`CLUSTER INFO`, `CLUSTER NODES`, `CLUSTER SLOTS`, `CLUSTER MEET`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER SETSLOT`, `CLUSTER FAILOVER`, `CLUSTER MYID`
+
+### Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cluster-enabled` | `false` | Enable cluster mode |
+| `--cluster-node-timeout` | `15000` | Node timeout in ms before failover |

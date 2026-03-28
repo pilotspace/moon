@@ -1,7 +1,10 @@
 target/
 .git/
 .github/
+.claude/
 *.md
 .planning/
-benches/
 tests/
+scripts/
+docs/
+docker-compose.yml

@@ -1,0 +1,73 @@
+---
+title: "Docker"
+description: "Run Moon in Docker with persistence and TLS."
+keywords: ["docker", "container", "deployment"]
+---
+
+Moon ships with a Dockerfile for containerized deployments.
+
+## Build the image
+
+```bash
+docker build -t moon .
+```
+
+## Run with defaults
+
+```bash
+docker run -p 6379:6379 moon
+```
+
+## Run with persistence
+
+Mount a volume for data durability:
+
+```bash
+docker run -p 6379:6379 -v moon-data:/data moon \
+  moon --bind 0.0.0.0 --dir /data --appendonly yes
+```
+
+## Run with authentication and TLS
+
+```bash
+docker run \
+  -p 6379:6379 \
+  -p 6380:6380 \
+  -v /path/to/certs:/certs:ro \
+  moon \
+  moon --bind 0.0.0.0 \
+    --requirepass secret \
+    --tls-port 6380 \
+    --tls-cert-file /certs/server.crt \
+    --tls-key-file /certs/server.key
+```
+
+## Production example
+
+```bash
+docker run -d \
+  --name moon \
+  --restart unless-stopped \
+  -p 6379:6379 \
+  -v moon-data:/data \
+  -v /etc/moon/certs:/certs:ro \
+  --ulimit nofile=65536:65536 \
+  moon \
+  moon --bind 0.0.0.0 \
+    --port 6379 \
+    --shards 0 \
+    --requirepass "$REDIS_PASSWORD" \
+    --appendonly yes \
+    --appendfsync everysec \
+    --dir /data \
+    --maxmemory 8589934592 \
+    --maxmemory-policy allkeys-lfu
+```
+
+<Tip>
+Use `--shards 0` to auto-detect available CPU cores inside the container. Set `--ulimit nofile=65536:65536` for high client counts.
+</Tip>
+
+<Warning>
+Always use `--bind 0.0.0.0` inside Docker containers. The default `127.0.0.1` is not reachable from outside the container. Use `--requirepass` or network-level access controls when binding to all interfaces.
+</Warning>
