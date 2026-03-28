@@ -28,12 +28,12 @@ use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
+use super::affinity::{AffinityTracker, MigratedConnectionState};
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
     handle_config, is_multi_key_command, try_inline_dispatch_loop,
 };
-use super::affinity::{AffinityTracker, MigratedConnectionState};
 use crate::framevec;
 use crate::server::codec::RespCodec;
 use crate::server::response_slot::ResponseSlotPool;
@@ -148,10 +148,8 @@ pub async fn handle_connection_sharded_monoio<
         usize,
         Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>,
     > = HashMap::with_capacity(num_shards);
-    let mut reply_futures: Vec<(
-        Vec<(usize, Option<Bytes>, Vec<u8>)>,
-        usize,
-    )> = Vec::with_capacity(num_shards);
+    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, usize)> =
+        Vec::with_capacity(num_shards);
 
     // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
@@ -1233,6 +1231,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
+                        &response_pool,
                     )
                     .await;
                     responses.push(response);
@@ -1248,6 +1247,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
+                        &response_pool,
                     )
                     .await;
                     responses.push(response);
@@ -1261,6 +1261,7 @@ pub async fn handle_connection_sharded_monoio<
                         &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
+                        &response_pool,
                     )
                     .await;
                     responses.push(response);
@@ -1279,6 +1280,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
+                        &response_pool,
                     )
                     .await;
                     responses.push(response);
@@ -1328,13 +1330,7 @@ pub async fn handle_connection_sharded_monoio<
                 }
                 let mut guard = shard_databases.write_db(shard_id, selected_db);
                 // No refresh_now here — called once per batch before the loop
-                let result = dispatch(
-                    &mut guard,
-                    cmd,
-                    cmd_args,
-                    &mut selected_db,
-                    db_count,
-                );
+                let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
 
                 let response = match result {
                     DispatchResult::Response(f) => f,
@@ -1428,7 +1424,8 @@ pub async fn handle_connection_sharded_monoio<
                 if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) {
                     let guard = shard_databases.read_db(target, selected_db);
                     let now_ms = cached_clock.ms();
-                    let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                    let result =
+                        dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
                     drop(guard);
                     let response = match result {
                         DispatchResult::Response(f) => f,
@@ -1516,8 +1513,7 @@ pub async fn handle_connection_sharded_monoio<
             // Await all shard responses (they execute in parallel on different shards)
             for (meta, target) in reply_futures.drain(..) {
                 let shard_responses = response_pool.future_for(target).await;
-                for ((resp_idx, aof_bytes, cmd_name), resp) in
-                    meta.into_iter().zip(shard_responses)
+                for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses)
                 {
                     // AOF logging for successful remote writes
                     if let Some(bytes) = aof_bytes {
@@ -1564,7 +1560,10 @@ pub async fn handle_connection_sharded_monoio<
                 peer_addr: peer_addr.clone(),
             };
             return (
-                MonoioHandlerResult::MigrateConnection { state: migrated_state, target_shard },
+                MonoioHandlerResult::MigrateConnection {
+                    state: migrated_state,
+                    target_shard,
+                },
                 Some(stream),
             );
         }

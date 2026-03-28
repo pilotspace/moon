@@ -132,7 +132,14 @@ pub async fn handle_connection_sharded(
     .await;
 
     // Handle migration result: extract FD from the returned stream and send via SPSC
-    if let (HandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (result.0, result.1) {
+    if let (
+        HandlerResult::MigrateConnection {
+            state,
+            target_shard,
+        },
+        Some(stream),
+    ) = (result.0, result.1)
+    {
         use std::os::unix::io::IntoRawFd;
         match stream.into_std() {
             Ok(std_stream) => {
@@ -148,7 +155,9 @@ pub async fn handle_connection_sharded(
                         spsc_notifiers[target_shard].notify_one();
                         tracing::info!(
                             "Shard {}: migrated connection {} to shard {}",
-                            shard_id, client_id, target_shard
+                            shard_id,
+                            client_id,
+                            target_shard
                         );
                     }
                     Err(returned_msg) => {
@@ -159,16 +168,14 @@ pub async fn handle_connection_sharded(
                         }
                         tracing::warn!(
                             "Shard {}: migration SPSC full, connection {} lost",
-                            shard_id, client_id
+                            shard_id,
+                            client_id
                         );
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "Shard {}: migration into_std failed: {}",
-                    shard_id, e
-                );
+                tracing::warn!("Shard {}: migration into_std failed: {}", shard_id, e);
                 // Stream consumed by into_std attempt, connection lost either way
             }
         }
@@ -847,24 +854,24 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if cmd.eq_ignore_ascii_case(b"KEYS") {
-                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &response_pool).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SCAN") {
-                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &response_pool).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers).await;
+                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &response_pool).await;
                         responses.push(response);
                         continue;
                     }
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &response_pool).await;
                         responses.push(response);
                         continue;
                     }
