@@ -16,9 +16,9 @@ use tracing::info;
 
 use crate::blocking::BlockingRegistry;
 use crate::command::connection as conn_cmd;
+use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::config::RuntimeConfig;
-use crate::command::metadata;
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;

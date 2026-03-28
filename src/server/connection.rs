@@ -19,9 +19,9 @@ use tokio_util::codec::Framed;
 
 use crate::command::config as config_cmd;
 use crate::command::connection as conn_cmd;
+use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
-use crate::command::metadata;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
