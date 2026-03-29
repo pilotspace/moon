@@ -215,7 +215,7 @@ async fn coordinate_mget(
 
     // Await all remote results
     for (indices, reply_rx) in pending_shards {
-        let frames = reply_rx.await.unwrap_or_default();
+        let frames = reply_rx.recv().await.unwrap_or_default();
         for (idx, frame) in indices.into_iter().zip(frames) {
             results[idx] = Some(frame);
         }
@@ -314,7 +314,7 @@ async fn coordinate_mset(
     }
 
     for reply_rx in pending_shards {
-        let _ = reply_rx.await;
+        let _ = reply_rx.recv().await;
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
@@ -397,7 +397,7 @@ async fn coordinate_multi_del_or_exists(
     }
 
     for reply_rx in pending_shards {
-        let frames = reply_rx.await.unwrap_or_default();
+        let frames = reply_rx.recv().await.unwrap_or_default();
         for frame in frames {
             if let Frame::Integer(n) = frame {
                 total_count += n;
@@ -467,7 +467,7 @@ pub async fn coordinate_keys(
 
     // Collect remote results
     for reply_rx in pending_shards {
-        let frame = reply_rx.await.unwrap_or(Frame::Null);
+        let frame = reply_rx.recv().await.unwrap_or(Frame::Null);
         if let Frame::Array(keys) = frame {
             all_keys.extend(keys);
         }
@@ -545,7 +545,7 @@ pub async fn coordinate_scan(
             reply_tx,
         };
         spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
-        reply_rx.await.unwrap_or(Frame::Null)
+        reply_rx.recv().await.unwrap_or(Frame::Null)
     };
 
     // Parse the SCAN response: [cursor, [keys...]]
@@ -626,7 +626,7 @@ pub async fn coordinate_dbsize(
     }
 
     for reply_rx in pending_shards {
-        let frame = reply_rx.await.unwrap_or(Frame::Null);
+        let frame = reply_rx.recv().await.unwrap_or(Frame::Null);
         if let Frame::Integer(n) = frame {
             total += n;
         }

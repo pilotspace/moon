@@ -303,6 +303,14 @@ impl super::Shard {
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
+        // Pending wakers for monoio cross-shard write dispatch.
+        // monoio's !Send single-threaded executor doesn't see cross-thread Waker::wake()
+        // from flume oneshot channels. Connection tasks register their waker here; the
+        // event loop drains and wakes them after every SPSC processing cycle (~1ms).
+        #[cfg(feature = "runtime-monoio")]
+        let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
@@ -415,6 +423,7 @@ impl super::Shard {
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                     }
@@ -460,6 +469,7 @@ impl super::Shard {
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                     }
@@ -557,6 +567,7 @@ impl super::Shard {
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                         Err(e) => {
@@ -575,6 +586,7 @@ impl super::Shard {
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                         Err(_) => {
@@ -585,6 +597,7 @@ impl super::Shard {
                 }
                 // SPSC notify -- event-driven cross-shard message drain
                 _ = spsc_notify_local.notified() => {
+                    tracing::trace!("Shard {}: SPSC notify fired", shard_id);
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
@@ -593,6 +606,11 @@ impl super::Shard {
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
                     );
+                    // Wake connection tasks waiting for cross-shard write responses.
+                    // They'll try_recv() — if the response arrived, proceed; otherwise re-register.
+                    for waker in pending_wakers.borrow_mut().drain(..) {
+                        waker.wake();
+                    }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
@@ -622,12 +640,14 @@ impl super::Shard {
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                     }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
                 _ = periodic_interval.tick() => {
+                    tracing::trace!("Shard {}: periodic tick", shard_id);
                     cached_clock.update();
 
                     let mut pending_snapshot = None;
@@ -638,6 +658,10 @@ impl super::Shard {
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
                     );
+                    // Wake connection tasks waiting for cross-shard write responses.
+                    for waker in pending_wakers.borrow_mut().drain(..) {
+                        waker.wake();
+                    }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, shard_id,
@@ -667,6 +691,7 @@ impl super::Shard {
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                     }

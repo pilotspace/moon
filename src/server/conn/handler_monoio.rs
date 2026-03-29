@@ -97,6 +97,7 @@ pub async fn handle_connection_sharded_monoio<
     cached_clock: CachedClock,
     can_migrate: bool,
     initial_read_buf: BytesMut,
+    pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -1499,6 +1500,7 @@ pub async fn handle_connection_sharded_monoio<
                         };
                         match push_result {
                             Ok(()) => {
+                                tracing::trace!("Shard {}: pushed PipelineBatch to shard {}, notifying", shard_id, target);
                                 spsc_notifiers[target].notify_one();
                                 break;
                             }
@@ -1512,11 +1514,39 @@ pub async fn handle_connection_sharded_monoio<
                 oneshot_futures.push((meta, reply_rx));
             }
 
-            // Await all shard responses via oneshot channels (cross-thread safe)
+            // Poll all shard responses via pending_wakers relay (monoio cross-thread waker fix).
+            // monoio's !Send executor doesn't see cross-thread Waker::wake() from flume.
+            // Instead, the connection task registers its waker in pending_wakers; the event
+            // loop drains and wakes them after every SPSC cycle (~1ms). On wake, try_recv()
+            // checks if the response arrived; if not, re-register and yield again.
             for (meta, reply_rx) in oneshot_futures.drain(..) {
-                let shard_responses = match reply_rx.recv_polling().await {
+                tracing::trace!("Shard {}: awaiting cross-shard response via pending_wakers", shard_id);
+                let shard_responses = {
+                    let pw = pending_wakers.clone();
+                    loop {
+                        match reply_rx.try_recv() {
+                            Ok(value) => break Ok(value),
+                            Err(flume::TryRecvError::Disconnected) => break Err(()),
+                            Err(flume::TryRecvError::Empty) => {
+                                // Yield once: register waker, return Pending, then Ready on wake.
+                                let mut yielded = false;
+                                std::future::poll_fn(|cx| {
+                                    if yielded {
+                                        std::task::Poll::Ready(())
+                                    } else {
+                                        yielded = true;
+                                        pw.borrow_mut().push(cx.waker().clone());
+                                        std::task::Poll::Pending
+                                    }
+                                }).await;
+                                // After wake, loop back to try_recv
+                            }
+                        }
+                    }
+                };
+                let shard_responses = match shard_responses {
                     Ok(r) => r,
-                    Err(_) => {
+                    Err(()) => {
                         for (resp_idx, _, _) in &meta {
                             responses[*resp_idx] = Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed"));
                         }

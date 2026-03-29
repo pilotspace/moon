@@ -346,6 +346,7 @@ pub(crate) fn spawn_monoio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
+    pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
 ) {
     use crate::server::connection::handle_connection_sharded_monoio;
 
@@ -378,6 +379,7 @@ pub(crate) fn spawn_monoio_connection(
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
+            let pw = pending_wakers.clone();
 
             let peer_addr = tcp_stream
                 .peer_addr()
@@ -401,6 +403,7 @@ pub(crate) fn spawn_monoio_connection(
                                 notifiers, snap_tx, clk,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
+                                pw,
                             )
                             .await;
                         }
@@ -430,6 +433,7 @@ pub(crate) fn spawn_monoio_connection(
                         snap_tx, clk,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
+                        pw,
                     )
                     .await;
 
@@ -521,6 +525,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
+    pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
 ) {
     use std::os::unix::io::FromRawFd;
 
@@ -566,6 +571,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
+            let pw = pending_wakers.clone();
             let peer_addr = state.peer_addr.clone();
 
             // Build read buffer with synthetic state-restoration commands prepended
@@ -579,6 +585,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     snap_tx, clk,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
+                    pw,
                 )
                 .await;
             });
