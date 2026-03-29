@@ -28,8 +28,6 @@ use crate::runtime::{
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
-use super::shared_databases::ShardDatabases;
-
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{UringConfig, UringDriver};
 
@@ -42,9 +40,10 @@ use super::{conn_accept, persistence_tick, spsc_handler, timers};
 impl super::Shard {
     /// Run the shard event loop on its dedicated current_thread runtime.
     ///
-    /// Wraps shard databases, pubsub registry, and SPSC producers in `Rc<RefCell<...>>`
+    /// Wraps shard databases and SPSC producers in `Rc<RefCell<...>>`
     /// (safe because the runtime is single-threaded -- cooperative scheduling prevents
-    /// concurrent borrows).
+    /// concurrent borrows). PubSubRegistry uses `Arc<RwLock<>>` for cross-shard
+    /// introspection reads.
     ///
     /// Receives new connections from the listener and spawns them as local tasks.
     /// Drains SPSC consumers for cross-shard dispatch requests and PubSubFanOut.
@@ -69,7 +68,7 @@ impl super::Shard {
         server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
-        shard_databases: Arc<ShardDatabases>,
+        all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     ) {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -238,7 +237,13 @@ impl super::Shard {
         }
 
         let dispatch_tx = Rc::new(RefCell::new(producers));
-        let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
+        // Use pre-shared Arc<RwLock<PubSubRegistry>> for this shard.
+        // Initialize with shard's restored registry data (from persistence/snapshot).
+        let pubsub_arc = all_pubsub_registries[self.id].clone();
+        {
+            let mut reg = pubsub_arc.write().unwrap();
+            *reg = std::mem::take(&mut self.pubsub_registry);
+        }
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
         let shard_id = self.id;
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
@@ -328,7 +333,7 @@ impl super::Shard {
                         Ok((tcp_stream, _addr)) => {
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, false, &tls_config,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -372,11 +377,12 @@ impl super::Shard {
 
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, is_tls, &tls_config,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_rc, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_rc, &all_pubsub_registries,
+                                shard_id, num_shards, config_port,
                             );
                         }
                         Err(_) => {
@@ -389,7 +395,7 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
                         &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -408,7 +414,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -419,7 +425,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -435,7 +441,7 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
                         &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -454,7 +460,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -465,7 +471,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -563,7 +569,7 @@ impl super::Shard {
                             };
                             conn_accept::spawn_monoio_connection(
                                 std_stream, false, &tls_config,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -582,11 +588,12 @@ impl super::Shard {
                         Ok((std_tcp_stream, is_tls)) => {
                             conn_accept::spawn_monoio_connection(
                                 std_tcp_stream, is_tls, &tls_config,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_rc, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_rc, &all_pubsub_registries,
+                                shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }
@@ -601,7 +608,7 @@ impl super::Shard {
                     tracing::trace!("Shard {}: SPSC notify fired", shard_id);
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
                         &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -625,7 +632,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -636,7 +643,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -653,7 +660,7 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
                         &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -676,7 +683,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -687,7 +694,7 @@ impl super::Shard {
                         {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -764,15 +771,6 @@ impl super::Shard {
 
         // Databases now live in Arc<ShardDatabases>, no reclaim needed.
         self.databases.clear();
-        self.pubsub_registry = match Rc::try_unwrap(pubsub_rc) {
-            Ok(refcell) => refcell.into_inner(),
-            Err(_) => {
-                info!(
-                    "Shard {}: could not reclaim pubsub_registry (outstanding Rc references)",
-                    self.id
-                );
-                PubSubRegistry::new()
-            }
-        };
+        self.pubsub_registry = std::mem::take(&mut *pubsub_arc.write().unwrap());
     }
 }

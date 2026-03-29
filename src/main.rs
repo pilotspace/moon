@@ -21,7 +21,6 @@ use moon::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
 use moon::server;
 use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
-use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -173,6 +172,17 @@ fn main() -> anyhow::Result<()> {
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
 
+    // Pre-create shared pubsub registries for cross-shard introspection reads.
+    let all_pubsub_registries: Vec<
+        std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
+    > = (0..num_shards)
+        .map(|_| {
+            std::sync::Arc::new(std::sync::RwLock::new(
+                moon::pubsub::PubSubRegistry::new(),
+            ))
+        })
+        .collect();
+
     // Create and restore all shards on main thread, then extract databases
     // into centralized ShardDatabases for cross-shard direct read access.
     let mut shards: Vec<Shard> = (0..num_shards)
@@ -215,6 +225,7 @@ fn main() -> anyhow::Result<()> {
         let shard_all_notifiers = all_notifiers.clone();
         let shard_tls_config = tls_config.clone();
         let shard_dbs = shard_databases.clone();
+        let shard_pubsub_registries = all_pubsub_registries.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -244,6 +255,7 @@ fn main() -> anyhow::Result<()> {
                             shard_spsc_notify,
                             shard_all_notifiers,
                             shard_dbs,
+                            shard_pubsub_registries,
                         )
                         .await;
                 });

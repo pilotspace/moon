@@ -77,7 +77,7 @@ pub async fn handle_connection_sharded_monoio<
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    pubsub_registry: Arc<RwLock<PubSubRegistry>>,
     blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
@@ -96,6 +96,7 @@ pub async fn handle_connection_sharded_monoio<
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
     remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
@@ -217,7 +218,7 @@ pub async fn handle_connection_sharded_monoio<
                                                                 continue;
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                            pubsub_registry.borrow_mut().subscribe(channel.clone(), sub);
+                                                            pubsub_registry.write().unwrap().subscribe(channel.clone(), sub);
                                                             // Propagate subscription metadata to other shards
                                                             {
                                                                 let mut producers = dispatch_tx.borrow_mut();
@@ -246,7 +247,7 @@ pub async fn handle_connection_sharded_monoio<
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
-                                                        let removed = pubsub_registry.borrow_mut().unsubscribe_all(subscriber_id);
+                                                        let removed = pubsub_registry.write().unwrap().unsubscribe_all(subscriber_id);
                                                         // Propagate unsubscribe metadata for each removed channel
                                                         {
                                                             let mut producers = dispatch_tx.borrow_mut();
@@ -266,7 +267,7 @@ pub async fn handle_connection_sharded_monoio<
                                                             }
                                                         }
                                                         if removed.is_empty() {
-                                                            subscription_count = pubsub_registry.borrow().total_subscription_count(subscriber_id);
+                                                            subscription_count = pubsub_registry.read().unwrap().total_subscription_count(subscriber_id);
                                                             let resp = pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
@@ -287,7 +288,7 @@ pub async fn handle_connection_sharded_monoio<
                                                     } else {
                                                         for arg in cmd_args {
                                                             if let Some(channel) = extract_bytes(arg) {
-                                                                pubsub_registry.borrow_mut().unsubscribe(channel.as_ref(), subscriber_id);
+                                                                pubsub_registry.write().unwrap().unsubscribe(channel.as_ref(), subscriber_id);
                                                                 // Propagate unsubscribe metadata to other shards
                                                                 {
                                                                     let mut producers = dispatch_tx.borrow_mut();
@@ -342,7 +343,7 @@ pub async fn handle_connection_sharded_monoio<
                                                                 continue;
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                            pubsub_registry.borrow_mut().psubscribe(pattern.clone(), sub);
+                                                            pubsub_registry.write().unwrap().psubscribe(pattern.clone(), sub);
                                                             // Propagate pattern subscription metadata to other shards
                                                             {
                                                                 let mut producers = dispatch_tx.borrow_mut();
@@ -371,7 +372,7 @@ pub async fn handle_connection_sharded_monoio<
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
-                                                        let removed = pubsub_registry.borrow_mut().punsubscribe_all(subscriber_id);
+                                                        let removed = pubsub_registry.write().unwrap().punsubscribe_all(subscriber_id);
                                                         // Propagate pattern unsubscribe metadata for each removed pattern
                                                         {
                                                             let mut producers = dispatch_tx.borrow_mut();
@@ -391,7 +392,7 @@ pub async fn handle_connection_sharded_monoio<
                                                             }
                                                         }
                                                         if removed.is_empty() {
-                                                            subscription_count = pubsub_registry.borrow().total_subscription_count(subscriber_id);
+                                                            subscription_count = pubsub_registry.read().unwrap().total_subscription_count(subscriber_id);
                                                             let resp = pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
@@ -412,7 +413,7 @@ pub async fn handle_connection_sharded_monoio<
                                                     } else {
                                                         for arg in cmd_args {
                                                             if let Some(pattern) = extract_bytes(arg) {
-                                                                pubsub_registry.borrow_mut().punsubscribe(pattern.as_ref(), subscriber_id);
+                                                                pubsub_registry.write().unwrap().punsubscribe(pattern.as_ref(), subscriber_id);
                                                                 // Propagate pattern unsubscribe metadata to other shards
                                                                 {
                                                                     let mut producers = dispatch_tx.borrow_mut();
@@ -1045,7 +1046,7 @@ pub async fn handle_connection_sharded_monoio<
                     }
                     match (channel, message) {
                         (Some(ch), Some(msg)) => {
-                            let local_count = { pubsub_registry.borrow_mut().publish(&ch, &msg) };
+                            let local_count = { pubsub_registry.write().unwrap().publish(&ch, &msg) };
                             // Targeted fanout: only send to shards that have subscribers
                             let targets = remote_subscriber_map.borrow().target_shards(&ch);
                             if targets.is_empty() {
@@ -1136,9 +1137,9 @@ pub async fn handle_connection_sharded_monoio<
                         }
                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                         if is_pattern {
-                            pubsub_registry.borrow_mut().psubscribe(ch.clone(), sub);
+                            pubsub_registry.write().unwrap().psubscribe(ch.clone(), sub);
                         } else {
-                            pubsub_registry.borrow_mut().subscribe(ch.clone(), sub);
+                            pubsub_registry.write().unwrap().subscribe(ch.clone(), sub);
                         }
                         // Propagate subscription metadata to other shards
                         {
@@ -1245,7 +1246,7 @@ pub async fn handle_connection_sharded_monoio<
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
                         let channels: Vec<Bytes> =
                             cmd_args[1..].iter().filter_map(|a| extract_bytes(a)).collect();
-                        let local = { pubsub_registry.borrow().numsub(&channels) };
+                        let local = { pubsub_registry.read().unwrap().numsub(&channels) };
                         let mut reply_rxs = Vec::new();
                         {
                             let mut producers = dispatch_tx.borrow_mut();
@@ -1282,7 +1283,7 @@ pub async fn handle_connection_sharded_monoio<
                         responses.push(Frame::Array(arr));
                     }
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
-                        let local = { pubsub_registry.borrow().numpat() };
+                        let local = { pubsub_registry.read().unwrap().numpat() };
                         let mut reply_rxs = Vec::new();
                         {
                             let mut producers = dispatch_tx.borrow_mut();
@@ -1935,8 +1936,8 @@ pub async fn handle_connection_sharded_monoio<
 
     // --- Disconnect cleanup: propagate unsubscribe for all active subscriptions ---
     if subscriber_id > 0 {
-        let removed_channels = { pubsub_registry.borrow_mut().unsubscribe_all(subscriber_id) };
-        let removed_patterns = { pubsub_registry.borrow_mut().punsubscribe_all(subscriber_id) };
+        let removed_channels = { pubsub_registry.write().unwrap().unsubscribe_all(subscriber_id) };
+        let removed_patterns = { pubsub_registry.write().unwrap().punsubscribe_all(subscriber_id) };
         let mut producers = dispatch_tx.borrow_mut();
         for ch in removed_channels {
             for target in 0..num_shards {

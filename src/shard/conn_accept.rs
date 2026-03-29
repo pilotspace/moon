@@ -75,7 +75,7 @@ pub(crate) fn spawn_tokio_connection(
     tls_config: &Option<Arc<rustls::ServerConfig>>,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
@@ -91,6 +91,7 @@ pub(crate) fn spawn_tokio_connection(
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -101,7 +102,7 @@ pub(crate) fn spawn_tokio_connection(
     let rsm = remote_subscriber_map.clone();
     let sdbs = shard_databases.clone();
     let dtx = dispatch_tx.clone();
-    let psr = pubsub_rc.clone();
+    let psr = pubsub_arc.clone();
     let blk = blocking_rc.clone();
     let sd = shutdown.clone();
     let aof = aof_tx.clone();
@@ -124,6 +125,7 @@ pub(crate) fn spawn_tokio_connection(
     let scfg = server_config.clone();
     let notifiers = all_notifiers.to_vec();
     let snap_tx = snapshot_trigger_tx.clone();
+    let all_regs = all_pubsub_registries.to_vec();
     // Fail closed: if the config lock is poisoned, treat as requiring auth
     // (deny by default) rather than silently disabling authentication.
     let reqpass = match rtcfg.read() {
@@ -175,6 +177,7 @@ pub(crate) fn spawn_tokio_connection(
                         snap_tx,
                         clk,
                         rsm,
+                        all_regs,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
@@ -191,7 +194,7 @@ pub(crate) fn spawn_tokio_connection(
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
                 tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm,
+                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm, all_regs,
             )
             .await;
         });
@@ -220,7 +223,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
@@ -236,6 +239,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -260,7 +264,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
             // Clone shared state (same pattern as spawn_tokio_connection)
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
-            let psr = pubsub_rc.clone();
+            let psr = pubsub_arc.clone();
             let blk = blocking_rc.clone();
             let sd = shutdown.clone();
             let aof = aof_tx.clone();
@@ -342,7 +346,7 @@ pub(crate) fn spawn_monoio_connection(
     tls_config: &Option<Arc<rustls::ServerConfig>>,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
@@ -358,6 +362,7 @@ pub(crate) fn spawn_monoio_connection(
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
     remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -370,7 +375,7 @@ pub(crate) fn spawn_monoio_connection(
             let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
-            let psr = pubsub_rc.clone();
+            let psr = pubsub_arc.clone();
             let blk = blocking_rc.clone();
             let sd = shutdown.clone();
             let aof = aof_tx.clone();
@@ -396,6 +401,7 @@ pub(crate) fn spawn_monoio_connection(
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
             let pw = pending_wakers.clone();
+            let all_regs = all_pubsub_registries.to_vec();
 
             let peer_addr = tcp_stream
                 .peer_addr()
@@ -439,6 +445,7 @@ pub(crate) fn spawn_monoio_connection(
                                 snap_tx,
                                 clk,
                                 rsm,
+                                all_regs,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
@@ -492,6 +499,7 @@ pub(crate) fn spawn_monoio_connection(
                         snap_tx,
                         clk,
                         rsm,
+                        all_regs,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
@@ -569,7 +577,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
@@ -608,7 +616,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
         Ok(tcp_stream) => {
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
-            let psr = pubsub_rc.clone();
+            let psr = pubsub_arc.clone();
             let blk = blocking_rc.clone();
             let sd = shutdown.clone();
             let aof = aof_tx.clone();
