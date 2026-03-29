@@ -727,10 +727,10 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::PubSubPublish {
             channel,
             message,
-            reply_tx,
+            slot,
         } => {
             let count = pubsub_registry.publish(&channel, &message);
-            let _ = reply_tx.send(count);
+            slot.add(count);
         }
         ShardMessage::PubSubIntrospect { query, reply_tx } => {
             use super::dispatch::{PubSubQuery, PubSubQueryResult};

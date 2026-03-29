@@ -1052,29 +1052,34 @@ pub async fn handle_connection_sharded_monoio<
                                 // Fast path: no remote subscribers
                                 responses.push(Frame::Integer(local_count));
                             } else {
-                                let mut reply_rxs = Vec::with_capacity(targets.len());
-                                {
-                                    let mut producers = dispatch_tx.borrow_mut();
-                                    for target in targets {
-                                        if target == shard_id { continue; }
-                                        let (tx, rx) = channel::oneshot();
-                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                        let publish_msg = ShardMessage::PubSubPublish {
-                                            channel: ch.clone(),
-                                            message: msg.clone(),
-                                            reply_tx: tx,
-                                        };
-                                        if producers[idx].try_push(publish_msg).is_ok() {
-                                            spsc_notifiers[target].notify_one();
-                                            reply_rxs.push(rx);
+                                let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != shard_id).collect();
+                                if remote_targets.is_empty() {
+                                    responses.push(Frame::Integer(local_count));
+                                } else {
+                                    let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(remote_targets.len() as u32));
+                                    {
+                                        let mut producers = dispatch_tx.borrow_mut();
+                                        for target in &remote_targets {
+                                            let idx = ChannelMesh::target_index(shard_id, *target);
+                                            let publish_msg = ShardMessage::PubSubPublish {
+                                                channel: ch.clone(),
+                                                message: msg.clone(),
+                                                slot: slot.clone(),
+                                            };
+                                            if producers[idx].try_push(publish_msg).is_ok() {
+                                                spsc_notifiers[*target].notify_one();
+                                            } else {
+                                                slot.add(0);
+                                            }
                                         }
                                     }
+                                    // Monoio: spin-yield for slot completion
+                                    while !slot.is_ready() {
+                                        monoio::time::sleep(std::time::Duration::from_micros(1)).await;
+                                    }
+                                    let total = local_count + slot.get();
+                                    responses.push(Frame::Integer(total));
                                 }
-                                let mut total = local_count;
-                                for rx in reply_rxs {
-                                    if let Ok(count) = rx.recv().await { total += count; }
-                                }
-                                responses.push(Frame::Integer(total));
                             }
                         }
                         _ => responses.push(Frame::Error(Bytes::from_static(

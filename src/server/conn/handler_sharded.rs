@@ -610,7 +610,7 @@ pub async fn handle_connection_sharded_inner<
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>> = HashMap::with_capacity(num_shards);
                 // Deferred PUBLISH replies: (response_index, receivers) — resolved after batch
-                let mut deferred_publish_replies: Vec<(usize, Vec<channel::OneshotReceiver<i64>>)> = Vec::new();
+                let mut deferred_publish_replies: Vec<(usize, std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>)> = Vec::new();
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -1106,29 +1106,32 @@ pub async fn handle_connection_sharded_inner<
                                         // Fast path: no remote subscribers, return local count immediately
                                         responses.push(Frame::Integer(local_count));
                                     } else {
-                                        // Send PubSubPublish only to targeted shards, defer await
-                                        let mut reply_rxs = Vec::with_capacity(targets.len());
-                                        {
-                                            let mut producers = dispatch_tx.borrow_mut();
-                                            for target in targets {
-                                                if target == shard_id { continue; }
-                                                let (tx, rx) = channel::oneshot();
-                                                let idx = ChannelMesh::target_index(shard_id, target);
-                                                let publish_msg = ShardMessage::PubSubPublish {
-                                                    channel: ch.clone(),
-                                                    message: msg.clone(),
-                                                    reply_tx: tx,
-                                                };
-                                                if producers[idx].try_push(publish_msg).is_ok() {
-                                                    spsc_notifiers[target].notify_one();
-                                                    reply_rxs.push(rx);
+                                        // Filter to remote targets only (skip self)
+                                        let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != shard_id).collect();
+                                        if remote_targets.is_empty() {
+                                            responses.push(Frame::Integer(local_count));
+                                        } else {
+                                            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(remote_targets.len() as u32));
+                                            {
+                                                let mut producers = dispatch_tx.borrow_mut();
+                                                for target in &remote_targets {
+                                                    let idx = ChannelMesh::target_index(shard_id, *target);
+                                                    let publish_msg = ShardMessage::PubSubPublish {
+                                                        channel: ch.clone(),
+                                                        message: msg.clone(),
+                                                        slot: slot.clone(),
+                                                    };
+                                                    if producers[idx].try_push(publish_msg).is_ok() {
+                                                        spsc_notifiers[*target].notify_one();
+                                                    } else {
+                                                        // Push failed -- this shard won't respond, decrement pending
+                                                        slot.add(0);
+                                                    }
                                                 }
                                             }
-                                        }
-                                        let resp_idx = responses.len();
-                                        responses.push(Frame::Integer(local_count));
-                                        if !reply_rxs.is_empty() {
-                                            deferred_publish_replies.push((resp_idx, reply_rxs));
+                                            let resp_idx = responses.len();
+                                            responses.push(Frame::Integer(local_count));
+                                            deferred_publish_replies.push((resp_idx, slot));
                                         }
                                     }
                                 }
@@ -1556,11 +1559,12 @@ pub async fn handle_connection_sharded_inner<
 
                 // Phase 3: Resolve deferred PUBLISH cross-shard replies (batched for pipeline efficiency)
                 if !deferred_publish_replies.is_empty() {
-                    for (resp_idx, rxs) in deferred_publish_replies.drain(..) {
-                        let mut extra = 0i64;
-                        for rx in rxs {
-                            if let Ok(count) = rx.await { extra += count; }
+                    for (resp_idx, slot) in deferred_publish_replies.drain(..) {
+                        // Spin-yield for all shards to respond (typically < 1us)
+                        while !slot.is_ready() {
+                            tokio::task::yield_now().await;
                         }
+                        let extra = slot.get();
                         if extra > 0 {
                             if let Frame::Integer(ref mut total) = responses[resp_idx] { *total += extra; }
                         }
