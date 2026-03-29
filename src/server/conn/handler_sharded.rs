@@ -266,7 +266,7 @@ pub async fn handle_connection_sharded_inner<
     // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
     // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
     let mut affinity_tracker = if num_shards > 1 && can_migrate {
-        Some(AffinityTracker::new(shard_id))
+        Some(AffinityTracker::new(shard_id, num_shards))
     } else {
         None
     };
@@ -305,7 +305,7 @@ pub async fn handle_connection_sharded_inner<
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>> = HashMap::with_capacity(num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>> = HashMap::with_capacity(num_shards);
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -905,17 +905,17 @@ pub async fn handle_connection_sharded_inner<
                         // Using read_db for local reads eliminates RwLock contention with
                         // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
-                            // WRITE PATH: eviction + exclusive lock + dispatch + wakeup
+                            // WRITE PATH: single lock acquisition for eviction + dispatch
                             let rt = runtime_config.read().unwrap();
-                            let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
-                            if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
-                                drop(guard_ev);
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
+                                drop(guard);
+                                drop(rt);
                                 responses.push(oom_frame);
                                 continue;
                             }
-                            drop(guard_ev);
+                            drop(rt);
 
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
                             let db_count = shard_databases.db_count();
                             guard.refresh_now_from_cache(&cached_clock);
                             let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
@@ -1006,17 +1006,22 @@ pub async fn handle_connection_sharded_inner<
                         // Cross-shard write: deferred SPSC dispatch (unchanged)
                         let resp_idx = responses.len();
                         responses.push(Frame::Null);
-                        let cmd_name = cmd.to_vec();
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_name));
+                        // Zero-copy: extract Bytes from frame's first element (refcount bump, no alloc).
+                        let cmd_bytes = if let Frame::Array(ref args) = frame {
+                            extract_bytes(&args[0]).unwrap_or_default()
+                        } else {
+                            Bytes::new()
+                        };
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes));
                     }
                 }
 
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, usize)> = Vec::with_capacity(remote_groups.len());
+                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_ptr = response_pool.slot_ptr(target);
-                        let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
+                        let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: slot_ptr };
                         let target_idx = ChannelMesh::target_index(shard_id, target);

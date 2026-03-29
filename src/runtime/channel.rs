@@ -5,7 +5,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::task::{Context, Poll};
 
 // --- mpsc ---
@@ -121,7 +122,7 @@ pub struct WatchSender<T> {
 }
 impl<T: Clone> WatchSender<T> {
     pub fn send(&self, value: T) -> Result<(), ()> {
-        *self.shared.lock().unwrap() = value;
+        *self.shared.lock() = value;
         let _ = self.notify_tx.try_send(());
         Ok(())
     }
@@ -137,7 +138,7 @@ impl<T: Clone> WatchReceiver<T> {
         self.notify_rx.recv_async().await.map_err(|_| ())
     }
     pub fn borrow(&self) -> T {
-        self.shared.lock().unwrap().clone()
+        self.shared.lock().clone()
     }
 }
 

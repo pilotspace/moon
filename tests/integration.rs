@@ -2491,7 +2491,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
 
         let listener_cancel = cancel.clone();
         listener_rt.block_on(async {
-            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel).await {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, false).await {
                 eprintln!("Listener error: {}", e);
             }
         });
@@ -3595,7 +3595,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
 
         let listener_cancel = cancel.clone();
         listener_rt.block_on(async {
-            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel).await {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, false).await {
                 eprintln!("Listener error: {}", e);
             }
         });

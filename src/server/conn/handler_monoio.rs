@@ -148,9 +148,9 @@ pub async fn handle_connection_sharded_monoio<
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
     let mut remote_groups: HashMap<
         usize,
-        Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Vec<u8>)>,
+        Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>,
     > = HashMap::with_capacity(num_shards);
-    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, usize)> =
+    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> =
         Vec::with_capacity(num_shards);
 
     // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
@@ -163,7 +163,7 @@ pub async fn handle_connection_sharded_monoio<
     // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
     // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
     let mut affinity_tracker = if num_shards > 1 && can_migrate {
-        Some(AffinityTracker::new(shard_id))
+        Some(AffinityTracker::new(shard_id, num_shards))
     } else {
         None
     };
@@ -1323,17 +1323,17 @@ pub async fn handle_connection_sharded_monoio<
                 // Using read_db for local reads eliminates RwLock contention with
                 // cross-shard shared reads from other shard threads.
                 if metadata::is_write(cmd) {
-                    // WRITE PATH: eviction check + exclusive lock + dispatch + wakeup
+                    // WRITE PATH: single lock acquisition for eviction + dispatch
                     let rt = runtime_config.read().unwrap();
-                    let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
-                    if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
-                        drop(guard_ev);
+                    let mut guard = shard_databases.write_db(shard_id, selected_db);
+                    if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
+                        drop(guard);
+                        drop(rt);
                         responses.push(oom_frame);
                         continue;
                     }
-                    drop(guard_ev);
+                    drop(rt);
 
-                    let mut guard = shard_databases.write_db(shard_id, selected_db);
                     let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
 
                     let response = match result {
@@ -1477,12 +1477,17 @@ pub async fn handle_connection_sharded_monoio<
                 } else {
                     None
                 };
-                let cmd_name = cmd.to_vec();
+                // Zero-copy: extract Bytes from frame's first element (refcount bump, no alloc).
+                let cmd_bytes = if let Frame::Array(ref args) = frame {
+                    extract_bytes(&args[0]).unwrap_or_default()
+                } else {
+                    Bytes::new()
+                };
                 remote_groups.entry(target).or_default().push((
                     resp_idx,
                     std::sync::Arc::new(frame),
                     aof_bytes,
-                    cmd_name,
+                    cmd_bytes,
                 ));
             }
         }
@@ -1493,13 +1498,13 @@ pub async fn handle_connection_sharded_monoio<
             reply_futures.clear();
 
             let mut oneshot_futures: Vec<(
-                Vec<(usize, Option<Bytes>, Vec<u8>)>,
+                Vec<(usize, Option<Bytes>, Bytes)>,
                 channel::OneshotReceiver<Vec<Frame>>,
             )> = Vec::new();
             for (target, entries) in remote_groups.drain() {
                 let (reply_tx, reply_rx) = channel::oneshot();
                 let (meta, commands): (
-                    Vec<(usize, Option<Bytes>, Vec<u8>)>,
+                    Vec<(usize, Option<Bytes>, Bytes)>,
                     Vec<std::sync::Arc<Frame>>,
                 ) = entries
                     .into_iter()

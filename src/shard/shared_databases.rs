@@ -39,20 +39,31 @@ impl ShardDatabases {
 
     /// Acquire an exclusive write lock on a specific database.
     ///
-    /// Uses `try_write()` with spin-hint loop instead of blocking `write()`.
-    /// This is critical for single-threaded async runtimes (monoio): blocking
-    /// `write()` would freeze the entire shard thread while waiting for
-    /// cross-shard readers to release their read locks.
+    /// Fast path: bounded spin with `try_write()` for the common case where
+    /// cross-shard read locks are held briefly (~51ns for DashTable lookup).
+    /// Slow path: falls back to blocking `write()` (OS-level parking) to avoid
+    /// infinite busy-spin when readers hold locks longer (e.g., KEYS, SCAN).
     #[inline]
     pub fn write_db(&self, shard_id: usize, db_index: usize) -> RwLockWriteGuard<'_, Database> {
-        loop {
+        // Spin briefly — resolves in 1-3 iterations for typical cross-shard reads.
+        for _ in 0..32 {
             if let Some(guard) = self.shards[shard_id][db_index].try_write() {
                 return guard;
             }
-            // Brief spin hint — cross-shard read locks are held for ~51ns (DashTable lookup),
-            // so contention resolves within a few iterations.
             std::hint::spin_loop();
         }
+        // Slow path: park the thread via OS futex instead of busy-spinning.
+        self.shards[shard_id][db_index].write()
+    }
+
+    /// Non-blocking write lock attempt for async callers that can yield.
+    #[inline]
+    pub fn try_write_db(
+        &self,
+        shard_id: usize,
+        db_index: usize,
+    ) -> Option<RwLockWriteGuard<'_, Database>> {
+        self.shards[shard_id][db_index].try_write()
     }
 
     /// Total number of shards.
