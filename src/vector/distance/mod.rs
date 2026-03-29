@@ -6,6 +6,11 @@
 
 pub mod scalar;
 
+#[cfg(target_arch = "x86_64")]
+pub mod avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod avx512;
+
 use std::sync::OnceLock;
 
 /// Static dispatch table for distance kernels.
