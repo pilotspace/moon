@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+
 use bytes::Bytes;
 use xxhash_rust::xxh64::xxh64;
 
@@ -17,6 +19,47 @@ pub struct ResponseSlotPtr(pub *const ResponseSlot);
 // The pointer remains valid for the lifetime of the connection's ResponseSlotPool,
 // which outlives all dispatched ShardMessage values.
 unsafe impl Send for ResponseSlotPtr {}
+
+/// Lock-free response slot for accumulating cross-shard PUBLISH subscriber counts.
+///
+/// Instead of N-1 oneshot channels (one per target shard), a single `Arc<PubSubResponseSlot>`
+/// is shared. Each shard atomically adds its local subscriber count. The connection handler
+/// spins on `remaining` reaching zero, then reads the total.
+pub struct PubSubResponseSlot {
+    /// Accumulated subscriber count from all remote shards.
+    total: AtomicI64,
+    /// Number of shards that haven't responded yet.
+    remaining: AtomicU32,
+}
+
+impl PubSubResponseSlot {
+    /// Create a new slot expecting `num_pending` shard responses.
+    pub fn new(num_pending: u32) -> Self {
+        Self {
+            total: AtomicI64::new(0),
+            remaining: AtomicU32::new(num_pending),
+        }
+    }
+
+    /// Called by SPSC handler: add this shard's subscriber count and decrement remaining.
+    #[inline]
+    pub fn add(&self, count: i64) {
+        self.total.fetch_add(count, Ordering::Relaxed);
+        self.remaining.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Called by connection handler: check if all shards have responded.
+    #[inline]
+    pub fn is_ready(&self) -> bool {
+        self.remaining.load(Ordering::Acquire) == 0
+    }
+
+    /// Called by connection handler after `is_ready()` returns true: get the accumulated total.
+    #[inline]
+    pub fn get(&self) -> i64 {
+        self.total.load(Ordering::Relaxed)
+    }
+}
 
 const HASH_SEED: u64 = 0;
 
@@ -155,11 +198,11 @@ pub enum ShardMessage {
         channel: Bytes,
         is_pattern: bool,
     },
-    /// Cross-shard PUBLISH with reply for accurate subscriber count.
+    /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
     PubSubPublish {
         channel: Bytes,
         message: Bytes,
-        reply_tx: channel::OneshotSender<i64>,
+        slot: std::sync::Arc<PubSubResponseSlot>,
     },
     /// Cross-shard PUBSUB introspection query with reply.
     PubSubIntrospect {
