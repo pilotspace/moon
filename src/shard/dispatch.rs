@@ -102,7 +102,10 @@ impl PubSubResponseFuture {
 impl std::future::Future for PubSubResponseFuture {
     type Output = i64;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<i64> {
         self.slot.poll_ready(cx)
     }
 }

@@ -21,6 +21,7 @@ use moon::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
 use moon::server;
 use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
+use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -365,7 +366,16 @@ fn main() -> anyhow::Result<()> {
                 info!("Cluster bus and gossip ticker started");
             }
 
-            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel, affinity_tracker).await {
+            let per_shard_accept = cfg!(target_os = "linux");
+            if let Err(e) = server::listener::run_sharded(
+                config,
+                conn_txs,
+                listener_cancel,
+                per_shard_accept,
+                affinity_tracker,
+            )
+            .await
+            {
                 tracing::error!("Listener error: {}", e);
             }
         });
@@ -403,7 +413,15 @@ fn main() -> anyhow::Result<()> {
 
         let per_shard_accept = cfg!(target_os = "linux");
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
-            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel, affinity_tracker).await {
+            if let Err(e) = server::listener::run_sharded(
+                config,
+                conn_txs,
+                listener_cancel,
+                per_shard_accept,
+                affinity_tracker,
+            )
+            .await
+            {
                 tracing::error!("Listener error: {}", e);
             }
         });

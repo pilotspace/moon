@@ -31,9 +31,10 @@ use crate::tracking::TrackingTable;
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{UringConfig, UringDriver};
 
-use super::dispatch::ShardMessage;
 use super::affinity::AffinityTracker;
+use super::dispatch::ShardMessage;
 use super::remote_subscriber_map::RemoteSubscriberMap;
+use super::shared_databases::ShardDatabases;
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use super::uring_handler;
 use super::{conn_accept, persistence_tick, spsc_handler, timers};
@@ -69,6 +70,7 @@ impl super::Shard {
         server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
+        shard_databases: Arc<ShardDatabases>,
         all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
         all_remote_sub_maps: Vec<Arc<RwLock<RemoteSubscriberMap>>>,
         affinity_tracker: Arc<RwLock<AffinityTracker>>,
@@ -340,7 +342,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                             );
                         }
                         Err(e) => {
@@ -423,7 +427,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                             );
                         }
                         #[cfg(feature = "runtime-monoio")]
@@ -469,7 +475,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                             );
                         }
                         #[cfg(feature = "runtime-monoio")]
@@ -643,7 +651,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                             );
                         }
                         #[cfg(feature = "runtime-monoio")]
@@ -694,7 +704,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                             );
                         }
                         #[cfg(feature = "runtime-monoio")]

@@ -99,7 +99,7 @@ pub async fn handle_connection_sharded(
     remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
-    affinity_tracker: Arc<RwLock<crate::shard::affinity::AffinityTracker>>,
+    pubsub_affinity: Arc<RwLock<crate::shard::affinity::AffinityTracker>>,
 ) {
     let peer_addr = stream
         .peer_addr()
@@ -133,6 +133,7 @@ pub async fn handle_connection_sharded(
         remote_subscriber_map,
         all_pubsub_registries,
         all_remote_sub_maps,
+        pubsub_affinity,
         true, // can_migrate: plain TCP supports FD extraction
         BytesMut::new(),
         None, // fresh connection, no migrated state
@@ -253,7 +254,7 @@ pub async fn handle_connection_sharded_inner<
     remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
-    affinity_tracker: Arc<RwLock<AffinityTracker>>,
+    pubsub_affinity: Arc<RwLock<crate::shard::affinity::AffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
@@ -363,7 +364,7 @@ pub async fn handle_connection_sharded_inner<
                                                 // Register pub/sub affinity for this client IP
                                                 if subscription_count == 1 {
                                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                        affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                        pubsub_affinity.write().unwrap().register(addr.ip(), shard_id);
                                                     }
                                                 }
                                                 // Direct shared-write: propagate subscription to all shards' remote subscriber maps
@@ -401,7 +402,7 @@ pub async fn handle_connection_sharded_inner<
                                                 // Register pub/sub affinity for this client IP
                                                 if subscription_count == 1 {
                                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                        affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                        pubsub_affinity.write().unwrap().register(addr.ip(), shard_id);
                                                     }
                                                 }
                                                 // Direct shared-write: propagate pattern subscription to all shards' remote subscriber maps
@@ -520,7 +521,7 @@ pub async fn handle_connection_sharded_inner<
                                 if subscription_count == 0 { break; }
                             }
                             Ok(None) => break,
-                            Err(_) => { return; }
+                            Err(_) => { return (HandlerResult::Done, None); }
                         }
                     }
                     if sub_break { break; }
@@ -1126,7 +1127,7 @@ pub async fn handle_connection_sharded_inner<
                                     crate::protocol::serialize(resp, &mut write_buf);
                                 }
                             }
-                            if stream.write_all(&write_buf).await.is_err() { return; }
+                            if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
                             responses.clear();
                         }
                         // Process subscribe arguments
@@ -1137,7 +1138,7 @@ pub async fn handle_connection_sharded_inner<
                                     write_buf.clear();
                                     let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                     crate::protocol::serialize(&err, &mut write_buf);
-                                    if stream.write_all(&write_buf).await.is_err() { return; }
+                                    if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
                                     continue;
                                 }
                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
@@ -1150,7 +1151,7 @@ pub async fn handle_connection_sharded_inner<
                                 // Register pub/sub affinity for this client IP
                                 if subscription_count == 1 {
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                        affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                        pubsub_affinity.write().unwrap().register(addr.ip(), shard_id);
                                     }
                                 }
                                 // Direct shared-write: propagate subscription to all shards' remote subscriber maps
@@ -1165,7 +1166,7 @@ pub async fn handle_connection_sharded_inner<
                                     pubsub::subscribe_response(&ch, subscription_count)
                                 };
                                 crate::protocol::serialize(&resp, &mut write_buf);
-                                if stream.write_all(&write_buf).await.is_err() { return; }
+                                if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
                             }
                         }
                         break; // break out of frame batch loop to re-enter main loop in subscriber mode
@@ -1591,7 +1592,7 @@ pub async fn handle_connection_sharded_inner<
         }
         // Remove affinity on disconnect (no subscriptions remain)
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-            affinity_tracker.write().unwrap().remove(&addr.ip());
+            pubsub_affinity.write().unwrap().remove(&addr.ip());
         }
     }
 

@@ -272,6 +272,10 @@ pub(crate) fn spawn_migrated_tokio_connection(
     match tokio::net::TcpStream::from_std(std_stream) {
         Ok(tcp_stream) => {
             // Clone shared state (same pattern as spawn_tokio_connection)
+            let rsm = remote_subscriber_map.clone();
+            let all_regs = all_pubsub_registries.to_vec();
+            let all_rsm = all_remote_sub_maps.to_vec();
+            let aff = affinity_tracker.clone();
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
             let psr = pubsub_arc.clone();
@@ -331,6 +335,10 @@ pub(crate) fn spawn_migrated_tokio_connection(
                     notifiers,
                     snap_tx,
                     clk,
+                    rsm,
+                    all_regs,
+                    all_rsm,
+                    aff,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     Some(&state),

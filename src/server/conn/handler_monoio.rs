@@ -1096,7 +1096,10 @@ pub async fn handle_connection_sharded_monoio<
                         // Register pub/sub affinity for this client IP
                         if subscription_count == 1 {
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                affinity_tracker
+                                    .write()
+                                    .unwrap()
+                                    .register(addr.ip(), shard_id);
                             }
                         }
                         let resp = if is_pattern {
@@ -1581,7 +1584,10 @@ pub async fn handle_connection_sharded_monoio<
                 // current pipeline batch, we must NOT take the fast path -- the read would
                 // execute before the deferred writes, violating command ordering. Fall through
                 // to SPSC dispatch to preserve pipeline semantics.
-                if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) && is_dispatch_read_supported(cmd) {
+                if !metadata::is_write(cmd)
+                    && !remote_groups.contains_key(&target)
+                    && is_dispatch_read_supported(cmd)
+                {
                     let guard = shard_databases.read_db(target, selected_db);
                     let now_ms = cached_clock.ms();
                     let result =
