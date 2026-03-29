@@ -242,7 +242,7 @@ impl super::Shard {
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
         let shard_id = self.id;
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
-        let mut remote_sub_map = RemoteSubscriberMap::new();
+        let remote_sub_map_rc = Rc::new(RefCell::new(RemoteSubscriberMap::new()));
         let num_shards = self.num_shards;
 
         // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
@@ -376,7 +376,7 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_rc, shard_id, num_shards, config_port,
                             );
                         }
                         Err(_) => {
@@ -390,7 +390,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
-                        &mut remote_sub_map, &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
@@ -436,7 +436,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
-                        &mut remote_sub_map, &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
@@ -586,7 +586,7 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_rc, shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }
@@ -602,7 +602,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
-                        &mut remote_sub_map, &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
@@ -654,7 +654,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
-                        &mut remote_sub_map, &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut *remote_sub_map_rc.borrow_mut(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,

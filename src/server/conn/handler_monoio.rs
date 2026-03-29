@@ -95,6 +95,7 @@ pub async fn handle_connection_sharded_monoio<
     spsc_notifiers: Vec<Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
+    remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
@@ -1045,33 +1046,36 @@ pub async fn handle_connection_sharded_monoio<
                     match (channel, message) {
                         (Some(ch), Some(msg)) => {
                             let local_count = { pubsub_registry.borrow_mut().publish(&ch, &msg) };
-                            let mut reply_rxs = Vec::new();
-                            {
-                                let mut producers = dispatch_tx.borrow_mut();
-                                for target in 0..num_shards {
-                                    if target == shard_id {
-                                        continue;
-                                    }
-                                    let (tx, rx) = channel::oneshot();
-                                    let idx = ChannelMesh::target_index(shard_id, target);
-                                    let publish_msg = ShardMessage::PubSubPublish {
-                                        channel: ch.clone(),
-                                        message: msg.clone(),
-                                        reply_tx: tx,
-                                    };
-                                    if producers[idx].try_push(publish_msg).is_ok() {
-                                        spsc_notifiers[target].notify_one();
-                                        reply_rxs.push(rx);
+                            // Targeted fanout: only send to shards that have subscribers
+                            let targets = remote_subscriber_map.borrow().target_shards(&ch);
+                            if targets.is_empty() {
+                                // Fast path: no remote subscribers
+                                responses.push(Frame::Integer(local_count));
+                            } else {
+                                let mut reply_rxs = Vec::with_capacity(targets.len());
+                                {
+                                    let mut producers = dispatch_tx.borrow_mut();
+                                    for target in targets {
+                                        if target == shard_id { continue; }
+                                        let (tx, rx) = channel::oneshot();
+                                        let idx = ChannelMesh::target_index(shard_id, target);
+                                        let publish_msg = ShardMessage::PubSubPublish {
+                                            channel: ch.clone(),
+                                            message: msg.clone(),
+                                            reply_tx: tx,
+                                        };
+                                        if producers[idx].try_push(publish_msg).is_ok() {
+                                            spsc_notifiers[target].notify_one();
+                                            reply_rxs.push(rx);
+                                        }
                                     }
                                 }
-                            }
-                            let mut total = local_count;
-                            for rx in reply_rxs {
-                                if let Ok(count) = rx.recv().await {
-                                    total += count;
+                                let mut total = local_count;
+                                for rx in reply_rxs {
+                                    if let Ok(count) = rx.recv().await { total += count; }
                                 }
+                                responses.push(Frame::Integer(total));
                             }
-                            responses.push(Frame::Integer(total));
                         }
                         _ => responses.push(Frame::Error(Bytes::from_static(
                             b"ERR invalid channel or message",

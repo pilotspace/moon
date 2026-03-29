@@ -96,6 +96,7 @@ pub async fn handle_connection_sharded(
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
+    remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
 ) {
     let peer_addr = stream
         .peer_addr()
@@ -126,6 +127,7 @@ pub async fn handle_connection_sharded(
         spsc_notifiers.clone(),
         snapshot_trigger_tx,
         cached_clock,
+        remote_subscriber_map,
         true, // can_migrate: plain TCP supports FD extraction
         BytesMut::new(),
         None, // fresh connection, no migrated state
@@ -243,6 +245,7 @@ pub async fn handle_connection_sharded_inner<
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
+    remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
@@ -606,6 +609,8 @@ pub async fn handle_connection_sharded_inner<
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>> = HashMap::with_capacity(num_shards);
+                // Deferred PUBLISH replies: (response_index, receivers) — resolved after batch
+                let mut deferred_publish_replies: Vec<(usize, Vec<channel::OneshotReceiver<i64>>)> = Vec::new();
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -1095,33 +1100,37 @@ pub async fn handle_connection_sharded_inner<
                             match (channel_arg, message_arg) {
                                 (Some(ch), Some(msg)) => {
                                     let local_count = { pubsub_registry.borrow_mut().publish(&ch, &msg) };
-                                    // Send to other shards with reply channels for accurate count
-                                    let mut reply_rxs = Vec::new();
-                                    {
-                                        let mut producers = dispatch_tx.borrow_mut();
-                                        for target in 0..num_shards {
-                                            if target == shard_id { continue; }
-                                            let (tx, rx) = channel::oneshot();
-                                            let idx = ChannelMesh::target_index(shard_id, target);
-                                            let publish_msg = ShardMessage::PubSubPublish {
-                                                channel: ch.clone(),
-                                                message: msg.clone(),
-                                                reply_tx: tx,
-                                            };
-                                            if producers[idx].try_push(publish_msg).is_ok() {
-                                                spsc_notifiers[target].notify_one();
-                                                reply_rxs.push(rx);
+                                    // Targeted fanout: only send to shards that have subscribers
+                                    let targets = remote_subscriber_map.borrow().target_shards(&ch);
+                                    if targets.is_empty() {
+                                        // Fast path: no remote subscribers, return local count immediately
+                                        responses.push(Frame::Integer(local_count));
+                                    } else {
+                                        // Send PubSubPublish only to targeted shards, defer await
+                                        let mut reply_rxs = Vec::with_capacity(targets.len());
+                                        {
+                                            let mut producers = dispatch_tx.borrow_mut();
+                                            for target in targets {
+                                                if target == shard_id { continue; }
+                                                let (tx, rx) = channel::oneshot();
+                                                let idx = ChannelMesh::target_index(shard_id, target);
+                                                let publish_msg = ShardMessage::PubSubPublish {
+                                                    channel: ch.clone(),
+                                                    message: msg.clone(),
+                                                    reply_tx: tx,
+                                                };
+                                                if producers[idx].try_push(publish_msg).is_ok() {
+                                                    spsc_notifiers[target].notify_one();
+                                                    reply_rxs.push(rx);
+                                                }
                                             }
                                         }
-                                    }
-                                    // Await all replies (PUBLISH is not latency-critical)
-                                    let mut total = local_count;
-                                    for rx in reply_rxs {
-                                        if let Ok(count) = rx.await {
-                                            total += count;
+                                        let resp_idx = responses.len();
+                                        responses.push(Frame::Integer(local_count));
+                                        if !reply_rxs.is_empty() {
+                                            deferred_publish_replies.push((resp_idx, reply_rxs));
                                         }
                                     }
-                                    responses.push(Frame::Integer(total));
                                 }
                                 _ => responses.push(Frame::Error(Bytes::from_static(b"ERR invalid channel or message"))),
                             }
@@ -1541,6 +1550,19 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                             responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                        }
+                    }
+                }
+
+                // Phase 3: Resolve deferred PUBLISH cross-shard replies (batched for pipeline efficiency)
+                if !deferred_publish_replies.is_empty() {
+                    for (resp_idx, rxs) in deferred_publish_replies.drain(..) {
+                        let mut extra = 0i64;
+                        for rx in rxs {
+                            if let Ok(count) = rx.await { extra += count; }
+                        }
+                        if extra > 0 {
+                            if let Frame::Integer(ref mut total) = responses[resp_idx] { *total += extra; }
                         }
                     }
                 }

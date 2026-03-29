@@ -22,6 +22,7 @@ use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
 use super::dispatch::ShardMessage;
+use super::remote_subscriber_map::RemoteSubscriberMap;
 use super::shared_databases::ShardDatabases;
 
 /// Create a SO_REUSEPORT TCP listener socket using socket2.
@@ -89,6 +90,7 @@ pub(crate) fn spawn_tokio_connection(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -96,6 +98,7 @@ pub(crate) fn spawn_tokio_connection(
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
 
+    let rsm = remote_subscriber_map.clone();
     let sdbs = shard_databases.clone();
     let dtx = dispatch_tx.clone();
     let psr = pubsub_rc.clone();
@@ -171,6 +174,7 @@ pub(crate) fn spawn_tokio_connection(
                         notifiers,
                         snap_tx,
                         clk,
+                        rsm,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
@@ -187,7 +191,7 @@ pub(crate) fn spawn_tokio_connection(
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
                 tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk,
+                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm,
             )
             .await;
         });
@@ -231,6 +235,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -352,6 +357,7 @@ pub(crate) fn spawn_monoio_connection(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -361,6 +367,7 @@ pub(crate) fn spawn_monoio_connection(
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
+            let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
             let psr = pubsub_rc.clone();
@@ -431,6 +438,7 @@ pub(crate) fn spawn_monoio_connection(
                                 notifiers,
                                 snap_tx,
                                 clk,
+                                rsm,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
@@ -483,6 +491,7 @@ pub(crate) fn spawn_monoio_connection(
                         notifiers,
                         snap_tx,
                         clk,
+                        rsm,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
