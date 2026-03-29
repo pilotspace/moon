@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod conn_accept;
 pub mod coordinator;
 pub mod dispatch;
