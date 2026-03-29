@@ -122,7 +122,7 @@ pub(crate) fn drain_spsc_shared(
         }
     }
 
-    // Process other messages (PubSubFanOut, SnapshotBegin, etc.)
+    // Process other messages (PubSubPublish, SnapshotBegin, etc.)
     for msg in other_messages {
         handle_shard_message_shared(
             shard_databases,
@@ -702,9 +702,6 @@ pub(crate) fn handle_shard_message_shared(
             let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
         }
-        ShardMessage::PubSubFanOut { channel, message } => {
-            pubsub_registry.publish(&channel, &message);
-        }
         ShardMessage::PubSubPublish {
             channel,
             message,
@@ -713,16 +710,12 @@ pub(crate) fn handle_shard_message_shared(
             let count = pubsub_registry.publish(&channel, &message);
             slot.add(count);
         }
-        ShardMessage::PubSubPublishBatch {
-            pairs,
-            slot,
-            counts,
-        } => {
+        ShardMessage::PubSubPublishBatch { pairs, slot } => {
             let mut batch_total: i64 = 0;
             for (i, (channel, message)) in pairs.iter().enumerate() {
                 let count = pubsub_registry.publish(channel, message);
-                if i < counts.len() {
-                    counts[i].store(count, std::sync::atomic::Ordering::Relaxed);
+                if i < slot.counts.len() {
+                    slot.counts[i].store(count, std::sync::atomic::Ordering::Relaxed);
                 }
                 batch_total += count;
             }

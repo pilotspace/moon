@@ -150,9 +150,11 @@ mod tests {
 
         let rb = HeapRb::new(64);
         let (mut prod, cons) = rb.split();
-        prod.try_push(ShardMessage::PubSubFanOut {
+        let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(0));
+        prod.try_push(ShardMessage::PubSubPublish {
             channel: Bytes::from_static(b"news"),
             message: Bytes::from_static(b"hello from shard 1"),
+            slot,
         })
         .ok()
         .expect("push should succeed");
@@ -204,9 +206,11 @@ mod tests {
         let (mut prod, cons) = rb.split();
 
         for _ in 0..300 {
-            prod.try_push(ShardMessage::PubSubFanOut {
+            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(0));
+            prod.try_push(ShardMessage::PubSubPublish {
                 channel: Bytes::from_static(b"ch"),
                 message: Bytes::from_static(b"msg"),
+                slot,
             })
             .ok()
             .unwrap();

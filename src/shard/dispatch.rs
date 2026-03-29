@@ -34,6 +34,10 @@ pub struct PubSubResponseSlot {
     remaining: AtomicU32,
     /// Wakes the connection handler when the last shard responds.
     waker: AtomicWaker,
+    /// Per-pair subscriber counts for batched PUBLISH.
+    /// Written by the SPSC handler, read by the connection handler after `is_ready()`.
+    /// Empty for single-PUBLISH slots (no batch).
+    pub counts: Vec<AtomicI64>,
 }
 
 impl PubSubResponseSlot {
@@ -43,6 +47,17 @@ impl PubSubResponseSlot {
             total: AtomicI64::new(0),
             remaining: AtomicU32::new(num_pending),
             waker: AtomicWaker::new(),
+            counts: Vec::new(),
+        }
+    }
+
+    /// Create a new slot with per-pair count tracking for batched PUBLISH.
+    pub fn with_counts(num_pending: u32, num_pairs: usize) -> Self {
+        Self {
+            total: AtomicI64::new(0),
+            remaining: AtomicU32::new(num_pending),
+            waker: AtomicWaker::new(),
+            counts: (0..num_pairs).map(|_| AtomicI64::new(0)).collect(),
         }
     }
 
@@ -65,12 +80,20 @@ impl PubSubResponseSlot {
     }
 
     /// Called by connection handler after `is_ready()` returns true: get the accumulated total.
+    ///
+    /// Uses Relaxed ordering because the Acquire load on `remaining` in `is_ready()`/`poll_ready()`
+    /// already establishes happens-before with the Release store in `add()`, ensuring all
+    /// prior `total.fetch_add(Relaxed)` writes are visible.
     #[inline]
     pub fn get(&self) -> i64 {
         self.total.load(Ordering::Relaxed)
     }
 
     /// Poll for readiness, registering the waker for notification.
+    ///
+    /// Uses Relaxed ordering on `total.load()` after the Acquire load on `remaining` confirms
+    /// all shards have responded. The Acquire/Release pair on `remaining` provides the
+    /// necessary happens-before guarantee for all prior `total.fetch_add(Relaxed)` stores.
     #[inline]
     pub fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
         // Fast path: already complete
@@ -162,8 +185,6 @@ pub enum ShardMessage {
         commands: Vec<std::sync::Arc<Frame>>,
         reply_tx: channel::OneshotSender<Vec<Frame>>,
     },
-    /// Publish a message to local subscribers on this shard.
-    PubSubFanOut { channel: Bytes, message: Bytes },
     /// Begin a cooperative snapshot at the given epoch.
     /// Shard creates SnapshotState and advances one segment per tick.
     /// Sends reply when snapshot is complete.
@@ -243,14 +264,11 @@ pub enum ShardMessage {
     },
     /// Batched cross-shard PUBLISH for pipeline efficiency.
     /// Multiple (channel, message) pairs destined for the same shard, sharing one ResponseSlot.
-    /// Each pair's subscriber count is accumulated into the slot, and per-pair counts
-    /// are written to the corresponding index in `counts`.
+    /// Each pair's subscriber count is accumulated into the slot's `counts` field, and the
+    /// batch total is accumulated into the slot's `total`.
     PubSubPublishBatch {
         pairs: Vec<(Bytes, Bytes)>,
         slot: std::sync::Arc<PubSubResponseSlot>,
-        /// Per-pair subscriber counts written by the SPSC handler.
-        /// Connection handler reads these after slot.is_ready() to assign per-PUBLISH responses.
-        counts: std::sync::Arc<Vec<AtomicI64>>,
     },
     /// Graceful shutdown signal.
     Shutdown,

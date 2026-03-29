@@ -11,7 +11,11 @@ use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+/// Type alias to distinguish pre-existing std::sync::RwLock (for ACL, runtime config, etc.)
+/// from parking_lot::RwLock (used for pubsub types added in this PR).
+type StdRwLock<T> = std::sync::RwLock<T>;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
@@ -32,7 +36,8 @@ use super::affinity::{AffinityTracker, MigratedConnectionState};
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
-    handle_config, is_multi_key_command, restore_migrated_state, try_inline_dispatch_loop,
+    handle_config, is_multi_key_command, propagate_subscription, restore_migrated_state,
+    try_inline_dispatch_loop, unpropagate_subscription,
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
@@ -77,28 +82,32 @@ pub async fn handle_connection_sharded_monoio<
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_registry: Arc<RwLock<PubSubRegistry>>,
+    pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
     aof_tx: Option<channel::MpscSender<AofMessage>>,
     tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
-    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
-    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     lua: Rc<mlua::Lua>,
     script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
-    acl_table: Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
-    remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
-    all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
-    all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
-    affinity_tracker: Arc<RwLock<AffinityTracker>>,
+    remote_subscriber_map: Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >,
+    all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
+    all_remote_sub_maps: Vec<
+        Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    >,
+    affinity_tracker: Arc<parking_lot::RwLock<AffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
@@ -220,17 +229,13 @@ pub async fn handle_connection_sharded_monoio<
                                                                 continue;
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                            pubsub_registry.write().unwrap().subscribe(channel.clone(), sub);
-                                                            // Direct shared-write: propagate subscription to all shards' remote subscriber maps
-                                                            for target in 0..num_shards {
-                                                                if target == shard_id { continue; }
-                                                                all_remote_sub_maps[target].write().unwrap().add(channel.clone(), shard_id, false);
-                                                            }
+                                                            pubsub_registry.write().subscribe(channel.clone(), sub);
+                                                            propagate_subscription(&all_remote_sub_maps, &channel, shard_id, num_shards, false);
                                                             subscription_count += 1;
                                                             // Register pub/sub affinity for this client IP
                                                             if subscription_count == 1 {
                                                                 if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                                    affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                                    affinity_tracker.write().register(addr.ip(), shard_id);
                                                                 }
                                                             }
                                                             let resp = pubsub::subscribe_response(&channel, subscription_count);
@@ -244,16 +249,12 @@ pub async fn handle_connection_sharded_monoio<
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
-                                                        let removed = pubsub_registry.write().unwrap().unsubscribe_all(subscriber_id);
-                                                        // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
+                                                        let removed = pubsub_registry.write().unsubscribe_all(subscriber_id);
                                                         for ch in &removed {
-                                                            for target in 0..num_shards {
-                                                                if target == shard_id { continue; }
-                                                                all_remote_sub_maps[target].write().unwrap().remove(ch, shard_id, false);
-                                                            }
+                                                            unpropagate_subscription(&all_remote_sub_maps, ch, shard_id, num_shards, false);
                                                         }
                                                         if removed.is_empty() {
-                                                            subscription_count = pubsub_registry.read().unwrap().total_subscription_count(subscriber_id);
+                                                            subscription_count = pubsub_registry.read().total_subscription_count(subscriber_id);
                                                             let resp = pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
@@ -274,12 +275,8 @@ pub async fn handle_connection_sharded_monoio<
                                                     } else {
                                                         for arg in cmd_args {
                                                             if let Some(channel) = extract_bytes(arg) {
-                                                                pubsub_registry.write().unwrap().unsubscribe(channel.as_ref(), subscriber_id);
-                                                                // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
-                                                                for target in 0..num_shards {
-                                                                    if target == shard_id { continue; }
-                                                                    all_remote_sub_maps[target].write().unwrap().remove(&channel, shard_id, false);
-                                                                }
+                                                                pubsub_registry.write().unsubscribe(channel.as_ref(), subscriber_id);
+                                                                unpropagate_subscription(&all_remote_sub_maps, &channel, shard_id, num_shards, false);
                                                                 subscription_count = subscription_count.saturating_sub(1);
                                                                 let resp = pubsub::unsubscribe_response(&channel, subscription_count);
                                                                 let mut resp_buf = BytesMut::new();
@@ -318,17 +315,13 @@ pub async fn handle_connection_sharded_monoio<
                                                                 continue;
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                            pubsub_registry.write().unwrap().psubscribe(pattern.clone(), sub);
-                                                            // Direct shared-write: propagate pattern subscription to all shards' remote subscriber maps
-                                                            for target in 0..num_shards {
-                                                                if target == shard_id { continue; }
-                                                                all_remote_sub_maps[target].write().unwrap().add(pattern.clone(), shard_id, true);
-                                                            }
+                                                            pubsub_registry.write().psubscribe(pattern.clone(), sub);
+                                                            propagate_subscription(&all_remote_sub_maps, &pattern, shard_id, num_shards, true);
                                                             subscription_count += 1;
                                                             // Register pub/sub affinity for this client IP
                                                             if subscription_count == 1 {
                                                                 if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                                    affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                                    affinity_tracker.write().register(addr.ip(), shard_id);
                                                                 }
                                                             }
                                                             let resp = pubsub::psubscribe_response(&pattern, subscription_count);
@@ -342,16 +335,12 @@ pub async fn handle_connection_sharded_monoio<
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
-                                                        let removed = pubsub_registry.write().unwrap().punsubscribe_all(subscriber_id);
-                                                        // Direct shared-write: propagate pattern unsubscribe to all shards' remote subscriber maps
+                                                        let removed = pubsub_registry.write().punsubscribe_all(subscriber_id);
                                                         for pat in &removed {
-                                                            for target in 0..num_shards {
-                                                                if target == shard_id { continue; }
-                                                                all_remote_sub_maps[target].write().unwrap().remove(pat, shard_id, true);
-                                                            }
+                                                            unpropagate_subscription(&all_remote_sub_maps, pat, shard_id, num_shards, true);
                                                         }
                                                         if removed.is_empty() {
-                                                            subscription_count = pubsub_registry.read().unwrap().total_subscription_count(subscriber_id);
+                                                            subscription_count = pubsub_registry.read().total_subscription_count(subscriber_id);
                                                             let resp = pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
@@ -372,12 +361,8 @@ pub async fn handle_connection_sharded_monoio<
                                                     } else {
                                                         for arg in cmd_args {
                                                             if let Some(pattern) = extract_bytes(arg) {
-                                                                pubsub_registry.write().unwrap().punsubscribe(pattern.as_ref(), subscriber_id);
-                                                                // Direct shared-write: propagate pattern unsubscribe to all shards' remote subscriber maps
-                                                                for target in 0..num_shards {
-                                                                    if target == shard_id { continue; }
-                                                                    all_remote_sub_maps[target].write().unwrap().remove(&pattern, shard_id, true);
-                                                                }
+                                                                pubsub_registry.write().punsubscribe(pattern.as_ref(), subscriber_id);
+                                                                unpropagate_subscription(&all_remote_sub_maps, &pattern, shard_id, num_shards, true);
                                                                 subscription_count = subscription_count.saturating_sub(1);
                                                                 let resp = pubsub::punsubscribe_response(&pattern, subscription_count);
                                                                 let mut resp_buf = BytesMut::new();
@@ -997,10 +982,9 @@ pub async fn handle_connection_sharded_monoio<
                     }
                     match (channel, message) {
                         (Some(ch), Some(msg)) => {
-                            let local_count =
-                                { pubsub_registry.write().unwrap().publish(&ch, &msg) };
+                            let local_count = { pubsub_registry.write().publish(&ch, &msg) };
                             // Targeted fanout: only send to shards that have subscribers
-                            let targets = remote_subscriber_map.read().unwrap().target_shards(&ch);
+                            let targets = remote_subscriber_map.read().target_shards(&ch);
                             if targets.is_empty() {
                                 // Fast path: no remote subscribers
                                 responses.push(Frame::Integer(local_count));
@@ -1077,29 +1061,22 @@ pub async fn handle_connection_sharded_monoio<
                         }
                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                         if is_pattern {
-                            pubsub_registry.write().unwrap().psubscribe(ch.clone(), sub);
+                            pubsub_registry.write().psubscribe(ch.clone(), sub);
                         } else {
-                            pubsub_registry.write().unwrap().subscribe(ch.clone(), sub);
+                            pubsub_registry.write().subscribe(ch.clone(), sub);
                         }
-                        // Direct shared-write: propagate subscription to all shards' remote subscriber maps
-                        for target in 0..num_shards {
-                            if target == shard_id {
-                                continue;
-                            }
-                            all_remote_sub_maps[target].write().unwrap().add(
-                                ch.clone(),
-                                shard_id,
-                                is_pattern,
-                            );
-                        }
+                        propagate_subscription(
+                            &all_remote_sub_maps,
+                            &ch,
+                            shard_id,
+                            num_shards,
+                            is_pattern,
+                        );
                         subscription_count += 1;
                         // Register pub/sub affinity for this client IP
                         if subscription_count == 1 {
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                affinity_tracker
-                                    .write()
-                                    .unwrap()
-                                    .register(addr.ip(), shard_id);
+                                affinity_tracker.write().register(addr.ip(), shard_id);
                             }
                         }
                         let resp = if is_pattern {
@@ -1155,7 +1132,7 @@ pub async fn handle_connection_sharded_monoio<
                         let mut all_channels: std::collections::HashSet<Bytes> =
                             std::collections::HashSet::new();
                         for reg in &all_pubsub_registries {
-                            let guard = reg.read().unwrap();
+                            let guard = reg.read();
                             all_channels.extend(guard.active_channels(pattern.as_deref()));
                         }
                         let arr: Vec<Frame> =
@@ -1170,7 +1147,7 @@ pub async fn handle_connection_sharded_monoio<
                         let mut counts: std::collections::HashMap<Bytes, i64> =
                             std::collections::HashMap::new();
                         for reg in &all_pubsub_registries {
-                            let guard = reg.read().unwrap();
+                            let guard = reg.read();
                             for (ch, c) in guard.numsub(&channels) {
                                 *counts.entry(ch).or_insert(0) += c;
                             }
@@ -1185,7 +1162,7 @@ pub async fn handle_connection_sharded_monoio<
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
                         let mut total: usize = 0;
                         for reg in &all_pubsub_registries {
-                            total += reg.read().unwrap().numpat();
+                            total += reg.read().numpat();
                         }
                         responses.push(Frame::Integer(total as i64));
                     }
@@ -1642,21 +1619,15 @@ pub async fn handle_connection_sharded_monoio<
         if !publish_batches.is_empty() {
             let mut batch_slots: Vec<(
                 std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>,
-                std::sync::Arc<Vec<std::sync::atomic::AtomicI64>>,
                 Vec<usize>,
             )> = Vec::new();
             {
                 let mut producers = dispatch_tx.borrow_mut();
                 for (target, entries) in publish_batches.drain() {
                     let n = entries.len();
-                    let slot =
-                        std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(1));
-                    let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicI64>> =
-                        std::sync::Arc::new(
-                            (0..n)
-                                .map(|_| std::sync::atomic::AtomicI64::new(0))
-                                .collect(),
-                        );
+                    let slot = std::sync::Arc::new(
+                        crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n),
+                    );
                     let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
                     let pairs: Vec<(Bytes, Bytes)> =
                         entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
@@ -1665,21 +1636,20 @@ pub async fn handle_connection_sharded_monoio<
                     let batch_msg = ShardMessage::PubSubPublishBatch {
                         pairs,
                         slot: slot.clone(),
-                        counts: counts.clone(),
                     };
                     if producers[idx].try_push(batch_msg).is_ok() {
                         spsc_notifiers[target].notify_one();
                     } else {
                         slot.add(0); // push failed, mark as done
                     }
-                    batch_slots.push((slot, counts, resp_indices));
+                    batch_slots.push((slot, resp_indices));
                 }
             }
             // Resolve all batch slots
-            for (slot, counts, resp_indices) in &batch_slots {
+            for (slot, resp_indices) in &batch_slots {
                 crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
                 for (i, resp_idx) in resp_indices.iter().enumerate() {
-                    let remote_count = counts[i].load(std::sync::atomic::Ordering::Relaxed);
+                    let remote_count = slot.counts[i].load(std::sync::atomic::Ordering::Relaxed);
                     if remote_count > 0 {
                         if let Frame::Integer(ref mut total) = responses[*resp_idx] {
                             *total += remote_count;
@@ -1868,44 +1838,17 @@ pub async fn handle_connection_sharded_monoio<
 
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if subscriber_id > 0 {
-        let removed_channels = {
-            pubsub_registry
-                .write()
-                .unwrap()
-                .unsubscribe_all(subscriber_id)
-        };
-        let removed_patterns = {
-            pubsub_registry
-                .write()
-                .unwrap()
-                .punsubscribe_all(subscriber_id)
-        };
-        // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
+        let removed_channels = { pubsub_registry.write().unsubscribe_all(subscriber_id) };
+        let removed_patterns = { pubsub_registry.write().punsubscribe_all(subscriber_id) };
         for ch in removed_channels {
-            for target in 0..num_shards {
-                if target == shard_id {
-                    continue;
-                }
-                all_remote_sub_maps[target]
-                    .write()
-                    .unwrap()
-                    .remove(&ch, shard_id, false);
-            }
+            unpropagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
         }
         for pat in removed_patterns {
-            for target in 0..num_shards {
-                if target == shard_id {
-                    continue;
-                }
-                all_remote_sub_maps[target]
-                    .write()
-                    .unwrap()
-                    .remove(&pat, shard_id, true);
-            }
+            unpropagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
         }
         // Remove affinity on disconnect (no subscriptions remain)
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-            affinity_tracker.write().unwrap().remove(&addr.ip());
+            affinity_tracker.write().remove(&addr.ip());
         }
     }
 

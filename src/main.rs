@@ -175,24 +175,26 @@ fn main() -> anyhow::Result<()> {
 
     // Pre-create shared pubsub registries for cross-shard introspection reads.
     let all_pubsub_registries: Vec<
-        std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
+        std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
     > = (0..num_shards)
-        .map(|_| std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new())))
+        .map(|_| std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new())))
         .collect();
 
     // Pre-create shared remote subscriber maps for zero-SPSC subscription propagation.
     let all_remote_sub_maps: Vec<
-        std::sync::Arc<std::sync::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+        std::sync::Arc<
+            parking_lot::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
+        >,
     > = (0..num_shards)
         .map(|_| {
-            std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(parking_lot::RwLock::new(
                 moon::shard::remote_subscriber_map::RemoteSubscriberMap::new(),
             ))
         })
         .collect();
 
     // Create shared affinity tracker for pub/sub connection routing
-    let affinity_tracker = std::sync::Arc::new(std::sync::RwLock::new(
+    let affinity_tracker = std::sync::Arc::new(parking_lot::RwLock::new(
         moon::shard::affinity::AffinityTracker::new(),
     ));
 

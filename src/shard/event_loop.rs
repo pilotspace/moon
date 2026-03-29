@@ -48,7 +48,7 @@ impl super::Shard {
     /// introspection reads.
     ///
     /// Receives new connections from the listener and spawns them as local tasks.
-    /// Drains SPSC consumers for cross-shard dispatch requests and PubSubFanOut.
+    /// Drains SPSC consumers for cross-shard dispatch requests and PubSubPublish.
     /// Runs cooperative active expiry. Shuts down gracefully on cancellation.
     pub async fn run(
         &mut self,
@@ -71,9 +71,9 @@ impl super::Shard {
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
         shard_databases: Arc<ShardDatabases>,
-        all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
-        all_remote_sub_maps: Vec<Arc<RwLock<RemoteSubscriberMap>>>,
-        affinity_tracker: Arc<RwLock<AffinityTracker>>,
+        all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
+        all_remote_sub_maps: Vec<Arc<parking_lot::RwLock<RemoteSubscriberMap>>>,
+        affinity_tracker: Arc<parking_lot::RwLock<AffinityTracker>>,
     ) {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -246,7 +246,7 @@ impl super::Shard {
         // Initialize with shard's restored registry data (from persistence/snapshot).
         let pubsub_arc = all_pubsub_registries[self.id].clone();
         {
-            let mut reg = pubsub_arc.write().unwrap();
+            let mut reg = pubsub_arc.write();
             *reg = std::mem::take(&mut self.pubsub_registry);
         }
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
@@ -404,7 +404,7 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -452,7 +452,7 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -623,7 +623,7 @@ impl super::Shard {
                     tracing::trace!("Shard {}: SPSC notify fired", shard_id);
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -677,7 +677,7 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
@@ -790,6 +790,6 @@ impl super::Shard {
 
         // Databases now live in Arc<ShardDatabases>, no reclaim needed.
         self.databases.clear();
-        self.pubsub_registry = std::mem::take(&mut *pubsub_arc.write().unwrap());
+        self.pubsub_registry = std::mem::take(&mut *pubsub_arc.write());
     }
 }

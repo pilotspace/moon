@@ -2418,25 +2418,25 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
         let all_notifiers = mesh.all_notifiers();
         let all_pubsub_registries: Vec<
-            std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
+            std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new()))
+                std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new()))
             })
             .collect();
         let all_remote_sub_maps: Vec<
             std::sync::Arc<
-                std::sync::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
+                parking_lot::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
             >,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(std::sync::RwLock::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(
                     moon::shard::remote_subscriber_map::RemoteSubscriberMap::new(),
                 ))
             })
             .collect();
 
-        let affinity_tracker = std::sync::Arc::new(std::sync::RwLock::new(
+        let affinity_tracker = std::sync::Arc::new(parking_lot::RwLock::new(
             moon::shard::affinity::AffinityTracker::new(),
         ));
 
@@ -3552,25 +3552,25 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
 
         let all_notifiers = mesh.all_notifiers();
         let all_pubsub_registries: Vec<
-            std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
+            std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new()))
+                std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new()))
             })
             .collect();
         let all_remote_sub_maps: Vec<
             std::sync::Arc<
-                std::sync::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
+                parking_lot::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
             >,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(std::sync::RwLock::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(
                     moon::shard::remote_subscriber_map::RemoteSubscriberMap::new(),
                 ))
             })
             .collect();
 
-        let affinity_tracker = std::sync::Arc::new(std::sync::RwLock::new(
+        let affinity_tracker = std::sync::Arc::new(parking_lot::RwLock::new(
             moon::shard::affinity::AffinityTracker::new(),
         ));
 

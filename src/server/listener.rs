@@ -252,7 +252,7 @@ pub async fn run_sharded(
     conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
     shutdown: CancellationToken,
     per_shard_accept: bool,
-    affinity_tracker: Arc<RwLock<crate::shard::affinity::AffinityTracker>>,
+    affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = TcpListener::bind(&addr).await?;
@@ -351,7 +351,7 @@ pub async fn run_sharded(
                         // Affinity-aware routing: check if this IP has a preferred shard
                         let target_shard = {
                             let peer_ip = addr.ip();
-                            if let Some(preferred) = affinity_tracker.read().unwrap().lookup(&peer_ip) {
+                            if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
                                 if preferred < num_shards {
                                     preferred
                                 } else {
@@ -403,7 +403,7 @@ pub async fn run_sharded(
     conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
     shutdown: CancellationToken,
     per_shard_accept: bool,
-    affinity_tracker: Arc<RwLock<crate::shard::affinity::AffinityTracker>>,
+    affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = monoio::net::TcpListener::bind(&addr)?;
@@ -464,7 +464,7 @@ pub async fn run_sharded(
                             // Affinity-aware routing
                             let target_shard = {
                                 let peer_ip = addr.ip();
-                                if let Some(preferred) = affinity_tracker.read().unwrap().lookup(&peer_ip) {
+                                if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
                                     if preferred < num_shards { preferred } else {
                                         let s = next_shard;
                                         next_shard = (next_shard + 1) % num_shards;
@@ -548,7 +548,7 @@ pub async fn run_sharded(
                             // Affinity-aware routing
                             let target_shard = {
                                 let peer_ip = addr.ip();
-                                if let Some(preferred) = affinity_tracker.read().unwrap().lookup(&peer_ip) {
+                                if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
                                     if preferred < num_shards { preferred } else {
                                         let s = next_shard;
                                         next_shard = (next_shard + 1) % num_shards;
