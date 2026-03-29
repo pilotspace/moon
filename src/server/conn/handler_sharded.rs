@@ -576,7 +576,7 @@ pub async fn handle_connection_sharded_inner<
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>> = HashMap::with_capacity(num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
@@ -1412,7 +1412,7 @@ pub async fn handle_connection_sharded_inner<
                         } else {
                             Bytes::new()
                         };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes, selected_db));
                     }
                 }
 
@@ -1421,9 +1421,12 @@ pub async fn handle_connection_sharded_inner<
                     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_ptr = response_pool.slot_ptr(target);
+                        // Use the db_index captured with the first command (all commands in a
+                        // pipeline batch targeting the same shard share the same db_index).
+                        let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(selected_db);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
+                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
                         {
                             let mut pending = msg;
