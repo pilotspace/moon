@@ -26,7 +26,13 @@ pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
     // The custom oneshot's AtomicWaker doesn't reliably wake monoio tasks
     // from other threads, causing cross-shard write dispatch to hang.
     let (tx, rx) = flume::bounded(1);
-    (OneshotSender { tx }, OneshotReceiver { rx, recv_fut: None })
+    (
+        OneshotSender { tx },
+        OneshotReceiver {
+            rx: Some(rx),
+            recv_fut: None,
+        },
+    )
 }
 
 pub struct OneshotSender<T> {
@@ -40,32 +46,44 @@ impl<T> OneshotSender<T> {
 }
 
 pub struct OneshotReceiver<T> {
-    rx: flume::Receiver<T>,
+    /// Receiver half — taken on first poll to avoid clone/race with try_recv.
+    rx: Option<flume::Receiver<T>>,
     /// Cached recv future — persists across polls for correct waker registration.
     recv_fut: Option<Pin<Box<dyn Future<Output = Result<T, flume::RecvError>> + Send>>>,
 }
 
 impl<T: Send + 'static> OneshotReceiver<T> {
     pub async fn recv(self) -> Result<T, RecvError> {
-        self.rx.recv_async().await.map_err(|_| RecvError)
+        match self.rx {
+            Some(rx) => rx.recv_async().await.map_err(|_| RecvError),
+            None => Err(RecvError), // rx was taken by poll
+        }
     }
 
     /// Alias for recv — flume's cross-thread wakeup works on all runtimes.
     pub async fn recv_polling(self) -> Result<T, RecvError> {
         self.recv().await
     }
+}
 
+impl<T: Send> OneshotReceiver<T> {
     /// Non-blocking try_recv for use with pending_wakers polling pattern.
     ///
     /// Returns `Ok(value)` if a value is available, `Err(TryRecvEmpty)` if not yet,
-    /// or `Err(TryRecvDisconnected)` if the sender was dropped.
+    /// or `Err(TryRecvDisconnected)` if the sender was dropped or rx was taken.
     pub fn try_recv(&self) -> Result<T, flume::TryRecvError> {
-        self.rx.try_recv()
+        match &self.rx {
+            Some(rx) => rx.try_recv(),
+            None => Err(flume::TryRecvError::Disconnected),
+        }
     }
 
     /// Blocking receive for use from non-async contexts (e.g., OS thread watchers).
     pub fn recv_blocking(self) -> Result<T, RecvError> {
-        self.rx.recv().map_err(|_| RecvError)
+        match self.rx {
+            Some(rx) => rx.recv().map_err(|_| RecvError),
+            None => Err(RecvError),
+        }
     }
 }
 
@@ -73,9 +91,12 @@ impl<T: Send + 'static> Future for OneshotReceiver<T> {
     type Output = Result<T, RecvError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Lazily create the recv future on first poll, then reuse it.
+        // Lazily take the receiver on first poll — moved, not cloned.
         if self.recv_fut.is_none() {
-            let rx = self.rx.clone();
+            let rx = match self.rx.take() {
+                Some(rx) => rx,
+                None => return Poll::Ready(Err(RecvError)),
+            };
             self.recv_fut = Some(Box::pin(rx.into_recv_async()));
         }
         match self.recv_fut.as_mut() {
@@ -84,10 +105,7 @@ impl<T: Send + 'static> Future for OneshotReceiver<T> {
                 Poll::Ready(Err(_)) => Poll::Ready(Err(RecvError)),
                 Poll::Pending => Poll::Pending,
             },
-            None => {
-                debug_assert!(false, "recv_fut should have been set above");
-                Poll::Pending
-            }
+            None => Poll::Ready(Err(RecvError)),
         }
     }
 }

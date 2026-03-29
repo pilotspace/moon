@@ -103,12 +103,13 @@ impl ShardDatabases {
     /// Acquires brief read locks on each database to gather metadata needed
     /// by `SnapshotState::new_from_metadata`. Called once at snapshot epoch start.
     pub fn snapshot_metadata(&self, shard_id: usize) -> (Vec<usize>, Vec<u32>) {
-        let segment_counts: Vec<usize> = (0..self.db_count)
-            .map(|i| self.read_db(shard_id, i).data().segment_count())
-            .collect();
-        let base_timestamps: Vec<u32> = (0..self.db_count)
-            .map(|i| self.read_db(shard_id, i).base_timestamp())
-            .collect();
+        let mut segment_counts = Vec::with_capacity(self.db_count);
+        let mut base_timestamps = Vec::with_capacity(self.db_count);
+        for i in 0..self.db_count {
+            let guard = self.read_db(shard_id, i);
+            segment_counts.push(guard.data().segment_count());
+            base_timestamps.push(guard.base_timestamp());
+        }
         (segment_counts, base_timestamps)
     }
 }

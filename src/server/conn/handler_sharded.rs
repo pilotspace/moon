@@ -162,8 +162,33 @@ pub async fn handle_connection_sharded(
                         );
                     }
                     Err(returned_msg) => {
-                        // SPSC full -- graceful fallback: close the FD via OwnedFd drop
-                        if let ShardMessage::MigrateConnection { fd, .. } = returned_msg {
+                        // SPSC full — retry with yield before giving up.
+                        let mut pending = Some(returned_msg);
+                        for _ in 0..8 {
+                            tokio::task::yield_now().await;
+                            let msg = pending.take().unwrap();
+                            let push_result = {
+                                let mut producers = dispatch_tx.borrow_mut();
+                                producers[target_idx].try_push(msg)
+                            };
+                            match push_result {
+                                Ok(()) => {
+                                    spsc_notifiers[target_shard].notify_one();
+                                    tracing::info!(
+                                        "Shard {}: migrated connection {} to shard {} (after retry)",
+                                        shard_id,
+                                        client_id,
+                                        target_shard
+                                    );
+                                    break;
+                                }
+                                Err(msg) => pending = Some(msg),
+                            }
+                        }
+                        if let Some(ShardMessage::MigrateConnection { fd, .. }) = pending {
+                            // SAFETY: fd is a valid, uniquely-owned file descriptor obtained
+                            // from TcpStream::into_raw_fd() above. No other code holds a
+                            // reference to this fd. OwnedFd closes it on drop.
                             use std::os::unix::io::FromRawFd;
                             drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
                         }
