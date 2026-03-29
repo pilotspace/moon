@@ -107,7 +107,6 @@ mod tests {
     use ringbuf::traits::{Producer, Split};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
 
     use self::dispatch::ShardMessage;
     use self::shared_databases::ShardDatabases;

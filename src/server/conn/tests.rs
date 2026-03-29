@@ -100,7 +100,7 @@ fn test_inline_mixed_batch() {
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
     // Inline loop should process GET but leave PING
-    let total = try_inline_dispatch_loop(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let total = try_inline_dispatch_loop(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(total, 1);
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
     assert_eq!(&read_buf[..], b"*1\r\n$4\r\nPING\r\n");
@@ -184,7 +184,7 @@ fn test_inline_multiple_gets() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let total = try_inline_dispatch_loop(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let total = try_inline_dispatch_loop(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(total, 2);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$1\r\n1\r\n$1\r\n2\r\n");
