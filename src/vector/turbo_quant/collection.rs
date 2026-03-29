@@ -142,7 +142,6 @@ impl CollectionMetadata {
 mod tests {
     use super::*;
     use crate::vector::turbo_quant::codebook::CODEBOOK_VERSION;
-    use crate::vector::turbo_quant::encoder::padded_dimension;
 
     #[test]
     fn test_new_creates_correct_padded_dimension() {

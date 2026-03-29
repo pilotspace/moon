@@ -47,9 +47,8 @@ pub fn tq_l2_adc_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::turbo_quant::codebook::quantize_scalar;
     use crate::vector::turbo_quant::encoder::{
-        encode_tq_mse, decode_tq_mse, nibble_unpack, padded_dimension,
+        encode_tq_mse, decode_tq_mse, padded_dimension,
     };
     use crate::vector::turbo_quant::fwht;
 
