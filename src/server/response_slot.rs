@@ -9,7 +9,9 @@ use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
+
+use atomic_waker::AtomicWaker;
 
 use crate::protocol::Frame;
 
@@ -21,19 +23,24 @@ const FILLED: u8 = 1;
 /// One thread (the target shard) calls `fill()` to deposit the response.
 /// Another thread (the connection owner) calls `poll_take()` to retrieve it.
 /// The AtomicU8 state machine provides the happens-before ordering.
+///
+/// Waker synchronization uses `AtomicWaker` (from the `atomic-waker` crate)
+/// which provides correct cross-thread waker registration via AcqRel atomics.
 pub struct ResponseSlot {
     state: AtomicU8,
     /// Response data. Written by producer (fill), read by consumer (poll_take).
     data: UnsafeCell<Option<Vec<Frame>>>,
     /// Waker registered by the consumer when slot is empty.
-    waker: UnsafeCell<Option<Waker>>,
+    /// Uses AtomicWaker for correct cross-thread synchronization.
+    waker: AtomicWaker,
 }
 
 // SAFETY: Only two threads access this slot:
 // - Connection owner (consumer): registers waker via poll_take, reads data
 // - Target shard (producer): writes data via fill, wakes consumer
 // The AtomicU8 state transitions provide Release/Acquire ordering ensuring
-// all writes to data/waker are visible across threads.
+// all writes to data are visible across threads. AtomicWaker handles
+// waker synchronization internally.
 unsafe impl Send for ResponseSlot {}
 unsafe impl Sync for ResponseSlot {}
 
@@ -43,7 +50,7 @@ impl ResponseSlot {
         Self {
             state: AtomicU8::new(EMPTY),
             data: UnsafeCell::new(None),
-            waker: UnsafeCell::new(None),
+            waker: AtomicWaker::new(),
         }
     }
 
@@ -66,13 +73,9 @@ impl ResponseSlot {
         let prev = self.state.swap(FILLED, Ordering::Release);
         debug_assert_eq!(prev, EMPTY, "ResponseSlot::fill called on non-EMPTY slot");
 
-        // Wake the consumer if it registered a waker.
-        // SAFETY: Waker is only written by consumer in poll_take when state is EMPTY.
-        // We just transitioned away from EMPTY, so no concurrent waker write is possible.
-        let waker = unsafe { (*self.waker.get()).take() };
-        if let Some(w) = waker {
-            w.wake();
-        }
+        // Wake the consumer. AtomicWaker handles synchronization internally —
+        // the waker registered by the consumer is guaranteed to be visible here.
+        self.waker.wake();
     }
 
     /// Poll for the response (called by the connection owner thread).
@@ -89,11 +92,8 @@ impl ResponseSlot {
             return Poll::Ready(data);
         }
 
-        // Slot is empty. Register waker BEFORE re-checking state to avoid lost wakeups.
-        // SAFETY: We are the only consumer; no concurrent waker write.
-        unsafe {
-            *self.waker.get() = Some(cx.waker().clone());
-        }
+        // Slot is empty. Register waker using AtomicWaker (handles synchronization).
+        self.waker.register(cx.waker());
 
         // Re-check state after waker registration.
         // Handles the race where producer fills between our first load and waker store.
@@ -101,10 +101,6 @@ impl ResponseSlot {
         if state == FILLED {
             let data = unsafe { (*self.data.get()).take().unwrap() };
             self.state.store(EMPTY, Ordering::Release);
-            // Clear the waker we just stored (no longer needed).
-            unsafe {
-                *self.waker.get() = None;
-            }
             return Poll::Ready(data);
         }
 
@@ -118,8 +114,9 @@ impl ResponseSlot {
         self.state.store(EMPTY, Ordering::Release);
         unsafe {
             *self.data.get() = None;
-            *self.waker.get() = None;
         }
+        // AtomicWaker::take() clears any registered waker.
+        self.waker.take();
     }
 }
 

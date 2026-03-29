@@ -36,7 +36,8 @@ use super::{
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
-use crate::server::response_slot::ResponseSlotPool;
+// ResponseSlotPool NOT used on monoio — its AtomicWaker doesn't cross
+// monoio's single-threaded (!Send) executor boundary. Use oneshot channels.
 
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
@@ -155,7 +156,8 @@ pub async fn handle_connection_sharded_monoio<
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
 
     // Pre-allocated response slots for zero-allocation cross-shard dispatch.
-    let response_pool = ResponseSlotPool::new(num_shards, shard_id);
+    // Monoio uses oneshot channels (not ResponseSlotPool) for cross-shard writes.
+    // ResponseSlotPool's AtomicWaker doesn't work with monoio's !Send executor.
 
     // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
     // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
@@ -1231,7 +1233,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
-                        &response_pool,
+                        &(),  // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1247,7 +1249,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
-                        &response_pool,
+                        &(),  // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1261,7 +1263,7 @@ pub async fn handle_connection_sharded_monoio<
                         &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
-                        &response_pool,
+                        &(),  // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1280,7 +1282,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
-                        &response_pool,
+                        &(),  // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1316,9 +1318,11 @@ pub async fn handle_connection_sharded_monoio<
             };
 
             if is_local {
-                // LOCAL FAST PATH: single borrow_mut covers dispatch + wakeup (no per-command acquire/release)
-                // Eviction check before write dispatch
+                // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
+                // Using read_db for local reads eliminates RwLock contention with
+                // cross-shard shared reads from other shard threads.
                 if metadata::is_write(cmd) {
+                    // WRITE PATH: eviction check + exclusive lock + dispatch + wakeup
                     let rt = runtime_config.read().unwrap();
                     let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
                     if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
@@ -1327,90 +1331,87 @@ pub async fn handle_connection_sharded_monoio<
                         continue;
                     }
                     drop(guard_ev);
-                }
-                let mut guard = shard_databases.write_db(shard_id, selected_db);
-                // No refresh_now here — called once per batch before the loop
-                let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
 
-                let response = match result {
-                    DispatchResult::Response(f) => f,
-                    DispatchResult::Quit(f) => {
-                        should_quit = true;
-                        f
-                    }
-                };
+                    let mut guard = shard_databases.write_db(shard_id, selected_db);
+                    let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
 
-                // AOF logging for successful local writes
-                if !matches!(response, Frame::Error(_)) && is_write {
-                    if let Some(ref tx) = aof_tx {
-                        let serialized = aof::serialize_command(&frame);
-                        let _ = tx.try_send(AofMessage::Append(serialized));
-                    }
-                }
+                    let response = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => {
+                            should_quit = true;
+                            f
+                        }
+                    };
 
-                // Post-dispatch wakeup hooks for producer commands (reuse outer dbs — no re-borrow)
-                if !matches!(response, Frame::Error(_)) {
-                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        || cmd.eq_ignore_ascii_case(b"ZADD");
-                    if needs_wake {
-                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            let mut reg = blocking_registry.borrow_mut();
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            {
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    selected_db,
-                                    &key,
-                                );
-                            } else {
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    selected_db,
-                                    &key,
-                                );
-                            }
+                    // AOF logging for successful local writes
+                    if !matches!(response, Frame::Error(_)) && is_write {
+                        if let Some(ref tx) = aof_tx {
+                            let serialized = aof::serialize_command(&frame);
+                            let _ = tx.try_send(AofMessage::Append(serialized));
                         }
                     }
-                }
 
-                drop(guard); // Single drop at end of local block
-
-                // Track key on read / invalidate tracked key on write
-                if tracking_state.enabled {
-                    if is_write {
-                        if !matches!(response, Frame::Error(_)) {
+                    // Post-dispatch wakeup hooks for producer commands
+                    if !matches!(response, Frame::Error(_)) {
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD");
+                        if needs_wake {
                             if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                let senders =
-                                    tracking_table.borrow_mut().invalidate_key(&key, client_id);
-                                if !senders.is_empty() {
-                                    let push =
-                                        crate::tracking::invalidation::invalidation_push(&[key]);
-                                    for tx in senders {
-                                        let _ = tx.try_send(push.clone());
-                                    }
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg,
+                                        &mut guard,
+                                        selected_db,
+                                        &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg,
+                                        &mut guard,
+                                        selected_db,
+                                        &key,
+                                    );
                                 }
                             }
                         }
-                    } else if !tracking_state.bcast {
+                    }
+
+                    drop(guard);
+                } else {
+                    // READ PATH: shared lock — no contention with other shards' reads
+                    let guard = shard_databases.read_db(shard_id, selected_db);
+                    let now_ms = cached_clock.ms();
+                    let result =
+                        dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                    drop(guard);
+
+                    let response = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => {
+                            should_quit = true;
+                            f
+                        }
+                    };
+
+                    // Track key on local read
+                    if tracking_state.enabled && !tracking_state.bcast {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            tracking_table.borrow_mut().track_key(
-                                client_id,
-                                &key,
-                                tracking_state.noloop,
-                            );
+                            tracking_table
+                                .borrow_mut()
+                                .track_key(client_id, &key, tracking_state.noloop);
                         }
                     }
-                }
+                    let response = apply_resp3_conversion(cmd, response, protocol_version);
+                    responses.push(response);
+                } // end read/write split
 
-                // Apply RESP3 response conversion if needed
-                let response = apply_resp3_conversion(cmd, response, protocol_version);
-                responses.push(response);
+                // (tracking and response push handled inside read/write branches above)
             } else if let Some(target) = target_shard {
                 // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
                 // By this point in_multi is false (MULTI queuing happens earlier with `continue`).
@@ -1472,8 +1473,9 @@ pub async fn handle_connection_sharded_monoio<
         if !remote_groups.is_empty() {
             reply_futures.clear();
 
+            let mut oneshot_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::new();
             for (target, entries) in remote_groups.drain() {
-                let slot_ptr = response_pool.slot_ptr(target);
+                let (reply_tx, reply_rx) = channel::oneshot();
                 let (meta, commands): (
                     Vec<(usize, Option<Bytes>, Vec<u8>)>,
                     Vec<std::sync::Arc<Frame>>,
@@ -1482,10 +1484,10 @@ pub async fn handle_connection_sharded_monoio<
                     .map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame))
                     .unzip();
 
-                let msg = ShardMessage::PipelineBatchSlotted {
+                let msg = ShardMessage::PipelineBatch {
                     db_index: selected_db,
                     commands,
-                    response_slot: slot_ptr,
+                    reply_tx,
                 };
                 let target_idx = ChannelMesh::target_index(shard_id, target);
                 {
@@ -1507,12 +1509,20 @@ pub async fn handle_connection_sharded_monoio<
                         }
                     }
                 }
-                reply_futures.push((meta, target));
+                oneshot_futures.push((meta, reply_rx));
             }
 
-            // Await all shard responses (they execute in parallel on different shards)
-            for (meta, target) in reply_futures.drain(..) {
-                let shard_responses = response_pool.future_for(target).await;
+            // Await all shard responses via oneshot channels (cross-thread safe)
+            for (meta, reply_rx) in oneshot_futures.drain(..) {
+                let shard_responses = match reply_rx.recv_polling().await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        for (resp_idx, _, _) in &meta {
+                            responses[*resp_idx] = Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed"));
+                        }
+                        continue;
+                    }
+                };
                 for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses)
                 {
                     // AOF logging for successful remote writes

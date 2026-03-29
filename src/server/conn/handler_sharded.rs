@@ -854,24 +854,24 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if cmd.eq_ignore_ascii_case(b"KEYS") {
-                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &response_pool).await;
+                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SCAN") {
-                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &response_pool).await;
+                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &response_pool).await;
+                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &()).await;
                         responses.push(response);
                         continue;
                     }
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &response_pool).await;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
@@ -901,7 +901,11 @@ pub async fn handle_connection_sharded_inner<
                     let aof_bytes = if is_write && aof_tx.is_some() { Some(aof::serialize_command(&frame)) } else { None };
 
                     if is_local {
+                        // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
+                        // Using read_db for local reads eliminates RwLock contention with
+                        // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
+                            // WRITE PATH: eviction + exclusive lock + dispatch + wakeup
                             let rt = runtime_config.read().unwrap();
                             let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
                             if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
@@ -910,54 +914,65 @@ pub async fn handle_connection_sharded_inner<
                                 continue;
                             }
                             drop(guard_ev);
-                        }
-                        let mut guard = shard_databases.write_db(shard_id, selected_db);
-                        let db_count = shard_databases.db_count();
-                        guard.refresh_now_from_cache(&cached_clock);
-                        let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
-                        let response = match result {
-                            DispatchResult::Response(f) => f,
-                            DispatchResult::Quit(f) => { should_quit = true; f }
-                        };
-                        if !matches!(response, Frame::Error(_)) {
-                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
-                            if needs_wake {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut reg = blocking_registry.borrow_mut();
-                                    if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                        crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, selected_db, &key);
-                                    } else {
-                                        crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, selected_db, &key);
-                                    }
-                                }
-                            }
-                        }
-                        drop(guard);
-                        if let Some(bytes) = aof_bytes {
+
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let db_count = shard_databases.db_count();
+                            guard.refresh_now_from_cache(&cached_clock);
+                            let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                            let response = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => { should_quit = true; f }
+                            };
                             if !matches!(response, Frame::Error(_)) {
-                                if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
-                            }
-                        }
-                        if tracking_state.enabled {
-                            if is_write {
-                                if !matches!(response, Frame::Error(_)) {
+                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
+                                if needs_wake {
                                     if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                        let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
-                                        if !senders.is_empty() {
-                                            let push = crate::tracking::invalidation::invalidation_push(&[key]);
-                                            for tx in senders { let _ = tx.try_send(push.clone()); }
+                                        let mut reg = blocking_registry.borrow_mut();
+                                        if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                            crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, selected_db, &key);
+                                        } else {
+                                            crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, selected_db, &key);
                                         }
                                     }
                                 }
-                            } else if !tracking_state.bcast {
+                            }
+                            drop(guard);
+                            if let Some(bytes) = aof_bytes {
+                                if !matches!(response, Frame::Error(_)) {
+                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
+                                }
+                            }
+                            if tracking_state.enabled && !matches!(response, Frame::Error(_)) {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                                    if !senders.is_empty() {
+                                        let push = crate::tracking::invalidation::invalidation_push(&[key]);
+                                        for tx in senders { let _ = tx.try_send(push.clone()); }
+                                    }
+                                }
+                            }
+                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            responses.push(response);
+                        } else {
+                            // READ PATH: shared lock — no contention with other shards' reads
+                            let guard = shard_databases.read_db(shard_id, selected_db);
+                            let now_ms = cached_clock.ms();
+                            let db_count = shard_databases.db_count();
+                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            drop(guard);
+                            let response = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => { should_quit = true; f }
+                            };
+                            if tracking_state.enabled && !tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
                                 }
                             }
+                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            responses.push(response);
                         }
-                        let response = apply_resp3_conversion(cmd, response, protocol_version);
-                        responses.push(response);
                     } else if let Some(target) = target_shard {
                         // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
                         // By this point in_multi is false (MULTI queuing happens earlier with `continue`).

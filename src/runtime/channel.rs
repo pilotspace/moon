@@ -130,6 +130,51 @@ impl<T> OneshotReceiver<T> {
         self.await
     }
 
+    /// Async polling receive for runtimes where cross-thread Waker::wake() is unreliable
+    /// (e.g., monoio's !Send single-threaded executor). Checks oneshot state in a loop
+    /// with async yield between iterations, avoiding reliance on the waker mechanism.
+    pub async fn recv_polling(self) -> Result<T, RecvError> {
+        loop {
+            let state = self.inner.state.load(Ordering::Acquire);
+            match state {
+                VALUE => {
+                    let value = unsafe { (*self.inner.value.get()).assume_init_read() };
+                    self.inner.state.store(CLOSED, Ordering::Relaxed);
+                    std::mem::forget(self);
+                    return Ok(value);
+                }
+                CLOSED => {
+                    std::mem::forget(self);
+                    return Err(RecvError);
+                }
+                EMPTY => {
+                    // Yield to the runtime — allows other tasks (including the event loop's
+                    // SPSC drain that processes the response) to make progress.
+                    // Sleep briefly to let monoio's reactor poll I/O and other tasks.
+                    // monoio's !Send executor doesn't support cross-thread Waker::wake(),
+                    // so we must poll periodically rather than relying on the waker.
+                    // 50μs balances latency (~20K ops/s floor) vs CPU spin.
+                    #[cfg(feature = "runtime-monoio")]
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    #[cfg(not(feature = "runtime-monoio"))]
+                    {
+                        let mut yielded = false;
+                        std::future::poll_fn(|cx| {
+                            if yielded {
+                                std::task::Poll::Ready(())
+                            } else {
+                                yielded = true;
+                                cx.waker().wake_by_ref();
+                                std::task::Poll::Pending
+                            }
+                        }).await;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
     /// Blocking receive for use from non-async contexts (e.g., OS thread watchers).
     /// Spins with thread::yield_now until value arrives or sender is dropped.
     pub fn recv_blocking(self) -> Result<T, RecvError> {

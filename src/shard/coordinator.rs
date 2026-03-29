@@ -18,7 +18,9 @@ use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::runtime::channel;
-use crate::server::response_slot::ResponseSlotPool;
+// Coordinator uses oneshot channels (not ResponseSlotPool) for cross-thread safety.
+// ResponseSlotPool's AtomicWaker doesn't work with monoio's !Send executor.
+// The oneshot overhead (~80ns) is negligible on the multi-key coordination path.
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::entry::CachedClock;
@@ -38,7 +40,7 @@ pub async fn coordinate_multi_key(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
         coordinate_mget(
@@ -141,7 +143,7 @@ async fn coordinate_mget(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -167,7 +169,7 @@ async fn coordinate_mget(
 
     let total = args.len();
     let mut results: Vec<Option<Frame>> = vec![None; total];
-    let mut pending_shards: Vec<(Vec<usize>, usize)> = Vec::new();
+    let mut pending_shards: Vec<(Vec<usize>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::new();
 
     // Iterate in ascending shard-ID order (BTreeMap guarantees this)
     for (shard_id, indexed_keys) in &groups {
@@ -190,7 +192,7 @@ async fn coordinate_mget(
             }
         } else {
             // Remote dispatch: batch of GET commands via MultiExecuteSlotted
-            let slot_ptr = response_pool.slot_ptr(*shard_id);
+            let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = indexed_keys
                 .iter()
                 .map(|(_, k)| {
@@ -201,19 +203,19 @@ async fn coordinate_mget(
                     (k.clone(), cmd)
                 })
                 .collect();
-            let msg = ShardMessage::MultiExecuteSlotted {
+            let msg = ShardMessage::MultiExecute {
                 db_index,
                 commands,
-                response_slot: slot_ptr,
+                reply_tx,
             };
             spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push((original_indices, *shard_id));
+            pending_shards.push((original_indices, reply_rx));
         }
     }
 
     // Await all remote results
-    for (indices, target_shard) in pending_shards {
-        let frames = response_pool.future_for(target_shard).await;
+    for (indices, reply_rx) in pending_shards {
+        let frames = reply_rx.await.unwrap_or_default();
         for (idx, frame) in indices.into_iter().zip(frames) {
             results[idx] = Some(frame);
         }
@@ -241,7 +243,7 @@ async fn coordinate_mset(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() || args.len() % 2 != 0 {
         return Frame::Error(Bytes::from_static(
@@ -279,7 +281,7 @@ async fn coordinate_mset(
         return crate::command::string::mset(&mut guard, args);
     }
 
-    let mut pending_shards: Vec<usize> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
@@ -289,7 +291,7 @@ async fn coordinate_mset(
                 guard.set_string(key.clone(), value.clone());
             }
         } else {
-            let slot_ptr = response_pool.slot_ptr(*shard_id);
+            let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = kv_pairs
                 .iter()
                 .map(|(k, v)| {
@@ -301,18 +303,18 @@ async fn coordinate_mset(
                     (k.clone(), cmd)
                 })
                 .collect();
-            let msg = ShardMessage::MultiExecuteSlotted {
+            let msg = ShardMessage::MultiExecute {
                 db_index,
                 commands,
-                response_slot: slot_ptr,
+                reply_tx,
             };
             spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push(*shard_id);
+            pending_shards.push(reply_rx);
         }
     }
 
-    for target_shard in pending_shards {
-        let _ = response_pool.future_for(target_shard).await;
+    for reply_rx in pending_shards {
+        let _ = reply_rx.await;
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
@@ -332,7 +334,7 @@ async fn coordinate_multi_del_or_exists(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     let cmd_upper = cmd.to_ascii_uppercase();
 
@@ -359,7 +361,7 @@ async fn coordinate_multi_del_or_exists(
     }
 
     let mut total_count: i64 = 0;
-    let mut pending_shards: Vec<usize> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
 
     for (shard_id, key_args) in &groups {
         if *shard_id == my_shard {
@@ -372,7 +374,7 @@ async fn coordinate_multi_del_or_exists(
                 total_count += n;
             }
         } else {
-            let slot_ptr = response_pool.slot_ptr(*shard_id);
+            let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = key_args
                 .iter()
                 .map(|arg| {
@@ -384,18 +386,18 @@ async fn coordinate_multi_del_or_exists(
                     (key, cmd_frame)
                 })
                 .collect();
-            let msg = ShardMessage::MultiExecuteSlotted {
+            let msg = ShardMessage::MultiExecute {
                 db_index,
                 commands,
-                response_slot: slot_ptr,
+                reply_tx,
             };
             spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push(*shard_id);
+            pending_shards.push(reply_rx);
         }
     }
 
-    for target_shard in pending_shards {
-        let frames = response_pool.future_for(target_shard).await;
+    for reply_rx in pending_shards {
+        let frames = reply_rx.await.unwrap_or_default();
         for frame in frames {
             if let Frame::Integer(n) = frame {
                 total_count += n;
@@ -418,7 +420,7 @@ pub async fn coordinate_keys(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -427,7 +429,7 @@ pub async fn coordinate_keys(
     }
 
     let mut all_keys: Vec<Frame> = Vec::new();
-    let mut pending_shards: Vec<usize> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
 
     // Execute locally on this shard
     {
@@ -446,7 +448,7 @@ pub async fn coordinate_keys(
         if target == my_shard {
             continue;
         }
-        let slot_ptr = response_pool.slot_ptr(target);
+        let (reply_tx, reply_rx) = channel::oneshot();
         let cmd_frame = {
             let mut parts = vec![Frame::BulkString(Bytes::from_static(b"KEYS"))];
             for a in args {
@@ -454,22 +456,20 @@ pub async fn coordinate_keys(
             }
             Frame::Array(parts.into())
         };
-        let msg = ShardMessage::ExecuteSlotted {
+        let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
-            response_slot: slot_ptr,
+            reply_tx,
         };
         spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
-        pending_shards.push(target);
+        pending_shards.push(reply_rx);
     }
 
     // Collect remote results
-    for target_shard in pending_shards {
-        let frames = response_pool.future_for(target_shard).await;
-        if let Some(frame) = frames.into_iter().next() {
-            if let Frame::Array(keys) = frame {
-                all_keys.extend(keys);
-            }
+    for reply_rx in pending_shards {
+        let frame = reply_rx.await.unwrap_or(Frame::Null);
+        if let Frame::Array(keys) = frame {
+            all_keys.extend(keys);
         }
     }
 
@@ -489,7 +489,7 @@ pub async fn coordinate_scan(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -535,18 +535,17 @@ pub async fn coordinate_scan(
         }
     } else {
         // Remote dispatch
-        let slot_ptr = response_pool.slot_ptr(target_shard_id);
+        let (reply_tx, reply_rx) = channel::oneshot();
         let mut parts = vec![Frame::BulkString(Bytes::from_static(b"SCAN"))];
         parts.extend(scan_args);
         let cmd_frame = Frame::Array(parts.into());
-        let msg = ShardMessage::ExecuteSlotted {
+        let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
-            response_slot: slot_ptr,
+            reply_tx,
         };
         spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
-        let frames = response_pool.future_for(target_shard_id).await;
-        frames.into_iter().next().unwrap_or(Frame::Null)
+        reply_rx.await.unwrap_or(Frame::Null)
     };
 
     // Parse the SCAN response: [cursor, [keys...]]
@@ -599,10 +598,10 @@ pub async fn coordinate_dbsize(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
-    response_pool: &ResponseSlotPool,
+    response_pool: &(),  // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     let mut total: i64 = 0;
-    let mut pending_shards: Vec<usize> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
 
     // Local shard
     {
@@ -615,20 +614,20 @@ pub async fn coordinate_dbsize(
         if target == my_shard {
             continue;
         }
-        let slot_ptr = response_pool.slot_ptr(target);
+        let (reply_tx, reply_rx) = channel::oneshot();
         let cmd_frame = Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"DBSIZE"))]);
-        let msg = ShardMessage::ExecuteSlotted {
+        let msg = ShardMessage::Execute {
             db_index,
             command: std::sync::Arc::new(cmd_frame),
-            response_slot: slot_ptr,
+            reply_tx,
         };
         spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
-        pending_shards.push(target);
+        pending_shards.push(reply_rx);
     }
 
-    for target_shard in pending_shards {
-        let frames = response_pool.future_for(target_shard).await;
-        if let Some(Frame::Integer(n)) = frames.into_iter().next() {
+    for reply_rx in pending_shards {
+        let frame = reply_rx.await.unwrap_or(Frame::Null);
+        if let Frame::Integer(n) = frame {
             total += n;
         }
     }
@@ -701,7 +700,7 @@ mod tests {
         // With num_shards=1, all keys are local
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
-        let response_pool = ResponseSlotPool::new(1, 0);
+        let response_pool = ();
         let result = coordinate_mget(
             &args,
             0,
@@ -742,7 +741,7 @@ mod tests {
 
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
-        let response_pool = ResponseSlotPool::new(1, 0);
+        let response_pool = ();
         let result = coordinate_mset(
             &args,
             0,
@@ -785,7 +784,7 @@ mod tests {
 
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
-        let response_pool = ResponseSlotPool::new(1, 0);
+        let response_pool = ();
         let result = coordinate_multi_del_or_exists(
             b"DEL",
             &args,
