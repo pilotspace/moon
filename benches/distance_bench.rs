@@ -3,8 +3,9 @@
 //! Validates VEC-SIMD-02: SIMD dispatch achieves >=3x speedup over scalar
 //! at standard embedding dimensions (384, 768, 1024).
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use moon::vector::distance;
+use std::hint::black_box;
 
 // ── Deterministic vector generators (LCG, seed-based) ──────────────────
 
