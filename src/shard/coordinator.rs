@@ -215,9 +215,20 @@ async fn coordinate_mget(
 
     // Await all remote results
     for (indices, reply_rx) in pending_shards {
-        let frames = reply_rx.recv().await.unwrap_or_default();
-        for (idx, frame) in indices.into_iter().zip(frames) {
-            results[idx] = Some(frame);
+        match reply_rx.recv().await {
+            Ok(frames) => {
+                for (idx, frame) in indices.into_iter().zip(frames) {
+                    results[idx] = Some(frame);
+                }
+            }
+            Err(_) => {
+                // Channel closed — target shard dropped without responding.
+                for idx in indices {
+                    results[idx] = Some(Frame::Error(Bytes::from_static(
+                        b"ERR cross-shard reply channel closed",
+                    )));
+                }
+            }
         }
     }
 
@@ -397,10 +408,18 @@ async fn coordinate_multi_del_or_exists(
     }
 
     for reply_rx in pending_shards {
-        let frames = reply_rx.recv().await.unwrap_or_default();
-        for frame in frames {
-            if let Frame::Integer(n) = frame {
-                total_count += n;
+        match reply_rx.recv().await {
+            Ok(frames) => {
+                for frame in frames {
+                    if let Frame::Integer(n) = frame {
+                        total_count += n;
+                    }
+                }
+            }
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during DEL/UNLINK",
+                ));
             }
         }
     }
@@ -467,9 +486,14 @@ pub async fn coordinate_keys(
 
     // Collect remote results
     for reply_rx in pending_shards {
-        let frame = reply_rx.recv().await.unwrap_or(Frame::Null);
-        if let Frame::Array(keys) = frame {
-            all_keys.extend(keys);
+        match reply_rx.recv().await {
+            Ok(Frame::Array(keys)) => all_keys.extend(keys),
+            Ok(_) => {} // Non-array response (e.g., error) — skip
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during KEYS",
+                ));
+            }
         }
     }
 
@@ -545,7 +569,12 @@ pub async fn coordinate_scan(
             reply_tx,
         };
         spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
-        reply_rx.recv().await.unwrap_or(Frame::Null)
+        match reply_rx.recv().await {
+            Ok(frame) => frame,
+            Err(_) => Frame::Error(Bytes::from_static(
+                b"ERR cross-shard reply channel closed during SCAN",
+            )),
+        }
     };
 
     // Parse the SCAN response: [cursor, [keys...]]
@@ -626,9 +655,14 @@ pub async fn coordinate_dbsize(
     }
 
     for reply_rx in pending_shards {
-        let frame = reply_rx.recv().await.unwrap_or(Frame::Null);
-        if let Frame::Integer(n) = frame {
-            total += n;
+        match reply_rx.recv().await {
+            Ok(Frame::Integer(n)) => total += n,
+            Ok(_) => {} // Non-integer response — skip
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during DBSIZE",
+                ));
+            }
         }
     }
 

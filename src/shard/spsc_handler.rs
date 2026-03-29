@@ -449,7 +449,7 @@ pub(crate) fn handle_shard_message_shared(
                     None => {
                         // SAFETY: response_slot points to a valid ResponseSlot owned by the
                         // connection's ResponseSlotPool, which outlives all dispatched messages.
-                        let slot = unsafe { &*response_slot };
+                        let slot = unsafe { &*response_slot.0 };
                         slot.fill(vec![crate::protocol::Frame::Error(
                             bytes::Bytes::from_static(b"ERR invalid command format"),
                         )]);
@@ -525,7 +525,7 @@ pub(crate) fn handle_shard_message_shared(
                 frame
             };
             // SAFETY: response_slot points to a valid ResponseSlot (see above).
-            let slot = unsafe { &*response_slot };
+            let slot = unsafe { &*response_slot.0 };
             slot.fill(vec![response]);
         }
         ShardMessage::MultiExecuteSlotted {
@@ -611,7 +611,7 @@ pub(crate) fn handle_shard_message_shared(
             }
             drop(guard);
             // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
-            let slot = unsafe { &*response_slot };
+            let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
         }
         ShardMessage::PipelineBatchSlotted {
@@ -699,7 +699,7 @@ pub(crate) fn handle_shard_message_shared(
             }
             drop(guard);
             // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
-            let slot = unsafe { &*response_slot };
+            let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
         }
         ShardMessage::PubSubFanOut { channel, message } => {

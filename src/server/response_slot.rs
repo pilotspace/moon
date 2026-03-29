@@ -7,6 +7,7 @@
 
 use std::cell::UnsafeCell;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
@@ -62,7 +63,8 @@ impl ResponseSlot {
     /// # Safety contract
     /// Must only be called when state is EMPTY. Calling fill on a FILLED slot
     /// is a logic error (response would be lost). Debug-asserts guard this.
-    pub fn fill(&self, response: Vec<Frame>) {
+    /// Single-producer only (target shard thread).
+    pub(crate) fn fill(&self, response: Vec<Frame>) {
         // Write data before state transition (will be visible via Release ordering)
         unsafe {
             *self.data.get() = Some(response);
@@ -82,7 +84,7 @@ impl ResponseSlot {
     ///
     /// Returns `Ready(data)` if the slot has been filled, or `Pending` if empty.
     /// After returning `Ready`, the slot is reset to EMPTY and can be reused.
-    pub fn poll_take(&self, cx: &mut Context<'_>) -> Poll<Vec<Frame>> {
+    pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> Poll<Vec<Frame>> {
         // Fast path: check if filled.
         let state = self.state.load(Ordering::Acquire);
         if state == FILLED {
@@ -110,7 +112,8 @@ impl ResponseSlot {
     /// Force-reset the slot to EMPTY, clearing any pending data and waker.
     ///
     /// Used after connection errors to ensure clean state for potential reuse.
-    pub fn reset(&self) {
+    #[allow(dead_code)] // Used in tests and available for future error recovery paths
+    pub(crate) fn reset(&self) {
         self.state.store(EMPTY, Ordering::Release);
         unsafe {
             *self.data.get() = None;
@@ -128,22 +131,22 @@ impl Default for ResponseSlot {
 
 /// Future that wraps a `ResponseSlot` reference for async `.await` usage.
 ///
-/// Holds a raw pointer to the slot for lifetime flexibility — the slot
-/// (owned by the pool) outlives the future (created per-dispatch).
-pub struct ResponseSlotFuture {
+/// The lifetime `'a` ties this future to the `ResponseSlotPool` that owns
+/// the slot, preventing use-after-free at compile time.
+pub struct ResponseSlotFuture<'a> {
     slot: *const ResponseSlot,
+    _marker: PhantomData<&'a ResponseSlot>,
 }
 
-// SAFETY: The underlying ResponseSlot is Send+Sync, and the pointer remains
-// valid for the lifetime of the connection (the pool that owns the slot
-// outlives all dispatched futures).
-unsafe impl Send for ResponseSlotFuture {}
+// SAFETY: The underlying ResponseSlot is Send+Sync, and the lifetime parameter
+// ensures the pool (which owns the slot) outlives this future.
+unsafe impl Send for ResponseSlotFuture<'_> {}
 
-impl Future for ResponseSlotFuture {
+impl Future for ResponseSlotFuture<'_> {
     type Output = Vec<Frame>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: Pointer validity guaranteed by ResponseSlotPool lifetime.
+        // SAFETY: Pointer validity guaranteed by lifetime bound to ResponseSlotPool.
         let slot = unsafe { &*self.slot };
         slot.poll_take(cx)
     }
@@ -186,10 +189,13 @@ impl ResponseSlotPool {
     }
 
     /// Create a future that resolves when the target shard fills the slot.
+    ///
+    /// The returned future borrows the pool, ensuring the slot outlives the future.
     #[inline]
-    pub fn future_for(&self, target_shard: usize) -> ResponseSlotFuture {
+    pub fn future_for(&self, target_shard: usize) -> ResponseSlotFuture<'_> {
         ResponseSlotFuture {
             slot: self.slot_ptr(target_shard),
+            _marker: PhantomData,
         }
     }
 }

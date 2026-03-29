@@ -125,11 +125,16 @@ trap cleanup EXIT
 
 parse_rps() {
     # Redis-benchmark 8.x uses \r for progress, final line has "requests per second"
-    tr '\r' '\n' \
-        | awk '/[Rr]equests per second/ { for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if ($i+0 == $i && $i > 0) { print $i; exit } } }' \
-        | head -1 \
-        || sed -n 's/.*[[:space:]]\([0-9][0-9.]*\)[[:space:]]*requests per second.*/\1/p' \
-        | sed 's/,//g' | tail -1
+    local input
+    input=$(tr '\r' '\n')
+    local result
+    result=$(echo "$input" | awk '/[Rr]equests per second/ { found=1; for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if ($i+0 == $i && $i > 0) { print $i; exit } } } END { if (!found) exit 1 }')
+    if [[ -n "$result" ]]; then
+        echo "$result"
+    else
+        echo "$input" | sed -n 's/.*[[:space:]]\([0-9][0-9.]*\)[[:space:]]*requests per second.*/\1/p' \
+            | sed 's/,//g' | tail -1
+    fi
 }
 
 parse_latency() {
@@ -452,10 +457,7 @@ for shards in $SHARDS_LIST; do
                 if ! $SKIP_REDIS; then
                     redis_result=$(bench_config "$HOST" "$REDIS_PORT" "$clients" "$pipeline" "$cmd")
                     REDIS_RPS[$local_key]=$(echo "$redis_result" | awk '{print $1}')
-                    REDIS_MIN[$local_key]=$(echo "$redis_result" | awk '{print $2}')
-                    REDIS_MAX[$local_key]=$(echo "$redis_result" | awk '{print $3}')
                     REDIS_P50[$local_key]=$(echo "$redis_result" | awk '{print $4}')
-                    REDIS_P99[$local_key]=$(echo "$redis_result" | awk '{print $5}')
                 fi
 
                 # Track 1-shard baseline

@@ -128,6 +128,7 @@ pub async fn handle_connection_sharded(
         cached_clock,
         true, // can_migrate: plain TCP supports FD extraction
         BytesMut::new(),
+        None, // fresh connection, no migrated state
     )
     .await;
 
@@ -219,6 +220,7 @@ pub async fn handle_connection_sharded_inner<
     cached_clock: CachedClock,
     can_migrate: bool,
     initial_read_buf: BytesMut,
+    migrated_state: Option<&MigratedConnectionState>,
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -227,18 +229,18 @@ pub async fn handle_connection_sharded_inner<
     let mut read_buf = if initial_read_buf.is_empty() {
         BytesMut::with_capacity(8192)
     } else {
-        // Migration buffer contains synthetic SELECT/CLIENT SETNAME + leftover bytes.
-        // Reserve extra capacity for incoming data beyond the initial commands.
+        // Migration buffer: leftover bytes from the source connection.
         let mut buf = initial_read_buf;
         buf.reserve(8192);
         buf
     };
     let mut write_buf = BytesMut::with_capacity(8192);
     let parse_config = crate::protocol::ParseConfig::default();
-    let mut protocol_version: u8 = 2;
-    let mut selected_db: usize = 0;
-    let mut authenticated = requirepass.is_none();
-    let mut current_user: String = "default".to_string();
+    // Restore connection state from migration, or use defaults for fresh connections.
+    let mut protocol_version: u8 = migrated_state.map_or(2, |s| s.protocol_version);
+    let mut selected_db: usize = migrated_state.map_or(0, |s| s.selected_db);
+    let mut authenticated = migrated_state.map_or(requirepass.is_none(), |s| s.authenticated);
+    let mut current_user: String = migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
     let acl_max_len = runtime_config
         .read()
         .map(|cfg| cfg.acllog_max_len)
@@ -254,7 +256,7 @@ pub async fn handle_connection_sharded_inner<
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
 
     // RESP3/HELLO connection-local state
-    let mut client_name: Option<Bytes> = None;
+    let mut client_name: Option<Bytes> = migrated_state.and_then(|s| s.client_name.clone());
 
     // Cluster ASKING flag: set by ASKING command, cleared unconditionally before routing check.
     let mut asking: bool = false;
@@ -890,8 +892,9 @@ pub async fn handle_connection_sharded_inner<
                     // and all responses are written, ensuring no command/response desync.
                     if let (Some(tracker), Some(target)) = (&mut affinity_tracker, target_shard) {
                         if let Some(migrate_to) = tracker.record(target) {
-                            // Migration preconditions: not in MULTI block
-                            if !in_multi {
+                            // Migration preconditions: not in MULTI, no active CLIENT TRACKING
+                            // (tracking connections need untrack_all cleanup which doesn't transfer)
+                            if !in_multi && !tracking_state.enabled {
                                 migration_target = Some(migrate_to);
                             }
                         }
@@ -1023,7 +1026,7 @@ pub async fn handle_connection_sharded_inner<
                         let slot_ptr = response_pool.slot_ptr(target);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: slot_ptr };
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
                         {
                             let mut pending = msg;

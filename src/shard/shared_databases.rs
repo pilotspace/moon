@@ -34,6 +34,8 @@ impl ShardDatabases {
     /// Acquire a shared read lock on a specific database.
     #[inline]
     pub fn read_db(&self, shard_id: usize, db_index: usize) -> RwLockReadGuard<'_, Database> {
+        debug_assert!(shard_id < self.shards.len(), "shard_id {shard_id} out of bounds ({})", self.shards.len());
+        debug_assert!(db_index < self.shards[shard_id].len(), "db_index {db_index} out of bounds ({})", self.shards[shard_id].len());
         self.shards[shard_id][db_index].read()
     }
 
@@ -45,6 +47,8 @@ impl ShardDatabases {
     /// infinite busy-spin when readers hold locks longer (e.g., KEYS, SCAN).
     #[inline]
     pub fn write_db(&self, shard_id: usize, db_index: usize) -> RwLockWriteGuard<'_, Database> {
+        debug_assert!(shard_id < self.shards.len(), "shard_id {shard_id} out of bounds ({})", self.shards.len());
+        debug_assert!(db_index < self.shards[shard_id].len(), "db_index {db_index} out of bounds ({})", self.shards[shard_id].len());
         // Spin briefly — resolves in 1-3 iterations for typical cross-shard reads.
         for _ in 0..32 {
             if let Some(guard) = self.shards[shard_id][db_index].try_write() {

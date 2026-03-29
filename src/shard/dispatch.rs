@@ -5,6 +5,19 @@ use crate::protocol::Frame;
 use crate::runtime::channel;
 use crate::server::response_slot::ResponseSlot;
 
+/// Newtype wrapper for `*const ResponseSlot` to isolate the `Send` unsafety.
+///
+/// Raw pointers are `!Send` by default. This newtype provides a localized
+/// `unsafe impl Send` with a clear safety contract, instead of requiring a
+/// blanket `unsafe impl Send for ShardMessage`.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseSlotPtr(pub *const ResponseSlot);
+
+// SAFETY: The pointed-to ResponseSlot is Send+Sync (enforced by its own unsafe impls).
+// The pointer remains valid for the lifetime of the connection's ResponseSlotPool,
+// which outlives all dispatched ShardMessage values.
+unsafe impl Send for ResponseSlotPtr {}
+
 const HASH_SEED: u64 = 0;
 
 /// Determine which shard owns a key.
@@ -114,31 +127,29 @@ pub enum ShardMessage {
     ExecuteSlotted {
         db_index: usize,
         command: std::sync::Arc<Frame>,
-        response_slot: *const ResponseSlot,
+        response_slot: ResponseSlotPtr,
     },
     /// Execute multi-key sub-operation with pre-allocated response slot.
     /// Used instead of MultiExecute for cross-shard multi-key dispatch.
     MultiExecuteSlotted {
         db_index: usize,
         commands: Vec<(Bytes, Frame)>,
-        response_slot: *const ResponseSlot,
+        response_slot: ResponseSlotPtr,
     },
     /// Execute pipelined batch with pre-allocated response slot.
     /// Used instead of PipelineBatch for cross-shard pipeline dispatch.
     PipelineBatchSlotted {
         db_index: usize,
         commands: Vec<std::sync::Arc<Frame>>,
-        response_slot: *const ResponseSlot,
+        response_slot: ResponseSlotPtr,
     },
     /// Graceful shutdown signal.
     Shutdown,
 }
 
-// SAFETY: All existing ShardMessage fields are Send. The new *const ResponseSlot
-// fields point to ResponseSlot values that are Send+Sync, and the pointers remain
-// valid for the lifetime of the connection (the ResponseSlotPool outlives all
-// dispatched messages). Raw pointers are !Send by default, requiring this explicit impl.
-unsafe impl Send for ShardMessage {}
+// ShardMessage is Send because all fields are Send. The raw pointer in
+// ResponseSlotPtr is the only non-auto-Send field, and it has its own
+// localized unsafe impl Send with documented safety invariants.
 
 #[cfg(test)]
 mod tests {

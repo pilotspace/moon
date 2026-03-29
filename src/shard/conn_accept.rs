@@ -53,42 +53,13 @@ pub(crate) fn create_reuseport_socket(addr: &str) -> std::io::Result<std::net::T
     Ok(socket.into())
 }
 
-/// Build a read buffer that prepends synthetic RESP commands for state restoration.
+/// Extract the read buffer remainder from migration state.
 ///
-/// Used by `spawn_migrated_*_connection` to restore selected_db and client_name.
-///
-/// If `selected_db != 0`, prepends `SELECT {db}`. If `client_name` is set, prepends
-/// `CLIENT SETNAME {name}`. The original `read_buf_remainder` is appended after the
-/// synthetic commands so the handler processes state restoration before any pending
-/// client data.
-fn build_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
-    let mut buf = BytesMut::new();
-
-    // Restore selected database via synthetic SELECT command
-    if state.selected_db != 0 {
-        let db_str = state.selected_db.to_string();
-        // RESP: *2\r\n$6\r\nSELECT\r\n${len}\r\n{db}\r\n
-        buf.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$");
-        buf.extend_from_slice(db_str.len().to_string().as_bytes());
-        buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(db_str.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-    }
-
-    // Restore client name via synthetic CLIENT SETNAME command
-    if let Some(ref name) = state.client_name {
-        // RESP: *3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n${len}\r\n{name}\r\n
-        buf.extend_from_slice(b"*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$");
-        buf.extend_from_slice(name.len().to_string().as_bytes());
-        buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(name);
-        buf.extend_from_slice(b"\r\n");
-    }
-
-    // Append any unparsed bytes from the original connection
-    buf.extend_from_slice(&state.read_buf_remainder);
-
-    buf
+/// State restoration (selected_db, client_name, protocol_version, current_user)
+/// is handled directly by the handler via the `migrated_state` parameter —
+/// no synthetic RESP commands are injected into the read buffer.
+fn take_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
+    std::mem::take(&mut state.read_buf_remainder)
 }
 
 /// Spawn a new tokio connection handler task (plain TCP or TLS).
@@ -202,6 +173,7 @@ pub(crate) fn spawn_tokio_connection(
                         clk,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
+                        None, // fresh connection
                     )
                     .await;
                 }
@@ -310,12 +282,10 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let clk = cached_clock.clone();
             let peer_addr = state.peer_addr.clone();
 
-            // Build read buffer with synthetic state-restoration commands prepended
-            let migration_buf = build_migration_read_buf(&mut state);
+            let migration_buf = take_migration_read_buf(&mut state);
 
-            // Pass requirepass=None so the handler treats the connection as pre-authenticated.
-            // State restoration (SELECT, CLIENT SETNAME) happens via synthetic commands
-            // prepended to the read buffer by the handler's normal command processing.
+            // State restoration happens directly via migrated_state parameter —
+            // no synthetic RESP commands, no leaked responses.
             tokio::task::spawn_local(async move {
                 let _ = handle_connection_sharded_inner(
                     tcp_stream,
@@ -344,6 +314,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
                     clk,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
+                    Some(&state),
                 )
                 .await;
             });
@@ -463,6 +434,7 @@ pub(crate) fn spawn_monoio_connection(
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
+                                None, // fresh connection
                             )
                             .await;
                         }
@@ -514,6 +486,7 @@ pub(crate) fn spawn_monoio_connection(
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
+                        None, // fresh connection
                     )
                     .await;
 
@@ -654,8 +627,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let pw = pending_wakers.clone();
             let peer_addr = state.peer_addr.clone();
 
-            // Build read buffer with synthetic state-restoration commands prepended
-            let migration_buf = build_migration_read_buf(&mut state);
+            let migration_buf = take_migration_read_buf(&mut state);
 
             monoio::spawn(async move {
                 let _ = handle_connection_sharded_monoio(
@@ -686,6 +658,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     pw,
+                    Some(&state),
                 )
                 .await;
             });

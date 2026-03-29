@@ -98,27 +98,26 @@ pub async fn handle_connection_sharded_monoio<
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
+    migrated_state: Option<&MigratedConnectionState>,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
     let mut read_buf = if initial_read_buf.is_empty() {
         BytesMut::with_capacity(8192)
     } else {
-        // Migration buffer contains synthetic SELECT/CLIENT SETNAME + leftover bytes.
-        // Reserve extra capacity for incoming data beyond the initial commands.
         let mut buf = initial_read_buf;
         buf.reserve(8192);
         buf
     };
     let mut write_buf = BytesMut::with_capacity(8192);
     let mut codec = RespCodec::default();
-    let mut selected_db: usize = 0;
+    let mut selected_db: usize = migrated_state.map_or(0, |s| s.selected_db);
     let db_count = shard_databases.db_count();
 
-    // Connection-level state (mirroring Tokio handler)
-    let mut protocol_version: u8 = 2;
-    let mut authenticated = requirepass.is_none();
-    let mut current_user: String = "default".to_string();
+    // Connection-level state — restored from migration or defaults for fresh connections.
+    let mut protocol_version: u8 = migrated_state.map_or(2, |s| s.protocol_version);
+    let mut authenticated = migrated_state.map_or(requirepass.is_none(), |s| s.authenticated);
+    let mut current_user: String = migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
     let acl_max_len = runtime_config
         .read()
         .map(|cfg| cfg.acllog_max_len)
@@ -126,7 +125,7 @@ pub async fn handle_connection_sharded_monoio<
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
-    let mut client_name: Option<Bytes> = None;
+    let mut client_name: Option<Bytes> = migrated_state.and_then(|s| s.client_name.clone());
     let mut asking: bool = false;
 
     // Pub/Sub connection-local state
@@ -1305,7 +1304,7 @@ pub async fn handle_connection_sharded_monoio<
             // Migration is deferred until AFTER the current batch is fully processed.
             if let (Some(tracker), Some(target)) = (&mut affinity_tracker, target_shard) {
                 if let Some(migrate_to) = tracker.record(target) {
-                    if !in_multi && subscription_count == 0 {
+                    if !in_multi && subscription_count == 0 && !tracking_state.enabled {
                         migration_target = Some(migrate_to);
                     }
                 }

@@ -1,6 +1,6 @@
 //! Runtime-agnostic channel types replacing tokio::sync::{mpsc, oneshot, watch, Notify}.
 //!
-//! Uses `flume` for mpsc/watch/notify. Oneshot uses a lock-free AtomicU8 state machine.
+//! Uses `flume` for mpsc, oneshot (bounded-1), watch, and notify.
 #![allow(unused_imports, clippy::result_unit_err)]
 
 use std::future::Future;
@@ -17,10 +17,7 @@ pub use flume::{
 };
 
 // --- oneshot ---
-// Lock-free oneshot using AtomicU8 state machine + UnsafeCell + AtomicWaker.
-// Zero mutex contention -- eliminates 12% CPU overhead from flume's Mutex<VecDeque>.
-
-// T: Send is required because value crosses thread boundaries.
+// Backed by flume bounded(1). Cross-thread wakeup works with monoio's !Send executor.
 
 pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
     // Use flume bounded(1) instead of custom AtomicU8 state machine.
@@ -81,10 +78,16 @@ impl<T: Send + 'static> Future for OneshotReceiver<T> {
             let rx = self.rx.clone();
             self.recv_fut = Some(Box::pin(rx.into_recv_async()));
         }
-        match self.recv_fut.as_mut().unwrap().as_mut().poll(cx) {
-            Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(RecvError)),
-            Poll::Pending => Poll::Pending,
+        match self.recv_fut.as_mut() {
+            Some(fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(RecvError)),
+                Poll::Pending => Poll::Pending,
+            },
+            None => {
+                debug_assert!(false, "recv_fut should have been set above");
+                Poll::Pending
+            }
         }
     }
 }
