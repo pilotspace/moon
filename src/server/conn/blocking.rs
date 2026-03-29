@@ -878,7 +878,7 @@ pub(crate) fn try_inline_dispatch(
         let key_bytes = &buf[key_start..key_end];
 
         // Lookup in database
-        let guard = shard_databases.read_db(shard_id, selected_db);
+        let mut guard = shard_databases.write_db(shard_id, selected_db);
         match guard.get(key_bytes) {
             Some(entry) => {
                 match entry.value.as_bytes() {

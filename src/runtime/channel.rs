@@ -3,10 +3,10 @@
 //! Uses `flume` for mpsc, oneshot (bounded-1), watch, and notify.
 #![allow(unused_imports, clippy::result_unit_err)]
 
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::task::{Context, Poll};
 
 // --- mpsc ---

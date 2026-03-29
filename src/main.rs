@@ -340,7 +340,10 @@ fn main() -> anyhow::Result<()> {
             // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP accept.
             // The central listener only routes TLS connections.
             let per_shard_accept = cfg!(target_os = "linux");
-            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel, per_shard_accept).await {
+            if let Err(e) =
+                server::listener::run_sharded(config, conn_txs, listener_cancel, per_shard_accept)
+                    .await
+            {
                 tracing::error!("Listener error: {}", e);
             }
         });
@@ -378,7 +381,10 @@ fn main() -> anyhow::Result<()> {
 
         let per_shard_accept = cfg!(target_os = "linux");
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
-            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel, per_shard_accept).await {
+            if let Err(e) =
+                server::listener::run_sharded(config, conn_txs, listener_cancel, per_shard_accept)
+                    .await
+            {
                 tracing::error!("Listener error: {}", e);
             }
         });

@@ -117,7 +117,8 @@ pub async fn handle_connection_sharded_monoio<
     // Connection-level state — restored from migration or defaults for fresh connections.
     let mut protocol_version: u8 = migrated_state.map_or(2, |s| s.protocol_version);
     let mut authenticated = migrated_state.map_or(requirepass.is_none(), |s| s.authenticated);
-    let mut current_user: String = migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
+    let mut current_user: String =
+        migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
     let acl_max_len = runtime_config
         .read()
         .map(|cfg| cfg.acllog_max_len)
