@@ -76,7 +76,7 @@ impl<T: Copy + Default> AlignedBuffer<T> {
             std::mem::forget(v);
             Self { ptr, len, layout }
         } else {
-            let mut buf = Self::new(v.len());
+            let buf = Self::new(v.len());
             if !v.is_empty() {
                 // SAFETY: buf.ptr points to a valid allocation of at least `v.len() * size_of::<T>()`
                 // bytes. src_ptr is valid for `v.len()` elements. The regions do not overlap
