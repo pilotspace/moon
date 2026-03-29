@@ -1671,9 +1671,7 @@ pub async fn handle_connection_sharded_monoio<
             }
             // Resolve all batch slots
             for (slot, counts, resp_indices) in &batch_slots {
-                while !slot.is_ready() {
-                    monoio::time::sleep(std::time::Duration::from_micros(1)).await;
-                }
+                crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
                 for (i, resp_idx) in resp_indices.iter().enumerate() {
                     let remote_count = counts[i].load(std::sync::atomic::Ordering::Relaxed);
                     if remote_count > 0 {
