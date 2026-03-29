@@ -90,8 +90,9 @@ pub(crate) fn spawn_tokio_connection(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
-    remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
+    remote_subscriber_map: &Arc<RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<RwLock<RemoteSubscriberMap>>],
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -126,6 +127,7 @@ pub(crate) fn spawn_tokio_connection(
     let notifiers = all_notifiers.to_vec();
     let snap_tx = snapshot_trigger_tx.clone();
     let all_regs = all_pubsub_registries.to_vec();
+    let all_rsm = all_remote_sub_maps.to_vec();
     // Fail closed: if the config lock is poisoned, treat as requiring auth
     // (deny by default) rather than silently disabling authentication.
     let reqpass = match rtcfg.read() {
@@ -178,6 +180,7 @@ pub(crate) fn spawn_tokio_connection(
                         clk,
                         rsm,
                         all_regs,
+                        all_rsm,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
@@ -195,6 +198,7 @@ pub(crate) fn spawn_tokio_connection(
             handle_connection_sharded(
                 tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm, all_regs,
+                all_rsm,
             )
             .await;
         });
@@ -238,8 +242,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
-    remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
+    remote_subscriber_map: &Arc<RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<RwLock<RemoteSubscriberMap>>],
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -402,6 +407,7 @@ pub(crate) fn spawn_monoio_connection(
             let clk = cached_clock.clone();
             let pw = pending_wakers.clone();
             let all_regs = all_pubsub_registries.to_vec();
+            let all_rsm = all_remote_sub_maps.to_vec();
 
             let peer_addr = tcp_stream
                 .peer_addr()
@@ -446,6 +452,7 @@ pub(crate) fn spawn_monoio_connection(
                                 clk,
                                 rsm,
                                 all_regs,
+                                all_rsm,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
@@ -500,6 +507,7 @@ pub(crate) fn spawn_monoio_connection(
                         clk,
                         rsm,
                         all_regs,
+                        all_rsm,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,

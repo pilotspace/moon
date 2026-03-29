@@ -2417,10 +2417,24 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         let conn_txs: Vec<channel::MpscSender<(tokio::net::TcpStream, bool)>> =
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
         let all_notifiers = mesh.all_notifiers();
-        let all_pubsub_registries: Vec<std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>> =
-            (0..num_shards)
-                .map(|_| std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new())))
-                .collect();
+        let all_pubsub_registries: Vec<
+            std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
+        > = (0..num_shards)
+            .map(|_| {
+                std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new()))
+            })
+            .collect();
+        let all_remote_sub_maps: Vec<
+            std::sync::Arc<
+                std::sync::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
+            >,
+        > = (0..num_shards)
+            .map(|_| {
+                std::sync::Arc::new(std::sync::RwLock::new(
+                    moon::shard::remote_subscriber_map::RemoteSubscriberMap::new(),
+                ))
+            })
+            .collect();
 
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
@@ -2433,6 +2447,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             let shard_spsc_notify = mesh.take_notify(id);
             let shard_all_notifiers = all_notifiers.clone();
             let shard_pubsub_regs = all_pubsub_registries.clone();
+            let shard_remote_sub_maps = all_remote_sub_maps.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-shard-{}", id))
@@ -2477,6 +2492,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_spsc_notify,
                         shard_all_notifiers,
                         shard_pubsub_regs,
+                        shard_remote_sub_maps,
                     )));
                 })
                 .expect("failed to spawn shard thread");
@@ -3520,10 +3536,24 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         let cluster_state = Some(std::sync::Arc::new(std::sync::RwLock::new(state)));
 
         let all_notifiers = mesh.all_notifiers();
-        let all_pubsub_registries: Vec<std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>> =
-            (0..num_shards)
-                .map(|_| std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new())))
-                .collect();
+        let all_pubsub_registries: Vec<
+            std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
+        > = (0..num_shards)
+            .map(|_| {
+                std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new()))
+            })
+            .collect();
+        let all_remote_sub_maps: Vec<
+            std::sync::Arc<
+                std::sync::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>,
+            >,
+        > = (0..num_shards)
+            .map(|_| {
+                std::sync::Arc::new(std::sync::RwLock::new(
+                    moon::shard::remote_subscriber_map::RemoteSubscriberMap::new(),
+                ))
+            })
+            .collect();
 
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
@@ -3537,6 +3567,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             let shard_spsc_notify = mesh.take_notify(id);
             let shard_all_notifiers = all_notifiers.clone();
             let shard_pubsub_regs = all_pubsub_registries.clone();
+            let shard_remote_sub_maps = all_remote_sub_maps.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-cluster-shard-{}", id))
@@ -3581,6 +3612,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         shard_spsc_notify,
                         shard_all_notifiers,
                         shard_pubsub_regs,
+                        shard_remote_sub_maps,
                     )));
                 })
                 .expect("failed to spawn shard thread");

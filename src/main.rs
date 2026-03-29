@@ -176,9 +176,16 @@ fn main() -> anyhow::Result<()> {
     let all_pubsub_registries: Vec<
         std::sync::Arc<std::sync::RwLock<moon::pubsub::PubSubRegistry>>,
     > = (0..num_shards)
+        .map(|_| std::sync::Arc::new(std::sync::RwLock::new(moon::pubsub::PubSubRegistry::new())))
+        .collect();
+
+    // Pre-create shared remote subscriber maps for zero-SPSC subscription propagation.
+    let all_remote_sub_maps: Vec<
+        std::sync::Arc<std::sync::RwLock<moon::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    > = (0..num_shards)
         .map(|_| {
             std::sync::Arc::new(std::sync::RwLock::new(
-                moon::pubsub::PubSubRegistry::new(),
+                moon::shard::remote_subscriber_map::RemoteSubscriberMap::new(),
             ))
         })
         .collect();
@@ -226,6 +233,7 @@ fn main() -> anyhow::Result<()> {
         let shard_tls_config = tls_config.clone();
         let shard_dbs = shard_databases.clone();
         let shard_pubsub_registries = all_pubsub_registries.clone();
+        let shard_remote_sub_maps = all_remote_sub_maps.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -256,6 +264,7 @@ fn main() -> anyhow::Result<()> {
                             shard_all_notifiers,
                             shard_dbs,
                             shard_pubsub_registries,
+                            shard_remote_sub_maps,
                         )
                         .await;
                 });

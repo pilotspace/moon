@@ -96,8 +96,9 @@ pub async fn handle_connection_sharded(
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
-    remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
+    all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
 ) {
     let peer_addr = stream
         .peer_addr()
@@ -130,6 +131,7 @@ pub async fn handle_connection_sharded(
         cached_clock,
         remote_subscriber_map,
         all_pubsub_registries,
+        all_remote_sub_maps,
         true, // can_migrate: plain TCP supports FD extraction
         BytesMut::new(),
         None, // fresh connection, no migrated state
@@ -247,8 +249,9 @@ pub async fn handle_connection_sharded_inner<
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
-    remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
+    all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
@@ -355,18 +358,10 @@ pub async fn handle_connection_sharded_inner<
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 { pubsub_registry.write().unwrap().subscribe(ch.clone(), sub); }
                                                 subscription_count += 1;
-                                                {
-                                                    let mut producers = dispatch_tx.borrow_mut();
-                                                    for target in 0..num_shards {
-                                                        if target == shard_id { continue; }
-                                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                                        let msg = ShardMessage::PubSubSubscribe {
-                                                            source_shard: shard_id,
-                                                            channel: ch.clone(),
-                                                            is_pattern: false,
-                                                        };
-                                                        if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                                    }
+                                                // Direct shared-write: propagate subscription to all shards' remote subscriber maps
+                                                for target in 0..num_shards {
+                                                    if target == shard_id { continue; }
+                                                    all_remote_sub_maps[target].write().unwrap().add(ch.clone(), shard_id, false);
                                                 }
                                                 write_buf.clear();
                                                 let resp = pubsub::subscribe_response(&ch, subscription_count);
@@ -395,18 +390,10 @@ pub async fn handle_connection_sharded_inner<
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 { pubsub_registry.write().unwrap().psubscribe(pat.clone(), sub); }
                                                 subscription_count += 1;
-                                                {
-                                                    let mut producers = dispatch_tx.borrow_mut();
-                                                    for target in 0..num_shards {
-                                                        if target == shard_id { continue; }
-                                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                                        let msg = ShardMessage::PubSubSubscribe {
-                                                            source_shard: shard_id,
-                                                            channel: pat.clone(),
-                                                            is_pattern: true,
-                                                        };
-                                                        if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                                    }
+                                                // Direct shared-write: propagate pattern subscription to all shards' remote subscriber maps
+                                                for target in 0..num_shards {
+                                                    if target == shard_id { continue; }
+                                                    all_remote_sub_maps[target].write().unwrap().add(pat.clone(), shard_id, true);
                                                 }
                                                 write_buf.clear();
                                                 let resp = pubsub::psubscribe_response(&pat, subscription_count);
@@ -425,18 +412,9 @@ pub async fn handle_connection_sharded_inner<
                                             } else {
                                                 for ch in &removed {
                                                     subscription_count = subscription_count.saturating_sub(1);
-                                                    {
-                                                        let mut producers = dispatch_tx.borrow_mut();
-                                                        for target in 0..num_shards {
-                                                            if target == shard_id { continue; }
-                                                            let idx = ChannelMesh::target_index(shard_id, target);
-                                                            let msg = ShardMessage::PubSubUnsubscribe {
-                                                                source_shard: shard_id,
-                                                                channel: ch.clone(),
-                                                                is_pattern: false,
-                                                            };
-                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                                        }
+                                                    for target in 0..num_shards {
+                                                        if target == shard_id { continue; }
+                                                        all_remote_sub_maps[target].write().unwrap().remove(ch, shard_id, false);
                                                     }
                                                     write_buf.clear();
                                                     crate::protocol::serialize(&pubsub::unsubscribe_response(ch, subscription_count), &mut write_buf);
@@ -448,18 +426,9 @@ pub async fn handle_connection_sharded_inner<
                                                 if let Some(ch) = extract_bytes(arg) {
                                                     { pubsub_registry.write().unwrap().unsubscribe(ch.as_ref(), subscriber_id); }
                                                     subscription_count = subscription_count.saturating_sub(1);
-                                                    {
-                                                        let mut producers = dispatch_tx.borrow_mut();
-                                                        for target in 0..num_shards {
-                                                            if target == shard_id { continue; }
-                                                            let idx = ChannelMesh::target_index(shard_id, target);
-                                                            let msg = ShardMessage::PubSubUnsubscribe {
-                                                                source_shard: shard_id,
-                                                                channel: ch.clone(),
-                                                                is_pattern: false,
-                                                            };
-                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                                        }
+                                                    for target in 0..num_shards {
+                                                        if target == shard_id { continue; }
+                                                        all_remote_sub_maps[target].write().unwrap().remove(&ch, shard_id, false);
                                                     }
                                                     write_buf.clear();
                                                     crate::protocol::serialize(&pubsub::unsubscribe_response(&ch, subscription_count), &mut write_buf);
@@ -478,18 +447,9 @@ pub async fn handle_connection_sharded_inner<
                                             } else {
                                                 for pat in &removed {
                                                     subscription_count = subscription_count.saturating_sub(1);
-                                                    {
-                                                        let mut producers = dispatch_tx.borrow_mut();
-                                                        for target in 0..num_shards {
-                                                            if target == shard_id { continue; }
-                                                            let idx = ChannelMesh::target_index(shard_id, target);
-                                                            let msg = ShardMessage::PubSubUnsubscribe {
-                                                                source_shard: shard_id,
-                                                                channel: pat.clone(),
-                                                                is_pattern: true,
-                                                            };
-                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                                        }
+                                                    for target in 0..num_shards {
+                                                        if target == shard_id { continue; }
+                                                        all_remote_sub_maps[target].write().unwrap().remove(pat, shard_id, true);
                                                     }
                                                     write_buf.clear();
                                                     crate::protocol::serialize(&pubsub::punsubscribe_response(pat, subscription_count), &mut write_buf);
@@ -501,18 +461,9 @@ pub async fn handle_connection_sharded_inner<
                                                 if let Some(pat) = extract_bytes(arg) {
                                                     { pubsub_registry.write().unwrap().punsubscribe(pat.as_ref(), subscriber_id); }
                                                     subscription_count = subscription_count.saturating_sub(1);
-                                                    {
-                                                        let mut producers = dispatch_tx.borrow_mut();
-                                                        for target in 0..num_shards {
-                                                            if target == shard_id { continue; }
-                                                            let idx = ChannelMesh::target_index(shard_id, target);
-                                                            let msg = ShardMessage::PubSubUnsubscribe {
-                                                                source_shard: shard_id,
-                                                                channel: pat.clone(),
-                                                                is_pattern: true,
-                                                            };
-                                                            if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                                        }
+                                                    for target in 0..num_shards {
+                                                        if target == shard_id { continue; }
+                                                        all_remote_sub_maps[target].write().unwrap().remove(&pat, shard_id, true);
                                                     }
                                                     write_buf.clear();
                                                     crate::protocol::serialize(&pubsub::punsubscribe_response(&pat, subscription_count), &mut write_buf);
@@ -612,8 +563,9 @@ pub async fn handle_connection_sharded_inner<
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>> = HashMap::with_capacity(num_shards);
-                // Deferred PUBLISH replies: (response_index, receivers) — resolved after batch
-                let mut deferred_publish_replies: Vec<(usize, std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>)> = Vec::new();
+                // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
+                // Key: target shard ID -> Vec of (response_index, channel, message)
+                let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -1104,7 +1056,7 @@ pub async fn handle_connection_sharded_inner<
                                 (Some(ch), Some(msg)) => {
                                     let local_count = { pubsub_registry.write().unwrap().publish(&ch, &msg) };
                                     // Targeted fanout: only send to shards that have subscribers
-                                    let targets = remote_subscriber_map.borrow().target_shards(&ch);
+                                    let targets = remote_subscriber_map.read().unwrap().target_shards(&ch);
                                     if targets.is_empty() {
                                         // Fast path: no remote subscribers, return local count immediately
                                         responses.push(Frame::Integer(local_count));
@@ -1114,27 +1066,14 @@ pub async fn handle_connection_sharded_inner<
                                         if remote_targets.is_empty() {
                                             responses.push(Frame::Integer(local_count));
                                         } else {
-                                            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(remote_targets.len() as u32));
-                                            {
-                                                let mut producers = dispatch_tx.borrow_mut();
-                                                for target in &remote_targets {
-                                                    let idx = ChannelMesh::target_index(shard_id, *target);
-                                                    let publish_msg = ShardMessage::PubSubPublish {
-                                                        channel: ch.clone(),
-                                                        message: msg.clone(),
-                                                        slot: slot.clone(),
-                                                    };
-                                                    if producers[idx].try_push(publish_msg).is_ok() {
-                                                        spsc_notifiers[*target].notify_one();
-                                                    } else {
-                                                        // Push failed -- this shard won't respond, decrement pending
-                                                        slot.add(0);
-                                                    }
-                                                }
-                                            }
+                                            // Accumulate into per-shard batches for coalesced dispatch
                                             let resp_idx = responses.len();
-                                            responses.push(Frame::Integer(local_count));
-                                            deferred_publish_replies.push((resp_idx, slot));
+                                            responses.push(Frame::Integer(local_count)); // placeholder, updated after batch flush
+                                            for target in &remote_targets {
+                                                publish_batches.entry(*target)
+                                                    .or_default()
+                                                    .push((resp_idx, ch.clone(), msg.clone()));
+                                            }
                                         }
                                     }
                                 }
@@ -1194,19 +1133,10 @@ pub async fn handle_connection_sharded_inner<
                                     { pubsub_registry.write().unwrap().subscribe(ch.clone(), sub); }
                                 }
                                 subscription_count += 1;
-                                // Propagate to other shards
-                                {
-                                    let mut producers = dispatch_tx.borrow_mut();
-                                    for target in 0..num_shards {
-                                        if target == shard_id { continue; }
-                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                        let msg = ShardMessage::PubSubSubscribe {
-                                            source_shard: shard_id,
-                                            channel: ch.clone(),
-                                            is_pattern,
-                                        };
-                                        if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
-                                    }
+                                // Direct shared-write: propagate subscription to all shards' remote subscriber maps
+                                for target in 0..num_shards {
+                                    if target == shard_id { continue; }
+                                    all_remote_sub_maps[target].write().unwrap().add(ch.clone(), shard_id, is_pattern);
                                 }
                                 write_buf.clear();
                                 let resp = if is_pattern {
@@ -1501,16 +1431,44 @@ pub async fn handle_connection_sharded_inner<
                     }
                 }
 
-                // Phase 3: Resolve deferred PUBLISH cross-shard replies (batched for pipeline efficiency)
-                if !deferred_publish_replies.is_empty() {
-                    for (resp_idx, slot) in deferred_publish_replies.drain(..) {
-                        // Spin-yield for all shards to respond (typically < 1us)
+                // Phase 3: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
+                if !publish_batches.is_empty() {
+                    let mut batch_slots: Vec<(std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>, std::sync::Arc<Vec<std::sync::atomic::AtomicI64>>, Vec<usize>)> = Vec::new();
+                    {
+                        let mut producers = dispatch_tx.borrow_mut();
+                        for (target, entries) in publish_batches.drain() {
+                            let n = entries.len();
+                            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(1));
+                            let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicI64>> = std::sync::Arc::new(
+                                (0..n).map(|_| std::sync::atomic::AtomicI64::new(0)).collect()
+                            );
+                            let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                            let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+
+                            let idx = ChannelMesh::target_index(shard_id, target);
+                            let batch_msg = ShardMessage::PubSubPublishBatch {
+                                pairs,
+                                slot: slot.clone(),
+                                counts: counts.clone(),
+                            };
+                            if producers[idx].try_push(batch_msg).is_ok() {
+                                spsc_notifiers[target].notify_one();
+                            } else {
+                                slot.add(0); // push failed, mark as done
+                            }
+                            batch_slots.push((slot, counts, resp_indices));
+                        }
+                    }
+                    // Resolve all batch slots
+                    for (slot, counts, resp_indices) in &batch_slots {
                         while !slot.is_ready() {
                             tokio::task::yield_now().await;
                         }
-                        let extra = slot.get();
-                        if extra > 0 {
-                            if let Frame::Integer(ref mut total) = responses[resp_idx] { *total += extra; }
+                        for (i, resp_idx) in resp_indices.iter().enumerate() {
+                            let remote_count = counts[i].load(std::sync::atomic::Ordering::Relaxed);
+                            if remote_count > 0 {
+                                if let Frame::Integer(ref mut total) = responses[*resp_idx] { *total += remote_count; }
+                            }
                         }
                     }
                 }
@@ -1575,32 +1533,39 @@ pub async fn handle_connection_sharded_inner<
 
     // Clean up pub/sub subscriptions on disconnect
     if subscriber_id > 0 {
-        let removed_channels = { pubsub_registry.write().unwrap().unsubscribe_all(subscriber_id) };
-        let removed_patterns = { pubsub_registry.write().unwrap().punsubscribe_all(subscriber_id) };
-        // Propagate unsubscribe to other shards
-        let mut producers = dispatch_tx.borrow_mut();
+        let removed_channels = {
+            pubsub_registry
+                .write()
+                .unwrap()
+                .unsubscribe_all(subscriber_id)
+        };
+        let removed_patterns = {
+            pubsub_registry
+                .write()
+                .unwrap()
+                .punsubscribe_all(subscriber_id)
+        };
+        // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
         for ch in removed_channels {
             for target in 0..num_shards {
-                if target == shard_id { continue; }
-                let idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::PubSubUnsubscribe {
-                    source_shard: shard_id,
-                    channel: ch.clone(),
-                    is_pattern: false,
-                };
-                if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                if target == shard_id {
+                    continue;
+                }
+                all_remote_sub_maps[target]
+                    .write()
+                    .unwrap()
+                    .remove(&ch, shard_id, false);
             }
         }
         for pat in removed_patterns {
             for target in 0..num_shards {
-                if target == shard_id { continue; }
-                let idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::PubSubUnsubscribe {
-                    source_shard: shard_id,
-                    channel: pat.clone(),
-                    is_pattern: true,
-                };
-                if producers[idx].try_push(msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                if target == shard_id {
+                    continue;
+                }
+                all_remote_sub_maps[target]
+                    .write()
+                    .unwrap()
+                    .remove(&pat, shard_id, true);
             }
         }
     }

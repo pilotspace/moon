@@ -380,7 +380,10 @@ mod tests {
         let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         let mut registry = PubSubRegistry::new();
         registry.subscribe(Bytes::from_static(b"news"), Subscriber::new(tx.clone(), 1));
-        registry.subscribe(Bytes::from_static(b"sports"), Subscriber::new(tx.clone(), 2));
+        registry.subscribe(
+            Bytes::from_static(b"sports"),
+            Subscriber::new(tx.clone(), 2),
+        );
         registry.subscribe(Bytes::from_static(b"weather"), Subscriber::new(tx, 3));
 
         let mut channels = registry.active_channels(None);
@@ -395,8 +398,14 @@ mod tests {
     fn test_active_channels_with_glob() {
         let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
         let mut registry = PubSubRegistry::new();
-        registry.subscribe(Bytes::from_static(b"news.a"), Subscriber::new(tx.clone(), 1));
-        registry.subscribe(Bytes::from_static(b"news.b"), Subscriber::new(tx.clone(), 2));
+        registry.subscribe(
+            Bytes::from_static(b"news.a"),
+            Subscriber::new(tx.clone(), 1),
+        );
+        registry.subscribe(
+            Bytes::from_static(b"news.b"),
+            Subscriber::new(tx.clone(), 2),
+        );
         registry.subscribe(Bytes::from_static(b"sports"), Subscriber::new(tx, 3));
 
         let channels = registry.active_channels(Some(b"news.*"));

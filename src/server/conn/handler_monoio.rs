@@ -95,8 +95,9 @@ pub async fn handle_connection_sharded_monoio<
     spsc_notifiers: Vec<Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
-    remote_subscriber_map: Rc<RefCell<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
+    all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
@@ -219,21 +220,10 @@ pub async fn handle_connection_sharded_monoio<
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.write().unwrap().subscribe(channel.clone(), sub);
-                                                            // Propagate subscription metadata to other shards
-                                                            {
-                                                                let mut producers = dispatch_tx.borrow_mut();
-                                                                for target in 0..num_shards {
-                                                                    if target == shard_id { continue; }
-                                                                    let idx = ChannelMesh::target_index(shard_id, target);
-                                                                    let msg = ShardMessage::PubSubSubscribe {
-                                                                        source_shard: shard_id,
-                                                                        channel: channel.clone(),
-                                                                        is_pattern: false,
-                                                                    };
-                                                                    if producers[idx].try_push(msg).is_ok() {
-                                                                        spsc_notifiers[target].notify_one();
-                                                                    }
-                                                                }
+                                                            // Direct shared-write: propagate subscription to all shards' remote subscriber maps
+                                                            for target in 0..num_shards {
+                                                                if target == shard_id { continue; }
+                                                                all_remote_sub_maps[target].write().unwrap().add(channel.clone(), shard_id, false);
                                                             }
                                                             subscription_count += 1;
                                                             let resp = pubsub::subscribe_response(&channel, subscription_count);
@@ -248,22 +238,11 @@ pub async fn handle_connection_sharded_monoio<
                                                 _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
                                                         let removed = pubsub_registry.write().unwrap().unsubscribe_all(subscriber_id);
-                                                        // Propagate unsubscribe metadata for each removed channel
-                                                        {
-                                                            let mut producers = dispatch_tx.borrow_mut();
-                                                            for ch in &removed {
-                                                                for target in 0..num_shards {
-                                                                    if target == shard_id { continue; }
-                                                                    let idx = ChannelMesh::target_index(shard_id, target);
-                                                                    let msg = ShardMessage::PubSubUnsubscribe {
-                                                                        source_shard: shard_id,
-                                                                        channel: ch.clone(),
-                                                                        is_pattern: false,
-                                                                    };
-                                                                    if producers[idx].try_push(msg).is_ok() {
-                                                                        spsc_notifiers[target].notify_one();
-                                                                    }
-                                                                }
+                                                        // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
+                                                        for ch in &removed {
+                                                            for target in 0..num_shards {
+                                                                if target == shard_id { continue; }
+                                                                all_remote_sub_maps[target].write().unwrap().remove(ch, shard_id, false);
                                                             }
                                                         }
                                                         if removed.is_empty() {
@@ -289,21 +268,10 @@ pub async fn handle_connection_sharded_monoio<
                                                         for arg in cmd_args {
                                                             if let Some(channel) = extract_bytes(arg) {
                                                                 pubsub_registry.write().unwrap().unsubscribe(channel.as_ref(), subscriber_id);
-                                                                // Propagate unsubscribe metadata to other shards
-                                                                {
-                                                                    let mut producers = dispatch_tx.borrow_mut();
-                                                                    for target in 0..num_shards {
-                                                                        if target == shard_id { continue; }
-                                                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                                                        let msg = ShardMessage::PubSubUnsubscribe {
-                                                                            source_shard: shard_id,
-                                                                            channel: channel.clone(),
-                                                                            is_pattern: false,
-                                                                        };
-                                                                        if producers[idx].try_push(msg).is_ok() {
-                                                                            spsc_notifiers[target].notify_one();
-                                                                        }
-                                                                    }
+                                                                // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
+                                                                for target in 0..num_shards {
+                                                                    if target == shard_id { continue; }
+                                                                    all_remote_sub_maps[target].write().unwrap().remove(&channel, shard_id, false);
                                                                 }
                                                                 subscription_count = subscription_count.saturating_sub(1);
                                                                 let resp = pubsub::unsubscribe_response(&channel, subscription_count);
@@ -344,21 +312,10 @@ pub async fn handle_connection_sharded_monoio<
                                                             }
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.write().unwrap().psubscribe(pattern.clone(), sub);
-                                                            // Propagate pattern subscription metadata to other shards
-                                                            {
-                                                                let mut producers = dispatch_tx.borrow_mut();
-                                                                for target in 0..num_shards {
-                                                                    if target == shard_id { continue; }
-                                                                    let idx = ChannelMesh::target_index(shard_id, target);
-                                                                    let msg = ShardMessage::PubSubSubscribe {
-                                                                        source_shard: shard_id,
-                                                                        channel: pattern.clone(),
-                                                                        is_pattern: true,
-                                                                    };
-                                                                    if producers[idx].try_push(msg).is_ok() {
-                                                                        spsc_notifiers[target].notify_one();
-                                                                    }
-                                                                }
+                                                            // Direct shared-write: propagate pattern subscription to all shards' remote subscriber maps
+                                                            for target in 0..num_shards {
+                                                                if target == shard_id { continue; }
+                                                                all_remote_sub_maps[target].write().unwrap().add(pattern.clone(), shard_id, true);
                                                             }
                                                             subscription_count += 1;
                                                             let resp = pubsub::psubscribe_response(&pattern, subscription_count);
@@ -373,22 +330,11 @@ pub async fn handle_connection_sharded_monoio<
                                                 _ if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
                                                         let removed = pubsub_registry.write().unwrap().punsubscribe_all(subscriber_id);
-                                                        // Propagate pattern unsubscribe metadata for each removed pattern
-                                                        {
-                                                            let mut producers = dispatch_tx.borrow_mut();
-                                                            for pat in &removed {
-                                                                for target in 0..num_shards {
-                                                                    if target == shard_id { continue; }
-                                                                    let idx = ChannelMesh::target_index(shard_id, target);
-                                                                    let msg = ShardMessage::PubSubUnsubscribe {
-                                                                        source_shard: shard_id,
-                                                                        channel: pat.clone(),
-                                                                        is_pattern: true,
-                                                                    };
-                                                                    if producers[idx].try_push(msg).is_ok() {
-                                                                        spsc_notifiers[target].notify_one();
-                                                                    }
-                                                                }
+                                                        // Direct shared-write: propagate pattern unsubscribe to all shards' remote subscriber maps
+                                                        for pat in &removed {
+                                                            for target in 0..num_shards {
+                                                                if target == shard_id { continue; }
+                                                                all_remote_sub_maps[target].write().unwrap().remove(pat, shard_id, true);
                                                             }
                                                         }
                                                         if removed.is_empty() {
@@ -414,21 +360,10 @@ pub async fn handle_connection_sharded_monoio<
                                                         for arg in cmd_args {
                                                             if let Some(pattern) = extract_bytes(arg) {
                                                                 pubsub_registry.write().unwrap().punsubscribe(pattern.as_ref(), subscriber_id);
-                                                                // Propagate pattern unsubscribe metadata to other shards
-                                                                {
-                                                                    let mut producers = dispatch_tx.borrow_mut();
-                                                                    for target in 0..num_shards {
-                                                                        if target == shard_id { continue; }
-                                                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                                                        let msg = ShardMessage::PubSubUnsubscribe {
-                                                                            source_shard: shard_id,
-                                                                            channel: pattern.clone(),
-                                                                            is_pattern: true,
-                                                                        };
-                                                                        if producers[idx].try_push(msg).is_ok() {
-                                                                            spsc_notifiers[target].notify_one();
-                                                                        }
-                                                                    }
+                                                                // Direct shared-write: propagate pattern unsubscribe to all shards' remote subscriber maps
+                                                                for target in 0..num_shards {
+                                                                    if target == shard_id { continue; }
+                                                                    all_remote_sub_maps[target].write().unwrap().remove(&pattern, shard_id, true);
                                                                 }
                                                                 subscription_count = subscription_count.saturating_sub(1);
                                                                 let resp = pubsub::punsubscribe_response(&pattern, subscription_count);
@@ -577,6 +512,9 @@ pub async fn handle_connection_sharded_monoio<
         // Pipeline batch optimization: reuse pre-allocated containers (clear, not re-create).
         responses.clear();
         remote_groups.clear();
+        // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
+        let mut publish_batches: std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes)>> =
+            std::collections::HashMap::new();
 
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
         {
@@ -1046,40 +984,29 @@ pub async fn handle_connection_sharded_monoio<
                     }
                     match (channel, message) {
                         (Some(ch), Some(msg)) => {
-                            let local_count = { pubsub_registry.write().unwrap().publish(&ch, &msg) };
+                            let local_count =
+                                { pubsub_registry.write().unwrap().publish(&ch, &msg) };
                             // Targeted fanout: only send to shards that have subscribers
-                            let targets = remote_subscriber_map.borrow().target_shards(&ch);
+                            let targets = remote_subscriber_map.read().unwrap().target_shards(&ch);
                             if targets.is_empty() {
                                 // Fast path: no remote subscribers
                                 responses.push(Frame::Integer(local_count));
                             } else {
-                                let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != shard_id).collect();
+                                let remote_targets: Vec<usize> =
+                                    targets.into_iter().filter(|&t| t != shard_id).collect();
                                 if remote_targets.is_empty() {
                                     responses.push(Frame::Integer(local_count));
                                 } else {
-                                    let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(remote_targets.len() as u32));
-                                    {
-                                        let mut producers = dispatch_tx.borrow_mut();
-                                        for target in &remote_targets {
-                                            let idx = ChannelMesh::target_index(shard_id, *target);
-                                            let publish_msg = ShardMessage::PubSubPublish {
-                                                channel: ch.clone(),
-                                                message: msg.clone(),
-                                                slot: slot.clone(),
-                                            };
-                                            if producers[idx].try_push(publish_msg).is_ok() {
-                                                spsc_notifiers[*target].notify_one();
-                                            } else {
-                                                slot.add(0);
-                                            }
-                                        }
+                                    // Accumulate into per-shard batches for coalesced dispatch
+                                    let resp_idx = responses.len();
+                                    responses.push(Frame::Integer(local_count)); // placeholder, updated after batch flush
+                                    for target in &remote_targets {
+                                        publish_batches.entry(*target).or_default().push((
+                                            resp_idx,
+                                            ch.clone(),
+                                            msg.clone(),
+                                        ));
                                     }
-                                    // Monoio: spin-yield for slot completion
-                                    while !slot.is_ready() {
-                                        monoio::time::sleep(std::time::Duration::from_micros(1)).await;
-                                    }
-                                    let total = local_count + slot.get();
-                                    responses.push(Frame::Integer(total));
                                 }
                             }
                         }
@@ -1141,21 +1068,16 @@ pub async fn handle_connection_sharded_monoio<
                         } else {
                             pubsub_registry.write().unwrap().subscribe(ch.clone(), sub);
                         }
-                        // Propagate subscription metadata to other shards
-                        {
-                            let mut producers = dispatch_tx.borrow_mut();
-                            for target in 0..num_shards {
-                                if target == shard_id { continue; }
-                                let idx = ChannelMesh::target_index(shard_id, target);
-                                let msg = ShardMessage::PubSubSubscribe {
-                                    source_shard: shard_id,
-                                    channel: ch.clone(),
-                                    is_pattern,
-                                };
-                                if producers[idx].try_push(msg).is_ok() {
-                                    spsc_notifiers[target].notify_one();
-                                }
+                        // Direct shared-write: propagate subscription to all shards' remote subscriber maps
+                        for target in 0..num_shards {
+                            if target == shard_id {
+                                continue;
                             }
+                            all_remote_sub_maps[target].write().unwrap().add(
+                                ch.clone(),
+                                shard_id,
+                                is_pattern,
+                            );
                         }
                         subscription_count += 1;
                         let resp = if is_pattern {
@@ -1219,8 +1141,10 @@ pub async fn handle_connection_sharded_monoio<
                         responses.push(Frame::Array(arr));
                     }
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
-                        let channels: Vec<Bytes> =
-                            cmd_args[1..].iter().filter_map(|a| extract_bytes(a)).collect();
+                        let channels: Vec<Bytes> = cmd_args[1..]
+                            .iter()
+                            .filter_map(|a| extract_bytes(a))
+                            .collect();
                         let mut counts: std::collections::HashMap<Bytes, i64> =
                             std::collections::HashMap::new();
                         for reg in &all_pubsub_registries {
@@ -1689,7 +1613,60 @@ pub async fn handle_connection_sharded_monoio<
             }
         }
 
-        // Phase 2: Dispatch all deferred remote commands as batched PipelineBatch
+        // Phase 2a: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
+        if !publish_batches.is_empty() {
+            let mut batch_slots: Vec<(
+                std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>,
+                std::sync::Arc<Vec<std::sync::atomic::AtomicI64>>,
+                Vec<usize>,
+            )> = Vec::new();
+            {
+                let mut producers = dispatch_tx.borrow_mut();
+                for (target, entries) in publish_batches.drain() {
+                    let n = entries.len();
+                    let slot =
+                        std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(1));
+                    let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicI64>> =
+                        std::sync::Arc::new(
+                            (0..n)
+                                .map(|_| std::sync::atomic::AtomicI64::new(0))
+                                .collect(),
+                        );
+                    let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                    let pairs: Vec<(Bytes, Bytes)> =
+                        entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+
+                    let idx = ChannelMesh::target_index(shard_id, target);
+                    let batch_msg = ShardMessage::PubSubPublishBatch {
+                        pairs,
+                        slot: slot.clone(),
+                        counts: counts.clone(),
+                    };
+                    if producers[idx].try_push(batch_msg).is_ok() {
+                        spsc_notifiers[target].notify_one();
+                    } else {
+                        slot.add(0); // push failed, mark as done
+                    }
+                    batch_slots.push((slot, counts, resp_indices));
+                }
+            }
+            // Resolve all batch slots
+            for (slot, counts, resp_indices) in &batch_slots {
+                while !slot.is_ready() {
+                    monoio::time::sleep(std::time::Duration::from_micros(1)).await;
+                }
+                for (i, resp_idx) in resp_indices.iter().enumerate() {
+                    let remote_count = counts[i].load(std::sync::atomic::Ordering::Relaxed);
+                    if remote_count > 0 {
+                        if let Frame::Integer(ref mut total) = responses[*resp_idx] {
+                            *total += remote_count;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2b: Dispatch all deferred remote commands as batched PipelineBatch
         // messages (one per target shard), await all in parallel.
         if !remote_groups.is_empty() {
             reply_futures.clear();
@@ -1866,25 +1843,30 @@ pub async fn handle_connection_sharded_monoio<
         }
     }
 
-    // --- Disconnect cleanup: propagate unsubscribe for all active subscriptions ---
+    // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if subscriber_id > 0 {
-        let removed_channels = { pubsub_registry.write().unwrap().unsubscribe_all(subscriber_id) };
-        let removed_patterns = { pubsub_registry.write().unwrap().punsubscribe_all(subscriber_id) };
-        let mut producers = dispatch_tx.borrow_mut();
+        let removed_channels = {
+            pubsub_registry
+                .write()
+                .unwrap()
+                .unsubscribe_all(subscriber_id)
+        };
+        let removed_patterns = {
+            pubsub_registry
+                .write()
+                .unwrap()
+                .punsubscribe_all(subscriber_id)
+        };
+        // Direct shared-write: propagate unsubscribe to all shards' remote subscriber maps
         for ch in removed_channels {
             for target in 0..num_shards {
                 if target == shard_id {
                     continue;
                 }
-                let idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::PubSubUnsubscribe {
-                    source_shard: shard_id,
-                    channel: ch.clone(),
-                    is_pattern: false,
-                };
-                if producers[idx].try_push(msg).is_ok() {
-                    spsc_notifiers[target].notify_one();
-                }
+                all_remote_sub_maps[target]
+                    .write()
+                    .unwrap()
+                    .remove(&ch, shard_id, false);
             }
         }
         for pat in removed_patterns {
@@ -1892,15 +1874,10 @@ pub async fn handle_connection_sharded_monoio<
                 if target == shard_id {
                     continue;
                 }
-                let idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::PubSubUnsubscribe {
-                    source_shard: shard_id,
-                    channel: pat.clone(),
-                    is_pattern: true,
-                };
-                if producers[idx].try_push(msg).is_ok() {
-                    spsc_notifiers[target].notify_one();
-                }
+                all_remote_sub_maps[target]
+                    .write()
+                    .unwrap()
+                    .remove(&pat, shard_id, true);
             }
         }
     }
