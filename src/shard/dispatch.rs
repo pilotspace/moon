@@ -204,6 +204,17 @@ pub enum ShardMessage {
         message: Bytes,
         slot: std::sync::Arc<PubSubResponseSlot>,
     },
+    /// Batched cross-shard PUBLISH for pipeline efficiency.
+    /// Multiple (channel, message) pairs destined for the same shard, sharing one ResponseSlot.
+    /// Each pair's subscriber count is accumulated into the slot, and per-pair counts
+    /// are written to the corresponding index in `counts`.
+    PubSubPublishBatch {
+        pairs: Vec<(Bytes, Bytes)>,
+        slot: std::sync::Arc<PubSubResponseSlot>,
+        /// Per-pair subscriber counts written by the SPSC handler.
+        /// Connection handler reads these after slot.is_ready() to assign per-PUBLISH responses.
+        counts: std::sync::Arc<Vec<AtomicI64>>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }

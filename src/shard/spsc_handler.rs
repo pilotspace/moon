@@ -732,6 +732,21 @@ pub(crate) fn handle_shard_message_shared(
             let count = pubsub_registry.publish(&channel, &message);
             slot.add(count);
         }
+        ShardMessage::PubSubPublishBatch {
+            pairs,
+            slot,
+            counts,
+        } => {
+            let mut batch_total: i64 = 0;
+            for (i, (channel, message)) in pairs.iter().enumerate() {
+                let count = pubsub_registry.publish(channel, message);
+                if i < counts.len() {
+                    counts[i].store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+                batch_total += count;
+            }
+            slot.add(batch_total);
+        }
         ShardMessage::ScriptLoad { sha1, script } => {
             // Fan-out: cache this script on this shard so EVALSHA works locally
             let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
