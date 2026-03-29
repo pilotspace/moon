@@ -19,17 +19,38 @@ use std::sync::{Arc, RwLock};
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
-use crate::command::{DispatchResult, dispatch};
+use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::PubSubRegistry;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::Database;
+use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
+
+use super::affinity::{AffinityTracker, MigratedConnectionState};
+use crate::server::response_slot::ResponseSlotPool;
+
+/// Result of `handle_connection_sharded_inner` execution.
+///
+/// The generic inner handler cannot perform FD extraction (requires concrete stream type).
+/// When migration is triggered, it returns `MigrateConnection` so the concrete caller
+/// can extract the raw FD and send the migration message via SPSC.
+pub enum HandlerResult {
+    /// Normal connection close (QUIT, EOF, error, shutdown).
+    Done,
+    /// AffinityTracker detected a dominant remote shard. The caller should:
+    /// 1. Extract the raw FD from the concrete stream (into_std + into_raw_fd)
+    /// 2. Send ShardMessage::MigrateConnection via SPSC to `target_shard`
+    /// 3. Drop the handler (connection ownership transferred)
+    MigrateConnection {
+        state: MigratedConnectionState,
+        target_shard: usize,
+    },
+}
 
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
@@ -40,7 +61,7 @@ use super::{
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
 ///
 /// Runs within a shard's single-threaded Tokio runtime. Has direct mutable access
-/// to the shard's databases via `Rc<RefCell<Vec<Database>>>` (safe: cooperative
+/// to the shard's databases via `Arc<ShardDatabases>` (thread-safe: parking_lot RwLock
 /// single-threaded scheduling means no concurrent borrows).
 ///
 /// Routing logic:
@@ -53,7 +74,7 @@ use super::{
 /// connection level same as the non-sharded handler.
 pub async fn handle_connection_sharded(
     stream: TcpStream,
-    databases: Rc<RefCell<Vec<Database>>>,
+    shard_databases: Arc<ShardDatabases>,
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -80,13 +101,13 @@ pub async fn handle_connection_sharded(
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    handle_connection_sharded_inner(
+    let result = handle_connection_sharded_inner(
         stream,
         peer_addr,
-        databases,
+        shard_databases,
         shard_id,
         num_shards,
-        dispatch_tx,
+        dispatch_tx.clone(),
         pubsub_registry,
         blocking_registry,
         shutdown,
@@ -102,23 +123,79 @@ pub async fn handle_connection_sharded(
         acl_table,
         runtime_config,
         config,
-        spsc_notifiers,
+        spsc_notifiers.clone(),
         snapshot_trigger_tx,
         cached_clock,
+        true, // can_migrate: plain TCP supports FD extraction
+        BytesMut::new(),
     )
     .await;
+
+    // Handle migration result: extract FD from the returned stream and send via SPSC
+    if let (
+        HandlerResult::MigrateConnection {
+            state,
+            target_shard,
+        },
+        Some(stream),
+    ) = (result.0, result.1)
+    {
+        use std::os::unix::io::IntoRawFd;
+        match stream.into_std() {
+            Ok(std_stream) => {
+                let raw_fd = std_stream.into_raw_fd();
+                let msg = ShardMessage::MigrateConnection { fd: raw_fd, state };
+                let target_idx = ChannelMesh::target_index(shard_id, target_shard);
+                let push_result = {
+                    let mut producers = dispatch_tx.borrow_mut();
+                    producers[target_idx].try_push(msg)
+                };
+                match push_result {
+                    Ok(()) => {
+                        spsc_notifiers[target_shard].notify_one();
+                        tracing::info!(
+                            "Shard {}: migrated connection {} to shard {}",
+                            shard_id,
+                            client_id,
+                            target_shard
+                        );
+                    }
+                    Err(returned_msg) => {
+                        // SPSC full -- graceful fallback: close the FD via OwnedFd drop
+                        if let ShardMessage::MigrateConnection { fd, .. } = returned_msg {
+                            use std::os::unix::io::FromRawFd;
+                            drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+                        }
+                        tracing::warn!(
+                            "Shard {}: migration SPSC full, connection {} lost",
+                            shard_id,
+                            client_id
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Shard {}: migration into_std failed: {}", shard_id, e);
+                // Stream consumed by into_std attempt, connection lost either way
+            }
+        }
+    }
 }
 
 /// Generic inner handler for sharded connections (Tokio runtime).
 ///
 /// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
 /// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
+///
+/// Returns `(HandlerResult, Option<S>)`: the stream is returned when migration is triggered
+/// so the concrete caller can extract the raw FD. `can_migrate` controls whether the
+/// AffinityTracker is active (set to `false` for TLS connections).
 pub async fn handle_connection_sharded_inner<
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 >(
     stream: S,
     peer_addr: String,
-    databases: Rc<RefCell<Vec<Database>>>,
+    shard_databases: Arc<ShardDatabases>,
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -140,12 +217,22 @@ pub async fn handle_connection_sharded_inner<
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
-) {
+    can_migrate: bool,
+    initial_read_buf: BytesMut,
+) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Direct buffer I/O: bypass Framed/codec for the hot path.
     let mut stream = stream;
-    let mut read_buf = BytesMut::with_capacity(8192);
+    let mut read_buf = if initial_read_buf.is_empty() {
+        BytesMut::with_capacity(8192)
+    } else {
+        // Migration buffer contains synthetic SELECT/CLIENT SETNAME + leftover bytes.
+        // Reserve extra capacity for incoming data beyond the initial commands.
+        let mut buf = initial_read_buf;
+        buf.reserve(8192);
+        buf
+    };
     let mut write_buf = BytesMut::with_capacity(8192);
     let parse_config = crate::protocol::ParseConfig::default();
     let mut protocol_version: u8 = 2;
@@ -176,7 +263,20 @@ pub async fn handle_connection_sharded_inner<
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
     let mut arena = Bump::with_capacity(4096);
 
+    // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
+    // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
+    let mut affinity_tracker = if num_shards > 1 && can_migrate {
+        Some(AffinityTracker::new(shard_id))
+    } else {
+        None
+    };
+
+    // Pre-allocated response slots for zero-allocation cross-shard dispatch.
+    let response_pool = ResponseSlotPool::new(num_shards, shard_id);
+
     let mut break_outer = false;
+    // Migration target: set when AffinityTracker triggers, acted on after batch response flush.
+    let mut migration_target: Option<usize> = None;
     loop {
         tokio::select! {
             result = stream.read_buf(&mut read_buf) => {
@@ -311,17 +411,16 @@ pub async fn handle_connection_sharded_inner<
                     // --- Lua scripting: EVAL / EVALSHA ---
                     if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
                         let response = {
-                            let mut dbs = databases.borrow_mut();
-                            let db_count = dbs.len();
-                            let db = &mut dbs[selected_db];
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let db_count = shard_databases.db_count();
                             if cmd.eq_ignore_ascii_case(b"EVAL") {
                                 crate::scripting::handle_eval(
-                                    &lua, &script_cache, cmd_args, db,
+                                    &lua, &script_cache, cmd_args, &mut guard,
                                     shard_id, num_shards, selected_db, db_count,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
-                                    &lua, &script_cache, cmd_args, db,
+                                    &lua, &script_cache, cmd_args, &mut guard,
                                     shard_id, num_shards, selected_db, db_count,
                                 )
                             }
@@ -503,15 +602,15 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- INFO ---
                     if cmd.eq_ignore_ascii_case(b"INFO") {
-                        let dbs = databases.borrow();
+                        let guard = shard_databases.read_db(shard_id, selected_db);
                         let response_text = {
-                            let resp_frame = conn_cmd::info_readonly(&dbs[selected_db], cmd_args);
+                            let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
                             match resp_frame {
                                 Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
                                 _ => String::new(),
                             }
                         };
-                        drop(dbs);
+                        drop(guard);
                         let mut response_text = response_text;
                         if let Some(ref rs) = repl_state {
                             if let Ok(rs_guard) = rs.try_read() {
@@ -628,7 +727,7 @@ pub async fn handle_connection_sharded_inner<
                             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                         } else {
                             in_multi = false;
-                            let result = execute_transaction_sharded(&databases, &command_queue, selected_db, &cached_clock);
+                            let result = execute_transaction_sharded(&shard_databases, shard_id, &command_queue, selected_db, &cached_clock);
                             command_queue.clear();
                             responses.push(result);
                         }
@@ -666,9 +765,9 @@ pub async fn handle_connection_sharded_inner<
                                 crate::protocol::serialize(response, &mut write_buf);
                             }
                         }
-                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return; }
+                        if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
                         let blocking_response = handle_blocking_command(
-                            cmd, cmd_args, selected_db, &databases, &blocking_registry,
+                            cmd, cmd_args, selected_db, &shard_databases, &blocking_registry,
                             shard_id, num_shards, &dispatch_tx, &shutdown,
                         ).await;
                         let blocking_response = apply_resp3_conversion(cmd, blocking_response, protocol_version);
@@ -755,24 +854,24 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if cmd.eq_ignore_ascii_case(b"KEYS") {
-                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SCAN") {
-                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers).await;
+                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &()).await;
                         responses.push(response);
                         continue;
                     }
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &databases, &dispatch_tx, &spsc_notifiers, &cached_clock).await;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
@@ -785,68 +884,126 @@ pub async fn handle_connection_sharded_inner<
                         _ => false,
                     };
 
+                    // Affinity sampling: record shard target for migration decision.
+                    // Only sample when we have a concrete target shard (key-bearing command).
+                    // Migration is deferred until AFTER the current batch is fully processed
+                    // and all responses are written, ensuring no command/response desync.
+                    if let (Some(tracker), Some(target)) = (&mut affinity_tracker, target_shard) {
+                        if let Some(migrate_to) = tracker.record(target) {
+                            // Migration preconditions: not in MULTI block
+                            if !in_multi {
+                                migration_target = Some(migrate_to);
+                            }
+                        }
+                    }
+
                     let is_write = if aof_tx.is_some() || tracking_state.enabled { metadata::is_write(cmd) } else { false };
                     let aof_bytes = if is_write && aof_tx.is_some() { Some(aof::serialize_command(&frame)) } else { None };
 
                     if is_local {
+                        // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
+                        // Using read_db for local reads eliminates RwLock contention with
+                        // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
+                            // WRITE PATH: eviction + exclusive lock + dispatch + wakeup
                             let rt = runtime_config.read().unwrap();
-                            let mut dbs_ev = databases.borrow_mut();
-                            if let Err(oom_frame) = try_evict_if_needed(&mut dbs_ev[selected_db], &rt) {
-                                drop(dbs_ev);
+                            let mut guard_ev = shard_databases.write_db(shard_id, selected_db);
+                            if let Err(oom_frame) = try_evict_if_needed(&mut guard_ev, &rt) {
+                                drop(guard_ev);
                                 responses.push(oom_frame);
                                 continue;
                             }
-                            drop(dbs_ev);
-                        }
-                        let mut dbs = databases.borrow_mut();
-                        let db_count = dbs.len();
-                        dbs[selected_db].refresh_now_from_cache(&cached_clock);
-                        let result = dispatch(&mut dbs[selected_db], cmd, cmd_args, &mut selected_db, db_count);
-                        let response = match result {
-                            DispatchResult::Response(f) => f,
-                            DispatchResult::Quit(f) => { should_quit = true; f }
-                        };
-                        if !matches!(response, Frame::Error(_)) {
-                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
-                            if needs_wake {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut reg = blocking_registry.borrow_mut();
-                                    if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                        crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut dbs[selected_db], selected_db, &key);
-                                    } else {
-                                        crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut dbs[selected_db], selected_db, &key);
-                                    }
-                                }
-                            }
-                        }
-                        drop(dbs);
-                        if let Some(bytes) = aof_bytes {
+                            drop(guard_ev);
+
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let db_count = shard_databases.db_count();
+                            guard.refresh_now_from_cache(&cached_clock);
+                            let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                            let response = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => { should_quit = true; f }
+                            };
                             if !matches!(response, Frame::Error(_)) {
-                                if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
-                            }
-                        }
-                        if tracking_state.enabled {
-                            if is_write {
-                                if !matches!(response, Frame::Error(_)) {
+                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
+                                if needs_wake {
                                     if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                        let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
-                                        if !senders.is_empty() {
-                                            let push = crate::tracking::invalidation::invalidation_push(&[key]);
-                                            for tx in senders { let _ = tx.try_send(push.clone()); }
+                                        let mut reg = blocking_registry.borrow_mut();
+                                        if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                            crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, selected_db, &key);
+                                        } else {
+                                            crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, selected_db, &key);
                                         }
                                     }
                                 }
-                            } else if !tracking_state.bcast {
+                            }
+                            drop(guard);
+                            if let Some(bytes) = aof_bytes {
+                                if !matches!(response, Frame::Error(_)) {
+                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
+                                }
+                            }
+                            if tracking_state.enabled && !matches!(response, Frame::Error(_)) {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                                    if !senders.is_empty() {
+                                        let push = crate::tracking::invalidation::invalidation_push(&[key]);
+                                        for tx in senders { let _ = tx.try_send(push.clone()); }
+                                    }
+                                }
+                            }
+                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            responses.push(response);
+                        } else {
+                            // READ PATH: shared lock — no contention with other shards' reads
+                            let guard = shard_databases.read_db(shard_id, selected_db);
+                            let now_ms = cached_clock.ms();
+                            let db_count = shard_databases.db_count();
+                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            drop(guard);
+                            let response = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => { should_quit = true; f }
+                            };
+                            if tracking_state.enabled && !tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
                                 }
                             }
+                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            responses.push(response);
                         }
-                        let response = apply_resp3_conversion(cmd, response, protocol_version);
-                        responses.push(response);
                     } else if let Some(target) = target_shard {
+                        // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
+                        // By this point in_multi is false (MULTI queuing happens earlier with `continue`).
+                        // Read commands execute directly on the target shard's database via RwLock read guard,
+                        // avoiding ~88us of two async scheduling hops through the SPSC channel.
+                        //
+                        // Guard: if there are already pending writes for this target shard in the
+                        // current pipeline batch, we must NOT take the fast path -- the read would
+                        // execute before the deferred writes, violating command ordering. Fall through
+                        // to SPSC dispatch to preserve pipeline semantics.
+                        if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) {
+                            let guard = shard_databases.read_db(target, selected_db);
+                            let now_ms = cached_clock.ms();
+                            let db_count = shard_databases.db_count();
+                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            drop(guard);
+                            let response = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => { should_quit = true; f }
+                            };
+                            // Client tracking for cross-shard reads
+                            if tracking_state.enabled && !tracking_state.bcast {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
+                                }
+                            }
+                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            responses.push(response);
+                            continue;
+                        }
+                        // Cross-shard write: deferred SPSC dispatch (unchanged)
                         let resp_idx = responses.len();
                         responses.push(Frame::Null);
                         let cmd_name = cmd.to_vec();
@@ -854,14 +1011,14 @@ pub async fn handle_connection_sharded_inner<
                     }
                 }
 
-                // Phase 2: Dispatch deferred remote commands
+                // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::with_capacity(remote_groups.len());
+                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
-                        let (reply_tx, reply_rx) = channel::oneshot();
+                        let slot_ptr = response_pool.slot_ptr(target);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Vec<u8>)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatch { db_index: selected_db, commands, reply_tx };
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: slot_ptr };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
                         {
                             let mut pending = msg;
@@ -873,26 +1030,18 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                         }
-                        reply_futures.push((meta, reply_rx));
+                        reply_futures.push((meta, target));
                     }
                     let proto_ver = protocol_version;
-                    for (meta, reply_rx) in reply_futures {
-                        match reply_rx.await {
-                            Ok(shard_responses) => {
-                                for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
-                                    if let Some(bytes) = aof_bytes {
-                                        if !matches!(resp, Frame::Error(_)) {
-                                            if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
-                                        }
-                                    }
-                                    responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                    for (meta, target) in reply_futures {
+                        let shard_responses = response_pool.future_for(target).await;
+                        for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                            if let Some(bytes) = aof_bytes {
+                                if !matches!(resp, Frame::Error(_)) {
+                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
                                 }
                             }
-                            Err(_) => {
-                                for (resp_idx, _, _) in meta {
-                                    responses[resp_idx] = Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed"));
-                                }
-                            }
+                            responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
                         }
                     }
                 }
@@ -907,7 +1056,30 @@ pub async fn handle_connection_sharded_inner<
                         crate::protocol::serialize(response, &mut write_buf);
                     }
                 }
-                if stream.write_all(&write_buf).await.is_err() { return; }
+                if stream.write_all(&write_buf).await.is_err() {
+                    return (HandlerResult::Done, None);
+                }
+
+                // Check if migration was triggered during frame processing.
+                // All responses for the current batch have been written, so the
+                // client sees no interruption -- TCP socket stays open.
+                if let Some(target_shard) = migration_target {
+                    let migrated_state = MigratedConnectionState {
+                        selected_db,
+                        authenticated,
+                        client_name: client_name.clone(),
+                        protocol_version,
+                        current_user: current_user.clone(),
+                        flags: 0,
+                        read_buf_remainder: read_buf.split(),
+                        client_id,
+                        peer_addr: peer_addr.clone(),
+                    };
+                    return (
+                        HandlerResult::MigrateConnection { state: migrated_state, target_shard },
+                        Some(stream),
+                    );
+                }
 
                 if write_buf.capacity() > 65536 { write_buf = BytesMut::with_capacity(8192); }
                 if read_buf.capacity() > 65536 {
@@ -935,4 +1107,6 @@ pub async fn handle_connection_sharded_inner<
     if tracking_state.enabled {
         tracking_table.borrow_mut().untrack_all(client_id);
     }
+
+    (HandlerResult::Done, None)
 }

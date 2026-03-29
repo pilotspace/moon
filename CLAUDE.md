@@ -128,9 +128,9 @@ Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness 
 
 ## CI
 
-- `cargo test --no-default-features --features runtime-tokio,jemalloc` — runs on ubuntu-latest with `MOON_NO_URING=1`
+- `cargo test ` — runs on ubuntu-latest with `MOON_NO_URING=1`
 - `cargo clippy -- -D warnings` — zero warnings policy (default features)
-- `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings` — zero warnings policy (tokio + jemalloc profile)
+- `cargo clippy  -- -D warnings` — zero warnings policy (tokio + jemalloc profile)
 - `cargo fmt --check` — enforced formatting
 - MSRV check — `cargo build` with Rust 1.85 toolchain
 - CodeQL (Rust) — weekly + on push/PR

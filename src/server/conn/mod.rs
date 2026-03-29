@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod blocking;
 #[cfg(feature = "runtime-monoio")]
 pub mod handler_monoio;
@@ -11,6 +12,8 @@ mod tests;
 pub mod util;
 
 // Re-export for internal use
+#[allow(unused_imports)]
+pub(crate) use affinity::{AffinityTracker, MigratedConnectionState};
 pub(crate) use blocking::convert_blocking_to_nonblocking;
 #[cfg(feature = "runtime-tokio")]
 pub(crate) use blocking::handle_blocking_command;

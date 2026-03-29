@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
+use bytes::BytesMut;
 use ringbuf::HeapProd;
 
 use crate::blocking::BlockingRegistry;
@@ -16,11 +17,79 @@ use crate::pubsub::PubSubRegistry;
 use crate::replication::state::ReplicationState;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
-use crate::storage::Database;
+use crate::server::conn::affinity::MigratedConnectionState;
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
 use super::dispatch::ShardMessage;
+use super::shared_databases::ShardDatabases;
+
+/// Create a SO_REUSEPORT TCP listener socket using socket2.
+///
+/// Returns a `std::net::TcpListener` that can be converted to
+/// `tokio::net::TcpListener::from_std()` for per-shard accept, or consumed
+/// via `into_raw_fd()` for io_uring multishot accept.
+///
+/// Each shard calls this with the same address; the kernel distributes
+/// incoming connections across all sockets bound with SO_REUSEPORT.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_reuseport_socket(addr: &str) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let domain = if sock_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&sock_addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+/// Build a read buffer that prepends synthetic RESP commands for state restoration.
+///
+/// Used by `spawn_migrated_*_connection` to restore selected_db and client_name.
+///
+/// If `selected_db != 0`, prepends `SELECT {db}`. If `client_name` is set, prepends
+/// `CLIENT SETNAME {name}`. The original `read_buf_remainder` is appended after the
+/// synthetic commands so the handler processes state restoration before any pending
+/// client data.
+fn build_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    // Restore selected database via synthetic SELECT command
+    if state.selected_db != 0 {
+        let db_str = state.selected_db.to_string();
+        // RESP: *2\r\n$6\r\nSELECT\r\n${len}\r\n{db}\r\n
+        buf.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$");
+        buf.extend_from_slice(db_str.len().to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(db_str.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    // Restore client name via synthetic CLIENT SETNAME command
+    if let Some(ref name) = state.client_name {
+        // RESP: *3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n${len}\r\n{name}\r\n
+        buf.extend_from_slice(b"*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$");
+        buf.extend_from_slice(name.len().to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    // Append any unparsed bytes from the original connection
+    buf.extend_from_slice(&state.read_buf_remainder);
+
+    buf
+}
 
 /// Spawn a new tokio connection handler task (plain TCP or TLS).
 ///
@@ -32,7 +101,7 @@ pub(crate) fn spawn_tokio_connection(
     tcp_stream: tokio::net::TcpStream,
     is_tls: bool,
     tls_config: &Option<Arc<rustls::ServerConfig>>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
@@ -56,7 +125,7 @@ pub(crate) fn spawn_tokio_connection(
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
 
-    let dbs = databases.clone();
+    let sdbs = shard_databases.clone();
     let dtx = dispatch_tx.clone();
     let psr = pubsub_rc.clone();
     let blk = blocking_rc.clone();
@@ -106,10 +175,33 @@ pub(crate) fn spawn_tokio_connection(
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
-                    handle_connection_sharded_inner(
-                        tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
-                        reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                        snap_tx, clk,
+                    let _ = handle_connection_sharded_inner(
+                        tls_stream,
+                        peer_addr,
+                        sdbs,
+                        shard_id,
+                        num_shards,
+                        dtx,
+                        psr,
+                        blk,
+                        sd,
+                        reqpass,
+                        aof,
+                        trk,
+                        cid,
+                        rs,
+                        cs,
+                        lua,
+                        sc,
+                        cp,
+                        acl,
+                        rtcfg,
+                        scfg,
+                        notifiers,
+                        snap_tx,
+                        clk,
+                        false, // can_migrate: TLS connections cannot transfer session state
+                        BytesMut::new(),
                     )
                     .await;
                 }
@@ -122,7 +214,7 @@ pub(crate) fn spawn_tokio_connection(
         // Plain TCP connection
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
-                tcp_stream, dbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
+                tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk,
             )
             .await;
@@ -130,16 +222,27 @@ pub(crate) fn spawn_tokio_connection(
     }
 }
 
-/// Spawn a new monoio connection handler task (plain TCP or TLS).
+/// Spawn a migrated connection handler on the target shard (Tokio runtime).
 ///
-/// Converts std TcpStream to monoio TcpStream and spawns via `monoio::spawn`.
-#[cfg(feature = "runtime-monoio")]
+/// Reconstructs a `TcpStream` from a raw FD transferred via `ShardMessage::MigrateConnection`,
+/// prepends synthetic RESP commands for state restoration (SELECT, CLIENT SETNAME), and
+/// spawns a handler with `requirepass = None` (pre-authenticated).
+///
+/// # Safety
+///
+/// The caller must ensure `fd` is a valid, open file descriptor representing a connected
+/// TCP socket. Ownership is transferred: this function consumes the FD (via `from_raw_fd`).
+///
+/// # Limitations
+///
+/// TLS connections cannot be migrated because TLS session state lives in userspace and
+/// cannot be reconstructed from a raw FD. Only plain TCP connections should be migrated.
+#[cfg(feature = "runtime-tokio")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_monoio_connection(
-    std_tcp_stream: crate::runtime::TcpStream,
-    is_tls: bool,
-    tls_config: &Option<Arc<rustls::ServerConfig>>,
-    databases: &Rc<RefCell<Vec<Database>>>,
+pub(crate) fn spawn_migrated_tokio_connection(
+    fd: std::os::unix::io::RawFd,
+    mut state: MigratedConnectionState,
+    shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
@@ -160,11 +263,134 @@ pub(crate) fn spawn_monoio_connection(
     num_shards: usize,
     config_port: u16,
 ) {
+    use std::os::unix::io::FromRawFd;
+
+    use crate::server::connection::handle_connection_sharded_inner;
+
+    // SAFETY: caller guarantees fd is a valid connected TCP socket.
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    if let Err(e) = std_stream.set_nonblocking(true) {
+        tracing::warn!(
+            "Shard {}: migrated fd {} set_nonblocking failed: {}",
+            shard_id,
+            fd,
+            e
+        );
+        return; // std_stream Drop closes FD
+    }
+    match tokio::net::TcpStream::from_std(std_stream) {
+        Ok(tcp_stream) => {
+            // Clone shared state (same pattern as spawn_tokio_connection)
+            let sdbs = shard_databases.clone();
+            let dtx = dispatch_tx.clone();
+            let psr = pubsub_rc.clone();
+            let blk = blocking_rc.clone();
+            let sd = shutdown.clone();
+            let aof = aof_tx.clone();
+            let trk = tracking_rc.clone();
+            let cid = state.client_id;
+            let rs = repl_state.clone();
+            let cs = cluster_state.clone();
+            let cp = config_port;
+            let lua = {
+                let mut lua_opt = lua_rc.borrow_mut();
+                if lua_opt.is_none() {
+                    *lua_opt = Some(
+                        crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
+                    );
+                }
+                lua_opt.as_ref().unwrap().clone()
+            };
+            let sc = script_cache_rc.clone();
+            let acl = acl_table.clone();
+            let rtcfg = runtime_config.clone();
+            let scfg = server_config.clone();
+            let notifiers = all_notifiers.to_vec();
+            let snap_tx = snapshot_trigger_tx.clone();
+            let clk = cached_clock.clone();
+            let peer_addr = state.peer_addr.clone();
+
+            // Build read buffer with synthetic state-restoration commands prepended
+            let migration_buf = build_migration_read_buf(&mut state);
+
+            // Pass requirepass=None so the handler treats the connection as pre-authenticated.
+            // State restoration (SELECT, CLIENT SETNAME) happens via synthetic commands
+            // prepended to the read buffer by the handler's normal command processing.
+            tokio::task::spawn_local(async move {
+                let _ = handle_connection_sharded_inner(
+                    tcp_stream,
+                    peer_addr,
+                    sdbs,
+                    shard_id,
+                    num_shards,
+                    dtx,
+                    psr,
+                    blk,
+                    sd,
+                    None, // requirepass: None = pre-authenticated
+                    aof,
+                    trk,
+                    cid,
+                    rs,
+                    cs,
+                    lua,
+                    sc,
+                    cp,
+                    acl,
+                    rtcfg,
+                    scfg,
+                    notifiers,
+                    snap_tx,
+                    clk,
+                    false, // can_migrate: already-migrated connections skip re-migration sampling
+                    migration_buf,
+                )
+                .await;
+            });
+        }
+        Err(e) => {
+            tracing::warn!("Shard {}: migration from_std failed: {}", shard_id, e);
+            // FD already consumed by from_raw_fd; std_stream moved into from_std
+        }
+    }
+}
+
+/// Spawn a new monoio connection handler task (plain TCP or TLS).
+///
+/// Converts std TcpStream to monoio TcpStream and spawns via `monoio::spawn`.
+#[cfg(feature = "runtime-monoio")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_monoio_connection(
+    std_tcp_stream: crate::runtime::TcpStream,
+    is_tls: bool,
+    tls_config: &Option<Arc<rustls::ServerConfig>>,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    blocking_rc: &Rc<RefCell<BlockingRegistry>>,
+    shutdown: &CancellationToken,
+    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    tracking_rc: &Rc<RefCell<TrackingTable>>,
+    lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
+    script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
+    acl_table: &Arc<RwLock<crate::acl::AclTable>>,
+    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    server_config: &Arc<crate::config::ServerConfig>,
+    all_notifiers: &[Arc<channel::Notify>],
+    snapshot_trigger_tx: &channel::WatchSender<u64>,
+    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    cached_clock: &CachedClock,
+    shard_id: usize,
+    num_shards: usize,
+    config_port: u16,
+    pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
+) {
     use crate::server::connection::handle_connection_sharded_monoio;
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
-            let dbs = databases.clone();
+            let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
             let psr = pubsub_rc.clone();
             let blk = blocking_rc.clone();
@@ -191,6 +417,7 @@ pub(crate) fn spawn_monoio_connection(
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
+            let pw = pending_wakers.clone();
 
             let peer_addr = tcp_stream
                 .peer_addr()
@@ -208,10 +435,34 @@ pub(crate) fn spawn_monoio_connection(
                                 Ok(cfg) => cfg.requirepass.clone(),
                                 Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                             };
-                            handle_connection_sharded_monoio(
-                                tls_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk,
-                                sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
-                                notifiers, snap_tx, clk,
+                            let _ = handle_connection_sharded_monoio(
+                                tls_stream,
+                                peer_addr,
+                                sdbs,
+                                shard_id,
+                                num_shards,
+                                dtx,
+                                psr,
+                                blk,
+                                sd,
+                                reqpass,
+                                aof,
+                                trk,
+                                cid,
+                                rs,
+                                cs,
+                                lua,
+                                sc,
+                                cp,
+                                acl,
+                                rtcfg,
+                                scfg,
+                                notifiers,
+                                snap_tx,
+                                clk,
+                                false, // can_migrate: TLS connections cannot transfer session state
+                                BytesMut::new(),
+                                pw,
                             )
                             .await;
                         }
@@ -226,22 +477,225 @@ pub(crate) fn spawn_monoio_connection(
                 });
             } else {
                 // Plain TCP connection
+                #[cfg(target_os = "linux")]
+                let dtx2 = dispatch_tx.clone();
+                #[cfg(target_os = "linux")]
+                let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
                     let reqpass = match rtcfg.read() {
                         Ok(cfg) => cfg.requirepass.clone(),
                         Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                     };
-                    handle_connection_sharded_monoio(
-                        tcp_stream, peer_addr, dbs, shard_id, num_shards, dtx, psr, blk, sd,
-                        reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                        snap_tx, clk,
+                    let _result = handle_connection_sharded_monoio(
+                        tcp_stream,
+                        peer_addr,
+                        sdbs,
+                        shard_id,
+                        num_shards,
+                        dtx,
+                        psr,
+                        blk,
+                        sd,
+                        reqpass,
+                        aof,
+                        trk,
+                        cid,
+                        rs,
+                        cs,
+                        lua,
+                        sc,
+                        cp,
+                        acl,
+                        rtcfg,
+                        scfg,
+                        notifiers,
+                        snap_tx,
+                        clk,
+                        cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
+                        BytesMut::new(),
+                        pw,
                     )
                     .await;
+
+                    // Handle migration result: extract FD via dup() and send via SPSC.
+                    // libc::dup is only available on Linux (target-specific dependency).
+                    #[cfg(target_os = "linux")]
+                    if let (crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (_result.0, _result.1) {
+                        use std::os::unix::io::{AsRawFd, FromRawFd};
+                        use ringbuf::traits::Producer;
+                        use crate::shard::mesh::ChannelMesh;
+
+                        let raw_fd = stream.as_raw_fd();
+                        let dup_fd = unsafe { libc::dup(raw_fd) };
+                        drop(stream); // closes original fd
+                        if dup_fd < 0 {
+                            tracing::warn!("Shard {}: migration dup() failed: {}", shard_id, std::io::Error::last_os_error());
+                        } else {
+                            let msg = ShardMessage::MigrateConnection { fd: dup_fd, state };
+                            let target_idx = ChannelMesh::target_index(shard_id, target_shard);
+                            let push_result = {
+                                let mut producers = dtx2.borrow_mut();
+                                producers[target_idx].try_push(msg)
+                            };
+                            match push_result {
+                                Ok(()) => {
+                                    notifiers2[target_shard].notify_one();
+                                    tracing::info!(
+                                        "Shard {}: migrated connection {} to shard {} (monoio)",
+                                        shard_id, cid, target_shard
+                                    );
+                                }
+                                Err(returned_msg) => {
+                                    if let ShardMessage::MigrateConnection { fd, .. } = returned_msg {
+                                        drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+                                    }
+                                    tracing::warn!(
+                                        "Shard {}: migration SPSC full, connection {} lost (monoio)",
+                                        shard_id, cid
+                                    );
+                                }
+                            }
+                        }
+                    }
                 });
             }
         }
         Err(e) => {
             tracing::warn!("Shard {}: from_std failed: {}", shard_id, e);
+        }
+    }
+}
+
+/// Spawn a migrated connection handler on the target shard (monoio runtime).
+///
+/// Reconstructs a `monoio::net::TcpStream` from a raw FD transferred via
+/// `ShardMessage::MigrateConnection`, prepends synthetic RESP commands for state
+/// restoration, and spawns a handler with `requirepass = None` (pre-authenticated).
+///
+/// # Safety
+///
+/// Same safety requirements as `spawn_migrated_tokio_connection`: the caller must
+/// ensure `fd` is a valid, open file descriptor for a connected TCP socket.
+///
+/// # Limitations
+///
+/// TLS connections cannot be migrated (TLS session state is in userspace).
+#[cfg(feature = "runtime-monoio")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_migrated_monoio_connection(
+    fd: std::os::unix::io::RawFd,
+    mut state: MigratedConnectionState,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    blocking_rc: &Rc<RefCell<BlockingRegistry>>,
+    shutdown: &CancellationToken,
+    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    tracking_rc: &Rc<RefCell<TrackingTable>>,
+    lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
+    script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
+    acl_table: &Arc<RwLock<crate::acl::AclTable>>,
+    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    server_config: &Arc<crate::config::ServerConfig>,
+    all_notifiers: &[Arc<channel::Notify>],
+    snapshot_trigger_tx: &channel::WatchSender<u64>,
+    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    cached_clock: &CachedClock,
+    shard_id: usize,
+    num_shards: usize,
+    config_port: u16,
+    pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
+) {
+    use std::os::unix::io::FromRawFd;
+
+    use crate::server::connection::handle_connection_sharded_monoio;
+
+    // SAFETY: caller guarantees fd is a valid connected TCP socket.
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    if let Err(e) = std_stream.set_nonblocking(true) {
+        tracing::warn!(
+            "Shard {}: migrated fd {} set_nonblocking failed: {}",
+            shard_id,
+            fd,
+            e
+        );
+        return; // std_stream Drop closes FD
+    }
+    match monoio::net::TcpStream::from_std(std_stream) {
+        Ok(tcp_stream) => {
+            let sdbs = shard_databases.clone();
+            let dtx = dispatch_tx.clone();
+            let psr = pubsub_rc.clone();
+            let blk = blocking_rc.clone();
+            let sd = shutdown.clone();
+            let aof = aof_tx.clone();
+            let trk = tracking_rc.clone();
+            let cid = state.client_id;
+            let rs = repl_state.clone();
+            let cs = cluster_state.clone();
+            let cp = config_port;
+            let lua = {
+                let mut lua_opt = lua_rc.borrow_mut();
+                if lua_opt.is_none() {
+                    *lua_opt = Some(
+                        crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
+                    );
+                }
+                lua_opt.as_ref().unwrap().clone()
+            };
+            let sc = script_cache_rc.clone();
+            let acl = acl_table.clone();
+            let rtcfg = runtime_config.clone();
+            let scfg = server_config.clone();
+            let notifiers = all_notifiers.to_vec();
+            let snap_tx = snapshot_trigger_tx.clone();
+            let clk = cached_clock.clone();
+            let pw = pending_wakers.clone();
+            let peer_addr = state.peer_addr.clone();
+
+            // Build read buffer with synthetic state-restoration commands prepended
+            let migration_buf = build_migration_read_buf(&mut state);
+
+            monoio::spawn(async move {
+                let _ = handle_connection_sharded_monoio(
+                    tcp_stream,
+                    peer_addr,
+                    sdbs,
+                    shard_id,
+                    num_shards,
+                    dtx,
+                    psr,
+                    blk,
+                    sd,
+                    None, // requirepass: None = pre-authenticated
+                    aof,
+                    trk,
+                    cid,
+                    rs,
+                    cs,
+                    lua,
+                    sc,
+                    cp,
+                    acl,
+                    rtcfg,
+                    scfg,
+                    notifiers,
+                    snap_tx,
+                    clk,
+                    false, // can_migrate: already-migrated connections skip re-migration sampling
+                    migration_buf,
+                    pw,
+                )
+                .await;
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Shard {}: migration from_std (monoio) failed: {}",
+                shard_id,
+                e
+            );
         }
     }
 }

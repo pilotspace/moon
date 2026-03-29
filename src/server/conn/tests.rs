@@ -11,17 +11,17 @@ use bytes::{Bytes, BytesMut};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Helper: create a single-database Rc<RefCell<Vec<Database>>> for testing.
-fn make_dbs() -> Rc<RefCell<Vec<Database>>> {
-    Rc::new(RefCell::new(vec![Database::new()]))
+/// Helper: create a single-shard, single-database ShardDatabases for testing.
+fn make_dbs() -> std::sync::Arc<crate::shard::shared_databases::ShardDatabases> {
+    crate::shard::shared_databases::ShardDatabases::new(vec![vec![Database::new()]])
 }
 
 #[test]
 fn test_inline_get_hit() {
     let dbs = make_dbs();
     {
-        let mut d = dbs.borrow_mut();
-        d[0].set(
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"bar")),
         );
@@ -30,7 +30,7 @@ fn test_inline_get_hit() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
@@ -43,7 +43,7 @@ fn test_inline_get_miss() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$-1\r\n");
@@ -56,14 +56,14 @@ fn test_inline_set() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"+OK\r\n");
 
     // Verify key was stored
-    let mut d = dbs.borrow_mut();
-    let entry = d[0].get(b"foo").expect("key should exist");
+    let guard = dbs.read_db(0, 0);
+    let entry = guard.get(b"foo").expect("key should exist");
     assert_eq!(entry.value.as_bytes().unwrap(), b"bar");
 }
 
@@ -76,7 +76,7 @@ fn test_inline_fallthrough() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 0);
     assert_eq!(read_buf.len(), original_len);
     assert!(write_buf.is_empty());
@@ -86,8 +86,8 @@ fn test_inline_fallthrough() {
 fn test_inline_mixed_batch() {
     let dbs = make_dbs();
     {
-        let mut d = dbs.borrow_mut();
-        d[0].set(
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"bar")),
         );
@@ -110,8 +110,8 @@ fn test_inline_mixed_batch() {
 fn test_inline_case_insensitive() {
     let dbs = make_dbs();
     {
-        let mut d = dbs.borrow_mut();
-        d[0].set(
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"baz")),
         );
@@ -120,7 +120,7 @@ fn test_inline_case_insensitive() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
     assert_eq!(&write_buf[..], b"$3\r\nbaz\r\n");
@@ -135,7 +135,7 @@ fn test_inline_partial() {
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 0);
     assert_eq!(read_buf.len(), original_len);
     assert!(write_buf.is_empty());
@@ -150,7 +150,7 @@ fn test_inline_set_with_aof() {
     let mut read_buf = BytesMut::from(&cmd[..]);
     let mut write_buf = BytesMut::new();
 
-    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, &aof_tx);
+    let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx);
     assert_eq!(result, 1);
     assert_eq!(&write_buf[..], b"+OK\r\n");
 
@@ -168,12 +168,12 @@ fn test_inline_set_with_aof() {
 fn test_inline_multiple_gets() {
     let dbs = make_dbs();
     {
-        let mut d = dbs.borrow_mut();
-        d[0].set(
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
             Bytes::from_static(b"a"),
             Entry::new_string(Bytes::from_static(b"1")),
         );
-        d[0].set(
+        guard.set(
             Bytes::from_static(b"b"),
             Entry::new_string(Bytes::from_static(b"2")),
         );

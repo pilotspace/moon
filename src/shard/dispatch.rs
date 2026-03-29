@@ -3,6 +3,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::protocol::Frame;
 use crate::runtime::channel;
+use crate::server::response_slot::ResponseSlot;
 
 const HASH_SEED: u64 = 0;
 
@@ -101,9 +102,43 @@ pub enum ShardMessage {
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
     /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
     ScriptLoad { sha1: String, script: bytes::Bytes },
+    /// Migrate a connection's file descriptor to this shard.
+    /// The source shard has deregistered the FD and extracted connection state.
+    /// This shard must reconstruct the TCP stream and spawn a new handler.
+    MigrateConnection {
+        fd: std::os::unix::io::RawFd,
+        state: crate::server::conn::affinity::MigratedConnectionState,
+    },
+    /// Execute a single command with pre-allocated response slot (zero allocation).
+    /// Used instead of Execute for cross-shard write dispatch.
+    ExecuteSlotted {
+        db_index: usize,
+        command: std::sync::Arc<Frame>,
+        response_slot: *const ResponseSlot,
+    },
+    /// Execute multi-key sub-operation with pre-allocated response slot.
+    /// Used instead of MultiExecute for cross-shard multi-key dispatch.
+    MultiExecuteSlotted {
+        db_index: usize,
+        commands: Vec<(Bytes, Frame)>,
+        response_slot: *const ResponseSlot,
+    },
+    /// Execute pipelined batch with pre-allocated response slot.
+    /// Used instead of PipelineBatch for cross-shard pipeline dispatch.
+    PipelineBatchSlotted {
+        db_index: usize,
+        commands: Vec<std::sync::Arc<Frame>>,
+        response_slot: *const ResponseSlot,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }
+
+// SAFETY: All existing ShardMessage fields are Send. The new *const ResponseSlot
+// fields point to ResponseSlot values that are Send+Sync, and the pointers remain
+// valid for the lifetime of the connection (the ResponseSlotPool outlives all
+// dispatched messages). Raw pointers are !Send by default, requiring this explicit impl.
+unsafe impl Send for ShardMessage {}
 
 #[cfg(test)]
 mod tests {

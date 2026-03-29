@@ -28,6 +28,8 @@ use crate::runtime::{
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
+use super::shared_databases::ShardDatabases;
+
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{UringConfig, UringDriver};
 
@@ -66,6 +68,7 @@ impl super::Shard {
         server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
+        shard_databases: Arc<ShardDatabases>,
     ) {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -138,15 +141,101 @@ impl super::Shard {
             Vec<uring_handler::InFlightSend>,
         > = std::collections::HashMap::new();
 
-        #[cfg(not(all(target_os = "linux", feature = "runtime-tokio")))]
+        // Per-shard SO_REUSEPORT listener (Linux + tokio, non-uring path).
+        // When io_uring is active, multishot accept handles this already.
+        // When io_uring is NOT active (MOON_NO_URING or init failure), create a tokio TcpListener.
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+        let per_shard_listener: Option<tokio::net::TcpListener> = {
+            if uring_state.is_none() {
+                if let Some(ref addr) = bind_addr {
+                    match conn_accept::create_reuseport_socket(addr) {
+                        Ok(std_listener) => match tokio::net::TcpListener::from_std(std_listener) {
+                            Ok(tl) => {
+                                info!(
+                                    "Shard {}: per-shard SO_REUSEPORT listener on {}",
+                                    self.id, addr
+                                );
+                                Some(tl)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Shard {}: tokio listener from_std failed: {}, using conn_rx",
+                                    self.id,
+                                    e
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
+                                self.id,
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None // io_uring handles accept via multishot
+            }
+        };
+
+        // Per-shard SO_REUSEPORT listener (Linux + monoio).
+        // Each shard creates its own listener; the kernel distributes connections via SO_REUSEPORT.
+        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        let per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
+            if let Some(ref addr) = bind_addr {
+                match conn_accept::create_reuseport_socket(addr) {
+                    Ok(std_listener) => match monoio::net::TcpListener::from_std(std_listener) {
+                        Ok(ml) => {
+                            info!(
+                                "Shard {}: per-shard SO_REUSEPORT listener on {} (monoio)",
+                                self.id, addr
+                            );
+                            Some(ml)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: monoio listener from_std failed: {}, using conn_rx",
+                                self.id,
+                                e
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            "Shard {}: SO_REUSEPORT bind failed: {}, using conn_rx",
+                            self.id,
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "runtime-tokio"),
+            all(target_os = "linux", feature = "runtime-monoio"),
+        )))]
         {
-            let _ = &bind_addr; // Suppress unused warning when io_uring path inactive
+            let _ = &bind_addr; // Suppress unused warning when per-shard accept inactive
             info!("Shard {} started", self.id);
         }
 
-        // Wrap databases and pubsub_registry in Rc<RefCell> for sharing with spawned
-        // connection tasks. Safe: single-threaded runtime guarantees no concurrent access.
-        let databases = Rc::new(RefCell::new(std::mem::take(&mut self.databases)));
+        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        {
+            if per_shard_monoio_listener.is_none() {
+                info!("Shard {} started (monoio, conn_rx fallback)", self.id);
+            }
+        }
+
         let dispatch_tx = Rc::new(RefCell::new(producers));
         let pubsub_rc = Rc::new(RefCell::new(std::mem::take(&mut self.pubsub_registry)));
         let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
@@ -208,10 +297,48 @@ impl super::Shard {
         // Per-shard cached clock: updated once per 1ms tick.
         let cached_clock = CachedClock::new();
 
+        // Pending FD migrations collected from SPSC drain (spawn wired in Plan 50-02).
+        let mut pending_migrations: Vec<(
+            std::os::unix::io::RawFd,
+            crate::server::conn::affinity::MigratedConnectionState,
+        )> = Vec::new();
+
+        // Pending wakers for monoio cross-shard write dispatch.
+        // monoio's !Send single-threaded executor doesn't see cross-thread Waker::wake()
+        // from flume oneshot channels. Connection tasks register their waker here; the
+        // event loop drains and wakes them after every SPSC processing cycle (~1ms).
+        #[cfg(feature = "runtime-monoio")]
+        let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
+
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
-                // Accept new connections from listener
+                // Per-shard SO_REUSEPORT accept (Linux only, non-uring tokio path)
+                result = async {
+                    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+                    if let Some(ref listener) = per_shard_listener {
+                        return listener.accept().await;
+                    }
+                    // Never resolves on non-Linux or when per_shard_listener is None
+                    std::future::pending::<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>().await
+                } => {
+                    match result {
+                        Ok((tcp_stream, _addr)) => {
+                            conn_accept::spawn_tokio_connection(
+                                tcp_stream, false, &tls_config,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Shard {}: per-shard accept error: {}", shard_id, e);
+                        }
+                    }
+                }
+                // Accept new connections from listener (MPSC fallback, always active on non-Linux)
                 stream = conn_rx.recv_async() => {
                     match stream {
                         Ok((tcp_stream, is_tls)) => {
@@ -243,7 +370,7 @@ impl super::Shard {
 
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, is_tls, &tls_config,
-                                &databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
@@ -260,15 +387,45 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
+                            );
+                        }
+                    }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.tick() => {
@@ -276,25 +433,56 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
+                            );
+                        }
+                    }
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
                     if persistence_tick::advance_snapshot_segment(
                         &mut snapshot_state,
-                        &databases,
+                        &shard_databases,
+                        shard_id,
                     ) {
                         if let Some(snap) = snapshot_state.as_mut() {
                             if let Err(e) = snap.finalize_async().await {
@@ -320,7 +508,7 @@ impl super::Shard {
                         let events = driver.drain_completions();
                         for event in events {
                             uring_handler::handle_uring_event(
-                                event, driver, &databases, &mut uring_parse_bufs,
+                                event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
                                 &mut inflight_sends, uring_listener_fd, &cached_clock,
                             );
                         }
@@ -336,11 +524,11 @@ impl super::Shard {
                 }
                 // Cooperative active expiry
                 _ = expiry_interval.tick() => {
-                    timers::run_active_expiry(&databases);
+                    timers::run_active_expiry(&shard_databases, shard_id);
                 }
                 // Background eviction timer
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&databases, &runtime_config);
+                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
@@ -354,17 +542,50 @@ impl super::Shard {
             // Monoio runtime: full event loop mirroring the tokio path.
             #[cfg(feature = "runtime-monoio")]
             monoio::select! {
-                // Accept new connections from listener
+                // Per-shard SO_REUSEPORT accept (Linux only, monoio path)
+                result = async {
+                    #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+                    if let Some(ref listener) = per_shard_monoio_listener {
+                        return listener.accept().await;
+                    }
+                    // Never resolves on non-Linux or when per_shard_monoio_listener is None
+                    std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
+                } => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            // Convert monoio TcpStream -> std::net::TcpStream (same pattern as listener.rs)
+                            let std_stream = {
+                                use std::os::unix::io::{IntoRawFd, FromRawFd};
+                                let fd = stream.into_raw_fd();
+                                unsafe { std::net::TcpStream::from_raw_fd(fd) }
+                            };
+                            conn_accept::spawn_monoio_connection(
+                                std_stream, false, &tls_config,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Shard {}: per-shard accept error (monoio): {}", shard_id, e);
+                        }
+                    }
+                }
+                // Accept new connections from listener (MPSC fallback, always active on non-Linux)
                 stream = conn_rx.recv_async() => {
                     match stream {
                         Ok((std_tcp_stream, is_tls)) => {
                             conn_accept::spawn_monoio_connection(
                                 std_tcp_stream, is_tls, &tls_config,
-                                &databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
                             );
                         }
                         Err(_) => {
@@ -375,43 +596,115 @@ impl super::Shard {
                 }
                 // SPSC notify -- event-driven cross-shard message drain
                 _ = spsc_notify_local.notified() => {
+                    tracing::trace!("Shard {}: SPSC notify fired", shard_id);
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
+                    // Wake connection tasks waiting for cross-shard write responses.
+                    // They'll try_recv() — if the response arrived, proceed; otherwise re-register.
+                    for waker in pending_wakers.borrow_mut().drain(..) {
+                        waker.wake();
+                    }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
+                            );
+                        }
+                    }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
                 _ = periodic_interval.tick() => {
+                    tracing::trace!("Shard {}: periodic tick", shard_id);
                     cached_clock.update();
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
-                        &databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
+                        &shard_databases, &mut consumers, &mut *pubsub_rc.borrow_mut(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
                     );
+                    // Wake connection tasks waiting for cross-shard write responses.
+                    for waker in pending_wakers.borrow_mut().drain(..) {
+                        waker.wake();
+                    }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &databases, shard_id,
+                        &shard_databases, shard_id,
                     );
+                    for (fd, state) in pending_migrations.drain(..) {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id, fd, state.client_id, state.peer_addr
+                        );
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            conn_accept::spawn_migrated_tokio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                            );
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            conn_accept::spawn_migrated_monoio_connection(
+                                fd, state,
+                                &shard_databases, &dispatch_tx, &pubsub_rc, &blocking_rc,
+                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &acl_table, &runtime_config, &server_config, &all_notifiers,
+                                &snapshot_trigger_tx, &repl_state, &cluster_state,
+                                &cached_clock, shard_id, num_shards, config_port,
+                                &pending_wakers,
+                            );
+                        }
+                    }
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
                     if persistence_tick::advance_snapshot_segment(
                         &mut snapshot_state,
-                        &databases,
+                        &shard_databases,
+                        shard_id,
                     ) {
                         if let Some(snap) = snapshot_state.as_mut() {
                             if let Err(e) = snap.finalize_async().await {
@@ -442,11 +735,11 @@ impl super::Shard {
                 }
                 // Cooperative active expiry every 100ms
                 _ = expiry_interval.tick() => {
-                    timers::run_active_expiry(&databases);
+                    timers::run_active_expiry(&shard_databases, shard_id);
                 }
                 // Background eviction timer
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&databases, &runtime_config);
+                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                 }
                 // Shutdown
                 _ = shutdown.cancelled() => {
@@ -467,17 +760,8 @@ impl super::Shard {
             }
         }
 
-        // Restore databases and pubsub_registry back to self for cleanup.
-        self.databases = match Rc::try_unwrap(databases) {
-            Ok(refcell) => refcell.into_inner(),
-            Err(_) => {
-                info!(
-                    "Shard {}: could not reclaim databases (outstanding Rc references)",
-                    self.id
-                );
-                Vec::new()
-            }
-        };
+        // Databases now live in Arc<ShardDatabases>, no reclaim needed.
+        self.databases.clear();
         self.pubsub_registry = match Rc::try_unwrap(pubsub_rc) {
             Ok(refcell) => refcell.into_inner(),
             Err(_) => {

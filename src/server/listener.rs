@@ -320,9 +320,25 @@ pub async fn run_sharded(
         });
     }
 
+    // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP accept directly.
+    // The central listener only handles TLS connections (spawned above).
+    // On non-Linux, the central listener handles all connections via round-robin MPSC.
+    #[cfg(target_os = "linux")]
+    let linux_reuseport_active = true;
+    #[cfg(not(target_os = "linux"))]
+    let linux_reuseport_active = false;
+
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            // Plain TCP accept -- only active on non-Linux (macOS fallback).
+            // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP directly.
+            result = async {
+                if linux_reuseport_active {
+                    std::future::pending::<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>().await
+                } else {
+                    listener.accept().await
+                }
+            } => {
                 match result {
                     Ok((mut stream, addr)) => {
                         // Protected mode: reject non-loopback connections when no auth configured
@@ -408,11 +424,27 @@ pub async fn run_sharded(
     };
     let mut tls_next_shard: usize = 0;
 
+    // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP accept directly.
+    // The central listener only handles TLS connections.
+    // On non-Linux, the central listener handles all connections via round-robin MPSC.
+    #[cfg(target_os = "linux")]
+    let linux_reuseport_active = true;
+    #[cfg(not(target_os = "linux"))]
+    let linux_reuseport_active = false;
+
     loop {
         // If TLS listener is configured, select on both plain and TLS accepts
         if let Some(ref tls_listener) = tls_listener {
             monoio::select! {
-                result = listener.accept() => {
+                // Plain TCP accept -- only active on non-Linux (macOS fallback).
+                // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP directly.
+                result = async {
+                    if linux_reuseport_active {
+                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
+                    } else {
+                        listener.accept().await
+                    }
+                } => {
                     match result {
                         Ok((mut stream, addr)) => {
                             if protected_mode_active && !addr.ip().is_loopback() {
@@ -474,7 +506,15 @@ pub async fn run_sharded(
             }
         } else {
             monoio::select! {
-                result = listener.accept() => {
+                // Plain TCP accept -- only active on non-Linux (macOS fallback).
+                // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP directly.
+                result = async {
+                    if linux_reuseport_active {
+                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
+                    } else {
+                        listener.accept().await
+                    }
+                } => {
                     match result {
                         Ok((mut stream, addr)) => {
                             if protected_mode_active && !addr.ip().is_loopback() {
