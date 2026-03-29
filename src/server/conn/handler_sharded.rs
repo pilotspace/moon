@@ -240,7 +240,8 @@ pub async fn handle_connection_sharded_inner<
     let mut protocol_version: u8 = migrated_state.map_or(2, |s| s.protocol_version);
     let mut selected_db: usize = migrated_state.map_or(0, |s| s.selected_db);
     let mut authenticated = migrated_state.map_or(requirepass.is_none(), |s| s.authenticated);
-    let mut current_user: String = migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
+    let mut current_user: String =
+        migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
     let acl_max_len = runtime_config
         .read()
         .map(|cfg| cfg.acllog_max_len)
