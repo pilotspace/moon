@@ -66,6 +66,44 @@ Multi-shard scaling milestone. Eliminated negative scaling, achieving 5M GET/s a
 | Negative scaling | -25% at 12 shards | **Zero at 1-8 shards** | Eliminated |
 | Command coverage p=1 | Parity | **Monoio beats Redis 8/10** | Improved |
 
+## [0.1.1] - 2026-03-28
+
+Structural stability milestone. Codebase refactoring for maintainability — no feature changes, no performance changes.
+
+### Changed
+
+#### Error and State Foundations (Phase 44)
+- Unified `MoonError` type hierarchy with structured `#[source]` on I/O variants carrying `PathBuf` context
+- `ConnectionContext` struct for connection state (selected_db, authenticated, client_name, protocol_version)
+- Criterion benchmark baseline (GET dispatch 69.1ns) to guard against regressions
+
+#### Command Metadata Registry (Phase 45)
+- `phf` static perfect hash map for O(1) command lookup (112 commands)
+- `CommandMeta` struct: name, arity, flags (read/write/fast/admin), key positions, ACL categories
+- `is_write()` classification via const bitflags — replaces duplicated match arms across codebase
+
+#### Persistence Hardening (Phase 46)
+- Eliminated server-crashing `unwrap()` calls in WAL, AOF, and RDB persistence code
+- Corruption recovery: WAL uses per-block CRC32 log+skip, AOF seeks to next RESP `*` marker, RDB breaks on mid-stream corruption
+- `WalWriter` methods remain `std::io::Result` (must-panic on flush = data loss prevention)
+
+#### AOF Replay Decoupling (Phase 47)
+- `CommandReplayEngine` trait breaks circular dependency between persistence and command dispatch
+- `StorageEngine` trait boundary for persistence replay and Lua scripting
+- `execute_command()` at command level (not individual get/set methods)
+
+#### God-File Decomposition (Phase 48)
+- `connection.rs` (5,102 lines) → 6 sub-modules in `conn/`: `handler_sharded.rs`, `handler_monoio.rs`, `handler_single.rs`, `shared.rs`, `blocking.rs`, `conn_state.rs`
+- `shard/mod.rs` (2,004 lines) → 6 sub-modules: `event_loop.rs`, `spsc_handler.rs`, `persistence_tick.rs`, `conn_accept.rs`, `timers.rs`, `uring_handler.rs`
+- Module facade pattern with `pub(crate)` re-exports preserving all external import paths
+- No single file exceeds 800 lines
+
+### Added
+- Docker: optimized multi-stage build (113MB → 41MB)
+- Mintlify documentation site
+- Claude Code GitHub workflow for PR reviews
+- `scripts/bench-resources.sh` for memory/CPU efficiency benchmarking
+
 ## [0.1.0] - 2026-03-27
 
 Initial release. A Redis-compatible in-memory data store written in Rust, achieving 1.84-1.99x Redis throughput at 8 shards and 27-35% less memory for 1KB+ values.
