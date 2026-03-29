@@ -177,7 +177,8 @@ fn main() -> anyhow::Result<()> {
     // into centralized ShardDatabases for cross-shard direct read access.
     let mut shards: Vec<Shard> = (0..num_shards)
         .map(|id| {
-            let mut shard = Shard::new(id, num_shards, config.databases, config.to_runtime_config());
+            let mut shard =
+                Shard::new(id, num_shards, config.databases, config.to_runtime_config());
             if let Some(ref dir) = persistence_dir {
                 shard.restore_from_persistence(dir);
             }

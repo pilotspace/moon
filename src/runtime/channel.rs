@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-
 // --- mpsc ---
 // flume provides unbounded + bounded async-capable mpsc channels that work on any runtime.
 pub use flume::{
@@ -20,10 +19,7 @@ pub use flume::{
 // Lock-free oneshot using AtomicU8 state machine + UnsafeCell + AtomicWaker.
 // Zero mutex contention -- eliminates 12% CPU overhead from flume's Mutex<VecDeque>.
 
-
-
 // T: Send is required because value crosses thread boundaries.
-
 
 pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
     // Use flume bounded(1) instead of custom AtomicU8 state machine.

@@ -308,8 +308,7 @@ impl super::Shard {
         // from flume oneshot channels. Connection tasks register their waker here; the
         // event loop drains and wakes them after every SPSC processing cycle (~1ms).
         #[cfg(feature = "runtime-monoio")]
-        let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
 
         loop {
             #[cfg(feature = "runtime-tokio")]

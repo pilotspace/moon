@@ -238,24 +238,15 @@ pub(crate) fn handle_shard_message_shared(
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             }
                         }
@@ -334,24 +325,15 @@ pub(crate) fn handle_shard_message_shared(
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             }
                         }
@@ -434,24 +416,15 @@ pub(crate) fn handle_shard_message_shared(
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             }
                         }
@@ -533,24 +506,15 @@ pub(crate) fn handle_shard_message_shared(
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             }
                         }
@@ -628,24 +592,15 @@ pub(crate) fn handle_shard_message_shared(
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             }
                         }
@@ -725,24 +680,15 @@ pub(crate) fn handle_shard_message_shared(
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                             {
                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else if cmd.eq_ignore_ascii_case(b"ZADD") {
                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             } else {
                                 crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg,
-                                    &mut guard,
-                                    db_idx,
-                                    &key,
+                                    &mut reg, &mut guard, db_idx, &key,
                                 );
                             }
                         }
@@ -794,7 +740,9 @@ pub(crate) fn handle_shard_message_shared(
             if guard.exists(&key) {
                 crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, db_index, &key);
                 crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, db_index, &key);
-                crate::blocking::wakeup::try_wake_stream_waiter(&mut reg, &mut guard, db_index, &key);
+                crate::blocking::wakeup::try_wake_stream_waiter(
+                    &mut reg, &mut guard, db_index, &key,
+                );
             }
         }
         ShardMessage::BlockCancel { wait_id } => {
@@ -839,7 +787,10 @@ pub(crate) fn handle_shard_message_shared(
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,
             // not dispatched through handle_shard_message_shared.
             // If we reach here, it's a logic error — log and drop.
-            tracing::warn!("Shard {}: MigrateConnection reached handle_shard_message_shared unexpectedly", shard_id);
+            tracing::warn!(
+                "Shard {}: MigrateConnection reached handle_shard_message_shared unexpectedly",
+                shard_id
+            );
         }
         ShardMessage::NewConnection(_) => {
             // NewConnection is handled via conn_rx, not SPSC

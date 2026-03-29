@@ -631,6 +631,19 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SETRANGE"),
     };
 
+    // Redis compatibility: SETRANGE with empty value on missing key returns 0 without creating key
+    if value.is_empty() {
+        return match db.get(&key) {
+            Some(entry) => match entry.value.as_bytes() {
+                Some(v) => Frame::Integer(v.len() as i64),
+                None => Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
+            },
+            None => Frame::Integer(0),
+        };
+    }
+
     // Redis limits string size to 512MB
     let required = match offset.checked_add(value.len()) {
         Some(r) if r <= 512 * 1024 * 1024 => r,
@@ -1791,7 +1804,10 @@ mod tests {
     fn test_substr_alias() {
         // SUBSTR uses the same getrange function, verify it produces identical results
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"msg"), Bytes::from_static(b"Hello, World!"));
+        db.set_string(
+            Bytes::from_static(b"msg"),
+            Bytes::from_static(b"Hello, World!"),
+        );
         // SUBSTR with same args as GETRANGE should produce identical output
         let getrange_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
         let substr_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
@@ -1803,9 +1819,35 @@ mod tests {
     }
 
     #[test]
+    fn test_setrange_empty_value_missing_key() {
+        // Redis: SETRANGE on missing key with empty value returns 0, does NOT create key
+        let mut db = make_db();
+        let result = setrange(&mut db, &[bs(b"nokey"), bs(b"5"), bs(b"")]);
+        assert_eq!(result, Frame::Integer(0));
+        assert_eq!(get(&mut db, &[bs(b"nokey")]), Frame::Null);
+    }
+
+    #[test]
+    fn test_setrange_empty_value_existing_key() {
+        // Redis: SETRANGE on existing key with empty value returns current length
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"mykey"), Bytes::from_static(b"Hello"));
+        let result = setrange(&mut db, &[bs(b"mykey"), bs(b"5"), bs(b"")]);
+        assert_eq!(result, Frame::Integer(5));
+        // Key unchanged
+        assert_eq!(
+            get(&mut db, &[bs(b"mykey")]),
+            Frame::BulkString(Bytes::from_static(b"Hello"))
+        );
+    }
+
+    #[test]
     fn test_substr_negative_indices() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"msg"), Bytes::from_static(b"Hello, World!"));
+        db.set_string(
+            Bytes::from_static(b"msg"),
+            Bytes::from_static(b"Hello, World!"),
+        );
         // SUBSTR with negative indices (alias behavior)
         let result = getrange(&mut db, &[bs(b"msg"), bs(b"-6"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));

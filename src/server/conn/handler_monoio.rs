@@ -1234,7 +1234,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
-                        &(),  // monoio: coordinator uses oneshot, not response_pool
+                        &(), // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1250,7 +1250,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
-                        &(),  // monoio: coordinator uses oneshot, not response_pool
+                        &(), // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1264,7 +1264,7 @@ pub async fn handle_connection_sharded_monoio<
                         &shard_databases,
                         &dispatch_tx,
                         &spsc_notifiers,
-                        &(),  // monoio: coordinator uses oneshot, not response_pool
+                        &(), // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1283,7 +1283,7 @@ pub async fn handle_connection_sharded_monoio<
                         &dispatch_tx,
                         &spsc_notifiers,
                         &cached_clock,
-                        &(),  // monoio: coordinator uses oneshot, not response_pool
+                        &(), // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
                     responses.push(response);
@@ -1391,8 +1391,7 @@ pub async fn handle_connection_sharded_monoio<
                             let senders =
                                 tracking_table.borrow_mut().invalidate_key(&key, client_id);
                             if !senders.is_empty() {
-                                let push =
-                                    crate::tracking::invalidation::invalidation_push(&[key]);
+                                let push = crate::tracking::invalidation::invalidation_push(&[key]);
                                 for tx in senders {
                                     let _ = tx.try_send(push.clone());
                                 }
@@ -1420,16 +1419,18 @@ pub async fn handle_connection_sharded_monoio<
                     // Track key on local read
                     if tracking_state.enabled && !tracking_state.bcast {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            tracking_table
-                                .borrow_mut()
-                                .track_key(client_id, &key, tracking_state.noloop);
+                            tracking_table.borrow_mut().track_key(
+                                client_id,
+                                &key,
+                                tracking_state.noloop,
+                            );
                         }
                     }
                     let response = apply_resp3_conversion(cmd, response, protocol_version);
                     responses.push(response);
                 } // end read/write split
 
-                // (tracking and response push handled inside read/write branches above)
+            // (tracking and response push handled inside read/write branches above)
             } else if let Some(target) = target_shard {
                 // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
                 // By this point in_multi is false (MULTI queuing happens earlier with `continue`).
@@ -1491,7 +1492,10 @@ pub async fn handle_connection_sharded_monoio<
         if !remote_groups.is_empty() {
             reply_futures.clear();
 
-            let mut oneshot_futures: Vec<(Vec<(usize, Option<Bytes>, Vec<u8>)>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::new();
+            let mut oneshot_futures: Vec<(
+                Vec<(usize, Option<Bytes>, Vec<u8>)>,
+                channel::OneshotReceiver<Vec<Frame>>,
+            )> = Vec::new();
             for (target, entries) in remote_groups.drain() {
                 let (reply_tx, reply_rx) = channel::oneshot();
                 let (meta, commands): (
@@ -1517,7 +1521,11 @@ pub async fn handle_connection_sharded_monoio<
                         };
                         match push_result {
                             Ok(()) => {
-                                tracing::trace!("Shard {}: pushed PipelineBatch to shard {}, notifying", shard_id, target);
+                                tracing::trace!(
+                                    "Shard {}: pushed PipelineBatch to shard {}, notifying",
+                                    shard_id,
+                                    target
+                                );
                                 spsc_notifiers[target].notify_one();
                                 break;
                             }
@@ -1537,7 +1545,10 @@ pub async fn handle_connection_sharded_monoio<
             // loop drains and wakes them after every SPSC cycle (~1ms). On wake, try_recv()
             // checks if the response arrived; if not, re-register and yield again.
             for (meta, reply_rx) in oneshot_futures.drain(..) {
-                tracing::trace!("Shard {}: awaiting cross-shard response via pending_wakers", shard_id);
+                tracing::trace!(
+                    "Shard {}: awaiting cross-shard response via pending_wakers",
+                    shard_id
+                );
                 let shard_responses = {
                     let pw = pending_wakers.clone();
                     loop {
@@ -1555,7 +1566,8 @@ pub async fn handle_connection_sharded_monoio<
                                         pw.borrow_mut().push(cx.waker().clone());
                                         std::task::Poll::Pending
                                     }
-                                }).await;
+                                })
+                                .await;
                                 // After wake, loop back to try_recv
                             }
                         }
@@ -1565,7 +1577,9 @@ pub async fn handle_connection_sharded_monoio<
                     Ok(r) => r,
                     Err(()) => {
                         for (resp_idx, _, _) in &meta {
-                            responses[*resp_idx] = Frame::Error(Bytes::from_static(b"ERR cross-shard dispatch failed"));
+                            responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                b"ERR cross-shard dispatch failed",
+                            ));
                         }
                         continue;
                     }

@@ -303,7 +303,9 @@ mod tests {
         let slot = pool.slot_for(1);
         let future = pool.future_for(1);
 
-        slot.fill(vec![Frame::SimpleString(bytes::Bytes::from_static(b"PONG"))]);
+        slot.fill(vec![Frame::SimpleString(bytes::Bytes::from_static(
+            b"PONG",
+        ))]);
 
         let result = block_on(future);
         assert_eq!(result.len(), 1);

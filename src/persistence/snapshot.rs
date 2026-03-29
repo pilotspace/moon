@@ -80,7 +80,14 @@ impl SnapshotState {
             .map(|db| db.data().segment_count())
             .collect();
         let base_timestamps: Vec<u32> = databases.iter().map(|db| db.base_timestamp()).collect();
-        Self::new_from_metadata(shard_id, epoch, num_databases, segment_counts, base_timestamps, file_path)
+        Self::new_from_metadata(
+            shard_id,
+            epoch,
+            num_databases,
+            segment_counts,
+            base_timestamps,
+            file_path,
+        )
     }
 
     /// Create from pre-collected metadata (for Arc<ShardDatabases> path).

@@ -978,7 +978,14 @@ pub(crate) fn try_inline_dispatch_loop(
 ) -> usize {
     let mut total = 0;
     loop {
-        let n = try_inline_dispatch(read_buf, write_buf, shard_databases, shard_id, selected_db, aof_tx);
+        let n = try_inline_dispatch(
+            read_buf,
+            write_buf,
+            shard_databases,
+            shard_id,
+            selected_db,
+            aof_tx,
+        );
         if n == 0 {
             break;
         }

@@ -20,13 +20,12 @@ fn make_dbs() -> std::sync::Arc<crate::shard::shared_databases::ShardDatabases> 
 fn test_inline_get_hit() {
     let dbs = make_dbs();
     {
-        {
-            let mut guard = dbs.write_db(0, 0);
-            guard.set(
-                Bytes::from_static(b"foo"),
-                Entry::new_string(Bytes::from_static(b"bar")),
-            );
-        }
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"bar")),
+        );
+    }
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
@@ -87,13 +86,12 @@ fn test_inline_fallthrough() {
 fn test_inline_mixed_batch() {
     let dbs = make_dbs();
     {
-        {
-            let mut guard = dbs.write_db(0, 0);
-            guard.set(
-                Bytes::from_static(b"foo"),
-                Entry::new_string(Bytes::from_static(b"bar")),
-            );
-        }
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
+            Bytes::from_static(b"foo"),
+            Entry::new_string(Bytes::from_static(b"bar")),
+        );
+    }
     // GET foo followed by PING
     let mut read_buf = BytesMut::new();
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
@@ -112,9 +110,8 @@ fn test_inline_mixed_batch() {
 fn test_inline_case_insensitive() {
     let dbs = make_dbs();
     {
-        {
-            let mut guard = dbs.write_db(0, 0);
-            guard.set(
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"baz")),
         );
@@ -171,13 +168,12 @@ fn test_inline_set_with_aof() {
 fn test_inline_multiple_gets() {
     let dbs = make_dbs();
     {
-        {
-            let mut guard = dbs.write_db(0, 0);
-            guard.set(
+        let mut guard = dbs.write_db(0, 0);
+        guard.set(
             Bytes::from_static(b"a"),
             Entry::new_string(Bytes::from_static(b"1")),
         );
-        d[0].set(
+        guard.set(
             Bytes::from_static(b"b"),
             Entry::new_string(Bytes::from_static(b"2")),
         );

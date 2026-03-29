@@ -40,7 +40,7 @@ pub async fn coordinate_multi_key(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
         coordinate_mget(
@@ -52,7 +52,7 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
-            response_pool,
+            _response_pool,
         )
         .await
     } else if cmd.eq_ignore_ascii_case(b"MSET") {
@@ -65,7 +65,7 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
-            response_pool,
+            _response_pool,
         )
         .await
     } else {
@@ -80,7 +80,7 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
-            response_pool,
+            _response_pool,
         )
         .await
     }
@@ -143,7 +143,7 @@ async fn coordinate_mget(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -243,7 +243,7 @@ async fn coordinate_mset(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() || args.len() % 2 != 0 {
         return Frame::Error(Bytes::from_static(
@@ -334,7 +334,7 @@ async fn coordinate_multi_del_or_exists(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     let cmd_upper = cmd.to_ascii_uppercase();
 
@@ -420,7 +420,7 @@ pub async fn coordinate_keys(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -489,7 +489,7 @@ pub async fn coordinate_scan(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -598,7 +598,7 @@ pub async fn coordinate_dbsize(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
-    response_pool: &(),  // placeholder — coordinator uses oneshot internally
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     let mut total: i64 = 0;
     let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();

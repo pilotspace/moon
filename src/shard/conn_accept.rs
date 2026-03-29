@@ -176,9 +176,30 @@ pub(crate) fn spawn_tokio_connection(
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     let _ = handle_connection_sharded_inner(
-                        tls_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
-                        reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                        snap_tx, clk,
+                        tls_stream,
+                        peer_addr,
+                        sdbs,
+                        shard_id,
+                        num_shards,
+                        dtx,
+                        psr,
+                        blk,
+                        sd,
+                        reqpass,
+                        aof,
+                        trk,
+                        cid,
+                        rs,
+                        cs,
+                        lua,
+                        sc,
+                        cp,
+                        acl,
+                        rtcfg,
+                        scfg,
+                        notifiers,
+                        snap_tx,
+                        clk,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                     )
@@ -274,8 +295,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
-                    *lua_opt =
-                        Some(crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"));
+                    *lua_opt = Some(
+                        crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
+                    );
                 }
                 lua_opt.as_ref().unwrap().clone()
             };
@@ -296,10 +318,30 @@ pub(crate) fn spawn_migrated_tokio_connection(
             // prepended to the read buffer by the handler's normal command processing.
             tokio::task::spawn_local(async move {
                 let _ = handle_connection_sharded_inner(
-                    tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
+                    tcp_stream,
+                    peer_addr,
+                    sdbs,
+                    shard_id,
+                    num_shards,
+                    dtx,
+                    psr,
+                    blk,
+                    sd,
                     None, // requirepass: None = pre-authenticated
-                    aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                    snap_tx, clk,
+                    aof,
+                    trk,
+                    cid,
+                    rs,
+                    cs,
+                    lua,
+                    sc,
+                    cp,
+                    acl,
+                    rtcfg,
+                    scfg,
+                    notifiers,
+                    snap_tx,
+                    clk,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                 )
@@ -307,11 +349,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
             });
         }
         Err(e) => {
-            tracing::warn!(
-                "Shard {}: migration from_std failed: {}",
-                shard_id,
-                e
-            );
+            tracing::warn!("Shard {}: migration from_std failed: {}", shard_id, e);
             // FD already consumed by from_raw_fd; std_stream moved into from_std
         }
     }
@@ -398,9 +436,30 @@ pub(crate) fn spawn_monoio_connection(
                                 Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                             };
                             let _ = handle_connection_sharded_monoio(
-                                tls_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk,
-                                sd, reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg,
-                                notifiers, snap_tx, clk,
+                                tls_stream,
+                                peer_addr,
+                                sdbs,
+                                shard_id,
+                                num_shards,
+                                dtx,
+                                psr,
+                                blk,
+                                sd,
+                                reqpass,
+                                aof,
+                                trk,
+                                cid,
+                                rs,
+                                cs,
+                                lua,
+                                sc,
+                                cp,
+                                acl,
+                                rtcfg,
+                                scfg,
+                                notifiers,
+                                snap_tx,
+                                clk,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
@@ -428,9 +487,30 @@ pub(crate) fn spawn_monoio_connection(
                         Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                     };
                     let _result = handle_connection_sharded_monoio(
-                        tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
-                        reqpass, aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                        snap_tx, clk,
+                        tcp_stream,
+                        peer_addr,
+                        sdbs,
+                        shard_id,
+                        num_shards,
+                        dtx,
+                        psr,
+                        blk,
+                        sd,
+                        reqpass,
+                        aof,
+                        trk,
+                        cid,
+                        rs,
+                        cs,
+                        lua,
+                        sc,
+                        cp,
+                        acl,
+                        rtcfg,
+                        scfg,
+                        notifiers,
+                        snap_tx,
+                        clk,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
@@ -579,10 +659,30 @@ pub(crate) fn spawn_migrated_monoio_connection(
 
             monoio::spawn(async move {
                 let _ = handle_connection_sharded_monoio(
-                    tcp_stream, peer_addr, sdbs, shard_id, num_shards, dtx, psr, blk, sd,
+                    tcp_stream,
+                    peer_addr,
+                    sdbs,
+                    shard_id,
+                    num_shards,
+                    dtx,
+                    psr,
+                    blk,
+                    sd,
                     None, // requirepass: None = pre-authenticated
-                    aof, trk, cid, rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers,
-                    snap_tx, clk,
+                    aof,
+                    trk,
+                    cid,
+                    rs,
+                    cs,
+                    lua,
+                    sc,
+                    cp,
+                    acl,
+                    rtcfg,
+                    scfg,
+                    notifiers,
+                    snap_tx,
+                    clk,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     pw,
