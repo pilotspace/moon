@@ -204,11 +204,6 @@ pub enum ShardMessage {
         message: Bytes,
         slot: std::sync::Arc<PubSubResponseSlot>,
     },
-    /// Cross-shard PUBSUB introspection query with reply.
-    PubSubIntrospect {
-        query: PubSubQuery,
-        reply_tx: channel::OneshotSender<PubSubQueryResult>,
-    },
     /// Graceful shutdown signal.
     Shutdown,
 }
@@ -216,23 +211,6 @@ pub enum ShardMessage {
 // ShardMessage is Send because all fields are Send. The raw pointer in
 // ResponseSlotPtr is the only non-auto-Send field, and it has its own
 // localized unsafe impl Send with documented safety invariants.
-
-/// Query types for PUBSUB introspection commands.
-pub enum PubSubQuery {
-    /// PUBSUB CHANNELS [pattern]
-    Channels(Option<Bytes>),
-    /// PUBSUB NUMSUB ch1 ch2 ...
-    NumSub(Vec<Bytes>),
-    /// PUBSUB NUMPAT
-    NumPat,
-}
-
-/// Result types for PUBSUB introspection queries.
-pub enum PubSubQueryResult {
-    Channels(Vec<Bytes>),
-    NumSub(Vec<(Bytes, i64)>),
-    NumPat(usize),
-}
 
 #[cfg(test)]
 mod tests {

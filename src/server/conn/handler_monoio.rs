@@ -21,7 +21,7 @@ use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
-use crate::shard::dispatch::{PubSubQuery, PubSubQueryResult, ShardMessage, key_to_shard};
+use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
@@ -1192,7 +1192,7 @@ pub async fn handle_connection_sharded_monoio<
                 continue;
             }
 
-            // --- PUBSUB introspection: CHANNELS / NUMSUB / NUMPAT ---
+            // --- PUBSUB introspection (zero-SPSC: direct shared-read) ---
             if cmd.eq_ignore_ascii_case(b"PUBSUB") {
                 if cmd_args.is_empty() {
                     responses.push(Frame::Error(Bytes::from_static(
@@ -1208,36 +1208,11 @@ pub async fn handle_connection_sharded_monoio<
                         } else {
                             None
                         };
-                        let local = {
-                            pubsub_registry
-                                .borrow()
-                                .active_channels(pattern.as_deref())
-                        };
-                        let mut reply_rxs = Vec::new();
-                        {
-                            let mut producers = dispatch_tx.borrow_mut();
-                            for target in 0..num_shards {
-                                if target == shard_id {
-                                    continue;
-                                }
-                                let (tx, rx) = channel::oneshot();
-                                let idx = ChannelMesh::target_index(shard_id, target);
-                                let msg = ShardMessage::PubSubIntrospect {
-                                    query: PubSubQuery::Channels(pattern.clone()),
-                                    reply_tx: tx,
-                                };
-                                if producers[idx].try_push(msg).is_ok() {
-                                    spsc_notifiers[target].notify_one();
-                                    reply_rxs.push(rx);
-                                }
-                            }
-                        }
                         let mut all_channels: std::collections::HashSet<Bytes> =
-                            local.into_iter().collect();
-                        for rx in reply_rxs {
-                            if let Ok(PubSubQueryResult::Channels(chs)) = rx.recv().await {
-                                all_channels.extend(chs);
-                            }
+                            std::collections::HashSet::new();
+                        for reg in &all_pubsub_registries {
+                            let guard = reg.read().unwrap();
+                            all_channels.extend(guard.active_channels(pattern.as_deref()));
                         }
                         let arr: Vec<Frame> =
                             all_channels.into_iter().map(Frame::BulkString).collect();
@@ -1246,33 +1221,12 @@ pub async fn handle_connection_sharded_monoio<
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
                         let channels: Vec<Bytes> =
                             cmd_args[1..].iter().filter_map(|a| extract_bytes(a)).collect();
-                        let local = { pubsub_registry.read().unwrap().numsub(&channels) };
-                        let mut reply_rxs = Vec::new();
-                        {
-                            let mut producers = dispatch_tx.borrow_mut();
-                            for target in 0..num_shards {
-                                if target == shard_id {
-                                    continue;
-                                }
-                                let (tx, rx) = channel::oneshot();
-                                let idx = ChannelMesh::target_index(shard_id, target);
-                                let msg = ShardMessage::PubSubIntrospect {
-                                    query: PubSubQuery::NumSub(channels.clone()),
-                                    reply_tx: tx,
-                                };
-                                if producers[idx].try_push(msg).is_ok() {
-                                    spsc_notifiers[target].notify_one();
-                                    reply_rxs.push(rx);
-                                }
-                            }
-                        }
                         let mut counts: std::collections::HashMap<Bytes, i64> =
-                            local.into_iter().collect();
-                        for rx in reply_rxs {
-                            if let Ok(PubSubQueryResult::NumSub(pairs)) = rx.recv().await {
-                                for (ch, c) in pairs {
-                                    *counts.entry(ch).or_insert(0) += c;
-                                }
+                            std::collections::HashMap::new();
+                        for reg in &all_pubsub_registries {
+                            let guard = reg.read().unwrap();
+                            for (ch, c) in guard.numsub(&channels) {
+                                *counts.entry(ch).or_insert(0) += c;
                             }
                         }
                         let mut arr = Vec::with_capacity(channels.len() * 2);
@@ -1283,33 +1237,11 @@ pub async fn handle_connection_sharded_monoio<
                         responses.push(Frame::Array(arr));
                     }
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
-                        let local = { pubsub_registry.read().unwrap().numpat() };
-                        let mut reply_rxs = Vec::new();
-                        {
-                            let mut producers = dispatch_tx.borrow_mut();
-                            for target in 0..num_shards {
-                                if target == shard_id {
-                                    continue;
-                                }
-                                let (tx, rx) = channel::oneshot();
-                                let idx = ChannelMesh::target_index(shard_id, target);
-                                let msg = ShardMessage::PubSubIntrospect {
-                                    query: PubSubQuery::NumPat,
-                                    reply_tx: tx,
-                                };
-                                if producers[idx].try_push(msg).is_ok() {
-                                    spsc_notifiers[target].notify_one();
-                                    reply_rxs.push(rx);
-                                }
-                            }
+                        let mut total: usize = 0;
+                        for reg in &all_pubsub_registries {
+                            total += reg.read().unwrap().numpat();
                         }
-                        let mut total_pat = local;
-                        for rx in reply_rxs {
-                            if let Ok(PubSubQueryResult::NumPat(n)) = rx.recv().await {
-                                total_pat += n;
-                            }
-                        }
-                        responses.push(Frame::Integer(total_pat as i64));
+                        responses.push(Frame::Integer(total as i64));
                     }
                     _ => {
                         responses.push(Frame::Error(Bytes::from_static(

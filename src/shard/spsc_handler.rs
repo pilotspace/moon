@@ -732,19 +732,6 @@ pub(crate) fn handle_shard_message_shared(
             let count = pubsub_registry.publish(&channel, &message);
             slot.add(count);
         }
-        ShardMessage::PubSubIntrospect { query, reply_tx } => {
-            use super::dispatch::{PubSubQuery, PubSubQueryResult};
-            let result = match query {
-                PubSubQuery::Channels(pat) => {
-                    PubSubQueryResult::Channels(pubsub_registry.active_channels(pat.as_deref()))
-                }
-                PubSubQuery::NumSub(channels) => {
-                    PubSubQueryResult::NumSub(pubsub_registry.numsub(&channels))
-                }
-                PubSubQuery::NumPat => PubSubQueryResult::NumPat(pubsub_registry.numpat()),
-            };
-            let _ = reply_tx.send(result);
-        }
         ShardMessage::ScriptLoad { sha1, script } => {
             // Fan-out: cache this script on this shard so EVALSHA works locally
             let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
