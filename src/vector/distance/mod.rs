@@ -28,6 +28,9 @@ pub struct DistanceTable {
     pub dot_f32: fn(&[f32], &[f32]) -> f32,
     /// Cosine distance for f32 vectors (1 - similarity).
     pub cosine_f32: fn(&[f32], &[f32]) -> f32,
+    /// TurboQuant asymmetric L2: (rotated_query, nibble_packed_code, norm) -> distance.
+    /// All tiers use scalar ADC for now; AVX2/AVX-512 VPERMPS ADC is Phase 61+ work.
+    pub tq_l2: fn(&[f32], &[u8], f32) -> f32,
 }
 
 static DISTANCE_TABLE: OnceLock<DistanceTable> = OnceLock::new();
@@ -41,6 +44,9 @@ static DISTANCE_TABLE: OnceLock<DistanceTable> = OnceLock::new();
 ///
 /// Must be called before any call to [`table()`].
 pub fn init() {
+    // Initialize FWHT dispatch alongside distance dispatch.
+    crate::vector::turbo_quant::fwht::init_fwht();
+
     DISTANCE_TABLE.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
         {
@@ -62,6 +68,7 @@ pub fn init() {
                         // SAFETY: AVX-512F verified by is_x86_feature_detected! above.
                         unsafe { avx512::cosine_f32(a, b) }
                     },
+                    tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scalar,
                 };
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -82,6 +89,7 @@ pub fn init() {
                         // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
                         unsafe { avx2::cosine_f32(a, b) }
                     },
+                    tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scalar,
                 };
             }
         }
@@ -106,6 +114,7 @@ pub fn init() {
                     // SAFETY: NEON is guaranteed on AArch64.
                     unsafe { neon::cosine_f32(a, b) }
                 },
+                tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scalar,
             };
         }
 
@@ -116,6 +125,7 @@ pub fn init() {
             l2_i8: scalar::l2_i8,
             dot_f32: scalar::dot_f32,
             cosine_f32: scalar::cosine_f32,
+            tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scalar,
         }
     });
 }
@@ -160,6 +170,12 @@ mod tests {
         let same = [1.0f32, 0.0, 0.0];
         let dist = (t.cosine_f32)(&same, &same);
         assert!(dist.abs() < 1e-6);
+
+        // Quick TQ ADC smoke test
+        let q = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let code = [0x10, 0x32, 0x54, 0x76]; // nibble-packed indices 0-7
+        let dist = (t.tq_l2)(&q, &code, 1.0);
+        assert!(dist >= 0.0, "tq_l2 should be non-negative, got {dist}");
     }
 
     #[test]
