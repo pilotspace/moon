@@ -73,3 +73,4 @@ appendonlydir/
 shard-*.wal
 shard-*.wal.old
 shard-*.rrdshard
+.claude/worktrees/

@@ -1,17 +1,13 @@
 //! Runtime-agnostic channel types replacing tokio::sync::{mpsc, oneshot, watch, Notify}.
 //!
-//! Uses `flume` for mpsc/watch/notify. Oneshot uses a lock-free AtomicU8 state machine.
+//! Uses `flume` for mpsc, oneshot (bounded-1), watch, and notify.
 #![allow(unused_imports, clippy::result_unit_err)]
 
-use std::cell::UnsafeCell;
+use parking_lot::Mutex;
 use std::future::Future;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
-
-use atomic_waker::AtomicWaker;
 
 // --- mpsc ---
 // flume provides unbounded + bounded async-capable mpsc channels that work on any runtime.
@@ -21,190 +17,96 @@ pub use flume::{
 };
 
 // --- oneshot ---
-// Lock-free oneshot using AtomicU8 state machine + UnsafeCell + AtomicWaker.
-// Zero mutex contention -- eliminates 12% CPU overhead from flume's Mutex<VecDeque>.
-
-const EMPTY: u8 = 0;
-const VALUE: u8 = 1;
-const CLOSED: u8 = 2;
-
-struct OneshotInner<T> {
-    state: AtomicU8,
-    value: UnsafeCell<MaybeUninit<T>>,
-    waker: AtomicWaker,
-}
-
-// SAFETY: The value is only written by sender (once) and read by receiver (once),
-// with atomic state transitions providing the happens-before ordering.
-// T: Send is required because value crosses thread boundaries.
-unsafe impl<T: Send> Send for OneshotInner<T> {}
-unsafe impl<T: Send> Sync for OneshotInner<T> {}
-
-impl<T> Drop for OneshotInner<T> {
-    fn drop(&mut self) {
-        // If state is VALUE, the value was written but never read -- drop it.
-        if *self.state.get_mut() == VALUE {
-            unsafe {
-                self.value.get_mut().assume_init_drop();
-            }
-        }
-    }
-}
+// Backed by flume bounded(1). Cross-thread wakeup works with monoio's !Send executor.
 
 pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
-    let inner = Arc::new(OneshotInner {
-        state: AtomicU8::new(EMPTY),
-        value: UnsafeCell::new(MaybeUninit::uninit()),
-        waker: AtomicWaker::new(),
-    });
+    // Use flume bounded(1) instead of custom AtomicU8 state machine.
+    // flume's cross-thread wakeup mechanism works with monoio's !Send executor
+    // (proven: the Notify type uses flume bounded(1) and works cross-thread).
+    // The custom oneshot's AtomicWaker doesn't reliably wake monoio tasks
+    // from other threads, causing cross-shard write dispatch to hang.
+    let (tx, rx) = flume::bounded(1);
     (
-        OneshotSender {
-            inner: inner.clone(),
-            sent: false,
+        OneshotSender { tx },
+        OneshotReceiver {
+            rx: Some(rx),
+            recv_fut: None,
         },
-        OneshotReceiver { inner },
     )
 }
 
 pub struct OneshotSender<T> {
-    inner: Arc<OneshotInner<T>>,
-    // Set to true when send() succeeds or handles CLOSED, to skip Drop's close logic.
-    sent: bool,
+    tx: flume::Sender<T>,
 }
 
 impl<T> OneshotSender<T> {
-    pub fn send(mut self, value: T) -> Result<(), T> {
-        // Write value into the UnsafeCell.
-        // SAFETY: Only the sender writes, and it does so exactly once (self is consumed).
-        unsafe {
-            (*self.inner.value.get()).write(value);
-        }
-
-        // Attempt state transition EMPTY -> VALUE.
-        // Release ordering ensures the value write is visible to the receiver's Acquire load.
-        match self
-            .inner
-            .state
-            .compare_exchange(EMPTY, VALUE, Ordering::Release, Ordering::Acquire)
-        {
-            Ok(_) => {
-                // Successfully stored value. Wake the receiver if it's waiting.
-                self.inner.waker.wake();
-                self.sent = true;
-                Ok(())
-            }
-            Err(CLOSED) => {
-                // Receiver was already dropped. Read back our value to return it.
-                let value = unsafe { (*self.inner.value.get()).assume_init_read() };
-                // Mark as EMPTY so OneshotInner::drop doesn't double-drop.
-                self.inner.state.store(EMPTY, Ordering::Relaxed);
-                self.sent = true;
-                Err(value)
-            }
-            Err(_) => unreachable!("invalid oneshot state"),
-        }
-    }
-}
-
-impl<T> Drop for OneshotSender<T> {
-    fn drop(&mut self) {
-        if self.sent {
-            return; // send() already handled the state transition.
-        }
-        // Sender dropped without sending. Transition EMPTY -> CLOSED.
-        let prev = self.inner.state.swap(CLOSED, Ordering::Release);
-        if prev == EMPTY {
-            // Receiver may be waiting -- wake it so it sees CLOSED.
-            self.inner.waker.wake();
-        }
-        // If prev == CLOSED, receiver already dropped -- nothing to do.
+    pub fn send(self, value: T) -> Result<(), T> {
+        self.tx.send(value).map_err(|e| e.into_inner())
     }
 }
 
 pub struct OneshotReceiver<T> {
-    inner: Arc<OneshotInner<T>>,
+    /// Receiver half — taken on first poll to avoid clone/race with try_recv.
+    rx: Option<flume::Receiver<T>>,
+    /// Cached recv future — persists across polls for correct waker registration.
+    recv_fut: Option<Pin<Box<dyn Future<Output = Result<T, flume::RecvError>> + Send>>>,
 }
 
-impl<T> OneshotReceiver<T> {
+impl<T: Send + 'static> OneshotReceiver<T> {
     pub async fn recv(self) -> Result<T, RecvError> {
-        self.await
+        match self.rx {
+            Some(rx) => rx.recv_async().await.map_err(|_| RecvError),
+            None => Err(RecvError), // rx was taken by poll
+        }
+    }
+
+    /// Alias for recv — flume's cross-thread wakeup works on all runtimes.
+    pub async fn recv_polling(self) -> Result<T, RecvError> {
+        self.recv().await
+    }
+}
+
+impl<T: Send> OneshotReceiver<T> {
+    /// Non-blocking try_recv for use with pending_wakers polling pattern.
+    ///
+    /// Returns `Ok(value)` if a value is available, `Err(TryRecvEmpty)` if not yet,
+    /// or `Err(TryRecvDisconnected)` if the sender was dropped or rx was taken.
+    pub fn try_recv(&self) -> Result<T, flume::TryRecvError> {
+        match &self.rx {
+            Some(rx) => rx.try_recv(),
+            None => Err(flume::TryRecvError::Disconnected),
+        }
     }
 
     /// Blocking receive for use from non-async contexts (e.g., OS thread watchers).
-    /// Spins with thread::yield_now until value arrives or sender is dropped.
     pub fn recv_blocking(self) -> Result<T, RecvError> {
-        loop {
-            let state = self.inner.state.load(Ordering::Acquire);
-            match state {
-                VALUE => {
-                    let value = unsafe { (*self.inner.value.get()).assume_init_read() };
-                    self.inner.state.store(CLOSED, Ordering::Relaxed);
-                    // Prevent Drop from also closing
-                    std::mem::forget(self);
-                    return Ok(value);
-                }
-                CLOSED => {
-                    std::mem::forget(self);
-                    return Err(RecvError);
-                }
-                EMPTY => std::thread::yield_now(),
-                _ => unreachable!(),
-            }
+        match self.rx {
+            Some(rx) => rx.recv().map_err(|_| RecvError),
+            None => Err(RecvError),
         }
     }
 }
 
-impl<T> Future for OneshotReceiver<T> {
+impl<T: Send + 'static> Future for OneshotReceiver<T> {
     type Output = Result<T, RecvError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Fast path: check state first.
-        let state = self.inner.state.load(Ordering::Acquire);
-        match state {
-            VALUE => {
-                // Value is ready. Read it out.
-                // SAFETY: Sender wrote the value before the Release store of VALUE.
-                // Our Acquire load ensures we see the write.
-                let value = unsafe { (*self.inner.value.get()).assume_init_read() };
-                // Transition to CLOSED so OneshotInner::drop doesn't double-drop.
-                self.inner.state.store(CLOSED, Ordering::Relaxed);
-                Poll::Ready(Ok(value))
-            }
-            CLOSED => Poll::Ready(Err(RecvError)),
-            EMPTY => {
-                // Register waker BEFORE re-checking state to avoid lost wakeups.
-                self.inner.waker.register(cx.waker());
-
-                // Re-check state after registering waker.
-                // This handles the race where sender completes between our first
-                // load and waker registration.
-                let state = self.inner.state.load(Ordering::Acquire);
-                match state {
-                    VALUE => {
-                        let value = unsafe { (*self.inner.value.get()).assume_init_read() };
-                        self.inner.state.store(CLOSED, Ordering::Relaxed);
-                        Poll::Ready(Ok(value))
-                    }
-                    CLOSED => Poll::Ready(Err(RecvError)),
-                    EMPTY => Poll::Pending,
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Lazily take the receiver on first poll — moved, not cloned.
+        if self.recv_fut.is_none() {
+            let rx = match self.rx.take() {
+                Some(rx) => rx,
+                None => return Poll::Ready(Err(RecvError)),
+            };
+            self.recv_fut = Some(Box::pin(rx.into_recv_async()));
         }
-    }
-}
-
-impl<T> Drop for OneshotReceiver<T> {
-    fn drop(&mut self) {
-        // If EMPTY, transition to CLOSED so sender's send returns Err.
-        // Use compare_exchange to avoid clobbering VALUE state.
-        let _ =
-            self.inner
-                .state
-                .compare_exchange(EMPTY, CLOSED, Ordering::Release, Ordering::Relaxed);
-        // If state was VALUE, the value remains in the inner and will be dropped
-        // by OneshotInner::drop.
+        match self.recv_fut.as_mut() {
+            Some(fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(RecvError)),
+                Poll::Pending => Poll::Pending,
+            },
+            None => Poll::Ready(Err(RecvError)),
+        }
     }
 }
 
@@ -241,7 +143,7 @@ pub struct WatchSender<T> {
 }
 impl<T: Clone> WatchSender<T> {
     pub fn send(&self, value: T) -> Result<(), ()> {
-        *self.shared.lock().unwrap() = value;
+        *self.shared.lock() = value;
         let _ = self.notify_tx.try_send(());
         Ok(())
     }
@@ -257,7 +159,7 @@ impl<T: Clone> WatchReceiver<T> {
         self.notify_rx.recv_async().await.map_err(|_| ())
     }
     pub fn borrow(&self) -> T {
-        self.shared.lock().unwrap().clone()
+        self.shared.lock().clone()
     }
 }
 
@@ -386,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_oneshot_drop_value_when_not_received() {
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
         DROP_COUNT.store(0, Ordering::SeqCst);
 

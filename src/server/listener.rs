@@ -251,6 +251,7 @@ pub async fn run_sharded(
     config: ServerConfig,
     conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
     shutdown: CancellationToken,
+    per_shard_accept: bool,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = TcpListener::bind(&addr).await?;
@@ -320,9 +321,19 @@ pub async fn run_sharded(
         });
     }
 
+    // When per_shard_accept is true (Linux production with SO_REUSEPORT), each shard
+    // has its own listener and the central listener only handles TLS.
+    // When false (tests, non-Linux), the central listener distributes via round-robin MPSC.
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            // Plain TCP accept -- disabled when per-shard SO_REUSEPORT listeners are active.
+            result = async {
+                if per_shard_accept {
+                    std::future::pending::<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>().await
+                } else {
+                    listener.accept().await
+                }
+            } => {
                 match result {
                     Ok((mut stream, addr)) => {
                         // Protected mode: reject non-loopback connections when no auth configured
@@ -374,6 +385,7 @@ pub async fn run_sharded(
     config: ServerConfig,
     conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
     shutdown: CancellationToken,
+    per_shard_accept: bool,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = monoio::net::TcpListener::bind(&addr)?;
@@ -412,7 +424,14 @@ pub async fn run_sharded(
         // If TLS listener is configured, select on both plain and TLS accepts
         if let Some(ref tls_listener) = tls_listener {
             monoio::select! {
-                result = listener.accept() => {
+                // Plain TCP accept -- disabled when per-shard SO_REUSEPORT listeners are active.
+                result = async {
+                    if per_shard_accept {
+                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
+                    } else {
+                        listener.accept().await
+                    }
+                } => {
                     match result {
                         Ok((mut stream, addr)) => {
                             if protected_mode_active && !addr.ip().is_loopback() {
@@ -474,7 +493,14 @@ pub async fn run_sharded(
             }
         } else {
             monoio::select! {
-                result = listener.accept() => {
+                // Plain TCP accept -- disabled when per-shard SO_REUSEPORT listeners are active.
+                result = async {
+                    if per_shard_accept {
+                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
+                    } else {
+                        listener.accept().await
+                    }
+                } => {
                     match result {
                         Ok((mut stream, addr)) => {
                             if protected_mode_active && !addr.ip().is_loopback() {

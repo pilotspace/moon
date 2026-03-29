@@ -515,6 +515,183 @@ pub fn strlen(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// GETRANGE key start end — return substring of string value.
+/// Negative indices count from the end. Out-of-range clamped to string bounds.
+/// Returns empty string for reversed range or missing key.
+pub fn getrange(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 3 {
+        return err_wrong_args("GETRANGE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GETRANGE"),
+    };
+    let start = match parse_i64(&args[1]) {
+        Some(v) => v,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        }
+    };
+    let end = match parse_i64(&args[2]) {
+        Some(v) => v,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        }
+    };
+    match db.get(key) {
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => getrange_slice(v, start, end),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
+        },
+        None => Frame::BulkString(Bytes::new()),
+    }
+}
+
+/// GETRANGE (read-only).
+pub fn getrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 3 {
+        return err_wrong_args("GETRANGE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GETRANGE"),
+    };
+    let start = match parse_i64(&args[1]) {
+        Some(v) => v,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        }
+    };
+    let end = match parse_i64(&args[2]) {
+        Some(v) => v,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        }
+    };
+    match db.get_if_alive(key, now_ms) {
+        Some(entry) => match entry.value.as_bytes() {
+            Some(v) => getrange_slice(v, start, end),
+            None => Frame::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
+        },
+        None => Frame::BulkString(Bytes::new()),
+    }
+}
+
+/// Shared logic for GETRANGE/SUBSTR: resolve negative indices, clamp, slice.
+fn getrange_slice(v: &[u8], start: i64, end: i64) -> Frame {
+    let len = v.len() as i64;
+    if len == 0 {
+        return Frame::BulkString(Bytes::new());
+    }
+    // Resolve negative indices
+    let mut s = if start < 0 { len + start } else { start };
+    let mut e = if end < 0 { len + end } else { end };
+    // Clamp
+    if s < 0 {
+        s = 0;
+    }
+    if e >= len {
+        e = len - 1;
+    }
+    if s > e {
+        return Frame::BulkString(Bytes::new());
+    }
+    Frame::BulkString(Bytes::copy_from_slice(&v[s as usize..=e as usize]))
+}
+
+/// SETRANGE key offset value — overwrite part of string at offset.
+/// Zero-pads if offset exceeds current length. Creates key if missing.
+/// Returns new string length.
+pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 3 {
+        return err_wrong_args("SETRANGE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("SETRANGE"),
+    };
+    let offset = match parse_i64(&args[1]) {
+        Some(v) if v >= 0 => v as usize,
+        _ => return Frame::Error(Bytes::from_static(b"ERR offset is out of range")),
+    };
+    let value = match extract_bytes(&args[2]) {
+        Some(v) => v,
+        None => return err_wrong_args("SETRANGE"),
+    };
+
+    // Redis compatibility: SETRANGE with empty value on missing key returns 0 without creating key
+    if value.is_empty() {
+        return match db.get(&key) {
+            Some(entry) => match entry.value.as_bytes() {
+                Some(v) => Frame::Integer(v.len() as i64),
+                None => Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
+            },
+            None => Frame::Integer(0),
+        };
+    }
+
+    // Redis limits string size to 512MB
+    let required = match offset.checked_add(value.len()) {
+        Some(r) if r <= 512 * 1024 * 1024 => r,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR string exceeds maximum allowed size (512MB)",
+            ));
+        }
+    };
+
+    let base_ts = db.base_timestamp();
+    let (existing_data, existing_expiry_ms) = match db.get(&key) {
+        Some(entry) => {
+            let expiry = entry.expires_at_ms(base_ts);
+            match entry.value.as_bytes() {
+                Some(v) => (Some(v.to_vec()), expiry),
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ));
+                }
+            }
+        }
+        None => (None, 0),
+    };
+
+    let mut buf = existing_data.unwrap_or_default();
+    // Extend with zero bytes if needed
+    if required > buf.len() {
+        buf.resize(required, 0);
+    }
+    // Overwrite at offset
+    buf[offset..offset + value.len()].copy_from_slice(value);
+
+    let new_len = buf.len() as i64;
+    let new_val = Bytes::from(buf);
+    let mut entry = if existing_expiry_ms > 0 {
+        Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+    } else {
+        Entry::new_string(new_val)
+    };
+    entry.set_last_access(db.now());
+    entry.set_access_counter(5);
+    db.set(key, entry);
+
+    Frame::Integer(new_len)
+}
+
 /// SETNX command handler (legacy wrapper).
 pub fn setnx(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
@@ -1420,5 +1597,259 @@ mod tests {
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
         let entry = db.get(b"key").unwrap();
         assert!(entry.has_expiry());
+    }
+
+    // --- GETRANGE tests ---
+
+    #[test]
+    fn test_getrange_basic() {
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"4")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"Hello")));
+    }
+
+    #[test]
+    fn test_getrange_negative_end() {
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"-1")]);
+        assert_eq!(
+            result,
+            Frame::BulkString(Bytes::from_static(b"Hello, World!"))
+        );
+    }
+
+    #[test]
+    fn test_getrange_negative_both() {
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        // len=13, -6 = 7, -1 = 12 → "World!"
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"-6"), bs(b"-1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
+    }
+
+    #[test]
+    fn test_getrange_middle() {
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"7"), bs(b"-1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
+    }
+
+    #[test]
+    fn test_getrange_out_of_range() {
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello"));
+        // end beyond string length — clamped
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"100")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"Hello")));
+    }
+
+    #[test]
+    fn test_getrange_reversed() {
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello"));
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"3"), bs(b"1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::new()));
+    }
+
+    #[test]
+    fn test_getrange_missing_key() {
+        let mut db = make_db();
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"-1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::new()));
+    }
+
+    #[test]
+    fn test_getrange_wrongtype() {
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = getrange(&mut db, &[bs(b"myhash"), bs(b"0"), bs(b"-1")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            _ => panic!("Expected WRONGTYPE error"),
+        }
+    }
+
+    #[test]
+    fn test_getrange_wrong_arity() {
+        let mut db = make_db();
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"0")]);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_getrange_empty_string() {
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"key"), Bytes::new());
+        let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"-1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::new()));
+    }
+
+    // --- SETRANGE tests ---
+
+    #[test]
+    fn test_setrange_basic() {
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        let result = setrange(&mut db, &[bs(b"key"), bs(b"7"), bs(b"Redis")]);
+        assert_eq!(result, Frame::Integer(13));
+        assert_eq!(
+            get(&mut db, &[bs(b"key")]),
+            Frame::BulkString(Bytes::from("Hello, Redis!"))
+        );
+    }
+
+    #[test]
+    fn test_setrange_zero_pad() {
+        let mut db = make_db();
+        let result = setrange(&mut db, &[bs(b"key"), bs(b"5"), bs(b"hi")]);
+        assert_eq!(result, Frame::Integer(7));
+        let val = get(&mut db, &[bs(b"key")]);
+        match val {
+            Frame::BulkString(b) => {
+                assert_eq!(b.len(), 7);
+                assert_eq!(&b[..5], &[0, 0, 0, 0, 0]);
+                assert_eq!(&b[5..], b"hi");
+            }
+            _ => panic!("Expected BulkString"),
+        }
+    }
+
+    #[test]
+    fn test_setrange_extend() {
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello"));
+        let result = setrange(&mut db, &[bs(b"key"), bs(b"5"), bs(b" World")]);
+        assert_eq!(result, Frame::Integer(11));
+        assert_eq!(
+            get(&mut db, &[bs(b"key")]),
+            Frame::BulkString(Bytes::from("Hello World"))
+        );
+    }
+
+    #[test]
+    fn test_setrange_negative_offset() {
+        let mut db = make_db();
+        let result = setrange(&mut db, &[bs(b"key"), bs(b"-1"), bs(b"hi")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"ERR offset")),
+            _ => panic!("Expected offset error"),
+        }
+    }
+
+    #[test]
+    fn test_setrange_preserves_ttl() {
+        let mut db = make_db();
+        let exp_ms = current_time_ms() + 100_000;
+        let base_ts = db.base_timestamp();
+        db.set(
+            Bytes::from_static(b"key"),
+            Entry::new_string_with_expiry(Bytes::from_static(b"Hello"), exp_ms, base_ts),
+        );
+        setrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"Jello")]);
+        let entry = db.get(b"key").unwrap();
+        assert!(entry.has_expiry());
+        assert_eq!(entry.value.as_bytes().unwrap(), b"Jello");
+    }
+
+    #[test]
+    fn test_setrange_wrongtype() {
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = setrange(&mut db, &[bs(b"myhash"), bs(b"0"), bs(b"hi")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            _ => panic!("Expected WRONGTYPE error"),
+        }
+    }
+
+    #[test]
+    fn test_setrange_wrong_arity() {
+        let mut db = make_db();
+        let result = setrange(&mut db, &[bs(b"key"), bs(b"0")]);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_setrange_at_zero_new_key() {
+        let mut db = make_db();
+        let result = setrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"Hello")]);
+        assert_eq!(result, Frame::Integer(5));
+        assert_eq!(
+            get(&mut db, &[bs(b"key")]),
+            Frame::BulkString(Bytes::from_static(b"Hello"))
+        );
+    }
+
+    // --- SUBSTR (alias for GETRANGE) ---
+
+    #[test]
+    fn test_substr_alias() {
+        // SUBSTR uses the same getrange function, verify it produces identical results
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"msg"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        // SUBSTR with same args as GETRANGE should produce identical output
+        let getrange_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
+        let substr_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
+        assert_eq!(getrange_result, substr_result);
+        assert_eq!(
+            substr_result,
+            Frame::BulkString(Bytes::from_static(b"Hello"))
+        );
+    }
+
+    #[test]
+    fn test_setrange_empty_value_missing_key() {
+        // Redis: SETRANGE on missing key with empty value returns 0, does NOT create key
+        let mut db = make_db();
+        let result = setrange(&mut db, &[bs(b"nokey"), bs(b"5"), bs(b"")]);
+        assert_eq!(result, Frame::Integer(0));
+        assert_eq!(get(&mut db, &[bs(b"nokey")]), Frame::Null);
+    }
+
+    #[test]
+    fn test_setrange_empty_value_existing_key() {
+        // Redis: SETRANGE on existing key with empty value returns current length
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"mykey"), Bytes::from_static(b"Hello"));
+        let result = setrange(&mut db, &[bs(b"mykey"), bs(b"5"), bs(b"")]);
+        assert_eq!(result, Frame::Integer(5));
+        // Key unchanged
+        assert_eq!(
+            get(&mut db, &[bs(b"mykey")]),
+            Frame::BulkString(Bytes::from_static(b"Hello"))
+        );
+    }
+
+    #[test]
+    fn test_substr_negative_indices() {
+        let mut db = make_db();
+        db.set_string(
+            Bytes::from_static(b"msg"),
+            Bytes::from_static(b"Hello, World!"),
+        );
+        // SUBSTR with negative indices (alias behavior)
+        let result = getrange(&mut db, &[bs(b"msg"), bs(b"-6"), bs(b"-1")]);
+        assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
     }
 }

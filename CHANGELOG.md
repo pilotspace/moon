@@ -5,6 +5,105 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-03-29
+
+Multi-shard scaling milestone. Eliminated negative scaling, achieving 5M GET/s and 2.5M SET/s at 4 shards — both exceeding Redis 8.6.1.
+
+### Added
+
+#### Shared-Read Direct Access (Phase 49)
+- `Arc<ShardDatabases>` with `parking_lot::RwLock<Database>` replaces `Rc<RefCell<Vec<Database>>>`
+- Cross-shard read commands (GET, HGET, SCARD, ZRANGE, etc.) bypass SPSC channels entirely via `read_db()` + `dispatch_read()` — reduces cross-shard read latency from ~88μs to ~56ns
+- Local read path uses shared `read_db()` lock instead of exclusive `write_db()` — eliminates RwLock contention between shards
+
+#### Connection Affinity (Phase 50)
+- `AffinityTracker` samples first 16 commands per connection to detect dominant shard
+- Lazy FD migration: if ≥60% of keys target a non-local shard, migrates the TCP connection's file descriptor to the target shard via `ShardMessage::MigrateConnection`
+- `MigratedConnectionState` preserves selected_db, client_name, protocol_version across migration
+- Graceful fallback: if migration fails, connection stays on current shard with shared-read
+
+#### Pre-Allocated Response Slots (Phase 51)
+- `ResponseSlotPool` with lock-free `AtomicU8` state machine for zero-allocation cross-shard write dispatch (Tokio path)
+- Eliminates per-dispatch `channel::oneshot()` heap allocation (~80-120ns savings per cross-shard write)
+
+#### SO_REUSEPORT Per-Shard Accept (Phase 52)
+- Each shard opens its own TCP listener with `SO_REUSEPORT` on Linux via `socket2` crate
+- Kernel distributes connections across shard listeners using consistent 4-tuple hashing
+- macOS/non-Linux: falls back to single-listener + MPSC round-robin (no behavior change)
+
+#### jemalloc Production Tuning (Phase 53)
+- `malloc_conf` static: `percpu_arena:percpu`, `background_thread:true`, `metadata_thp:auto`, `dirty_decay_ms:5000`, `muzzy_decay_ms:30000`, `abort_conf:true`
+- Closes ~50% of allocation speed gap with mimalloc while retaining jemalloc's superior fragmentation behavior
+
+#### New Commands (Phase 55)
+- GETRANGE — return substring of stored string value
+- SETRANGE — overwrite part of stored string at offset with zero-fill
+- SUBSTR — alias for GETRANGE (Redis 1.x compatibility)
+
+### Changed
+
+- Custom `AtomicU8` oneshot channel replaced with `flume::bounded(1)` for cross-thread safety on monoio's `!Send` executor
+- `pending_wakers` relay pattern: event loop locally wakes connection tasks after SPSC processing, bridging monoio's cross-thread waker limitation
+- `write_db()` uses `try_write()` spin loop instead of blocking `write()` — prevents OS thread freeze on monoio when cross-shard readers hold locks
+- Benchmark scripts: `scripts/bench-scaling.sh` for multi-shard test matrix, `scripts/bench-production.sh` updated
+
+### Fixed
+
+- ResponseSlot `UnsafeCell<Option<Waker>>` data race on ARM64 — replaced with `AtomicWaker`
+- Local read path took exclusive write lock (`write_db()`) even for GET — split into `read_db()` + `dispatch_read()`
+- Monoio local write path silently dropped responses (`responses.push(response)` missing after read/write split) — all write commands (SET, INCR, LPUSH, etc.) hung on monoio
+- Pipeline ordering guard: `!remote_groups.contains_key(&target)` prevents stale reads when batch has pending writes for same shard
+
+### Performance
+
+| Metric | Before (v0.1.0) | After (v0.1.2) | Change |
+|--------|:---------------:|:--------------:|:------:|
+| Multi-shard GET p=16 | 688K (0.38x Redis) | **1,923K (1.17x Redis)** | **2.8x** |
+| Multi-shard GET p=64 | N/A | **5,002K (1.60x Redis)** | New |
+| Multi-shard SET p=16 | N/A | **1,515K (1.32x Redis)** | New |
+| Multi-shard SET p=64 | N/A | **2,500K (1.55x Redis)** | New |
+| Monoio 1s p=128 GET | 5,407K | **5,005K (1.25x Redis)** | Maintained |
+| Negative scaling | -25% at 12 shards | **Zero at 1-8 shards** | Eliminated |
+| Command coverage p=1 | Parity | **Monoio beats Redis 8/10** | Improved |
+
+## [0.1.1] - 2026-03-28
+
+Structural stability milestone. Codebase refactoring for maintainability — no feature changes, no performance changes.
+
+### Changed
+
+#### Error and State Foundations (Phase 44)
+- Unified `MoonError` type hierarchy with structured `#[source]` on I/O variants carrying `PathBuf` context
+- `ConnectionContext` struct for connection state (selected_db, authenticated, client_name, protocol_version)
+- Criterion benchmark baseline (GET dispatch 69.1ns) to guard against regressions
+
+#### Command Metadata Registry (Phase 45)
+- `phf` static perfect hash map for O(1) command lookup (112 commands)
+- `CommandMeta` struct: name, arity, flags (read/write/fast/admin), key positions, ACL categories
+- `is_write()` classification via const bitflags — replaces duplicated match arms across codebase
+
+#### Persistence Hardening (Phase 46)
+- Eliminated server-crashing `unwrap()` calls in WAL, AOF, and RDB persistence code
+- Corruption recovery: WAL uses per-block CRC32 log+skip, AOF seeks to next RESP `*` marker, RDB breaks on mid-stream corruption
+- `WalWriter` methods remain `std::io::Result` (must-panic on flush = data loss prevention)
+
+#### AOF Replay Decoupling (Phase 47)
+- `CommandReplayEngine` trait breaks circular dependency between persistence and command dispatch
+- `StorageEngine` trait boundary for persistence replay and Lua scripting
+- `execute_command()` at command level (not individual get/set methods)
+
+#### God-File Decomposition (Phase 48)
+- `connection.rs` (5,102 lines) → 6 sub-modules in `conn/`: `handler_sharded.rs`, `handler_monoio.rs`, `handler_single.rs`, `shared.rs`, `blocking.rs`, `conn_state.rs`
+- `shard/mod.rs` (2,004 lines) → 6 sub-modules: `event_loop.rs`, `spsc_handler.rs`, `persistence_tick.rs`, `conn_accept.rs`, `timers.rs`, `uring_handler.rs`
+- Module facade pattern with `pub(crate)` re-exports preserving all external import paths
+- No single file exceeds 800 lines
+
+### Added
+- Docker: optimized multi-stage build (113MB → 41MB)
+- Mintlify documentation site
+- Claude Code GitHub workflow for PR reviews
+- `scripts/bench-resources.sh` for memory/CPU efficiency benchmarking
+
 ## [0.1.0] - 2026-03-27
 
 Initial release. A Redis-compatible in-memory data store written in Rust, achieving 1.84-1.99x Redis throughput at 8 shards and 27-35% less memory for 1KB+ values.

@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 #[cfg(feature = "runtime-tokio")]
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
@@ -14,6 +12,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::protocol::Frame;
+#[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 
@@ -137,14 +136,15 @@ pub(crate) fn execute_transaction(
 /// Transactions in the shared-nothing architecture are restricted to local-shard
 /// keys only. Cross-shard transactions require distributed coordination (future work).
 pub(crate) fn execute_transaction_sharded(
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
     cached_clock: &CachedClock,
 ) -> Frame {
-    let mut dbs = databases.borrow_mut();
-    let db_count = dbs.len();
-    dbs[selected_db].refresh_now_from_cache(cached_clock);
+    let mut guard = shard_databases.write_db(shard_id, selected_db);
+    let db_count = shard_databases.db_count();
+    guard.refresh_now_from_cache(cached_clock);
 
     let mut results = Vec::with_capacity(command_queue.len());
     let mut selected = selected_db;
@@ -160,7 +160,7 @@ pub(crate) fn execute_transaction_sharded(
             }
         };
 
-        let result = dispatch(&mut dbs[selected], cmd, cmd_args, &mut selected, db_count);
+        let result = dispatch(&mut guard, cmd, cmd_args, &mut selected, db_count);
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,

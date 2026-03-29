@@ -2418,9 +2418,19 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
         let all_notifiers = mesh.all_notifiers();
 
+        // Create all shards on main thread, extract databases into ShardDatabases
+        let mut shards: Vec<Shard> = (0..num_shards)
+            .map(|id| Shard::new(id, num_shards, config.databases, config.to_runtime_config()))
+            .collect();
+        let all_dbs: Vec<Vec<moon::storage::Database>> = shards
+            .iter_mut()
+            .map(|s| std::mem::take(&mut s.databases))
+            .collect();
+        let shard_databases = moon::shard::shared_databases::ShardDatabases::new(all_dbs);
+
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
-        for id in 0..num_shards {
+        for (id, mut shard) in shards.into_iter().enumerate() {
             let producers = mesh.take_producers(id);
             let consumers = mesh.take_consumers(id);
             let conn_rx = mesh.take_conn_rx(id);
@@ -2428,6 +2438,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             let shard_cancel = cancel.clone();
             let shard_spsc_notify = mesh.take_notify(id);
             let shard_all_notifiers = all_notifiers.clone();
+            let shard_dbs = shard_databases.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-shard-{}", id))
@@ -2438,12 +2449,6 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         .expect("failed to build shard runtime");
 
                     let local = tokio::task::LocalSet::new();
-                    let mut shard = Shard::new(
-                        id,
-                        num_shards,
-                        shard_config.databases,
-                        shard_config.to_runtime_config(),
-                    );
 
                     let (snap_tx, snap_rx) = channel::watch(0u64);
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
@@ -2471,6 +2476,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         std::sync::Arc::new(shard_config),
                         shard_spsc_notify,
                         shard_all_notifiers,
+                        shard_dbs,
                     )));
                 })
                 .expect("failed to spawn shard thread");
@@ -2485,7 +2491,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
 
         let listener_cancel = cancel.clone();
         listener_rt.block_on(async {
-            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel).await {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, false).await {
                 eprintln!("Listener error: {}", e);
             }
         });
@@ -3515,9 +3521,19 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
 
         let all_notifiers = mesh.all_notifiers();
 
+        // Create all shards on main thread, extract databases into ShardDatabases
+        let mut shards: Vec<Shard> = (0..num_shards)
+            .map(|id| Shard::new(id, num_shards, config.databases, config.to_runtime_config()))
+            .collect();
+        let all_dbs: Vec<Vec<moon::storage::Database>> = shards
+            .iter_mut()
+            .map(|s| std::mem::take(&mut s.databases))
+            .collect();
+        let shard_databases = moon::shard::shared_databases::ShardDatabases::new(all_dbs);
+
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
-        for id in 0..num_shards {
+        for (id, mut shard) in shards.into_iter().enumerate() {
             let producers = mesh.take_producers(id);
             let consumers = mesh.take_consumers(id);
             let conn_rx = mesh.take_conn_rx(id);
@@ -3526,6 +3542,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             let shard_cs = cluster_state.clone();
             let shard_spsc_notify = mesh.take_notify(id);
             let shard_all_notifiers = all_notifiers.clone();
+            let shard_dbs = shard_databases.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-cluster-shard-{}", id))
@@ -3536,12 +3553,6 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         .expect("failed to build shard runtime");
 
                     let local = tokio::task::LocalSet::new();
-                    let mut shard = Shard::new(
-                        id,
-                        num_shards,
-                        shard_config.databases,
-                        shard_config.to_runtime_config(),
-                    );
 
                     let (snap_tx, snap_rx) = channel::watch(0u64);
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
@@ -3569,6 +3580,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         std::sync::Arc::new(shard_config),
                         shard_spsc_notify,
                         shard_all_notifiers,
+                        shard_dbs,
                     )));
                 })
                 .expect("failed to spawn shard thread");
@@ -3583,7 +3595,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
 
         let listener_cancel = cancel.clone();
         listener_rt.block_on(async {
-            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel).await {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, false).await {
                 eprintln!("Listener error: {}", e);
             }
         });

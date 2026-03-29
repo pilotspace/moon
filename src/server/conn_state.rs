@@ -16,7 +16,7 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::scripting::ScriptCache;
 use crate::shard::dispatch::ShardMessage;
-use crate::storage::Database;
+use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
 use crate::tracking::{TrackingState, TrackingTable};
 
@@ -29,7 +29,7 @@ use crate::tracking::{TrackingState, TrackingTable};
 /// **Phase 44:** Defined only. Adoption in connection handlers deferred to Phase 48.
 #[allow(dead_code)]
 pub struct ConnectionContext {
-    pub databases: Rc<RefCell<Vec<Database>>>,
+    pub shard_databases: Arc<ShardDatabases>,
     pub shard_id: usize,
     pub num_shards: usize,
     pub dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,

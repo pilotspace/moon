@@ -10,26 +10,30 @@ use std::sync::{Arc, RwLock};
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
 use crate::persistence::wal::WalWriter;
-use crate::storage::Database;
+
+use super::shared_databases::ShardDatabases;
 
 /// Run cooperative active expiry across all databases.
-pub(crate) fn run_active_expiry(databases: &Rc<RefCell<Vec<Database>>>) {
-    let mut dbs = databases.borrow_mut();
-    for db in dbs.iter_mut() {
-        crate::server::expiration::expire_cycle_direct(db);
+pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id: usize) {
+    let db_count = shard_databases.db_count();
+    for i in 0..db_count {
+        let mut guard = shard_databases.write_db(shard_id, i);
+        crate::server::expiration::expire_cycle_direct(&mut guard);
     }
 }
 
 /// Run background eviction if maxmemory is configured.
 pub(crate) fn run_eviction(
-    databases: &Rc<RefCell<Vec<Database>>>,
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
     runtime_config: &Arc<RwLock<RuntimeConfig>>,
 ) {
     let rt = runtime_config.read().unwrap();
     if rt.maxmemory > 0 {
-        let mut dbs = databases.borrow_mut();
-        for db in dbs.iter_mut() {
-            let _ = crate::storage::eviction::try_evict_if_needed(db, &rt);
+        let db_count = shard_databases.db_count();
+        for i in 0..db_count {
+            let mut guard = shard_databases.write_db(shard_id, i);
+            let _ = crate::storage::eviction::try_evict_if_needed(&mut guard, &rt);
         }
     }
 }
