@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn test_bfs_reorder_known_order() {
         let (num_nodes, m0, flat) = make_test_graph();
-        let (bfs_order, bfs_inverse) = bfs_reorder(num_nodes, m0, 0, &flat);
+        let (_bfs_order, bfs_inverse) = bfs_reorder(num_nodes, m0, 0, &flat);
 
         // BFS from 0: visit 0, then neighbors 1,2, then 1's neighbor 3, then 2's neighbor 4
         // (4 is already reached via 2, so order is 0,1,2,3,4)

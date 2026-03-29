@@ -480,8 +480,7 @@ mod tests {
         let vecs: Vec<Vec<f32>> = (0..n).map(|i| lcg_f32(dim, i * 7 + 13)).collect();
 
         let mut builder = HnswBuilder::new(16, 200, 42);
-        for i in 0..n {
-            let vi = &vecs[i as usize];
+        for _i in 0..n {
             builder.insert(|a, b| l2_vecs(&vecs[a as usize], &vecs[b as usize]));
         }
         let graph = builder.build(8);
@@ -489,7 +488,6 @@ mod tests {
         assert_eq!(graph.num_nodes(), n);
 
         // BFS from entry point should reach all nodes
-        let m0 = graph.m0() as usize;
         let mut visited = vec![false; n as usize];
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(graph.entry_point());
@@ -556,7 +554,6 @@ mod tests {
 
         let mut builder = HnswBuilder::new(m, 200, 123);
         for i in 0..n {
-            let vi = &vecs[i as usize];
             builder.insert(|a, b| l2_vecs(&vecs[a as usize], &vecs[b as usize]));
         }
         let graph = builder.build(8);
@@ -583,7 +580,6 @@ mod tests {
 
         let mut builder = HnswBuilder::new(8, 100, 99);
         for i in 0..n {
-            let vi = &vecs[i as usize];
             builder.insert(|a, b| l2_vecs(&vecs[a as usize], &vecs[b as usize]));
         }
         let graph = builder.build(8);
