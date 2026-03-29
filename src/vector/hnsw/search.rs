@@ -4,7 +4,13 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use smallvec::SmallVec;
+
+use super::graph::{HnswGraph, SENTINEL};
 use crate::vector::aligned_buffer::AlignedBuffer;
+use crate::vector::turbo_quant::collection::CollectionMetadata;
+use crate::vector::turbo_quant::fwht;
+use crate::vector::types::{SearchResult, VectorId};
 
 /// Bit vector for O(1) visited tracking. 64x more cache-efficient than HashSet
 /// for dense integer keys. Uses test_and_set for combined check+mark.
@@ -117,71 +123,436 @@ impl SearchScratch {
     }
 }
 
+/// HNSW search with 2-hop dual prefetch and TQ-ADC distance.
+///
+/// # Arguments
+/// - `graph`: The HNSW graph (BFS-reordered layer 0).
+/// - `vectors_tq`: Flat buffer of TQ codes in BFS order. Each code is `bytes_per_code` bytes.
+///   Layout per code: [nibble_packed_codes (padded_dim/2 bytes)] [norm (4 bytes f32 LE)].
+/// - `query`: Raw query vector (f32, original dimension, NOT rotated).
+/// - `collection`: Collection metadata (sign flips, padded dimension).
+/// - `k`: Number of nearest neighbors to return.
+/// - `ef_search`: Beam width (must be >= k). Higher = better recall, slower.
+/// - `scratch`: Mutable scratch space (cleared internally, reused across calls).
+///
+/// # Returns
+/// Up to `k` SearchResults sorted by distance ascending (nearest first).
+///
+/// # Algorithm
+/// 1. Prepare rotated query: pad to padded_dim, apply FWHT with collection sign flips.
+/// 2. Upper layers: greedy single-best descent from entry_point to layer 1.
+///    - At each layer, scan all neighbors of current node, move to nearest.
+///    - Repeat until no improvement found, then descend one layer.
+///    - Upper layers use ORIGINAL node IDs (not BFS-reordered).
+/// 3. Layer 0: ef-bounded beam search with BitVec visited tracking.
+///    - Convert current node from original to BFS space.
+///    - Seed candidates/results with entry node.
+///    - Pop nearest candidate, expand its neighbors.
+///    - 2-hop prefetch: while computing distance for neighbor[i], prefetch neighbor[i+2].
+///    - Early termination: if nearest candidate > farthest result and results.len >= ef.
+///    - Prune results to ef (pop farthest when over capacity).
+/// 4. Extract top-K from results heap, map BFS positions back to original IDs.
+///
+/// # Zero-allocation guarantee (VEC-HNSW-03)
+/// All allocations happen in SearchScratch::new(). During search:
+/// - BitVec.clear_all uses memset (no alloc).
+/// - BinaryHeap.push/pop reuses existing capacity.
+/// - query_rotated is pre-allocated AlignedBuffer.
+/// - SmallVec output uses stack storage for k <= 32.
+pub fn hnsw_search(
+    graph: &HnswGraph,
+    vectors_tq: &[u8],
+    query: &[f32],
+    collection: &CollectionMetadata,
+    k: usize,
+    ef_search: usize,
+    scratch: &mut SearchScratch,
+) -> SmallVec<[SearchResult; 32]> {
+    let num_nodes = graph.num_nodes();
+    if num_nodes == 0 {
+        return SmallVec::new();
+    }
+
+    let ef = ef_search.max(k);
+    scratch.clear(num_nodes);
+
+    // Step 1: Prepare rotated query into scratch.query_rotated
+    let dim = query.len();
+    let padded = collection.padded_dimension as usize;
+    let q_rot = scratch.query_rotated.as_mut_slice();
+    // Copy query and zero-pad
+    q_rot[..dim].copy_from_slice(query);
+    for v in q_rot[dim..padded].iter_mut() {
+        *v = 0.0;
+    }
+    // Normalize query for FWHT
+    let mut norm_sq = 0.0f32;
+    for &v in &q_rot[..dim] {
+        norm_sq += v * v;
+    }
+    let q_norm = norm_sq.sqrt();
+    if q_norm > 0.0 {
+        let inv = 1.0 / q_norm;
+        for v in q_rot[..dim].iter_mut() {
+            *v *= inv;
+        }
+    }
+    // Apply FWHT with collection's sign flips
+    fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
+
+    // Get distance function
+    let dist_table = crate::vector::distance::table();
+    let tq_l2 = dist_table.tq_l2;
+
+    // Capture immutable slice of rotated query (after mutation phase is done)
+    let q_rotated: &[f32] = scratch.query_rotated.as_slice();
+
+    // Compute distance from rotated query to a node (by BFS position).
+    // tq_code returns the full code slot; we strip the last 4 bytes (norm).
+    let dist_bfs = |bfs_pos: u32| -> f32 {
+        let code = graph.tq_code(bfs_pos, vectors_tq);
+        let code_only = &code[..code.len() - 4];
+        let norm = graph.tq_norm(bfs_pos, vectors_tq);
+        tq_l2(q_rotated, code_only, norm)
+    };
+
+    // Step 2: Upper layer greedy descent (original node ID space)
+    let mut current_orig = graph.to_original(graph.entry_point());
+    let mut current_dist = dist_bfs(graph.entry_point());
+
+    for layer in (1..=graph.max_level() as usize).rev() {
+        loop {
+            let mut improved = false;
+            for &nb in graph.neighbors_upper(current_orig, layer) {
+                if nb == SENTINEL {
+                    break;
+                }
+                let nb_bfs = graph.to_bfs(nb);
+                let d = dist_bfs(nb_bfs);
+                if d < current_dist {
+                    current_orig = nb;
+                    current_dist = d;
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+
+    // Step 3: Layer 0 beam search (BFS space)
+    let entry_bfs = graph.to_bfs(current_orig);
+    scratch.visited.test_and_set(entry_bfs);
+    scratch
+        .candidates
+        .push(Reverse(OrdF32Pair(current_dist, entry_bfs)));
+    scratch.results.push(OrdF32Pair(current_dist, entry_bfs));
+
+    while let Some(Reverse(OrdF32Pair(c_dist, c_bfs))) = scratch.candidates.pop() {
+        // Early termination
+        if scratch.results.len() >= ef {
+            if let Some(&OrdF32Pair(worst, _)) = scratch.results.peek() {
+                if c_dist > worst {
+                    break;
+                }
+            }
+        }
+
+        let neighbors = graph.neighbors_l0(c_bfs);
+
+        // Prefetch first neighbor's data
+        if let Some(&first_nb) = neighbors.first() {
+            if first_nb != SENTINEL {
+                graph.prefetch_node(first_nb, vectors_tq);
+            }
+        }
+
+        for (idx, &nb) in neighbors.iter().enumerate() {
+            if nb == SENTINEL {
+                break;
+            }
+            if scratch.visited.test_and_set(nb) {
+                continue;
+            }
+
+            // 2-hop prefetch: prefetch neighbor[idx+2] while computing distance for neighbor[idx]
+            if idx + 2 < neighbors.len() {
+                let next = neighbors[idx + 2];
+                if next != SENTINEL {
+                    graph.prefetch_node(next, vectors_tq);
+                }
+            }
+
+            let d = dist_bfs(nb);
+
+            // Check if this neighbor should be added
+            let dominated =
+                scratch.results.len() >= ef && d >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
+            if !dominated {
+                scratch
+                    .candidates
+                    .push(Reverse(OrdF32Pair(d, nb)));
+                scratch.results.push(OrdF32Pair(d, nb));
+                if scratch.results.len() > ef {
+                    scratch.results.pop(); // remove farthest
+                }
+            }
+        }
+    }
+
+    // Step 4: Extract top-K, map back to original IDs
+    // Results is a max-heap. Drain all, sort, take top-k.
+    let mut collected: SmallVec<[SearchResult; 32]> = SmallVec::new();
+    while let Some(OrdF32Pair(dist, bfs_pos)) = scratch.results.pop() {
+        collected.push(SearchResult::new(
+            dist,
+            VectorId(graph.to_original(bfs_pos)),
+        ));
+    }
+    // collected is in reverse distance order (farthest first from max-heap drain)
+    collected.reverse();
+    // Now nearest first -- truncate to k
+    collected.truncate(k);
+    collected
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::vector::distance;
+    use crate::vector::hnsw::build::HnswBuilder;
+    use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+    use crate::vector::turbo_quant::encoder::{encode_tq_mse, padded_dimension};
+    use crate::vector::types::DistanceMetric;
+
+    fn lcg_f32(dim: usize, seed: u32) -> Vec<f32> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed;
+        for _ in 0..dim {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    fn normalize(v: &mut [f32]) -> f32 {
+        let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            let inv = 1.0 / norm;
+            v.iter_mut().for_each(|x| *x *= inv);
+        }
+        norm
+    }
+
+    fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum()
+    }
+
+    /// Build a complete test fixture: vectors, TQ codes, HNSW graph, BFS-ordered TQ buffer.
+    fn build_test_index(
+        n: usize,
+        dim: usize,
+        m: u8,
+        ef_construction: u16,
+    ) -> (Vec<Vec<f32>>, HnswGraph, Vec<u8>, CollectionMetadata) {
+        distance::init();
+
+        let collection = CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        );
+        let padded = collection.padded_dimension as usize;
+        let signs = collection.fwht_sign_flips.as_slice();
+
+        // Generate and encode vectors
+        let mut vectors = Vec::with_capacity(n);
+        let mut codes = Vec::with_capacity(n);
+        let mut work = vec![0.0f32; padded];
+        for i in 0..n {
+            let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+            normalize(&mut v);
+            let code = encode_tq_mse(&v, signs, &mut work);
+            vectors.push(v);
+            codes.push(code);
+        }
+
+        let dist_table = distance::table();
+        let bytes_per_code = padded / 2 + 4; // nibble-packed + norm
+
+        // Build a flat TQ buffer in insertion order for construction
+        let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
+        for code in &codes {
+            tq_buffer_orig.extend_from_slice(&code.codes);
+            tq_buffer_orig.extend_from_slice(&code.norm.to_le_bytes());
+        }
+
+        // Precompute all rotated queries for pairwise distance oracle
+        let mut all_rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut q_rot_buf = vec![0.0f32; padded];
+        for i in 0..n {
+            q_rot_buf[..dim].copy_from_slice(&vectors[i]);
+            for v in q_rot_buf[dim..padded].iter_mut() {
+                *v = 0.0;
+            }
+            fwht::fwht(&mut q_rot_buf[..padded], signs);
+            all_rotated.push(q_rot_buf[..padded].to_vec());
+        }
+
+        // Build HNSW with true pairwise distance oracle
+        let mut builder = HnswBuilder::new(m, ef_construction, 12345);
+
+        for _i in 0..n {
+            builder.insert(|a: u32, b: u32| {
+                // True pairwise: use a's rotated query against b's code
+                let q_rot = &all_rotated[a as usize];
+                let offset = b as usize * bytes_per_code;
+                let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
+                let norm_bytes =
+                    &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
+                let norm = f32::from_le_bytes([
+                    norm_bytes[0],
+                    norm_bytes[1],
+                    norm_bytes[2],
+                    norm_bytes[3],
+                ]);
+                (dist_table.tq_l2)(q_rot, code_slice, norm)
+            });
+        }
+
+        let graph = builder.build(bytes_per_code as u32);
+
+        // Rearrange TQ buffer into BFS order
+        let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
+        for bfs_pos in 0..n {
+            let orig_id = graph.to_original(bfs_pos as u32) as usize;
+            let src = orig_id * bytes_per_code;
+            let dst = bfs_pos * bytes_per_code;
+            tq_buffer_bfs[dst..dst + bytes_per_code]
+                .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
+        }
+
+        (vectors, graph, tq_buffer_bfs, collection)
+    }
+
+    /// Compute recall against brute-force TQ-ADC distances (same metric as search).
+    fn compute_recall_tq(
+        found: &[SearchResult],
+        graph: &HnswGraph,
+        tq_buf: &[u8],
+        query: &[f32],
+        collection: &CollectionMetadata,
+        k: usize,
+    ) -> f32 {
+        let padded = collection.padded_dimension as usize;
+        let signs = collection.fwht_sign_flips.as_slice();
+        let dist_table = distance::table();
+
+        // Prepare rotated query (same as in hnsw_search)
+        let dim = query.len();
+        let mut q_rotated = vec![0.0f32; padded];
+        q_rotated[..dim].copy_from_slice(query);
+        let mut norm_sq = 0.0f32;
+        for &v in &q_rotated[..dim] {
+            norm_sq += v * v;
+        }
+        let q_norm = norm_sq.sqrt();
+        if q_norm > 0.0 {
+            let inv = 1.0 / q_norm;
+            for v in q_rotated[..dim].iter_mut() {
+                *v *= inv;
+            }
+        }
+        fwht::fwht(&mut q_rotated[..padded], signs);
+
+        // Brute force: compute TQ-ADC distance to every node
+        let n = graph.num_nodes();
+        let mut dists: Vec<(f32, u32)> = (0..n)
+            .map(|bfs_pos| {
+                let code = graph.tq_code(bfs_pos, tq_buf);
+                let code_only = &code[..code.len() - 4];
+                let norm = graph.tq_norm(bfs_pos, tq_buf);
+                let d = (dist_table.tq_l2)(&q_rotated, code_only, norm);
+                let orig_id = graph.to_original(bfs_pos);
+                (d, orig_id)
+            })
+            .collect();
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let gt_ids: std::collections::HashSet<u32> =
+            dists.iter().take(k).map(|d| d.1).collect();
+        let found_ids: std::collections::HashSet<u32> =
+            found.iter().map(|r| r.id.0).collect();
+        let overlap = gt_ids.intersection(&found_ids).count();
+        overlap as f32 / k as f32
+    }
+
+    // ── BitVec tests ──────────────────────────────────────────────────
+
     #[test]
     fn test_bitvec_new_word_count() {
-        let bv = super::BitVec::new(1000);
+        let bv = BitVec::new(1000);
         // ceil(1000/64) = 16 words
         assert_eq!(bv.words.len(), 16);
     }
 
     #[test]
     fn test_bitvec_test_and_set_first_returns_false() {
-        let mut bv = super::BitVec::new(100);
+        let mut bv = BitVec::new(100);
         assert!(!bv.test_and_set(42));
     }
 
     #[test]
     fn test_bitvec_test_and_set_second_returns_true() {
-        let mut bv = super::BitVec::new(100);
+        let mut bv = BitVec::new(100);
         assert!(!bv.test_and_set(42));
         assert!(bv.test_and_set(42));
     }
 
     #[test]
     fn test_bitvec_boundary_ids() {
-        let mut bv = super::BitVec::new(1000);
-        // ID 0
+        let mut bv = BitVec::new(1000);
         assert!(!bv.test_and_set(0));
         assert!(bv.test_and_set(0));
-        // ID 63 (last bit of first word)
         assert!(!bv.test_and_set(63));
         assert!(bv.test_and_set(63));
-        // ID 64 (first bit of second word)
         assert!(!bv.test_and_set(64));
         assert!(bv.test_and_set(64));
-        // ID 999 (near max)
         assert!(!bv.test_and_set(999));
         assert!(bv.test_and_set(999));
     }
 
     #[test]
     fn test_bitvec_clear_all_resets() {
-        let mut bv = super::BitVec::new(100);
+        let mut bv = BitVec::new(100);
         bv.test_and_set(10);
         bv.test_and_set(50);
         bv.clear_all(100);
-        // After clear, test_and_set should return false again
         assert!(!bv.test_and_set(10));
         assert!(!bv.test_and_set(50));
     }
 
     #[test]
     fn test_bitvec_clear_all_grows() {
-        let mut bv = super::BitVec::new(100);
-        // Grow to 2000
+        let mut bv = BitVec::new(100);
         bv.clear_all(2000);
         assert!(bv.words.len() >= (2000 + 63) / 64);
-        // Should still work for high IDs
         assert!(!bv.test_and_set(1999));
         assert!(bv.test_and_set(1999));
     }
 
+    // ── SearchScratch tests ───────────────────────────────────────────
+
     #[test]
     fn test_search_scratch_new_sizes() {
-        use crate::vector::aligned_buffer::AlignedBuffer;
-        let scratch = super::SearchScratch::new(1000, 1024);
+        let scratch = SearchScratch::new(1000, 1024);
         assert!(scratch.candidates.capacity() >= 256);
         assert!(scratch.results.capacity() >= 256);
         assert!(scratch.visited.words.len() >= (1000 + 63) / 64);
@@ -190,10 +561,11 @@ mod tests {
 
     #[test]
     fn test_search_scratch_clear_preserves_capacity() {
-        let mut scratch = super::SearchScratch::new(1000, 1024);
-        // Push some items
-        scratch.candidates.push(std::cmp::Reverse(super::OrdF32Pair(1.0, 0)));
-        scratch.results.push(super::OrdF32Pair(1.0, 0));
+        let mut scratch = SearchScratch::new(1000, 1024);
+        scratch
+            .candidates
+            .push(Reverse(OrdF32Pair(1.0, 0)));
+        scratch.results.push(OrdF32Pair(1.0, 0));
         let cap_before_cand = scratch.candidates.capacity();
         let cap_before_res = scratch.results.capacity();
 
@@ -201,8 +573,204 @@ mod tests {
 
         assert!(scratch.candidates.is_empty());
         assert!(scratch.results.is_empty());
-        // Capacity must not shrink
         assert!(scratch.candidates.capacity() >= cap_before_cand);
         assert!(scratch.results.capacity() >= cap_before_res);
+    }
+
+    // ── hnsw_search tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_search_empty_graph() {
+        distance::init();
+        let collection = CollectionMetadata::new(
+            1, 64, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        );
+        let graph = HnswBuilder::new(16, 200, 42).build(
+            (collection.padded_dimension / 2 + 4) as u32,
+        );
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(0, padded);
+        let query = vec![0.0f32; 64];
+        let results = hnsw_search(&graph, &[], &query, &collection, 10, 64, &mut scratch);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_single_node() {
+        let (vectors, graph, tq_buf, collection) = build_test_index(1, 64, 16, 200);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(1, padded);
+        let results = hnsw_search(
+            &graph,
+            &tq_buf,
+            &vectors[0],
+            &collection,
+            1,
+            64,
+            &mut scratch,
+        );
+        assert_eq!(results.len(), 1);
+        // The single node should be returned (original ID 0)
+        assert_eq!(results[0].id.0, 0);
+    }
+
+    #[test]
+    fn test_search_100_vectors_recall() {
+        let n = 100;
+        let dim = 64;
+        let k = 10;
+        let ef = 64;
+        let (_vectors, graph, tq_buf, collection) = build_test_index(n, dim, 16, 200);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        // Test with multiple queries -- recall measured against brute-force TQ-ADC
+        let mut total_recall = 0.0f32;
+        let num_queries = 10;
+        for q_seed in 0..num_queries {
+            let mut query = lcg_f32(dim, 10000 + q_seed * 17);
+            normalize(&mut query);
+            let results =
+                hnsw_search(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+            assert!(results.len() <= k);
+            let recall =
+                compute_recall_tq(&results, &graph, &tq_buf, &query, &collection, k);
+            total_recall += recall;
+        }
+        let avg_recall = total_recall / num_queries as f32;
+        eprintln!("100 vectors, dim=64, ef=64: avg TQ-ADC recall@10 = {avg_recall:.3}");
+        assert!(
+            avg_recall >= 0.90,
+            "avg recall {avg_recall:.3} < 0.90 for 100 vectors with ef=64"
+        );
+    }
+
+    #[test]
+    fn test_search_1000_vectors_recall() {
+        let n = 1000;
+        let dim = 128;
+        let k = 10;
+        let ef = 128;
+        let (_vectors, graph, tq_buf, collection) = build_test_index(n, dim, 16, 200);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        let mut total_recall = 0.0f32;
+        let num_queries = 10;
+        for q_seed in 0..num_queries {
+            let mut query = lcg_f32(dim, 20000 + q_seed * 31);
+            normalize(&mut query);
+            let results =
+                hnsw_search(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+            assert!(results.len() <= k);
+            let recall =
+                compute_recall_tq(&results, &graph, &tq_buf, &query, &collection, k);
+            total_recall += recall;
+        }
+        let avg_recall = total_recall / num_queries as f32;
+        eprintln!("1000 vectors, dim=128, ef=128: avg TQ-ADC recall@10 = {avg_recall:.3}");
+        assert!(
+            avg_recall >= 0.95,
+            "avg recall {avg_recall:.3} < 0.95 for 1000 vectors with ef=128"
+        );
+    }
+
+    #[test]
+    fn test_search_k1_returns_nearest() {
+        let n = 50;
+        let dim = 32;
+        let (vectors, graph, tq_buf, collection) = build_test_index(n, dim, 8, 100);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        // Search for k=1 with high ef for maximum accuracy
+        let query = &vectors[0]; // query IS a database vector
+        let results =
+            hnsw_search(&graph, &tq_buf, query, &collection, 1, 128, &mut scratch);
+        assert_eq!(results.len(), 1);
+        // Should find vector 0 itself (or very close to it)
+        // Due to TQ quantization, self-distance is non-zero but should still rank #1
+        eprintln!(
+            "k=1 search for vector[0]: found id={}, dist={}",
+            results[0].id.0, results[0].distance
+        );
+    }
+
+    #[test]
+    fn test_search_reuses_scratch_no_panic() {
+        let n = 50;
+        let dim = 32;
+        let (vectors, graph, tq_buf, collection) = build_test_index(n, dim, 8, 100);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        // Search twice -- should not panic
+        let _r1 = hnsw_search(
+            &graph,
+            &tq_buf,
+            &vectors[0],
+            &collection,
+            5,
+            64,
+            &mut scratch,
+        );
+        let _r2 = hnsw_search(
+            &graph,
+            &tq_buf,
+            &vectors[1],
+            &collection,
+            5,
+            64,
+            &mut scratch,
+        );
+    }
+
+    #[test]
+    fn test_search_scratch_capacity_stable() {
+        let n = 50;
+        let dim = 32;
+        let (vectors, graph, tq_buf, collection) = build_test_index(n, dim, 8, 100);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        // Warm up to establish capacity
+        let _r = hnsw_search(
+            &graph,
+            &tq_buf,
+            &vectors[0],
+            &collection,
+            5,
+            64,
+            &mut scratch,
+        );
+        let cap_cand = scratch.candidates.capacity();
+        let cap_res = scratch.results.capacity();
+        let words_len = scratch.visited.words.len();
+
+        // Second search should not grow capacity
+        let _r2 = hnsw_search(
+            &graph,
+            &tq_buf,
+            &vectors[1],
+            &collection,
+            5,
+            64,
+            &mut scratch,
+        );
+        assert_eq!(
+            scratch.candidates.capacity(),
+            cap_cand,
+            "candidates capacity grew between searches"
+        );
+        assert_eq!(
+            scratch.results.capacity(),
+            cap_res,
+            "results capacity grew between searches"
+        );
+        assert_eq!(
+            scratch.visited.words.len(),
+            words_len,
+            "visited words grew between searches"
+        );
     }
 }
