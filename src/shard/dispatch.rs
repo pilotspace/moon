@@ -186,18 +186,6 @@ pub enum ShardMessage {
         commands: Vec<std::sync::Arc<Frame>>,
         response_slot: ResponseSlotPtr,
     },
-    /// Cross-shard subscription metadata: another shard gained a subscriber.
-    PubSubSubscribe {
-        source_shard: usize,
-        channel: Bytes,
-        is_pattern: bool,
-    },
-    /// Cross-shard subscription metadata: another shard lost all subscribers for a channel.
-    PubSubUnsubscribe {
-        source_shard: usize,
-        channel: Bytes,
-        is_pattern: bool,
-    },
     /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
     PubSubPublish {
         channel: Bytes,

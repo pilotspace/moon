@@ -162,12 +162,10 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        let mut remote_sub_map = self::remote_subscriber_map::RemoteSubscriberMap::new();
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
             &mut pubsub,
-            &mut remote_sub_map,
             &blocking,
             &mut pending_snap,
             &mut snap_state,
@@ -219,12 +217,10 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        let mut remote_sub_map = self::remote_subscriber_map::RemoteSubscriberMap::new();
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
             &mut pubsub,
-            &mut remote_sub_map,
             &blocking,
             &mut pending_snap,
             &mut snap_state,

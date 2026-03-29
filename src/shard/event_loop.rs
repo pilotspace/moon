@@ -398,7 +398,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
-                        &mut *remote_sub_map_arc.write().unwrap(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
@@ -444,7 +444,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
-                        &mut *remote_sub_map_arc.write().unwrap(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
@@ -612,7 +612,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
-                        &mut *remote_sub_map_arc.write().unwrap(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
@@ -664,7 +664,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write().unwrap(),
-                        &mut *remote_sub_map_arc.write().unwrap(), &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,

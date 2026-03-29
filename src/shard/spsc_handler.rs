@@ -25,7 +25,6 @@ use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 
 use super::dispatch::ShardMessage;
-use super::remote_subscriber_map::RemoteSubscriberMap;
 use super::shared_databases::ShardDatabases;
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
@@ -37,7 +36,6 @@ pub(crate) fn drain_spsc_shared(
     shard_databases: &Arc<ShardDatabases>,
     consumers: &mut [HeapCons<ShardMessage>],
     pubsub_registry: &mut PubSubRegistry,
-    remote_subscriber_map: &mut RemoteSubscriberMap,
     blocking_registry: &Rc<RefCell<BlockingRegistry>>,
     pending_snapshot: &mut Option<(
         u64,
@@ -109,7 +107,6 @@ pub(crate) fn drain_spsc_shared(
             handle_shard_message_shared(
                 shard_databases,
                 pubsub_registry,
-                remote_subscriber_map,
                 blocking_registry,
                 msg,
                 pending_snapshot,
@@ -130,7 +127,6 @@ pub(crate) fn drain_spsc_shared(
         handle_shard_message_shared(
             shard_databases,
             pubsub_registry,
-            remote_subscriber_map,
             blocking_registry,
             msg,
             pending_snapshot,
@@ -153,7 +149,6 @@ pub(crate) fn drain_spsc_shared(
 pub(crate) fn handle_shard_message_shared(
     shard_databases: &Arc<ShardDatabases>,
     pubsub_registry: &mut PubSubRegistry,
-    remote_subscriber_map: &mut RemoteSubscriberMap,
     blocking_registry: &Rc<RefCell<BlockingRegistry>>,
     msg: ShardMessage,
     pending_snapshot: &mut Option<(
@@ -709,20 +704,6 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::PubSubFanOut { channel, message } => {
             pubsub_registry.publish(&channel, &message);
-        }
-        ShardMessage::PubSubSubscribe {
-            source_shard,
-            channel,
-            is_pattern,
-        } => {
-            remote_subscriber_map.add(channel, source_shard, is_pattern);
-        }
-        ShardMessage::PubSubUnsubscribe {
-            source_shard,
-            channel,
-            is_pattern,
-        } => {
-            remote_subscriber_map.remove(&channel, source_shard, is_pattern);
         }
         ShardMessage::PubSubPublish {
             channel,
