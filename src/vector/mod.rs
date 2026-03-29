@@ -2,3 +2,5 @@
 
 pub mod aligned_buffer;
 pub mod distance;
+pub mod types;
+

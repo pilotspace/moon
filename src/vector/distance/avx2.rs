@@ -393,6 +393,7 @@ mod tests {
             assert!(rel < 1e-4, "l2 tail len={len}: scalar={expected_l2}, avx2={got_l2}");
 
             let expected_dot = scalar::dot_f32(&a, &b);
+            // SAFETY: AVX2+FMA verified at test entry.
             let got_dot = unsafe { dot_f32(&a, &b) };
             let rel = (got_dot - expected_dot).abs() / expected_dot.abs().max(1e-10);
             assert!(rel < 1e-4, "dot tail len={len}: scalar={expected_dot}, avx2={got_dot}");
@@ -400,6 +401,7 @@ mod tests {
             let ai = gen_i8(len, 42);
             let bi = gen_i8(len, 99);
             let expected_i8 = scalar::l2_i8(&ai, &bi);
+            // SAFETY: AVX2+FMA verified at test entry.
             let got_i8 = unsafe { l2_i8(&ai, &bi) };
             assert_eq!(got_i8, expected_i8, "l2_i8 tail len={len}");
         }
@@ -420,6 +422,7 @@ mod tests {
 
         let ai: &[i8] = &[];
         let bi: &[i8] = &[];
+        // SAFETY: AVX2+FMA verified above.
         unsafe {
             assert_eq!(l2_i8(ai, bi), 0);
         }
