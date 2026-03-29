@@ -200,3 +200,156 @@ mod tests {
         assert_eq!((t.l2_i8)(&ai, &bi), expected_i8);
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    /// Deterministic f32 vector via LCG PRNG, values in [-1.0, 1.0].
+    fn deterministic_f32(dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed as u32;
+        for _ in 0..dim {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    /// Deterministic i8 vector via LCG PRNG, values in [-128, 127].
+    fn deterministic_i8(dim: usize, seed: u64) -> Vec<i8> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed as u32;
+        for _ in 0..dim {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s >> 24) as i8);
+        }
+        v
+    }
+
+    /// Relative tolerance check for f32 values.
+    fn approx_eq_f32(a: f32, b: f32, rel_tol: f32) -> bool {
+        (a - b).abs() <= rel_tol * a.abs().max(b.abs()).max(1e-6)
+    }
+
+    const TEST_DIMS: &[usize] = &[
+        1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 100, 128, 256, 384, 768, 1024,
+    ];
+
+    #[test]
+    fn test_simd_matches_scalar_l2_f32() {
+        init();
+        let t = table();
+        for &dim in TEST_DIMS {
+            let a = deterministic_f32(dim, 42);
+            let b = deterministic_f32(dim, 99);
+            let scalar_result = scalar::l2_f32(&a, &b);
+            let dispatch_result = (t.l2_f32)(&a, &b);
+            assert!(
+                approx_eq_f32(scalar_result, dispatch_result, 1e-4),
+                "l2_f32 mismatch at dim={dim}: scalar={scalar_result}, dispatch={dispatch_result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simd_matches_scalar_l2_i8() {
+        init();
+        let t = table();
+        for &dim in TEST_DIMS {
+            let a = deterministic_i8(dim, 42);
+            let b = deterministic_i8(dim, 99);
+            assert_eq!(
+                scalar::l2_i8(&a, &b),
+                (t.l2_i8)(&a, &b),
+                "l2_i8 mismatch at dim={dim}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simd_matches_scalar_dot_f32() {
+        init();
+        let t = table();
+        for &dim in TEST_DIMS {
+            let a = deterministic_f32(dim, 42);
+            let b = deterministic_f32(dim, 99);
+            let scalar_result = scalar::dot_f32(&a, &b);
+            let dispatch_result = (t.dot_f32)(&a, &b);
+            assert!(
+                approx_eq_f32(scalar_result, dispatch_result, 1e-4),
+                "dot_f32 mismatch at dim={dim}: scalar={scalar_result}, dispatch={dispatch_result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simd_matches_scalar_cosine_f32() {
+        init();
+        let t = table();
+        for &dim in TEST_DIMS {
+            let a = deterministic_f32(dim, 42);
+            let b = deterministic_f32(dim, 99);
+            let scalar_result = scalar::cosine_f32(&a, &b);
+            let dispatch_result = (t.cosine_f32)(&a, &b);
+            assert!(
+                approx_eq_f32(scalar_result, dispatch_result, 1e-4),
+                "cosine_f32 mismatch at dim={dim}: scalar={scalar_result}, dispatch={dispatch_result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_identical_vectors_l2() {
+        init();
+        let t = table();
+        for &dim in &[1, 768, 1024] {
+            let a = deterministic_f32(dim, 42);
+            let scalar_result = scalar::l2_f32(&a, &a);
+            let dispatch_result = (t.l2_f32)(&a, &a);
+            assert_eq!(scalar_result, 0.0, "scalar l2 of identical vectors != 0 at dim={dim}");
+            assert_eq!(dispatch_result, 0.0, "dispatch l2 of identical vectors != 0 at dim={dim}");
+        }
+    }
+
+    #[test]
+    fn test_zero_vector_cosine() {
+        init();
+        let t = table();
+        let zero = vec![0.0f32; 128];
+        let nonzero = deterministic_f32(128, 42);
+        // Zero vector should return 1.0 (max distance) for both scalar and dispatch
+        assert_eq!(scalar::cosine_f32(&zero, &nonzero), 1.0);
+        assert_eq!((t.cosine_f32)(&zero, &nonzero), 1.0);
+        assert_eq!(scalar::cosine_f32(&nonzero, &zero), 1.0);
+        assert_eq!((t.cosine_f32)(&nonzero, &zero), 1.0);
+    }
+
+    #[test]
+    fn test_single_element() {
+        init();
+        let t = table();
+        let a = [0.5f32];
+        let b = [0.8f32];
+
+        // L2: (0.5 - 0.8)^2 = 0.09
+        let l2_s = scalar::l2_f32(&a, &b);
+        let l2_d = (t.l2_f32)(&a, &b);
+        assert!(approx_eq_f32(l2_s, l2_d, 1e-6), "single-element l2_f32 mismatch");
+
+        // Dot: 0.5 * 0.8 = 0.4
+        let dot_s = scalar::dot_f32(&a, &b);
+        let dot_d = (t.dot_f32)(&a, &b);
+        assert!(approx_eq_f32(dot_s, dot_d, 1e-6), "single-element dot_f32 mismatch");
+
+        // Cosine: 1 - (0.4 / (0.5 * 0.8)) = 0.0
+        let cos_s = scalar::cosine_f32(&a, &b);
+        let cos_d = (t.cosine_f32)(&a, &b);
+        assert!(approx_eq_f32(cos_s, cos_d, 1e-6), "single-element cosine_f32 mismatch");
+
+        // i8 single element
+        let ai = [42i8];
+        let bi = [-10i8];
+        assert_eq!(scalar::l2_i8(&ai, &bi), (t.l2_i8)(&ai, &bi));
+    }
+}
