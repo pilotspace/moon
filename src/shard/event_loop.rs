@@ -440,7 +440,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }
@@ -488,7 +490,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }
@@ -586,7 +590,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }
@@ -664,7 +670,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }
@@ -717,7 +725,9 @@ impl super::Shard {
                                 &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, shard_id, num_shards, config_port,
+                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                                &all_remote_sub_maps, &affinity_tracker,
+                                shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );
                         }

@@ -19,7 +19,7 @@ type StdRwLock<T> = std::sync::RwLock<T>;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
-use crate::command::{DispatchResult, dispatch, dispatch_read};
+use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
@@ -41,6 +41,7 @@ use super::{
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
+use crate::shard::affinity::AffinityTracker as PubSubAffinityTracker;
 // ResponseSlotPool NOT used on monoio — its AtomicWaker doesn't cross
 // monoio's single-threaded (!Send) executor boundary. Use oneshot channels.
 
@@ -107,7 +108,7 @@ pub async fn handle_connection_sharded_monoio<
     all_remote_sub_maps: Vec<
         Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     >,
-    affinity_tracker: Arc<parking_lot::RwLock<AffinityTracker>>,
+    pubsub_affinity: Arc<parking_lot::RwLock<PubSubAffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
@@ -235,7 +236,7 @@ pub async fn handle_connection_sharded_monoio<
                                                             // Register pub/sub affinity for this client IP
                                                             if subscription_count == 1 {
                                                                 if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                                    affinity_tracker.write().register(addr.ip(), shard_id);
+                                                                    pubsub_affinity.write().register(addr.ip(), shard_id);
                                                                 }
                                                             }
                                                             let resp = pubsub::subscribe_response(&channel, subscription_count);
@@ -321,7 +322,7 @@ pub async fn handle_connection_sharded_monoio<
                                                             // Register pub/sub affinity for this client IP
                                                             if subscription_count == 1 {
                                                                 if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                                    affinity_tracker.write().register(addr.ip(), shard_id);
+                                                                    pubsub_affinity.write().register(addr.ip(), shard_id);
                                                                 }
                                                             }
                                                             let resp = pubsub::psubscribe_response(&pattern, subscription_count);
@@ -1076,7 +1077,7 @@ pub async fn handle_connection_sharded_monoio<
                         // Register pub/sub affinity for this client IP
                         if subscription_count == 1 {
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                affinity_tracker.write().register(addr.ip(), shard_id);
+                                pubsub_affinity.write().register(addr.ip(), shard_id);
                             }
                         }
                         let resp = if is_pattern {
@@ -1137,7 +1138,7 @@ pub async fn handle_connection_sharded_monoio<
                         }
                         let arr: Vec<Frame> =
                             all_channels.into_iter().map(Frame::BulkString).collect();
-                        responses.push(Frame::Array(arr));
+                        responses.push(Frame::Array(arr.into()));
                     }
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
                         let channels: Vec<Bytes> = cmd_args[1..]
@@ -1157,7 +1158,7 @@ pub async fn handle_connection_sharded_monoio<
                             arr.push(Frame::BulkString(ch.clone()));
                             arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));
                         }
-                        responses.push(Frame::Array(arr));
+                        responses.push(Frame::Array(arr.into()));
                     }
                     Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
                         let mut total: usize = 0;
@@ -1848,7 +1849,7 @@ pub async fn handle_connection_sharded_monoio<
         }
         // Remove affinity on disconnect (no subscriptions remain)
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-            affinity_tracker.write().remove(&addr.ip());
+            pubsub_affinity.write().remove(&addr.ip());
         }
     }
 

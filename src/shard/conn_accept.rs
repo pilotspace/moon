@@ -383,8 +383,10 @@ pub(crate) fn spawn_monoio_connection(
     repl_state: &Option<Arc<StdRwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
-    remote_subscriber_map: &Rc<RefCell<RemoteSubscriberMap>>,
+    remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<parking_lot::RwLock<RemoteSubscriberMap>>],
+    affinity_tracker: &Arc<parking_lot::RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -620,6 +622,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
     repl_state: &Option<Arc<StdRwLock<ReplicationState>>>,
     cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<parking_lot::RwLock<RemoteSubscriberMap>>],
+    pubsub_affinity: &Arc<parking_lot::RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -669,6 +675,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
+            let rsm = remote_subscriber_map.clone();
+            let all_regs = all_pubsub_registries.to_vec();
+            let all_rsm = all_remote_sub_maps.to_vec();
+            let aff = pubsub_affinity.clone();
             let pw = pending_wakers.clone();
             let peer_addr = state.peer_addr.clone();
 
@@ -700,6 +710,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     notifiers,
                     snap_tx,
                     clk,
+                    rsm,
+                    all_regs,
+                    all_rsm,
+                    aff,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     pw,
