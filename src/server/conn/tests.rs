@@ -62,7 +62,7 @@ fn test_inline_set() {
     assert_eq!(&write_buf[..], b"+OK\r\n");
 
     // Verify key was stored
-    let guard = dbs.read_db(0, 0);
+    let mut guard = dbs.write_db(0, 0);
     let entry = guard.get(b"foo").expect("key should exist");
     assert_eq!(entry.value.as_bytes().unwrap(), b"bar");
 }
