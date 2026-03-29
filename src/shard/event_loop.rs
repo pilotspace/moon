@@ -32,6 +32,7 @@ use crate::tracking::TrackingTable;
 use crate::io::{UringConfig, UringDriver};
 
 use super::dispatch::ShardMessage;
+use super::affinity::AffinityTracker;
 use super::remote_subscriber_map::RemoteSubscriberMap;
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use super::uring_handler;
@@ -70,6 +71,7 @@ impl super::Shard {
         all_notifiers: Vec<Arc<channel::Notify>>,
         all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
         all_remote_sub_maps: Vec<Arc<RwLock<RemoteSubscriberMap>>>,
+        affinity_tracker: Arc<RwLock<AffinityTracker>>,
     ) {
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -384,6 +386,7 @@ impl super::Shard {
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps,
+                                &affinity_tracker,
                                 shard_id, num_shards, config_port,
                             );
                         }
@@ -596,6 +599,7 @@ impl super::Shard {
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps,
+                                &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
                             );

@@ -190,6 +190,11 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // Create shared affinity tracker for pub/sub connection routing
+    let affinity_tracker = std::sync::Arc::new(std::sync::RwLock::new(
+        moon::shard::affinity::AffinityTracker::new(),
+    ));
+
     // Create and restore all shards on main thread, then extract databases
     // into centralized ShardDatabases for cross-shard direct read access.
     let mut shards: Vec<Shard> = (0..num_shards)
@@ -234,6 +239,7 @@ fn main() -> anyhow::Result<()> {
         let shard_dbs = shard_databases.clone();
         let shard_pubsub_registries = all_pubsub_registries.clone();
         let shard_remote_sub_maps = all_remote_sub_maps.clone();
+        let shard_affinity = affinity_tracker.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -265,6 +271,7 @@ fn main() -> anyhow::Result<()> {
                             shard_dbs,
                             shard_pubsub_registries,
                             shard_remote_sub_maps,
+                            shard_affinity,
                         )
                         .await;
                 });
@@ -358,13 +365,7 @@ fn main() -> anyhow::Result<()> {
                 info!("Cluster bus and gossip ticker started");
             }
 
-            // On Linux, per-shard SO_REUSEPORT listeners handle plain TCP accept.
-            // The central listener only routes TLS connections.
-            let per_shard_accept = cfg!(target_os = "linux");
-            if let Err(e) =
-                server::listener::run_sharded(config, conn_txs, listener_cancel, per_shard_accept)
-                    .await
-            {
+            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel, affinity_tracker).await {
                 tracing::error!("Listener error: {}", e);
             }
         });
@@ -402,10 +403,7 @@ fn main() -> anyhow::Result<()> {
 
         let per_shard_accept = cfg!(target_os = "linux");
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
-            if let Err(e) =
-                server::listener::run_sharded(config, conn_txs, listener_cancel, per_shard_accept)
-                    .await
-            {
+            if let Err(e) = server::listener::run_sharded(config, conn_txs, listener_cancel, affinity_tracker).await {
                 tracing::error!("Listener error: {}", e);
             }
         });

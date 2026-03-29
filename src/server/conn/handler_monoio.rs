@@ -98,6 +98,7 @@ pub async fn handle_connection_sharded_monoio<
     remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
+    affinity_tracker: Arc<RwLock<AffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
@@ -226,6 +227,12 @@ pub async fn handle_connection_sharded_monoio<
                                                                 all_remote_sub_maps[target].write().unwrap().add(channel.clone(), shard_id, false);
                                                             }
                                                             subscription_count += 1;
+                                                            // Register pub/sub affinity for this client IP
+                                                            if subscription_count == 1 {
+                                                                if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                                                    affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                                }
+                                                            }
                                                             let resp = pubsub::subscribe_response(&channel, subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
@@ -318,6 +325,12 @@ pub async fn handle_connection_sharded_monoio<
                                                                 all_remote_sub_maps[target].write().unwrap().add(pattern.clone(), shard_id, true);
                                                             }
                                                             subscription_count += 1;
+                                                            // Register pub/sub affinity for this client IP
+                                                            if subscription_count == 1 {
+                                                                if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                                                    affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                                }
+                                                            }
                                                             let resp = pubsub::psubscribe_response(&pattern, subscription_count);
                                                             let mut resp_buf = BytesMut::new();
                                                             codec.encode_frame(&resp, &mut resp_buf);
@@ -1080,6 +1093,12 @@ pub async fn handle_connection_sharded_monoio<
                             );
                         }
                         subscription_count += 1;
+                        // Register pub/sub affinity for this client IP
+                        if subscription_count == 1 {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                            }
+                        }
                         let resp = if is_pattern {
                             pubsub::psubscribe_response(&ch, subscription_count)
                         } else {
@@ -1879,6 +1898,10 @@ pub async fn handle_connection_sharded_monoio<
                     .unwrap()
                     .remove(&pat, shard_id, true);
             }
+        }
+        // Remove affinity on disconnect (no subscriptions remain)
+        if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+            affinity_tracker.write().unwrap().remove(&addr.ip());
         }
     }
 

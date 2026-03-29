@@ -21,6 +21,7 @@ use crate::server::conn::affinity::MigratedConnectionState;
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
+use super::affinity::AffinityTracker;
 use super::dispatch::ShardMessage;
 use super::remote_subscriber_map::RemoteSubscriberMap;
 use super::shared_databases::ShardDatabases;
@@ -93,6 +94,7 @@ pub(crate) fn spawn_tokio_connection(
     remote_subscriber_map: &Arc<RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
     all_remote_sub_maps: &[Arc<RwLock<RemoteSubscriberMap>>],
+    affinity_tracker: &Arc<RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -100,6 +102,7 @@ pub(crate) fn spawn_tokio_connection(
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
 
+    let aff = affinity_tracker.clone();
     let rsm = remote_subscriber_map.clone();
     let sdbs = shard_databases.clone();
     let dtx = dispatch_tx.clone();
@@ -181,6 +184,7 @@ pub(crate) fn spawn_tokio_connection(
                         rsm,
                         all_regs,
                         all_rsm,
+                        aff,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
@@ -198,7 +202,7 @@ pub(crate) fn spawn_tokio_connection(
             handle_connection_sharded(
                 tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
                 rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm, all_regs,
-                all_rsm,
+                all_rsm, aff,
             )
             .await;
         });
@@ -245,6 +249,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     remote_subscriber_map: &Arc<RwLock<RemoteSubscriberMap>>,
     all_pubsub_registries: &[Arc<RwLock<PubSubRegistry>>],
     all_remote_sub_maps: &[Arc<RwLock<RemoteSubscriberMap>>],
+    affinity_tracker: &Arc<RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -377,6 +382,7 @@ pub(crate) fn spawn_monoio_connection(
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
+            let aff = affinity_tracker.clone();
             let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
@@ -453,6 +459,7 @@ pub(crate) fn spawn_monoio_connection(
                                 rsm,
                                 all_regs,
                                 all_rsm,
+                                aff,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
@@ -508,6 +515,7 @@ pub(crate) fn spawn_monoio_connection(
                         rsm,
                         all_regs,
                         all_rsm,
+                        aff,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,

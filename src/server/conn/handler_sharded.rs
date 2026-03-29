@@ -99,6 +99,7 @@ pub async fn handle_connection_sharded(
     remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
+    affinity_tracker: Arc<RwLock<crate::shard::affinity::AffinityTracker>>,
 ) {
     let peer_addr = stream
         .peer_addr()
@@ -252,6 +253,7 @@ pub async fn handle_connection_sharded_inner<
     remote_subscriber_map: Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
     all_pubsub_registries: Vec<Arc<RwLock<PubSubRegistry>>>,
     all_remote_sub_maps: Vec<Arc<RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
+    affinity_tracker: Arc<RwLock<AffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
@@ -358,6 +360,12 @@ pub async fn handle_connection_sharded_inner<
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 { pubsub_registry.write().unwrap().subscribe(ch.clone(), sub); }
                                                 subscription_count += 1;
+                                                // Register pub/sub affinity for this client IP
+                                                if subscription_count == 1 {
+                                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                                        affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                    }
+                                                }
                                                 // Direct shared-write: propagate subscription to all shards' remote subscriber maps
                                                 for target in 0..num_shards {
                                                     if target == shard_id { continue; }
@@ -390,6 +398,12 @@ pub async fn handle_connection_sharded_inner<
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 { pubsub_registry.write().unwrap().psubscribe(pat.clone(), sub); }
                                                 subscription_count += 1;
+                                                // Register pub/sub affinity for this client IP
+                                                if subscription_count == 1 {
+                                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                                        affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                                    }
+                                                }
                                                 // Direct shared-write: propagate pattern subscription to all shards' remote subscriber maps
                                                 for target in 0..num_shards {
                                                     if target == shard_id { continue; }
@@ -1133,6 +1147,12 @@ pub async fn handle_connection_sharded_inner<
                                     { pubsub_registry.write().unwrap().subscribe(ch.clone(), sub); }
                                 }
                                 subscription_count += 1;
+                                // Register pub/sub affinity for this client IP
+                                if subscription_count == 1 {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        affinity_tracker.write().unwrap().register(addr.ip(), shard_id);
+                                    }
+                                }
                                 // Direct shared-write: propagate subscription to all shards' remote subscriber maps
                                 for target in 0..num_shards {
                                     if target == shard_id { continue; }
@@ -1567,6 +1587,10 @@ pub async fn handle_connection_sharded_inner<
                     .unwrap()
                     .remove(&pat, shard_id, true);
             }
+        }
+        // Remove affinity on disconnect (no subscriptions remain)
+        if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+            affinity_tracker.write().unwrap().remove(&addr.ip());
         }
     }
 

@@ -2436,6 +2436,10 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             })
             .collect();
 
+        let affinity_tracker = std::sync::Arc::new(std::sync::RwLock::new(
+            moon::shard::affinity::AffinityTracker::new(),
+        ));
+
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
         for id in 0..num_shards {
@@ -2448,6 +2452,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
             let shard_all_notifiers = all_notifiers.clone();
             let shard_pubsub_regs = all_pubsub_registries.clone();
             let shard_remote_sub_maps = all_remote_sub_maps.clone();
+            let shard_affinity = affinity_tracker.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-shard-{}", id))
@@ -2493,6 +2498,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_all_notifiers,
                         shard_pubsub_regs,
                         shard_remote_sub_maps,
+                        shard_affinity,
                     )));
                 })
                 .expect("failed to spawn shard thread");
@@ -2507,7 +2513,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
 
         let listener_cancel = cancel.clone();
         listener_rt.block_on(async {
-            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, false).await {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, affinity_tracker).await {
                 eprintln!("Listener error: {}", e);
             }
         });
@@ -3555,6 +3561,10 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             })
             .collect();
 
+        let affinity_tracker = std::sync::Arc::new(std::sync::RwLock::new(
+            moon::shard::affinity::AffinityTracker::new(),
+        ));
+
         // Spawn shard threads
         let mut shard_handles = Vec::with_capacity(num_shards);
         for id in 0..num_shards {
@@ -3568,6 +3578,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
             let shard_all_notifiers = all_notifiers.clone();
             let shard_pubsub_regs = all_pubsub_registries.clone();
             let shard_remote_sub_maps = all_remote_sub_maps.clone();
+            let shard_affinity = affinity_tracker.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("test-cluster-shard-{}", id))
@@ -3613,6 +3624,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                         shard_all_notifiers,
                         shard_pubsub_regs,
                         shard_remote_sub_maps,
+                        shard_affinity,
                     )));
                 })
                 .expect("failed to spawn shard thread");
@@ -3627,7 +3639,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
 
         let listener_cancel = cancel.clone();
         listener_rt.block_on(async {
-            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, false).await {
+            if let Err(e) = listener::run_sharded(config, conn_txs, listener_cancel, affinity_tracker).await {
                 eprintln!("Listener error: {}", e);
             }
         });
