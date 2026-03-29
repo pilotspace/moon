@@ -5,5 +5,7 @@
 //! at <= 0.009 MSE distortion for unit vectors (Theorem 1).
 
 pub mod codebook;
+pub mod collection;
 pub mod encoder;
 pub mod fwht;
+pub mod tq_adc;
