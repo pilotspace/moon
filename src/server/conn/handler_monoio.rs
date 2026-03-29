@@ -1384,6 +1384,23 @@ pub async fn handle_connection_sharded_monoio<
                     }
 
                     drop(guard);
+
+                    // Track key on write / invalidate tracked keys
+                    if tracking_state.enabled && !matches!(response, Frame::Error(_)) {
+                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                            let senders =
+                                tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                            if !senders.is_empty() {
+                                let push =
+                                    crate::tracking::invalidation::invalidation_push(&[key]);
+                                for tx in senders {
+                                    let _ = tx.try_send(push.clone());
+                                }
+                            }
+                        }
+                    }
+                    let response = apply_resp3_conversion(cmd, response, protocol_version);
+                    responses.push(response);
                 } else {
                     // READ PATH: shared lock — no contention with other shards' reads
                     let guard = shard_databases.read_db(shard_id, selected_db);
