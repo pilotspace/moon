@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+
+use atomic_waker::AtomicWaker;
 use bytes::Bytes;
 use xxhash_rust::xxh64::xxh64;
 
@@ -17,6 +20,118 @@ pub struct ResponseSlotPtr(pub *const ResponseSlot);
 // The pointer remains valid for the lifetime of the connection's ResponseSlotPool,
 // which outlives all dispatched ShardMessage values.
 unsafe impl Send for ResponseSlotPtr {}
+
+/// Lock-free response slot for accumulating cross-shard PUBLISH subscriber counts.
+///
+/// Instead of N-1 oneshot channels (one per target shard), a single `Arc<PubSubResponseSlot>`
+/// is shared. Each shard atomically adds its local subscriber count. The connection handler
+/// awaits a `PubSubResponseFuture` that wakes properly when the last shard responds,
+/// eliminating the previous spin-yield polling.
+pub struct PubSubResponseSlot {
+    /// Accumulated subscriber count from all remote shards.
+    total: AtomicI64,
+    /// Number of shards that haven't responded yet.
+    remaining: AtomicU32,
+    /// Wakes the connection handler when the last shard responds.
+    waker: AtomicWaker,
+    /// Per-pair subscriber counts for batched PUBLISH.
+    /// Written by the SPSC handler, read by the connection handler after `is_ready()`.
+    /// Empty for single-PUBLISH slots (no batch).
+    pub counts: Vec<AtomicI64>,
+}
+
+impl PubSubResponseSlot {
+    /// Create a new slot expecting `num_pending` shard responses.
+    pub fn new(num_pending: u32) -> Self {
+        Self {
+            total: AtomicI64::new(0),
+            remaining: AtomicU32::new(num_pending),
+            waker: AtomicWaker::new(),
+            counts: Vec::new(),
+        }
+    }
+
+    /// Create a new slot with per-pair count tracking for batched PUBLISH.
+    pub fn with_counts(num_pending: u32, num_pairs: usize) -> Self {
+        Self {
+            total: AtomicI64::new(0),
+            remaining: AtomicU32::new(num_pending),
+            waker: AtomicWaker::new(),
+            counts: (0..num_pairs).map(|_| AtomicI64::new(0)).collect(),
+        }
+    }
+
+    /// Called by SPSC handler: add this shard's subscriber count and decrement remaining.
+    /// Wakes the connection handler when the last shard responds.
+    #[inline]
+    pub fn add(&self, count: i64) {
+        self.total.fetch_add(count, Ordering::Relaxed);
+        let prev = self.remaining.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            // This was the last shard -- wake the connection handler
+            self.waker.wake();
+        }
+    }
+
+    /// Called by connection handler: check if all shards have responded.
+    #[inline]
+    pub fn is_ready(&self) -> bool {
+        self.remaining.load(Ordering::Acquire) == 0
+    }
+
+    /// Called by connection handler after `is_ready()` returns true: get the accumulated total.
+    ///
+    /// Uses Relaxed ordering because the Acquire load on `remaining` in `is_ready()`/`poll_ready()`
+    /// already establishes happens-before with the Release store in `add()`, ensuring all
+    /// prior `total.fetch_add(Relaxed)` writes are visible.
+    #[inline]
+    pub fn get(&self) -> i64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Poll for readiness, registering the waker for notification.
+    ///
+    /// Uses Relaxed ordering on `total.load()` after the Acquire load on `remaining` confirms
+    /// all shards have responded. The Acquire/Release pair on `remaining` provides the
+    /// necessary happens-before guarantee for all prior `total.fetch_add(Relaxed)` stores.
+    #[inline]
+    pub fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        // Fast path: already complete
+        if self.remaining.load(Ordering::Acquire) == 0 {
+            return std::task::Poll::Ready(self.total.load(Ordering::Relaxed));
+        }
+        // Register waker before re-checking (avoids missed wake race)
+        self.waker.register(cx.waker());
+        // Re-check after registration
+        if self.remaining.load(Ordering::Acquire) == 0 {
+            return std::task::Poll::Ready(self.total.load(Ordering::Relaxed));
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// Future that resolves when all shards have responded to a PUBLISH.
+/// Returns the accumulated subscriber count.
+pub struct PubSubResponseFuture {
+    slot: std::sync::Arc<PubSubResponseSlot>,
+}
+
+impl PubSubResponseFuture {
+    pub fn new(slot: std::sync::Arc<PubSubResponseSlot>) -> Self {
+        Self { slot }
+    }
+}
+
+impl std::future::Future for PubSubResponseFuture {
+    type Output = i64;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<i64> {
+        self.slot.poll_ready(cx)
+    }
+}
 
 const HASH_SEED: u64 = 0;
 
@@ -70,8 +185,6 @@ pub enum ShardMessage {
         commands: Vec<std::sync::Arc<Frame>>,
         reply_tx: channel::OneshotSender<Vec<Frame>>,
     },
-    /// Publish a message to local subscribers on this shard.
-    PubSubFanOut { channel: Bytes, message: Bytes },
     /// Begin a cooperative snapshot at the given epoch.
     /// Shard creates SnapshotState and advances one segment per tick.
     /// Sends reply when snapshot is complete.
@@ -143,6 +256,20 @@ pub enum ShardMessage {
         commands: Vec<std::sync::Arc<Frame>>,
         response_slot: ResponseSlotPtr,
     },
+    /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
+    PubSubPublish {
+        channel: Bytes,
+        message: Bytes,
+        slot: std::sync::Arc<PubSubResponseSlot>,
+    },
+    /// Batched cross-shard PUBLISH for pipeline efficiency.
+    /// Multiple (channel, message) pairs destined for the same shard, sharing one ResponseSlot.
+    /// Each pair's subscriber count is accumulated into the slot's `counts` field, and the
+    /// batch total is accumulated into the slot's `total`.
+    PubSubPublishBatch {
+        pairs: Vec<(Bytes, Bytes)>,
+        slot: std::sync::Arc<PubSubResponseSlot>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }
@@ -155,6 +282,7 @@ pub enum ShardMessage {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     #[test]
     fn test_key_to_shard_deterministic() {
@@ -224,5 +352,55 @@ mod tests {
         assert_eq!(key_to_shard(b"any_key", 1), 0);
         assert_eq!(key_to_shard(b"another_key", 1), 0);
         assert_eq!(key_to_shard(b"{tag}.key", 1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_slot_waker() {
+        let slot = Arc::new(PubSubResponseSlot::new(1));
+        let slot2 = slot.clone();
+
+        // Spawn a task that adds to the slot after a short delay
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            slot2.add(42);
+        });
+
+        // Await the future -- should wake properly when add() is called
+        let result = PubSubResponseFuture::new(slot).await;
+        assert_eq!(result, 42);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_slot_multiple_shards() {
+        let slot = Arc::new(PubSubResponseSlot::new(3));
+
+        // Spawn 3 tasks that each add a subscriber count
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let slot = slot.clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    slot.add(10 + i);
+                })
+            })
+            .collect();
+
+        // Await the future -- should resolve with the sum of all 3 adds
+        let result = PubSubResponseFuture::new(slot).await;
+        // 10 + 11 + 12 = 33
+        assert_eq!(result, 33);
+
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_slot_already_ready() {
+        // Slot with 0 pending should resolve immediately
+        let slot = Arc::new(PubSubResponseSlot::new(0));
+        let result = PubSubResponseFuture::new(slot).await;
+        assert_eq!(result, 0);
     }
 }

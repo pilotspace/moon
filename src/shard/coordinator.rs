@@ -411,8 +411,10 @@ async fn coordinate_multi_del_or_exists(
         match reply_rx.recv().await {
             Ok(frames) => {
                 for frame in frames {
-                    if let Frame::Integer(n) = frame {
-                        total_count += n;
+                    match frame {
+                        Frame::Integer(n) => total_count += n,
+                        Frame::Error(_) => return frame,
+                        _ => {}
                     }
                 }
             }

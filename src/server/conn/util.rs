@@ -56,3 +56,50 @@ pub(crate) fn apply_resp3_conversion(cmd: &[u8], response: Frame, proto: u8) -> 
     cmd_upper_buf[..cmd_upper_len].make_ascii_uppercase();
     crate::protocol::resp3::maybe_convert_resp3(&cmd_upper_buf[..cmd_upper_len], response, proto)
 }
+
+/// Propagate a subscription (or pattern subscription) to all remote shards' subscriber maps.
+///
+/// Called after subscribing locally to ensure remote shards know to forward published
+/// messages to this shard. Acquires each shard's RemoteSubscriberMap write lock
+/// individually (no nested locks).
+pub(crate) fn propagate_subscription(
+    all_remote_sub_maps: &[std::sync::Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >],
+    channel: &Bytes,
+    shard_id: usize,
+    num_shards: usize,
+    is_pattern: bool,
+) {
+    for target in 0..num_shards {
+        if target == shard_id {
+            continue;
+        }
+        all_remote_sub_maps[target]
+            .write()
+            .add(channel.clone(), shard_id, is_pattern);
+    }
+}
+
+/// Remove a subscription (or pattern subscription) from all remote shards' subscriber maps.
+///
+/// Called after unsubscribing locally. Acquires each shard's RemoteSubscriberMap write lock
+/// individually (no nested locks).
+pub(crate) fn unpropagate_subscription(
+    all_remote_sub_maps: &[std::sync::Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >],
+    channel: &Bytes,
+    shard_id: usize,
+    num_shards: usize,
+    is_pattern: bool,
+) {
+    for target in 0..num_shards {
+        if target == shard_id {
+            continue;
+        }
+        all_remote_sub_maps[target]
+            .write()
+            .remove(channel, shard_id, is_pattern);
+    }
+}

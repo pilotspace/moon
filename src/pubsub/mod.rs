@@ -149,6 +149,38 @@ impl PubSubRegistry {
         count
     }
 
+    /// List active channels, optionally filtered by glob pattern.
+    pub fn active_channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
+        self.channels
+            .keys()
+            .filter(|ch| match pattern {
+                Some(pat) => crate::command::key::glob_match(pat, ch),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return subscriber counts for specific channels.
+    pub fn numsub(&self, channels: &[Bytes]) -> Vec<(Bytes, i64)> {
+        channels
+            .iter()
+            .map(|ch| {
+                let count = self
+                    .channels
+                    .get(ch)
+                    .map(|subs| subs.len() as i64)
+                    .unwrap_or(0);
+                (ch.clone(), count)
+            })
+            .collect()
+    }
+
+    /// Return total number of pattern subscriptions across all patterns.
+    pub fn numpat(&self) -> usize {
+        self.patterns.iter().map(|(_, subs)| subs.len()).sum()
+    }
+
     /// Count channels this subscriber is subscribed to.
     pub fn channel_subscription_count(&self, sub_id: u64) -> usize {
         self.channels
@@ -341,6 +373,73 @@ mod tests {
         let removed = registry.unsubscribe_all(1);
         assert_eq!(removed.len(), 2);
         assert_eq!(registry.channel_subscription_count(1), 0);
+    }
+
+    #[test]
+    fn test_active_channels_no_filter() {
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.subscribe(Bytes::from_static(b"news"), Subscriber::new(tx.clone(), 1));
+        registry.subscribe(
+            Bytes::from_static(b"sports"),
+            Subscriber::new(tx.clone(), 2),
+        );
+        registry.subscribe(Bytes::from_static(b"weather"), Subscriber::new(tx, 3));
+
+        let mut channels = registry.active_channels(None);
+        channels.sort();
+        assert_eq!(channels.len(), 3);
+        assert!(channels.contains(&Bytes::from_static(b"news")));
+        assert!(channels.contains(&Bytes::from_static(b"sports")));
+        assert!(channels.contains(&Bytes::from_static(b"weather")));
+    }
+
+    #[test]
+    fn test_active_channels_with_glob() {
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.subscribe(
+            Bytes::from_static(b"news.a"),
+            Subscriber::new(tx.clone(), 1),
+        );
+        registry.subscribe(
+            Bytes::from_static(b"news.b"),
+            Subscriber::new(tx.clone(), 2),
+        );
+        registry.subscribe(Bytes::from_static(b"sports"), Subscriber::new(tx, 3));
+
+        let channels = registry.active_channels(Some(b"news.*"));
+        assert_eq!(channels.len(), 2);
+        assert!(channels.contains(&Bytes::from_static(b"news.a")));
+        assert!(channels.contains(&Bytes::from_static(b"news.b")));
+    }
+
+    #[test]
+    fn test_numsub() {
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.subscribe(Bytes::from_static(b"ch1"), Subscriber::new(tx.clone(), 1));
+        registry.subscribe(Bytes::from_static(b"ch1"), Subscriber::new(tx.clone(), 2));
+        registry.subscribe(Bytes::from_static(b"ch2"), Subscriber::new(tx, 3));
+
+        let result = registry.numsub(&[
+            Bytes::from_static(b"ch1"),
+            Bytes::from_static(b"ch2"),
+            Bytes::from_static(b"ch3"),
+        ]);
+        assert_eq!(result[0], (Bytes::from_static(b"ch1"), 2));
+        assert_eq!(result[1], (Bytes::from_static(b"ch2"), 1));
+        assert_eq!(result[2], (Bytes::from_static(b"ch3"), 0));
+    }
+
+    #[test]
+    fn test_numpat() {
+        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.psubscribe(Bytes::from_static(b"a.*"), Subscriber::new(tx.clone(), 1));
+        registry.psubscribe(Bytes::from_static(b"b.*"), Subscriber::new(tx, 2));
+
+        assert_eq!(registry.numpat(), 2);
     }
 
     #[test]

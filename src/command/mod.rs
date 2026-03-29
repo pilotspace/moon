@@ -636,6 +636,52 @@ fn err_unknown(cmd: &[u8]) -> Frame {
 /// Takes `&Database` (immutable) and `now_ms` for expiry checks.
 /// Only called for commands where `metadata::is_read()` returns true.
 /// Uses (length, first_byte) dispatch for O(1) lookup.
+/// Check whether a command is supported by the shared-read dispatch path.
+///
+/// Returns `true` for all commands handled by `dispatch_read()`. Uses the same
+/// `(len, b0)` two-level dispatch pattern for O(1) lookup. This guard is used
+/// to avoid acquiring a read lock on the shared database when the command would
+/// just fall through to the unknown-command error.
+pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
+    let len = cmd.len();
+    if len == 0 {
+        return false;
+    }
+    let b0 = cmd[0] | 0x20;
+    matches!(
+        (len, b0),
+        (3, b'g')  // GET
+        | (3, b't')  // TTL
+        | (4, b'e')  // ECHO
+        | (4, b'h')  // HGET, HLEN
+        | (4, b'i')  // INFO
+        | (4, b'k')  // KEYS
+        | (4, b'l')  // LLEN, LPOS
+        | (4, b'm')  // MGET
+        | (4, b'p')  // PTTL, PING
+        | (4, b's')  // SCAN
+        | (4, b't')  // TYPE
+        | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
+        | (5, b's')  // SCARD, SDIFF, SSCAN
+        | (5, b'z')  // ZCARD, ZRANK, ZSCAN
+        | (6, b'e')  // EXISTS
+        | (6, b'l')  // LRANGE, LINDEX
+        | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
+        | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
+        | (7, b'c')  // COMMAND
+        | (7, b'h')  // HGETALL, HEXISTS
+        | (8, b'g')  // GETRANGE
+        | (8, b's')  // SMEMBERS
+        | (8, b'z')  // ZREVRANK
+        | (9, b's')  // SISMEMBER
+        | (9, b'z')  // ZREVRANGE, ZLEXCOUNT
+        | (10, b's') // SMISMEMBER
+        | (11, b's') // SRANDMEMBER
+        | (13, b'z') // ZRANGEBYSCORE
+        | (16, b'z') // ZREVRANGEBYSCORE
+    )
+}
+
 pub fn dispatch_read(
     db: &Database,
     cmd: &[u8],

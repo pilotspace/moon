@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use ringbuf::HeapProd;
@@ -21,8 +21,14 @@ use crate::server::conn::affinity::MigratedConnectionState;
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
+use super::affinity::AffinityTracker;
 use super::dispatch::ShardMessage;
+use super::remote_subscriber_map::RemoteSubscriberMap;
 use super::shared_databases::ShardDatabases;
+
+/// Type alias to distinguish pre-existing std::sync::RwLock (for ACL, runtime config, etc.)
+/// from parking_lot::RwLock (used for pubsub types).
+type StdRwLock<T> = std::sync::RwLock<T>;
 
 /// Create a SO_REUSEPORT TCP listener socket using socket2.
 ///
@@ -74,21 +80,25 @@ pub(crate) fn spawn_tokio_connection(
     tls_config: &Option<Arc<rustls::ServerConfig>>,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: &Option<Arc<StdRwLock<ReplicationState>>>,
+    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<parking_lot::RwLock<RemoteSubscriberMap>>],
+    affinity_tracker: &Arc<parking_lot::RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -96,9 +106,11 @@ pub(crate) fn spawn_tokio_connection(
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
 
+    let aff = affinity_tracker.clone();
+    let rsm = remote_subscriber_map.clone();
     let sdbs = shard_databases.clone();
     let dtx = dispatch_tx.clone();
-    let psr = pubsub_rc.clone();
+    let psr = pubsub_arc.clone();
     let blk = blocking_rc.clone();
     let sd = shutdown.clone();
     let aof = aof_tx.clone();
@@ -121,6 +133,8 @@ pub(crate) fn spawn_tokio_connection(
     let scfg = server_config.clone();
     let notifiers = all_notifiers.to_vec();
     let snap_tx = snapshot_trigger_tx.clone();
+    let all_regs = all_pubsub_registries.to_vec();
+    let all_rsm = all_remote_sub_maps.to_vec();
     // Fail closed: if the config lock is poisoned, treat as requiring auth
     // (deny by default) rather than silently disabling authentication.
     let reqpass = match rtcfg.read() {
@@ -171,6 +185,10 @@ pub(crate) fn spawn_tokio_connection(
                         notifiers,
                         snap_tx,
                         clk,
+                        rsm,
+                        all_regs,
+                        all_rsm,
+                        aff,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
@@ -187,7 +205,8 @@ pub(crate) fn spawn_tokio_connection(
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
                 tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk,
+                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm, all_regs,
+                all_rsm, aff,
             )
             .await;
         });
@@ -216,21 +235,25 @@ pub(crate) fn spawn_migrated_tokio_connection(
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: &Option<Arc<StdRwLock<ReplicationState>>>,
+    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<parking_lot::RwLock<RemoteSubscriberMap>>],
+    affinity_tracker: &Arc<parking_lot::RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -253,9 +276,13 @@ pub(crate) fn spawn_migrated_tokio_connection(
     match tokio::net::TcpStream::from_std(std_stream) {
         Ok(tcp_stream) => {
             // Clone shared state (same pattern as spawn_tokio_connection)
+            let rsm = remote_subscriber_map.clone();
+            let all_regs = all_pubsub_registries.to_vec();
+            let all_rsm = all_remote_sub_maps.to_vec();
+            let aff = affinity_tracker.clone();
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
-            let psr = pubsub_rc.clone();
+            let psr = pubsub_arc.clone();
             let blk = blocking_rc.clone();
             let sd = shutdown.clone();
             let aof = aof_tx.clone();
@@ -312,6 +339,10 @@ pub(crate) fn spawn_migrated_tokio_connection(
                     notifiers,
                     snap_tx,
                     clk,
+                    rsm,
+                    all_regs,
+                    all_rsm,
+                    aff,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     Some(&state),
@@ -337,21 +368,25 @@ pub(crate) fn spawn_monoio_connection(
     tls_config: &Option<Arc<rustls::ServerConfig>>,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: &Option<Arc<StdRwLock<ReplicationState>>>,
+    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<parking_lot::RwLock<RemoteSubscriberMap>>],
+    affinity_tracker: &Arc<parking_lot::RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -361,9 +396,11 @@ pub(crate) fn spawn_monoio_connection(
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
+            let aff = affinity_tracker.clone();
+            let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
-            let psr = pubsub_rc.clone();
+            let psr = pubsub_arc.clone();
             let blk = blocking_rc.clone();
             let sd = shutdown.clone();
             let aof = aof_tx.clone();
@@ -389,6 +426,8 @@ pub(crate) fn spawn_monoio_connection(
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
             let pw = pending_wakers.clone();
+            let all_regs = all_pubsub_registries.to_vec();
+            let all_rsm = all_remote_sub_maps.to_vec();
 
             let peer_addr = tcp_stream
                 .peer_addr()
@@ -431,6 +470,10 @@ pub(crate) fn spawn_monoio_connection(
                                 notifiers,
                                 snap_tx,
                                 clk,
+                                rsm,
+                                all_regs,
+                                all_rsm,
+                                aff,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
@@ -483,6 +526,10 @@ pub(crate) fn spawn_monoio_connection(
                         notifiers,
                         snap_tx,
                         clk,
+                        rsm,
+                        all_regs,
+                        all_rsm,
+                        aff,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
@@ -560,21 +607,25 @@ pub(crate) fn spawn_migrated_monoio_connection(
     mut state: MigratedConnectionState,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_rc: &Rc<RefCell<PubSubRegistry>>,
+    pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
-    cluster_state: &Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: &Option<Arc<StdRwLock<ReplicationState>>>,
+    cluster_state: &Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     cached_clock: &CachedClock,
+    remote_subscriber_map: &Arc<parking_lot::RwLock<RemoteSubscriberMap>>,
+    all_pubsub_registries: &[Arc<parking_lot::RwLock<PubSubRegistry>>],
+    all_remote_sub_maps: &[Arc<parking_lot::RwLock<RemoteSubscriberMap>>],
+    pubsub_affinity: &Arc<parking_lot::RwLock<AffinityTracker>>,
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
@@ -599,7 +650,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
         Ok(tcp_stream) => {
             let sdbs = shard_databases.clone();
             let dtx = dispatch_tx.clone();
-            let psr = pubsub_rc.clone();
+            let psr = pubsub_arc.clone();
             let blk = blocking_rc.clone();
             let sd = shutdown.clone();
             let aof = aof_tx.clone();
@@ -624,6 +675,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let notifiers = all_notifiers.to_vec();
             let snap_tx = snapshot_trigger_tx.clone();
             let clk = cached_clock.clone();
+            let rsm = remote_subscriber_map.clone();
+            let all_regs = all_pubsub_registries.to_vec();
+            let all_rsm = all_remote_sub_maps.to_vec();
+            let aff = pubsub_affinity.clone();
             let pw = pending_wakers.clone();
             let peer_addr = state.peer_addr.clone();
 
@@ -655,6 +710,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     notifiers,
                     snap_tx,
                     clk,
+                    rsm,
+                    all_regs,
+                    all_rsm,
+                    aff,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     pw,
