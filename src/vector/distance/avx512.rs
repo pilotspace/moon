@@ -253,7 +253,7 @@ mod tests {
         let mut s = seed;
         for _ in 0..len {
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            v.push(((s >> 24) as i8));
+            v.push((s >> 24) as i8);
         }
         v
     }
