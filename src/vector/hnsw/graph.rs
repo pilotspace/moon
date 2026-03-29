@@ -48,6 +48,8 @@ pub struct HnswGraph {
     upper_layers: Vec<SmallVec<[u32; 32]>>,
 
     /// Node levels: levels[original_id] = level for that node.
+    /// Used during search to determine which layers a node participates in.
+    #[allow(dead_code)]
     levels: Vec<u8>,
 
     /// Bytes per TQ code (padded_dim / 2 + 4 for norm as f32).
@@ -173,7 +175,7 @@ impl HnswGraph {
     /// Prefetches 2 cache lines of neighbors (128 bytes = 32 u32s at M0=32)
     /// and 3 cache lines of TQ code data (~192 bytes covers 512-byte TQ code start).
     #[inline(always)]
-    pub fn prefetch_node(&self, bfs_pos: u32, vectors_tq: &[u8]) {
+    pub fn prefetch_node(&self, bfs_pos: u32, _vectors_tq: &[u8]) {
         let neighbor_offset = bfs_pos as usize * self.m0 as usize;
         let vector_offset = bfs_pos as usize * self.bytes_per_code as usize;
 
@@ -181,7 +183,7 @@ impl HnswGraph {
         {
             use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             let nptr = self.layer0_neighbors.as_ptr();
-            let vptr = vectors_tq.as_ptr();
+            let vptr = _vectors_tq.as_ptr();
             // SAFETY: prefetch is an architectural hint on x86_64. Out-of-bounds
             // prefetch addresses do not fault -- the CPU silently ignores them.
             // No memory is read or written; only the cache hierarchy is hinted.
