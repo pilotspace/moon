@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
+use atomic_waker::AtomicWaker;
 use bytes::Bytes;
 use xxhash_rust::xxh64::xxh64;
 
@@ -24,12 +25,15 @@ unsafe impl Send for ResponseSlotPtr {}
 ///
 /// Instead of N-1 oneshot channels (one per target shard), a single `Arc<PubSubResponseSlot>`
 /// is shared. Each shard atomically adds its local subscriber count. The connection handler
-/// spins on `remaining` reaching zero, then reads the total.
+/// awaits a `PubSubResponseFuture` that wakes properly when the last shard responds,
+/// eliminating the previous spin-yield polling.
 pub struct PubSubResponseSlot {
     /// Accumulated subscriber count from all remote shards.
     total: AtomicI64,
     /// Number of shards that haven't responded yet.
     remaining: AtomicU32,
+    /// Wakes the connection handler when the last shard responds.
+    waker: AtomicWaker,
 }
 
 impl PubSubResponseSlot {
@@ -38,14 +42,20 @@ impl PubSubResponseSlot {
         Self {
             total: AtomicI64::new(0),
             remaining: AtomicU32::new(num_pending),
+            waker: AtomicWaker::new(),
         }
     }
 
     /// Called by SPSC handler: add this shard's subscriber count and decrement remaining.
+    /// Wakes the connection handler when the last shard responds.
     #[inline]
     pub fn add(&self, count: i64) {
         self.total.fetch_add(count, Ordering::Relaxed);
-        self.remaining.fetch_sub(1, Ordering::Release);
+        let prev = self.remaining.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            // This was the last shard -- wake the connection handler
+            self.waker.wake();
+        }
     }
 
     /// Called by connection handler: check if all shards have responded.
@@ -58,6 +68,42 @@ impl PubSubResponseSlot {
     #[inline]
     pub fn get(&self) -> i64 {
         self.total.load(Ordering::Relaxed)
+    }
+
+    /// Poll for readiness, registering the waker for notification.
+    #[inline]
+    pub fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        // Fast path: already complete
+        if self.remaining.load(Ordering::Acquire) == 0 {
+            return std::task::Poll::Ready(self.total.load(Ordering::Relaxed));
+        }
+        // Register waker before re-checking (avoids missed wake race)
+        self.waker.register(cx.waker());
+        // Re-check after registration
+        if self.remaining.load(Ordering::Acquire) == 0 {
+            return std::task::Poll::Ready(self.total.load(Ordering::Relaxed));
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// Future that resolves when all shards have responded to a PUBLISH.
+/// Returns the accumulated subscriber count.
+pub struct PubSubResponseFuture {
+    slot: std::sync::Arc<PubSubResponseSlot>,
+}
+
+impl PubSubResponseFuture {
+    pub fn new(slot: std::sync::Arc<PubSubResponseSlot>) -> Self {
+        Self { slot }
+    }
+}
+
+impl std::future::Future for PubSubResponseFuture {
+    type Output = i64;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        self.slot.poll_ready(cx)
     }
 }
 
@@ -215,6 +261,7 @@ pub enum ShardMessage {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     #[test]
     fn test_key_to_shard_deterministic() {
@@ -284,5 +331,55 @@ mod tests {
         assert_eq!(key_to_shard(b"any_key", 1), 0);
         assert_eq!(key_to_shard(b"another_key", 1), 0);
         assert_eq!(key_to_shard(b"{tag}.key", 1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_slot_waker() {
+        let slot = Arc::new(PubSubResponseSlot::new(1));
+        let slot2 = slot.clone();
+
+        // Spawn a task that adds to the slot after a short delay
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            slot2.add(42);
+        });
+
+        // Await the future -- should wake properly when add() is called
+        let result = PubSubResponseFuture::new(slot).await;
+        assert_eq!(result, 42);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_slot_multiple_shards() {
+        let slot = Arc::new(PubSubResponseSlot::new(3));
+
+        // Spawn 3 tasks that each add a subscriber count
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let slot = slot.clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    slot.add(10 + i);
+                })
+            })
+            .collect();
+
+        // Await the future -- should resolve with the sum of all 3 adds
+        let result = PubSubResponseFuture::new(slot).await;
+        // 10 + 11 + 12 = 33
+        assert_eq!(result, 33);
+
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_slot_already_ready() {
+        // Slot with 0 pending should resolve immediately
+        let slot = Arc::new(PubSubResponseSlot::new(0));
+        let result = PubSubResponseFuture::new(slot).await;
+        assert_eq!(result, 0);
     }
 }
