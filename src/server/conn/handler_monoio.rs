@@ -32,7 +32,7 @@ use super::affinity::{AffinityTracker, MigratedConnectionState};
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
-    handle_config, is_multi_key_command, try_inline_dispatch_loop,
+    handle_config, is_multi_key_command, restore_migrated_state, try_inline_dispatch_loop,
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
@@ -111,14 +111,14 @@ pub async fn handle_connection_sharded_monoio<
     };
     let mut write_buf = BytesMut::with_capacity(8192);
     let mut codec = RespCodec::default();
-    let mut selected_db: usize = migrated_state.map_or(0, |s| s.selected_db);
+    let (
+        mut protocol_version,
+        mut selected_db,
+        mut authenticated,
+        mut current_user,
+        client_name_restored,
+    ) = restore_migrated_state(migrated_state, &requirepass);
     let db_count = shard_databases.db_count();
-
-    // Connection-level state — restored from migration or defaults for fresh connections.
-    let mut protocol_version: u8 = migrated_state.map_or(2, |s| s.protocol_version);
-    let mut authenticated = migrated_state.map_or(requirepass.is_none(), |s| s.authenticated);
-    let mut current_user: String =
-        migrated_state.map_or_else(|| "default".to_string(), |s| s.current_user.clone());
     let acl_max_len = runtime_config
         .read()
         .map(|cfg| cfg.acllog_max_len)
@@ -126,7 +126,7 @@ pub async fn handle_connection_sharded_monoio<
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
-    let mut client_name: Option<Bytes> = migrated_state.and_then(|s| s.client_name.clone());
+    let mut client_name: Option<Bytes> = client_name_restored;
     let mut asking: bool = false;
 
     // Pub/Sub connection-local state

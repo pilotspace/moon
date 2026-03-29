@@ -26,7 +26,9 @@ pub(crate) use shared::{SharedDatabases, execute_transaction};
 pub(crate) use shared::{
     execute_transaction_sharded, extract_primary_key, handle_config, is_multi_key_command,
 };
-pub(crate) use util::{apply_resp3_conversion, extract_bytes, extract_command};
+pub(crate) use util::{
+    apply_resp3_conversion, extract_bytes, extract_command, restore_migrated_state,
+};
 
 // Re-export handler functions at the module level so external callers
 // can use crate::server::conn::{handle_connection_sharded, ...}

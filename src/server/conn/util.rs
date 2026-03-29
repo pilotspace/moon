@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+use super::affinity::MigratedConnectionState;
 use crate::protocol::Frame;
 
 /// Extract command name (as raw byte slice reference) and args from a Frame::Array.
@@ -24,6 +25,22 @@ pub(crate) fn extract_bytes(frame: &Frame) -> Option<Bytes> {
         Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.clone()),
         _ => None,
     }
+}
+
+/// Restore connection state from migration, or use defaults for fresh connections.
+///
+/// Returns (protocol_version, selected_db, authenticated, current_user, client_name).
+pub(crate) fn restore_migrated_state(
+    migrated: Option<&MigratedConnectionState>,
+    requirepass: &Option<String>,
+) -> (u8, usize, bool, String, Option<Bytes>) {
+    (
+        migrated.map_or(2, |s| s.protocol_version),
+        migrated.map_or(0, |s| s.selected_db),
+        migrated.map_or(requirepass.is_none(), |s| s.authenticated),
+        migrated.map_or_else(|| "default".to_string(), |s| s.current_user.clone()),
+        migrated.and_then(|s| s.client_name.clone()),
+    )
 }
 
 /// Apply RESP3 response type conversion based on command name and protocol version.
