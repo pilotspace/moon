@@ -4,6 +4,7 @@
 //! [`table()`] to get the static `DistanceTable` with the best available
 //! kernel for the current CPU.
 
+pub mod fastscan;
 pub mod scalar;
 
 #[cfg(target_arch = "x86_64")]
@@ -46,6 +47,8 @@ static DISTANCE_TABLE: OnceLock<DistanceTable> = OnceLock::new();
 pub fn init() {
     // Initialize FWHT dispatch alongside distance dispatch.
     crate::vector::turbo_quant::fwht::init_fwht();
+    // Initialize FastScan dispatch (AVX2 VPSHUFB or scalar fallback).
+    fastscan::init_fastscan();
 
     DISTANCE_TABLE.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
