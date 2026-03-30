@@ -91,6 +91,101 @@ pub const BOUNDARIES: [f32; 15] = [
      0.045_762,  0.059_190_5,  0.076_583,
 ];
 
+// ── 1-bit Lloyd-Max codebook for N(0,1) ──────────────────────────────
+
+/// 1-bit (2 centroids): +/- sqrt(2/pi) for N(0,1).
+pub const RAW_CENTROIDS_1BIT: [f32; 2] = [-0.7979, 0.7979];
+
+/// 1-bit boundary: single threshold at zero.
+pub const RAW_BOUNDARIES_1BIT: [f32; 1] = [0.0];
+
+// ── 2-bit Lloyd-Max codebook for N(0,1) ──────────────────────────────
+
+/// 2-bit (4 centroids): Lloyd-Max optimal for N(0,1) with 4 levels.
+pub const RAW_CENTROIDS_2BIT: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+
+/// 2-bit boundaries: midpoints between adjacent 2-bit centroids.
+pub const RAW_BOUNDARIES_2BIT: [f32; 3] = [-0.9816, 0.0, 0.9816];
+
+// ── 3-bit Lloyd-Max codebook for N(0,1) ──────────────────────────────
+
+/// 3-bit (8 centroids): Lloyd-Max optimal for N(0,1) with 8 levels.
+pub const RAW_CENTROIDS_3BIT: [f32; 8] = [
+    -2.1520, -1.3440, -0.7560, -0.2451,
+     0.2451,  0.7560,  1.3440,  2.1520,
+];
+
+/// 3-bit boundaries: midpoints between adjacent 3-bit centroids.
+pub const RAW_BOUNDARIES_3BIT: [f32; 7] = [
+    -1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480,
+];
+
+/// Compute dimension-scaled centroids for any bit width (1-4).
+///
+/// Returns a Vec because the size varies by bit width.
+/// sigma = 1/sqrt(padded_dim), matching FWHT normalization.
+pub fn scaled_centroids_n(padded_dim: u32, bits: u8) -> Vec<f32> {
+    let sigma = 1.0 / (padded_dim as f32).sqrt();
+    match bits {
+        1 => RAW_CENTROIDS_1BIT.iter().map(|&c| c * sigma).collect(),
+        2 => RAW_CENTROIDS_2BIT.iter().map(|&c| c * sigma).collect(),
+        3 => RAW_CENTROIDS_3BIT.iter().map(|&c| c * sigma).collect(),
+        4 => {
+            let sc = scaled_centroids(padded_dim);
+            sc.to_vec()
+        }
+        _ => panic!("unsupported bit width: {bits}"),
+    }
+}
+
+/// Compute dimension-scaled boundaries for any bit width (1-4).
+pub fn scaled_boundaries_n(padded_dim: u32, bits: u8) -> Vec<f32> {
+    let sigma = 1.0 / (padded_dim as f32).sqrt();
+    match bits {
+        1 => RAW_BOUNDARIES_1BIT.iter().map(|&b| b * sigma).collect(),
+        2 => RAW_BOUNDARIES_2BIT.iter().map(|&b| b * sigma).collect(),
+        3 => RAW_BOUNDARIES_3BIT.iter().map(|&b| b * sigma).collect(),
+        4 => {
+            let sb = scaled_boundaries(padded_dim);
+            sb.to_vec()
+        }
+        _ => panic!("unsupported bit width: {bits}"),
+    }
+}
+
+/// Generic quantizer for any bit width. Scans boundaries linearly.
+///
+/// For 1-bit this is equivalent to `if val >= 0.0 { 1 } else { 0 }`.
+#[inline]
+pub fn quantize_with_boundaries_n(val: f32, boundaries: &[f32], n_centroids: u8) -> u8 {
+    let _ = n_centroids; // used for debug_assert below
+    debug_assert_eq!(boundaries.len(), (n_centroids - 1) as usize);
+    let mut idx = 0u8;
+    for &b in boundaries.iter() {
+        if val >= b {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/// Compute packed code size in bytes for a given dimension and bit width.
+///
+/// 1-bit: pdim/8, 2-bit: pdim/4, 3-bit: (pdim*3+7)/8, 4-bit: pdim/2.
+#[inline]
+pub fn code_bytes_per_vector(padded_dim: u32, bits: u8) -> usize {
+    let pd = padded_dim as usize;
+    match bits {
+        1 => pd / 8,
+        2 => pd / 4,
+        3 => (pd * 3 + 7) / 8,
+        4 => pd / 2,
+        _ => panic!("unsupported bit width: {bits}"),
+    }
+}
+
 /// Quantize a single f32 value using LEGACY boundaries (1/sqrt(768) scaling).
 /// DEPRECATED: Use `quantize_with_boundaries` for dimension-adaptive quantization.
 #[inline]
@@ -204,5 +299,122 @@ mod tests {
     #[test]
     fn test_codebook_version() {
         assert_eq!(CODEBOOK_VERSION, 2);
+    }
+
+    // ── Multi-bit codebook tests ──────────────────────────────────────
+
+    #[test]
+    fn test_1bit_centroids() {
+        assert_eq!(RAW_CENTROIDS_1BIT.len(), 2);
+        // Symmetric around 0
+        assert!((RAW_CENTROIDS_1BIT[0] + RAW_CENTROIDS_1BIT[1]).abs() < 1e-6);
+        // Values = +/- sqrt(2/pi) ~ 0.7979
+        assert!((RAW_CENTROIDS_1BIT[1] - 0.7979).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_1bit_boundaries() {
+        assert_eq!(RAW_BOUNDARIES_1BIT.len(), 1);
+        assert_eq!(RAW_BOUNDARIES_1BIT[0], 0.0);
+    }
+
+    #[test]
+    fn test_2bit_centroids() {
+        assert_eq!(RAW_CENTROIDS_2BIT.len(), 4);
+        // Symmetric
+        for i in 0..4 {
+            let diff = (RAW_CENTROIDS_2BIT[i] + RAW_CENTROIDS_2BIT[3 - i]).abs();
+            assert!(diff < 1e-6, "2-bit symmetry violated at {i}");
+        }
+        // Specific values
+        assert!((RAW_CENTROIDS_2BIT[0] - (-1.5104)).abs() < 0.001);
+        assert!((RAW_CENTROIDS_2BIT[1] - (-0.4528)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_2bit_boundaries() {
+        assert_eq!(RAW_BOUNDARIES_2BIT.len(), 3);
+        assert!((RAW_BOUNDARIES_2BIT[0] - (-0.9816)).abs() < 0.001);
+        assert_eq!(RAW_BOUNDARIES_2BIT[1], 0.0);
+        assert!((RAW_BOUNDARIES_2BIT[2] - 0.9816).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_3bit_centroids() {
+        assert_eq!(RAW_CENTROIDS_3BIT.len(), 8);
+        // Symmetric
+        for i in 0..8 {
+            let diff = (RAW_CENTROIDS_3BIT[i] + RAW_CENTROIDS_3BIT[7 - i]).abs();
+            assert!(diff < 1e-4, "3-bit symmetry violated at {i}: {} vs {}", RAW_CENTROIDS_3BIT[i], RAW_CENTROIDS_3BIT[7 - i]);
+        }
+        // Sorted ascending
+        for i in 1..8 {
+            assert!(RAW_CENTROIDS_3BIT[i] > RAW_CENTROIDS_3BIT[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_3bit_boundaries() {
+        assert_eq!(RAW_BOUNDARIES_3BIT.len(), 7);
+        // Symmetric
+        for i in 0..7 {
+            let diff = (RAW_BOUNDARIES_3BIT[i] + RAW_BOUNDARIES_3BIT[6 - i]).abs();
+            assert!(diff < 1e-4, "3-bit boundary symmetry violated at {i}");
+        }
+        // Center boundary is 0
+        assert_eq!(RAW_BOUNDARIES_3BIT[3], 0.0);
+    }
+
+    #[test]
+    fn test_scaled_centroids_n_sizes() {
+        let pdim = 1024u32;
+        assert_eq!(scaled_centroids_n(pdim, 1).len(), 2);
+        assert_eq!(scaled_centroids_n(pdim, 2).len(), 4);
+        assert_eq!(scaled_centroids_n(pdim, 3).len(), 8);
+        assert_eq!(scaled_centroids_n(pdim, 4).len(), 16);
+    }
+
+    #[test]
+    fn test_scaled_centroids_n_values() {
+        let pdim = 1024u32;
+        let sigma = 1.0 / (pdim as f32).sqrt();
+        let c1 = scaled_centroids_n(pdim, 1);
+        assert!((c1[1] - 0.7979 * sigma).abs() < 1e-6);
+        let c2 = scaled_centroids_n(pdim, 2);
+        assert!((c2[3] - 1.5104 * sigma).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_quantize_with_boundaries_n_1bit() {
+        let b = &RAW_BOUNDARIES_1BIT[..];
+        assert_eq!(quantize_with_boundaries_n(-1.0, b, 2), 0);
+        assert_eq!(quantize_with_boundaries_n(0.5, b, 2), 1);
+        assert_eq!(quantize_with_boundaries_n(0.0, b, 2), 1); // >= 0.0 -> 1
+    }
+
+    #[test]
+    fn test_quantize_with_boundaries_n_2bit() {
+        let b = &RAW_BOUNDARIES_2BIT[..];
+        assert_eq!(quantize_with_boundaries_n(-2.0, b, 4), 0);
+        assert_eq!(quantize_with_boundaries_n(-0.5, b, 4), 1);
+        assert_eq!(quantize_with_boundaries_n(0.5, b, 4), 2);
+        assert_eq!(quantize_with_boundaries_n(2.0, b, 4), 3);
+    }
+
+    #[test]
+    fn test_quantize_with_boundaries_n_3bit() {
+        let b = &RAW_BOUNDARIES_3BIT[..];
+        assert_eq!(quantize_with_boundaries_n(-3.0, b, 8), 0);
+        assert_eq!(quantize_with_boundaries_n(3.0, b, 8), 7);
+        assert_eq!(quantize_with_boundaries_n(0.0, b, 8), 4); // >= 0.0
+    }
+
+    #[test]
+    fn test_code_bytes_per_vector() {
+        let pdim = 1024u32;
+        assert_eq!(code_bytes_per_vector(pdim, 1), 128);  // 1024/8
+        assert_eq!(code_bytes_per_vector(pdim, 2), 256);  // 1024/4
+        assert_eq!(code_bytes_per_vector(pdim, 3), 384);  // (1024*3+7)/8 = 384
+        assert_eq!(code_bytes_per_vector(pdim, 4), 512);  // 1024/2
     }
 }
