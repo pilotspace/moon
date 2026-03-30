@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::build::HnswBuilder;
-use crate::vector::hnsw::search::{hnsw_search, SearchScratch};
+use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::persistence::segment_io;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::turbo_quant::encoder::encode_tq_mse;
@@ -334,15 +334,20 @@ pub fn compact(
     Ok(segment)
 }
 
-/// Verify recall of the HNSW graph against brute-force TQ-ADC ground truth.
+/// Verify recall of the HNSW graph using f32 L2 search against brute-force
+/// f32 L2 ground truth.
+///
+/// Since ImmutableSegment now delegates HNSW traversal to hnsw_search_f32
+/// (TQ-ADC is reserved for brute-force scan), verification must also use
+/// f32 L2 to match the production search path.
 ///
 /// Samples min(RECALL_SAMPLE_SIZE, n) queries deterministically and measures
 /// recall@10. Returns average recall across all sampled queries.
 fn verify_recall(
     graph: &crate::vector::hnsw::graph::HnswGraph,
-    tq_buffer_bfs: &[u8],
+    _tq_buffer_bfs: &[u8],
     live_vectors: &[f32],
-    collection: &Arc<CollectionMetadata>,
+    _collection: &Arc<CollectionMetadata>,
     dimension: u32,
 ) -> f32 {
     let n = graph.num_nodes() as usize;
@@ -351,63 +356,45 @@ fn verify_recall(
     }
 
     let dim = dimension as usize;
-    let padded = collection.padded_dimension as usize;
-    let signs = collection.fwht_sign_flips.as_slice();
-    let dist_table = crate::vector::distance::table();
+    let l2_fn = crate::vector::distance::table().l2_f32;
     let k = 10.min(n);
-    let ef_verify = 64;
+    let ef_verify = 128;
+
+    // BFS-reorder f32 vectors for hnsw_search_f32
+    let mut f32_bfs = vec![0.0f32; n * dim];
+    for bfs_pos in 0..n {
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let src = orig_id * dim;
+        let dst = bfs_pos * dim;
+        f32_bfs[dst..dst + dim].copy_from_slice(&live_vectors[src..src + dim]);
+    }
 
     // Determine sample indices (deterministic)
     let sample_size = RECALL_SAMPLE_SIZE.min(n);
     let step = if n > sample_size { n / sample_size } else { 1 };
     let sample_indices: Vec<usize> = (0..n).step_by(step).take(sample_size).collect();
 
-    let mut scratch = SearchScratch::new(n as u32, collection.padded_dimension);
     let mut total_recall = 0.0f32;
 
     for &query_orig_idx in &sample_indices {
         let query_slice = &live_vectors[query_orig_idx * dim..(query_orig_idx + 1) * dim];
 
-        // HNSW search
-        let hnsw_results = hnsw_search(
+        // HNSW search using f32 L2 (matches production path)
+        let hnsw_results = hnsw_search_f32(
             graph,
-            tq_buffer_bfs,
+            &f32_bfs,
+            dim,
             query_slice,
-            collection,
             k,
             ef_verify,
-            &mut scratch,
+            None,
         );
 
-        // Brute-force TQ-ADC ground truth
-        let mut q_rotated = vec![0.0f32; padded];
-        q_rotated[..dim].copy_from_slice(query_slice);
-        // Normalize
-        let mut norm_sq = 0.0f32;
-        for &v in &q_rotated[..dim] {
-            norm_sq += v * v;
-        }
-        let q_norm = norm_sq.sqrt();
-        if q_norm > 0.0 {
-            let inv = 1.0 / q_norm;
-            for v in q_rotated[..dim].iter_mut() {
-                *v *= inv;
-            }
-        }
-        for v in q_rotated[dim..padded].iter_mut() {
-            *v = 0.0;
-        }
-        fwht::fwht(&mut q_rotated[..padded], signs);
-
-        // Compute distance to every node
+        // Brute-force f32 L2 ground truth
         let mut dists: Vec<(f32, u32)> = (0..n as u32)
-            .map(|bfs_pos| {
-                let code = graph.tq_code(bfs_pos, tq_buffer_bfs);
-                let code_only = &code[..code.len() - 4];
-                let norm = graph.tq_norm(bfs_pos, tq_buffer_bfs);
-                let d = (dist_table.tq_l2)(&q_rotated, code_only, norm);
-                let orig_id = graph.to_original(bfs_pos);
-                (d, orig_id)
+            .map(|i| {
+                let v = &live_vectors[i as usize * dim..(i as usize + 1) * dim];
+                (l2_fn(query_slice, v), i)
             })
             .collect();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));

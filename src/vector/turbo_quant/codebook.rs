@@ -203,6 +203,6 @@ mod tests {
 
     #[test]
     fn test_codebook_version() {
-        assert_eq!(CODEBOOK_VERSION, 1);
+        assert_eq!(CODEBOOK_VERSION, 2);
     }
 }

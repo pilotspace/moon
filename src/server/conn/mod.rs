@@ -20,6 +20,7 @@ pub(crate) use blocking::handle_blocking_command;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) use blocking::handle_blocking_command_monoio;
 #[cfg(feature = "runtime-monoio")]
+#[allow(unused_imports)]
 pub(crate) use blocking::try_inline_dispatch;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) use blocking::try_inline_dispatch_loop;

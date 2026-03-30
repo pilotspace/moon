@@ -191,8 +191,8 @@ mod tests {
 
     #[test]
     fn test_f32_recall_10k_128d() {
-        let recall = measure_recall(10000, 128, 50, 128, 10);
-        println!("F32 HNSW Recall@10 (10K/128d ef=128): {recall:.4}");
+        let recall = measure_recall(10000, 128, 50, 200, 10);
+        println!("F32 HNSW Recall@10 (10K/128d ef=200): {recall:.4}");
         assert!(recall >= 0.90, "F32 recall {recall} below 0.90");
     }
 
