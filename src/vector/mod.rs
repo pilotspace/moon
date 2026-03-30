@@ -8,4 +8,5 @@ pub mod turbo_quant;
 pub mod filter;
 pub mod store;
 pub mod types;
+pub mod mvcc;
 
