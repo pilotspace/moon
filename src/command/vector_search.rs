@@ -392,6 +392,76 @@ fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
     Frame::Array(items.into())
 }
 
+/// Merge multiple per-shard FT.SEARCH responses into a global top-K result.
+///
+/// Each shard response is: [num_results, doc_id, [score_fields], doc_id, [score_fields], ...]
+/// This function extracts all (doc_id, score) pairs, sorts by score ascending (lower
+/// distance = better), takes top-K, and rebuilds the response frame.
+pub fn merge_search_results(shard_responses: &[Frame], k: usize) -> Frame {
+    // Collect all (score, doc_id, fields_frame) triples
+    let mut all_results: Vec<(f32, Bytes, Frame)> = Vec::new();
+
+    for resp in shard_responses {
+        let items = match resp {
+            Frame::Array(items) => items,
+            Frame::Error(_) => continue, // skip errored shards
+            _ => continue,
+        };
+        if items.is_empty() {
+            continue;
+        }
+        // items[0] = count, then pairs of (doc_id, fields_array)
+        let mut i = 1;
+        while i + 1 < items.len() {
+            let doc_id = match &items[i] {
+                Frame::BulkString(b) => b.clone(),
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            };
+            let fields = items[i + 1].clone();
+            let score = extract_score_from_fields(&fields);
+            all_results.push((score, doc_id, fields));
+            i += 2;
+        }
+    }
+
+    // Sort by score ascending (lower distance = better match)
+    all_results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    all_results.truncate(k);
+
+    // Rebuild response
+    let total = all_results.len() as i64;
+    let mut items = Vec::with_capacity(1 + all_results.len() * 2);
+    items.push(Frame::Integer(total));
+    for (_, doc_id, fields) in all_results {
+        items.push(Frame::BulkString(doc_id));
+        items.push(fields);
+    }
+    Frame::Array(items.into())
+}
+
+/// Extract the numeric score from a fields array like ["__vec_score", "0.5"].
+fn extract_score_from_fields(fields: &Frame) -> f32 {
+    if let Frame::Array(items) = fields {
+        for pair in items.chunks(2) {
+            if pair.len() == 2 {
+                if let Frame::BulkString(key) = &pair[0] {
+                    if key.as_ref() == b"__vec_score" {
+                        if let Frame::BulkString(val) = &pair[1] {
+                            if let Ok(s) = std::str::from_utf8(val) {
+                                return s.parse().unwrap_or(f32::MAX);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    f32::MAX
+}
+
 // -- Helpers (private) --
 
 fn extract_bulk(frame: &Frame) -> Option<Bytes> {
@@ -585,6 +655,75 @@ mod tests {
         assert_eq!(output[4], -63); // -0.5 -> -63
         assert_eq!(output[5], 127); // 2.0 clamped to 1.0 -> 127
         assert_eq!(output[6], -127); // -2.0 clamped to -1.0 -> -127
+    }
+
+    #[test]
+    fn test_merge_search_results_combines_shards() {
+        // Shard 0 returns: [2, "vec:0", ["__vec_score", "0.1"], "vec:1", ["__vec_score", "0.5"]]
+        // Shard 1 returns: [2, "vec:10", ["__vec_score", "0.3"], "vec:11", ["__vec_score", "0.9"]]
+        // Global top-2 should be: vec:0 (0.1), vec:10 (0.3)
+
+        let shard0 = Frame::Array(vec![
+            Frame::Integer(2),
+            bulk(b"vec:0"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.1")].into()),
+            bulk(b"vec:1"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.5")].into()),
+        ].into());
+
+        let shard1 = Frame::Array(vec![
+            Frame::Integer(2),
+            bulk(b"vec:10"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.3")].into()),
+            bulk(b"vec:11"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.9")].into()),
+        ].into());
+
+        let result = merge_search_results(&[shard0, shard1], 2);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items[0], Frame::Integer(2));
+                assert_eq!(items[1], Frame::BulkString(Bytes::from("vec:0")));
+                assert_eq!(items[3], Frame::BulkString(Bytes::from("vec:10")));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_search_results_handles_errors() {
+        // One shard returns error, one returns valid results
+        let shard0 = Frame::Error(Bytes::from_static(b"ERR shard unavailable"));
+        let shard1 = Frame::Array(vec![
+            Frame::Integer(1),
+            bulk(b"vec:5"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.2")].into()),
+        ].into());
+
+        let result = merge_search_results(&[shard0, shard1], 5);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items[0], Frame::Integer(1));
+                assert_eq!(items[1], Frame::BulkString(Bytes::from("vec:5")));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_search_results_empty() {
+        // No results from any shard
+        let shard0 = Frame::Array(vec![Frame::Integer(0)].into());
+        let shard1 = Frame::Array(vec![Frame::Integer(0)].into());
+
+        let result = merge_search_results(&[shard0, shard1], 10);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], Frame::Integer(0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
     }
 
     #[test]
