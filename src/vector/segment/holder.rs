@@ -6,8 +6,10 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
+use crate::vector::filter::selectivity::{select_strategy, FilterStrategy};
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::types::SearchResult;
 
@@ -48,6 +50,16 @@ impl SegmentHolder {
         self.segments.store(Arc::new(new_list));
     }
 
+    /// Total vector count across mutable + all immutable segments.
+    pub fn total_vectors(&self) -> u32 {
+        let snapshot = self.load();
+        let mut total = snapshot.mutable.len() as u32;
+        for imm in &snapshot.immutable {
+            total += imm.total_count();
+        }
+        total
+    }
+
     /// Fan-out search across mutable + all immutable segments, merge results.
     ///
     /// 1. Load snapshot (atomic, lock-free).
@@ -62,21 +74,105 @@ impl SegmentHolder {
         ef_search: usize,
         scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
+        self.search_filtered(query_f32, query_sq, k, ef_search, scratch, None)
+    }
+
+    /// Fan-out search with optional filter bitmap.
+    ///
+    /// Dispatches to the correct strategy based on filter selectivity:
+    /// - Unfiltered: standard search path
+    /// - BruteForceFiltered: linear scan on bitmap matches
+    /// - HnswFiltered: HNSW with ACORN 2-hop allow-list
+    /// - HnswPostFilter: HNSW with 3xK oversampling + post-filter
+    pub fn search_filtered(
+        &self,
+        query_f32: &[f32],
+        query_sq: &[i8],
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        filter_bitmap: Option<&RoaringBitmap>,
+    ) -> SmallVec<[SearchResult; 32]> {
+        let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
-        // Brute-force on mutable
-        let mut all_results = snapshot.mutable.brute_force_search(query_sq, k);
-
-        // HNSW on each immutable
-        for imm in &snapshot.immutable {
-            let imm_results = imm.search(query_f32, k, ef_search, scratch);
-            all_results.extend(imm_results);
+        match strategy {
+            FilterStrategy::Unfiltered => {
+                // Existing path -- no bitmap
+                let mut all = snapshot.mutable.brute_force_search(query_sq, k);
+                for imm in &snapshot.immutable {
+                    all.extend(imm.search(query_f32, k, ef_search, scratch));
+                }
+                all.sort();
+                all.truncate(k);
+                all
+            }
+            FilterStrategy::BruteForceFiltered => {
+                // Linear scan on mutable + immutable -- bitmap narrows to few vectors
+                let mut all = snapshot
+                    .mutable
+                    .brute_force_search_filtered(query_sq, k, filter_bitmap);
+                // Immutable segments: use HNSW filtered (still correct, bitmap handles it)
+                for imm in &snapshot.immutable {
+                    all.extend(imm.search_filtered(
+                        query_f32,
+                        k,
+                        ef_search,
+                        scratch,
+                        filter_bitmap,
+                    ));
+                }
+                all.sort();
+                all.truncate(k);
+                all
+            }
+            FilterStrategy::HnswFiltered => {
+                let mut all = snapshot
+                    .mutable
+                    .brute_force_search_filtered(query_sq, k, filter_bitmap);
+                for imm in &snapshot.immutable {
+                    all.extend(imm.search_filtered(
+                        query_f32,
+                        k,
+                        ef_search,
+                        scratch,
+                        filter_bitmap,
+                    ));
+                }
+                all.sort();
+                all.truncate(k);
+                all
+            }
+            FilterStrategy::HnswPostFilter => {
+                // 3x oversampling then post-filter
+                let oversample_k = k * 3;
+                let mut all = snapshot
+                    .mutable
+                    .brute_force_search_filtered(query_sq, oversample_k, filter_bitmap);
+                for imm in &snapshot.immutable {
+                    // Search with 3x k, no filter in HNSW, filter results after
+                    let imm_results = imm.search(
+                        query_f32,
+                        oversample_k,
+                        ef_search.max(oversample_k),
+                        scratch,
+                    );
+                    // Post-filter
+                    if let Some(bm) = filter_bitmap {
+                        for r in imm_results {
+                            if bm.contains(r.id.0) {
+                                all.push(r);
+                            }
+                        }
+                    } else {
+                        all.extend(imm_results);
+                    }
+                }
+                all.sort();
+                all.truncate(k);
+                all
+            }
         }
-
-        // Merge: sort by distance ascending, truncate to k
-        all_results.sort();
-        all_results.truncate(k);
-        all_results
     }
 }
 

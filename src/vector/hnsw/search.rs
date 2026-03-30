@@ -4,6 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 use super::graph::{HnswGraph, SENTINEL};
@@ -168,6 +169,26 @@ pub fn hnsw_search(
     ef_search: usize,
     scratch: &mut SearchScratch,
 ) -> SmallVec<[SearchResult; 32]> {
+    hnsw_search_filtered(graph, vectors_tq, query, collection, k, ef_search, scratch, None)
+}
+
+/// HNSW search with optional filter bitmap (ACORN 2-hop expansion).
+///
+/// When `allow_bitmap` is Some, only vectors whose ORIGINAL ID is in the bitmap
+/// are added to results. However, vectors OUTSIDE the bitmap are still traversed
+/// for graph connectivity (ACORN principle). When a neighbor fails the filter,
+/// we also immediately explore that neighbor's neighbors (2-hop reach) to prevent
+/// "filter island" disconnection at low selectivity.
+pub fn hnsw_search_filtered(
+    graph: &HnswGraph,
+    vectors_tq: &[u8],
+    query: &[f32],
+    collection: &CollectionMetadata,
+    k: usize,
+    ef_search: usize,
+    scratch: &mut SearchScratch,
+    allow_bitmap: Option<&RoaringBitmap>,
+) -> SmallVec<[SearchResult; 32]> {
     let num_nodes = graph.num_nodes();
     if num_nodes == 0 {
         return SmallVec::new();
@@ -241,13 +262,18 @@ pub fn hnsw_search(
         }
     }
 
-    // Step 3: Layer 0 beam search (BFS space)
+    // Step 3: Layer 0 beam search (BFS space) with ACORN 2-hop filter expansion
     let entry_bfs = graph.to_bfs(current_orig);
     scratch.visited.test_and_set(entry_bfs);
+
+    let entry_passes = allow_bitmap.map_or(true, |bm| bm.contains(graph.to_original(entry_bfs)));
+
     scratch
         .candidates
         .push(Reverse(OrdF32Pair(current_dist, entry_bfs)));
-    scratch.results.push(OrdF32Pair(current_dist, entry_bfs));
+    if entry_passes {
+        scratch.results.push(OrdF32Pair(current_dist, entry_bfs));
+    }
 
     while let Some(Reverse(OrdF32Pair(c_dist, c_bfs))) = scratch.candidates.pop() {
         // Early termination
@@ -285,17 +311,49 @@ pub fn hnsw_search(
             }
 
             let d = dist_bfs(nb);
+            let orig_id = graph.to_original(nb);
+            let passes_filter = allow_bitmap.map_or(true, |bm| bm.contains(orig_id));
 
-            // Check if this neighbor should be added
-            let dominated =
-                scratch.results.len() >= ef && d >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
-            if !dominated {
-                scratch
-                    .candidates
-                    .push(Reverse(OrdF32Pair(d, nb)));
-                scratch.results.push(OrdF32Pair(d, nb));
-                if scratch.results.len() > ef {
-                    scratch.results.pop(); // remove farthest
+            if passes_filter {
+                // Normal: add to candidates AND results (same as unfiltered)
+                let dominated = scratch.results.len() >= ef
+                    && d >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
+                if !dominated {
+                    scratch.candidates.push(Reverse(OrdF32Pair(d, nb)));
+                    scratch.results.push(OrdF32Pair(d, nb));
+                    if scratch.results.len() > ef {
+                        scratch.results.pop();
+                    }
+                }
+            } else {
+                // ACORN: add to candidates for connectivity but NOT to results
+                let dominated = scratch.results.len() >= ef
+                    && d >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
+                if !dominated {
+                    scratch.candidates.push(Reverse(OrdF32Pair(d, nb)));
+                }
+                // 2-hop expansion: immediately explore nb's neighbors
+                for &hop2_nb in graph.neighbors_l0(nb) {
+                    if hop2_nb == SENTINEL {
+                        break;
+                    }
+                    if scratch.visited.test_and_set(hop2_nb) {
+                        continue;
+                    }
+                    let d2 = dist_bfs(hop2_nb);
+                    let hop2_orig = graph.to_original(hop2_nb);
+                    let hop2_passes = allow_bitmap.map_or(true, |bm| bm.contains(hop2_orig));
+                    let hop2_dominated = scratch.results.len() >= ef
+                        && d2 >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
+                    if !hop2_dominated {
+                        scratch.candidates.push(Reverse(OrdF32Pair(d2, hop2_nb)));
+                        if hop2_passes {
+                            scratch.results.push(OrdF32Pair(d2, hop2_nb));
+                            if scratch.results.len() > ef {
+                                scratch.results.pop();
+                            }
+                        }
+                    }
                 }
             }
         }

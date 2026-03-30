@@ -4,11 +4,12 @@
 
 use std::sync::Arc;
 
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
-use crate::vector::hnsw::search::{hnsw_search, SearchScratch};
+use crate::vector::hnsw::search::{hnsw_search, hnsw_search_filtered, SearchScratch};
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::types::SearchResult;
 
@@ -71,6 +72,27 @@ impl ImmutableSegment {
             k,
             ef_search,
             scratch,
+        )
+    }
+
+    /// Delegated HNSW search with filter bitmap (ACORN 2-hop).
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        allow_bitmap: Option<&RoaringBitmap>,
+    ) -> SmallVec<[SearchResult; 32]> {
+        hnsw_search_filtered(
+            &self.graph,
+            self.vectors_tq.as_slice(),
+            query,
+            &self.collection_meta,
+            k,
+            ef_search,
+            scratch,
+            allow_bitmap,
         )
     }
 

@@ -6,6 +6,7 @@
 use std::collections::BinaryHeap;
 
 use parking_lot::RwLock;
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 use crate::vector::types::{SearchResult, VectorId};
@@ -115,6 +116,17 @@ impl MutableSegment {
     /// Brute-force search over all non-deleted entries using l2_i8.
     /// Returns top-k results sorted by distance ascending.
     pub fn brute_force_search(&self, query_sq: &[i8], k: usize) -> SmallVec<[SearchResult; 32]> {
+        self.brute_force_search_filtered(query_sq, k, None)
+    }
+
+    /// Brute-force filtered search. When bitmap is Some, only entries whose
+    /// internal_id is in the bitmap are considered.
+    pub fn brute_force_search_filtered(
+        &self,
+        query_sq: &[i8],
+        k: usize,
+        allow_bitmap: Option<&RoaringBitmap>,
+    ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
         let dim = inner.dimension as usize;
         let l2_i8 = crate::vector::distance::table().l2_i8;
@@ -126,6 +138,11 @@ impl MutableSegment {
         for entry in &inner.entries {
             if entry.delete_lsn != 0 {
                 continue;
+            }
+            if let Some(bm) = allow_bitmap {
+                if !bm.contains(entry.internal_id) {
+                    continue;
+                }
             }
             let offset = entry.internal_id as usize * dim;
             let vec_sq = &inner.vectors_sq[offset..offset + dim];
