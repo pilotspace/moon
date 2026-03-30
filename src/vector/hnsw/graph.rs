@@ -1,5 +1,5 @@
 //! HNSW graph data structure with contiguous layer-0 storage, BFS reorder,
-//! and dual prefetch for cache-optimized traversal.
+//! CSR upper-layer storage, and dual prefetch for cache-optimized traversal.
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use smallvec::SmallVec;
@@ -16,7 +16,19 @@ pub const DEFAULT_M0: u8 = 32;
 /// Immutable HNSW graph with BFS-reordered layer 0 for cache-friendly traversal.
 ///
 /// Layer 0 neighbors are stored in a flat `AlignedBuffer<u32>` indexed by BFS position.
-/// Upper layer neighbors use `SmallVec` indexed by original node ID.
+/// Upper layer neighbors use CSR (Compressed Sparse Row) format for memory efficiency.
+///
+/// ## CSR Upper Layer Storage
+///
+/// For each (node_id, level) pair, neighbors are in:
+///   `upper_neighbors[upper_offsets[idx]..upper_offsets[idx+1]]`
+/// where `idx = upper_index[node_id] + (level - 1)`.
+///
+/// Nodes with level=0 have `upper_index[node_id] == SENTINEL` (no entry).
+///
+/// Memory comparison for 1M nodes (2% at L1, 0.04% at L2, M=16):
+/// - SmallVec: 1M * 136 bytes = 136 MB (every node allocates inline storage)
+/// - CSR: 1M * 4 (index) + ~20K * 4 (offsets) + ~320K * 4 (neighbors) = ~5.4 MB
 pub struct HnswGraph {
     /// Total number of nodes in the graph.
     num_nodes: u32,
@@ -40,12 +52,14 @@ pub struct HnswGraph {
     /// Inverse: bfs_inverse[bfs_position] = original_id.
     bfs_inverse: Vec<u32>,
 
-    /// Upper layers: Vec indexed by original node ID.
-    /// Only nodes with level > 0 have non-empty SmallVecs.
-    /// Contains neighbors for levels 1..=max_level.
-    /// Layout: upper_layers[node_id] stores all upper-layer neighbors concatenated,
-    /// with each level having `m` slots. Level l starts at offset (l-1)*m.
-    upper_layers: Vec<SmallVec<[u32; 32]>>,
+    /// CSR upper-layer index: node_id -> start row in upper_offsets, or SENTINEL.
+    /// Length: num_nodes.
+    upper_index: Vec<u32>,
+    /// CSR row pointers: upper_offsets[row..row+1] delimits neighbors in upper_neighbors.
+    /// Length: total_upper_rows + 1.
+    upper_offsets: Vec<u32>,
+    /// CSR column values: actual neighbor IDs (no SENTINEL padding).
+    upper_neighbors: Vec<u32>,
 
     /// Node levels: levels[original_id] = level for that node.
     /// Used during search to determine which layers a node participates in.
@@ -58,6 +72,10 @@ pub struct HnswGraph {
 
 impl HnswGraph {
     /// Create from raw parts (called by HnswBuilder::build).
+    ///
+    /// Accepts SmallVec upper layers from the builder and converts to CSR internally.
+    /// This keeps the builder simple (SmallVec during construction) while the immutable
+    /// graph benefits from CSR's compact storage.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         num_nodes: u32,
@@ -72,6 +90,9 @@ impl HnswGraph {
         levels: Vec<u8>,
         bytes_per_code: u32,
     ) -> Self {
+        let (upper_index, upper_offsets, upper_neighbors) =
+            build_upper_csr(&upper_layers, m);
+
         Self {
             num_nodes,
             m,
@@ -81,7 +102,43 @@ impl HnswGraph {
             layer0_neighbors,
             bfs_order,
             bfs_inverse,
-            upper_layers,
+            upper_index,
+            upper_offsets,
+            upper_neighbors,
+            levels,
+            bytes_per_code,
+        }
+    }
+
+    /// Create from pre-built CSR arrays (used by deserialization).
+    #[allow(clippy::too_many_arguments)]
+    fn from_csr(
+        num_nodes: u32,
+        m: u8,
+        m0: u8,
+        entry_point: u32,
+        max_level: u8,
+        layer0_neighbors: AlignedBuffer<u32>,
+        bfs_order: Vec<u32>,
+        bfs_inverse: Vec<u32>,
+        upper_index: Vec<u32>,
+        upper_offsets: Vec<u32>,
+        upper_neighbors: Vec<u32>,
+        levels: Vec<u8>,
+        bytes_per_code: u32,
+    ) -> Self {
+        Self {
+            num_nodes,
+            m,
+            m0,
+            entry_point,
+            max_level,
+            layer0_neighbors,
+            bfs_order,
+            bfs_inverse,
+            upper_index,
+            upper_offsets,
+            upper_neighbors,
             levels,
             bytes_per_code,
         }
@@ -128,19 +185,20 @@ impl HnswGraph {
 
     /// Get upper-layer neighbors for a node at a specific level.
     /// `node_id` is in ORIGINAL space (upper layers not BFS-reordered).
-    /// Returns slice of m u32s (may contain SENTINEL).
+    /// Returns a slice of neighbor IDs (no SENTINEL padding, variable length).
     #[inline]
     pub fn neighbors_upper(&self, node_id: u32, level: usize) -> &[u32] {
-        let sv = &self.upper_layers[node_id as usize];
-        if sv.is_empty() {
+        let idx_start = self.upper_index[node_id as usize];
+        if idx_start == SENTINEL {
             return &[];
         }
-        let start = (level - 1) * self.m as usize;
-        let end = start + self.m as usize;
-        if end > sv.len() {
+        let row = idx_start as usize + (level - 1);
+        if row + 1 >= self.upper_offsets.len() {
             return &[];
         }
-        &sv[start..end]
+        let start = self.upper_offsets[row] as usize;
+        let end = self.upper_offsets[row + 1] as usize;
+        &self.upper_neighbors[start..end]
     }
 
     /// Get the TQ code bytes for a node from the vector data buffer.
@@ -179,19 +237,24 @@ impl HnswGraph {
 
     /// Serialize the graph to a byte buffer.
     ///
-    /// Format (all LE):
+    /// Format v2 (all LE):
     ///   num_nodes: u32, m: u8, m0: u8, entry_point: u32, max_level: u8,
     ///   bytes_per_code: u32,
-    ///   layer0_len: u32 (number of u32 values), layer0_neighbors: [u32; layer0_len],
+    ///   layer0_len: u32, layer0_neighbors: [u32; layer0_len],
     ///   bfs_order: [u32; num_nodes], bfs_inverse: [u32; num_nodes],
     ///   levels: [u8; num_nodes],
-    ///   upper_layers_count: u32 (nodes with non-empty upper layers),
-    ///   for each: node_id: u32, neighbors_len: u16, neighbors: [u32; neighbors_len]
+    ///   upper_index: [u32; num_nodes],
+    ///   upper_offsets_len: u32, upper_offsets: [u32; upper_offsets_len],
+    ///   upper_neighbors_len: u32, upper_neighbors: [u32; upper_neighbors_len]
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.num_nodes as usize;
         let layer0_len = self.layer0_neighbors.len();
-        // Estimate capacity
-        let capacity = 4 + 1 + 1 + 4 + 1 + 4 + 4 + layer0_len * 4 + n * 4 * 2 + n + 4 + 256;
+        let capacity = 4 + 1 + 1 + 4 + 1 + 4
+            + 4 + layer0_len * 4
+            + n * 4 * 2 + n
+            + n * 4
+            + 4 + self.upper_offsets.len() * 4
+            + 4 + self.upper_neighbors.len() * 4;
         let mut buf = Vec::with_capacity(capacity);
 
         buf.extend_from_slice(&self.num_nodes.to_le_bytes());
@@ -218,22 +281,17 @@ impl HnswGraph {
         // Levels
         buf.extend_from_slice(&self.levels);
 
-        // Upper layers: only non-empty
-        let non_empty: Vec<(u32, &SmallVec<[u32; 32]>)> = self
-            .upper_layers
-            .iter()
-            .enumerate()
-            .filter(|(_, sv)| !sv.is_empty())
-            .map(|(i, sv)| (i as u32, sv))
-            .collect();
-
-        buf.extend_from_slice(&(non_empty.len() as u32).to_le_bytes());
-        for (node_id, sv) in &non_empty {
-            buf.extend_from_slice(&node_id.to_le_bytes());
-            buf.extend_from_slice(&(sv.len() as u16).to_le_bytes());
-            for &nb in sv.iter() {
-                buf.extend_from_slice(&nb.to_le_bytes());
-            }
+        // CSR upper layers
+        for &v in &self.upper_index {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.upper_offsets.len() as u32).to_le_bytes());
+        for &v in &self.upper_offsets {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.upper_neighbors.len() as u32).to_le_bytes());
+        for &v in &self.upper_neighbors {
+            buf.extend_from_slice(&v.to_le_bytes());
         }
 
         buf
@@ -255,13 +313,6 @@ impl HnswGraph {
             ensure(*pos, 1)?;
             let v = data[*pos];
             *pos += 1;
-            Ok(v)
-        };
-
-        let read_u16 = |pos: &mut usize| -> Result<u16, &'static str> {
-            ensure(*pos, 2)?;
-            let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-            *pos += 2;
             Ok(v)
         };
 
@@ -309,36 +360,33 @@ impl HnswGraph {
         let levels = data[pos..pos + n].to_vec();
         pos += n;
 
-        // Upper layers
-        let upper_count = read_u32(&mut pos)? as usize;
-        let mut upper_layers: Vec<SmallVec<[u32; 32]>> = vec![SmallVec::new(); n];
-        for _ in 0..upper_count {
-            let node_id = read_u32(&mut pos)? as usize;
-            if node_id >= n {
-                return Err("upper layer node_id out of range");
-            }
-            let nb_len = read_u16(&mut pos)? as usize;
-            ensure(pos, nb_len * 4)?;
-            let mut sv = SmallVec::with_capacity(nb_len);
-            for _ in 0..nb_len {
-                sv.push(read_u32(&mut pos)?);
-            }
-            upper_layers[node_id] = sv;
+        // CSR upper layers
+        ensure(pos, n * 4)?;
+        let mut upper_index = Vec::with_capacity(n);
+        for _ in 0..n {
+            upper_index.push(read_u32(&mut pos)?);
         }
 
-        Ok(Self {
-            num_nodes,
-            m,
-            m0,
-            entry_point,
-            max_level,
-            layer0_neighbors,
-            bfs_order,
-            bfs_inverse,
-            upper_layers,
-            levels,
-            bytes_per_code,
-        })
+        let offsets_len = read_u32(&mut pos)? as usize;
+        ensure(pos, offsets_len * 4)?;
+        let mut upper_offsets = Vec::with_capacity(offsets_len);
+        for _ in 0..offsets_len {
+            upper_offsets.push(read_u32(&mut pos)?);
+        }
+
+        let neighbors_len = read_u32(&mut pos)? as usize;
+        ensure(pos, neighbors_len * 4)?;
+        let mut upper_neighbors = Vec::with_capacity(neighbors_len);
+        for _ in 0..neighbors_len {
+            upper_neighbors.push(read_u32(&mut pos)?);
+        }
+
+        Ok(Self::from_csr(
+            num_nodes, m, m0, entry_point, max_level,
+            layer0_neighbors, bfs_order, bfs_inverse,
+            upper_index, upper_offsets, upper_neighbors,
+            levels, bytes_per_code,
+        ))
     }
 
     /// Dual prefetch: neighbor list + vector data for a BFS-positioned node.
@@ -377,6 +425,53 @@ impl HnswGraph {
             let _ = (neighbor_offset, vector_offset);
         }
     }
+}
+
+/// Convert SmallVec upper layers to CSR format.
+///
+/// Input: `upper_layers[node_id]` = SmallVec with `level * m` entries
+///   (each level has m slots, SENTINEL-padded).
+///
+/// Output: (upper_index, upper_offsets, upper_neighbors) where:
+/// - `upper_index[node_id]` = starting row in offsets, or SENTINEL if level=0
+/// - `upper_offsets[row]..upper_offsets[row+1]` = neighbor range in upper_neighbors
+/// - `upper_neighbors` = packed neighbor IDs (SENTINELs stripped)
+fn build_upper_csr(
+    upper_layers: &[SmallVec<[u32; 32]>],
+    m: u8,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let n = upper_layers.len();
+    let mut upper_index = vec![SENTINEL; n];
+    let mut upper_offsets: Vec<u32> = Vec::new();
+    let mut upper_neighbors: Vec<u32> = Vec::new();
+
+    let m_usize = m as usize;
+
+    for (node_id, sv) in upper_layers.iter().enumerate() {
+        if sv.is_empty() {
+            continue;
+        }
+        // Number of upper levels for this node
+        let num_levels = sv.len() / m_usize;
+        upper_index[node_id] = upper_offsets.len() as u32;
+
+        for level_idx in 0..num_levels {
+            upper_offsets.push(upper_neighbors.len() as u32);
+            let start = level_idx * m_usize;
+            let end = start + m_usize;
+            // Copy non-SENTINEL neighbors
+            for &nb in &sv[start..end] {
+                if nb == SENTINEL {
+                    break;
+                }
+                upper_neighbors.push(nb);
+            }
+        }
+    }
+    // Final sentinel offset (marks end of last row)
+    upper_offsets.push(upper_neighbors.len() as u32);
+
+    (upper_index, upper_offsets, upper_neighbors)
 }
 
 /// Perform BFS traversal from entry_point on layer 0 and return
@@ -579,11 +674,12 @@ mod tests {
             vec![2], 8,
         );
 
+        // CSR strips sentinels, so level 1 has [10, 20] and level 2 has [30]
         let l1 = graph.neighbors_upper(0, 1);
         assert_eq!(l1, &[10, 20]);
 
         let l2 = graph.neighbors_upper(0, 2);
-        assert_eq!(l2, &[30, s]);
+        assert_eq!(l2, &[30]);
     }
 
     #[test]
@@ -736,13 +832,12 @@ mod tests {
             assert_eq!(restored.to_original(i), graph.to_original(i));
         }
 
-        // Check upper layers for node 0 at level 1
+        // Check upper layers for node 0 at level 1 -- CSR strips sentinels
         let l1 = restored.neighbors_upper(0, 1);
-        assert_eq!(l1.len(), m as usize);
+        assert_eq!(l1.len(), 3); // only 3 non-sentinel neighbors
         assert_eq!(l1[0], 1);
         assert_eq!(l1[1], 2);
         assert_eq!(l1[2], 3);
-        assert_eq!(l1[3], SENTINEL);
     }
 
     #[test]
@@ -793,5 +888,177 @@ mod tests {
         // Nodes 2,3 should be after (unreachable, appended in ID order)
         assert!(bfs_order[2] >= 2);
         assert!(bfs_order[3] >= 2);
+    }
+
+    // ── CSR-specific tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_csr_5_node_graph_same_neighbors() {
+        // 5-node graph: node 0 at level 2, node 1 at level 1, rest at level 0.
+        let m: u8 = 4;
+        let s = SENTINEL;
+        let mut upper = vec![SmallVec::new(); 5];
+
+        // Node 0, level 2: 2 levels * 4 slots = 8 entries
+        let mut sv0 = SmallVec::new();
+        // Level 1: neighbors [1, 2, S, S]
+        sv0.extend_from_slice(&[1, 2, s, s]);
+        // Level 2: neighbors [3, S, S, S]
+        sv0.extend_from_slice(&[3, s, s, s]);
+        upper[0] = sv0;
+
+        // Node 1, level 1: 1 level * 4 slots = 4 entries
+        let mut sv1 = SmallVec::new();
+        // Level 1: neighbors [0, 4, S, S]
+        sv1.extend_from_slice(&[0, 4, s, s]);
+        upper[1] = sv1;
+
+        let graph = HnswGraph::new(
+            5, m, 8, 0, 2,
+            AlignedBuffer::new(40),
+            vec![0, 1, 2, 3, 4], vec![0, 1, 2, 3, 4],
+            upper, vec![2, 1, 0, 0, 0], 8,
+        );
+
+        // Node 0, level 1: [1, 2] (sentinels stripped)
+        assert_eq!(graph.neighbors_upper(0, 1), &[1, 2]);
+        // Node 0, level 2: [3]
+        assert_eq!(graph.neighbors_upper(0, 2), &[3]);
+        // Node 1, level 1: [0, 4]
+        assert_eq!(graph.neighbors_upper(1, 1), &[0, 4]);
+        // Node 2 (level 0): empty
+        assert!(graph.neighbors_upper(2, 1).is_empty());
+        // Node 3 (level 0): empty
+        assert!(graph.neighbors_upper(3, 1).is_empty());
+        // Node 4 (level 0): empty
+        assert!(graph.neighbors_upper(4, 1).is_empty());
+    }
+
+    #[test]
+    fn test_csr_serialization_roundtrip() {
+        let m: u8 = 4;
+        let s = SENTINEL;
+        let mut upper = vec![SmallVec::new(); 3];
+        let mut sv = SmallVec::new();
+        sv.extend_from_slice(&[1, 2, s, s]); // level 1
+        upper[0] = sv;
+
+        let graph = HnswGraph::new(
+            3, m, 8, 0, 1,
+            AlignedBuffer::new(24),
+            vec![0, 1, 2], vec![0, 1, 2],
+            upper, vec![1, 0, 0], 8,
+        );
+
+        let bytes = graph.to_bytes();
+        let restored = HnswGraph::from_bytes(&bytes).unwrap();
+
+        // Verify CSR structure preserved
+        assert_eq!(restored.neighbors_upper(0, 1), &[1, 2]);
+        assert!(restored.neighbors_upper(1, 1).is_empty());
+        assert!(restored.neighbors_upper(2, 1).is_empty());
+    }
+
+    #[test]
+    fn test_csr_memory_estimate() {
+        // For 1M nodes with 2% at level 1 and 0.04% at level 2, M=16:
+        // upper_index: 1M * 4 = 4 MB
+        // upper_offsets: ~20,400 rows * 4 = ~82 KB
+        // upper_neighbors: ~20K nodes * 16 avg neighbors = 320K * 4 = ~1.3 MB
+        // Total: ~5.4 MB vs 136 MB with SmallVec
+
+        let n = 1_000_000usize;
+        let m: u8 = 16;
+        let s = SENTINEL;
+
+        // Simulate: 2% nodes at level 1, 0.04% at level 2
+        let mut upper = vec![SmallVec::new(); n];
+        let mut level1_count = 0u32;
+        let mut level2_count = 0u32;
+
+        for i in 0..n {
+            if i % 2500 == 0 && level2_count < 400 {
+                // Level 2 node: 2 levels * m slots
+                let mut sv = SmallVec::with_capacity(2 * m as usize);
+                for j in 0..m as u32 {
+                    sv.push(if j < 8 { (i as u32 + j + 1) % n as u32 } else { s });
+                }
+                for j in 0..m as u32 {
+                    sv.push(if j < 4 { (i as u32 + j + 100) % n as u32 } else { s });
+                }
+                upper[i] = sv;
+                level2_count += 1;
+            } else if i % 50 == 0 && level1_count < 20_000 {
+                // Level 1 node: 1 level * m slots
+                let mut sv = SmallVec::with_capacity(m as usize);
+                for j in 0..m as u32 {
+                    sv.push(if j < 10 { (i as u32 + j + 1) % n as u32 } else { s });
+                }
+                upper[i] = sv;
+                level1_count += 1;
+            }
+        }
+
+        let (index, offsets, neighbors) = build_upper_csr(&upper, m);
+
+        // CSR memory: index + offsets + neighbors (all Vec<u32>)
+        let csr_bytes = index.len() * 4 + offsets.len() * 4 + neighbors.len() * 4;
+        // Average per node
+        let avg_per_node = csr_bytes / n;
+
+        // SmallVec baseline: every node pays 136 bytes (size_of::<SmallVec<[u32; 32]>>)
+        // Even empty SmallVec on stack is 136 bytes due to inline storage
+        let smallvec_bytes = n * std::mem::size_of::<SmallVec<[u32; 32]>>();
+
+        assert!(
+            csr_bytes < 10_000_000, // < 10 MB
+            "CSR memory {} bytes ({} avg/node) exceeds 10 MB",
+            csr_bytes, avg_per_node
+        );
+        assert!(
+            csr_bytes < smallvec_bytes / 10,
+            "CSR ({} MB) should be at least 10x smaller than SmallVec ({} MB)",
+            csr_bytes / 1_000_000,
+            smallvec_bytes / 1_000_000
+        );
+    }
+
+    #[test]
+    fn test_csr_empty_upper_layers_return_empty() {
+        // All nodes at level 0 -- every neighbor_upper should be empty
+        let n = 10u32;
+        let graph = HnswGraph::new(
+            n, 16, 32, 0, 0,
+            AlignedBuffer::new(n as usize * 32),
+            (0..n).collect(), (0..n).collect(),
+            vec![SmallVec::new(); n as usize],
+            vec![0; n as usize], 8,
+        );
+
+        for i in 0..n {
+            assert!(graph.neighbors_upper(i, 1).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_build_upper_csr_strips_sentinels() {
+        // Verify that CSR strips SENTINEL padding from neighbor lists
+        let m: u8 = 4;
+        let s = SENTINEL;
+        let mut upper = vec![SmallVec::new(); 2];
+        let mut sv = SmallVec::new();
+        sv.extend_from_slice(&[10, s, s, s]); // only 1 actual neighbor
+        upper[0] = sv;
+
+        let (index, offsets, neighbors) = build_upper_csr(&upper, m);
+        assert_ne!(index[0], SENTINEL);
+        assert_eq!(index[1], SENTINEL);
+        // Only 1 neighbor stored, not 4
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0], 10);
+        // Offsets: [0, 1] (one row with 1 element)
+        let row = index[0] as usize;
+        assert_eq!(offsets[row], 0);
+        assert_eq!(offsets[row + 1], 1);
     }
 }
