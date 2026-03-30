@@ -308,6 +308,160 @@ mod tests {
     }
 
     #[test]
+    fn test_holder_search_mvcc_backward_compat() {
+        // search_mvcc with snapshot=0 and empty dirty_set should match search results
+        distance::init();
+        let dim = 8;
+        let holder = SegmentHolder::new(dim as u32);
+        {
+            let snap = holder.load();
+            for i in 0..5u32 {
+                let sq = make_sq_vector(dim, i * 13 + 1);
+                let f32_v = vec![0.0f32; dim];
+                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+            }
+        }
+        let query_sq = make_sq_vector(dim, 1);
+        let query_f32 = vec![0.0f32; dim];
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+        let committed = roaring::RoaringBitmap::new();
+
+        let non_mvcc = holder.search(&query_f32, &query_sq, 3, 64, &mut scratch);
+        let mvcc_ctx = super::holder::MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &committed,
+            dirty_set: &[],
+            dirty_vectors_sq: &[],
+            dimension: dim as u32,
+        };
+        let mvcc = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_ctx);
+
+        assert_eq!(non_mvcc.len(), mvcc.len());
+        for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {
+            assert_eq!(a.id.0, b.id.0);
+        }
+    }
+
+    #[test]
+    fn test_holder_search_mvcc_filters_by_snapshot() {
+        distance::init();
+        let dim = 4;
+        let holder = SegmentHolder::new(dim as u32);
+        {
+            let snap = holder.load();
+            // insert_lsn=1, visible to snapshot=5
+            snap.mutable.append(0, &[0.0f32; 4], &[0i8; 4], 1.0, 1);
+            // insert_lsn=10, NOT visible to snapshot=5
+            snap.mutable.append(1, &[0.0f32; 4], &[1i8; 4], 1.0, 10);
+        }
+        let query_sq = vec![0i8; dim];
+        let query_f32 = vec![0.0f32; dim];
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+        let committed = roaring::RoaringBitmap::new();
+        let mvcc_ctx = super::holder::MvccContext {
+            snapshot_lsn: 5,
+            my_txn_id: 99,
+            committed: &committed,
+            dirty_set: &[],
+            dirty_vectors_sq: &[],
+            dimension: dim as u32,
+        };
+        let results = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_ctx);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.0, 0);
+    }
+
+    #[test]
+    fn test_holder_search_mvcc_dirty_set_merge() {
+        // Dirty set entries should appear in results (read-your-own-writes)
+        distance::init();
+        let dim = 4;
+        let holder = SegmentHolder::new(dim as u32);
+        {
+            let snap = holder.load();
+            // One existing entry far from query
+            snap.mutable.append(0, &[0.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
+        }
+        let query_sq = vec![0i8; dim];
+        let query_f32 = vec![0.0f32; dim];
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+        let committed = roaring::RoaringBitmap::new();
+
+        // Dirty set has one entry close to query
+        let dirty_entry = super::mutable::MutableEntry {
+            internal_id: 1000,
+            key_hash: 999,
+            vector_offset: 0,
+            norm: 1.0,
+            insert_lsn: 50,
+            delete_lsn: 0,
+            txn_id: 42,
+        };
+        let dirty_sq = vec![0i8; dim]; // identical to query -> distance 0
+
+        let mvcc_ctx = super::holder::MvccContext {
+            snapshot_lsn: 10,
+            my_txn_id: 42,
+            committed: &committed,
+            dirty_set: std::slice::from_ref(&dirty_entry),
+            dirty_vectors_sq: &dirty_sq,
+            dimension: dim as u32,
+        };
+        let results = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_ctx);
+
+        // Dirty entry should be first (distance 0)
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id.0, 1000);
+        assert_eq!(results[0].distance, 0.0);
+    }
+
+    #[test]
+    fn test_holder_search_mvcc_empty_dirty_set_matches_no_dirty() {
+        distance::init();
+        let dim = 8;
+        let holder = SegmentHolder::new(dim as u32);
+        {
+            let snap = holder.load();
+            for i in 0..5u32 {
+                let sq = make_sq_vector(dim, i * 13 + 1);
+                let f32_v = vec![0.0f32; dim];
+                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+            }
+        }
+        let query_sq = make_sq_vector(dim, 1);
+        let query_f32 = vec![0.0f32; dim];
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+        let committed = roaring::RoaringBitmap::new();
+
+        let mvcc_empty = super::holder::MvccContext {
+            snapshot_lsn: 10,
+            my_txn_id: 99,
+            committed: &committed,
+            dirty_set: &[],
+            dirty_vectors_sq: &[],
+            dimension: dim as u32,
+        };
+        let r1 = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_empty);
+
+        // Same with explicit empty dirty set
+        let mvcc_empty2 = super::holder::MvccContext {
+            snapshot_lsn: 10,
+            my_txn_id: 99,
+            committed: &committed,
+            dirty_set: &[],
+            dirty_vectors_sq: &[],
+            dimension: dim as u32,
+        };
+        let r2 = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_empty2);
+
+        assert_eq!(r1.len(), r2.len());
+        for (a, b) in r1.iter().zip(r2.iter()) {
+            assert_eq!(a.id.0, b.id.0);
+        }
+    }
+
+    #[test]
     fn test_holder_snapshot_isolation() {
         let holder = SegmentHolder::new(128);
 
