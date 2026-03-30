@@ -117,3 +117,11 @@ harness = false
 [[bench]]
 name = "distance_bench"
 harness = false
+
+[[bench]]
+name = "hnsw_bench"
+harness = false
+
+[[bench]]
+name = "fwht_bench"
+harness = false
