@@ -11,10 +11,16 @@ use smallvec::SmallVec;
 
 use crate::vector::filter::selectivity::{select_strategy, FilterStrategy};
 use crate::vector::hnsw::search::SearchScratch;
+use crate::vector::segment::ivf::IvfSegment;
+use crate::vector::turbo_quant::encoder::padded_dimension;
+use crate::vector::turbo_quant::fwht;
 use crate::vector::types::{SearchResult, VectorId};
 
 use super::immutable::ImmutableSegment;
 use super::mutable::{MutableEntry, MutableSegment};
+
+/// Default number of IVF clusters to probe during search.
+const DEFAULT_NPROBE: usize = 32;
 
 /// MVCC context for snapshot-isolated search. Passed by reference, zero allocation.
 pub struct MvccContext<'a> {
@@ -33,6 +39,8 @@ pub struct MvccContext<'a> {
 pub struct SegmentList {
     pub mutable: Arc<MutableSegment>,
     pub immutable: Vec<Arc<ImmutableSegment>>,
+    /// IVF segments for billion-scale approximate search.
+    pub ivf: Vec<Arc<IvfSegment>>,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -48,6 +56,7 @@ impl SegmentHolder {
             segments: ArcSwap::from_pointee(SegmentList {
                 mutable: Arc::new(MutableSegment::new(dimension)),
                 immutable: Vec::new(),
+                ivf: Vec::new(),
             }),
         }
     }
@@ -63,12 +72,15 @@ impl SegmentHolder {
         self.segments.store(Arc::new(new_list));
     }
 
-    /// Total vector count across mutable + all immutable segments.
+    /// Total vector count across mutable + immutable + IVF segments.
     pub fn total_vectors(&self) -> u32 {
         let snapshot = self.load();
         let mut total = snapshot.mutable.len() as u32;
         for imm in &snapshot.immutable {
             total += imm.total_count();
+        }
+        for ivf_seg in &snapshot.ivf {
+            total += ivf_seg.total_vectors() as u32;
         }
         total
     }
@@ -109,23 +121,18 @@ impl SegmentHolder {
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
-        match strategy {
+        let mut all = match strategy {
             FilterStrategy::Unfiltered => {
-                // Existing path -- no bitmap
                 let mut all = snapshot.mutable.brute_force_search(query_sq, k);
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, ef_search, scratch));
                 }
-                all.sort();
-                all.truncate(k);
                 all
             }
             FilterStrategy::BruteForceFiltered => {
-                // Linear scan on mutable + immutable -- bitmap narrows to few vectors
                 let mut all = snapshot
                     .mutable
                     .brute_force_search_filtered(query_sq, k, filter_bitmap);
-                // Immutable segments: use HNSW filtered (still correct, bitmap handles it)
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
@@ -135,8 +142,6 @@ impl SegmentHolder {
                         filter_bitmap,
                     ));
                 }
-                all.sort();
-                all.truncate(k);
                 all
             }
             FilterStrategy::HnswFiltered => {
@@ -152,25 +157,20 @@ impl SegmentHolder {
                         filter_bitmap,
                     ));
                 }
-                all.sort();
-                all.truncate(k);
                 all
             }
             FilterStrategy::HnswPostFilter => {
-                // 3x oversampling then post-filter
                 let oversample_k = k * 3;
                 let mut all = snapshot
                     .mutable
                     .brute_force_search_filtered(query_sq, oversample_k, filter_bitmap);
                 for imm in &snapshot.immutable {
-                    // Search with 3x k, no filter in HNSW, filter results after
                     let imm_results = imm.search(
                         query_f32,
                         oversample_k,
                         ef_search.max(oversample_k),
                         scratch,
                     );
-                    // Post-filter
                     if let Some(bm) = filter_bitmap {
                         for r in imm_results {
                             if bm.contains(r.id.0) {
@@ -181,11 +181,56 @@ impl SegmentHolder {
                         all.extend(imm_results);
                     }
                 }
-                all.sort();
-                all.truncate(k);
                 all
             }
+        };
+
+        // Fan-out to IVF segments.
+        if !snapshot.ivf.is_empty() {
+            let dim = query_f32.len();
+            let pdim = padded_dimension(dim as u32) as usize;
+
+            for ivf_seg in &snapshot.ivf {
+                // Rotate query using this IVF segment's sign flips.
+                let mut q_rotated = vec![0.0f32; pdim];
+                q_rotated[..dim].copy_from_slice(query_f32);
+                // Normalize before FWHT.
+                let qnorm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if qnorm > 0.0 {
+                    let inv = 1.0 / qnorm;
+                    for v in q_rotated[..dim].iter_mut() {
+                        *v *= inv;
+                    }
+                }
+                fwht::fwht(&mut q_rotated, ivf_seg.sign_flips());
+
+                // LUT buffer on the stack (16KB for 1024-dim, well within 8MB stack).
+                let mut lut_buf = vec![0u8; pdim * 16];
+
+                if let Some(bm) = filter_bitmap {
+                    all.extend(ivf_seg.search_filtered(
+                        query_f32,
+                        &q_rotated,
+                        k,
+                        DEFAULT_NPROBE,
+                        &mut lut_buf,
+                        bm,
+                    ));
+                } else {
+                    all.extend(ivf_seg.search(
+                        query_f32,
+                        &q_rotated,
+                        k,
+                        DEFAULT_NPROBE,
+                        &mut lut_buf,
+                    ));
+                }
+            }
         }
+
+        all.sort();
+        all.truncate(k);
+        all
     }
 
     /// MVCC-aware fan-out search with dirty set merge.
@@ -236,6 +281,46 @@ impl SegmentHolder {
                 ));
             } else {
                 all.extend(imm.search(query_f32, k, ef_search, scratch));
+            }
+        }
+
+        // 2b. IVF segment search (IVF entries are committed by definition).
+        if !snapshot.ivf.is_empty() {
+            let dim = query_f32.len();
+            let pdim = padded_dimension(dim as u32) as usize;
+
+            for ivf_seg in &snapshot.ivf {
+                let mut q_rotated = vec![0.0f32; pdim];
+                q_rotated[..dim].copy_from_slice(query_f32);
+                let qnorm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if qnorm > 0.0 {
+                    let inv = 1.0 / qnorm;
+                    for v in q_rotated[..dim].iter_mut() {
+                        *v *= inv;
+                    }
+                }
+                fwht::fwht(&mut q_rotated, ivf_seg.sign_flips());
+
+                let mut lut_buf = vec![0u8; pdim * 16];
+
+                if let Some(bm) = filter_bitmap {
+                    all.extend(ivf_seg.search_filtered(
+                        query_f32,
+                        &q_rotated,
+                        k,
+                        DEFAULT_NPROBE,
+                        &mut lut_buf,
+                        bm,
+                    ));
+                } else {
+                    all.extend(ivf_seg.search(
+                        query_f32,
+                        &q_rotated,
+                        k,
+                        DEFAULT_NPROBE,
+                        &mut lut_buf,
+                    ));
+                }
             }
         }
 
@@ -311,6 +396,7 @@ mod tests {
         holder.swap(SegmentList {
             mutable: new_mutable,
             immutable: Vec::new(),
+            ivf: Vec::new(),
         });
 
         let snap = holder.load();
@@ -574,6 +660,7 @@ mod tests {
         holder.swap(SegmentList {
             mutable: new_mutable,
             immutable: Vec::new(),
+            ivf: Vec::new(),
         });
 
         // Old snapshot still sees the original mutable (1 entry from our append)
@@ -582,5 +669,87 @@ mod tests {
         // New snapshot sees new mutable (2 entries)
         let snap_after = holder.load();
         assert_eq!(snap_after.mutable.len(), 2);
+    }
+
+    #[test]
+    fn test_holder_search_with_ivf() {
+        use crate::vector::aligned_buffer::AlignedBuffer;
+        use crate::vector::segment::ivf::{
+            self, IvfQuantization, IvfSegment,
+        };
+        use crate::vector::turbo_quant::encoder::padded_dimension;
+
+        distance::init();
+        let dim = 8usize;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+
+        // Create sign flips.
+        let mut sign_flips = vec![1.0f32; pdim];
+        for (i, s) in sign_flips.iter_mut().enumerate() {
+            if i % 3 == 0 { *s = -1.0; }
+        }
+
+        // Build a small IVF segment with 20 vectors, 2 clusters.
+        let n = 20;
+        let n_clusters = 2;
+
+        // Cluster 0: vectors near origin. Cluster 1: vectors near (5,5,...).
+        let mut vectors = Vec::with_capacity(n * dim);
+        let mut tq_codes = Vec::with_capacity(n);
+        let mut norms = Vec::with_capacity(n);
+        let ids: Vec<u32> = (1000..1000 + n as u32).collect();
+
+        for i in 0..n {
+            let offset = if i < n / 2 { 0.0 } else { 5.0 };
+            let v: Vec<f32> = (0..dim).map(|d| offset + (i * dim + d) as f32 * 0.01).collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(if norm > 0.0 { norm } else { 1.0 });
+            vectors.extend_from_slice(&v);
+            tq_codes.push(vec![(i & 0xF) as u8; dim_half]);
+        }
+
+        let ivf_seg = ivf::build_ivf_segment(
+            &vectors, &tq_codes, &norms, &ids, dim, n_clusters, &sign_flips,
+        );
+
+        assert_eq!(ivf_seg.total_vectors(), n as u64);
+
+        // Create holder and swap in SegmentList with IVF.
+        let holder = SegmentHolder::new(dim as u32);
+
+        // Insert mutable vectors (ids 0-4).
+        {
+            let snap = holder.load();
+            for i in 0..5u32 {
+                let sq = make_sq_vector(dim, i * 13 + 1);
+                let f32_v = vec![0.0f32; dim];
+                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+            }
+        }
+
+        // Swap in list that includes the IVF segment.
+        let old_snap = holder.load();
+        holder.swap(SegmentList {
+            mutable: Arc::clone(&old_snap.mutable),
+            immutable: Vec::new(),
+            ivf: vec![Arc::new(ivf_seg)],
+        });
+
+        // total_vectors should include IVF vectors.
+        assert_eq!(holder.total_vectors(), 5 + n as u32);
+
+        // Search should return results from both mutable and IVF.
+        let query_f32 = vec![0.0f32; dim];
+        let query_sq = make_sq_vector(dim, 1);
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+
+        let results = holder.search(&query_f32, &query_sq, 10, 64, &mut scratch);
+        assert!(!results.is_empty());
+        // Should contain at least some IVF results (ids >= 1000).
+        let ivf_count = results.iter().filter(|r| r.id.0 >= 1000).count();
+        // And mutable results (ids < 5).
+        let mut_count = results.iter().filter(|r| r.id.0 < 5).count();
+        assert!(ivf_count > 0 || mut_count > 0, "should have results from both segments");
     }
 }

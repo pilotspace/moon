@@ -137,6 +137,7 @@ impl VectorStore {
                 let new_list = crate::vector::segment::SegmentList {
                     mutable: Arc::new(recovered.mutable),
                     immutable: immutable_arcs,
+                    ivf: Vec::new(),
                 };
                 index.segments.swap(new_list);
             }

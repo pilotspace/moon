@@ -11,7 +11,7 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::distance::fastscan;
 use crate::vector::turbo_quant::codebook::CENTROIDS;
 use crate::vector::turbo_quant::encoder::padded_dimension;
-use crate::vector::types::{SearchResult, VectorId};
+use crate::vector::types::SearchResult;
 
 /// Quantization method used within IVF posting lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
