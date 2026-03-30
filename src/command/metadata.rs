@@ -67,6 +67,7 @@ impl AclCategories {
     pub const KEYSPACE: Self = Self(1 << 15);
     pub const WRITE_CAT: Self = Self(1 << 16);
     pub const READ_CAT: Self = Self(1 << 17);
+    pub const SEARCH: Self = Self(1 << 18);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
@@ -126,6 +127,7 @@ const PUB: AclCategories = AclCategories::PUBSUB;
 const SCR: AclCategories = AclCategories::SCRIPTING;
 const TXN: AclCategories = AclCategories::TRANSACTIONS;
 const DNG: AclCategories = AclCategories::DANGEROUS;
+const SRCH: AclCategories = AclCategories::SEARCH;
 
 // ---------------------------------------------------------------------------
 // Static registry — phf perfect-hash map keyed by uppercase command name
@@ -341,6 +343,12 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "REPLCONF" => CommandMeta { name: "REPLCONF", arity: -1, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "PSYNC" => CommandMeta { name: "PSYNC", arity: 3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "CLUSTER" => CommandMeta { name: "CLUSTER", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+
+    // ---- Vector search commands ----
+    "FT.CREATE" => CommandMeta { name: "FT.CREATE", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
+    "FT.SEARCH" => CommandMeta { name: "FT.SEARCH", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
+    "FT.DROPINDEX" => CommandMeta { name: "FT.DROPINDEX", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
+    "FT.INFO" => CommandMeta { name: "FT.INFO", arity: 2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
 };
 
 // ---------------------------------------------------------------------------

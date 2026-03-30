@@ -16,6 +16,7 @@ use crate::config::RuntimeConfig;
 use crate::persistence::replay::DispatchReplayEngine;
 use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
+use crate::vector::store::VectorStore;
 
 /// A shard owns all per-core state. No Arc, no Mutex -- fully owned by its thread.
 ///
@@ -33,6 +34,8 @@ pub struct Shard {
     pub runtime_config: RuntimeConfig,
     /// Per-shard Pub/Sub registry -- no global Mutex, fully owned by shard thread.
     pub pubsub_registry: PubSubRegistry,
+    /// Per-shard vector store -- no Arc, no Mutex, fully owned by shard thread.
+    pub vector_store: VectorStore,
 }
 
 impl Shard {
@@ -45,6 +48,7 @@ impl Shard {
             num_shards,
             runtime_config: config,
             pubsub_registry: PubSubRegistry::new(),
+            vector_store: VectorStore::new(),
         }
     }
 
