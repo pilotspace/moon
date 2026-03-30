@@ -295,6 +295,87 @@ pub fn tq_l2_adc_budgeted(
     (sum0 + sum1 + sum2 + sum3) * norm_sq
 }
 
+use smallvec::SmallVec;
+use crate::vector::turbo_quant::collection::CollectionMetadata;
+use crate::vector::turbo_quant::fwht;
+use crate::vector::types::{SearchResult, VectorId};
+
+/// Brute-force scan of ALL TQ codes using asymmetric distance computation.
+///
+/// This is the paper-validated NN search method (arXiv 2504.19874 Section 4.4).
+/// TQ-ADC is correct for exhaustive scan but NOT for HNSW greedy navigation
+/// (use hnsw_search_f32 for graph traversal).
+///
+/// `query`: raw f32 query vector (original dimension, NOT rotated).
+/// `tq_buffer`: flat buffer of TQ codes. Layout per code: [nibbles (pdim/2)] [norm (4 bytes)].
+///   Codes may be in any order (original-ID or BFS order).
+/// `n_vectors`: number of vectors in the buffer.
+/// `collection`: metadata with sign flips, codebook, padded dimension.
+/// `k`: number of nearest neighbors to return.
+///
+/// Returns up to k SearchResults sorted by distance ascending.
+pub fn brute_force_tq_adc(
+    query: &[f32],
+    tq_buffer: &[u8],
+    n_vectors: usize,
+    collection: &CollectionMetadata,
+    k: usize,
+) -> SmallVec<[SearchResult; 32]> {
+    if n_vectors == 0 || k == 0 {
+        return SmallVec::new();
+    }
+
+    let dim = query.len();
+    let padded = collection.padded_dimension as usize;
+    let bytes_per_code = padded / 2 + 4;
+    let code_len = padded / 2;
+    let codebook = &collection.codebook;
+
+    // Prepare rotated query: normalize, pad, FWHT
+    let mut q_rotated = vec![0.0f32; padded];
+    q_rotated[..dim].copy_from_slice(query);
+    for v in q_rotated[dim..padded].iter_mut() {
+        *v = 0.0;
+    }
+    let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if q_norm > 0.0 {
+        let inv = 1.0 / q_norm;
+        for v in q_rotated[..dim].iter_mut() {
+            *v *= inv;
+        }
+    }
+    fwht::fwht(&mut q_rotated[..padded], collection.fwht_sign_flips.as_slice());
+
+    // Scan all vectors, keep top-K in a max-heap
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<(ordered_float::OrderedFloat<f32>, u32)> = BinaryHeap::new();
+
+    for i in 0..n_vectors {
+        let offset = i * bytes_per_code;
+        let code = &tq_buffer[offset..offset + code_len];
+        let norm_bytes = &tq_buffer[offset + code_len..offset + code_len + 4];
+        let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+        let dist = tq_l2_adc_scaled(&q_rotated, code, norm, codebook);
+
+        if heap.len() < k {
+            heap.push((ordered_float::OrderedFloat(dist), i as u32));
+        } else if let Some(&(worst, _)) = heap.peek() {
+            if dist < worst.0 {
+                heap.pop();
+                heap.push((ordered_float::OrderedFloat(dist), i as u32));
+            }
+        }
+    }
+
+    // Extract sorted results
+    let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
+    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    results.into_iter()
+        .map(|(d, id)| SearchResult::new(d, VectorId(id)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +566,123 @@ mod tests {
         let code = [0x21, 0x43]; // arbitrary nibbles
         let dist = tq_l2_adc_scalar(&q, &code, 1.5);
         assert!(dist >= 0.0, "distance must be non-negative, got {dist}");
+    }
+
+    #[test]
+    fn test_brute_force_tq_adc_recall() {
+        use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
+        use crate::vector::types::DistanceMetric;
+        use std::sync::Arc;
+
+        fwht::init_fwht();
+        let n = 1000;
+        let dim = 128;
+        let collection = Arc::new(CollectionMetadata::new(
+            1, dim as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        ));
+        let padded = collection.padded_dimension as usize;
+        let signs = collection.fwht_sign_flips.as_slice();
+        let boundaries = &collection.codebook_boundaries;
+        let bytes_per_code = padded / 2 + 4;
+
+        // Generate and encode vectors using scaled boundaries (matching collection codebook)
+        let mut vectors = Vec::with_capacity(n);
+        let mut tq_buffer: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
+        let mut work = vec![0.0f32; padded];
+
+        for i in 0..n {
+            let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+            normalize(&mut v);
+            let code = encode_tq_mse_scaled(&v, signs, boundaries, &mut work);
+            tq_buffer.extend_from_slice(&code.codes);
+            tq_buffer.extend_from_slice(&code.norm.to_le_bytes());
+            vectors.push(v);
+        }
+
+        // Test recall over 50 queries
+        let k = 10;
+        let num_queries = 50;
+        let mut total_recall = 0.0f64;
+
+        for qi in 0..num_queries {
+            let mut query = lcg_f32(dim, (qi * 31 + 997) as u32);
+            normalize(&mut query);
+
+            // True L2 brute force ground truth
+            let mut true_dists: Vec<(f32, usize)> = vectors.iter().enumerate()
+                .map(|(idx, v)| {
+                    let d: f32 = query.iter().zip(v.iter())
+                        .map(|(a, b)| { let diff = a - b; diff * diff })
+                        .sum();
+                    (d, idx)
+                })
+                .collect();
+            true_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let true_top_k: Vec<usize> = true_dists.iter().take(k).map(|&(_, id)| id).collect();
+
+            // TQ-ADC brute force
+            let results = brute_force_tq_adc(&query, &tq_buffer, n, &collection, k);
+            let adc_top_k: Vec<usize> = results.iter().map(|r| r.id.0 as usize).collect();
+
+            // Count overlap
+            let hits = adc_top_k.iter().filter(|id| true_top_k.contains(id)).count();
+            total_recall += hits as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / num_queries as f64;
+        eprintln!("brute_force_tq_adc recall@{k}: {avg_recall:.4}");
+        // 4-bit ADC at 128d achieves ~0.80-0.85 recall (dimension-dependent).
+        // Higher dimensions (768d) achieve 0.90+ due to better FWHT concentration.
+        assert!(avg_recall >= 0.80, "recall@{k} = {avg_recall:.4}, expected >= 0.80");
+    }
+
+    #[test]
+    fn test_brute_force_tq_adc_empty() {
+        use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+        use crate::vector::types::DistanceMetric;
+        use std::sync::Arc;
+
+        fwht::init_fwht();
+        let collection = Arc::new(CollectionMetadata::new(
+            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        ));
+        let query = vec![0.1f32; 128];
+        let results = brute_force_tq_adc(&query, &[], 0, &collection, 10);
+        assert!(results.is_empty(), "empty buffer should return empty results");
+    }
+
+    #[test]
+    fn test_brute_force_tq_adc_k_larger_than_n() {
+        use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
+        use crate::vector::types::DistanceMetric;
+        use std::sync::Arc;
+
+        fwht::init_fwht();
+        let n = 10;
+        let dim = 128;
+        let collection = Arc::new(CollectionMetadata::new(
+            1, dim as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        ));
+        let padded = collection.padded_dimension as usize;
+        let signs = collection.fwht_sign_flips.as_slice();
+        let boundaries = &collection.codebook_boundaries;
+        let bytes_per_code = padded / 2 + 4;
+
+        let mut tq_buffer: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
+        let mut work = vec![0.0f32; padded];
+
+        for i in 0..n {
+            let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+            normalize(&mut v);
+            let code = encode_tq_mse_scaled(&v, signs, boundaries, &mut work);
+            tq_buffer.extend_from_slice(&code.codes);
+            tq_buffer.extend_from_slice(&code.norm.to_le_bytes());
+        }
+
+        let query = vec![0.1f32; dim];
+        let results = brute_force_tq_adc(&query, &tq_buffer, n, &collection, 100);
+        assert_eq!(results.len(), n, "k=100 with n=10 should return 10 results");
     }
 }

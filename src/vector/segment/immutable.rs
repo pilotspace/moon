@@ -148,6 +148,32 @@ impl ImmutableSegment {
         }
     }
 
+    /// Brute-force TQ-ADC scan over all vectors in this segment.
+    ///
+    /// Used for small segments, IVF posting lists, or when exhaustive search
+    /// is preferred over approximate HNSW traversal. Vector IDs in results
+    /// are original IDs (not BFS positions).
+    pub fn brute_force_search(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> SmallVec<[SearchResult; 32]> {
+        use crate::vector::turbo_quant::tq_adc::brute_force_tq_adc;
+        use crate::vector::types::VectorId;
+        let mut results = brute_force_tq_adc(
+            query,
+            self.vectors_tq.as_slice(),
+            self.total_count as usize,
+            &self.collection_meta,
+            k,
+        );
+        // Map BFS positions back to original IDs
+        for r in results.iter_mut() {
+            r.id = VectorId(self.graph.to_original(r.id.0));
+        }
+        results
+    }
+
     /// Mark an entry as deleted. Only called during vacuum rebuild setup.
     pub fn mark_deleted(&mut self, internal_id: u32, delete_lsn: u64) {
         if let Some(header) = self.mvcc.get_mut(internal_id as usize) {
