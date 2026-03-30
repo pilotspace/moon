@@ -8,4 +8,6 @@ pub mod codebook;
 pub mod collection;
 pub mod encoder;
 pub mod fwht;
+pub mod inner_product;
+pub mod qjl;
 pub mod tq_adc;
