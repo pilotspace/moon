@@ -416,4 +416,100 @@ mod tests {
         let frozen = seg.freeze();
         assert_eq!(frozen.entries[0].delete_lsn, 42);
     }
+
+    // -- MVCC tests (Phase 65-02) --
+
+    #[test]
+    fn test_brute_force_search_mvcc_backward_compat() {
+        // snapshot_lsn=0 with empty committed should return same results as non-MVCC search
+        distance::init();
+        let dim = 8;
+        let seg = MutableSegment::new(dim as u32);
+        for i in 0..10u32 {
+            let f32_v = make_f32_vector(dim, i * 7 + 1);
+            let sq_v = make_sq_vector(dim, i * 7 + 1);
+            seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64);
+        }
+        let query = make_sq_vector(dim, 1);
+        let committed = roaring::RoaringBitmap::new();
+
+        let non_mvcc = seg.brute_force_search(&query, 3);
+        let mvcc = seg.brute_force_search_mvcc(&query, 3, None, 0, 0, &committed);
+
+        assert_eq!(non_mvcc.len(), mvcc.len());
+        for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {
+            assert_eq!(a.id.0, b.id.0);
+            assert_eq!(a.distance, b.distance);
+        }
+    }
+
+    #[test]
+    fn test_brute_force_search_mvcc_filters_by_snapshot() {
+        // Entries with insert_lsn > snapshot should be invisible
+        distance::init();
+        let dim = 4;
+        let seg = MutableSegment::new(dim as u32);
+        let f32_v = [0.0f32; 4];
+
+        // insert_lsn=1, should be visible to snapshot=5
+        seg.append(0, &f32_v, &[0i8, 0, 0, 0], 1.0, 1);
+        // insert_lsn=10, should NOT be visible to snapshot=5
+        seg.append(1, &f32_v, &[1i8, 1, 1, 1], 1.0, 10);
+
+        let committed = roaring::RoaringBitmap::new();
+        let results = seg.brute_force_search_mvcc(&[0i8, 0, 0, 0], 3, None, 5, 99, &committed);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.0, 0);
+    }
+
+    #[test]
+    fn test_brute_force_search_mvcc_filters_uncommitted_other_txn() {
+        // Entries owned by another uncommitted txn should be invisible
+        distance::init();
+        let dim = 4;
+        let seg = MutableSegment::new(dim as u32);
+        let f32_v = [0.0f32; 4];
+
+        seg.append(0, &f32_v, &[0i8, 0, 0, 0], 1.0, 1); // txn_id=0
+
+        // Manually append with txn_id via append_transactional
+        seg.append_transactional(1, &f32_v, &[1i8, 1, 1, 1], 1.0, 2, 42); // txn_id=42
+
+        let committed = roaring::RoaringBitmap::new(); // 42 not committed
+        // my_txn_id=99 (not 42), snapshot=10
+        let results = seg.brute_force_search_mvcc(&[0i8, 0, 0, 0], 3, None, 10, 99, &committed);
+
+        // Only entry 0 should be visible (entry 1 owned by uncommitted txn 42)
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.0, 0);
+    }
+
+    #[test]
+    fn test_brute_force_search_mvcc_read_own_writes() {
+        // Entries owned by my_txn_id should be visible even if not committed
+        distance::init();
+        let dim = 4;
+        let seg = MutableSegment::new(dim as u32);
+        let f32_v = [0.0f32; 4];
+
+        seg.append_transactional(0, &f32_v, &[0i8, 0, 0, 0], 1.0, 5, 42); // my txn
+
+        let committed = roaring::RoaringBitmap::new();
+        let results = seg.brute_force_search_mvcc(&[0i8, 0, 0, 0], 3, None, 10, 42, &committed);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.0, 0);
+    }
+
+    #[test]
+    fn test_append_transactional_sets_txn_id() {
+        let seg = MutableSegment::new(4);
+        seg.append_transactional(100, &[1.0f32; 4], &[1i8; 4], 1.5, 5, 42);
+
+        let frozen = seg.freeze();
+        assert_eq!(frozen.entries[0].txn_id, 42);
+        assert_eq!(frozen.entries[0].insert_lsn, 5);
+        assert_eq!(frozen.entries[0].key_hash, 100);
+    }
 }

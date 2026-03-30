@@ -244,4 +244,22 @@ mod tests {
 
         assert!(store.get_index(b"nonexistent").is_none());
     }
+
+    // -- MVCC tests (Phase 65-02) --
+
+    #[test]
+    fn test_vector_store_has_txn_manager() {
+        let store = VectorStore::new();
+        // txn_manager accessible, starts with 0 active
+        assert_eq!(store.txn_manager().active_count(), 0);
+        assert_eq!(store.txn_manager().committed_count(), 0);
+    }
+
+    #[test]
+    fn test_vector_store_txn_manager_mut() {
+        let mut store = VectorStore::new();
+        let txn = store.txn_manager_mut().begin();
+        assert_eq!(txn.txn_id, 1);
+        assert_eq!(store.txn_manager().active_count(), 1);
+    }
 }
