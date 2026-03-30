@@ -206,12 +206,13 @@ pub fn hnsw_search_filtered(
     for v in q_rot[dim..padded].iter_mut() {
         *v = 0.0;
     }
-    // Normalize query for FWHT
-    let mut norm_sq = 0.0f32;
+    // Compute query norm BEFORE normalization (needed for distance correction)
+    let mut q_norm_sq = 0.0f32;
     for &v in &q_rot[..dim] {
-        norm_sq += v * v;
+        q_norm_sq += v * v;
     }
-    let q_norm = norm_sq.sqrt();
+    let q_norm = q_norm_sq.sqrt();
+    // Normalize query to unit length (TQ operates on unit sphere)
     if q_norm > 0.0 {
         let inv = 1.0 / q_norm;
         for v in q_rot[..dim].iter_mut() {
@@ -221,13 +222,13 @@ pub fn hnsw_search_filtered(
     // Apply FWHT with collection's sign flips
     fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
 
-    // Use tq_l2_adc directly instead of through DistanceTable function pointer.
-    // All DistanceTable tiers use the same scalar ADC (SIMD ADC is future work).
-    // Direct call enables inlining and avoids indirect-call overhead in the hot loop.
-    use crate::vector::turbo_quant::tq_adc::{tq_l2_adc_scalar, tq_l2_adc_budgeted};
+    // Use dimension-scaled TQ-ADC directly (not through DistanceTable function pointer).
+    // The collection's codebook is scaled by 1/sqrt(padded_dim) to match FWHT normalization.
+    use crate::vector::turbo_quant::tq_adc::{tq_l2_adc_scaled, tq_l2_adc_scaled_budgeted};
 
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
+    let codebook = &collection.codebook;
 
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;
@@ -239,7 +240,7 @@ pub fn hnsw_search_filtered(
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        tq_l2_adc_scalar(q_rotated, code_only, norm)
+        tq_l2_adc_scaled(q_rotated, code_only, norm, codebook)
     };
 
     // Budgeted distance: used in layer 0 beam search. Aborts early when partial
@@ -250,7 +251,7 @@ pub fn hnsw_search_filtered(
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        tq_l2_adc_budgeted(q_rotated, code_only, norm, budget)
+        tq_l2_adc_scaled_budgeted(q_rotated, code_only, norm, codebook, budget)
     };
 
     // Step 2: Upper layer greedy descent (original node ID space)

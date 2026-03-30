@@ -8,6 +8,138 @@
 
 use super::codebook::CENTROIDS;
 
+/// Asymmetric L2 distance using dimension-scaled centroids.
+///
+/// Same algorithm as `tq_l2_adc_scalar` but accepts the codebook as a parameter
+/// instead of using the hardcoded (1/sqrt(768)) CENTROIDS constant.
+/// This is the correct version for production use.
+#[inline]
+pub fn tq_l2_adc_scaled(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    centroids: &[f32; 16],
+) -> f32 {
+    let padded = q_rotated.len();
+    debug_assert_eq!(code.len(), padded / 2);
+
+    let norm_sq = norm * norm;
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+
+    let code_len = code.len();
+    let chunks = code_len / 4;
+    let remainder = code_len % 4;
+
+    for c in 0..chunks {
+        let base = c * 4;
+        let qbase = base * 2;
+
+        let b0 = code[base];
+        let b1 = code[base + 1];
+        let b2 = code[base + 2];
+        let b3 = code[base + 3];
+
+        let d0lo = q_rotated[qbase] - centroids[(b0 & 0x0F) as usize];
+        let d0hi = q_rotated[qbase + 1] - centroids[(b0 >> 4) as usize];
+        sum0 += d0lo * d0lo + d0hi * d0hi;
+
+        let d1lo = q_rotated[qbase + 2] - centroids[(b1 & 0x0F) as usize];
+        let d1hi = q_rotated[qbase + 3] - centroids[(b1 >> 4) as usize];
+        sum1 += d1lo * d1lo + d1hi * d1hi;
+
+        let d2lo = q_rotated[qbase + 4] - centroids[(b2 & 0x0F) as usize];
+        let d2hi = q_rotated[qbase + 5] - centroids[(b2 >> 4) as usize];
+        sum2 += d2lo * d2lo + d2hi * d2hi;
+
+        let d3lo = q_rotated[qbase + 6] - centroids[(b3 & 0x0F) as usize];
+        let d3hi = q_rotated[qbase + 7] - centroids[(b3 >> 4) as usize];
+        sum3 += d3lo * d3lo + d3hi * d3hi;
+    }
+
+    let tail_start = chunks * 4;
+    for j in 0..remainder {
+        let i = tail_start + j;
+        let byte = code[i];
+        let d_lo = q_rotated[i * 2] - centroids[(byte & 0x0F) as usize];
+        let d_hi = q_rotated[i * 2 + 1] - centroids[(byte >> 4) as usize];
+        sum0 += d_lo * d_lo + d_hi * d_hi;
+    }
+
+    (sum0 + sum1 + sum2 + sum3) * norm_sq
+}
+
+/// Budgeted version of `tq_l2_adc_scaled` with early termination.
+#[inline]
+pub fn tq_l2_adc_scaled_budgeted(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    centroids: &[f32; 16],
+    budget: f32,
+) -> f32 {
+    let padded = q_rotated.len();
+    debug_assert_eq!(code.len(), padded / 2);
+
+    let norm_sq = norm * norm;
+    let sum_budget = if norm_sq > 0.0 { budget / norm_sq } else { f32::MAX };
+
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+
+    let code_len = code.len();
+    let chunks = code_len / 4;
+    let remainder = code_len % 4;
+
+    for c in 0..chunks {
+        let base = c * 4;
+        let qbase = base * 2;
+
+        let b0 = code[base];
+        let b1 = code[base + 1];
+        let b2 = code[base + 2];
+        let b3 = code[base + 3];
+
+        let d0lo = q_rotated[qbase] - centroids[(b0 & 0x0F) as usize];
+        let d0hi = q_rotated[qbase + 1] - centroids[(b0 >> 4) as usize];
+        sum0 += d0lo * d0lo + d0hi * d0hi;
+
+        let d1lo = q_rotated[qbase + 2] - centroids[(b1 & 0x0F) as usize];
+        let d1hi = q_rotated[qbase + 3] - centroids[(b1 >> 4) as usize];
+        sum1 += d1lo * d1lo + d1hi * d1hi;
+
+        let d2lo = q_rotated[qbase + 4] - centroids[(b2 & 0x0F) as usize];
+        let d2hi = q_rotated[qbase + 5] - centroids[(b2 >> 4) as usize];
+        sum2 += d2lo * d2lo + d2hi * d2hi;
+
+        let d3lo = q_rotated[qbase + 6] - centroids[(b3 & 0x0F) as usize];
+        let d3hi = q_rotated[qbase + 7] - centroids[(b3 >> 4) as usize];
+        sum3 += d3lo * d3lo + d3hi * d3hi;
+
+        if c & 15 == 15 {
+            let partial = sum0 + sum1 + sum2 + sum3;
+            if partial > sum_budget {
+                return f32::MAX;
+            }
+        }
+    }
+
+    let tail_start = chunks * 4;
+    for j in 0..remainder {
+        let i = tail_start + j;
+        let byte = code[i];
+        let d_lo = q_rotated[i * 2] - centroids[(byte & 0x0F) as usize];
+        let d_hi = q_rotated[i * 2 + 1] - centroids[(byte >> 4) as usize];
+        sum0 += d_lo * d_lo + d_hi * d_hi;
+    }
+
+    (sum0 + sum1 + sum2 + sum3) * norm_sq
+}
+
 /// Asymmetric L2 distance: full-precision query vs TQ code.
 ///
 /// `q_rotated`: pre-rotated query (already FWHT'd, length = padded_dim).

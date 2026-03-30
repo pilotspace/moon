@@ -6,7 +6,7 @@
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::types::DistanceMetric;
-use super::codebook::{CENTROIDS, CODEBOOK_VERSION, BOUNDARIES};
+use super::codebook::{CODEBOOK_VERSION, scaled_centroids, scaled_boundaries};
 use super::encoder::padded_dimension;
 
 /// Quantization algorithm selector.
@@ -93,8 +93,8 @@ impl CollectionMetadata {
             quantization,
             fwht_sign_flips: sign_flips,
             codebook_version: CODEBOOK_VERSION,
-            codebook: CENTROIDS,
-            codebook_boundaries: BOUNDARIES,
+            codebook: scaled_centroids(padded),
+            codebook_boundaries: scaled_boundaries(padded),
             metadata_checksum: 0, // computed below
         };
         meta.metadata_checksum = meta.compute_checksum();

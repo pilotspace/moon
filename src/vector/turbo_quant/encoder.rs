@@ -6,7 +6,7 @@
 //! Achieves 8x compression (768d f32 -> 512 bytes + 4 bytes norm)
 //! at <= 0.009 MSE distortion for unit vectors (Theorem 1).
 
-use super::codebook::{CENTROIDS, quantize_scalar};
+use super::codebook::{CENTROIDS, quantize_scalar, quantize_with_boundaries};
 use super::fwht;
 
 /// Encoded TurboQuant representation of a single vector.
@@ -101,10 +101,63 @@ pub fn encode_tq_mse(vector: &[f32], sign_flips: &[f32], work_buf: &mut [f32]) -
     // Step 4: Randomized FWHT (uses OnceLock-dispatched fn)
     fwht::fwht(&mut work_buf[..padded], sign_flips);
 
-    // Step 5: Quantize each coordinate
+    // Step 5: Quantize each coordinate (legacy: uses hardcoded 1/sqrt(768) boundaries)
     let mut indices = Vec::with_capacity(padded);
     for &val in work_buf[..padded].iter() {
         indices.push(quantize_scalar(val));
+    }
+
+    // Step 6: Nibble pack
+    let codes = nibble_pack(&indices);
+
+    TqCode { codes, norm }
+}
+
+/// Encode using dimension-adaptive scaled boundaries.
+///
+/// Same as `encode_tq_mse` but uses the provided scaled boundaries
+/// instead of the legacy hardcoded 1/sqrt(768) boundaries.
+/// This version produces correct quantization for ANY dimension.
+pub fn encode_tq_mse_scaled(
+    vector: &[f32],
+    sign_flips: &[f32],
+    boundaries: &[f32; 15],
+    work_buf: &mut [f32],
+) -> TqCode {
+    let dim = vector.len();
+    let padded = padded_dimension(dim as u32) as usize;
+    debug_assert!(work_buf.len() >= padded);
+    debug_assert_eq!(sign_flips.len(), padded);
+
+    // Step 1: Compute norm
+    let mut norm_sq = 0.0f32;
+    for &v in vector {
+        norm_sq += v * v;
+    }
+    let norm = norm_sq.sqrt();
+
+    // Step 2+3: Normalize and pad into work buffer
+    if norm > 0.0 {
+        let inv_norm = 1.0 / norm;
+        for (dst, &src) in work_buf[..dim].iter_mut().zip(vector.iter()) {
+            *dst = src * inv_norm;
+        }
+    } else {
+        for dst in work_buf[..dim].iter_mut() {
+            *dst = 0.0;
+        }
+    }
+    for dst in work_buf[dim..padded].iter_mut() {
+        *dst = 0.0;
+    }
+
+    // Step 4: Randomized FWHT
+    fwht::fwht(&mut work_buf[..padded], sign_flips);
+
+    // Step 5: Quantize each coordinate with dimension-scaled boundaries
+    let mut indices = Vec::with_capacity(padded);
+    for &val in work_buf[..padded].iter() {
+        indices.push(quantize_with_boundaries(val, boundaries));
     }
 
     // Step 6: Nibble pack

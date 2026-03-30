@@ -1,79 +1,112 @@
 //! Lloyd-Max 16-centroid codebook for TurboQuant 4-bit quantization.
 //!
-//! After randomized FWHT of a unit vector in R^d (d=768, padded to 1024),
-//! each coordinate follows approximately N(0, 1/sqrt(d)). The Lloyd-Max
+//! After randomized FWHT of a unit vector in R^d (padded to next power of 2),
+//! each coordinate follows approximately N(0, 1/sqrt(padded_dim)). The Lloyd-Max
 //! algorithm finds centroids that minimize mean squared error for this
 //! distribution.
 //!
-//! The standard Lloyd-Max centroids for N(0,1) at 16 levels are scaled
-//! by sigma = 1/sqrt(768) to match the FWHT output distribution.
+//! The standard Lloyd-Max centroids for N(0,1) at 16 levels are stored
+//! UNSCALED. Scaling by sigma = 1/sqrt(padded_dim) happens at runtime
+//! via `scaled_centroids()` and `scaled_boundaries()`, which are stored
+//! in CollectionMetadata per collection.
+//!
+//! CRITICAL: The previous version hardcoded 1/sqrt(768) scaling, which was
+//! WRONG for any dimension != 768 (e.g., 128 pads to 128, 768 pads to 1024).
+//! The FWHT normalization uses 1/sqrt(padded_dim), so the codebook must match.
 
 /// Codebook version for forward compatibility.
-///
-/// Checked at segment load time. Future codebook changes use versioned decode.
-pub const CODEBOOK_VERSION: u8 = 1;
+/// Bumped to 2: dimension-adaptive scaling (fixes recall bug from v1).
+pub const CODEBOOK_VERSION: u8 = 2;
 
-/// Lloyd-Max optimal 16-centroid codebook for FWHT-rotated unit vectors.
+/// Standard N(0,1) Lloyd-Max 16-level centroids (Panter & Dite, 1951).
+/// UNSCALED — must be multiplied by sigma = 1/sqrt(padded_dim) before use.
 ///
-/// Standard N(0,1) Lloyd-Max 16-level centroids (Panter & Dite, 1951):
 ///   +/-2.4008, +/-1.8435, +/-1.4371, +/-1.0993,
 ///   +/-0.7990, +/-0.5282, +/-0.2743, +/-0.0298
 ///
-/// Scaled by sigma = 1/sqrt(768) = 0.036084...
-///
 /// Invariants:
 /// - Sorted ascending
-/// - Symmetric: `CENTROIDS[i] == -CENTROIDS[15-i]`
-/// - `quantize_scalar(CENTROIDS[k]) == k` for all k (fixed-point property)
+/// - Symmetric: `RAW_CENTROIDS[i] == -RAW_CENTROIDS[15-i]`
+pub const RAW_CENTROIDS: [f32; 16] = [
+    -2.4008, -1.8435, -1.4371, -1.0993,
+    -0.7990, -0.5282, -0.2743, -0.0298,
+     0.0298,  0.2743,  0.5282,  0.7990,
+     1.0993,  1.4371,  1.8435,  2.4008,
+];
+
+/// Raw N(0,1) decision boundaries (midpoints between adjacent RAW_CENTROIDS).
+pub const RAW_BOUNDARIES: [f32; 15] = [
+    -2.12215,  // mid(-2.4008, -1.8435)
+    -1.6403,   // mid(-1.8435, -1.4371)
+    -1.2682,   // mid(-1.4371, -1.0993)
+    -0.94915,  // mid(-1.0993, -0.7990)
+    -0.6636,   // mid(-0.7990, -0.5282)
+    -0.40125,  // mid(-0.5282, -0.2743)
+    -0.15205,  // mid(-0.2743, -0.0298)
+     0.0,      // mid(-0.0298,  0.0298) — exact zero by symmetry
+     0.15205,  // mid( 0.0298,  0.2743)
+     0.40125,  // mid( 0.2743,  0.5282)
+     0.6636,   // mid( 0.5282,  0.7990)
+     0.94915,  // mid( 0.7990,  1.0993)
+     1.2682,   // mid( 1.0993,  1.4371)
+     1.6403,   // mid( 1.4371,  1.8435)
+     2.12215,  // mid( 1.8435,  2.4008)
+];
+
+/// Compute dimension-scaled centroids for a given padded dimension.
+/// sigma = 1/sqrt(padded_dim), which matches the FWHT normalization.
+pub fn scaled_centroids(padded_dim: u32) -> [f32; 16] {
+    let sigma = 1.0 / (padded_dim as f32).sqrt();
+    let mut c = [0.0f32; 16];
+    for i in 0..16 {
+        c[i] = RAW_CENTROIDS[i] * sigma;
+    }
+    c
+}
+
+/// Compute dimension-scaled boundaries for a given padded dimension.
+pub fn scaled_boundaries(padded_dim: u32) -> [f32; 15] {
+    let sigma = 1.0 / (padded_dim as f32).sqrt();
+    let mut b = [0.0f32; 15];
+    for i in 0..15 {
+        b[i] = RAW_BOUNDARIES[i] * sigma;
+    }
+    b
+}
+
+/// Legacy constants for backward compatibility with codebook_version=1.
+/// Scaled by 1/sqrt(768) — ONLY correct for dim=768 with no padding.
 pub const CENTROIDS: [f32; 16] = [
-    -0.086_643, // -2.4008 / sqrt(768)
-    -0.066_523, // -1.8435 / sqrt(768)
-    -0.051_858, // -1.4371 / sqrt(768)
-    -0.039_666, // -1.0993 / sqrt(768)
-    -0.028_829, // -0.7990 / sqrt(768)
-    -0.019_060, // -0.5282 / sqrt(768)
-    -0.009_897, // -0.2743 / sqrt(768)
-    -0.001_075, // -0.0298 / sqrt(768)
-    0.001_075,  //  0.0298 / sqrt(768)
-    0.009_897,  //  0.2743 / sqrt(768)
-    0.019_060,  //  0.5282 / sqrt(768)
-    0.028_829,  //  0.7990 / sqrt(768)
-    0.039_666,  //  1.0993 / sqrt(768)
-    0.051_858,  //  1.4371 / sqrt(768)
-    0.066_523,  //  1.8435 / sqrt(768)
-    0.086_643,  //  2.4008 / sqrt(768)
+    -0.086_643, -0.066_523, -0.051_858, -0.039_666,
+    -0.028_829, -0.019_060, -0.009_897, -0.001_075,
+     0.001_075,  0.009_897,  0.019_060,  0.028_829,
+     0.039_666,  0.051_858,  0.066_523,  0.086_643,
 ];
 
-/// Decision boundaries: midpoints between adjacent centroids.
-///
-/// `quantize_scalar(x) = k` where `BOUNDARIES[k-1] <= x < BOUNDARIES[k]`,
-/// with implicit `-inf` at the left and `+inf` at the right.
+/// Legacy boundaries for backward compatibility.
 pub const BOUNDARIES: [f32; 15] = [
-    -0.076_583, // mid(C[0], C[1])
-    -0.059_190_5, // mid(C[1], C[2])
-    -0.045_762, // mid(C[2], C[3])
-    -0.034_247_5, // mid(C[3], C[4])
-    -0.023_944_5, // mid(C[4], C[5])
-    -0.014_478_5, // mid(C[5], C[6])
-    -0.005_486, // mid(C[6], C[7])
-    0.0,        // mid(C[7], C[8]) — exact zero by symmetry
-    0.005_486,  // mid(C[8], C[9])
-    0.014_478_5, // mid(C[9], C[10])
-    0.023_944_5, // mid(C[10], C[11])
-    0.034_247_5, // mid(C[11], C[12])
-    0.045_762,  // mid(C[12], C[13])
-    0.059_190_5, // mid(C[13], C[14])
-    0.076_583,  // mid(C[14], C[15])
+    -0.076_583, -0.059_190_5, -0.045_762, -0.034_247_5,
+    -0.023_944_5, -0.014_478_5, -0.005_486, 0.0,
+     0.005_486,  0.014_478_5,  0.023_944_5,  0.034_247_5,
+     0.045_762,  0.059_190_5,  0.076_583,
 ];
 
-/// Quantize a single f32 value to its nearest centroid index (0..15).
+/// Quantize a single f32 value using LEGACY boundaries (1/sqrt(768) scaling).
+/// DEPRECATED: Use `quantize_with_boundaries` for dimension-adaptive quantization.
+#[inline]
+pub fn quantize_scalar(val: f32) -> u8 {
+    quantize_with_boundaries(val, &BOUNDARIES)
+}
+
+/// Quantize a single f32 value to its nearest centroid index (0..15)
+/// using the provided dimension-scaled boundaries.
 ///
 /// Uses linear scan through boundaries. For 15 comparisons this is faster
 /// than binary search due to branch prediction on the sorted data.
 #[inline]
-pub fn quantize_scalar(val: f32) -> u8 {
+pub fn quantize_with_boundaries(val: f32, boundaries: &[f32; 15]) -> u8 {
     let mut idx = 0u8;
-    for &b in BOUNDARIES.iter() {
+    for &b in boundaries.iter() {
         if val >= b {
             idx += 1;
         } else {
