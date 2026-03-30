@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use crate::protocol::Frame;
 use crate::vector::filter::FilterExpr;
 use crate::vector::store::{IndexMeta, VectorStore};
+use crate::vector::turbo_quant::collection::QuantizationConfig;
 use crate::vector::types::{DistanceMetric, SearchResult};
 
 /// FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM 768 DISTANCE_METRIC L2
@@ -82,11 +83,12 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     };
     pos += 1;
 
-    // Parse key-value pairs: TYPE, DIM, DISTANCE_METRIC, M, EF_CONSTRUCTION
+    // Parse key-value pairs: TYPE, DIM, DISTANCE_METRIC, M, EF_CONSTRUCTION, QUANTIZATION
     let mut dimension: Option<u32> = None;
     let mut metric = DistanceMetric::L2;
     let mut hnsw_m: u32 = 16;
     let mut hnsw_ef_construction: u32 = 200;
+    let mut quantization = QuantizationConfig::TurboQuant4;
 
     let param_end = pos + num_params;
     while pos + 1 < param_end && pos + 1 < args.len() {
@@ -135,6 +137,25 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 None => return Frame::Error(Bytes::from_static(b"ERR invalid EF_CONSTRUCTION value")),
             };
             pos += 1;
+        } else if key.eq_ignore_ascii_case(b"QUANTIZATION") {
+            let val = match extract_bulk(&args[pos]) {
+                Some(v) => v,
+                None => return Frame::Error(Bytes::from_static(b"ERR invalid QUANTIZATION value")),
+            };
+            quantization = if val.eq_ignore_ascii_case(b"TQ1") {
+                QuantizationConfig::TurboQuant1
+            } else if val.eq_ignore_ascii_case(b"TQ2") {
+                QuantizationConfig::TurboQuant2
+            } else if val.eq_ignore_ascii_case(b"TQ3") {
+                QuantizationConfig::TurboQuant3
+            } else if val.eq_ignore_ascii_case(b"TQ4") {
+                QuantizationConfig::TurboQuant4
+            } else if val.eq_ignore_ascii_case(b"SQ8") {
+                QuantizationConfig::Sq8
+            } else {
+                return Frame::Error(Bytes::from_static(b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, or SQ8)"));
+            };
+            pos += 1;
         } else {
             pos += 1; // skip unknown param value
         }
@@ -154,6 +175,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         hnsw_ef_construction,
         source_field,
         key_prefixes: prefixes,
+        quantization,
     };
 
     match store.create_index(meta) {

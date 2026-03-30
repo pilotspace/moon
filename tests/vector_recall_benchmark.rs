@@ -81,7 +81,8 @@ fn measure_recall(n: u32, d: usize, n_queries: usize, ef_search: usize, k: usize
     let mut work = vec![0.0f32; padded];
     for i in 0..n as usize {
         let v = &vectors[i * d..(i + 1) * d];
-        let code = encode_tq_mse_scaled(v, meta.fwht_sign_flips.as_slice(), &meta.codebook_boundaries, &mut work);
+        let boundaries_arr: &[f32; 15] = meta.codebook_boundaries.as_slice().try_into().expect("boundaries must be 15 elements for 4-bit TQ");
+        let code = encode_tq_mse_scaled(v, meta.fwht_sign_flips.as_slice(), boundaries_arr, &mut work);
         all_tq.extend_from_slice(&code.codes);
         all_tq.extend_from_slice(&code.norm.to_le_bytes());
     }
@@ -103,7 +104,7 @@ fn measure_recall(n: u32, d: usize, n_queries: usize, ef_search: usize, k: usize
         fwht::fwht(&mut rot[..padded], meta.fwht_sign_flips.as_slice());
     }
 
-    let codebook = &meta.codebook;
+    let codebook: &[f32; 16] = meta.codebook.as_slice().try_into().expect("codebook must be 16 elements for 4-bit TQ");
     let mut builder = HnswBuilder::new(16, 200, 42);
     for _ in 0..n {
         builder.insert(|a, b| {
@@ -287,7 +288,8 @@ fn recall_debug_1k_128d() {
     let mut work = vec![0.0f32; padded];
     for i in 0..n as usize {
         let v = &vectors[i * d..(i + 1) * d];
-        let code = encode_tq_mse_scaled(v, meta.fwht_sign_flips.as_slice(), &meta.codebook_boundaries, &mut work);
+        let boundaries_arr: &[f32; 15] = meta.codebook_boundaries.as_slice().try_into().expect("boundaries must be 15 elements for 4-bit TQ");
+        let code = encode_tq_mse_scaled(v, meta.fwht_sign_flips.as_slice(), boundaries_arr, &mut work);
         all_tq.extend_from_slice(&code.codes);
         all_tq.extend_from_slice(&code.norm.to_le_bytes());
     }

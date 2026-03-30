@@ -68,6 +68,88 @@ pub fn randomized_fwht_scalar(data: &mut [f32], sign_flips: &[f32]) {
     normalize_fwht(data);
 }
 
+// ── NEON FWHT ─────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+
+/// NEON-accelerated randomized normalized FWHT.
+///
+/// Processes 4 butterflies per SIMD instruction for passes where h >= 4.
+/// Falls back to scalar for h = 1, 2 passes (only need 1-2 element operations).
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+/// Pointer arithmetic stays within slice bounds (guaranteed by loop structure
+/// and power-of-2 invariant).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn fwht_neon(data: &mut [f32], sign_flips: &[f32]) {
+    let n = data.len();
+    debug_assert!(n.is_power_of_two());
+    debug_assert_eq!(data.len(), sign_flips.len());
+
+    // SAFETY: NEON is baseline on all AArch64 CPUs. All pointer arithmetic
+    // stays within `data` and `sign_flips` bounds (loop indices bounded by n,
+    // which equals both slice lengths, and n is a power of 2).
+
+    // Step 1: Apply sign flips via NEON vmulq_f32 (4 floats at a time)
+    let mut i = 0;
+    while i + 4 <= n {
+        let d = vld1q_f32(data.as_ptr().add(i));
+        let s = vld1q_f32(sign_flips.as_ptr().add(i));
+        vst1q_f32(data.as_mut_ptr().add(i), vmulq_f32(d, s));
+        i += 4;
+    }
+    // Scalar remainder for sign flips
+    while i < n {
+        *data.get_unchecked_mut(i) *= *sign_flips.get_unchecked(i);
+        i += 1;
+    }
+
+    // Step 2: Butterfly passes
+    let mut h = 1;
+    while h < n {
+        let mut j = 0;
+        while j < n {
+            let mut k = j;
+            // NEON path: process 4 butterflies when h >= 4
+            while k + 4 <= j + h && k + h + 4 <= n {
+                let a = vld1q_f32(data.as_ptr().add(k));
+                let b = vld1q_f32(data.as_ptr().add(k + h));
+                vst1q_f32(data.as_mut_ptr().add(k), vaddq_f32(a, b));
+                vst1q_f32(data.as_mut_ptr().add(k + h), vsubq_f32(a, b));
+                k += 4;
+            }
+            // Scalar remainder
+            while k < j + h {
+                let x = *data.get_unchecked(k);
+                let y = *data.get_unchecked(k + h);
+                *data.get_unchecked_mut(k) = x + y;
+                *data.get_unchecked_mut(k + h) = x - y;
+                k += 1;
+            }
+            j += h * 2;
+        }
+        h *= 2;
+    }
+
+    // Step 3: Normalize by 1/sqrt(n)
+    let scale_val = 1.0 / (n as f32).sqrt();
+    let scale = vdupq_n_f32(scale_val);
+    i = 0;
+    while i + 4 <= n {
+        let d = vld1q_f32(data.as_ptr().add(i));
+        vst1q_f32(data.as_mut_ptr().add(i), vmulq_f32(d, scale));
+        i += 4;
+    }
+    // Scalar remainder for normalization
+    while i < n {
+        *data.get_unchecked_mut(i) *= scale_val;
+        i += 1;
+    }
+}
+
 // ── AVX2 FWHT ─────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -171,7 +253,11 @@ pub fn init_fwht() {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            // NEON FWHT would go here; for now use scalar.
+            // NEON is baseline on all AArch64 CPUs — no feature detection needed.
+            return |data: &mut [f32], signs: &[f32]| {
+                // SAFETY: NEON is guaranteed on all AArch64 processors.
+                unsafe { fwht_neon(data, signs) }
+            };
         }
         #[allow(unreachable_code)]
         (randomized_fwht_scalar as FwhtFn)
@@ -318,6 +404,65 @@ mod tests {
                 "AVX2 mismatch at [{i}]: scalar={}, avx2={}",
                 scalar_data[i],
                 avx2_data[i]
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_neon_matches_scalar() {
+        for &dim in &[4, 8, 16, 64, 256, 1024] {
+            let signs: Vec<f32> = (0..dim)
+                .map(|i| if (i * 7 + 3) % 5 < 2 { -1.0 } else { 1.0 })
+                .collect();
+            let original: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001 - 0.5).collect();
+
+            // Scalar path
+            let mut scalar_data = original.clone();
+            randomized_fwht_scalar(&mut scalar_data, &signs);
+
+            // NEON path
+            let mut neon_data = original.clone();
+            // SAFETY: NEON is baseline on AArch64.
+            unsafe { fwht_neon(&mut neon_data, &signs) };
+
+            for i in 0..dim {
+                assert!(
+                    (scalar_data[i] - neon_data[i]).abs() < 1e-6,
+                    "NEON mismatch at dim={dim} [{i}]: scalar={}, neon={}",
+                    scalar_data[i],
+                    neon_data[i]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_neon_self_inverse() {
+        let dim = 1024;
+        let signs: Vec<f32> = (0..dim)
+            .map(|i| if (i * 11 + 5) % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let original: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.002 - 1.0).collect();
+        let mut data = original.clone();
+
+        // Apply NEON FWHT twice (self-inverse with identity signs)
+        let ones_signs = vec![1.0f32; dim];
+        // SAFETY: NEON is baseline on AArch64.
+        unsafe {
+            fwht_neon(&mut data, &signs);
+            // Inverse: FWHT then normalize then apply signs
+            fwht_neon(&mut data, &ones_signs);
+        }
+        apply_sign_flips(&mut data, &signs);
+
+        for i in 0..dim {
+            assert!(
+                (data[i] - original[i]).abs() < 1e-4,
+                "NEON self-inverse failed at [{i}]: got {}, expected {}",
+                data[i],
+                original[i]
             );
         }
     }

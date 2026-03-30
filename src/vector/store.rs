@@ -33,6 +33,8 @@ pub struct IndexMeta {
     pub source_field: Bytes,
     /// Key prefixes to auto-index (from PREFIX clause).
     pub key_prefixes: Vec<Bytes>,
+    /// Quantization algorithm. Default: TurboQuant4.
+    pub quantization: QuantizationConfig,
 }
 
 /// A single vector index: meta + segments + scratch + collection config.
@@ -111,7 +113,7 @@ impl VectorStore {
             collection_id,
             meta.dimension,
             meta.metric,
-            QuantizationConfig::Sq8,
+            meta.quantization,
             collection_id, // use collection_id as seed for determinism
         ));
         let segments = SegmentHolder::new(meta.dimension);
@@ -233,6 +235,21 @@ mod tests {
             hnsw_ef_construction: 200,
             source_field: Bytes::from_static(b"vec"),
             key_prefixes: prefixes.iter().map(|p| Bytes::from(p.to_string())).collect(),
+            quantization: QuantizationConfig::TurboQuant4,
+        }
+    }
+
+    fn make_meta_quant(name: &str, dim: u32, quant: QuantizationConfig) -> IndexMeta {
+        IndexMeta {
+            name: Bytes::from(name.to_owned()),
+            dimension: dim,
+            padded_dimension: padded_dimension(dim),
+            metric: DistanceMetric::L2,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            source_field: Bytes::from_static(b"vec"),
+            key_prefixes: vec![Bytes::from_static(b"doc:")],
+            quantization: quant,
         }
     }
 
@@ -319,5 +336,41 @@ mod tests {
         let txn = store.txn_manager_mut().begin();
         assert_eq!(txn.txn_id, 1);
         assert_eq!(store.txn_manager().active_count(), 1);
+    }
+
+    // -- Multi-bit quantization tests (Phase 72-02) --
+
+    #[test]
+    fn test_create_index_with_tq2_has_4_centroids() {
+        let mut store = VectorStore::new();
+        let meta = make_meta_quant("idx_tq2", 128, QuantizationConfig::TurboQuant2);
+        store.create_index(meta).unwrap();
+
+        let idx = store.get_index(b"idx_tq2").unwrap();
+        assert_eq!(idx.collection.codebook.len(), 4);
+        assert_eq!(idx.collection.codebook_boundaries.len(), 3);
+        assert_eq!(idx.collection.quantization, QuantizationConfig::TurboQuant2);
+    }
+
+    #[test]
+    fn test_create_index_with_tq1_has_2_centroids() {
+        let mut store = VectorStore::new();
+        let meta = make_meta_quant("idx_tq1", 128, QuantizationConfig::TurboQuant1);
+        store.create_index(meta).unwrap();
+
+        let idx = store.get_index(b"idx_tq1").unwrap();
+        assert_eq!(idx.collection.codebook.len(), 2);
+        assert_eq!(idx.collection.quantization, QuantizationConfig::TurboQuant1);
+    }
+
+    #[test]
+    fn test_create_index_default_tq4() {
+        let mut store = VectorStore::new();
+        let meta = make_meta("idx_default", 128, &["doc:"]);
+        store.create_index(meta).unwrap();
+
+        let idx = store.get_index(b"idx_default").unwrap();
+        assert_eq!(idx.collection.codebook.len(), 16);
+        assert_eq!(idx.collection.quantization, QuantizationConfig::TurboQuant4);
     }
 }

@@ -105,10 +105,11 @@ pub fn init() {
                     // SAFETY: NEON is guaranteed on AArch64.
                     unsafe { neon::l2_f32(a, b) }
                 },
-                l2_i8: |a, b| {
-                    // SAFETY: NEON is guaranteed on AArch64.
-                    unsafe { neon::l2_i8(a, b) }
-                },
+                // Use scalar l2_i8: the compiler auto-vectorizes with SDOT/SADALP
+                // which is 3.5x faster than our explicit vmovl+vmlal NEON chain.
+                // The explicit NEON l2_i8 widens i8->i16->i32 (6 instructions per 16
+                // elements) while LLVM's auto-vectorization uses SADALP (2 instructions).
+                l2_i8: scalar::l2_i8,
                 dot_f32: |a, b| {
                     // SAFETY: NEON is guaranteed on AArch64.
                     unsafe { neon::dot_f32(a, b) }

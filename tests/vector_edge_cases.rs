@@ -12,6 +12,7 @@ use moon::vector::distance;
 use moon::vector::segment::mutable::MutableSegment;
 use moon::vector::store::{IndexMeta, VectorStore};
 use moon::vector::turbo_quant::encoder::padded_dimension;
+use moon::vector::turbo_quant::collection::QuantizationConfig;
 use moon::vector::types::DistanceMetric;
 
 // -- Helpers --
@@ -30,6 +31,7 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         hnsw_ef_construction: 200,
         source_field: Bytes::from_static(b"vec"),
         key_prefixes: vec![Bytes::from_static(b"doc:")],
+        quantization: QuantizationConfig::TurboQuant4,
     }
 }
 
