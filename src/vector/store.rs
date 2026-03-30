@@ -51,6 +51,9 @@ pub struct VectorStore {
     next_collection_id: u64,
     /// Per-shard MVCC transaction manager.
     txn_manager: TransactionManager,
+    /// Segments recovered from persistence, awaiting FT.CREATE to claim them.
+    /// Key: collection_id. Populated during crash recovery.
+    pending_segments: HashMap<u64, crate::vector::persistence::recovery::RecoveredCollection>,
 }
 
 impl VectorStore {
@@ -59,6 +62,7 @@ impl VectorStore {
             indexes: HashMap::new(),
             next_collection_id: 1,
             txn_manager: TransactionManager::new(),
+            pending_segments: HashMap::new(),
         }
     }
 
@@ -72,6 +76,26 @@ impl VectorStore {
     #[inline]
     pub fn txn_manager_mut(&mut self) -> &mut TransactionManager {
         &mut self.txn_manager
+    }
+
+    /// Attach recovered segments from persistence. Called by shard restore.
+    ///
+    /// Stores recovered collections in pending_segments, keyed by collection_id.
+    /// They will be attached to indexes when FT.CREATE runs (or immediately if
+    /// the index already exists).
+    pub fn attach_recovered(
+        &mut self,
+        recovered: crate::vector::persistence::recovery::RecoveredState,
+    ) {
+        for (collection_id, collection) in recovered.collections {
+            self.pending_segments.insert(collection_id, collection);
+        }
+    }
+
+    /// Number of pending (unattached) recovered collections.
+    #[allow(dead_code)]
+    pub fn pending_count(&self) -> usize {
+        self.pending_segments.len()
     }
 
     /// Create a new index. Returns Err(&str) if index already exists.
@@ -94,13 +118,30 @@ impl VectorStore {
         let scratch = SearchScratch::new(0, padded);
 
         let name = meta.name.clone();
-        self.indexes.insert(name, VectorIndex {
+        self.indexes.insert(name.clone(), VectorIndex {
             meta,
             segments,
             scratch,
             collection,
             payload_index: PayloadIndex::new(),
         });
+
+        // Check if recovered segments exist for this collection_id
+        if let Some(recovered) = self.pending_segments.remove(&collection_id) {
+            if let Some(index) = self.indexes.get(&name) {
+                let mut immutable_arcs: Vec<Arc<crate::vector::segment::immutable::ImmutableSegment>> =
+                    Vec::with_capacity(recovered.immutable.len());
+                for (imm, _meta) in recovered.immutable {
+                    immutable_arcs.push(Arc::new(imm));
+                }
+                let new_list = crate::vector::segment::SegmentList {
+                    mutable: Arc::new(recovered.mutable),
+                    immutable: immutable_arcs,
+                };
+                index.segments.swap(new_list);
+            }
+        }
+
         Ok(())
     }
 

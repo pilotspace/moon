@@ -92,6 +92,35 @@ impl Shard {
             }
         }
 
+        // Recover vector store from WAL + on-disk segments
+        let vector_persist_dir = dir.join(format!("shard-{}-vectors", self.id));
+        if vector_persist_dir.exists() || wal_file.exists() {
+            match crate::vector::persistence::recovery::recover_vector_store(
+                &wal_file,
+                &vector_persist_dir,
+            ) {
+                Ok(recovered) => {
+                    let seg_count: usize = recovered
+                        .collections
+                        .values()
+                        .map(|c| c.immutable.len())
+                        .sum();
+                    if !recovered.collections.is_empty() {
+                        info!(
+                            "Shard {}: recovered {} vector collections ({} immutable segments)",
+                            self.id,
+                            recovered.collections.len(),
+                            seg_count
+                        );
+                    }
+                    self.vector_store.attach_recovered(recovered);
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: vector recovery failed: {:?}", self.id, e);
+                }
+            }
+        }
+
         total_keys
     }
 }
