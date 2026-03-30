@@ -95,6 +95,9 @@ fn string_to_metric(s: &str) -> Result<DistanceMetric, SegmentIoError> {
 fn quant_to_string(q: QuantizationConfig) -> String {
     match q {
         QuantizationConfig::Sq8 => "Sq8".to_owned(),
+        QuantizationConfig::TurboQuant1 => "TurboQuant1".to_owned(),
+        QuantizationConfig::TurboQuant2 => "TurboQuant2".to_owned(),
+        QuantizationConfig::TurboQuant3 => "TurboQuant3".to_owned(),
         QuantizationConfig::TurboQuant4 => "TurboQuant4".to_owned(),
         QuantizationConfig::TurboQuantProd4 => "TurboQuantProd4".to_owned(),
     }
@@ -103,6 +106,9 @@ fn quant_to_string(q: QuantizationConfig) -> String {
 fn string_to_quant(s: &str) -> Result<QuantizationConfig, SegmentIoError> {
     match s {
         "Sq8" => Ok(QuantizationConfig::Sq8),
+        "TurboQuant1" => Ok(QuantizationConfig::TurboQuant1),
+        "TurboQuant2" => Ok(QuantizationConfig::TurboQuant2),
+        "TurboQuant3" => Ok(QuantizationConfig::TurboQuant3),
         "TurboQuant4" => Ok(QuantizationConfig::TurboQuant4),
         "TurboQuantProd4" => Ok(QuantizationConfig::TurboQuantProd4),
         _ => Err(SegmentIoError::InvalidMetadata(format!("unknown quantization: {s}"))),
@@ -170,8 +176,8 @@ pub fn write_immutable_segment(
         total_count: segment.total_count(),
         metadata_checksum: collection.metadata_checksum,
         codebook_version: collection.codebook_version,
-        codebook: collection.codebook.to_vec(),
-        codebook_boundaries: collection.codebook_boundaries.to_vec(),
+        codebook: collection.codebook.clone(),
+        codebook_boundaries: collection.codebook_boundaries.clone(),
         fwht_sign_flips: collection.fwht_sign_flips.as_slice().to_vec(),
     };
     let json = serde_json::to_string_pretty(&meta)
@@ -203,17 +209,26 @@ pub fn read_immutable_segment(
     let mut sign_flips = AlignedBuffer::<f32>::new(meta.fwht_sign_flips.len());
     sign_flips.as_mut_slice().copy_from_slice(&meta.fwht_sign_flips);
 
-    let mut codebook = [0.0f32; 16];
-    if meta.codebook.len() != 16 {
-        return Err(SegmentIoError::InvalidMetadata("codebook must have 16 entries".to_owned()));
+    // Variable-length codebook: validate size matches quantization variant.
+    // SQ8 stores empty codebook (no quantization centroids needed).
+    if quantization.is_turbo_quant() {
+        let expected_centroids = quantization.n_centroids();
+        let expected_boundaries = expected_centroids - 1;
+        if meta.codebook.len() != expected_centroids {
+            return Err(SegmentIoError::InvalidMetadata(format!(
+                "codebook must have {} entries for {:?}, got {}",
+                expected_centroids, quantization, meta.codebook.len()
+            )));
+        }
+        if meta.codebook_boundaries.len() != expected_boundaries {
+            return Err(SegmentIoError::InvalidMetadata(format!(
+                "codebook_boundaries must have {} entries for {:?}, got {}",
+                expected_boundaries, quantization, meta.codebook_boundaries.len()
+            )));
+        }
     }
-    codebook.copy_from_slice(&meta.codebook);
-
-    let mut boundaries = [0.0f32; 15];
-    if meta.codebook_boundaries.len() != 15 {
-        return Err(SegmentIoError::InvalidMetadata("codebook_boundaries must have 15 entries".to_owned()));
-    }
-    boundaries.copy_from_slice(&meta.codebook_boundaries);
+    let codebook = meta.codebook.clone();
+    let boundaries = meta.codebook_boundaries.clone();
 
     // Reconstruct QJL matrix for TurboQuantProd4 from seed+1.
     // The QJL matrix is NOT checksummed (derived, not stored).
@@ -235,8 +250,8 @@ pub fn read_immutable_segment(
         quantization,
         fwht_sign_flips: sign_flips,
         codebook_version: meta.codebook_version,
-        codebook,
-        codebook_boundaries: boundaries,
+        codebook: codebook.clone(),
+        codebook_boundaries: boundaries.clone(),
         metadata_checksum: meta.metadata_checksum,
         qjl_matrix,
     };

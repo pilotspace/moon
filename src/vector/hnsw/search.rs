@@ -228,7 +228,7 @@ pub fn hnsw_search_filtered(
 
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
-    let codebook = &collection.codebook;
+    let codebook = collection.codebook_16();
 
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;

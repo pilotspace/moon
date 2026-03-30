@@ -6,7 +6,7 @@
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::types::DistanceMetric;
-use super::codebook::{CODEBOOK_VERSION, scaled_centroids, scaled_boundaries};
+use super::codebook::{CODEBOOK_VERSION, scaled_centroids_n, scaled_boundaries_n, code_bytes_per_vector};
 use super::encoder::padded_dimension;
 
 /// Quantization algorithm selector.
@@ -16,6 +16,35 @@ pub enum QuantizationConfig {
     Sq8 = 0,
     TurboQuant4 = 1,
     TurboQuantProd4 = 2,
+    TurboQuant1 = 3,
+    TurboQuant2 = 4,
+    TurboQuant3 = 5,
+}
+
+impl QuantizationConfig {
+    /// Number of bits per coordinate for this quantization variant.
+    #[inline]
+    pub fn bits(&self) -> u8 {
+        match self {
+            Self::TurboQuant1 => 1,
+            Self::TurboQuant2 => 2,
+            Self::TurboQuant3 => 3,
+            Self::TurboQuant4 | Self::TurboQuantProd4 => 4,
+            Self::Sq8 => 8,
+        }
+    }
+
+    /// Returns true for any TurboQuant variant (1/2/3/4-bit).
+    #[inline]
+    pub fn is_turbo_quant(&self) -> bool {
+        matches!(self, Self::TurboQuant1 | Self::TurboQuant2 | Self::TurboQuant3 | Self::TurboQuant4 | Self::TurboQuantProd4)
+    }
+
+    /// Number of centroids for this quantization variant: 2^bits.
+    #[inline]
+    pub fn n_centroids(&self) -> usize {
+        1 << self.bits()
+    }
 }
 
 /// Immutable per-collection configuration with integrity checksum.
@@ -37,8 +66,8 @@ pub struct CollectionMetadata {
     pub fwht_sign_flips: AlignedBuffer<f32>,
 
     pub codebook_version: u8,
-    pub codebook: [f32; 16],
-    pub codebook_boundaries: [f32; 15],
+    pub codebook: Vec<f32>,
+    pub codebook_boundaries: Vec<f32>,
 
     /// XXHash64 of all fields above. Verified at load and search init.
     pub metadata_checksum: u64,
@@ -107,8 +136,17 @@ impl CollectionMetadata {
             quantization,
             fwht_sign_flips: sign_flips,
             codebook_version: CODEBOOK_VERSION,
-            codebook: scaled_centroids(padded),
-            codebook_boundaries: scaled_boundaries(padded),
+            codebook: if quantization.is_turbo_quant() {
+                scaled_centroids_n(padded, quantization.bits())
+            } else {
+                // SQ8 doesn't use codebooks -- store empty Vec
+                Vec::new()
+            },
+            codebook_boundaries: if quantization.is_turbo_quant() {
+                scaled_boundaries_n(padded, quantization.bits())
+            } else {
+                Vec::new()
+            },
             metadata_checksum: 0, // computed below
             qjl_matrix,
         };
@@ -138,6 +176,38 @@ impl CollectionMetadata {
             data.extend_from_slice(&s.to_le_bytes());
         }
         xxh64(&data, 0)
+    }
+
+    /// Packed code size in bytes per vector for this collection's quantization.
+    #[inline]
+    pub fn code_bytes_per_vector(&self) -> usize {
+        code_bytes_per_vector(self.padded_dimension, self.quantization.bits())
+    }
+
+    /// Convenience accessor: returns the codebook boundaries as a `&[f32; 15]` reference.
+    ///
+    /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
+    /// Used by legacy `encode_tq_mse_scaled` which requires fixed-size array.
+    pub fn codebook_boundaries_15(&self) -> &[f32; 15] {
+        assert_eq!(
+            self.codebook_boundaries.len(), 15,
+            "codebook_boundaries_15 requires 4-bit quantization (15 boundaries), got {}",
+            self.codebook_boundaries.len()
+        );
+        self.codebook_boundaries[..15].try_into().unwrap()
+    }
+
+    /// Convenience accessor: returns the codebook as a `&[f32; 16]` reference.
+    ///
+    /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
+    /// Used by legacy `tq_l2_adc_scaled` which requires fixed-size array.
+    pub fn codebook_16(&self) -> &[f32; 16] {
+        assert_eq!(
+            self.codebook.len(), 16,
+            "codebook_16 requires 4-bit quantization (16 centroids), got {}",
+            self.codebook.len()
+        );
+        self.codebook[..16].try_into().unwrap()
     }
 
     /// Verify metadata integrity. Returns Err if checksum mismatch.
@@ -259,5 +329,124 @@ mod tests {
         assert!(msg.contains("checksum mismatch"));
         assert!(msg.contains("0xdead"));
         assert!(msg.contains("0xbeef"));
+    }
+
+    // -- Multi-bit TurboQuant tests (Phase 72-02) --
+
+    #[test]
+    fn test_turbo_quant1_exists_and_has_correct_repr() {
+        assert_eq!(QuantizationConfig::TurboQuant1 as u8, 3);
+        assert_eq!(QuantizationConfig::TurboQuant2 as u8, 4);
+        assert_eq!(QuantizationConfig::TurboQuant3 as u8, 5);
+    }
+
+    #[test]
+    fn test_bits_helper() {
+        assert_eq!(QuantizationConfig::TurboQuant1.bits(), 1);
+        assert_eq!(QuantizationConfig::TurboQuant2.bits(), 2);
+        assert_eq!(QuantizationConfig::TurboQuant3.bits(), 3);
+        assert_eq!(QuantizationConfig::TurboQuant4.bits(), 4);
+        assert_eq!(QuantizationConfig::TurboQuantProd4.bits(), 4);
+        assert_eq!(QuantizationConfig::Sq8.bits(), 8);
+    }
+
+    #[test]
+    fn test_is_turbo_quant() {
+        assert!(QuantizationConfig::TurboQuant1.is_turbo_quant());
+        assert!(QuantizationConfig::TurboQuant2.is_turbo_quant());
+        assert!(QuantizationConfig::TurboQuant3.is_turbo_quant());
+        assert!(QuantizationConfig::TurboQuant4.is_turbo_quant());
+        assert!(QuantizationConfig::TurboQuantProd4.is_turbo_quant());
+        assert!(!QuantizationConfig::Sq8.is_turbo_quant());
+    }
+
+    #[test]
+    fn test_tq1_codebook_has_2_centroids_1_boundary() {
+        let meta = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant1, 42,
+        );
+        assert_eq!(meta.codebook.len(), 2);
+        assert_eq!(meta.codebook_boundaries.len(), 1);
+        assert!(meta.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn test_tq2_codebook_has_4_centroids_3_boundaries() {
+        let meta = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant2, 42,
+        );
+        assert_eq!(meta.codebook.len(), 4);
+        assert_eq!(meta.codebook_boundaries.len(), 3);
+        assert!(meta.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn test_tq3_codebook_has_8_centroids_7_boundaries() {
+        let meta = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant3, 42,
+        );
+        assert_eq!(meta.codebook.len(), 8);
+        assert_eq!(meta.codebook_boundaries.len(), 7);
+        assert!(meta.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn test_tq4_still_has_16_centroids_15_boundaries() {
+        let meta = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        );
+        assert_eq!(meta.codebook.len(), 16);
+        assert_eq!(meta.codebook_boundaries.len(), 15);
+        assert!(meta.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn test_code_bytes_per_vector() {
+        let meta1 = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant1, 42,
+        );
+        // 768 pads to 1024. 1-bit: 1024/8 = 128
+        assert_eq!(meta1.code_bytes_per_vector(), 128);
+
+        let meta2 = CollectionMetadata::new(
+            2, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant2, 42,
+        );
+        // 2-bit: 1024/4 = 256
+        assert_eq!(meta2.code_bytes_per_vector(), 256);
+
+        let meta4 = CollectionMetadata::new(
+            4, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        );
+        // 4-bit: 1024/2 = 512
+        assert_eq!(meta4.code_bytes_per_vector(), 512);
+    }
+
+    #[test]
+    fn test_checksum_changes_when_quantization_changes() {
+        let meta1 = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant1, 42,
+        );
+        let meta4 = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        );
+        assert_ne!(meta1.metadata_checksum, meta4.metadata_checksum);
+    }
+
+    #[test]
+    fn test_codebook_16_accessor() {
+        let meta = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        );
+        let cb: &[f32; 16] = meta.codebook_16();
+        assert_eq!(cb.len(), 16);
+    }
+
+    #[test]
+    fn test_codebook_boundaries_15_accessor() {
+        let meta = CollectionMetadata::new(
+            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        );
+        let bb: &[f32; 15] = meta.codebook_boundaries_15();
+        assert_eq!(bb.len(), 15);
     }
 }

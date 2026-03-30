@@ -297,8 +297,311 @@ pub fn tq_l2_adc_budgeted(
 
 use smallvec::SmallVec;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
+use crate::vector::turbo_quant::codebook::code_bytes_per_vector;
 use crate::vector::turbo_quant::fwht;
 use crate::vector::types::{SearchResult, VectorId};
+
+/// Asymmetric L2 distance for any bit width (1-4).
+///
+/// Unpacks indices inline from the packed code based on bit width,
+/// looks up centroids from the variable-length slice, and computes
+/// squared difference. 4-way unrolled accumulation.
+///
+/// For bits=4, this produces identical results to `tq_l2_adc_scaled`.
+#[inline]
+pub fn tq_l2_adc_multibit(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    centroids: &[f32],
+    bits: u8,
+) -> f32 {
+    match bits {
+        1 => tq_l2_adc_1bit(q_rotated, code, norm, centroids),
+        2 => tq_l2_adc_2bit(q_rotated, code, norm, centroids),
+        3 => tq_l2_adc_3bit(q_rotated, code, norm, centroids),
+        4 => {
+            // Delegate to existing optimized 4-bit path
+            debug_assert_eq!(centroids.len(), 16);
+            let c: &[f32; 16] = centroids.try_into().unwrap_or_else(|_| {
+                panic!("4-bit ADC requires exactly 16 centroids, got {}", centroids.len())
+            });
+            tq_l2_adc_scaled(q_rotated, code, norm, c)
+        }
+        _ => panic!("unsupported bit width: {bits}"),
+    }
+}
+
+/// 1-bit ADC: extract single bit per dimension, 8 dimensions per byte.
+#[inline]
+fn tq_l2_adc_1bit(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32]) -> f32 {
+    let padded = q_rotated.len();
+    debug_assert_eq!(code.len(), padded / 8);
+    debug_assert_eq!(centroids.len(), 2);
+
+    let norm_sq = norm * norm;
+    let c0 = centroids[0];
+    let c1 = centroids[1];
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+
+    let code_len = code.len();
+    let chunks = code_len / 4;
+    let remainder = code_len % 4;
+
+    for c in 0..chunks {
+        let base = c * 4;
+        let qbase = base * 8;
+
+        for j in 0..8 {
+            let idx = (code[base] >> j) & 1;
+            let cent = if idx == 0 { c0 } else { c1 };
+            let d = q_rotated[qbase + j] - cent;
+            sum0 += d * d;
+        }
+        for j in 0..8 {
+            let idx = (code[base + 1] >> j) & 1;
+            let cent = if idx == 0 { c0 } else { c1 };
+            let d = q_rotated[qbase + 8 + j] - cent;
+            sum1 += d * d;
+        }
+        for j in 0..8 {
+            let idx = (code[base + 2] >> j) & 1;
+            let cent = if idx == 0 { c0 } else { c1 };
+            let d = q_rotated[qbase + 16 + j] - cent;
+            sum2 += d * d;
+        }
+        for j in 0..8 {
+            let idx = (code[base + 3] >> j) & 1;
+            let cent = if idx == 0 { c0 } else { c1 };
+            let d = q_rotated[qbase + 24 + j] - cent;
+            sum3 += d * d;
+        }
+    }
+
+    let tail_start = chunks * 4;
+    for i in 0..remainder {
+        let byte_idx = tail_start + i;
+        let qoff = byte_idx * 8;
+        for j in 0..8 {
+            let idx = (code[byte_idx] >> j) & 1;
+            let cent = if idx == 0 { c0 } else { c1 };
+            let d = q_rotated[qoff + j] - cent;
+            sum0 += d * d;
+        }
+    }
+
+    (sum0 + sum1 + sum2 + sum3) * norm_sq
+}
+
+/// 2-bit ADC: extract 2 bits per dimension, 4 dimensions per byte.
+#[inline]
+fn tq_l2_adc_2bit(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32]) -> f32 {
+    let padded = q_rotated.len();
+    debug_assert_eq!(code.len(), padded / 4);
+    debug_assert_eq!(centroids.len(), 4);
+
+    let norm_sq = norm * norm;
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+
+    let code_len = code.len();
+    let chunks = code_len / 4;
+    let remainder = code_len % 4;
+
+    for c in 0..chunks {
+        let base = c * 4;
+        let qbase = base * 4;
+
+        for j in 0..4 {
+            let idx = (code[base] >> (j * 2)) & 3;
+            let d = q_rotated[qbase + j] - centroids[idx as usize];
+            sum0 += d * d;
+        }
+        for j in 0..4 {
+            let idx = (code[base + 1] >> (j * 2)) & 3;
+            let d = q_rotated[qbase + 4 + j] - centroids[idx as usize];
+            sum1 += d * d;
+        }
+        for j in 0..4 {
+            let idx = (code[base + 2] >> (j * 2)) & 3;
+            let d = q_rotated[qbase + 8 + j] - centroids[idx as usize];
+            sum2 += d * d;
+        }
+        for j in 0..4 {
+            let idx = (code[base + 3] >> (j * 2)) & 3;
+            let d = q_rotated[qbase + 12 + j] - centroids[idx as usize];
+            sum3 += d * d;
+        }
+    }
+
+    let tail_start = chunks * 4;
+    for i in 0..remainder {
+        let byte_idx = tail_start + i;
+        let qoff = byte_idx * 4;
+        for j in 0..4 {
+            let idx = (code[byte_idx] >> (j * 2)) & 3;
+            let d = q_rotated[qoff + j] - centroids[idx as usize];
+            sum0 += d * d;
+        }
+    }
+
+    (sum0 + sum1 + sum2 + sum3) * norm_sq
+}
+
+/// 3-bit ADC: extract 3 bits per dimension, 8 dimensions per 3-byte group.
+#[inline]
+fn tq_l2_adc_3bit(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32]) -> f32 {
+    let padded = q_rotated.len();
+    debug_assert_eq!(code.len(), padded * 3 / 8);
+    debug_assert_eq!(centroids.len(), 8);
+
+    let norm_sq = norm * norm;
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+
+    // Process in 3-byte groups (8 dimensions each)
+    let n_groups = code.len() / 3;
+    let groups_2 = n_groups / 2;
+    let groups_rem = n_groups % 2;
+
+    for g in 0..groups_2 {
+        let group_base = g * 2;
+
+        // Group 0
+        let off0 = group_base * 3;
+        let qoff0 = group_base * 8;
+        let bits0 = code[off0] as u32
+            | ((code[off0 + 1] as u32) << 8)
+            | ((code[off0 + 2] as u32) << 16);
+        for j in 0..8 {
+            let idx = ((bits0 >> (j * 3)) & 7) as usize;
+            let d = q_rotated[qoff0 + j] - centroids[idx];
+            sum0 += d * d;
+        }
+
+        // Group 1
+        let off1 = (group_base + 1) * 3;
+        let qoff1 = (group_base + 1) * 8;
+        let bits1 = code[off1] as u32
+            | ((code[off1 + 1] as u32) << 8)
+            | ((code[off1 + 2] as u32) << 16);
+        for j in 0..8 {
+            let idx = ((bits1 >> (j * 3)) & 7) as usize;
+            let d = q_rotated[qoff1 + j] - centroids[idx];
+            sum1 += d * d;
+        }
+    }
+
+    if groups_rem > 0 {
+        let off = groups_2 * 2 * 3;
+        let qoff = groups_2 * 2 * 8;
+        let bits = code[off] as u32
+            | ((code[off + 1] as u32) << 8)
+            | ((code[off + 2] as u32) << 16);
+        for j in 0..8 {
+            let idx = ((bits >> (j * 3)) & 7) as usize;
+            let d = q_rotated[qoff + j] - centroids[idx];
+            sum0 += d * d;
+        }
+    }
+
+    (sum0 + sum1) * norm_sq
+}
+
+/// Budgeted version of `tq_l2_adc_multibit` with early termination.
+#[inline]
+pub fn tq_l2_adc_multibit_budgeted(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    centroids: &[f32],
+    bits: u8,
+    budget: f32,
+) -> f32 {
+    // For simplicity, compute full distance and check budget after.
+    // The 4-bit path has the optimized inner-loop budget check.
+    if bits == 4 {
+        debug_assert_eq!(centroids.len(), 16);
+        let c: &[f32; 16] = centroids.try_into().unwrap_or_else(|_| {
+            panic!("4-bit ADC requires exactly 16 centroids")
+        });
+        return tq_l2_adc_scaled_budgeted(q_rotated, code, norm, c, budget);
+    }
+
+    let dist = tq_l2_adc_multibit(q_rotated, code, norm, centroids, bits);
+    if dist > budget { f32::MAX } else { dist }
+}
+
+/// Brute-force scan of ALL TQ codes at any bit width using ADC.
+///
+/// `bits`: quantization bit width (1-4).
+/// Code layout per vector: [packed_code (code_bytes_per_vector)] [norm (4 bytes LE f32)].
+pub fn brute_force_tq_adc_multibit(
+    query: &[f32],
+    tq_buffer: &[u8],
+    n_vectors: usize,
+    collection: &CollectionMetadata,
+    k: usize,
+    bits: u8,
+) -> SmallVec<[SearchResult; 32]> {
+    if n_vectors == 0 || k == 0 {
+        return SmallVec::new();
+    }
+
+    let dim = query.len();
+    let padded = collection.padded_dimension as usize;
+    let code_len = code_bytes_per_vector(collection.padded_dimension, bits);
+    let bytes_per_code = code_len + 4; // code + f32 norm
+    let centroids = &collection.codebook;
+
+    // Prepare rotated query
+    let mut q_rotated = vec![0.0f32; padded];
+    q_rotated[..dim].copy_from_slice(query);
+    for v in q_rotated[dim..padded].iter_mut() {
+        *v = 0.0;
+    }
+    let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if q_norm > 0.0 {
+        let inv = 1.0 / q_norm;
+        for v in q_rotated[..dim].iter_mut() {
+            *v *= inv;
+        }
+    }
+    fwht::fwht(&mut q_rotated[..padded], collection.fwht_sign_flips.as_slice());
+
+    // Scan with max-heap for top-K
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<(ordered_float::OrderedFloat<f32>, u32)> = BinaryHeap::new();
+
+    for i in 0..n_vectors {
+        let offset = i * bytes_per_code;
+        let code = &tq_buffer[offset..offset + code_len];
+        let norm_bytes = &tq_buffer[offset + code_len..offset + code_len + 4];
+        let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+        let dist = tq_l2_adc_multibit(&q_rotated, code, norm, centroids, bits);
+
+        if heap.len() < k {
+            heap.push((ordered_float::OrderedFloat(dist), i as u32));
+        } else if let Some(&(worst, _)) = heap.peek() {
+            if dist < worst.0 {
+                heap.pop();
+                heap.push((ordered_float::OrderedFloat(dist), i as u32));
+            }
+        }
+    }
+
+    let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
+    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    results.into_iter()
+        .map(|(d, id)| SearchResult::new(d, VectorId(id)))
+        .collect()
+}
 
 /// Brute-force scan of ALL TQ codes using asymmetric distance computation.
 ///
@@ -329,7 +632,7 @@ pub fn brute_force_tq_adc(
     let padded = collection.padded_dimension as usize;
     let bytes_per_code = padded / 2 + 4;
     let code_len = padded / 2;
-    let codebook = &collection.codebook;
+    let codebook = collection.codebook_16();
 
     // Prepare rotated query: normalize, pad, FWHT
     let mut q_rotated = vec![0.0f32; padded];
@@ -583,7 +886,7 @@ mod tests {
         ));
         let padded = collection.padded_dimension as usize;
         let signs = collection.fwht_sign_flips.as_slice();
-        let boundaries = &collection.codebook_boundaries;
+        let boundaries = collection.codebook_boundaries_15();
         let bytes_per_code = padded / 2 + 4;
 
         // Generate and encode vectors using scaled boundaries (matching collection codebook)
@@ -667,7 +970,7 @@ mod tests {
         ));
         let padded = collection.padded_dimension as usize;
         let signs = collection.fwht_sign_flips.as_slice();
-        let boundaries = &collection.codebook_boundaries;
+        let boundaries = collection.codebook_boundaries_15();
         let bytes_per_code = padded / 2 + 4;
 
         let mut tq_buffer: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
