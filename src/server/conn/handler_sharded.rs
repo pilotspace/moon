@@ -308,8 +308,8 @@ pub async fn handle_connection_sharded_inner<
 
     // Pub/Sub subscriber mode state
     use crate::pubsub::{self, subscriber::Subscriber};
-    let mut pubsub_tx: Option<channel::MpscSender<Frame>> = None;
-    let mut pubsub_rx: Option<channel::MpscReceiver<Frame>> = None;
+    let mut pubsub_tx: Option<channel::MpscSender<Bytes>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<Bytes>> = None;
     let mut subscriber_id: u64 = 0;
     let mut subscription_count: usize = 0;
 
@@ -521,14 +521,9 @@ pub async fn handle_connection_sharded_inner<
                 }
                 msg = rx.recv_async() => {
                     match msg {
-                        Ok(frame) => {
-                            write_buf.clear();
-                            if protocol_version >= 3 {
-                                crate::protocol::serialize_resp3(&frame, &mut write_buf);
-                            } else {
-                                crate::protocol::serialize(&frame, &mut write_buf);
-                            }
-                            if stream.write_all(&write_buf).await.is_err() { break; }
+                        Ok(data) => {
+                            // Data is pre-serialized RESP bytes — write directly
+                            if stream.write_all(&data).await.is_err() { break; }
                         }
                         Err(_) => break,
                     }
@@ -1102,7 +1097,7 @@ pub async fn handle_connection_sharded_inner<
                         }
                         // Allocate pubsub channel if not yet created
                         if pubsub_tx.is_none() {
-                            let (tx, rx) = channel::mpsc_bounded(256);
+                            let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
                             pubsub_tx = Some(tx);
                             pubsub_rx = Some(rx);
                         }
