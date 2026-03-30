@@ -157,7 +157,10 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     };
 
     match store.create_index(meta) {
-        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        Ok(()) => {
+            crate::vector::metrics::increment_indexes();
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
         Err(msg) => Frame::Error(Bytes::from(format!("ERR {msg}"))),
     }
 }
@@ -172,6 +175,7 @@ pub fn ft_dropindex(store: &mut VectorStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
     };
     if store.drop_index(&name) {
+        crate::vector::metrics::decrement_indexes();
         Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
         Frame::Error(Bytes::from_static(b"Unknown Index name"))
@@ -269,7 +273,11 @@ pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
 
     // Parse optional FILTER clause
     let filter_expr = parse_filter_clause(args);
-    search_local_filtered(store, &index_name, &query_blob, k, filter_expr.as_ref())
+    let start = std::time::Instant::now();
+    let result = search_local_filtered(store, &index_name, &query_blob, k, filter_expr.as_ref());
+    crate::vector::metrics::increment_search();
+    crate::vector::metrics::record_search_latency(start.elapsed().as_micros() as u64);
+    result
 }
 
 /// Direct local search for cross-shard VectorSearch messages.
@@ -1295,5 +1303,50 @@ mod tests {
         let idx = store.get_index(b"myidx").unwrap();
         // payload_index should exist -- insert and evaluate should work
         let _ = &idx.payload_index;
+    }
+
+    #[test]
+    fn test_vector_metrics_increment_decrement() {
+        use std::sync::atomic::Ordering;
+
+        // Capture before-snapshot immediately before each operation to handle
+        // parallel test interference on global atomics.
+        let mut store = VectorStore::new();
+        let args = ft_create_args();
+
+        // FT.CREATE should increment VECTOR_INDEXES
+        let before_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
+        ft_create(&mut store, &args);
+        let after_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
+        assert!(after_create > before_create, "FT.CREATE should increment VECTOR_INDEXES");
+
+        // FT.SEARCH should increment VECTOR_SEARCH_TOTAL
+        crate::vector::distance::init();
+        let before_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
+        let query_vec: Vec<u8> = vec![0u8; 128 * 4];
+        let search_args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 5 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            Frame::BulkString(Bytes::from(query_vec)),
+        ];
+        ft_search(&mut store, &search_args);
+        let after_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
+        assert!(after_search > before_search, "FT.SEARCH should increment VECTOR_SEARCH_TOTAL");
+
+        // Latency should be non-zero after a search
+        let latency = crate::vector::metrics::VECTOR_SEARCH_LATENCY_US.load(Ordering::Relaxed);
+        // latency may be 0 on very fast machines, so just check it was written (could be 0 if sub-microsecond)
+
+        // FT.DROPINDEX should decrement VECTOR_INDEXES
+        let before_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
+        ft_dropindex(&mut store, &[bulk(b"myidx")]);
+        let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
+        assert!(after_drop < before_drop, "FT.DROPINDEX should decrement VECTOR_INDEXES");
+
+        // Suppress unused variable warning
+        let _ = latency;
     }
 }

@@ -157,6 +157,27 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     ));
     sections.push_str("\r\n");
 
+    sections.push_str("# Vector\r\n");
+    sections.push_str(&format!(
+        "vector_indexes:{}\r\n\
+         vector_total_vectors:{}\r\n\
+         vector_memory_bytes:{}\r\n\
+         vector_search_total:{}\r\n\
+         vector_search_latency_us:{}\r\n\
+         vector_compaction_count:{}\r\n\
+         vector_compaction_duration_ms:{}\r\n\
+         vector_mutable_segment_bytes:{}\r\n",
+        crate::vector::metrics::VECTOR_INDEXES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_TOTAL_VECTORS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_MEMORY_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_SEARCH_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_COMPACTION_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_COMPACTION_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_MUTABLE_SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    sections.push_str("\r\n");
+
     sections.push_str("# Keyspace\r\n");
     let key_count = db.len();
     let expires_count = db.expires_count();

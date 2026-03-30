@@ -925,6 +925,7 @@ fn auto_index_hset(
                             // Append to mutable segment
                             let snap = idx.segments.load();
                             let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+                            crate::vector::metrics::add_vectors(1);
 
                             // Populate payload index with all HASH fields (for filtered search)
                             let mut j = 1;
