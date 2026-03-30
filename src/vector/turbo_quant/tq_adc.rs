@@ -20,6 +20,7 @@ use super::codebook::CENTROIDS;
 /// 1. Unpack nibbles to centroid indices inline (no allocation)
 /// 2. For each dimension: d = q_rotated[i] - CENTROIDS[idx[i]]
 /// 3. Sum d*d, scale by norm^2
+#[inline]
 pub fn tq_l2_adc_scalar(
     q_rotated: &[f32],
     code: &[u8],
@@ -29,19 +30,137 @@ pub fn tq_l2_adc_scalar(
     debug_assert_eq!(code.len(), padded / 2);
 
     let norm_sq = norm * norm;
-    let mut sum = 0.0f32;
 
-    for i in 0..code.len() {
-        let byte = code[i];
-        let lo_idx = (byte & 0x0F) as usize;
-        let hi_idx = (byte >> 4) as usize;
+    // 4-way unrolled accumulation breaks dependency chain for out-of-order execution.
+    // Each accumulator can retire independently, hiding FMA latency (~4 cycles).
+    // Process 4 code bytes (8 dimensions) per iteration.
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
 
-        let d_lo = q_rotated[i * 2] - CENTROIDS[lo_idx];
-        let d_hi = q_rotated[i * 2 + 1] - CENTROIDS[hi_idx];
-        sum += d_lo * d_lo + d_hi * d_hi;
+    let code_len = code.len();
+    let chunks = code_len / 4;
+    let remainder = code_len % 4;
+
+    // Main unrolled loop: 4 bytes = 8 dimensions per iteration.
+    // Indexing uses pre-computed base to help the optimizer.
+    for c in 0..chunks {
+        let base = c * 4;
+        let qbase = base * 2;
+
+        let b0 = code[base];
+        let b1 = code[base + 1];
+        let b2 = code[base + 2];
+        let b3 = code[base + 3];
+
+        let d0lo = q_rotated[qbase] - CENTROIDS[(b0 & 0x0F) as usize];
+        let d0hi = q_rotated[qbase + 1] - CENTROIDS[(b0 >> 4) as usize];
+        sum0 += d0lo * d0lo + d0hi * d0hi;
+
+        let d1lo = q_rotated[qbase + 2] - CENTROIDS[(b1 & 0x0F) as usize];
+        let d1hi = q_rotated[qbase + 3] - CENTROIDS[(b1 >> 4) as usize];
+        sum1 += d1lo * d1lo + d1hi * d1hi;
+
+        let d2lo = q_rotated[qbase + 4] - CENTROIDS[(b2 & 0x0F) as usize];
+        let d2hi = q_rotated[qbase + 5] - CENTROIDS[(b2 >> 4) as usize];
+        sum2 += d2lo * d2lo + d2hi * d2hi;
+
+        let d3lo = q_rotated[qbase + 6] - CENTROIDS[(b3 & 0x0F) as usize];
+        let d3hi = q_rotated[qbase + 7] - CENTROIDS[(b3 >> 4) as usize];
+        sum3 += d3lo * d3lo + d3hi * d3hi;
     }
 
-    sum * norm_sq
+    // Handle remaining 0-3 bytes.
+    let tail_start = chunks * 4;
+    for j in 0..remainder {
+        let i = tail_start + j;
+        let byte = code[i];
+        let d_lo = q_rotated[i * 2] - CENTROIDS[(byte & 0x0F) as usize];
+        let d_hi = q_rotated[i * 2 + 1] - CENTROIDS[(byte >> 4) as usize];
+        sum0 += d_lo * d_lo + d_hi * d_hi;
+    }
+
+    (sum0 + sum1 + sum2 + sum3) * norm_sq
+}
+
+/// TQ-ADC distance with early termination budget.
+///
+/// Identical to `tq_l2_adc_scalar` but aborts early if the accumulated sum
+/// exceeds `budget / norm^2`, returning `f32::MAX`. This avoids completing
+/// the full ADC loop for neighbors that are clearly dominated.
+///
+/// `budget`: the worst distance currently in the results heap. If the partial
+/// distance already exceeds this, the neighbor cannot improve results.
+#[inline]
+pub fn tq_l2_adc_budgeted(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    budget: f32,
+) -> f32 {
+    let padded = q_rotated.len();
+    debug_assert_eq!(code.len(), padded / 2);
+
+    let norm_sq = norm * norm;
+    // Pre-divide budget by norm^2 so we compare raw sums in the loop.
+    let sum_budget = if norm_sq > 0.0 { budget / norm_sq } else { f32::MAX };
+
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+
+    let code_len = code.len();
+    let chunks = code_len / 4;
+    let remainder = code_len % 4;
+
+    for c in 0..chunks {
+        let base = c * 4;
+        let qbase = base * 2;
+
+        let b0 = code[base];
+        let b1 = code[base + 1];
+        let b2 = code[base + 2];
+        let b3 = code[base + 3];
+
+        let d0lo = q_rotated[qbase] - CENTROIDS[(b0 & 0x0F) as usize];
+        let d0hi = q_rotated[qbase + 1] - CENTROIDS[(b0 >> 4) as usize];
+        sum0 += d0lo * d0lo + d0hi * d0hi;
+
+        let d1lo = q_rotated[qbase + 2] - CENTROIDS[(b1 & 0x0F) as usize];
+        let d1hi = q_rotated[qbase + 3] - CENTROIDS[(b1 >> 4) as usize];
+        sum1 += d1lo * d1lo + d1hi * d1hi;
+
+        let d2lo = q_rotated[qbase + 4] - CENTROIDS[(b2 & 0x0F) as usize];
+        let d2hi = q_rotated[qbase + 5] - CENTROIDS[(b2 >> 4) as usize];
+        sum2 += d2lo * d2lo + d2hi * d2hi;
+
+        let d3lo = q_rotated[qbase + 6] - CENTROIDS[(b3 & 0x0F) as usize];
+        let d3hi = q_rotated[qbase + 7] - CENTROIDS[(b3 >> 4) as usize];
+        sum3 += d3lo * d3lo + d3hi * d3hi;
+
+        // Check budget every 128 dimensions (16 iterations of 4-way unroll).
+        // The partial sum is a lower bound on the final sum, so early exit is safe.
+        // Checking every 16 iterations amortizes branch cost for best throughput.
+        if c & 15 == 15 {
+            let partial = sum0 + sum1 + sum2 + sum3;
+            if partial > sum_budget {
+                return f32::MAX;
+            }
+        }
+    }
+
+    let tail_start = chunks * 4;
+    for j in 0..remainder {
+        let i = tail_start + j;
+        let byte = code[i];
+        let d_lo = q_rotated[i * 2] - CENTROIDS[(byte & 0x0F) as usize];
+        let d_hi = q_rotated[i * 2 + 1] - CENTROIDS[(byte >> 4) as usize];
+        sum0 += d_lo * d_lo + d_hi * d_hi;
+    }
+
+    (sum0 + sum1 + sum2 + sum3) * norm_sq
 }
 
 #[cfg(test)]

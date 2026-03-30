@@ -121,18 +121,22 @@ impl SegmentHolder {
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
-        let mut all = match strategy {
+        // Pre-allocate merge buffer: k results per segment (mutable + immutables).
+        // Uses with_capacity to avoid inline-to-heap transitions in SmallVec.
+        let segment_count = 1 + snapshot.immutable.len();
+        let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
+
+        match strategy {
             FilterStrategy::Unfiltered => {
-                let mut all = snapshot.mutable.brute_force_search(query_sq, k);
+                all.extend(snapshot.mutable.brute_force_search(query_sq, k));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, ef_search, scratch));
                 }
-                all
             }
             FilterStrategy::BruteForceFiltered => {
-                let mut all = snapshot
+                all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(query_sq, k, filter_bitmap);
+                    .brute_force_search_filtered(query_sq, k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
@@ -142,12 +146,11 @@ impl SegmentHolder {
                         filter_bitmap,
                     ));
                 }
-                all
             }
             FilterStrategy::HnswFiltered => {
-                let mut all = snapshot
+                all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(query_sq, k, filter_bitmap);
+                    .brute_force_search_filtered(query_sq, k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
@@ -157,13 +160,12 @@ impl SegmentHolder {
                         filter_bitmap,
                     ));
                 }
-                all
             }
             FilterStrategy::HnswPostFilter => {
                 let oversample_k = k * 3;
-                let mut all = snapshot
+                all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(query_sq, oversample_k, filter_bitmap);
+                    .brute_force_search_filtered(query_sq, oversample_k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     let imm_results = imm.search(
                         query_f32,
@@ -181,9 +183,8 @@ impl SegmentHolder {
                         all.extend(imm_results);
                     }
                 }
-                all
             }
-        };
+        }
 
         // Fan-out to IVF segments.
         if !snapshot.ivf.is_empty() {
@@ -228,7 +229,7 @@ impl SegmentHolder {
             }
         }
 
-        all.sort();
+        all.sort_unstable();
         all.truncate(k);
         all
     }
@@ -348,7 +349,7 @@ impl SegmentHolder {
         }
 
         // 4. Merge all results, take global top-k
-        all.sort();
+        all.sort_unstable();
         all.truncate(k);
         all
     }

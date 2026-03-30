@@ -112,6 +112,12 @@ impl HnswGraph {
         self.m0
     }
 
+    /// Bytes per TQ code slot (padded_dim/2 + 4 for norm).
+    #[inline]
+    pub fn bytes_per_code(&self) -> u32 {
+        self.bytes_per_code
+    }
+
     /// Get layer-0 neighbors for a BFS-reordered node position.
     /// Returns a slice of m0 u32s (may contain SENTINEL for unfilled slots).
     #[inline]

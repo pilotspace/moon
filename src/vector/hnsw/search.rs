@@ -221,20 +221,36 @@ pub fn hnsw_search_filtered(
     // Apply FWHT with collection's sign flips
     fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
 
-    // Get distance function
-    let dist_table = crate::vector::distance::table();
-    let tq_l2 = dist_table.tq_l2;
+    // Use tq_l2_adc directly instead of through DistanceTable function pointer.
+    // All DistanceTable tiers use the same scalar ADC (SIMD ADC is future work).
+    // Direct call enables inlining and avoids indirect-call overhead in the hot loop.
+    use crate::vector::turbo_quant::tq_adc::{tq_l2_adc_scalar, tq_l2_adc_budgeted};
 
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
 
-    // Compute distance from rotated query to a node (by BFS position).
-    // tq_code returns the full code slot; we strip the last 4 bytes (norm).
+    // Pre-compute code layout for inlined offset computation.
+    let bytes_per_code = graph.bytes_per_code() as usize;
+    let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 bytes are norm)
+
+    // Unbounded distance: used in upper-layer descent where no budget exists.
     let dist_bfs = |bfs_pos: u32| -> f32 {
-        let code = graph.tq_code(bfs_pos, vectors_tq);
-        let code_only = &code[..code.len() - 4];
-        let norm = graph.tq_norm(bfs_pos, vectors_tq);
-        tq_l2(q_rotated, code_only, norm)
+        let offset = bfs_pos as usize * bytes_per_code;
+        let code_only = &vectors_tq[offset..offset + code_len];
+        let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
+        let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+        tq_l2_adc_scalar(q_rotated, code_only, norm)
+    };
+
+    // Budgeted distance: used in layer 0 beam search. Aborts early when partial
+    // distance exceeds budget, returning f32::MAX. Saves ~30-50% of ADC loop
+    // iterations for clearly-dominated neighbors at high ef.
+    let dist_bfs_budgeted = |bfs_pos: u32, budget: f32| -> f32 {
+        let offset = bfs_pos as usize * bytes_per_code;
+        let code_only = &vectors_tq[offset..offset + code_len];
+        let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
+        let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+        tq_l2_adc_budgeted(q_rotated, code_only, norm, budget)
     };
 
     // Step 2: Upper layer greedy descent (original node ID space)
@@ -275,14 +291,14 @@ pub fn hnsw_search_filtered(
         scratch.results.push(OrdF32Pair(current_dist, entry_bfs));
     }
 
+    // Cache the worst (farthest) distance in results to avoid repeated heap peek.
+    // Updated after every results mutation (push or pop). Avoids O(1) peek per neighbor.
+    let mut worst_dist = f32::MAX;
+
     while let Some(Reverse(OrdF32Pair(c_dist, c_bfs))) = scratch.candidates.pop() {
-        // Early termination
-        if scratch.results.len() >= ef {
-            if let Some(&OrdF32Pair(worst, _)) = scratch.results.peek() {
-                if c_dist > worst {
-                    break;
-                }
-            }
+        // Early termination: if nearest candidate is farther than worst result
+        if scratch.results.len() >= ef && c_dist > worst_dist {
+            break;
         }
 
         let neighbors = graph.neighbors_l0(c_bfs);
@@ -310,58 +326,83 @@ pub fn hnsw_search_filtered(
                 }
             }
 
-            let d = dist_bfs(nb);
-            let orig_id = graph.to_original(nb);
-            let passes_filter = allow_bitmap.map_or(true, |bm| bm.contains(orig_id));
+            // Use budgeted ADC when results heap is full (budget = worst distance).
+            // Early-exit saves ~30-50% of ADC iterations for dominated neighbors.
+            let d = if worst_dist < f32::MAX {
+                dist_bfs_budgeted(nb, worst_dist)
+            } else {
+                dist_bfs(nb)
+            };
 
-            if passes_filter {
-                // Normal: add to candidates AND results (same as unfiltered)
-                let dominated = scratch.results.len() >= ef
-                    && d >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
+            // Fast domination check: d == f32::MAX means budgeted ADC aborted early.
+            let dominated = d == f32::MAX || (scratch.results.len() >= ef && d >= worst_dist);
+
+            if let Some(bm) = allow_bitmap {
+                let orig_id = graph.to_original(nb);
+                if bm.contains(orig_id) {
+                    // Passes filter: add to candidates AND results
+                    if !dominated {
+                        scratch.candidates.push(Reverse(OrdF32Pair(d, nb)));
+                        scratch.results.push(OrdF32Pair(d, nb));
+                        if scratch.results.len() > ef {
+                            scratch.results.pop();
+                        }
+                        // Update cached worst after any mutation that fills/overfills
+                        if scratch.results.len() >= ef {
+                            worst_dist = scratch.results.peek().map_or(f32::MAX, |p| p.0);
+                        }
+                    }
+                } else {
+                    // ACORN: add to candidates for connectivity but NOT to results
+                    if !dominated {
+                        scratch.candidates.push(Reverse(OrdF32Pair(d, nb)));
+                    }
+                    // 2-hop expansion: immediately explore nb's neighbors
+                    for &hop2_nb in graph.neighbors_l0(nb) {
+                        if hop2_nb == SENTINEL {
+                            break;
+                        }
+                        if scratch.visited.test_and_set(hop2_nb) {
+                            continue;
+                        }
+                        let d2 = dist_bfs(hop2_nb);
+                        let hop2_dominated = scratch.results.len() >= ef && d2 >= worst_dist;
+                        if !hop2_dominated {
+                            scratch.candidates.push(Reverse(OrdF32Pair(d2, hop2_nb)));
+                            let hop2_orig = graph.to_original(hop2_nb);
+                            if bm.contains(hop2_orig) {
+                                scratch.results.push(OrdF32Pair(d2, hop2_nb));
+                                if scratch.results.len() > ef {
+                                    scratch.results.pop();
+                                }
+                                if scratch.results.len() >= ef {
+                                    worst_dist = scratch.results.peek().map_or(f32::MAX, |p| p.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Unfiltered fast path: no bitmap checks, no 2-hop expansion
                 if !dominated {
                     scratch.candidates.push(Reverse(OrdF32Pair(d, nb)));
                     scratch.results.push(OrdF32Pair(d, nb));
                     if scratch.results.len() > ef {
                         scratch.results.pop();
                     }
-                }
-            } else {
-                // ACORN: add to candidates for connectivity but NOT to results
-                let dominated = scratch.results.len() >= ef
-                    && d >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
-                if !dominated {
-                    scratch.candidates.push(Reverse(OrdF32Pair(d, nb)));
-                }
-                // 2-hop expansion: immediately explore nb's neighbors
-                for &hop2_nb in graph.neighbors_l0(nb) {
-                    if hop2_nb == SENTINEL {
-                        break;
-                    }
-                    if scratch.visited.test_and_set(hop2_nb) {
-                        continue;
-                    }
-                    let d2 = dist_bfs(hop2_nb);
-                    let hop2_orig = graph.to_original(hop2_nb);
-                    let hop2_passes = allow_bitmap.map_or(true, |bm| bm.contains(hop2_orig));
-                    let hop2_dominated = scratch.results.len() >= ef
-                        && d2 >= scratch.results.peek().map_or(f32::MAX, |p| p.0);
-                    if !hop2_dominated {
-                        scratch.candidates.push(Reverse(OrdF32Pair(d2, hop2_nb)));
-                        if hop2_passes {
-                            scratch.results.push(OrdF32Pair(d2, hop2_nb));
-                            if scratch.results.len() > ef {
-                                scratch.results.pop();
-                            }
-                        }
+                    if scratch.results.len() >= ef {
+                        worst_dist = scratch.results.peek().map_or(f32::MAX, |p| p.0);
                     }
                 }
             }
         }
     }
 
-    // Step 4: Extract top-K, map back to original IDs
-    // Results is a max-heap. Drain all, sort, take top-k.
-    let mut collected: SmallVec<[SearchResult; 32]> = SmallVec::new();
+    // Step 4: Extract top-K, map back to original IDs.
+    // Results is a max-heap of up to `ef` entries. We need the nearest `k`.
+    // Strategy: drain into SmallVec (farthest-first from max-heap), reverse, truncate.
+    let result_count = scratch.results.len();
+    let mut collected: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(result_count);
     while let Some(OrdF32Pair(dist, bfs_pos)) = scratch.results.pop() {
         collected.push(SearchResult::new(
             dist,
