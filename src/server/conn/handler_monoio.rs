@@ -1271,6 +1271,32 @@ pub async fn handle_connection_sharded_monoio<
                     continue;
                 }
 
+                // --- FT.* vector search commands ---
+                // Vector commands dispatch via SPSC to shard event loops that own VectorStore.
+                if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                    if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                        let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
+                            Ok((index_name, query_blob, k)) => {
+                                crate::shard::coordinator::scatter_vector_search_remote(
+                                    index_name, query_blob, k,
+                                    shard_id, num_shards,
+                                    &dispatch_tx, &spsc_notifiers,
+                                ).await
+                            }
+                            Err(err_frame) => err_frame,
+                        };
+                        responses.push(response);
+                        continue;
+                    }
+                    // FT.CREATE, FT.DROPINDEX, FT.INFO: send to shard 0
+                    let response = crate::shard::coordinator::send_vector_command_to_shard0(
+                        std::sync::Arc::new(frame),
+                        shard_id, &dispatch_tx, &spsc_notifiers,
+                    ).await;
+                    responses.push(response);
+                    continue;
+                }
+
                 // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
                 if is_multi_key_command(cmd, cmd_args) {
                     let response = crate::shard::coordinator::coordinate_multi_key(

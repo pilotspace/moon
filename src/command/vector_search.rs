@@ -462,6 +462,49 @@ fn extract_score_from_fields(fields: &Frame) -> f32 {
     f32::MAX
 }
 
+/// Parse FT.SEARCH arguments into (index_name, query_blob, k).
+///
+/// Used by connection handlers to extract search parameters before dispatching
+/// to the coordinator's scatter_vector_search_remote. Returns Err(Frame::Error)
+/// if args are malformed.
+pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize), Frame> {
+    if args.len() < 2 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.SEARCH' command",
+        )));
+    }
+
+    let index_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Err(Frame::Error(Bytes::from_static(b"ERR invalid index name"))),
+    };
+
+    let query_str = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Err(Frame::Error(Bytes::from_static(b"ERR invalid query"))),
+    };
+
+    let (k, param_name) = match parse_knn_query(&query_str) {
+        Some(parsed) => parsed,
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR invalid KNN query syntax",
+            )))
+        }
+    };
+
+    let query_blob = match extract_param_blob(args, &param_name) {
+        Some(blob) => blob,
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR query vector parameter not found in PARAMS",
+            )))
+        }
+    };
+
+    Ok((index_name, query_blob, k))
+}
+
 // -- Helpers (private) --
 
 fn extract_bulk(frame: &Frame) -> Option<Bytes> {

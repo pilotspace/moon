@@ -726,6 +726,65 @@ pub async fn scatter_vector_search(
     crate::command::vector_search::merge_search_results(&shard_responses, k)
 }
 
+/// Scatter FT.SEARCH to all shards via SPSC (no local vector_store needed).
+///
+/// Used by connection handlers that don't have direct vector_store access.
+/// Sends VectorSearch to every shard (including local) via SPSC, collects
+/// results, and merges into a global top-K response.
+pub async fn scatter_vector_search_remote(
+    index_name: Bytes,
+    query_blob: Bytes,
+    k: usize,
+    my_shard: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    let mut receivers = Vec::with_capacity(num_shards);
+
+    for shard_id in 0..num_shards {
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::VectorSearch {
+            index_name: index_name.clone(),
+            query_blob: query_blob.clone(),
+            k,
+            reply_tx,
+        };
+        spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        receivers.push(reply_rx);
+    }
+
+    let mut shard_responses = Vec::with_capacity(num_shards);
+    for rx in receivers {
+        match rx.recv().await {
+            Ok(frame) => shard_responses.push(frame),
+            Err(_) => {} // shard disconnected, skip
+        }
+    }
+
+    crate::command::vector_search::merge_search_results(&shard_responses, k)
+}
+
+/// Send an FT.* management command (FT.CREATE, FT.DROPINDEX, FT.INFO) to shard 0.
+///
+/// Index management operations are global -- shard 0 is the canonical owner.
+/// Used by connection handlers that don't have direct vector_store access.
+pub async fn send_vector_command_to_shard0(
+    command: std::sync::Arc<Frame>,
+    my_shard: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    let (reply_tx, reply_rx) = channel::oneshot();
+    let msg = ShardMessage::VectorCommand { command, reply_tx };
+    spsc_send(dispatch_tx, my_shard, 0, msg, spsc_notifiers).await;
+
+    match reply_rx.recv().await {
+        Ok(frame) => frame,
+        Err(_) => Frame::Error(Bytes::from_static(b"ERR shard 0 disconnected")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
