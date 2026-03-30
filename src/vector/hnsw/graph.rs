@@ -171,6 +171,170 @@ impl HnswGraph {
         self.bfs_inverse[bfs_pos as usize]
     }
 
+    /// Serialize the graph to a byte buffer.
+    ///
+    /// Format (all LE):
+    ///   num_nodes: u32, m: u8, m0: u8, entry_point: u32, max_level: u8,
+    ///   bytes_per_code: u32,
+    ///   layer0_len: u32 (number of u32 values), layer0_neighbors: [u32; layer0_len],
+    ///   bfs_order: [u32; num_nodes], bfs_inverse: [u32; num_nodes],
+    ///   levels: [u8; num_nodes],
+    ///   upper_layers_count: u32 (nodes with non-empty upper layers),
+    ///   for each: node_id: u32, neighbors_len: u16, neighbors: [u32; neighbors_len]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n = self.num_nodes as usize;
+        let layer0_len = self.layer0_neighbors.len();
+        // Estimate capacity
+        let capacity = 4 + 1 + 1 + 4 + 1 + 4 + 4 + layer0_len * 4 + n * 4 * 2 + n + 4 + 256;
+        let mut buf = Vec::with_capacity(capacity);
+
+        buf.extend_from_slice(&self.num_nodes.to_le_bytes());
+        buf.push(self.m);
+        buf.push(self.m0);
+        buf.extend_from_slice(&self.entry_point.to_le_bytes());
+        buf.push(self.max_level);
+        buf.extend_from_slice(&self.bytes_per_code.to_le_bytes());
+
+        // Layer 0
+        buf.extend_from_slice(&(layer0_len as u32).to_le_bytes());
+        for &v in self.layer0_neighbors.as_slice() {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // BFS order and inverse
+        for &v in &self.bfs_order {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.bfs_inverse {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Levels
+        buf.extend_from_slice(&self.levels);
+
+        // Upper layers: only non-empty
+        let non_empty: Vec<(u32, &SmallVec<[u32; 32]>)> = self
+            .upper_layers
+            .iter()
+            .enumerate()
+            .filter(|(_, sv)| !sv.is_empty())
+            .map(|(i, sv)| (i as u32, sv))
+            .collect();
+
+        buf.extend_from_slice(&(non_empty.len() as u32).to_le_bytes());
+        for (node_id, sv) in &non_empty {
+            buf.extend_from_slice(&node_id.to_le_bytes());
+            buf.extend_from_slice(&(sv.len() as u16).to_le_bytes());
+            for &nb in sv.iter() {
+                buf.extend_from_slice(&nb.to_le_bytes());
+            }
+        }
+
+        buf
+    }
+
+    /// Deserialize from bytes. Returns `Err` on truncation or format mismatch.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        let mut pos = 0;
+
+        let ensure = |pos: usize, need: usize| -> Result<(), &'static str> {
+            if pos + need > data.len() {
+                Err("truncated graph data")
+            } else {
+                Ok(())
+            }
+        };
+
+        let read_u8 = |pos: &mut usize| -> Result<u8, &'static str> {
+            ensure(*pos, 1)?;
+            let v = data[*pos];
+            *pos += 1;
+            Ok(v)
+        };
+
+        let read_u16 = |pos: &mut usize| -> Result<u16, &'static str> {
+            ensure(*pos, 2)?;
+            let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+            *pos += 2;
+            Ok(v)
+        };
+
+        let read_u32 = |pos: &mut usize| -> Result<u32, &'static str> {
+            ensure(*pos, 4)?;
+            let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            *pos += 4;
+            Ok(v)
+        };
+
+        let num_nodes = read_u32(&mut pos)?;
+        let m = read_u8(&mut pos)?;
+        let m0 = read_u8(&mut pos)?;
+        let entry_point = read_u32(&mut pos)?;
+        let max_level = read_u8(&mut pos)?;
+        let bytes_per_code = read_u32(&mut pos)?;
+
+        let n = num_nodes as usize;
+
+        // Layer 0
+        let layer0_len = read_u32(&mut pos)? as usize;
+        ensure(pos, layer0_len * 4)?;
+        let mut layer0_vec = Vec::with_capacity(layer0_len);
+        for _ in 0..layer0_len {
+            layer0_vec.push(read_u32(&mut pos)?);
+        }
+        let layer0_neighbors = AlignedBuffer::from_vec(layer0_vec);
+
+        // BFS order
+        ensure(pos, n * 4)?;
+        let mut bfs_order = Vec::with_capacity(n);
+        for _ in 0..n {
+            bfs_order.push(read_u32(&mut pos)?);
+        }
+
+        // BFS inverse
+        ensure(pos, n * 4)?;
+        let mut bfs_inverse = Vec::with_capacity(n);
+        for _ in 0..n {
+            bfs_inverse.push(read_u32(&mut pos)?);
+        }
+
+        // Levels
+        ensure(pos, n)?;
+        let levels = data[pos..pos + n].to_vec();
+        pos += n;
+
+        // Upper layers
+        let upper_count = read_u32(&mut pos)? as usize;
+        let mut upper_layers: Vec<SmallVec<[u32; 32]>> = vec![SmallVec::new(); n];
+        for _ in 0..upper_count {
+            let node_id = read_u32(&mut pos)? as usize;
+            if node_id >= n {
+                return Err("upper layer node_id out of range");
+            }
+            let nb_len = read_u16(&mut pos)? as usize;
+            ensure(pos, nb_len * 4)?;
+            let mut sv = SmallVec::with_capacity(nb_len);
+            for _ in 0..nb_len {
+                sv.push(read_u32(&mut pos)?);
+            }
+            upper_layers[node_id] = sv;
+        }
+
+        Ok(Self {
+            num_nodes,
+            m,
+            m0,
+            entry_point,
+            max_level,
+            layer0_neighbors,
+            bfs_order,
+            bfs_inverse,
+            upper_layers,
+            levels,
+            bytes_per_code,
+        })
+    }
+
     /// Dual prefetch: neighbor list + vector data for a BFS-positioned node.
     /// Prefetches 2 cache lines of neighbors (128 bytes = 32 u32s at M0=32)
     /// and 3 cache lines of TQ code data (~192 bytes covers 512-byte TQ code start).
@@ -519,6 +683,87 @@ mod tests {
         assert_eq!(graph.num_nodes(), 0);
         assert_eq!(graph.entry_point(), 0);
         assert_eq!(graph.max_level(), 0);
+    }
+
+    #[test]
+    fn test_graph_serialization_roundtrip() {
+        let (num_nodes, m0, flat) = make_test_graph();
+        let m: u8 = 16;
+        let (bfs_order, bfs_inverse) = bfs_reorder(num_nodes, m0, 0, &flat);
+        let layer0 = rearrange_layer0(num_nodes, m0, &flat, &bfs_order, &bfs_inverse);
+
+        // Build upper layers for node 0 (level 1)
+        // With m=16, each level has m=16 slots. Node 0 has level 1.
+        let mut upper = vec![SmallVec::new(); num_nodes as usize];
+        let mut sv: SmallVec<[u32; 32]> = SmallVec::new();
+        // Level 1: m=16 slots
+        for i in 0..m as u32 {
+            sv.push(if i < 3 { i + 1 } else { SENTINEL });
+        }
+        upper[0] = sv;
+
+        let levels = vec![1, 0, 0, 0, 0];
+
+        let graph = HnswGraph::new(
+            num_nodes, m, m0, bfs_order[0], 1,
+            layer0, bfs_order, bfs_inverse,
+            upper, levels, 36,
+        );
+
+        let bytes = graph.to_bytes();
+        let restored = HnswGraph::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.num_nodes(), graph.num_nodes());
+        assert_eq!(restored.m(), graph.m());
+        assert_eq!(restored.m0(), graph.m0());
+        assert_eq!(restored.entry_point(), graph.entry_point());
+        assert_eq!(restored.max_level(), graph.max_level());
+
+        // Check layer 0 neighbors match
+        for i in 0..num_nodes {
+            assert_eq!(restored.neighbors_l0(i), graph.neighbors_l0(i));
+        }
+
+        // Check BFS mappings
+        for i in 0..num_nodes {
+            assert_eq!(restored.to_bfs(i), graph.to_bfs(i));
+            assert_eq!(restored.to_original(i), graph.to_original(i));
+        }
+
+        // Check upper layers for node 0 at level 1
+        let l1 = restored.neighbors_upper(0, 1);
+        assert_eq!(l1.len(), m as usize);
+        assert_eq!(l1[0], 1);
+        assert_eq!(l1[1], 2);
+        assert_eq!(l1[2], 3);
+        assert_eq!(l1[3], SENTINEL);
+    }
+
+    #[test]
+    fn test_graph_serialization_empty() {
+        let graph = HnswGraph::new(
+            0, DEFAULT_M, DEFAULT_M0, 0, 0,
+            AlignedBuffer::new(0),
+            Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), 8,
+        );
+        let bytes = graph.to_bytes();
+        let restored = HnswGraph::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.num_nodes(), 0);
+    }
+
+    #[test]
+    fn test_graph_from_bytes_rejects_truncated() {
+        let graph = HnswGraph::new(
+            5, 16, 4, 0, 0,
+            AlignedBuffer::new(20),
+            vec![0, 1, 2, 3, 4], vec![0, 1, 2, 3, 4],
+            vec![SmallVec::new(); 5],
+            vec![0; 5], 8,
+        );
+        let bytes = graph.to_bytes();
+        // Truncate to half
+        assert!(HnswGraph::from_bytes(&bytes[..bytes.len() / 2]).is_err());
     }
 
     #[test]

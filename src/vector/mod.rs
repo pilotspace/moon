@@ -9,4 +9,5 @@ pub mod filter;
 pub mod store;
 pub mod types;
 pub mod mvcc;
+pub mod persistence;
 
