@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::runtime::channel;
+use bytes::Bytes;
 
 /// A subscriber wrapping an mpsc sender for delivering pub/sub messages.
 ///

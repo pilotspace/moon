@@ -215,6 +215,11 @@ impl PubSubRegistry {
 }
 
 // -- Pre-serialization helpers for zero-copy fan-out --
+//
+// NOTE: Pub/sub messages use Array + BulkString frames, which serialize identically
+// in RESP2 and RESP3. When proper RESP3 Push (`>`) framing is added, these helpers
+// must produce both RESP2 and RESP3 variants, with the subscriber storing which
+// protocol version its client uses.
 
 /// Pre-serialize a "message" delivery into RESP2 wire bytes.
 /// Called once per PUBLISH; the returned Bytes is cloned (refcount bump) per subscriber.
@@ -296,7 +301,16 @@ fn pmessage_frame(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Frame {
 #[cfg(all(test, feature = "runtime-tokio"))]
 mod tests {
     use super::*;
+    use crate::protocol::ParseConfig;
     use crate::runtime::channel;
+
+    /// Parse pre-serialized RESP bytes back into a Frame for assertion.
+    fn parse_resp(data: &[u8]) -> Frame {
+        let mut buf = BytesMut::from(data);
+        crate::protocol::parse(&mut buf, &ParseConfig::default())
+            .expect("valid RESP")
+            .expect("complete frame")
+    }
 
     #[tokio::test]
     async fn test_subscribe_and_publish() {
@@ -311,8 +325,15 @@ mod tests {
         assert_eq!(count, 1);
 
         let msg = rx.recv_async().await.unwrap();
-        let expected = serialize_message_bytes(&Bytes::from_static(b"news"), &Bytes::from_static(b"hello"));
-        assert_eq!(msg, expected);
+        let parsed = parse_resp(&msg);
+        assert_eq!(
+            parsed,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"message")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"hello")),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -329,12 +350,16 @@ mod tests {
         assert_eq!(count, 1);
 
         let msg = rx.recv_async().await.unwrap();
-        let expected = serialize_pmessage_bytes(
-            &Bytes::from_static(b"news.*"),
-            &Bytes::from_static(b"news.sports"),
-            &Bytes::from_static(b"goal!"),
+        let parsed = parse_resp(&msg);
+        assert_eq!(
+            parsed,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"pmessage")),
+                Frame::BulkString(Bytes::from_static(b"news.*")),
+                Frame::BulkString(Bytes::from_static(b"news.sports")),
+                Frame::BulkString(Bytes::from_static(b"goal!")),
+            ])
         );
-        assert_eq!(msg, expected);
     }
 
     #[tokio::test]

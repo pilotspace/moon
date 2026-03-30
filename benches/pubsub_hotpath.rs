@@ -42,7 +42,10 @@ fn bench_publish_fanout(c: &mut Criterion) {
     group.finish();
 }
 
-/// Bench: channel try_send throughput with pre-serialized Bytes
+/// Bench: channel try_send throughput with pre-serialized Bytes.
+///
+/// Creates channel inside `b.iter` to ensure each iteration measures a
+/// successful send (not the full/failure path from channel saturation).
 fn bench_try_send(c: &mut Criterion) {
     let mut group = c.benchmark_group("try_send_bytes");
 
@@ -50,29 +53,29 @@ fn bench_try_send(c: &mut Criterion) {
     let data = Bytes::from(vec![b'x'; 80]);
 
     group.bench_function("single_send", |b| {
-        let (tx, rx) = channel::mpsc_bounded::<Bytes>(4096);
         b.iter(|| {
-            black_box(tx.try_send(data.clone()).is_ok());
+            let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
+            black_box(tx.try_send(black_box(data.clone())).is_ok());
+            black_box(rx.try_recv().ok());
         });
-        while rx.try_recv().is_ok() {}
     });
 
     group.bench_function("10x_fanout_send", |b| {
-        let mut txs = Vec::new();
-        let mut rxs = Vec::new();
-        for _ in 0..10 {
-            let (tx, rx) = channel::mpsc_bounded::<Bytes>(4096);
-            txs.push(tx);
-            rxs.push(rx);
-        }
         b.iter(|| {
+            let mut txs = Vec::new();
+            let mut rxs = Vec::new();
+            for _ in 0..10 {
+                let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
+                txs.push(tx);
+                rxs.push(rx);
+            }
             for tx in &txs {
-                black_box(tx.try_send(data.clone()).is_ok());
+                black_box(tx.try_send(black_box(data.clone())).is_ok());
+            }
+            for rx in &rxs {
+                black_box(rx.try_recv().ok());
             }
         });
-        for rx in &rxs {
-            while rx.try_recv().is_ok() {}
-        }
     });
     group.finish();
 }
@@ -98,7 +101,9 @@ fn bench_rwlock_contention(c: &mut Criterion) {
         let channel = Bytes::from_static(b"bench:ch");
         let message = Bytes::from("x".repeat(32));
         b.iter(|| {
-            let count = registry.write().publish(black_box(&channel), black_box(&message));
+            let count = registry
+                .write()
+                .publish(black_box(&channel), black_box(&message));
             black_box(count);
         });
     });
