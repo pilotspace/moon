@@ -5,5 +5,6 @@ pub mod distance;
 pub mod hnsw;
 pub mod segment;
 pub mod turbo_quant;
+pub mod store;
 pub mod types;
 
