@@ -5,3 +5,4 @@
 pub mod build;
 pub mod graph;
 pub mod search;
+pub mod search_sq;
