@@ -1000,6 +1000,24 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
+                            // Auto-index vectors on successful HSET (local write path)
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut vs = shard_databases.vector_store(shard_id);
+                                    crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &key, cmd_args);
+                                }
+                            }
+                            // Auto-delete vectors on DEL/HDEL/UNLINK (local write path)
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") || cmd.eq_ignore_ascii_case(b"HDEL"))
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut vs = shard_databases.vector_store(shard_id);
+                                    vs.mark_deleted_for_key(&key);
+                                }
+                            }
                             if !matches!(response, Frame::Error(_)) {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");

@@ -70,6 +70,8 @@ impl super::Shard {
         all_notifiers: Vec<Arc<channel::Notify>>,
         shard_databases: Arc<ShardDatabases>,
     ) {
+        let shard_id = self.id;
+
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
@@ -303,8 +305,13 @@ impl super::Shard {
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
-        // Per-shard VectorStore: directly owned by shard thread, same pattern as PubSubRegistry.
-        let mut vector_store = std::mem::replace(
+        // Per-shard VectorStore: use the SHARED instance from ShardDatabases.
+        // This ensures handler_sharded FT.* commands and SPSC auto-indexing
+        // (triggered by HSET) operate on the SAME VectorStore.
+        //
+        // The shard-owned vector_store (from Shard struct) is discarded.
+        // All vector operations go through shard_databases.vector_store(shard_id).
+        let _discarded_vector_store = std::mem::replace(
             &mut self.vector_store,
             crate::vector::store::VectorStore::new(),
         );
@@ -397,7 +404,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations, &mut vector_store,
+                        &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
@@ -443,7 +450,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations, &mut vector_store,
+                        &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
@@ -609,7 +616,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations, &mut vector_store,
+                        &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
                     // Wake connection tasks waiting for cross-shard write responses.
                     // They'll try_recv() — if the response arrived, proceed; otherwise re-register.
@@ -661,7 +668,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations, &mut vector_store,
+                        &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
                     // Wake connection tasks waiting for cross-shard write responses.
                     for waker in pending_wakers.borrow_mut().drain(..) {

@@ -311,6 +311,34 @@ impl<K, V> Segment<K, V> {
             }
         }
 
+        // Fallback: full linear scan of remaining groups.
+        // This handles the rare case where insert placed a key in a group
+        // that is neither group_a nor group_b (overflow during high-occupancy
+        // or split redistribution). Without this, get/get_mut would fail to
+        // find a key that was legitimately inserted.
+        for g in 0..NUM_GROUPS {
+            if g == group_a || g == group_b {
+                continue; // already checked above
+            }
+            let base = g * 16;
+
+            #[cfg(target_arch = "x86_64")]
+            let mask = unsafe { self.ctrl[g].match_h2(h2) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let mask = self.ctrl[g].match_h2(h2);
+
+            for pos in mask {
+                let slot = base + pos;
+                if slot < REGULAR_SLOTS {
+                    // SAFETY: ctrl byte matches h2 -> slot is initialized.
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key {
+                        return Some(slot);
+                    }
+                }
+            }
+        }
+
         None
     }
 

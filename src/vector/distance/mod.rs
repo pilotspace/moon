@@ -144,10 +144,11 @@ pub fn init() {
 /// In practice, `init()` is called from `main()` at startup.
 #[inline(always)]
 pub fn table() -> &'static DistanceTable {
-    // SAFETY: init() is called at startup before any search operation.
+    // SAFETY: init() is called from main() at startup before any search operation.
     // The OnceLock is guaranteed to be initialized by the time any search
     // path reaches this function. Using unwrap_unchecked avoids a branch
     // on the hot path.
+    debug_assert!(DISTANCE_TABLE.get().is_some(), "distance::init() was not called before table()");
     unsafe { DISTANCE_TABLE.get().unwrap_unchecked() }
 }
 
