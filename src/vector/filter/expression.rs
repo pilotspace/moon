@@ -3,6 +3,7 @@ use ordered_float::OrderedFloat;
 
 /// Filter expression AST for vector search pre/post filtering.
 /// Evaluated against PayloadIndex to produce a RoaringBitmap of matching vector IDs.
+#[derive(Debug)]
 pub enum FilterExpr {
     /// Tag equality: @field:{value}
     TagEq { field: Bytes, value: Bytes },

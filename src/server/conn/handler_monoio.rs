@@ -1276,7 +1276,7 @@ pub async fn handle_connection_sharded_monoio<
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
                     if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                         let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
-                            Ok((index_name, query_blob, k)) => {
+                            Ok((index_name, query_blob, k, _filter)) => {
                                 crate::shard::coordinator::scatter_vector_search_remote(
                                     index_name, query_blob, k,
                                     shard_id, num_shards,

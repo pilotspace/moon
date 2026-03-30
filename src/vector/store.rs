@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::segment::SegmentHolder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
@@ -39,6 +40,7 @@ pub struct VectorIndex {
     pub segments: SegmentHolder,
     pub scratch: SearchScratch,
     pub collection: Arc<CollectionMetadata>,
+    pub payload_index: PayloadIndex,
 }
 
 /// Per-shard store of all vector indexes. Directly owned by shard thread.
@@ -81,6 +83,7 @@ impl VectorStore {
             segments,
             scratch,
             collection,
+            payload_index: PayloadIndex::new(),
         });
         Ok(())
     }

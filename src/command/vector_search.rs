@@ -6,9 +6,11 @@
 //! these handlers directly with the per-shard VectorStore.
 
 use bytes::Bytes;
+use ordered_float::OrderedFloat;
 use smallvec::SmallVec;
 
 use crate::protocol::Frame;
+use crate::vector::filter::FilterExpr;
 use crate::vector::store::{IndexMeta, VectorStore};
 use crate::vector::types::{DistanceMetric, SearchResult};
 
@@ -265,7 +267,9 @@ pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
         }
     };
 
-    search_local(store, &index_name, &query_blob, k)
+    // Parse optional FILTER clause
+    let filter_expr = parse_filter_clause(args);
+    search_local_filtered(store, &index_name, &query_blob, k, filter_expr.as_ref())
 }
 
 /// Direct local search for cross-shard VectorSearch messages.
@@ -275,6 +279,20 @@ pub fn search_local(
     index_name: &[u8],
     query_blob: &[u8],
     k: usize,
+) -> Frame {
+    search_local_filtered(store, index_name, query_blob, k, None)
+}
+
+/// Local search with optional filter expression.
+///
+/// Evaluates filter against PayloadIndex to produce bitmap, then dispatches
+/// to search_filtered which selects optimal strategy (brute-force/HNSW/post-filter).
+pub fn search_local_filtered(
+    store: &mut VectorStore,
+    index_name: &[u8],
+    query_blob: &[u8],
+    k: usize,
+    filter: Option<&FilterExpr>,
 ) -> Frame {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
@@ -294,9 +312,20 @@ pub fn search_local(
     let mut query_sq = vec![0i8; dim];
     quantize_f32_to_sq(&query_f32, &mut query_sq);
     let ef_search = k.max(64);
-    let results = idx
-        .segments
-        .search(&query_f32, &query_sq, k, ef_search, &mut idx.scratch);
+
+    let filter_bitmap = filter.map(|f| {
+        let total = idx.segments.total_vectors();
+        idx.payload_index.evaluate_bitmap(f, total)
+    });
+
+    let results = idx.segments.search_filtered(
+        &query_f32,
+        &query_sq,
+        k,
+        ef_search,
+        &mut idx.scratch,
+        filter_bitmap.as_ref(),
+    );
     build_search_response(&results)
 }
 
@@ -462,12 +491,12 @@ fn extract_score_from_fields(fields: &Frame) -> f32 {
     f32::MAX
 }
 
-/// Parse FT.SEARCH arguments into (index_name, query_blob, k).
+/// Parse FT.SEARCH arguments into (index_name, query_blob, k, filter).
 ///
 /// Used by connection handlers to extract search parameters before dispatching
 /// to the coordinator's scatter_vector_search_remote. Returns Err(Frame::Error)
 /// if args are malformed.
-pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize), Frame> {
+pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize, Option<FilterExpr>), Frame> {
     if args.len() < 2 {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.SEARCH' command",
@@ -502,7 +531,124 @@ pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize), Fra
         }
     };
 
-    Ok((index_name, query_blob, k))
+    let filter = parse_filter_clause(args);
+    Ok((index_name, query_blob, k, filter))
+}
+
+// -- Filter parsing --
+
+/// Parse FILTER clause from FT.SEARCH args.
+/// Looks for "FILTER" keyword after the query string, parses the filter expression.
+///
+/// Supported syntax:
+///   @field:{value}              -- tag equality
+///   @field:[min max]            -- numeric range
+///   @field:{value} @field2:[a b] -- implicit AND of multiple conditions
+fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
+    // Find FILTER keyword in args (after index_name and query)
+    let mut i = 2;
+    while i < args.len() {
+        if matches_keyword(&args[i], b"FILTER") {
+            i += 1;
+            if i >= args.len() {
+                return None;
+            }
+            let filter_str = extract_bulk(&args[i])?;
+            return parse_filter_string(&filter_str);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse filter string like "@field:{value}" or "@field:[min max]"
+/// Multiple conditions are implicitly ANDed.
+fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
+    let s = std::str::from_utf8(s).ok()?;
+    let mut exprs: Vec<FilterExpr> = Vec::new();
+    let mut pos = 0;
+    while pos < s.len() {
+        // Skip whitespace
+        while pos < s.len() && s.as_bytes()[pos] == b' ' {
+            pos += 1;
+        }
+        if pos >= s.len() {
+            break;
+        }
+        if s.as_bytes()[pos] != b'@' {
+            return None;
+        }
+        pos += 1; // skip @
+
+        // Read field name until : or { or [
+        let field_start = pos;
+        while pos < s.len() && !matches!(s.as_bytes()[pos], b':' | b'{' | b'[') {
+            pos += 1;
+        }
+        let field = Bytes::from(s[field_start..pos].to_owned());
+        if pos >= s.len() {
+            return None;
+        }
+
+        // Determine type
+        if s.as_bytes()[pos] == b':' {
+            pos += 1; // skip :
+        }
+
+        if pos < s.len() && s.as_bytes()[pos] == b'{' {
+            // Tag: @field:{value}
+            pos += 1;
+            let val_start = pos;
+            while pos < s.len() && s.as_bytes()[pos] != b'}' {
+                pos += 1;
+            }
+            let value = Bytes::from(s[val_start..pos].to_owned());
+            if pos < s.len() {
+                pos += 1; // skip }
+            }
+            exprs.push(FilterExpr::TagEq { field, value });
+        } else if pos < s.len() && s.as_bytes()[pos] == b'[' {
+            // Numeric range: @field:[min max]
+            pos += 1;
+            let range_start = pos;
+            while pos < s.len() && s.as_bytes()[pos] != b']' {
+                pos += 1;
+            }
+            let range_str = &s[range_start..pos];
+            if pos < s.len() {
+                pos += 1; // skip ]
+            }
+            let parts: Vec<&str> = range_str.split_whitespace().collect();
+            if parts.len() != 2 {
+                return None;
+            }
+            let min: f64 = parts[0].parse().ok()?;
+            let max: f64 = parts[1].parse().ok()?;
+            if (min - max).abs() < f64::EPSILON {
+                exprs.push(FilterExpr::NumEq {
+                    field,
+                    value: OrderedFloat(min),
+                });
+            } else {
+                exprs.push(FilterExpr::NumRange {
+                    field,
+                    min: OrderedFloat(min),
+                    max: OrderedFloat(max),
+                });
+            }
+        } else {
+            return None;
+        }
+    }
+    // Combine with AND
+    if exprs.is_empty() {
+        return None;
+    }
+    let mut result = exprs.remove(0);
+    for expr in exprs {
+        result = FilterExpr::And(Box::new(result), Box::new(expr));
+    }
+    Some(result)
 }
 
 // -- Helpers (private) --
