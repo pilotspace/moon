@@ -1,3 +1,314 @@
 //! TurboQuant inner-product mode (TurboQuant_prod).
 //!
-//! Placeholder -- implementation in Task 2.
+//! Implements Algorithm 2 from arXiv 2504.19874:
+//! 1. MSE encode at (b-1) bits (use 4-bit = standard TQ MSE)
+//! 2. Compute residual r = x - DeQuant_mse(idx)
+//! 3. QJL encode: sign(S * r), store ||r||
+//! 4. Score: <y, x_hat> = <y, x_mse> + sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
+
+use super::encoder::{decode_tq_mse, encode_tq_mse_scaled, TqCode};
+use super::qjl;
+
+/// Encoded TurboQuant inner-product representation.
+pub struct TqProdCode {
+    /// MSE-quantized codes (nibble-packed, same as TqCode.codes).
+    pub mse_codes: Vec<u8>,
+    /// Original vector L2 norm.
+    pub original_norm: f32,
+    /// QJL sign bits: sign(S * residual). Length = ceil(dim/8) bytes.
+    pub qjl_signs: Vec<u8>,
+    /// L2 norm of the residual: ||x - DeQuant_mse(mse_codes)||.
+    pub residual_norm: f32,
+}
+
+/// Encode a vector using TurboQuant_prod (inner-product mode).
+///
+/// Algorithm 2 from arXiv 2504.19874:
+/// 1. idx = Quant_mse(x)
+/// 2. r = x - DeQuant_mse(idx)
+/// 3. qjl_signs = sign(S * r)
+/// 4. Store: (idx, qjl_signs, ||r||, ||x||)
+///
+/// `vector`: original f32 vector (dim dimensions).
+/// `sign_flips`: FWHT sign flips (padded_dim elements).
+/// `boundaries`: scaled quantization boundaries.
+/// `qjl_matrix`: d x d Gaussian matrix (dim * dim elements, row-major).
+/// `work_buf`: scratch buffer (>= padded_dim elements).
+pub fn encode_tq_prod(
+    vector: &[f32],
+    sign_flips: &[f32],
+    boundaries: &[f32; 15],
+    qjl_matrix: &[f32],
+    work_buf: &mut [f32],
+) -> TqProdCode {
+    let dim = vector.len();
+
+    // Step 1: MSE encode
+    let mse_code = encode_tq_mse_scaled(vector, sign_flips, boundaries, work_buf);
+
+    // Step 2: Decode and compute residual
+    let mut decode_buf = vec![0.0f32; sign_flips.len()];
+    let reconstructed = decode_tq_mse(&mse_code, sign_flips, dim, &mut decode_buf);
+    let mut residual = Vec::with_capacity(dim);
+    let mut r_norm_sq = 0.0f32;
+    for i in 0..dim {
+        let r = vector[i] - reconstructed[i];
+        residual.push(r);
+        r_norm_sq += r * r;
+    }
+    let residual_norm = r_norm_sq.sqrt();
+
+    // Step 3: QJL encode the residual
+    let qjl_signs = qjl::qjl_encode(qjl_matrix, &residual, dim);
+
+    TqProdCode {
+        mse_codes: mse_code.codes,
+        original_norm: mse_code.norm,
+        qjl_signs,
+        residual_norm,
+    }
+}
+
+/// Score inner product <query, x_hat> using TurboQuant_prod.
+///
+/// <y, x_hat> = <y, x_mse> + sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
+///
+/// `query`: raw f32 query vector (dim dimensions).
+/// `code`: TqProdCode from encode_tq_prod.
+/// `sign_flips`: FWHT sign flips (padded_dim elements).
+/// `qjl_matrix`: d x d Gaussian matrix (same one used for encoding).
+///
+/// Returns estimated inner product (higher = more similar for IP metric).
+pub fn score_inner_product(
+    query: &[f32],
+    code: &TqProdCode,
+    sign_flips: &[f32],
+    qjl_matrix: &[f32],
+) -> f32 {
+    let dim = query.len();
+
+    // Term 1: <y, x_mse> via decode
+    let mse_code = TqCode {
+        codes: code.mse_codes.clone(),
+        norm: code.original_norm,
+    };
+    let mut decode_buf = vec![0.0f32; sign_flips.len()];
+    let x_mse = decode_tq_mse(&mse_code, sign_flips, dim, &mut decode_buf);
+    let mut dot_mse = 0.0f32;
+    for i in 0..dim {
+        dot_mse += query[i] * x_mse[i];
+    }
+
+    // Term 2: sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
+    // Compute S*y
+    let mut s_y = vec![0.0f32; dim];
+    for row in 0..dim {
+        let row_start = row * dim;
+        let mut dot = 0.0f32;
+        for col in 0..dim {
+            dot += qjl_matrix[row_start + col] * query[col];
+        }
+        s_y[row] = dot;
+    }
+
+    // Compute <S*y, sign(S*r)> where sign values are +1/-1
+    let mut dot_qjl = 0.0f32;
+    for row in 0..dim {
+        let sign_val = if code.qjl_signs[row / 8] & (1 << (row % 8)) != 0 {
+            1.0f32
+        } else {
+            -1.0f32
+        };
+        dot_qjl += s_y[row] * sign_val;
+    }
+
+    let scale = (std::f32::consts::PI / 2.0).sqrt() / dim as f32;
+    dot_mse + scale * code.residual_norm * dot_qjl
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::turbo_quant::codebook::scaled_boundaries;
+    use crate::vector::turbo_quant::encoder::padded_dimension;
+    use crate::vector::turbo_quant::fwht;
+    use crate::vector::turbo_quant::qjl::generate_qjl_matrix;
+
+    /// Deterministic LCG PRNG for reproducible test vectors.
+    fn lcg_f32(dim: usize, seed: u32) -> Vec<f32> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed;
+        for _ in 0..dim {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    /// Normalize a vector to unit length.
+    fn normalize(v: &mut [f32]) -> f32 {
+        let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            let inv = 1.0 / norm;
+            v.iter_mut().for_each(|x| *x *= inv);
+        }
+        norm
+    }
+
+    /// Generate deterministic sign flips for testing.
+    fn test_sign_flips(dim: usize, seed: u64) -> Vec<f32> {
+        let mut signs = Vec::with_capacity(dim);
+        let mut s = seed;
+        for _ in 0..dim {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            signs.push(if (s >> 63) == 0 { 1.0f32 } else { -1.0 });
+        }
+        signs
+    }
+
+    #[test]
+    fn test_encode_tq_prod_fields() {
+        fwht::init_fwht();
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let sign_flips = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries(padded as u32);
+        let qjl_matrix = generate_qjl_matrix(dim, 999);
+        let mut work = vec![0.0f32; padded];
+
+        let mut vec = lcg_f32(dim, 77);
+        normalize(&mut vec);
+
+        let code = encode_tq_prod(&vec, &sign_flips, &boundaries, &qjl_matrix, &mut work);
+
+        assert!(!code.mse_codes.is_empty(), "MSE codes should be non-empty");
+        assert!(!code.qjl_signs.is_empty(), "QJL signs should be non-empty");
+        assert_eq!(
+            code.qjl_signs.len(),
+            (dim + 7) / 8,
+            "QJL signs should be ceil(dim/8) bytes"
+        );
+        assert!(code.original_norm > 0.0, "norm should be positive for non-zero vector");
+        assert!(
+            code.residual_norm >= 0.0,
+            "residual norm should be non-negative"
+        );
+        // Residual norm should be smaller than original norm (MSE distortion is bounded)
+        assert!(
+            code.residual_norm < code.original_norm,
+            "residual norm {:.4} should be less than original norm {:.4}",
+            code.residual_norm, code.original_norm
+        );
+    }
+
+    #[test]
+    fn test_inner_product_unbiased_estimator() {
+        fwht::init_fwht();
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let sign_flips = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries(padded as u32);
+        let qjl_matrix = generate_qjl_matrix(dim, 999);
+        let mut work = vec![0.0f32; padded];
+
+        // Random query vector
+        let mut query = lcg_f32(dim, 12345);
+        normalize(&mut query);
+
+        let n = 1000;
+        let mut sum_true_ip = 0.0f64;
+        let mut sum_est_ip = 0.0f64;
+        let mut sum_abs_true_ip = 0.0f64;
+
+        for seed in 0..n {
+            let mut vec = lcg_f32(dim, seed * 7 + 13);
+            normalize(&mut vec);
+
+            // True inner product
+            let true_ip: f32 = query.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+
+            // Encode and score
+            let code = encode_tq_prod(&vec, &sign_flips, &boundaries, &qjl_matrix, &mut work);
+            let est_ip = score_inner_product(&query, &code, &sign_flips, &qjl_matrix);
+
+            sum_true_ip += true_ip as f64;
+            sum_est_ip += est_ip as f64;
+            sum_abs_true_ip += (true_ip as f64).abs();
+        }
+
+        let bias = (sum_est_ip - sum_true_ip) / sum_abs_true_ip;
+        eprintln!(
+            "TurboQuant_prod unbiased test: mean_true_ip={:.6}, mean_est_ip={:.6}, bias={:.6}",
+            sum_true_ip / n as f64,
+            sum_est_ip / n as f64,
+            bias
+        );
+
+        assert!(
+            bias.abs() < 0.05,
+            "inner-product estimator bias {:.4} exceeds 5% tolerance (over {} vectors)",
+            bias,
+            n
+        );
+    }
+
+    #[test]
+    fn test_inner_product_self_score() {
+        fwht::init_fwht();
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let sign_flips = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries(padded as u32);
+        let qjl_matrix = generate_qjl_matrix(dim, 999);
+        let mut work = vec![0.0f32; padded];
+
+        let mut vec = lcg_f32(dim, 77);
+        normalize(&mut vec);
+
+        let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+        let code = encode_tq_prod(&vec, &sign_flips, &boundaries, &qjl_matrix, &mut work);
+        let self_score = score_inner_product(&vec, &code, &sign_flips, &qjl_matrix);
+
+        // <x, x> should approximately equal ||x||^2 = 1.0 for unit vectors
+        let relative_err = (self_score - norm_sq).abs() / norm_sq;
+        eprintln!(
+            "Self-score: expected={:.6}, got={:.6}, relative_err={:.6}",
+            norm_sq, self_score, relative_err
+        );
+        assert!(
+            relative_err < 0.15,
+            "self-score relative error {:.4} exceeds 15% tolerance",
+            relative_err
+        );
+    }
+
+    #[test]
+    fn test_inner_product_orthogonal_near_zero() {
+        fwht::init_fwht();
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let sign_flips = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries(padded as u32);
+        let qjl_matrix = generate_qjl_matrix(dim, 999);
+        let mut work = vec![0.0f32; padded];
+
+        // Construct near-orthogonal vectors: e_0 and e_1
+        let mut v1 = vec![0.0f32; dim];
+        v1[0] = 1.0;
+        let mut v2 = vec![0.0f32; dim];
+        v2[1] = 1.0;
+
+        let code = encode_tq_prod(&v2, &sign_flips, &boundaries, &qjl_matrix, &mut work);
+        let score = score_inner_product(&v1, &code, &sign_flips, &qjl_matrix);
+
+        eprintln!("Orthogonal score: {:.6} (expected ~0.0)", score);
+        assert!(
+            score.abs() < 0.3,
+            "orthogonal vectors should score near 0, got {:.4}",
+            score
+        );
+    }
+}

@@ -42,6 +42,12 @@ pub struct CollectionMetadata {
 
     /// XXHash64 of all fields above. Verified at load and search init.
     pub metadata_checksum: u64,
+
+    /// Optional QJL matrix for inner-product mode (TurboQuantProd4).
+    /// dim x dim f32 Gaussian matrix. Only allocated when quantization == TurboQuantProd4.
+    /// Memory: dim^2 * 4 bytes (e.g., 2.25 MB for dim=768).
+    /// NOT included in metadata_checksum (derived from seed+1, not stored in integrity-checked fields).
+    pub qjl_matrix: Option<Vec<f32>>,
 }
 
 /// Errors related to collection metadata integrity.
@@ -84,6 +90,14 @@ impl CollectionMetadata {
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
+        // Generate QJL matrix only for inner-product quantization mode.
+        // Uses seed+1 to avoid collision with sign flip seed.
+        let qjl_matrix = if quantization == QuantizationConfig::TurboQuantProd4 {
+            Some(super::qjl::generate_qjl_matrix(dimension as usize, seed.wrapping_add(1)))
+        } else {
+            None
+        };
+
         let mut meta = Self {
             collection_id,
             created_at_lsn: 0,
@@ -96,6 +110,7 @@ impl CollectionMetadata {
             codebook: scaled_centroids(padded),
             codebook_boundaries: scaled_boundaries(padded),
             metadata_checksum: 0, // computed below
+            qjl_matrix,
         };
         meta.metadata_checksum = meta.compute_checksum();
         meta
