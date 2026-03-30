@@ -125,6 +125,28 @@ impl VectorStore {
         }).collect()
     }
 
+    /// Mark vectors as deleted for a key that was removed (DEL/HDEL/UNLINK).
+    ///
+    /// Finds all indexes whose key_prefixes match the key, computes the key_hash,
+    /// and marks matching entries as deleted in the mutable segment. This prevents
+    /// stale vectors from appearing in search results.
+    ///
+    /// NOTE: Vec allocation for matching_names is acceptable -- this only fires
+    /// when a deleted key matches an index prefix (rare per-operation).
+    pub fn mark_deleted_for_key(&mut self, key: &[u8]) {
+        let matching_names = self.find_matching_index_names(key);
+        if matching_names.is_empty() {
+            return;
+        }
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        for idx_name in matching_names {
+            if let Some(idx) = self.indexes.get(&idx_name) {
+                let snap = idx.segments.load();
+                snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
+            }
+        }
+    }
+
     /// Number of indexes.
     pub fn len(&self) -> usize {
         self.indexes.len()

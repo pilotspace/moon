@@ -175,6 +175,22 @@ impl MutableSegment {
         }
     }
 
+    /// Mark all entries matching a key_hash as deleted.
+    ///
+    /// Used by the DEL/HDEL/UNLINK post-dispatch hook to remove stale vectors
+    /// when the underlying key is deleted. Returns the number of entries marked.
+    pub fn mark_deleted_by_key_hash(&self, key_hash: u64, delete_lsn: u64) -> u32 {
+        let mut inner = self.inner.write();
+        let mut count = 0u32;
+        for entry in inner.entries.iter_mut() {
+            if entry.key_hash == key_hash && entry.delete_lsn == 0 {
+                entry.delete_lsn = delete_lsn;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Freeze: take a read-lock snapshot of vectors and entries for compaction.
     pub fn freeze(&self) -> FrozenSegment {
         let inner = self.inner.read();
