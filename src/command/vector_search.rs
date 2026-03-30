@@ -801,4 +801,161 @@ mod tests {
         let result = ft_info(&store, &[bulk(b"nonexistent")]);
         assert!(matches!(result, Frame::Error(_)));
     }
+
+    /// Helper to build FT.CREATE args with custom parameters.
+    fn build_ft_create_args(
+        name: &str,
+        prefix: &str,
+        field: &str,
+        dim: u32,
+        metric: &str,
+    ) -> Vec<Frame> {
+        vec![
+            Frame::BulkString(Bytes::from(name.to_owned())),
+            Frame::BulkString(Bytes::from_static(b"ON")),
+            Frame::BulkString(Bytes::from_static(b"HASH")),
+            Frame::BulkString(Bytes::from_static(b"PREFIX")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from(prefix.to_owned())),
+            Frame::BulkString(Bytes::from_static(b"SCHEMA")),
+            Frame::BulkString(Bytes::from(field.to_owned())),
+            Frame::BulkString(Bytes::from_static(b"VECTOR")),
+            Frame::BulkString(Bytes::from_static(b"HNSW")),
+            Frame::BulkString(Bytes::from_static(b"6")),
+            Frame::BulkString(Bytes::from_static(b"TYPE")),
+            Frame::BulkString(Bytes::from_static(b"FLOAT32")),
+            Frame::BulkString(Bytes::from_static(b"DIM")),
+            Frame::BulkString(Bytes::from(dim.to_string())),
+            Frame::BulkString(Bytes::from_static(b"DISTANCE_METRIC")),
+            Frame::BulkString(Bytes::from(metric.to_owned())),
+        ]
+    }
+
+    #[test]
+    fn test_end_to_end_create_insert_search() {
+        // Initialize distance functions (required before any search)
+        crate::vector::distance::init();
+
+        let mut store = VectorStore::new();
+        let dim: usize = 4;
+
+        // 1. FT.CREATE
+        let create_args = build_ft_create_args("e2eidx", "doc:", "embedding", dim as u32, "L2");
+        let result = ft_create(&mut store, &create_args);
+        assert!(
+            matches!(result, Frame::SimpleString(_)),
+            "FT.CREATE should return OK, got {result:?}"
+        );
+
+        // 2. Insert vectors directly into the mutable segment
+        let idx = store.get_index_mut(b"e2eidx").unwrap();
+        let vectors: Vec<[f32; 4]> = vec![
+            [1.0, 0.0, 0.0, 0.0], // vec:0 -- exact match for query
+            [0.0, 1.0, 0.0, 0.0], // vec:1 -- orthogonal
+            [0.9, 0.1, 0.0, 0.0], // vec:2 -- close to vec:0
+        ];
+
+        let snap = idx.segments.load();
+        for (i, v) in vectors.iter().enumerate() {
+            let mut sq = vec![0i8; dim];
+            quantize_f32_to_sq(v, &mut sq);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+        }
+        drop(snap);
+
+        // 3. FT.SEARCH for vector close to [1.0, 0.0, 0.0, 0.0]
+        let query_vec: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        let query_blob: Vec<u8> = query_vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let search_args = vec![
+            Frame::BulkString(Bytes::from_static(b"e2eidx")),
+            Frame::BulkString(Bytes::from_static(b"*=>[KNN 2 @embedding $query]")),
+            Frame::BulkString(Bytes::from_static(b"PARAMS")),
+            Frame::BulkString(Bytes::from_static(b"2")),
+            Frame::BulkString(Bytes::from_static(b"query")),
+            Frame::BulkString(Bytes::from(query_blob)),
+        ];
+
+        let result = ft_search(&mut store, &search_args);
+        match &result {
+            Frame::Array(items) => {
+                // First element is count
+                assert!(
+                    matches!(&items[0], Frame::Integer(n) if *n >= 1),
+                    "Should find at least 1 result, got {result:?}"
+                );
+                // First result should be vec:0 (exact match, distance 0)
+                if let Frame::BulkString(doc_id) = &items[1] {
+                    assert_eq!(
+                        doc_id.as_ref(),
+                        b"vec:0",
+                        "Nearest vector should be id 0 (exact match)"
+                    );
+                }
+                // Second result should be vec:2 (closest after exact match)
+                if items.len() >= 4 {
+                    if let Frame::BulkString(doc_id) = &items[3] {
+                        assert_eq!(
+                            doc_id.as_ref(),
+                            b"vec:2",
+                            "Second nearest should be vec:2 (close to query)"
+                        );
+                    }
+                }
+            }
+            Frame::Error(e) => panic!(
+                "FT.SEARCH returned error: {:?}",
+                std::str::from_utf8(e)
+            ),
+            _ => panic!("FT.SEARCH should return Array, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_info_returns_correct_data() {
+        let mut store = VectorStore::new();
+        let args = build_ft_create_args("testidx", "test:", "vec", 128, "COSINE");
+        ft_create(&mut store, &args);
+
+        let info_args = [Frame::BulkString(Bytes::from_static(b"testidx"))];
+        let result = ft_info(&store, &info_args);
+        match result {
+            Frame::Array(items) => {
+                assert!(items.len() >= 6, "FT.INFO should return at least 6 items");
+                // Check dimension
+                let mut found_dim = false;
+                for pair in items.chunks(2) {
+                    if let Frame::BulkString(key) = &pair[0] {
+                        if key.as_ref() == b"dimension" {
+                            if let Frame::Integer(d) = &pair[1] {
+                                assert_eq!(*d, 128);
+                                found_dim = true;
+                            }
+                        }
+                    }
+                }
+                assert!(found_dim, "FT.INFO should return dimension");
+            }
+            other => panic!("FT.INFO should return Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_search_unknown_index() {
+        let mut store = VectorStore::new();
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"nonexistent")),
+            Frame::BulkString(Bytes::from_static(b"*=>[KNN 5 @vec $query]")),
+            Frame::BulkString(Bytes::from_static(b"PARAMS")),
+            Frame::BulkString(Bytes::from_static(b"2")),
+            Frame::BulkString(Bytes::from_static(b"query")),
+            Frame::BulkString(Bytes::from(vec![0u8; 16])),
+        ];
+        let result = ft_search(&mut store, &args);
+        assert!(
+            matches!(result, Frame::Error(_)),
+            "Should error on unknown index, got {result:?}"
+        );
+    }
 }
