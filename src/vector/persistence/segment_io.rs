@@ -1,11 +1,12 @@
 //! Immutable segment disk I/O: write and read segment directories.
 //!
-//! Each immutable segment is stored as a directory containing 5 files:
+//! Each immutable segment is stored as a directory containing 6 files:
 //! ```text
 //! {persist_dir}/segment-{segment_id}/
 //!   hnsw_graph.bin      -- HnswGraph::to_bytes() output
 //!   tq_codes.bin        -- raw TQ code bytes
 //!   sq_vectors.bin      -- raw SQ vector bytes (i8 as u8)
+//!   f32_vectors.bin     -- raw f32 vector bytes (BFS-ordered, for HNSW search)
 //!   mvcc_headers.bin    -- [count:u32 LE][MvccHeader; count] (20 bytes each)
 //!   segment_meta.json   -- JSON metadata with checksum verification
 //! ```
@@ -135,6 +136,14 @@ pub fn write_immutable_segment(
     };
     fs::write(seg_dir.join("sq_vectors.bin"), sq_as_u8)?;
 
+    // 3b. f32_vectors.bin (f32 as u8 -- safe transmute for persistence)
+    let f32_slice = segment.vectors_f32().as_slice();
+    // SAFETY: f32 and [u8; 4] have identical size; no invalid bit patterns for LE bytes.
+    let f32_as_u8: &[u8] = unsafe {
+        std::slice::from_raw_parts(f32_slice.as_ptr() as *const u8, f32_slice.len() * 4)
+    };
+    fs::write(seg_dir.join("f32_vectors.bin"), f32_as_u8)?;
+
     // 4. mvcc_headers.bin: [count:u32 LE][MvccHeader; count]
     let mvcc = segment.mvcc_headers();
     let count = mvcc.len() as u32;
@@ -251,6 +260,23 @@ pub fn read_immutable_segment(
     let sq_i8: Vec<i8> = sq_bytes.into_iter().map(|b| b as i8).collect();
     let vectors_sq = AlignedBuffer::from_vec(sq_i8);
 
+    // 4b. Read f32 vectors (u8 -> f32, LE byte order)
+    let f32_path = seg_dir.join("f32_vectors.bin");
+    let vectors_f32 = if f32_path.exists() {
+        let f32_bytes = fs::read(&f32_path)?;
+        if f32_bytes.len() % 4 != 0 {
+            return Err(SegmentIoError::InvalidMetadata("f32_vectors.bin not aligned to 4 bytes".to_owned()));
+        }
+        let f32_vec: Vec<f32> = f32_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        AlignedBuffer::from_vec(f32_vec)
+    } else {
+        // Backward compatibility: older segments without f32 vectors
+        AlignedBuffer::new(0)
+    };
+
     // 5. Read MVCC headers
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin"))?;
     if mvcc_bytes.len() < 4 {
@@ -291,6 +317,7 @@ pub fn read_immutable_segment(
         graph,
         vectors_tq,
         vectors_sq,
+        vectors_f32,
         mvcc,
         collection.clone(),
         meta.live_count,
@@ -305,7 +332,6 @@ mod tests {
     use super::*;
     use crate::vector::distance;
     use crate::vector::hnsw::build::HnswBuilder;
-    use crate::vector::hnsw::search::SearchScratch;
     use crate::vector::turbo_quant::encoder::encode_tq_mse;
     use crate::vector::turbo_quant::fwht;
 
@@ -389,6 +415,7 @@ mod tests {
 
         let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
         let mut sq_bfs = vec![0i8; n * dim];
+        let mut f32_bfs = vec![0.0f32; n * dim];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
             let src = orig_id * bytes_per_code;
@@ -398,6 +425,7 @@ mod tests {
             let sq_src = orig_id * dim;
             let sq_dst = bfs_pos * dim;
             sq_bfs[sq_dst..sq_dst + dim].copy_from_slice(&sq_vectors[sq_src..sq_src + dim]);
+            f32_bfs[sq_dst..sq_dst + dim].copy_from_slice(&vectors[orig_id]);
         }
 
         let mvcc: Vec<MvccHeader> = (0..n as u32)
@@ -412,6 +440,7 @@ mod tests {
             graph,
             AlignedBuffer::from_vec(tq_buffer_bfs),
             AlignedBuffer::from_vec(sq_bfs),
+            AlignedBuffer::from_vec(f32_bfs),
             mvcc,
             collection.clone(),
             n as u32,
@@ -422,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_creates_5_files() {
+    fn test_write_creates_6_files() {
         let (segment, collection) = build_test_segment(20, 64);
         let tmp = tempfile::tempdir().unwrap();
 
@@ -432,6 +461,7 @@ mod tests {
         assert!(seg_dir.join("hnsw_graph.bin").exists());
         assert!(seg_dir.join("tq_codes.bin").exists());
         assert!(seg_dir.join("sq_vectors.bin").exists());
+        assert!(seg_dir.join("f32_vectors.bin").exists());
         assert!(seg_dir.join("mvcc_headers.bin").exists());
         assert!(seg_dir.join("segment_meta.json").exists());
     }
@@ -454,12 +484,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         write_immutable_segment(tmp.path(), 1, &segment, &collection).unwrap();
-        let (restored, restored_col) = read_immutable_segment(tmp.path(), 1).unwrap();
+        let (restored, _restored_col) = read_immutable_segment(tmp.path(), 1).unwrap();
 
         let mut query = lcg_f32(64, 99999);
         normalize(&mut query);
-        let mut scratch = SearchScratch::new(50, restored_col.padded_dimension);
-        let results = restored.search(&query, 5, 64, &mut scratch);
+        let results = restored.search(&query, 5, 64);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
     }

@@ -266,6 +266,15 @@ pub fn compact(
         sq_bfs[dst..dst + dim].copy_from_slice(&live_sq_vecs[src..src + dim]);
     }
 
+    // BFS reorder f32 vectors for HNSW search
+    let mut f32_bfs = vec![0.0f32; n * dim];
+    for bfs_pos in 0..n {
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let src = orig_id * dim;
+        let dst = bfs_pos * dim;
+        f32_bfs[dst..dst + dim].copy_from_slice(&live_f32_vecs[src..src + dim]);
+    }
+
     // ── Step 4: Verify recall ────────────────────────────────────────
     let recall = verify_recall(
         &graph,
@@ -309,6 +318,7 @@ pub fn compact(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
         AlignedBuffer::from_vec(sq_bfs),
+        AlignedBuffer::from_vec(f32_bfs),
         mvcc,
         collection.clone(),
         live_count,
@@ -485,10 +495,9 @@ mod tests {
         assert_eq!(imm.total_count(), 100);
 
         // Verify search works on the resulting segment
-        let mut scratch = SearchScratch::new(100, collection.padded_dimension);
         let mut query = lcg_f32(64, 99999);
         normalize(&mut query);
-        let results = imm.search(&query, 5, 64, &mut scratch);
+        let results = imm.search(&query, 5, 64);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
     }

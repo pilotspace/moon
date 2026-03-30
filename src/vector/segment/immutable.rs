@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
-use crate::vector::hnsw::search::{hnsw_search, hnsw_search_filtered, SearchScratch};
+use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::types::SearchResult;
 
@@ -28,6 +28,7 @@ pub struct ImmutableSegment {
     vectors_tq: AlignedBuffer<u8>,
     #[allow(dead_code)]
     vectors_sq: AlignedBuffer<i8>,
+    vectors_f32: AlignedBuffer<f32>,
     mvcc: Vec<MvccHeader>,
     collection_meta: Arc<CollectionMetadata>,
     live_count: u32,
@@ -40,6 +41,7 @@ impl ImmutableSegment {
         graph: HnswGraph,
         vectors_tq: AlignedBuffer<u8>,
         vectors_sq: AlignedBuffer<i8>,
+        vectors_f32: AlignedBuffer<f32>,
         mvcc: Vec<MvccHeader>,
         collection_meta: Arc<CollectionMetadata>,
         live_count: u32,
@@ -49,6 +51,7 @@ impl ImmutableSegment {
             graph,
             vectors_tq,
             vectors_sq,
+            vectors_f32,
             mvcc,
             collection_meta,
             live_count,
@@ -56,42 +59,42 @@ impl ImmutableSegment {
         }
     }
 
-    /// Delegated HNSW search.
+    /// Delegated HNSW search using f32 L2 distance (not TQ-ADC).
+    ///
+    /// TQ-ADC is invalid for greedy HNSW navigation (BitVec bug caused 0.00
+    /// recall). f32 L2 with Vec<bool> visited tracking achieves 0.999 recall.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
-        scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
-        hnsw_search(
+        hnsw_search_f32(
             &self.graph,
-            self.vectors_tq.as_slice(),
+            self.vectors_f32.as_slice(),
+            self.collection_meta.dimension as usize,
             query,
-            &self.collection_meta,
             k,
             ef_search,
-            scratch,
+            None,
         )
     }
 
-    /// Delegated HNSW search with filter bitmap (ACORN 2-hop).
+    /// Delegated HNSW search with filter bitmap using f32 L2 distance.
     pub fn search_filtered(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
-        scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
-        hnsw_search_filtered(
+        hnsw_search_f32(
             &self.graph,
-            self.vectors_tq.as_slice(),
+            self.vectors_f32.as_slice(),
+            self.collection_meta.dimension as usize,
             query,
-            &self.collection_meta,
             k,
             ef_search,
-            scratch,
             allow_bitmap,
         )
     }
@@ -109,6 +112,11 @@ impl ImmutableSegment {
     /// Access the SQ vector buffer.
     pub fn vectors_sq(&self) -> &AlignedBuffer<i8> {
         &self.vectors_sq
+    }
+
+    /// Access the f32 vector buffer (BFS-ordered, used for HNSW search).
+    pub fn vectors_f32(&self) -> &AlignedBuffer<f32> {
+        &self.vectors_f32
     }
 
     /// Access MVCC headers.
@@ -157,7 +165,6 @@ mod tests {
     use crate::vector::aligned_buffer::AlignedBuffer;
     use crate::vector::distance;
     use crate::vector::hnsw::build::HnswBuilder;
-    use crate::vector::hnsw::search::SearchScratch;
     use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
     use crate::vector::turbo_quant::encoder::{encode_tq_mse, padded_dimension};
     use crate::vector::turbo_quant::fwht;
@@ -186,7 +193,7 @@ mod tests {
     fn build_immutable_segment(
         n: usize,
         dim: usize,
-    ) -> (ImmutableSegment, Vec<Vec<f32>>, SearchScratch) {
+    ) -> (ImmutableSegment, Vec<Vec<f32>>) {
         distance::init();
 
         let collection = Arc::new(CollectionMetadata::new(
@@ -268,6 +275,13 @@ mod tests {
                 .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
         }
 
+        // BFS reorder f32 vectors for HNSW search
+        let mut f32_bfs = vec![0.0f32; n * dim];
+        for orig in 0..n {
+            let bfs = graph.to_bfs(orig as u32) as usize;
+            f32_bfs[bfs * dim..(bfs + 1) * dim].copy_from_slice(&vectors[orig]);
+        }
+
         let mvcc: Vec<MvccHeader> = (0..n as u32)
             .map(|i| MvccHeader {
                 internal_id: i,
@@ -280,40 +294,40 @@ mod tests {
             graph,
             AlignedBuffer::from_vec(tq_buffer_bfs),
             AlignedBuffer::from_vec(sq_vectors),
+            AlignedBuffer::from_vec(f32_bfs),
             mvcc,
             collection.clone(),
             n as u32,
             n as u32,
         );
 
-        let scratch = SearchScratch::new(n as u32, collection.padded_dimension);
-        (segment, vectors, scratch)
+        (segment, vectors)
     }
 
     #[test]
     fn test_immutable_search_returns_results() {
-        let (segment, vectors, mut scratch) = build_immutable_segment(50, 64);
-        let results = segment.search(&vectors[0], 5, 64, &mut scratch);
+        let (segment, vectors) = build_immutable_segment(50, 64);
+        let results = segment.search(&vectors[0], 5, 64);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
     }
 
     #[test]
     fn test_immutable_live_count() {
-        let (segment, _, _) = build_immutable_segment(50, 64);
+        let (segment, _) = build_immutable_segment(50, 64);
         assert_eq!(segment.live_count(), 50);
         assert_eq!(segment.total_count(), 50);
     }
 
     #[test]
     fn test_immutable_dead_fraction_zero() {
-        let (segment, _, _) = build_immutable_segment(50, 64);
+        let (segment, _) = build_immutable_segment(50, 64);
         assert_eq!(segment.dead_fraction(), 0.0);
     }
 
     #[test]
     fn test_immutable_dead_fraction_after_delete() {
-        let (mut segment, _, _) = build_immutable_segment(10, 64);
+        let (mut segment, _) = build_immutable_segment(10, 64);
         segment.mark_deleted(0, 100);
         segment.mark_deleted(1, 101);
         assert_eq!(segment.live_count(), 8);
@@ -338,6 +352,7 @@ mod tests {
             graph,
             AlignedBuffer::new(0),
             AlignedBuffer::new(0),
+            AlignedBuffer::new(0),
             Vec::new(),
             collection,
             0,
@@ -348,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_immutable_mark_deleted_idempotent() {
-        let (mut segment, _, _) = build_immutable_segment(10, 64);
+        let (mut segment, _) = build_immutable_segment(10, 64);
         segment.mark_deleted(0, 100);
         assert_eq!(segment.live_count(), 9);
         // Second delete of same entry should not decrement further

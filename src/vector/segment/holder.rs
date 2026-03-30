@@ -115,7 +115,7 @@ impl SegmentHolder {
         query_sq: &[i8],
         k: usize,
         ef_search: usize,
-        scratch: &mut SearchScratch,
+        _scratch: &mut SearchScratch,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
@@ -130,7 +130,7 @@ impl SegmentHolder {
             FilterStrategy::Unfiltered => {
                 all.extend(snapshot.mutable.brute_force_search(query_sq, k));
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search(query_f32, k, ef_search, scratch));
+                    all.extend(imm.search(query_f32, k, ef_search));
                 }
             }
             FilterStrategy::BruteForceFiltered => {
@@ -142,7 +142,6 @@ impl SegmentHolder {
                         query_f32,
                         k,
                         ef_search,
-                        scratch,
                         filter_bitmap,
                     ));
                 }
@@ -156,7 +155,6 @@ impl SegmentHolder {
                         query_f32,
                         k,
                         ef_search,
-                        scratch,
                         filter_bitmap,
                     ));
                 }
@@ -171,7 +169,6 @@ impl SegmentHolder {
                         query_f32,
                         oversample_k,
                         ef_search.max(oversample_k),
-                        scratch,
                     );
                     if let Some(bm) = filter_bitmap {
                         for r in imm_results {
@@ -252,7 +249,7 @@ impl SegmentHolder {
         query_sq: &[i8],
         k: usize,
         ef_search: usize,
-        scratch: &mut SearchScratch,
+        _scratch: &mut SearchScratch,
         filter_bitmap: Option<&RoaringBitmap>,
         mvcc: &MvccContext<'_>,
     ) -> SmallVec<[SearchResult; 32]> {
@@ -277,11 +274,10 @@ impl SegmentHolder {
                     query_f32,
                     k,
                     ef_search,
-                    scratch,
                     filter_bitmap,
                 ));
             } else {
-                all.extend(imm.search(query_f32, k, ef_search, scratch));
+                all.extend(imm.search(query_f32, k, ef_search));
             }
         }
 
