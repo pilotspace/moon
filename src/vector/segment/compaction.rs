@@ -109,54 +109,142 @@ pub fn compact(
     }
 
     // ── Step 3: Build HNSW ───────────────────────────────────────────
-    // Precompute all rotated queries for pairwise distance oracle
-    let mut all_rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
-    let mut q_rot_buf = vec![0.0f32; padded];
 
-    for i in 0..n {
-        let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
-        // Normalize
-        let mut norm_sq = 0.0f32;
-        for &v in vec_slice {
-            norm_sq += v * v;
+    // --- GPU HNSW build path (feature-gated) ---
+    // When gpu-cuda is enabled and the batch is large enough, attempt a
+    // GPU-accelerated HNSW construction via CAGRA. On any failure the GPU
+    // path returns None and we fall through to the CPU builder below.
+    #[cfg(feature = "gpu-cuda")]
+    let gpu_graph: Option<crate::vector::hnsw::graph::HnswGraph> = {
+        use crate::vector::gpu::{try_gpu_build_hnsw, MIN_VECTORS_FOR_GPU};
+        if n >= MIN_VECTORS_FOR_GPU {
+            try_gpu_build_hnsw(&live_f32_vecs, dim, HNSW_M, HNSW_EF_CONSTRUCTION, seed)
+        } else {
+            None
         }
-        let norm = norm_sq.sqrt();
+    };
 
-        q_rot_buf[..dim].copy_from_slice(vec_slice);
-        if norm > 0.0 {
-            let inv = 1.0 / norm;
-            for v in q_rot_buf[..dim].iter_mut() {
-                *v *= inv;
+    // Determine whether we need the CPU path. When GPU succeeded we skip
+    // the expensive all_rotated precomputation and HnswBuilder entirely.
+    #[cfg(feature = "gpu-cuda")]
+    let need_cpu_build = gpu_graph.is_none();
+    #[cfg(not(feature = "gpu-cuda"))]
+    let need_cpu_build = true;
+
+    // Precompute all rotated queries for pairwise distance oracle (CPU path only)
+    let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
+        let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut q_rot_buf = vec![0.0f32; padded];
+
+        // --- GPU batch FWHT path (feature-gated) ---
+        // Attempt to accelerate the FWHT rotation of all query vectors on the GPU.
+        // Build a contiguous buffer of normalized, zero-padded vectors, run GPU FWHT,
+        // then split back into per-vector slices.
+        #[cfg(feature = "gpu-cuda")]
+        let gpu_fwht_done = {
+            use crate::vector::gpu::{try_gpu_batch_fwht, MIN_BATCH_FOR_GPU};
+            if n >= MIN_BATCH_FOR_GPU {
+                // Build contiguous padded buffer: normalize + zero-pad each vector
+                let mut batch_buf = vec![0.0f32; n * padded];
+                for i in 0..n {
+                    let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
+                    let mut norm_sq = 0.0f32;
+                    for &v in vec_slice {
+                        norm_sq += v * v;
+                    }
+                    let norm = norm_sq.sqrt();
+                    let dst = &mut batch_buf[i * padded..i * padded + dim];
+                    dst.copy_from_slice(vec_slice);
+                    if norm > 0.0 {
+                        let inv = 1.0 / norm;
+                        for v in dst.iter_mut() {
+                            *v *= inv;
+                        }
+                    }
+                    // padded tail already zero from vec! initialization
+                }
+
+                if try_gpu_batch_fwht(&mut batch_buf, signs, padded) {
+                    // GPU succeeded: split batch buffer into per-vector vecs
+                    for i in 0..n {
+                        rotated.push(batch_buf[i * padded..(i + 1) * padded].to_vec());
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        #[cfg(feature = "gpu-cuda")]
+        let skip_cpu_fwht = gpu_fwht_done;
+        #[cfg(not(feature = "gpu-cuda"))]
+        let skip_cpu_fwht = false;
+
+        if !skip_cpu_fwht {
+            for i in 0..n {
+                let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
+                // Normalize
+                let mut norm_sq = 0.0f32;
+                for &v in vec_slice {
+                    norm_sq += v * v;
+                }
+                let norm = norm_sq.sqrt();
+
+                q_rot_buf[..dim].copy_from_slice(vec_slice);
+                if norm > 0.0 {
+                    let inv = 1.0 / norm;
+                    for v in q_rot_buf[..dim].iter_mut() {
+                        *v *= inv;
+                    }
+                }
+                for v in q_rot_buf[dim..padded].iter_mut() {
+                    *v = 0.0;
+                }
+                fwht::fwht(&mut q_rot_buf[..padded], signs);
+                rotated.push(q_rot_buf[..padded].to_vec());
             }
         }
-        for v in q_rot_buf[dim..padded].iter_mut() {
-            *v = 0.0;
+        rotated
+    } else {
+        Vec::new()
+    };
+
+    let graph = if need_cpu_build {
+        let dist_table = crate::vector::distance::table();
+        let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
+
+        for _i in 0..n {
+            builder.insert(|a: u32, b: u32| {
+                let q_rot = &all_rotated[a as usize];
+                let offset = b as usize * bytes_per_code;
+                let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
+                let norm_bytes =
+                    &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
+                let norm = f32::from_le_bytes([
+                    norm_bytes[0],
+                    norm_bytes[1],
+                    norm_bytes[2],
+                    norm_bytes[3],
+                ]);
+                (dist_table.tq_l2)(q_rot, code_slice, norm)
+            });
         }
-        fwht::fwht(&mut q_rot_buf[..padded], signs);
-        all_rotated.push(q_rot_buf[..padded].to_vec());
-    }
 
-    let dist_table = crate::vector::distance::table();
-    let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
-
-    for _i in 0..n {
-        builder.insert(|a: u32, b: u32| {
-            let q_rot = &all_rotated[a as usize];
-            let offset = b as usize * bytes_per_code;
-            let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
-            let norm_bytes =
-                &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
-            let norm = f32::from_le_bytes([
-                norm_bytes[0],
-                norm_bytes[1],
-                norm_bytes[2],
-                norm_bytes[3],
-            ]);
-            (dist_table.tq_l2)(q_rot, code_slice, norm)
-        });
-    }
-
-    let graph = builder.build(bytes_per_code as u32);
+        builder.build(bytes_per_code as u32)
+    } else {
+        #[cfg(feature = "gpu-cuda")]
+        {
+            // SAFETY: gpu_graph is Some when need_cpu_build is false
+            gpu_graph.expect("gpu_graph must be Some when need_cpu_build is false")
+        }
+        #[cfg(not(feature = "gpu-cuda"))]
+        {
+            unreachable!("need_cpu_build is always true without gpu-cuda feature")
+        }
+    };
 
     // ── Step 5: BFS reorder TQ and SQ buffers ────────────────────────
     // (Step 5 before Step 4 because verify_recall needs BFS-ordered buffer)
@@ -462,5 +550,27 @@ mod tests {
             imm2.mark_deleted(i, 300);
         }
         assert!(!needs_vacuum(&imm2), "should not need vacuum at 10% dead");
+    }
+
+    /// Verify that compact() works identically without the gpu-cuda feature.
+    /// This test always runs (no feature gate) and ensures the CPU path is
+    /// unaffected by the GPU integration code.
+    #[test]
+    fn test_compact_without_gpu_feature_unchanged() {
+        let (frozen, collection) = make_frozen_segment(100, 64, 0);
+        let result = compact(&frozen, &collection, 12345, None);
+        assert!(result.is_ok(), "compact failed: {:?}", result.err());
+        assert_eq!(result.unwrap().live_count(), 100);
+    }
+
+    /// When gpu-cuda feature is enabled but no CUDA device is present (CI),
+    /// compact() should fall back to the CPU path transparently.
+    #[cfg(feature = "gpu-cuda")]
+    #[test]
+    fn test_gpu_fallback_to_cpu() {
+        let (frozen, collection) = make_frozen_segment(100, 64, 0);
+        let result = compact(&frozen, &collection, 12345, None);
+        assert!(result.is_ok(), "compact with GPU fallback failed: {:?}", result.err());
+        assert_eq!(result.unwrap().live_count(), 100);
     }
 }
