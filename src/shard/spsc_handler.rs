@@ -924,7 +924,32 @@ fn auto_index_hset(
                             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
                             // Append to mutable segment
                             let snap = idx.segments.load();
-                            snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+                            let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+
+                            // Populate payload index with all HASH fields (for filtered search)
+                            let mut j = 1;
+                            while j + 1 < args.len() {
+                                if let (
+                                    crate::protocol::Frame::BulkString(f_name),
+                                    crate::protocol::Frame::BulkString(f_val),
+                                ) = (&args[j], &args[j + 1])
+                                {
+                                    // Skip the vector field itself
+                                    if !f_name.eq_ignore_ascii_case(&source_field) {
+                                        // Try parsing as numeric, otherwise store as tag
+                                        if let Ok(num) = std::str::from_utf8(f_val)
+                                            .ok()
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .ok_or(())
+                                        {
+                                            idx.payload_index.insert_numeric(f_name, num, internal_id);
+                                        } else {
+                                            idx.payload_index.insert_tag(f_name, f_val, internal_id);
+                                        }
+                                    }
+                                }
+                                j += 2;
+                            }
                         }
                     }
                     break;
