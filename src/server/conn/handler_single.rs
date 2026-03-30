@@ -68,6 +68,7 @@ pub async fn handle_connection(
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    vector_store: Option<Arc<Mutex<crate::vector::store::VectorStore>>>,
 ) {
     // Capture peer address before Framed wraps the stream (stream is moved)
     let peer_addr = stream
@@ -943,7 +944,30 @@ pub async fn handle_connection(
 
                     // --- Collect for phase 2 dispatch (needs db lock) ---
                     match extract_command(&frame) {
-                        Some((cmd, _cmd_args)) => {
+                        Some((cmd, cmd_args)) => {
+                            // FT.* vector commands: dispatch immediately (no db lock needed)
+                            if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                                if let Some(ref vs) = vector_store {
+                                    let mut store = vs.lock();
+                                    let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+                                        crate::command::vector_search::ft_create(&mut *store, cmd_args)
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                                        crate::command::vector_search::ft_search(&mut *store, cmd_args)
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                                        crate::command::vector_search::ft_dropindex(&mut *store, cmd_args)
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                                        crate::command::vector_search::ft_info(&*store, cmd_args)
+                                    } else {
+                                        Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
+                                    };
+                                    responses.push(response);
+                                    continue; // skip dispatchable
+                                } else {
+                                    responses.push(Frame::Error(bytes::Bytes::from_static(b"ERR vector search not initialized")));
+                                    continue;
+                                }
+                            }
+
                             let is_write = metadata::is_write(cmd);
 
                             // Serialize for AOF before dispatch
@@ -1012,6 +1036,23 @@ pub async fn handle_connection(
                                 }
                                 let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
+
+                                // FT.* read commands (FT.SEARCH, FT.INFO)
+                                if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                                    if let Some(ref vs) = vector_store {
+                                        let mut store = vs.lock();
+                                        let response = if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                                            crate::command::vector_search::ft_search(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                                            crate::command::vector_search::ft_info(&*store, d_args)
+                                        } else {
+                                            Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
+                                        };
+                                        responses[resp_idx] = response;
+                                        continue;
+                                    }
+                                }
+
                                 let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut selected_db, db_count);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
@@ -1054,11 +1095,49 @@ pub async fn handle_connection(
                                 }
                                 drop(rt);
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
+
+                                // FT.* vector commands: dispatch to VectorStore directly
+                                if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                                    if let Some(ref vs) = vector_store {
+                                        let mut store = vs.lock();
+                                        let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+                                            crate::command::vector_search::ft_create(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                                            crate::command::vector_search::ft_search(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                                            crate::command::vector_search::ft_dropindex(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                                            crate::command::vector_search::ft_info(&*store, d_args)
+                                        } else {
+                                            Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
+                                        };
+                                        responses[resp_idx] = response;
+                                        continue;
+                                    } else {
+                                        responses[resp_idx] = Frame::Error(bytes::Bytes::from_static(b"ERR vector search not initialized"));
+                                        continue;
+                                    }
+                                }
+
+                                // HSET auto-indexing: after dispatch, check for vector index match
+                                let is_hset = d_cmd.eq_ignore_ascii_case(b"HSET");
+
                                 let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
                                 };
+
+                                // Auto-index vector on successful HSET
+                                if is_hset && !matches!(&response, Frame::Error(_)) {
+                                    if let Some(ref vs) = vector_store {
+                                        if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
+                                            let mut store = vs.lock();
+                                            crate::shard::spsc_handler::auto_index_hset_public(&mut store, &key, d_args);
+                                        }
+                                    }
+                                }
+
                                 // Invalidate tracked key on successful write
                                 if !matches!(&response, Frame::Error(_)) {
                                     if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {

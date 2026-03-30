@@ -883,6 +883,15 @@ fn dispatch_vector_command(vector_store: &mut VectorStore, command: &crate::prot
 /// NOTE: Vec allocations here are acceptable because auto-indexing only fires when
 /// a key matches an index prefix (rare per-operation), and f32 decode + SQ encode
 /// is inherently O(dim) work. This is post-dispatch processing, not hot-path.
+/// Public wrapper for auto-indexing on HSET — called from single-shard handler.
+pub fn auto_index_hset_public(
+    vector_store: &mut VectorStore,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+) {
+    auto_index_hset(vector_store, key, args);
+}
+
 fn auto_index_hset(
     vector_store: &mut VectorStore,
     key: &[u8],

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
 
 use crate::storage::Database;
+use crate::vector::store::VectorStore;
 
 /// Thread-safe wrapper over per-shard databases.
 ///
@@ -11,6 +12,8 @@ use crate::storage::Database;
 /// (shared) or `write_db()` (exclusive) to enable cross-shard direct reads.
 pub struct ShardDatabases {
     shards: Vec<Vec<RwLock<Database>>>,
+    /// Per-shard VectorStore for FT.* commands in single-shard mode.
+    vector_stores: Vec<Mutex<VectorStore>>,
     num_shards: usize,
     db_count: usize,
 }
@@ -24,11 +27,21 @@ impl ShardDatabases {
             .into_iter()
             .map(|dbs| dbs.into_iter().map(RwLock::new).collect())
             .collect();
+        let vector_stores = (0..num_shards)
+            .map(|_| Mutex::new(VectorStore::new()))
+            .collect();
         Arc::new(Self {
             shards,
+            vector_stores,
             num_shards,
             db_count,
         })
+    }
+
+    /// Acquire exclusive access to a shard's VectorStore.
+    #[inline]
+    pub fn vector_store(&self, shard_id: usize) -> MutexGuard<'_, VectorStore> {
+        self.vector_stores[shard_id].lock()
     }
 
     /// Acquire a shared read lock on a specific database.
