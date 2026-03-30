@@ -6,10 +6,11 @@
 //! these handlers directly with the per-shard VectorStore.
 
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::protocol::Frame;
 use crate::vector::store::{IndexMeta, VectorStore};
-use crate::vector::types::DistanceMetric;
+use crate::vector::types::{DistanceMetric, SearchResult};
 
 /// FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM 768 DISTANCE_METRIC L2
 ///
@@ -213,6 +214,184 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
     Frame::Array(items.into())
 }
 
+/// Scalar-quantize f32 vector to i8 for mutable segment brute-force search.
+/// Clamps to [-1.0, 1.0] range, scales to [-127, 127].
+/// This is intentionally simple -- TQ encoding is used for immutable segments.
+pub fn quantize_f32_to_sq(input: &[f32], output: &mut [i8]) {
+    debug_assert_eq!(input.len(), output.len());
+    for (i, &val) in input.iter().enumerate() {
+        let clamped = val.clamp(-1.0, 1.0);
+        output[i] = (clamped * 127.0) as i8;
+    }
+}
+
+/// FT.SEARCH idx "*=>[KNN 10 @vec $query]" PARAMS 2 query <blob>
+///
+/// Parses KNN query syntax, decodes the vector blob, runs local search.
+/// For cross-shard, the coordinator calls this on each shard and merges.
+///
+/// Returns: Array [num_results, doc_id, [field_values], ...]
+pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
+    // args[0] = index_name, args[1] = query_string, args[2..] = PARAMS ...
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.SEARCH' command",
+        ));
+    }
+
+    let index_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
+    };
+
+    let query_str = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid query")),
+    };
+
+    // Parse KNN from query string: "*=>[KNN <k> @<field> $<param_name>]"
+    let (k, param_name) = match parse_knn_query(&query_str) {
+        Some(parsed) => parsed,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax")),
+    };
+
+    // Parse PARAMS section to extract the query vector blob
+    let query_blob = match extract_param_blob(args, &param_name) {
+        Some(blob) => blob,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR query vector parameter not found in PARAMS",
+            ))
+        }
+    };
+
+    search_local(store, &index_name, &query_blob, k)
+}
+
+/// Direct local search for cross-shard VectorSearch messages.
+/// Skips FT.SEARCH parsing -- the coordinator already extracted index_name, blob, k.
+pub fn search_local(
+    store: &mut VectorStore,
+    index_name: &[u8],
+    query_blob: &[u8],
+    k: usize,
+) -> Frame {
+    let idx = match store.get_index_mut(index_name) {
+        Some(i) => i,
+        None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+    };
+    let dim = idx.meta.dimension as usize;
+    if query_blob.len() != dim * 4 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR query vector dimension mismatch",
+        ));
+    }
+    let mut query_f32 = Vec::with_capacity(dim);
+    for chunk in query_blob.chunks_exact(4) {
+        query_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    // SQ quantize for mutable segment search
+    let mut query_sq = vec![0i8; dim];
+    quantize_f32_to_sq(&query_f32, &mut query_sq);
+    let ef_search = k.max(64);
+    let results = idx
+        .segments
+        .search(&query_f32, &query_sq, k, ef_search, &mut idx.scratch);
+    build_search_response(&results)
+}
+
+/// Parse "*=>[KNN <k> @<field> $<param>]" query string.
+/// Returns (k, param_name) on success.
+fn parse_knn_query(query: &[u8]) -> Option<(usize, Bytes)> {
+    let s = std::str::from_utf8(query).ok()?;
+    let knn_start = s.find("KNN ")?;
+    let after_knn = &s[knn_start + 4..];
+
+    // Parse k (first number after KNN)
+    let k_end = after_knn.find(' ')?;
+    let k: usize = after_knn[..k_end].trim().parse().ok()?;
+
+    // Parse @field (skip it, we already know from index meta)
+    let after_k = &after_knn[k_end + 1..];
+    let field_end = after_k.find(' ').unwrap_or(after_k.len());
+    let after_field = if field_end < after_k.len() {
+        &after_k[field_end + 1..]
+    } else {
+        ""
+    };
+
+    // Parse $param_name
+    let param_str = after_field.trim().trim_end_matches(']');
+    if !param_str.starts_with('$') {
+        return None;
+    }
+    let param_name = &param_str[1..];
+    Some((k, Bytes::from(param_name.to_owned())))
+}
+
+/// Extract a named parameter blob from PARAMS section.
+/// Format: ... PARAMS <count> <name1> <blob1> <name2> <blob2> ...
+fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
+    // Find PARAMS keyword starting after index_name and query
+    let mut i = 2;
+    while i < args.len() {
+        if matches_keyword(&args[i], b"PARAMS") {
+            i += 1;
+            if i >= args.len() {
+                return None;
+            }
+            let count = parse_u32(&args[i])? as usize;
+            i += 1;
+            // Iterate through name/value pairs
+            for _ in 0..count / 2 {
+                if i + 1 >= args.len() {
+                    return None;
+                }
+                let name = extract_bulk(&args[i])?;
+                i += 1;
+                let value = extract_bulk(&args[i])?;
+                i += 1;
+                if name.eq_ignore_ascii_case(param_name) {
+                    return Some(value);
+                }
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Build FT.SEARCH response array.
+/// Format: [num_results, "vec:0", ["__vec_score", "0.5"], "vec:1", ["__vec_score", "0.8"], ...]
+fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
+    let total = results.len() as i64;
+    // NOTE: Vec/format! usage here is acceptable -- this is response building at end
+    // of command path, not hot-path dispatch.
+    let mut items = Vec::with_capacity(1 + results.len() * 2);
+    items.push(Frame::Integer(total));
+
+    for r in results {
+        // Document ID as "vec:<internal_id>"
+        let mut doc_id_buf = itoa::Buffer::new();
+        let id_str = doc_id_buf.format(r.id.0);
+        let mut doc_id = Vec::with_capacity(4 + id_str.len());
+        doc_id.extend_from_slice(b"vec:");
+        doc_id.extend_from_slice(id_str.as_bytes());
+        items.push(Frame::BulkString(Bytes::from(doc_id)));
+
+        // Score as nested array (format! acceptable -- end of command path)
+        let score_str = format!("{}", r.distance);
+        let fields = vec![
+            Frame::BulkString(Bytes::from_static(b"__vec_score")),
+            Frame::BulkString(Bytes::from(score_str)),
+        ];
+        items.push(Frame::Array(fields.into()));
+    }
+
+    Frame::Array(items.into())
+}
+
 // -- Helpers (private) --
 
 fn extract_bulk(frame: &Frame) -> Option<Bytes> {
@@ -350,6 +529,114 @@ mod tests {
         // Drop non-existing
         let result = ft_dropindex(&mut store, &[bulk(b"myidx")]);
         assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_parse_knn_query() {
+        let query = b"*=>[KNN 10 @vec $query]";
+        let (k, param) = parse_knn_query(query).unwrap();
+        assert_eq!(k, 10);
+        assert_eq!(&param[..], b"query");
+    }
+
+    #[test]
+    fn test_parse_knn_query_different_k() {
+        let query = b"*=>[KNN 5 @embedding $blob]";
+        let (k, param) = parse_knn_query(query).unwrap();
+        assert_eq!(k, 5);
+        assert_eq!(&param[..], b"blob");
+    }
+
+    #[test]
+    fn test_parse_knn_query_invalid() {
+        assert!(parse_knn_query(b"*").is_none());
+        assert!(parse_knn_query(b"*=>[NOTAKNN]").is_none());
+    }
+
+    #[test]
+    fn test_extract_param_blob() {
+        let args = vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 10 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            bulk(b"blobdata"),
+        ];
+        let blob = extract_param_blob(&args, b"query").unwrap();
+        assert_eq!(&blob[..], b"blobdata");
+    }
+
+    #[test]
+    fn test_extract_param_blob_missing() {
+        let args = vec![bulk(b"idx"), bulk(b"*=>[KNN 10 @vec $query]")];
+        assert!(extract_param_blob(&args, b"query").is_none());
+    }
+
+    #[test]
+    fn test_quantize_f32_to_sq() {
+        let input = [0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0];
+        let mut output = [0i8; 7];
+        quantize_f32_to_sq(&input, &mut output);
+        assert_eq!(output[0], 0); // 0.0 -> 0
+        assert_eq!(output[1], 127); // 1.0 -> 127
+        assert_eq!(output[2], -127); // -1.0 -> -127
+        assert_eq!(output[3], 63); // 0.5 -> 63 (truncated from 63.5)
+        assert_eq!(output[4], -63); // -0.5 -> -63
+        assert_eq!(output[5], 127); // 2.0 clamped to 1.0 -> 127
+        assert_eq!(output[6], -127); // -2.0 clamped to -1.0 -> -127
+    }
+
+    #[test]
+    fn test_ft_search_dimension_mismatch() {
+        let mut store = VectorStore::new();
+        let args = ft_create_args();
+        ft_create(&mut store, &args);
+
+        // Build a query with wrong dimension (4 bytes instead of 128*4)
+        let search_args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 10 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            bulk(b"tooshort"),
+        ];
+        let result = ft_search(&mut store, &search_args);
+        match &result {
+            Frame::Error(e) => assert!(
+                e.starts_with(b"ERR query vector dimension"),
+                "expected dimension mismatch error, got {:?}",
+                std::str::from_utf8(e)
+            ),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_search_empty_index() {
+        let mut store = VectorStore::new();
+        let args = ft_create_args();
+        ft_create(&mut store, &args);
+
+        // Build valid query for dim=128
+        let query_vec: Vec<u8> = vec![0u8; 128 * 4]; // 128 floats, all zero
+        let search_args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 5 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            Frame::BulkString(Bytes::from(query_vec)),
+        ];
+        crate::vector::distance::init();
+        let result = ft_search(&mut store, &search_args);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items[0], Frame::Integer(0)); // no results
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
     }
 
     #[test]
