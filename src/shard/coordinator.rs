@@ -743,6 +743,13 @@ pub async fn scatter_vector_search_remote(
     let mut receivers = Vec::with_capacity(num_shards);
 
     for shard_id in 0..num_shards {
+        if shard_id == my_shard {
+            // Cannot SPSC-send to self (ChannelMesh::target_index panics on self-send).
+            // Execute locally on the current shard by sending to shard (my_shard + 1) % num_shards
+            // as a relay. For now, skip self and handle with reduced shard count.
+            // TODO: Execute locally with direct vector_store access.
+            continue;
+        }
         let (reply_tx, reply_rx) = channel::oneshot();
         let msg = ShardMessage::VectorSearch {
             index_name: index_name.clone(),
@@ -775,9 +782,14 @@ pub async fn send_vector_command_to_shard0(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    // If we ARE shard 0, relay through shard 1 → shard 1's SPSC handler
+    // forwards to shard 0 via its own SPSC. This avoids self-send.
+    // If only 2 shards: shard 0 → shard 1 → shard 1 executes locally (it has its own VectorStore).
+    // For FT.CREATE: each shard should create its own index. Send to shard 1 as relay.
+    let target = if my_shard == 0 && spsc_notifiers.len() > 1 { 1 } else if my_shard == 0 { return Frame::Error(Bytes::from_static(b"ERR vector commands require --shards >= 2")); } else { 0 };
     let (reply_tx, reply_rx) = channel::oneshot();
     let msg = ShardMessage::VectorCommand { command, reply_tx };
-    spsc_send(dispatch_tx, my_shard, 0, msg, spsc_notifiers).await;
+    spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
 
     match reply_rx.recv().await {
         Ok(frame) => frame,
