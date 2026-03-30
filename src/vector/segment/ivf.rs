@@ -4,9 +4,14 @@
 //! FAISS-interleaved layout (32-vector blocks, dimension-interleaved) for
 //! VPSHUFB FastScan distance computation.
 
+use roaring::RoaringBitmap;
+use smallvec::SmallVec;
+
 use crate::vector::aligned_buffer::AlignedBuffer;
+use crate::vector::distance::fastscan;
 use crate::vector::turbo_quant::codebook::CENTROIDS;
 use crate::vector::turbo_quant::encoder::padded_dimension;
+use crate::vector::types::{SearchResult, VectorId};
 
 /// Quantization method used within IVF posting lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +204,8 @@ pub struct IvfSegment {
     dimension: u32,
     /// Padded dimension (next power of 2).
     padded_dim: u32,
+    /// FWHT sign flips used to rotate queries before LUT precomputation.
+    sign_flips: AlignedBuffer<f32>,
 }
 
 impl IvfSegment {
@@ -209,6 +216,7 @@ impl IvfSegment {
         n_clusters: u32,
         quantization: IvfQuantization,
         dimension: u32,
+        sign_flips: AlignedBuffer<f32>,
     ) -> Self {
         Self {
             centroids,
@@ -217,6 +225,7 @@ impl IvfSegment {
             quantization,
             dimension,
             padded_dim: padded_dimension(dimension),
+            sign_flips,
         }
     }
 
@@ -260,11 +269,342 @@ impl IvfSegment {
     pub fn total_vectors(&self) -> u64 {
         self.posting_lists.iter().map(|pl| pl.count as u64).sum()
     }
+
+    /// Reference to the FWHT sign flips for query rotation.
+    #[inline]
+    pub fn sign_flips(&self) -> &[f32] {
+        self.sign_flips.as_slice()
+    }
+
+    /// Search this IVF segment: precompute LUT, probe nprobe clusters, merge top-k.
+    ///
+    /// `query_f32`: raw f32 query vector (original dimension).
+    /// `q_rotated`: pre-rotated query for LUT precomputation (padded_dim).
+    /// `k`: number of results to return.
+    /// `nprobe`: number of clusters to probe.
+    /// `lut_buf`: caller-provided LUT buffer (padded_dim * 16 bytes).
+    ///
+    /// No heap allocations for typical nprobe/k values (SmallVec stack).
+    pub fn search(
+        &self,
+        query_f32: &[f32],
+        q_rotated: &[f32],
+        k: usize,
+        nprobe: usize,
+        lut_buf: &mut [u8],
+    ) -> SmallVec<[SearchResult; 32]> {
+        // Precompute u8 distance LUT from rotated query.
+        precompute_lut(q_rotated, lut_buf);
+
+        let dim = self.dimension as usize;
+        let pdim = self.padded_dim as usize;
+        let dim_half = pdim / 2;
+
+        // Find the nprobe closest centroids.
+        let probed = find_nprobe_nearest(
+            query_f32,
+            self.centroids.as_slice(),
+            dim,
+            self.n_clusters as usize,
+            nprobe,
+        );
+
+        let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
+
+        for &cluster_idx in &probed {
+            let pl = &self.posting_lists[cluster_idx as usize];
+            if pl.count == 0 {
+                continue;
+            }
+            fastscan::scan_posting_list(
+                pl.codes.as_slice(),
+                lut_buf,
+                dim_half,
+                &pl.ids,
+                &pl.norms,
+                pl.count,
+                k,
+                &mut results,
+            );
+        }
+
+        // Final merge: sort and truncate to k across all probed clusters.
+        results.sort_unstable();
+        if results.len() > k {
+            results.truncate(k);
+        }
+        results
+    }
+
+    /// Search with a RoaringBitmap filter: only return results whose IDs are in the bitmap.
+    ///
+    /// Post-filtering approach: scan clusters as normal, then filter results.
+    pub fn search_filtered(
+        &self,
+        query_f32: &[f32],
+        q_rotated: &[f32],
+        k: usize,
+        nprobe: usize,
+        lut_buf: &mut [u8],
+        filter: &RoaringBitmap,
+    ) -> SmallVec<[SearchResult; 32]> {
+        // Get unfiltered results (with oversampling to compensate for filtering).
+        let oversample_k = k * 3;
+        let mut raw = self.search(query_f32, q_rotated, oversample_k, nprobe, lut_buf);
+
+        // Post-filter: keep only IDs in the bitmap.
+        raw.retain(|r| filter.contains(r.id.0));
+        if raw.len() > k {
+            raw.truncate(k);
+        }
+        raw
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k-means clustering (runs at compaction time, NOT on hot path)
+// ---------------------------------------------------------------------------
+
+/// LCG PRNG (Knuth MMIX). Not cryptographic -- for reproducible k-means init only.
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    /// Random usize in [0, bound).
+    fn next_usize(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+}
+
+/// Lloyd's k-means clustering. Returns centroids as flat f32 array (n_clusters * dim).
+///
+/// `vectors`: flat f32 array (n_vectors * dim).
+/// `dim`: vector dimension.
+/// `n_clusters`: number of clusters.
+/// `max_iters`: iteration limit.
+/// `seed`: for reproducible initialization (random subset selection).
+///
+/// This runs at compaction time -- allocations are fine.
+pub fn kmeans_lloyd(
+    vectors: &[f32],
+    dim: usize,
+    n_clusters: usize,
+    max_iters: usize,
+    seed: u64,
+) -> Vec<f32> {
+    let n_vectors = vectors.len() / dim;
+    let actual_k = n_clusters.min(n_vectors);
+
+    // Initialize centroids via random subset selection.
+    let mut rng = Lcg::new(seed);
+    let mut centroids = vec![0.0f32; actual_k * dim];
+    let mut chosen = Vec::with_capacity(actual_k);
+
+    for i in 0..actual_k {
+        let mut idx = rng.next_usize(n_vectors);
+        // Simple retry to avoid duplicates (acceptable for init).
+        let mut attempts = 0;
+        while chosen.contains(&idx) && attempts < 100 {
+            idx = rng.next_usize(n_vectors);
+            attempts += 1;
+        }
+        chosen.push(idx);
+        centroids[i * dim..(i + 1) * dim]
+            .copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
+    }
+
+    let l2_f32 = crate::vector::distance::table().l2_f32;
+
+    // Assignments: cluster index for each vector.
+    let mut assignments = vec![0u32; n_vectors];
+
+    for _iter in 0..max_iters {
+        let mut changed = false;
+
+        // Assign each vector to nearest centroid.
+        for v in 0..n_vectors {
+            let vec_slice = &vectors[v * dim..(v + 1) * dim];
+            let mut best_cluster = 0u32;
+            let mut best_dist = f32::MAX;
+            for c in 0..actual_k {
+                let centroid_slice = &centroids[c * dim..(c + 1) * dim];
+                let dist = l2_f32(vec_slice, centroid_slice);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_cluster = c as u32;
+                }
+            }
+            if assignments[v] != best_cluster {
+                assignments[v] = best_cluster;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        // Recompute centroids as mean of assigned vectors.
+        let mut sums = vec![0.0f32; actual_k * dim];
+        let mut counts = vec![0u32; actual_k];
+
+        for v in 0..n_vectors {
+            let c = assignments[v] as usize;
+            counts[c] += 1;
+            let base = c * dim;
+            let vec_base = v * dim;
+            for d in 0..dim {
+                sums[base + d] += vectors[vec_base + d];
+            }
+        }
+
+        for c in 0..actual_k {
+            if counts[c] > 0 {
+                let inv = 1.0 / counts[c] as f32;
+                let base = c * dim;
+                for d in 0..dim {
+                    centroids[base + d] = sums[base + d] * inv;
+                }
+            }
+            // Empty cluster: keep previous centroid (no update).
+        }
+    }
+
+    centroids
+}
+
+/// Find the nprobe closest centroids to a query vector by L2 distance.
+///
+/// Returns cluster indices sorted by ascending distance.
+pub fn find_nprobe_nearest(
+    query: &[f32],
+    centroids: &[f32],
+    dim: usize,
+    n_clusters: usize,
+    nprobe: usize,
+) -> SmallVec<[u32; 64]> {
+    let l2_f32 = crate::vector::distance::table().l2_f32;
+    let effective_nprobe = nprobe.min(n_clusters);
+
+    // Compute distances to all centroids.
+    let mut dists: SmallVec<[(f32, u32); 64]> = SmallVec::with_capacity(n_clusters);
+    for c in 0..n_clusters {
+        let centroid = &centroids[c * dim..(c + 1) * dim];
+        let dist = l2_f32(query, centroid);
+        dists.push((dist, c as u32));
+    }
+
+    // Partial sort would be optimal but full sort is fine for typical n_clusters.
+    dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    dists.iter().take(effective_nprobe).map(|&(_, idx)| idx).collect()
+}
+
+/// Build an IvfSegment from raw vectors, TQ codes, norms, and IDs.
+///
+/// Runs k-means, assigns vectors to clusters, builds interleaved posting lists.
+/// This is a compaction-time operation -- allocations are acceptable.
+pub fn build_ivf_segment(
+    vectors_f32: &[f32],
+    tq_codes: &[Vec<u8>],
+    norms: &[f32],
+    ids: &[u32],
+    dim: usize,
+    n_clusters: usize,
+    sign_flips: &[f32],
+) -> IvfSegment {
+    let n_vectors = vectors_f32.len() / dim;
+    let actual_k = n_clusters.min(n_vectors);
+
+    // Run k-means to compute centroids.
+    let centroids_flat = kmeans_lloyd(vectors_f32, dim, actual_k, 50, 42);
+
+    let l2_f32 = crate::vector::distance::table().l2_f32;
+
+    // Assign each vector to nearest centroid.
+    let mut cluster_assignments = Vec::with_capacity(n_vectors);
+    for v in 0..n_vectors {
+        let vec_slice = &vectors_f32[v * dim..(v + 1) * dim];
+        let mut best = 0usize;
+        let mut best_dist = f32::MAX;
+        for c in 0..actual_k {
+            let centroid = &centroids_flat[c * dim..(c + 1) * dim];
+            let dist = l2_f32(vec_slice, centroid);
+            if dist < best_dist {
+                best_dist = dist;
+                best = c;
+            }
+        }
+        cluster_assignments.push(best);
+    }
+
+    // Group by cluster and build posting lists.
+    let mut cluster_codes: Vec<Vec<Vec<u8>>> = (0..actual_k).map(|_| Vec::new()).collect();
+    let mut cluster_ids: Vec<Vec<u32>> = (0..actual_k).map(|_| Vec::new()).collect();
+    let mut cluster_norms: Vec<Vec<f32>> = (0..actual_k).map(|_| Vec::new()).collect();
+
+    for v in 0..n_vectors {
+        let c = cluster_assignments[v];
+        cluster_codes[c].push(tq_codes[v].clone());
+        cluster_ids[c].push(ids[v]);
+        cluster_norms[c].push(norms[v]);
+    }
+
+    let mut posting_lists = Vec::with_capacity(actual_k);
+    for c in 0..actual_k {
+        posting_lists.push(interleave_posting_list(
+            &cluster_codes[c],
+            &cluster_ids[c],
+            &cluster_norms[c],
+        ));
+    }
+
+    let mut sf_buf = AlignedBuffer::new(sign_flips.len());
+    sf_buf.as_mut_slice().copy_from_slice(sign_flips);
+
+    IvfSegment::new(
+        AlignedBuffer::from_vec(centroids_flat),
+        posting_lists,
+        actual_k as u32,
+        IvfQuantization::TurboQuant4Bit,
+        dim as u32,
+        sf_buf,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generate deterministic sign flips (+/-1.0) for tests.
+    fn test_sign_flips(len: usize, seed: u32) -> Vec<f32> {
+        let mut flips = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            if s & 1 == 0 { flips.push(1.0); } else { flips.push(-1.0); }
+        }
+        flips
+    }
+
+    /// Generate deterministic f32 vector via LCG.
+    fn det_f32(dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed as u32;
+        for _ in 0..dim {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
 
     #[test]
     fn test_posting_list_new_empty() {
@@ -435,6 +775,7 @@ mod tests {
             n_clusters,
             IvfQuantization::TurboQuant4Bit,
             dim,
+            AlignedBuffer::new(1024),
         );
 
         assert_eq!(seg.n_clusters(), 4);
@@ -469,6 +810,7 @@ mod tests {
             n_clusters,
             IvfQuantization::TurboQuant4Bit,
             dim,
+            AlignedBuffer::new(padded_dimension(dim) as usize),
         );
 
         assert_eq!(seg.total_vectors(), 30);
@@ -484,5 +826,354 @@ mod tests {
         assert_eq!(quantize_dist_to_u8(1.0), 255);
         // Negative -> 0
         assert_eq!(quantize_dist_to_u8(-0.1), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // k-means tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kmeans_lloyd_convergence() {
+        crate::vector::distance::init();
+        let dim = 128;
+        let n = 1000;
+        let n_clusters = 16;
+
+        // Generate random vectors.
+        let mut vectors = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            vectors.extend(det_f32(dim, i as u64 + 1));
+        }
+
+        let centroids = kmeans_lloyd(&vectors, dim, n_clusters, 50, 12345);
+
+        // Should produce n_clusters * dim floats.
+        assert_eq!(centroids.len(), n_clusters * dim);
+
+        // Verify all 16 centroids are non-degenerate (not all identical).
+        let mut unique = 0;
+        for c in 0..n_clusters {
+            let slice = &centroids[c * dim..(c + 1) * dim];
+            let mag: f32 = slice.iter().map(|x| x * x).sum();
+            if mag > 0.0 {
+                unique += 1;
+            }
+        }
+        assert_eq!(unique, n_clusters, "all centroids should be non-degenerate");
+    }
+
+    #[test]
+    fn test_find_nprobe_nearest_correctness() {
+        crate::vector::distance::init();
+        let dim = 4;
+        // 3 centroids at known positions.
+        let centroids = vec![
+            0.0, 0.0, 0.0, 0.0, // cluster 0 at origin
+            10.0, 0.0, 0.0, 0.0, // cluster 1 at (10,0,0,0)
+            0.0, 10.0, 0.0, 0.0, // cluster 2 at (0,10,0,0)
+        ];
+
+        // Query near cluster 0.
+        let query = vec![0.1, 0.1, 0.0, 0.0];
+        let nearest = find_nprobe_nearest(&query, &centroids, dim, 3, 2);
+        assert_eq!(nearest.len(), 2);
+        assert_eq!(nearest[0], 0, "cluster 0 should be closest");
+    }
+
+    #[test]
+    fn test_find_nprobe_nearest_sorted_by_distance() {
+        crate::vector::distance::init();
+        let dim = 4;
+        let centroids = vec![
+            0.0, 0.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            2.0, 0.0, 0.0, 0.0,
+            3.0, 0.0, 0.0, 0.0,
+        ];
+        let query = vec![0.0, 0.0, 0.0, 0.0];
+        let nearest = find_nprobe_nearest(&query, &centroids, dim, 4, 4);
+        assert_eq!(nearest.as_slice(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_ivf_search_nprobe_1_single_cluster() {
+        crate::vector::distance::init();
+        let dim = 8;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+
+        // Build 2 clusters, each with some vectors.
+        let signs = test_sign_flips(pdim, 42);
+
+        // Cluster 0: vectors 0-3, cluster 1: vectors 4-7.
+        let codes0: Vec<Vec<u8>> = (0..4).map(|v| vec![(v & 0xF) as u8; dim_half]).collect();
+        let ids0: Vec<u32> = (0..4).collect();
+        let norms0 = vec![1.0f32; 4];
+        let pl0 = interleave_posting_list(&codes0, &ids0, &norms0);
+
+        let codes1: Vec<Vec<u8>> = (4..8).map(|v| vec![(v & 0xF) as u8; dim_half]).collect();
+        let ids1: Vec<u32> = (4..8).collect();
+        let norms1 = vec![1.0f32; 4];
+        let pl1 = interleave_posting_list(&codes1, &ids1, &norms1);
+
+        // Centroids: cluster 0 at origin, cluster 1 far away.
+        let mut centroids_data = vec![0.0f32; 2 * dim];
+        for d in 0..dim {
+            centroids_data[dim + d] = 100.0;
+        }
+
+        let mut sf_buf = AlignedBuffer::new(pdim);
+        sf_buf.as_mut_slice().copy_from_slice(&signs);
+
+        let seg = IvfSegment::new(
+            AlignedBuffer::from_vec(centroids_data),
+            vec![pl0, pl1],
+            2,
+            IvfQuantization::TurboQuant4Bit,
+            dim as u32,
+            sf_buf,
+        );
+
+        // Query near origin -> should probe cluster 0 only.
+        let query = vec![0.0f32; dim];
+        let q_rotated = vec![0.0f32; pdim];
+        let mut lut_buf = vec![0u8; pdim * 16];
+
+        let results = seg.search(&query, &q_rotated, 4, 1, &mut lut_buf);
+
+        // All results should be from cluster 0 (ids 0-3).
+        for r in &results {
+            assert!(r.id.0 < 4, "nprobe=1 should only return cluster 0 vectors, got id={}", r.id.0);
+        }
+    }
+
+    #[test]
+    fn test_ivf_search_nprobe_all_matches_brute_force() {
+        crate::vector::distance::init();
+        let dim = 8;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+
+        let signs = test_sign_flips(pdim, 42);
+
+        // 2 clusters, 4 vectors each.
+        let codes0: Vec<Vec<u8>> = (0..4).map(|v| vec![(v & 0xF) as u8; dim_half]).collect();
+        let ids0: Vec<u32> = (0..4).collect();
+        let norms0 = vec![1.0f32; 4];
+        let pl0 = interleave_posting_list(&codes0, &ids0, &norms0);
+
+        let codes1: Vec<Vec<u8>> = (4..8).map(|v| vec![(v & 0xF) as u8; dim_half]).collect();
+        let ids1: Vec<u32> = (4..8).collect();
+        let norms1 = vec![1.0f32; 4];
+        let pl1 = interleave_posting_list(&codes1, &ids1, &norms1);
+
+        let centroids_data = vec![0.0f32; 2 * dim];
+
+        let mut sf_buf = AlignedBuffer::new(pdim);
+        sf_buf.as_mut_slice().copy_from_slice(&signs);
+
+        let seg = IvfSegment::new(
+            AlignedBuffer::from_vec(centroids_data),
+            vec![pl0, pl1],
+            2,
+            IvfQuantization::TurboQuant4Bit,
+            dim as u32,
+            sf_buf,
+        );
+
+        let query = vec![0.0f32; dim];
+        let q_rotated = vec![0.0f32; pdim];
+        let mut lut_buf = vec![0u8; pdim * 16];
+
+        // nprobe = n_clusters: scan all clusters.
+        let results = seg.search(&query, &q_rotated, 8, 2, &mut lut_buf);
+
+        // Should return all 8 vectors (or at least k=8).
+        assert_eq!(results.len(), 8, "nprobe=all should return all vectors");
+
+        // Verify all IDs present.
+        let mut ids: Vec<u32> = results.iter().map(|r| r.id.0).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_ivf_search_filtered_respects_bitmap() {
+        crate::vector::distance::init();
+        let dim = 8;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+
+        let signs = test_sign_flips(pdim, 42);
+
+        let codes: Vec<Vec<u8>> = (0..8).map(|v| vec![(v & 0xF) as u8; dim_half]).collect();
+        let ids: Vec<u32> = (0..8).collect();
+        let norms = vec![1.0f32; 8];
+        let pl = interleave_posting_list(&codes, &ids, &norms);
+
+        let centroids_data = vec![0.0f32; 1 * dim];
+
+        let mut sf_buf = AlignedBuffer::new(pdim);
+        sf_buf.as_mut_slice().copy_from_slice(&signs);
+
+        let seg = IvfSegment::new(
+            AlignedBuffer::from_vec(centroids_data),
+            vec![pl],
+            1,
+            IvfQuantization::TurboQuant4Bit,
+            dim as u32,
+            sf_buf,
+        );
+
+        let query = vec![0.0f32; dim];
+        let q_rotated = vec![0.0f32; pdim];
+        let mut lut_buf = vec![0u8; pdim * 16];
+
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(2);
+        bitmap.insert(5);
+
+        let results = seg.search_filtered(&query, &q_rotated, 8, 1, &mut lut_buf, &bitmap);
+        for r in &results {
+            assert!(bitmap.contains(r.id.0), "filtered result id {} not in bitmap", r.id.0);
+        }
+    }
+
+    #[test]
+    fn test_build_ivf_segment_creates_valid_segment() {
+        crate::vector::distance::init();
+        let dim = 8;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let dim_half = pdim / 2;
+        let n = 100;
+        let n_clusters = 4;
+        let signs = test_sign_flips(pdim, 42);
+
+        let mut vectors = Vec::with_capacity(n * dim);
+        let mut tq_codes = Vec::with_capacity(n);
+        let mut norms = Vec::with_capacity(n);
+        let ids: Vec<u32> = (0..n as u32).collect();
+
+        for i in 0..n {
+            let v = det_f32(dim, i as u64 + 1);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(norm);
+            vectors.extend_from_slice(&v);
+            // Simple fake TQ code (just hash of vector index).
+            tq_codes.push(vec![(i & 0xFF) as u8; dim_half]);
+        }
+
+        let seg = build_ivf_segment(&vectors, &tq_codes, &norms, &ids, dim, n_clusters, &signs);
+        assert_eq!(seg.n_clusters() as usize, n_clusters);
+        assert_eq!(seg.total_vectors(), n as u64);
+        assert_eq!(seg.dimension(), dim as u32);
+    }
+
+    #[test]
+    fn test_recall_at_10_nprobe_32() {
+        // Recall test: 10K vectors from 256 synthetic Gaussian clusters.
+        // nprobe=32 should achieve >= 0.90 recall@10.
+        crate::vector::distance::init();
+
+        let dim = 32;
+        let pdim = padded_dimension(dim as u32) as usize;
+        let _dim_half = pdim / 2;
+        let n_vectors = 10_000;
+        let n_clusters = 256;
+        let n_queries = 100;
+        let k = 10;
+        let nprobe = 32;
+        let signs = test_sign_flips(pdim, 42);
+
+        // Generate clustered data: 256 clusters, ~39 vectors per cluster.
+        let mut rng = Lcg::new(9999);
+        let mut vectors = Vec::with_capacity(n_vectors * dim);
+        let mut cluster_means = Vec::with_capacity(n_clusters * dim);
+
+        // Generate cluster means.
+        for _ in 0..n_clusters {
+            for _ in 0..dim {
+                let val = (rng.next_u64() as f32 / u64::MAX as f32) * 20.0 - 10.0;
+                cluster_means.push(val);
+            }
+        }
+
+        // Assign vectors to clusters with small noise.
+        for i in 0..n_vectors {
+            let c = i % n_clusters;
+            for d in 0..dim {
+                let noise = (rng.next_u64() as f32 / u64::MAX as f32) * 0.2 - 0.1;
+                vectors.push(cluster_means[c * dim + d] + noise);
+            }
+        }
+
+        // Compute norms and fake TQ codes.
+        let mut norms = Vec::with_capacity(n_vectors);
+        let mut tq_codes = Vec::with_capacity(n_vectors);
+        let ids: Vec<u32> = (0..n_vectors as u32).collect();
+
+        for i in 0..n_vectors {
+            let v = &vectors[i * dim..(i + 1) * dim];
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(if norm > 0.0 { norm } else { 1.0 });
+
+            // Create TQ codes: encode using real encoder for accurate recall.
+            let mut work_buf = vec![0.0f32; pdim];
+            let code = crate::vector::turbo_quant::encoder::encode_tq_mse(v, &signs, &mut work_buf);
+            tq_codes.push(code.codes);
+        }
+
+        // Build IVF segment.
+        let seg = build_ivf_segment(&vectors, &tq_codes, &norms, &ids, dim, n_clusters, &signs);
+
+        // Ground truth: IVF search with nprobe = ALL clusters (exhaustive).
+        // Recall measures partition quality: how many true top-k (by IVF metric)
+        // are found when probing only nprobe out of n_clusters.
+        let mut total_recall = 0.0f64;
+
+        for q_idx in 0..n_queries {
+            let query = det_f32(dim, 100_000 + q_idx as u64);
+
+            // Rotate query for LUT precomputation.
+            let mut q_rotated = vec![0.0f32; pdim];
+            q_rotated[..dim].copy_from_slice(&query);
+            let qnorm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if qnorm > 0.0 {
+                let inv = 1.0 / qnorm;
+                for v in q_rotated[..dim].iter_mut() {
+                    *v *= inv;
+                }
+            }
+            crate::vector::turbo_quant::fwht::fwht(&mut q_rotated, &signs);
+
+            let mut lut_buf = vec![0u8; pdim * 16];
+
+            // Ground truth: exhaustive scan of ALL clusters.
+            let gt_results = seg.search(&query, &q_rotated, k, n_clusters, &mut lut_buf);
+            let gt_ids: Vec<u32> = gt_results.iter().map(|r| r.id.0).collect();
+
+            // IVF search with limited nprobe.
+            let results = seg.search(&query, &q_rotated, k, nprobe, &mut lut_buf);
+
+            // Count recall: how many of our top-k are in ground truth top-k.
+            let result_ids: Vec<u32> = results.iter().map(|r| r.id.0).collect();
+            let hits = result_ids.iter().filter(|id| gt_ids.contains(id)).count();
+            total_recall += hits as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / n_queries as f64;
+        assert!(
+            avg_recall >= 0.90,
+            "recall@10 = {avg_recall:.4} < 0.90 at nprobe={nprobe}"
+        );
+    }
+
+    #[test]
+    fn test_lcg_deterministic() {
+        let mut rng1 = Lcg::new(42);
+        let mut rng2 = Lcg::new(42);
+        for _ in 0..100 {
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
+        }
     }
 }
