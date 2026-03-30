@@ -1001,4 +1001,140 @@ mod tests {
             "Should error on unknown index, got {result:?}"
         );
     }
+
+    #[test]
+    fn test_parse_filter_clause_tag() {
+        let args = vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 10 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(b"@category:{electronics}"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"q"),
+            bulk(b"blob"),
+        ];
+        let filter = parse_filter_clause(&args);
+        assert!(filter.is_some(), "should parse @category:{{electronics}}");
+        match filter.unwrap() {
+            crate::vector::filter::FilterExpr::TagEq { field, value } => {
+                assert_eq!(&field[..], b"category");
+                assert_eq!(&value[..], b"electronics");
+            }
+            other => panic!("expected TagEq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_clause_numeric_range() {
+        let args = vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(b"@price:[10 100]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"q"),
+            bulk(b"blob"),
+        ];
+        let filter = parse_filter_clause(&args);
+        assert!(filter.is_some());
+        match filter.unwrap() {
+            crate::vector::filter::FilterExpr::NumRange { field, min, max } => {
+                assert_eq!(&field[..], b"price");
+                assert_eq!(*min, 10.0);
+                assert_eq!(*max, 100.0);
+            }
+            other => panic!("expected NumRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_clause_numeric_eq() {
+        let args = vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(b"@price:[50 50]"),
+        ];
+        let filter = parse_filter_clause(&args);
+        assert!(filter.is_some());
+        match filter.unwrap() {
+            crate::vector::filter::FilterExpr::NumEq { field, value } => {
+                assert_eq!(&field[..], b"price");
+                assert_eq!(*value, 50.0);
+            }
+            other => panic!("expected NumEq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_clause_compound() {
+        let args = vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(b"@a:{x} @b:[1 10]"),
+        ];
+        let filter = parse_filter_clause(&args);
+        assert!(filter.is_some());
+        match filter.unwrap() {
+            crate::vector::filter::FilterExpr::And(left, right) => {
+                assert!(matches!(*left, crate::vector::filter::FilterExpr::TagEq { .. }));
+                assert!(matches!(*right, crate::vector::filter::FilterExpr::NumRange { .. }));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_clause_none() {
+        // No FILTER keyword
+        let args = vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 10 @vec $q]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"q"),
+            bulk(b"blob"),
+        ];
+        let filter = parse_filter_clause(&args);
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn test_ft_search_with_filter_no_regression() {
+        // Unfiltered FT.SEARCH still works identically
+        crate::vector::distance::init();
+        let mut store = VectorStore::new();
+        let args = ft_create_args();
+        ft_create(&mut store, &args);
+
+        let query_vec: Vec<u8> = vec![0u8; 128 * 4];
+        let search_args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 5 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            Frame::BulkString(Bytes::from(query_vec)),
+        ];
+        let result = ft_search(&mut store, &search_args);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items[0], Frame::Integer(0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vector_index_has_payload_index() {
+        let mut store = VectorStore::new();
+        let args = ft_create_args();
+        ft_create(&mut store, &args);
+        let idx = store.get_index(b"myidx").unwrap();
+        // payload_index should exist -- insert and evaluate should work
+        let _ = &idx.payload_index;
+    }
 }
