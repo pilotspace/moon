@@ -11,3 +11,6 @@ pub mod types;
 pub mod mvcc;
 pub mod persistence;
 
+#[cfg(feature = "gpu-cuda")]
+pub mod gpu;
+
