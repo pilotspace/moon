@@ -84,6 +84,8 @@ fn build_test_graph(
 
 const SCALES: &[u32] = &[1000, 5000, 10000];
 const DIM: usize = 128;
+const DIM_768: usize = 768;
+const SCALES_768: &[u32] = &[1000, 5000, 10000];
 
 fn bench_hnsw_build(c: &mut Criterion) {
     distance::init();
@@ -170,5 +172,103 @@ fn bench_hnsw_search_ef(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hnsw_build, bench_hnsw_search, bench_hnsw_search_ef);
+fn bench_hnsw_build_768d(c: &mut Criterion) {
+    distance::init();
+    let mut group = c.benchmark_group("hnsw_build_768d");
+    // 768d builds are substantially slower; extend measurement time
+    group.measurement_time(std::time::Duration::from_secs(30));
+
+    for &n in SCALES_768 {
+        let vecs: Vec<Vec<f32>> = (0..n).map(|i| make_f32_vector(DIM_768, i * 7 + 13)).collect();
+        let padded = padded_dimension(DIM_768 as u32) as usize;
+        let bytes_per_code = (padded / 2 + 4) as u32;
+
+        group.bench_with_input(BenchmarkId::new("build_768d", n), &n, |bench, &n| {
+            bench.iter(|| {
+                let mut builder = HnswBuilder::new(16, 200, 42);
+                for _i in 0..n {
+                    builder.insert(|a, b| {
+                        let va = &vecs[a as usize];
+                        let vb = &vecs[b as usize];
+                        va.iter().zip(vb.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+                    });
+                }
+                black_box(builder.build(bytes_per_code))
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_hnsw_search_768d(c: &mut Criterion) {
+    distance::init();
+    let mut group = c.benchmark_group("hnsw_search_768d");
+    // 768d search uses larger TQ codes; extend measurement for stability
+    group.measurement_time(std::time::Duration::from_secs(20));
+
+    for &n in SCALES_768 {
+        let (graph, vectors_tq, collection) = build_test_graph(n, DIM_768);
+        let query = make_f32_vector(DIM_768, 999_999);
+        let padded = padded_dimension(DIM_768 as u32);
+        let mut scratch = SearchScratch::new(n, padded);
+
+        group.bench_with_input(BenchmarkId::new("search_768d", n), &n, |bench, _| {
+            bench.iter(|| {
+                scratch.clear(n);
+                let results = hnsw_search(
+                    black_box(&graph),
+                    black_box(&vectors_tq),
+                    black_box(&query),
+                    &collection,
+                    10,
+                    64,
+                    &mut scratch,
+                );
+                black_box(results)
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_hnsw_search_ef_768d(c: &mut Criterion) {
+    distance::init();
+    let mut group = c.benchmark_group("hnsw_search_ef_768d");
+    group.measurement_time(std::time::Duration::from_secs(20));
+
+    let n = 10000u32;
+    let (graph, vectors_tq, collection) = build_test_graph(n, DIM_768);
+    let query = make_f32_vector(DIM_768, 999_999);
+    let padded = padded_dimension(DIM_768 as u32);
+    let mut scratch = SearchScratch::new(n, padded);
+
+    for &ef in &[32usize, 64, 128, 256] {
+        group.bench_with_input(BenchmarkId::new("ef_768d", ef), &ef, |bench, &ef| {
+            bench.iter(|| {
+                scratch.clear(n);
+                let results = hnsw_search(
+                    black_box(&graph),
+                    black_box(&vectors_tq),
+                    black_box(&query),
+                    &collection,
+                    10,
+                    ef,
+                    &mut scratch,
+                );
+                black_box(results)
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hnsw_build,
+    bench_hnsw_search,
+    bench_hnsw_search_ef,
+    bench_hnsw_build_768d,
+    bench_hnsw_search_768d,
+    bench_hnsw_search_ef_768d
+);
 criterion_main!(benches);
