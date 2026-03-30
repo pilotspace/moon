@@ -158,6 +158,60 @@ mod tests {
     }
 
     #[test]
+    fn test_holder_search_filtered_none_same_as_unfiltered() {
+        distance::init();
+        let dim = 8;
+        let holder = SegmentHolder::new(dim as u32);
+        {
+            let snap = holder.load();
+            for i in 0..5u32 {
+                let sq = make_sq_vector(dim, i * 13 + 1);
+                let f32_v = vec![0.0f32; dim];
+                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+            }
+        }
+        let query_sq = make_sq_vector(dim, 1);
+        let query_f32 = vec![0.0f32; dim];
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+
+        let unfiltered = holder.search(&query_f32, &query_sq, 3, 64, &mut scratch);
+        let filtered = holder.search_filtered(&query_f32, &query_sq, 3, 64, &mut scratch, None);
+        assert_eq!(unfiltered.len(), filtered.len());
+        for (u, f) in unfiltered.iter().zip(filtered.iter()) {
+            assert_eq!(u.id.0, f.id.0);
+        }
+    }
+
+    #[test]
+    fn test_holder_search_filtered_with_bitmap() {
+        distance::init();
+        let dim = 8;
+        let holder = SegmentHolder::new(dim as u32);
+        {
+            let snap = holder.load();
+            for i in 0..5u32 {
+                let sq = make_sq_vector(dim, i * 13 + 1);
+                let f32_v = vec![0.0f32; dim];
+                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+            }
+        }
+        let query_sq = make_sq_vector(dim, 1);
+        let query_f32 = vec![0.0f32; dim];
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+
+        // Only allow IDs 2, 3, 4
+        let mut bitmap = roaring::RoaringBitmap::new();
+        bitmap.insert(2);
+        bitmap.insert(3);
+        bitmap.insert(4);
+
+        let results = holder.search_filtered(&query_f32, &query_sq, 3, 64, &mut scratch, Some(&bitmap));
+        for r in &results {
+            assert!(bitmap.contains(r.id.0), "result id {} not in bitmap", r.id.0);
+        }
+    }
+
+    #[test]
     fn test_holder_snapshot_isolation() {
         let holder = SegmentHolder::new(128);
 

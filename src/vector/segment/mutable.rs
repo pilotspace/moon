@@ -338,6 +338,49 @@ mod tests {
     }
 
     #[test]
+    fn test_brute_force_search_filtered_none_same_as_unfiltered() {
+        distance::init();
+        let dim = 8;
+        let seg = MutableSegment::new(dim as u32);
+        for i in 0..10u32 {
+            let f32_v = make_f32_vector(dim, i * 7 + 1);
+            let sq_v = make_sq_vector(dim, i * 7 + 1);
+            seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64);
+        }
+        let query = make_sq_vector(dim, 1);
+        let unfiltered = seg.brute_force_search(&query, 3);
+        let filtered = seg.brute_force_search_filtered(&query, 3, None);
+        assert_eq!(unfiltered.len(), filtered.len());
+        for (u, f) in unfiltered.iter().zip(filtered.iter()) {
+            assert_eq!(u.id.0, f.id.0);
+        }
+    }
+
+    #[test]
+    fn test_brute_force_search_filtered_skips_non_bitmap() {
+        distance::init();
+        let dim = 4;
+        let seg = MutableSegment::new(dim as u32);
+        let f32_v = [0.0f32; 4];
+        seg.append(0, &f32_v, &[0i8, 0, 0, 0], 1.0, 1); // id 0
+        seg.append(1, &f32_v, &[1i8, 1, 1, 1], 1.0, 2); // id 1
+        seg.append(2, &f32_v, &[10i8, 10, 10, 10], 1.0, 3); // id 2
+
+        // Only allow id 1 and 2
+        let mut bitmap = roaring::RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(2);
+
+        let results = seg.brute_force_search_filtered(&[0i8, 0, 0, 0], 3, Some(&bitmap));
+        for r in &results {
+            assert_ne!(r.id.0, 0, "id 0 should be filtered out");
+        }
+        assert!(!results.is_empty());
+        // id 1 should be nearest (distance 4)
+        assert_eq!(results[0].id.0, 1);
+    }
+
+    #[test]
     fn test_no_hnsw_methods_exist() {
         // This test documents the compile-time guarantee:
         // MutableSegment has no build_hnsw, insert_hnsw, or graph field.

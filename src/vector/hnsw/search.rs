@@ -726,6 +726,51 @@ mod tests {
     }
 
     #[test]
+    fn test_search_filtered_none_same_as_unfiltered() {
+        let n = 50;
+        let dim = 32;
+        let k = 5;
+        let ef = 64;
+        let (vectors, graph, tq_buf, collection) = build_test_index(n, dim, 8, 100);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        let unfiltered = hnsw_search(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch);
+        let filtered = hnsw_search_filtered(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch, None);
+
+        assert_eq!(unfiltered.len(), filtered.len());
+        for (u, f) in unfiltered.iter().zip(filtered.iter()) {
+            assert_eq!(u.id.0, f.id.0);
+        }
+    }
+
+    #[test]
+    fn test_search_filtered_bitmap_returns_only_matching_ids() {
+        let n = 100;
+        let dim = 64;
+        let k = 10;
+        let ef = 128;
+        let (_vectors, graph, tq_buf, collection) = build_test_index(n, dim, 16, 200);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        // Allow only even IDs
+        let mut bitmap = roaring::RoaringBitmap::new();
+        for i in (0..n as u32).step_by(2) {
+            bitmap.insert(i);
+        }
+
+        let mut query = lcg_f32(dim, 99999);
+        normalize(&mut query);
+
+        let results = hnsw_search_filtered(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch, Some(&bitmap));
+        for r in &results {
+            assert!(bitmap.contains(r.id.0), "result id {} not in bitmap", r.id.0);
+        }
+        assert!(!results.is_empty(), "filtered search should return some results");
+    }
+
+    #[test]
     fn test_search_scratch_capacity_stable() {
         let n = 50;
         let dim = 32;
