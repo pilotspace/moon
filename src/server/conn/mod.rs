@@ -27,7 +27,8 @@ pub(crate) use shared::{
     execute_transaction_sharded, extract_primary_key, handle_config, is_multi_key_command,
 };
 pub(crate) use util::{
-    apply_resp3_conversion, extract_bytes, extract_command, restore_migrated_state,
+    apply_resp3_conversion, extract_bytes, extract_command, propagate_subscription,
+    restore_migrated_state, unpropagate_subscription,
 };
 
 // Re-export handler functions at the module level so external callers
