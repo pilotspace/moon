@@ -96,6 +96,31 @@ impl ImmutableSegment {
         )
     }
 
+    /// Access the HNSW graph.
+    pub fn graph(&self) -> &HnswGraph {
+        &self.graph
+    }
+
+    /// Access the TQ code buffer.
+    pub fn vectors_tq(&self) -> &AlignedBuffer<u8> {
+        &self.vectors_tq
+    }
+
+    /// Access the SQ vector buffer.
+    pub fn vectors_sq(&self) -> &AlignedBuffer<i8> {
+        &self.vectors_sq
+    }
+
+    /// Access MVCC headers.
+    pub fn mvcc_headers(&self) -> &[MvccHeader] {
+        &self.mvcc
+    }
+
+    /// Access collection metadata.
+    pub fn collection_meta(&self) -> &Arc<CollectionMetadata> {
+        &self.collection_meta
+    }
+
     /// Number of live (non-deleted) entries.
     pub fn live_count(&self) -> u32 {
         self.live_count

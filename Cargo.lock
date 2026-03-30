@@ -1264,6 +1264,8 @@ dependencies = [
  "roaring",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "sha1_smol",
  "sha2",
  "smallvec",

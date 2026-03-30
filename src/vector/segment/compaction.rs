@@ -10,11 +10,13 @@
 //! 7. Persist to disk (stub for Phase 66)
 //! 8. Construct ImmutableSegment
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::build::HnswBuilder;
 use crate::vector::hnsw::search::{hnsw_search, SearchScratch};
+use crate::vector::persistence::segment_io;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::turbo_quant::encoder::encode_tq_mse;
 use crate::vector::turbo_quant::fwht;
@@ -32,6 +34,7 @@ const HNSW_EF_CONSTRUCTION: u16 = 200;
 pub enum CompactionError {
     RecallTooLow { recall: f32, required: f32 },
     EmptySegment,
+    PersistFailed(String),
 }
 
 impl std::fmt::Display for CompactionError {
@@ -41,6 +44,7 @@ impl std::fmt::Display for CompactionError {
                 write!(f, "compaction recall {recall:.4} below required {required:.4}")
             }
             Self::EmptySegment => write!(f, "cannot compact empty segment"),
+            Self::PersistFailed(msg) => write!(f, "persist failed: {msg}"),
         }
     }
 }
@@ -48,7 +52,9 @@ impl std::fmt::Display for CompactionError {
 /// Convert a frozen mutable segment into an optimized immutable segment.
 ///
 /// Steps: filter dead -> encode TQ -> build HNSW -> verify recall -> BFS reorder ->
-/// construct ImmutableSegment.
+/// persist (optional) -> construct ImmutableSegment.
+///
+/// `persist`: when `Some((dir, segment_id))`, writes the segment to disk after construction.
 ///
 /// Returns `Err(CompactionError::RecallTooLow)` if recall < 0.95.
 /// Returns `Err(CompactionError::EmptySegment)` if all entries are deleted.
@@ -56,6 +62,7 @@ pub fn compact(
     frozen: &FrozenSegment,
     collection: &Arc<CollectionMetadata>,
     seed: u64,
+    persist: Option<(&Path, u64)>,
 ) -> Result<ImmutableSegment, CompactionError> {
     let dim = frozen.dimension as usize;
     let padded = collection.padded_dimension as usize;
@@ -189,8 +196,9 @@ pub fn compact(
     // ── Step 6: Payload indexes (stub for Phase 64) ──────────────────
     // No-op.
 
-    // ── Step 7: Persist to disk (stub for Phase 66) ──────────────────
-    // No-op.
+    // ── Step 7: Persist to disk ────────────────────────────────────────
+    // Deferred to after ImmutableSegment construction so we can pass the
+    // complete segment to write_immutable_segment.
 
     // ── Step 8: Create ImmutableSegment ──────────────────────────────
     // Build MVCC headers in BFS order
@@ -209,7 +217,7 @@ pub fn compact(
     let total_count = frozen.entries.len() as u32;
     let live_count = n as u32;
 
-    Ok(ImmutableSegment::new(
+    let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
         AlignedBuffer::from_vec(sq_bfs),
@@ -217,7 +225,15 @@ pub fn compact(
         collection.clone(),
         live_count,
         total_count,
-    ))
+    );
+
+    // Step 7 (continued): persist to disk if requested
+    if let Some((dir, segment_id)) = persist {
+        segment_io::write_immutable_segment(dir, segment_id, &segment, collection)
+            .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
+    }
+
+    Ok(segment)
 }
 
 /// Verify recall of the HNSW graph against brute-force TQ-ADC ground truth.
@@ -374,7 +390,7 @@ mod tests {
     #[test]
     fn test_compact_100_vectors() {
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
-        let result = compact(&frozen, &collection, 12345);
+        let result = compact(&frozen, &collection, 12345, None);
         assert!(result.is_ok(), "compact failed: {:?}", result.err());
         let imm = result.unwrap();
         assert_eq!(imm.live_count(), 100);
@@ -392,7 +408,7 @@ mod tests {
     #[test]
     fn test_compact_filters_deleted() {
         let (frozen, collection) = make_frozen_segment(50, 64, 10);
-        let result = compact(&frozen, &collection, 12345);
+        let result = compact(&frozen, &collection, 12345, None);
         assert!(result.is_ok(), "compact failed: {:?}", result.err());
         let imm = result.unwrap();
         // 50 total, 10 deleted -> 40 live
@@ -403,7 +419,7 @@ mod tests {
     #[test]
     fn test_compact_empty_returns_error() {
         let (frozen, collection) = make_frozen_segment(5, 64, 5);
-        let result = compact(&frozen, &collection, 12345);
+        let result = compact(&frozen, &collection, 12345, None);
         assert!(result.is_err());
         match result.err().unwrap() {
             CompactionError::EmptySegment => {}
@@ -415,7 +431,7 @@ mod tests {
     fn test_compact_recall_above_threshold() {
         let (frozen, collection) = make_frozen_segment(500, 64, 0);
         // compact() internally verifies recall >= 0.95 and returns Ok only if it passes
-        let result = compact(&frozen, &collection, 12345);
+        let result = compact(&frozen, &collection, 12345, None);
         assert!(result.is_ok(), "compact failed (recall too low): {:?}", result.err());
     }
 
@@ -423,7 +439,7 @@ mod tests {
     fn test_needs_vacuum_threshold() {
         // Create segment with 25% dead
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
-        let result = compact(&frozen, &collection, 12345);
+        let result = compact(&frozen, &collection, 12345, None);
         assert!(result.is_ok());
         let mut imm = result.unwrap();
 
@@ -438,7 +454,7 @@ mod tests {
 
         // Create another with 10% dead
         let (frozen2, collection2) = make_frozen_segment(100, 64, 0);
-        let result2 = compact(&frozen2, &collection2, 54321);
+        let result2 = compact(&frozen2, &collection2, 54321, None);
         assert!(result2.is_ok());
         let mut imm2 = result2.unwrap();
 
