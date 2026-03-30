@@ -988,4 +988,265 @@ mod tests {
         let results = brute_force_tq_adc(&query, &tq_buffer, n, &collection, 100);
         assert_eq!(results.len(), n, "k=100 with n=10 should return 10 results");
     }
+
+    // ── Multi-bit ADC tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_tq_l2_adc_multibit_self_distance_1bit() {
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
+        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
+
+        fwht::init_fwht();
+        let dim = 768;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries_n(padded as u32, 1);
+        let centroids = scaled_centroids_n(padded as u32, 1);
+        let mut work = vec![0.0f32; padded];
+
+        let mut v = lcg_f32(dim, 99);
+        normalize(&mut v);
+
+        let code = encode_tq_mse_multibit(&v, &signs, &boundaries, 1, &mut work);
+
+        // Rotate query
+        let mut q_rotated = vec![0.0f32; padded];
+        q_rotated[..dim].copy_from_slice(&v);
+        fwht::fwht(&mut q_rotated, &signs);
+
+        let dist = tq_l2_adc_multibit(&q_rotated, &code.codes, code.norm, &centroids, 1);
+        eprintln!("1-bit self-distance: {dist}");
+        assert!(dist < 0.8, "1-bit self-distance {dist} too large");
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_tq_l2_adc_multibit_self_distance_2bit() {
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
+        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
+
+        fwht::init_fwht();
+        let dim = 768;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries_n(padded as u32, 2);
+        let centroids = scaled_centroids_n(padded as u32, 2);
+        let mut work = vec![0.0f32; padded];
+
+        let mut v = lcg_f32(dim, 99);
+        normalize(&mut v);
+
+        let code = encode_tq_mse_multibit(&v, &signs, &boundaries, 2, &mut work);
+
+        let mut q_rotated = vec![0.0f32; padded];
+        q_rotated[..dim].copy_from_slice(&v);
+        fwht::fwht(&mut q_rotated, &signs);
+
+        let dist = tq_l2_adc_multibit(&q_rotated, &code.codes, code.norm, &centroids, 2);
+        eprintln!("2-bit self-distance: {dist}");
+        assert!(dist < 0.3, "2-bit self-distance {dist} too large");
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_tq_l2_adc_multibit_self_distance_3bit() {
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
+        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
+
+        fwht::init_fwht();
+        let dim = 768;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let boundaries = scaled_boundaries_n(padded as u32, 3);
+        let centroids = scaled_centroids_n(padded as u32, 3);
+        let mut work = vec![0.0f32; padded];
+
+        let mut v = lcg_f32(dim, 99);
+        normalize(&mut v);
+
+        let code = encode_tq_mse_multibit(&v, &signs, &boundaries, 3, &mut work);
+
+        let mut q_rotated = vec![0.0f32; padded];
+        q_rotated[..dim].copy_from_slice(&v);
+        fwht::fwht(&mut q_rotated, &signs);
+
+        let dist = tq_l2_adc_multibit(&q_rotated, &code.codes, code.norm, &centroids, 3);
+        eprintln!("3-bit self-distance: {dist}");
+        assert!(dist < 0.08, "3-bit self-distance {dist} too large");
+        assert!(dist >= 0.0);
+    }
+
+    #[test]
+    fn test_tq_l2_adc_multibit_ranking() {
+        use crate::vector::turbo_quant::encoder::{encode_tq_mse_multibit, decode_tq_mse_multibit};
+        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
+
+        fwht::init_fwht();
+        let dim = 768;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+
+        for bits in [1u8, 2, 3] {
+            let boundaries = scaled_boundaries_n(padded as u32, bits);
+            let centroids = scaled_centroids_n(padded as u32, bits);
+            let mut work_enc = vec![0.0f32; padded];
+            let mut work_dec = vec![0.0f32; padded];
+
+            // Encode 10 vectors
+            let mut codes = Vec::new();
+            let mut originals = Vec::new();
+            for seed in 0..10u32 {
+                let mut v = lcg_f32(dim, seed * 7 + 13);
+                normalize(&mut v);
+                originals.push(v.clone());
+                codes.push(encode_tq_mse_multibit(&v, &signs, &boundaries, bits, &mut work_enc));
+            }
+
+            // Query
+            let mut query = lcg_f32(dim, 999);
+            normalize(&mut query);
+            let mut q_rotated = vec![0.0f32; padded];
+            q_rotated[..dim].copy_from_slice(&query);
+            fwht::fwht(&mut q_rotated, &signs);
+
+            // ADC distances
+            let adc_dists: Vec<f32> = codes.iter()
+                .map(|c| tq_l2_adc_multibit(&q_rotated, &c.codes, c.norm, &centroids, bits))
+                .collect();
+
+            // Decoded L2 distances
+            let bf_dists: Vec<f32> = codes.iter()
+                .map(|c| {
+                    let decoded = decode_tq_mse_multibit(c, &signs, &centroids, bits, dim, &mut work_dec);
+                    let mut sum = 0.0f32;
+                    for (a, b) in query.iter().zip(decoded.iter()) {
+                        let d = a - b;
+                        sum += d * d;
+                    }
+                    sum
+                })
+                .collect();
+
+            let mut adc_order: Vec<usize> = (0..10).collect();
+            adc_order.sort_by(|&a, &b| adc_dists[a].partial_cmp(&adc_dists[b]).unwrap());
+
+            let mut bf_order: Vec<usize> = (0..10).collect();
+            bf_order.sort_by(|&a, &b| bf_dists[a].partial_cmp(&bf_dists[b]).unwrap());
+
+            eprintln!("{bits}-bit ADC ranking: {adc_order:?}");
+            eprintln!("{bits}-bit BF  ranking: {bf_order:?}");
+
+            // Top-1 should match
+            assert_eq!(adc_order[0], bf_order[0], "{bits}-bit: nearest neighbor mismatch");
+        }
+    }
+
+    #[test]
+    fn test_tq_l2_adc_multibit_budgeted_returns_max() {
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
+        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
+
+        fwht::init_fwht();
+        let dim = 768;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+
+        for bits in [1u8, 2, 3] {
+            let boundaries = scaled_boundaries_n(padded as u32, bits);
+            let centroids = scaled_centroids_n(padded as u32, bits);
+            let mut work = vec![0.0f32; padded];
+
+            let mut v = lcg_f32(dim, 99);
+            normalize(&mut v);
+            let code = encode_tq_mse_multibit(&v, &signs, &boundaries, bits, &mut work);
+
+            // Create a distant query
+            let v2: Vec<f32> = v.iter().map(|&x| -x).collect();
+            let mut q_rotated = vec![0.0f32; padded];
+            q_rotated[..dim].copy_from_slice(&v2);
+            fwht::fwht(&mut q_rotated, &signs);
+
+            // Use a tiny budget that will be exceeded
+            let dist = tq_l2_adc_multibit_budgeted(
+                &q_rotated, &code.codes, code.norm, &centroids, bits, 0.001,
+            );
+            assert_eq!(dist, f32::MAX, "{bits}-bit: budgeted should return MAX");
+        }
+    }
+
+    #[test]
+    fn test_brute_force_tq_adc_multibit_recall() {
+        use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+        use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
+        use crate::vector::turbo_quant::codebook::code_bytes_per_vector;
+        use crate::vector::types::DistanceMetric;
+        use std::sync::Arc;
+
+        fwht::init_fwht();
+        let n = 500;
+        let dim = 128;
+
+        for (bits, quant, min_recall) in [
+            // At 128d, FWHT concentration is weak. These thresholds reflect that.
+            // Higher dimensions (768d) achieve significantly better recall.
+            (1u8, QuantizationConfig::TurboQuant1, 0.25),
+            (2, QuantizationConfig::TurboQuant2, 0.40),
+            (3, QuantizationConfig::TurboQuant3, 0.60),
+        ] {
+            let collection = Arc::new(CollectionMetadata::new(
+                1, dim as u32, DistanceMetric::L2, quant, 42,
+            ));
+            let padded = collection.padded_dimension as usize;
+            let signs = collection.fwht_sign_flips.as_slice();
+            let boundaries = &collection.codebook_boundaries;
+            let code_len = code_bytes_per_vector(padded as u32, bits);
+            let bytes_per_code = code_len + 4;
+
+            let mut vectors = Vec::with_capacity(n);
+            let mut tq_buffer: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
+            let mut work = vec![0.0f32; padded];
+
+            for i in 0..n {
+                let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+                normalize(&mut v);
+                let code = encode_tq_mse_multibit(&v, signs, boundaries, bits, &mut work);
+                tq_buffer.extend_from_slice(&code.codes);
+                tq_buffer.extend_from_slice(&code.norm.to_le_bytes());
+                vectors.push(v);
+            }
+
+            let k = 10;
+            let num_queries = 30;
+            let mut total_recall = 0.0f64;
+
+            for qi in 0..num_queries {
+                let mut query = lcg_f32(dim, (qi * 31 + 997) as u32);
+                normalize(&mut query);
+
+                let mut true_dists: Vec<(f32, usize)> = vectors.iter().enumerate()
+                    .map(|(idx, v)| {
+                        let d: f32 = query.iter().zip(v.iter())
+                            .map(|(a, b)| { let diff = a - b; diff * diff })
+                            .sum();
+                        (d, idx)
+                    })
+                    .collect();
+                true_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let true_top_k: Vec<usize> = true_dists.iter().take(k).map(|&(_, id)| id).collect();
+
+                let results = brute_force_tq_adc_multibit(&query, &tq_buffer, n, &collection, k, bits);
+                let adc_top_k: Vec<usize> = results.iter().map(|r| r.id.0 as usize).collect();
+
+                let hits = adc_top_k.iter().filter(|id| true_top_k.contains(id)).count();
+                total_recall += hits as f64 / k as f64;
+            }
+
+            let avg_recall = total_recall / num_queries as f64;
+            eprintln!("{bits}-bit brute_force_tq_adc_multibit recall@{k}: {avg_recall:.4}");
+            assert!(
+                avg_recall >= min_recall,
+                "{bits}-bit recall@{k} = {avg_recall:.4}, expected >= {min_recall}"
+            );
+        }
+    }
 }

@@ -6,7 +6,7 @@
 //! Achieves 8x compression (768d f32 -> 512 bytes + 4 bytes norm)
 //! at <= 0.009 MSE distortion for unit vectors (Theorem 1).
 
-use super::codebook::{CENTROIDS, quantize_scalar, quantize_with_boundaries, quantize_with_boundaries_n, code_bytes_per_vector};
+use super::codebook::{CENTROIDS, quantize_scalar, quantize_with_boundaries, quantize_with_boundaries_n};
 use super::fwht;
 
 /// Encoded TurboQuant representation of a single vector.
