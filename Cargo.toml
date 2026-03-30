@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "dispatch_baseline"
 harness = false
+
+[[bench]]
+name = "pubsub_hotpath"
+harness = false

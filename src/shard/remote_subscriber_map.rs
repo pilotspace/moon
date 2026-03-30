@@ -69,17 +69,25 @@ impl RemoteSubscriberMap {
     }
 
     /// Return deduplicated set of all shard IDs that should receive a PUBLISH for `channel`.
+    ///
+    /// Uses a SmallVec + manual dedup to avoid HashSet heap allocation on the hot path.
     pub fn target_shards(&self, channel: &[u8]) -> Vec<usize> {
-        let mut result: HashSet<usize> = HashSet::new();
+        let mut result: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
         if let Some(shards) = self.channels.get(channel) {
-            result.extend(shards.iter());
+            result.extend(shards.iter().copied());
         }
-        for (pattern, shards) in &self.patterns {
-            if crate::command::key::glob_match(pattern, channel) {
-                result.extend(shards.iter());
+        if !self.patterns.is_empty() {
+            for (pattern, shards) in &self.patterns {
+                if crate::command::key::glob_match(pattern, channel) {
+                    for &s in shards {
+                        if !result.contains(&s) {
+                            result.push(s);
+                        }
+                    }
+                }
             }
         }
-        result.into_iter().collect()
+        result.into_vec()
     }
 }
 

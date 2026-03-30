@@ -146,8 +146,8 @@ pub async fn handle_connection_sharded_monoio<
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
     let mut subscriber_id: u64 = 0;
-    let mut pubsub_tx: Option<channel::MpscSender<Frame>> = None;
-    let mut pubsub_rx: Option<channel::MpscReceiver<Frame>> = None;
+    let mut pubsub_tx: Option<channel::MpscSender<bytes::Bytes>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<bytes::Bytes>> = None;
 
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
@@ -420,10 +420,8 @@ pub async fn handle_connection_sharded_monoio<
                 }
                 msg = rx.recv_async() => {
                     match msg {
-                        Ok(frame) => {
-                            let mut resp_buf = BytesMut::new();
-                            codec.encode_frame(&frame, &mut resp_buf);
-                            let data = resp_buf.freeze();
+                        Ok(data) => {
+                            // Data is pre-serialized RESP bytes — write directly
                             let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                             if result.is_err() { break; }
                         }
@@ -1034,7 +1032,7 @@ pub async fn handle_connection_sharded_monoio<
                 }
                 // Allocate pubsub channel if not yet created
                 if pubsub_tx.is_none() {
-                    let (tx, rx) = channel::mpsc_bounded(256);
+                    let (tx, rx) = channel::mpsc_bounded::<bytes::Bytes>(256);
                     pubsub_tx = Some(tx);
                     pubsub_rx = Some(rx);
                 }
