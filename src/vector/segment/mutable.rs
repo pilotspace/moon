@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
+use crate::vector::mvcc::visibility::is_visible;
 use crate::vector::types::{SearchResult, VectorId};
 
 /// Maximum byte size before a mutable segment is considered full (128 MB).
@@ -166,6 +167,98 @@ impl MutableSegment {
             .collect();
         // into_sorted_vec gives ascending order by our Ord (distance ascending)
         results
+    }
+
+    /// MVCC-aware brute-force search. Applies visibility filter per entry.
+    ///
+    /// When snapshot_lsn == 0 and my_txn_id == 0, behaves like non-transactional
+    /// search (backward compatible with existing code path).
+    ///
+    /// Zero additional allocations beyond the result SmallVec -- visibility check
+    /// is pure comparisons + bitmap lookup (no alloc).
+    pub fn brute_force_search_mvcc(
+        &self,
+        query_sq: &[i8],
+        k: usize,
+        allow_bitmap: Option<&RoaringBitmap>,
+        snapshot_lsn: u64,
+        my_txn_id: u64,
+        committed: &RoaringBitmap,
+    ) -> SmallVec<[SearchResult; 32]> {
+        let inner = self.inner.read();
+        let dim = inner.dimension as usize;
+        let l2_i8 = crate::vector::distance::table().l2_i8;
+
+        let mut heap: BinaryHeap<DistId> = BinaryHeap::with_capacity(k + 1);
+
+        for entry in &inner.entries {
+            // MVCC visibility replaces the simple delete_lsn != 0 check
+            if !is_visible(
+                entry.insert_lsn,
+                entry.delete_lsn,
+                entry.txn_id,
+                snapshot_lsn,
+                my_txn_id,
+                committed,
+            ) {
+                continue;
+            }
+            if let Some(bm) = allow_bitmap {
+                if !bm.contains(entry.internal_id) {
+                    continue;
+                }
+            }
+            let offset = entry.internal_id as usize * dim;
+            let vec_sq = &inner.vectors_sq[offset..offset + dim];
+            let dist = l2_i8(query_sq, vec_sq);
+
+            if heap.len() < k {
+                heap.push(DistId(dist, entry.internal_id));
+            } else if let Some(&DistId(worst, _)) = heap.peek() {
+                if dist < worst {
+                    heap.pop();
+                    heap.push(DistId(dist, entry.internal_id));
+                }
+            }
+        }
+
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|DistId(d, id)| SearchResult::new(d as f32, VectorId(id)))
+            .collect()
+    }
+
+    /// Append a vector within a transaction context. Sets txn_id on the entry.
+    pub fn append_transactional(
+        &self,
+        key_hash: u64,
+        vector_f32: &[f32],
+        vector_sq: &[i8],
+        norm: f32,
+        insert_lsn: u64,
+        txn_id: u64,
+    ) -> u32 {
+        let mut inner = self.inner.write();
+        let internal_id = inner.entries.len() as u32;
+        let vector_offset = (inner.vectors_sq.len() / inner.dimension as usize) as u32;
+
+        inner.vectors_f32.extend_from_slice(vector_f32);
+        inner.vectors_sq.extend_from_slice(vector_sq);
+
+        inner.entries.push(MutableEntry {
+            internal_id,
+            key_hash,
+            vector_offset,
+            norm,
+            insert_lsn,
+            delete_lsn: 0,
+            txn_id,
+        });
+
+        inner.byte_size +=
+            inner.dimension as usize * (1 + 4) + std::mem::size_of::<MutableEntry>();
+
+        internal_id
     }
 
     /// Returns true when the segment exceeds the 128 MB threshold.

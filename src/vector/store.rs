@@ -9,6 +9,7 @@ use bytes::Bytes;
 
 use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
+use crate::vector::mvcc::manager::TransactionManager;
 use crate::vector::segment::SegmentHolder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::padded_dimension;
@@ -48,6 +49,8 @@ pub struct VectorStore {
     indexes: HashMap<Bytes, VectorIndex>,
     /// Monotonically increasing collection ID counter.
     next_collection_id: u64,
+    /// Per-shard MVCC transaction manager.
+    txn_manager: TransactionManager,
 }
 
 impl VectorStore {
@@ -55,7 +58,20 @@ impl VectorStore {
         Self {
             indexes: HashMap::new(),
             next_collection_id: 1,
+            txn_manager: TransactionManager::new(),
         }
+    }
+
+    /// Read-only access to the transaction manager.
+    #[inline]
+    pub fn txn_manager(&self) -> &TransactionManager {
+        &self.txn_manager
+    }
+
+    /// Mutable access to the transaction manager.
+    #[inline]
+    pub fn txn_manager_mut(&mut self) -> &mut TransactionManager {
+        &mut self.txn_manager
     }
 
     /// Create a new index. Returns Err(&str) if index already exists.
