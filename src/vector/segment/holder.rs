@@ -11,10 +11,23 @@ use smallvec::SmallVec;
 
 use crate::vector::filter::selectivity::{select_strategy, FilterStrategy};
 use crate::vector::hnsw::search::SearchScratch;
-use crate::vector::types::SearchResult;
+use crate::vector::types::{SearchResult, VectorId};
 
 use super::immutable::ImmutableSegment;
-use super::mutable::MutableSegment;
+use super::mutable::{MutableEntry, MutableSegment};
+
+/// MVCC context for snapshot-isolated search. Passed by reference, zero allocation.
+pub struct MvccContext<'a> {
+    pub snapshot_lsn: u64,
+    pub my_txn_id: u64,
+    pub committed: &'a roaring::RoaringBitmap,
+    /// Dirty set: uncommitted entries from the active transaction.
+    /// Brute-force scanned and merged into results.
+    pub dirty_set: &'a [MutableEntry],
+    /// SQ vectors for dirty set entries (contiguous, dimension-strided).
+    pub dirty_vectors_sq: &'a [i8],
+    pub dimension: u32,
+}
 
 /// Snapshot of all segments at a point in time.
 pub struct SegmentList {
@@ -174,6 +187,86 @@ impl SegmentHolder {
             }
         }
     }
+
+    /// MVCC-aware fan-out search with dirty set merge.
+    ///
+    /// 1. Brute-force MVCC search on mutable segment (visibility filtered).
+    /// 2. HNSW search on immutable segments (immutable entries are committed by
+    ///    definition -- compacted only after commit. Visibility post-filter
+    ///    deferred until Phase 66 when delete_lsn tracking on immutable entries
+    ///    is added).
+    /// 3. Brute-force scan dirty_set entries (always visible -- own txn).
+    /// 4. Merge all results, take global top-k.
+    ///
+    /// When mvcc.snapshot_lsn == 0 and dirty_set is empty, this is equivalent
+    /// to the non-MVCC search path.
+    pub fn search_mvcc(
+        &self,
+        query_f32: &[f32],
+        query_sq: &[i8],
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        filter_bitmap: Option<&RoaringBitmap>,
+        mvcc: &MvccContext<'_>,
+    ) -> SmallVec<[SearchResult; 32]> {
+        let snapshot = self.load();
+
+        // 1. MVCC-aware brute-force on mutable segment
+        let mut all = snapshot.mutable.brute_force_search_mvcc(
+            query_sq,
+            k,
+            filter_bitmap,
+            mvcc.snapshot_lsn,
+            mvcc.my_txn_id,
+            mvcc.committed,
+        );
+
+        // 2. HNSW search on immutable segments.
+        // Immutable segment entries are committed by definition (compacted only
+        // after commit). No visibility post-filter needed for Phase 65.
+        for imm in &snapshot.immutable {
+            if filter_bitmap.is_some() {
+                all.extend(imm.search_filtered(
+                    query_f32,
+                    k,
+                    ef_search,
+                    scratch,
+                    filter_bitmap,
+                ));
+            } else {
+                all.extend(imm.search(query_f32, k, ef_search, scratch));
+            }
+        }
+
+        // 3. Brute-force scan dirty set entries (always visible -- own txn's writes).
+        if !mvcc.dirty_set.is_empty() {
+            let dim = mvcc.dimension as usize;
+            let l2_i8 = crate::vector::distance::table().l2_i8;
+
+            for (idx, entry) in mvcc.dirty_set.iter().enumerate() {
+                // Skip deleted dirty entries
+                if entry.delete_lsn != 0 {
+                    continue;
+                }
+                // Apply filter bitmap if present
+                if let Some(bm) = filter_bitmap {
+                    if !bm.contains(entry.internal_id) {
+                        continue;
+                    }
+                }
+                let offset = idx * dim;
+                let vec_sq = &mvcc.dirty_vectors_sq[offset..offset + dim];
+                let dist = l2_i8(query_sq, vec_sq);
+                all.push(SearchResult::new(dist as f32, VectorId(entry.internal_id)));
+            }
+        }
+
+        // 4. Merge all results, take global top-k
+        all.sort();
+        all.truncate(k);
+        all
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +420,7 @@ mod tests {
         let committed = roaring::RoaringBitmap::new();
 
         let non_mvcc = holder.search(&query_f32, &query_sq, 3, 64, &mut scratch);
-        let mvcc_ctx = super::holder::MvccContext {
+        let mvcc_ctx = super::MvccContext {
             snapshot_lsn: 0,
             my_txn_id: 0,
             committed: &committed,
@@ -359,7 +452,7 @@ mod tests {
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
-        let mvcc_ctx = super::holder::MvccContext {
+        let mvcc_ctx = super::MvccContext {
             snapshot_lsn: 5,
             my_txn_id: 99,
             committed: &committed,
@@ -389,7 +482,7 @@ mod tests {
         let committed = roaring::RoaringBitmap::new();
 
         // Dirty set has one entry close to query
-        let dirty_entry = super::mutable::MutableEntry {
+        let dirty_entry = crate::vector::segment::mutable::MutableEntry {
             internal_id: 1000,
             key_hash: 999,
             vector_offset: 0,
@@ -400,7 +493,7 @@ mod tests {
         };
         let dirty_sq = vec![0i8; dim]; // identical to query -> distance 0
 
-        let mvcc_ctx = super::holder::MvccContext {
+        let mvcc_ctx = super::MvccContext {
             snapshot_lsn: 10,
             my_txn_id: 42,
             committed: &committed,
@@ -434,7 +527,7 @@ mod tests {
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
 
-        let mvcc_empty = super::holder::MvccContext {
+        let mvcc_empty = super::MvccContext {
             snapshot_lsn: 10,
             my_txn_id: 99,
             committed: &committed,
@@ -445,7 +538,7 @@ mod tests {
         let r1 = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_empty);
 
         // Same with explicit empty dirty set
-        let mvcc_empty2 = super::holder::MvccContext {
+        let mvcc_empty2 = super::MvccContext {
             snapshot_lsn: 10,
             my_txn_id: 99,
             committed: &committed,

@@ -318,13 +318,26 @@ pub fn search_local_filtered(
         idx.payload_index.evaluate_bitmap(f, total)
     });
 
-    let results = idx.segments.search_filtered(
+    // Non-transactional reads use snapshot_lsn=0 (backward compatible).
+    // Empty committed bitmap is stack-allocated and never queried (short-circuit).
+    let empty_committed = roaring::RoaringBitmap::new();
+    let mvcc_ctx = crate::vector::segment::holder::MvccContext {
+        snapshot_lsn: 0,
+        my_txn_id: 0,
+        committed: &empty_committed,
+        dirty_set: &[],
+        dirty_vectors_sq: &[],
+        dimension: idx.meta.dimension,
+    };
+
+    let results = idx.segments.search_mvcc(
         &query_f32,
         &query_sq,
         k,
         ef_search,
         &mut idx.scratch,
         filter_bitmap.as_ref(),
+        &mvcc_ctx,
     );
     build_search_response(&results)
 }
