@@ -165,6 +165,7 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
+        let mut vs = crate::vector::store::VectorStore::new();
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
@@ -180,6 +181,7 @@ mod tests {
             &script_cache,
             &clock,
             &mut Vec::new(),
+            &mut vs,
         );
 
         let msg = rx.try_recv().expect("subscriber should receive message");
@@ -220,6 +222,7 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
+        let mut vs = crate::vector::store::VectorStore::new();
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
@@ -235,6 +238,7 @@ mod tests {
             &script_cache,
             &clock,
             &mut Vec::new(),
+            &mut vs,
         );
     }
 

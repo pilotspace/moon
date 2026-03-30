@@ -24,6 +24,9 @@ use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 
+use crate::command::vector_search;
+use crate::vector::store::VectorStore;
+
 use super::dispatch::ShardMessage;
 use super::shared_databases::ShardDatabases;
 
@@ -54,6 +57,7 @@ pub(crate) fn drain_spsc_shared(
         std::os::unix::io::RawFd,
         crate::server::conn::affinity::MigratedConnectionState,
     )>,
+    vector_store: &mut VectorStore,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -84,7 +88,9 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::MultiExecute { .. }
                         | ShardMessage::ExecuteSlotted { .. }
                         | ShardMessage::PipelineBatchSlotted { .. }
-                        | ShardMessage::MultiExecuteSlotted { .. } => {
+                        | ShardMessage::MultiExecuteSlotted { .. }
+                        | ShardMessage::VectorSearch { .. }
+                        | ShardMessage::VectorCommand { .. } => {
                             execute_batch.push(msg);
                         }
                         ShardMessage::MigrateConnection { fd, state } => {
@@ -118,6 +124,7 @@ pub(crate) fn drain_spsc_shared(
                 shard_id,
                 script_cache,
                 cached_clock,
+                vector_store,
             );
         }
     }
@@ -138,6 +145,7 @@ pub(crate) fn drain_spsc_shared(
             shard_id,
             script_cache,
             cached_clock,
+            vector_store,
         );
     }
 }
@@ -164,6 +172,7 @@ pub(crate) fn handle_shard_message_shared(
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
+    vector_store: &mut VectorStore,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -250,6 +259,16 @@ pub(crate) fn handle_shard_message_shared(
                                 );
                             }
                         }
+                    }
+                }
+
+                // Auto-index: if HSET succeeded and key matches a vector index prefix,
+                // extract the vector field and append to mutable segment.
+                if cmd.eq_ignore_ascii_case(b"HSET")
+                    && !matches!(frame, crate::protocol::Frame::Error(_))
+                {
+                    if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                        auto_index_hset(vector_store, key_bytes, args);
                     }
                 }
 
@@ -770,6 +789,19 @@ pub(crate) fn handle_shard_message_shared(
         } => {
             // Slot ownership is tracked in ClusterState, not per-shard.
         }
+        ShardMessage::VectorSearch {
+            index_name,
+            query_blob,
+            k,
+            reply_tx,
+        } => {
+            let response = vector_search::search_local(vector_store, &index_name, &query_blob, k);
+            let _ = reply_tx.send(response);
+        }
+        ShardMessage::VectorCommand { command, reply_tx } => {
+            let response = dispatch_vector_command(vector_store, &command);
+            let _ = reply_tx.send(response);
+        }
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
         }
@@ -794,6 +826,88 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::NewConnection(_) => {
             // NewConnection is handled via conn_rx, not SPSC
+        }
+    }
+}
+
+/// Dispatch FT.* commands to the appropriate vector_search handler.
+fn dispatch_vector_command(vector_store: &mut VectorStore, command: &crate::protocol::Frame) -> crate::protocol::Frame {
+    let (cmd, args) = match extract_command_static(command) {
+        Some(pair) => pair,
+        None => {
+            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR invalid command format",
+            ))
+        }
+    };
+
+    if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+        vector_search::ft_create(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+        vector_search::ft_search(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+        vector_search::ft_dropindex(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+        vector_search::ft_info(vector_store, args)
+    } else {
+        crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT command"))
+    }
+}
+
+/// After a successful HSET, check if the key matches any vector index prefix.
+/// If so, extract the vector field value, SQ-quantize, and append to mutable segment.
+///
+/// NOTE: Vec allocations here are acceptable because auto-indexing only fires when
+/// a key matches an index prefix (rare per-operation), and f32 decode + SQ encode
+/// is inherently O(dim) work. This is post-dispatch processing, not hot-path.
+fn auto_index_hset(
+    vector_store: &mut VectorStore,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+) {
+    let matching_names = vector_store.find_matching_index_names(key);
+    if matching_names.is_empty() {
+        return;
+    }
+
+    for idx_name in matching_names {
+        let idx = match vector_store.get_index_mut(&idx_name) {
+            Some(i) => i,
+            None => continue,
+        };
+        let source_field = idx.meta.source_field.clone();
+        let dim = idx.meta.dimension as usize;
+
+        // Find the source field in HSET args: args[0]=key, args[1]=field1, args[2]=val1, ...
+        let mut i = 1;
+        while i + 1 < args.len() {
+            if let crate::protocol::Frame::BulkString(field) = &args[i] {
+                if field.eq_ignore_ascii_case(&source_field) {
+                    if let crate::protocol::Frame::BulkString(blob) = &args[i + 1] {
+                        if blob.len() == dim * 4 {
+                            // Decode f32 from blob
+                            let mut f32_vec = Vec::with_capacity(dim);
+                            for chunk in blob.chunks_exact(4) {
+                                f32_vec.push(f32::from_le_bytes([
+                                    chunk[0], chunk[1], chunk[2], chunk[3],
+                                ]));
+                            }
+                            // SQ quantize
+                            let mut sq_vec = vec![0i8; dim];
+                            vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
+                            // Compute norm
+                            let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            // Key hash for the entry
+                            let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+                            // Append to mutable segment
+                            let snap = idx.segments.load();
+                            snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+                        }
+                    }
+                    break;
+                }
+            }
+            i += 2;
         }
     }
 }

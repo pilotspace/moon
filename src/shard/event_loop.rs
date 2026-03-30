@@ -303,6 +303,12 @@ impl super::Shard {
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
+        // Per-shard VectorStore: directly owned by shard thread, same pattern as PubSubRegistry.
+        let mut vector_store = std::mem::replace(
+            &mut self.vector_store,
+            crate::vector::store::VectorStore::new(),
+        );
+
         // Pending wakers for monoio cross-shard write dispatch.
         // monoio's !Send single-threaded executor doesn't see cross-thread Waker::wake()
         // from flume oneshot channels. Connection tasks register their waker here; the
@@ -391,7 +397,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations,
+                        &mut pending_migrations, &mut vector_store,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
@@ -437,7 +443,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations,
+                        &mut pending_migrations, &mut vector_store,
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
@@ -603,7 +609,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations,
+                        &mut pending_migrations, &mut vector_store,
                     );
                     // Wake connection tasks waiting for cross-shard write responses.
                     // They'll try_recv() — if the response arrived, proceed; otherwise re-register.
@@ -655,7 +661,7 @@ impl super::Shard {
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations,
+                        &mut pending_migrations, &mut vector_store,
                     );
                     // Wake connection tasks waiting for cross-shard write responses.
                     for waker in pending_wakers.borrow_mut().drain(..) {
