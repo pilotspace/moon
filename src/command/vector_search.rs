@@ -362,6 +362,10 @@ pub fn search_local_filtered(
     for chunk in query_blob.chunks_exact(4) {
         query_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
+
+    // Auto-compact mutable → HNSW if threshold reached (lazy, first search only).
+    idx.try_compact();
+
     // Higher ef compensates for TQ-4bit quantization distortion in HNSW beam search.
     // TQ-ADC fetches ef candidates, f32 reranking selects top-k with exact distances.
     let ef_search = (k * 10).max(200).min(500);

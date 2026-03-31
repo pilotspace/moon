@@ -62,15 +62,13 @@ impl VectorIndex {
     /// should be moved to a background task with async notification.
     pub fn try_compact(&mut self) {
         let mutable_len;
-        let has_immutable;
         {
             let snapshot = self.segments.load();
             mutable_len = snapshot.mutable.len();
-            has_immutable = !snapshot.immutable.is_empty();
         } // drop snapshot guard before freeze/compact
 
-        // Only compact if: enough vectors AND no immutable segments yet
-        if mutable_len < COMPACT_THRESHOLD || has_immutable {
+        // Only compact if enough vectors accumulated
+        if mutable_len < COMPACT_THRESHOLD {
             return;
         }
 
@@ -85,7 +83,10 @@ impl VectorIndex {
                 let padded = self.collection.padded_dimension;
                 self.scratch = SearchScratch::new(num_nodes, padded);
 
-                // Swap: empty mutable + new immutable
+                // Swap: empty mutable + append new immutable to existing list
+                let old = self.segments.load();
+                let mut imm_list = old.immutable.clone();
+                imm_list.push(Arc::new(immutable));
                 let new_list = SegmentList {
                     mutable: Arc::new(
                         crate::vector::segment::mutable::MutableSegment::new(
@@ -93,8 +94,8 @@ impl VectorIndex {
                             self.collection.clone(),
                         ),
                     ),
-                    immutable: vec![Arc::new(immutable)],
-                    ivf: Vec::new(),
+                    immutable: imm_list,
+                    ivf: old.ivf.clone(),
                 };
                 self.segments.swap(new_list);
             }
