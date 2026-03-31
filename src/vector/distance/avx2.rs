@@ -14,7 +14,7 @@ use core::arch::x86_64::*;
 /// Reduces 8 floats to a single scalar: extract high 128, add to low 128,
 /// then shuffle-add within the remaining 4 lanes.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
     // SAFETY: Caller guarantees AVX2 is available via target_feature.
@@ -30,7 +30,7 @@ unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
 
 /// Horizontal sum of 8 packed i32 lanes in a `__m256i`.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
     // SAFETY: Caller guarantees AVX2 is available via target_feature.
