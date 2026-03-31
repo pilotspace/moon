@@ -80,7 +80,11 @@ impl SubCentroidTable {
 
             // Bin boundaries (raw, unscaled)
             let lo_bound = if k == 0 { -6.0 } else { raw_boundaries[k - 1] };
-            let hi_bound = if k == n_centroids - 1 { 6.0 } else { raw_boundaries[k] };
+            let hi_bound = if k == n_centroids - 1 {
+                6.0
+            } else {
+                raw_boundaries[k]
+            };
 
             // Lower sub-bin: [lo_bound, c_k)
             let lower_sub = conditional_mean_n01(lo_bound, c_k);
@@ -91,7 +95,11 @@ impl SubCentroidTable {
             table[k * 2 + 1] = upper_sub * sigma;
         }
 
-        Self { table, bits, padded_dim }
+        Self {
+            table,
+            bits,
+            padded_dim,
+        }
     }
 
     /// Look up sub-centroid value for a given index and sign bit.
@@ -147,11 +155,9 @@ fn std_normal_cdf(x: f64) -> f64 {
 /// Complementary error function approximation (Abramowitz & Stegun 7.1.26).
 fn erfc_approx(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.3275911 * x.abs());
-    let poly = t * (0.254829592
-        + t * (-0.284496736
-            + t * (1.421413741
-                + t * (-1.453152027
-                    + t * 1.061405429))));
+    let poly = t
+        * (0.254829592
+            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
     let result = poly * (-x * x).exp();
     if x >= 0.0 { result } else { 2.0 - result }
 }
@@ -240,7 +246,11 @@ pub fn encode_tq_sign(
     // Step 6: Nibble pack indices
     let codes = nibble_pack(&indices);
 
-    TqSignCode { codes, sign_bits, norm }
+    TqSignCode {
+        codes,
+        sign_bits,
+        norm,
+    }
 }
 
 /// Encode with generic bit width (1-4 bit) + sign bits.
@@ -305,7 +315,11 @@ pub fn encode_tq_sign_multibit(
         _ => panic!("unsupported bit width: {bits}"),
     };
 
-    TqSignCode { codes, sign_bits, norm }
+    TqSignCode {
+        codes,
+        sign_bits,
+        norm,
+    }
 }
 
 // ── Asymmetric Distance with Sub-Centroid ───────────────────────────
@@ -479,7 +493,10 @@ impl AdcLut {
             }
         }
 
-        Self { distances, n_entries }
+        Self {
+            distances,
+            n_entries,
+        }
     }
 
     /// Build LUT for standard (non-sub-centroid) 4-bit ADC.
@@ -499,7 +516,10 @@ impl AdcLut {
             }
         }
 
-        Self { distances, n_entries }
+        Self {
+            distances,
+            n_entries,
+        }
     }
 
     /// Score using LUT with sub-centroid sign bits (4-bit).
@@ -573,7 +593,9 @@ pub fn total_bytes_per_vector(padded_dim: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::turbo_quant::codebook::{scaled_boundaries, scaled_centroids, RAW_CENTROIDS};
+    use crate::vector::turbo_quant::codebook::{
+        RAW_CENTROIDS, scaled_boundaries, scaled_centroids,
+    };
     use crate::vector::turbo_quant::encoder::padded_dimension;
     use crate::vector::turbo_quant::fwht;
 
@@ -601,7 +623,8 @@ mod tests {
         let mut signs = Vec::with_capacity(dim);
         let mut s = seed;
         for _ in 0..dim {
-            s = s.wrapping_mul(6_364_136_223_846_793_005)
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
             signs.push(if (s >> 63) == 0 { 1.0f32 } else { -1.0 });
         }
@@ -642,7 +665,7 @@ mod tests {
 
         // Each sub-centroid should lie within its bin
         for k in 0..16usize {
-            let lo = table.table[k * 2];     // lower sub-centroid
+            let lo = table.table[k * 2]; // lower sub-centroid
             let hi = table.table[k * 2 + 1]; // upper sub-centroid
             let centroid = RAW_CENTROIDS[k] * sigma;
 
@@ -744,7 +767,10 @@ mod tests {
             let code = encode_tq_sign(&v, &sign_flips, &boundaries, &centroids_arr, &mut work);
             // Also encode standard TQ for comparison
             let std_code = crate::vector::turbo_quant::encoder::encode_tq_mse_scaled(
-                &v, &sign_flips, &boundaries, &mut work,
+                &v,
+                &sign_flips,
+                &boundaries,
+                &mut work,
             );
             db_codes.push(std_code);
             db_sign_codes.push(code);
@@ -765,12 +791,17 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                    let d: f32 = query
+                        .iter()
+                        .zip(v.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum();
                     (d, i)
                 })
                 .collect();
             gt_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            let gt_set: std::collections::HashSet<usize> = gt_dists[..k].iter().map(|(_, i)| *i).collect();
+            let gt_set: std::collections::HashSet<usize> =
+                gt_dists[..k].iter().map(|(_, i)| *i).collect();
 
             // Prepare rotated query
             let mut q_rot = vec![0.0f32; padded];
@@ -794,7 +825,8 @@ mod tests {
                 })
                 .collect();
             std_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            let std_set: std::collections::HashSet<usize> = std_dists[..k].iter().map(|(_, i)| *i).collect();
+            let std_set: std::collections::HashSet<usize> =
+                std_dists[..k].iter().map(|(_, i)| *i).collect();
 
             // Sign-bit sub-centroid distances
             let mut sign_dists: Vec<(f32, usize)> = db_sign_codes
@@ -806,7 +838,8 @@ mod tests {
                 })
                 .collect();
             sign_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            let sign_set: std::collections::HashSet<usize> = sign_dists[..k].iter().map(|(_, i)| *i).collect();
+            let sign_set: std::collections::HashSet<usize> =
+                sign_dists[..k].iter().map(|(_, i)| *i).collect();
 
             let std_recall = gt_set.intersection(&std_set).count() as f64 / k as f64;
             let sign_recall = gt_set.intersection(&sign_set).count() as f64 / k as f64;
@@ -883,7 +916,10 @@ mod tests {
         let mut vec = lcg_f32(dim, 77);
         normalize(&mut vec);
         let code = crate::vector::turbo_quant::encoder::encode_tq_mse_scaled(
-            &vec, &sign_flips, &boundaries, &mut work,
+            &vec,
+            &sign_flips,
+            &boundaries,
+            &mut work,
         );
 
         let mut query = lcg_f32(dim, 12345);
@@ -943,7 +979,12 @@ mod tests {
 
         // Large budget: should return same score
         let large = tq_sign_l2_adc_budgeted(
-            &q_rot, &code.codes, &code.sign_bits, code.norm, &sub_table, full + 1.0,
+            &q_rot,
+            &code.codes,
+            &code.sign_bits,
+            code.norm,
+            &sub_table,
+            full + 1.0,
         );
         assert!(
             (full - large).abs() < 1e-4,
@@ -952,7 +993,12 @@ mod tests {
 
         // Small budget: should early-terminate
         let small = tq_sign_l2_adc_budgeted(
-            &q_rot, &code.codes, &code.sign_bits, code.norm, &sub_table, full * 0.01,
+            &q_rot,
+            &code.codes,
+            &code.sign_bits,
+            code.norm,
+            &sub_table,
+            full * 0.01,
         );
         assert_eq!(small, f32::MAX, "should early-terminate with tiny budget");
     }
@@ -981,7 +1027,10 @@ mod tests {
         assert!(mean < 0.0 && mean > -0.15, "center lo sub: {mean:.6}");
 
         let mean_hi = conditional_mean_n01(0.0, 0.15205);
-        assert!(mean_hi > 0.0 && mean_hi < 0.15, "center hi sub: {mean_hi:.6}");
+        assert!(
+            mean_hi > 0.0 && mean_hi < 0.15,
+            "center hi sub: {mean_hi:.6}"
+        );
     }
 
     #[test]

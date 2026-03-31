@@ -23,7 +23,10 @@ const POST_FILTER_SELECTIVITY: f64 = 0.80;
 /// - <2% (or <20K matches): BruteForceFiltered
 /// - 2%-80%: HnswFiltered (ACORN 2-hop)
 /// - >80%: HnswPostFilter (3x oversampling)
-pub fn select_strategy(filter_bitmap: Option<&RoaringBitmap>, total_vectors: u32) -> FilterStrategy {
+pub fn select_strategy(
+    filter_bitmap: Option<&RoaringBitmap>,
+    total_vectors: u32,
+) -> FilterStrategy {
     let bitmap = match filter_bitmap {
         None => return FilterStrategy::Unfiltered,
         Some(bm) => bm,

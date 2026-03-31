@@ -9,12 +9,12 @@ use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
-use crate::vector::filter::selectivity::{select_strategy, FilterStrategy};
+use crate::vector::filter::selectivity::{FilterStrategy, select_strategy};
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::segment::ivf::IvfSegment;
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::turbo_quant::fwht;
-use crate::vector::types::{SearchResult, VectorId};
+use crate::vector::types::SearchResult;
 
 use super::immutable::ImmutableSegment;
 use super::mutable::{MutableEntry, MutableSegment};
@@ -48,7 +48,10 @@ pub struct SegmentHolder {
 
 impl SegmentHolder {
     /// Create a holder with a fresh MutableSegment and empty immutable list.
-    pub fn new(dimension: u32, collection: Arc<crate::vector::turbo_quant::collection::CollectionMetadata>) -> Self {
+    pub fn new(
+        dimension: u32,
+        collection: Arc<crate::vector::turbo_quant::collection::CollectionMetadata>,
+    ) -> Self {
         Self {
             segments: ArcSwap::from_pointee(SegmentList {
                 mutable: Arc::new(MutableSegment::new(dimension, collection)),
@@ -123,48 +126,71 @@ impl SegmentHolder {
         // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
         let collection = snapshot.mutable.collection();
         let query_state = if !collection.qjl_matrices.is_empty() {
-            Some(crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                query_f32,
-                &collection.qjl_matrices,
-                collection.fwht_sign_flips.as_slice(),
-                collection.padded_dimension as usize,
-            ))
+            Some(
+                crate::vector::turbo_quant::inner_product::prepare_query_prod(
+                    query_f32,
+                    &collection.qjl_matrices,
+                    collection.fwht_sign_flips.as_slice(),
+                    collection.padded_dimension as usize,
+                ),
+            )
         } else {
             None // Light mode: no QJL matrices, use TQ-ADC brute force
         };
 
         match strategy {
             FilterStrategy::Unfiltered => {
-                all.extend(snapshot.mutable.brute_force_search(query_f32, query_state.as_ref(), k));
+                all.extend(
+                    snapshot
+                        .mutable
+                        .brute_force_search(query_f32, query_state.as_ref(), k),
+                );
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, ef_search, _scratch));
                 }
             }
             FilterStrategy::BruteForceFiltered => {
-                all.extend(snapshot
-                    .mutable
-                    .brute_force_search_filtered(query_f32, query_state.as_ref(), k, filter_bitmap));
+                all.extend(snapshot.mutable.brute_force_search_filtered(
+                    query_f32,
+                    query_state.as_ref(),
+                    k,
+                    filter_bitmap,
+                ));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
-                        query_f32, k, ef_search, _scratch, filter_bitmap,
+                        query_f32,
+                        k,
+                        ef_search,
+                        _scratch,
+                        filter_bitmap,
                     ));
                 }
             }
             FilterStrategy::HnswFiltered => {
-                all.extend(snapshot
-                    .mutable
-                    .brute_force_search_filtered(query_f32, query_state.as_ref(), k, filter_bitmap));
+                all.extend(snapshot.mutable.brute_force_search_filtered(
+                    query_f32,
+                    query_state.as_ref(),
+                    k,
+                    filter_bitmap,
+                ));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
-                        query_f32, k, ef_search, _scratch, filter_bitmap,
+                        query_f32,
+                        k,
+                        ef_search,
+                        _scratch,
+                        filter_bitmap,
                     ));
                 }
             }
             FilterStrategy::HnswPostFilter => {
                 let oversample_k = k * 3;
-                all.extend(snapshot
-                    .mutable
-                    .brute_force_search_filtered(query_f32, query_state.as_ref(), oversample_k, filter_bitmap));
+                all.extend(snapshot.mutable.brute_force_search_filtered(
+                    query_f32,
+                    query_state.as_ref(),
+                    oversample_k,
+                    filter_bitmap,
+                ));
                 for imm in &snapshot.immutable {
                     let imm_results = imm.search(
                         query_f32,
@@ -259,11 +285,14 @@ impl SegmentHolder {
         // Prepare TurboQuant_prod query state for mutable search.
         let collection = snapshot.mutable.collection();
         let query_state = if !collection.qjl_matrices.is_empty() {
-            Some(crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                query_f32, &collection.qjl_matrices,
-                collection.fwht_sign_flips.as_slice(),
-                collection.padded_dimension as usize,
-            ))
+            Some(
+                crate::vector::turbo_quant::inner_product::prepare_query_prod(
+                    query_f32,
+                    &collection.qjl_matrices,
+                    collection.fwht_sign_flips.as_slice(),
+                    collection.padded_dimension as usize,
+                ),
+            )
         } else {
             None
         };
@@ -284,13 +313,7 @@ impl SegmentHolder {
         // after commit). No visibility post-filter needed for Phase 65.
         for imm in &snapshot.immutable {
             if filter_bitmap.is_some() {
-                all.extend(imm.search_filtered(
-                    query_f32,
-                    k,
-                    ef_search,
-                    _scratch,
-                    filter_bitmap,
-                ));
+                all.extend(imm.search_filtered(query_f32, k, ef_search, _scratch, filter_bitmap));
             } else {
                 all.extend(imm.search(query_f32, k, ef_search, _scratch));
             }
@@ -358,7 +381,11 @@ mod tests {
     fn make_test_collection(dim: u32) -> Arc<CollectionMetadata> {
         // Use Exact mode in tests to preserve TQ_prod scoring compatibility
         Arc::new(CollectionMetadata::with_build_mode(
-            1, dim, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            dim,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
             crate::vector::turbo_quant::collection::BuildMode::Exact,
         ))
     }
@@ -381,7 +408,9 @@ mod tests {
         let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
         if q_norm > 0.0 {
             let inv = 1.0 / q_norm;
-            for v in q_rot[..dim].iter_mut() { *v *= inv; }
+            for v in q_rot[..dim].iter_mut() {
+                *v *= inv;
+            }
         }
         crate::vector::turbo_quant::fwht::fwht(&mut q_rot, collection.fwht_sign_flips.as_slice());
         q_rot
@@ -404,8 +433,7 @@ mod tests {
         // Insert into original mutable
         {
             let snap = holder.load();
-            snap.mutable
-                .append(1, &[0.0f32; 128], &[0i8; 128], 1.0, 1);
+            snap.mutable.append(1, &[0.0f32; 128], &[0i8; 128], 1.0, 1);
         }
 
         // Swap with a new list
@@ -436,15 +464,13 @@ mod tests {
             for i in 0..5u32 {
                 let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable
-                    .append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
             }
         }
 
         let query_sq = make_sq_vector(dim, 1); // same as vector 0
         let query_f32 = vec![0.0f32; dim];
-        let mut scratch =
-            crate::vector::hnsw::search::SearchScratch::new(0, 128);
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
         let results = holder.search(&query_f32, 3, 64, &mut scratch);
         assert!(!results.is_empty());
@@ -505,7 +531,11 @@ mod tests {
 
         let results = holder.search_filtered(&query_f32, 3, 64, &mut scratch, Some(&bitmap));
         for r in &results {
-            assert!(bitmap.contains(r.id.0), "result id {} not in bitmap", r.id.0);
+            assert!(
+                bitmap.contains(r.id.0),
+                "result id {} not in bitmap",
+                r.id.0
+            );
         }
     }
 
@@ -588,7 +618,8 @@ mod tests {
         {
             let snap = holder.load();
             // One existing entry far from query (f32 L2 distance)
-            snap.mutable.append(0, &[100.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
+            snap.mutable
+                .append(0, &[100.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
         }
         let query_sq = vec![0i8; dim];
         let query_f32 = vec![0.0f32; dim];
@@ -719,9 +750,7 @@ mod tests {
     #[test]
     fn test_holder_search_with_ivf() {
         use crate::vector::aligned_buffer::AlignedBuffer;
-        use crate::vector::segment::ivf::{
-            self, IvfQuantization, IvfSegment,
-        };
+        use crate::vector::segment::ivf::{self, IvfQuantization, IvfSegment};
 
         distance::init();
         let dim = 8usize;
@@ -731,7 +760,9 @@ mod tests {
         // Create sign flips.
         let mut sign_flips = vec![1.0f32; pdim];
         for (i, s) in sign_flips.iter_mut().enumerate() {
-            if i % 3 == 0 { *s = -1.0; }
+            if i % 3 == 0 {
+                *s = -1.0;
+            }
         }
 
         // Build a small IVF segment with 20 vectors, 2 clusters.
@@ -746,7 +777,9 @@ mod tests {
 
         for i in 0..n {
             let offset = if i < n / 2 { 0.0 } else { 5.0 };
-            let v: Vec<f32> = (0..dim).map(|d| offset + (i * dim + d) as f32 * 0.01).collect();
+            let v: Vec<f32> = (0..dim)
+                .map(|d| offset + (i * dim + d) as f32 * 0.01)
+                .collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             norms.push(if norm > 0.0 { norm } else { 1.0 });
             vectors.extend_from_slice(&v);
@@ -754,7 +787,13 @@ mod tests {
         }
 
         let ivf_seg = ivf::build_ivf_segment(
-            &vectors, &tq_codes, &norms, &ids, dim, n_clusters, &sign_flips,
+            &vectors,
+            &tq_codes,
+            &norms,
+            &ids,
+            dim,
+            n_clusters,
+            &sign_flips,
         );
 
         assert_eq!(ivf_seg.total_vectors(), n as u64);
@@ -795,6 +834,9 @@ mod tests {
         let ivf_count = results.iter().filter(|r| r.id.0 >= 1000).count();
         // And mutable results (ids < 5).
         let mut_count = results.iter().filter(|r| r.id.0 < 5).count();
-        assert!(ivf_count > 0 || mut_count > 0, "should have results from both segments");
+        assert!(
+            ivf_count > 0 || mut_count > 0,
+            "should have results from both segments"
+        );
     }
 }

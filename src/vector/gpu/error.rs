@@ -46,10 +46,9 @@ impl fmt::Display for GpuBuildError {
                 f,
                 "GPU out of memory: requested {requested} bytes, {available} bytes available"
             ),
-            Self::RecallBelowThreshold { actual, threshold } => write!(
-                f,
-                "recall {actual:.4} below threshold {threshold:.4}"
-            ),
+            Self::RecallBelowThreshold { actual, threshold } => {
+                write!(f, "recall {actual:.4} below threshold {threshold:.4}")
+            }
             Self::KernelLaunchFailed(msg) => write!(f, "kernel launch failed: {msg}"),
             Self::SynchronizationFailed(msg) => write!(f, "device sync failed: {msg}"),
         }

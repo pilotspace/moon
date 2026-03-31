@@ -3,12 +3,12 @@
 //! Validates baseline performance: build throughput and search QPS
 //! at dimensions (128d) and scales (1K, 5K, 10K).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use moon::vector::distance;
 use moon::vector::hnsw::build::HnswBuilder;
-use moon::vector::hnsw::search::{hnsw_search, SearchScratch};
+use moon::vector::hnsw::search::{SearchScratch, hnsw_search};
 use moon::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use moon::vector::turbo_quant::encoder::{encode_tq_mse, padded_dimension};
 use moon::vector::types::DistanceMetric;
@@ -36,8 +36,13 @@ fn build_test_graph(
     CollectionMetadata,
 ) {
     let padded = padded_dimension(dim as u32) as usize;
-    let collection =
-        CollectionMetadata::new(1, dim as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42);
+    let collection = CollectionMetadata::new(
+        1,
+        dim as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+    );
 
     // Generate and encode all vectors
     let mut tq_codes: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
@@ -46,7 +51,11 @@ fn build_test_graph(
 
     for i in 0..n {
         let vec_f32 = make_f32_vector(dim, i * 7 + 13);
-        let tq = encode_tq_mse(&vec_f32, collection.fwht_sign_flips.as_slice(), &mut work_buf);
+        let tq = encode_tq_mse(
+            &vec_f32,
+            collection.fwht_sign_flips.as_slice(),
+            &mut work_buf,
+        );
         tq_codes.push(tq.codes);
         tq_norms.push(tq.norm);
     }
@@ -58,7 +67,10 @@ fn build_test_graph(
         builder.insert(|a, b| {
             let va = &vecs[a as usize];
             let vb = &vecs[b as usize];
-            va.iter().zip(vb.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+            va.iter()
+                .zip(vb.iter())
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum()
         });
     }
 
@@ -103,7 +115,10 @@ fn bench_hnsw_build(c: &mut Criterion) {
                     builder.insert(|a, b| {
                         let va = &vecs[a as usize];
                         let vb = &vecs[b as usize];
-                        va.iter().zip(vb.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+                        va.iter()
+                            .zip(vb.iter())
+                            .map(|(x, y)| (x - y) * (x - y))
+                            .sum()
                     });
                 }
                 black_box(builder.build(bytes_per_code))
@@ -179,7 +194,9 @@ fn bench_hnsw_build_768d(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(30));
 
     for &n in SCALES_768 {
-        let vecs: Vec<Vec<f32>> = (0..n).map(|i| make_f32_vector(DIM_768, i * 7 + 13)).collect();
+        let vecs: Vec<Vec<f32>> = (0..n)
+            .map(|i| make_f32_vector(DIM_768, i * 7 + 13))
+            .collect();
         let padded = padded_dimension(DIM_768 as u32) as usize;
         let bytes_per_code = (padded / 2 + 4) as u32;
 
@@ -190,7 +207,10 @@ fn bench_hnsw_build_768d(c: &mut Criterion) {
                     builder.insert(|a, b| {
                         let va = &vecs[a as usize];
                         let vb = &vecs[b as usize];
-                        va.iter().zip(vb.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+                        va.iter()
+                            .zip(vb.iter())
+                            .map(|(x, y)| (x - y) * (x - y))
+                            .sum()
                     });
                 }
                 black_box(builder.build(bytes_per_code))

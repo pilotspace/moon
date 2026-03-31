@@ -637,6 +637,57 @@ fn err_unknown(cmd: &[u8]) -> Frame {
 /// Takes `&Database` (immutable) and `now_ms` for expiry checks.
 /// Only called for commands where `metadata::is_read()` returns true.
 /// Uses (length, first_byte) dispatch for O(1) lookup.
+/// Coarse prefilter: check whether a command *might* be handled by `dispatch_read()`.
+///
+/// Matches on `(command_length, first_byte_lowercase)` buckets — the same O(1)
+/// two-level dispatch pattern used by `dispatch_read()`. Because multiple commands
+/// share a `(len, b0)` bucket (e.g. `(4, b'h')` covers both HGET and HLEN),
+/// this returns `true` for any command in a bucket that contains at least one
+/// read command. The definitive exact-match check is performed inside
+/// `dispatch_read()` itself via `eq_ignore_ascii_case`.
+///
+/// Used by the connection handler to avoid acquiring a read lock on the shared
+/// database when the command definitely cannot be a shared-read.
+pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
+    let len = cmd.len();
+    if len == 0 {
+        return false;
+    }
+    let b0 = cmd[0] | 0x20;
+    matches!(
+        (len, b0),
+        (3, b'g')  // GET
+        | (3, b't')  // TTL
+        | (4, b'e')  // ECHO
+        | (4, b'h')  // HGET, HLEN
+        | (4, b'i')  // INFO
+        | (4, b'k')  // KEYS
+        | (4, b'l')  // LLEN, LPOS
+        | (4, b'm')  // MGET
+        | (4, b'p')  // PTTL, PING
+        | (4, b's')  // SCAN
+        | (4, b't')  // TYPE
+        | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
+        | (5, b's')  // SCARD, SDIFF, SSCAN
+        | (5, b'z')  // ZCARD, ZRANK, ZSCAN
+        | (6, b'e')  // EXISTS
+        | (6, b'l')  // LRANGE, LINDEX
+        | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
+        | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
+        | (7, b'c')  // COMMAND
+        | (7, b'h')  // HGETALL, HEXISTS
+        | (8, b'g')  // GETRANGE
+        | (8, b's')  // SMEMBERS
+        | (8, b'z')  // ZREVRANK
+        | (9, b's')  // SISMEMBER
+        | (9, b'z')  // ZREVRANGE, ZLEXCOUNT
+        | (10, b's') // SMISMEMBER
+        | (11, b's') // SRANDMEMBER
+        | (13, b'z') // ZRANGEBYSCORE
+        | (16, b'z') // ZREVRANGEBYSCORE
+    )
+}
+
 pub fn dispatch_read(
     db: &Database,
     cmd: &[u8],
@@ -1291,6 +1342,112 @@ mod tests {
         match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
             DispatchResult::Response(Frame::Error(_)) => {}
             _ => panic!("Expected Error response"),
+        }
+    }
+
+    #[test]
+    fn test_is_dispatch_read_supported_known_reads() {
+        // Commands that dispatch_read() handles — prefilter must return true.
+        for cmd in &[
+            b"GET" as &[u8],
+            b"get",
+            b"TTL",
+            b"MGET",
+            b"KEYS",
+            b"SCAN",
+            b"TYPE",
+            b"HGET",
+            b"HLEN",
+            b"HMGET",
+            b"HKEYS",
+            b"HVALS",
+            b"HSCAN",
+            b"HGETALL",
+            b"HEXISTS",
+            b"SCARD",
+            b"SDIFF",
+            b"SSCAN",
+            b"SINTER",
+            b"SUNION",
+            b"STRLEN",
+            b"SUBSTR",
+            b"SMEMBERS",
+            b"SISMEMBER",
+            b"SMISMEMBER",
+            b"SRANDMEMBER",
+            b"ZCARD",
+            b"ZRANK",
+            b"ZSCAN",
+            b"ZSCORE",
+            b"ZRANGE",
+            b"ZCOUNT",
+            b"ZREVRANK",
+            b"ZREVRANGE",
+            b"ZLEXCOUNT",
+            b"ZRANGEBYSCORE",
+            b"ZREVRANGEBYSCORE",
+            b"LLEN",
+            b"LRANGE",
+            b"LINDEX",
+            b"PTTL",
+            b"PING",
+            b"ECHO",
+            b"INFO",
+            b"EXISTS",
+            b"GETRANGE",
+            b"COMMAND",
+        ] {
+            assert!(
+                is_dispatch_read_supported(cmd),
+                "{} should be supported",
+                std::str::from_utf8(cmd).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_dispatch_read_supported_non_reads() {
+        // Write commands and unknown commands — prefilter must return false.
+        for cmd in &[
+            b"SET" as &[u8],
+            b"DEL",
+            b"RPUSH",
+            b"LPUSH",
+            b"UNKNOWN",
+            b"",
+            b"X",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            b"BGSAVE",
+            b"WAIT",
+            b"OBJECT",
+            b"RANDOMKEY",
+        ] {
+            assert!(
+                !is_dispatch_read_supported(cmd),
+                "{} should NOT be supported",
+                std::str::from_utf8(cmd).unwrap_or("<empty>")
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_read_parity_with_prefilter() {
+        // For commands the prefilter accepts, dispatch_read must not panic.
+        let db = Database::new();
+        let now_ms = 0u64;
+        for cmd in &[
+            b"GET" as &[u8],
+            b"HGET",
+            b"SCARD",
+            b"ZRANK",
+            b"LLEN",
+            b"GETRANGE",
+        ] {
+            assert!(is_dispatch_read_supported(cmd));
+            // dispatch_read returns Frame — should not panic, even without args.
+            let mut selected = 0usize;
+            let _result = dispatch_read(&db, cmd, &[], now_ms, &mut selected, 16);
         }
     }
 }

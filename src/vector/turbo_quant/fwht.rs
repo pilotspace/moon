@@ -20,7 +20,10 @@ use std::sync::OnceLock;
 #[inline]
 pub fn fwht_scalar(data: &mut [f32]) {
     let n = data.len();
-    debug_assert!(n.is_power_of_two(), "FWHT requires power-of-2 length, got {n}");
+    debug_assert!(
+        n.is_power_of_two(),
+        "FWHT requires power-of-2 length, got {n}"
+    );
     let mut h = 1;
     while h < n {
         let mut i = 0;
@@ -307,9 +310,17 @@ mod tests {
         let mut data = [1.0f32, 1.0, 1.0, 1.0];
         let signs = ones(4);
         randomized_fwht_scalar(&mut data, &signs);
-        assert!((data[0] - 2.0).abs() < 1e-6, "expected 2.0, got {}", data[0]);
+        assert!(
+            (data[0] - 2.0).abs() < 1e-6,
+            "expected 2.0, got {}",
+            data[0]
+        );
         for i in 1..4 {
-            assert!(data[i].abs() < 1e-6, "expected 0.0 at [{i}], got {}", data[i]);
+            assert!(
+                data[i].abs() < 1e-6,
+                "expected 0.0 at [{i}], got {}",
+                data[i]
+            );
         }
     }
 

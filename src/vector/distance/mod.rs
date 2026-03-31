@@ -149,7 +149,10 @@ pub fn table() -> &'static DistanceTable {
     // The OnceLock is guaranteed to be initialized by the time any search
     // path reaches this function. Using unwrap_unchecked avoids a branch
     // on the hot path.
-    debug_assert!(DISTANCE_TABLE.get().is_some(), "distance::init() was not called before table()");
+    debug_assert!(
+        DISTANCE_TABLE.get().is_some(),
+        "distance::init() was not called before table()"
+    );
     unsafe { DISTANCE_TABLE.get().unwrap_unchecked() }
 }
 
@@ -330,8 +333,14 @@ mod integration_tests {
             let a = deterministic_f32(dim, 42);
             let scalar_result = scalar::l2_f32(&a, &a);
             let dispatch_result = (t.l2_f32)(&a, &a);
-            assert_eq!(scalar_result, 0.0, "scalar l2 of identical vectors != 0 at dim={dim}");
-            assert_eq!(dispatch_result, 0.0, "dispatch l2 of identical vectors != 0 at dim={dim}");
+            assert_eq!(
+                scalar_result, 0.0,
+                "scalar l2 of identical vectors != 0 at dim={dim}"
+            );
+            assert_eq!(
+                dispatch_result, 0.0,
+                "dispatch l2 of identical vectors != 0 at dim={dim}"
+            );
         }
     }
 
@@ -358,17 +367,26 @@ mod integration_tests {
         // L2: (0.5 - 0.8)^2 = 0.09
         let l2_s = scalar::l2_f32(&a, &b);
         let l2_d = (t.l2_f32)(&a, &b);
-        assert!(approx_eq_f32(l2_s, l2_d, 1e-6), "single-element l2_f32 mismatch");
+        assert!(
+            approx_eq_f32(l2_s, l2_d, 1e-6),
+            "single-element l2_f32 mismatch"
+        );
 
         // Dot: 0.5 * 0.8 = 0.4
         let dot_s = scalar::dot_f32(&a, &b);
         let dot_d = (t.dot_f32)(&a, &b);
-        assert!(approx_eq_f32(dot_s, dot_d, 1e-6), "single-element dot_f32 mismatch");
+        assert!(
+            approx_eq_f32(dot_s, dot_d, 1e-6),
+            "single-element dot_f32 mismatch"
+        );
 
         // Cosine: 1 - (0.4 / (0.5 * 0.8)) = 0.0
         let cos_s = scalar::cosine_f32(&a, &b);
         let cos_d = (t.cosine_f32)(&a, &b);
-        assert!(approx_eq_f32(cos_s, cos_d, 1e-6), "single-element cosine_f32 mismatch");
+        assert!(
+            approx_eq_f32(cos_s, cos_d, 1e-6),
+            "single-element cosine_f32 mismatch"
+        );
 
         // i8 single element
         let ai = [42i8];

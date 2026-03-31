@@ -28,29 +28,27 @@ pub const CODEBOOK_VERSION: u8 = 2;
 /// - Sorted ascending
 /// - Symmetric: `RAW_CENTROIDS[i] == -RAW_CENTROIDS[15-i]`
 pub const RAW_CENTROIDS: [f32; 16] = [
-    -2.4008, -1.8435, -1.4371, -1.0993,
-    -0.7990, -0.5282, -0.2743, -0.0298,
-     0.0298,  0.2743,  0.5282,  0.7990,
-     1.0993,  1.4371,  1.8435,  2.4008,
+    -2.4008, -1.8435, -1.4371, -1.0993, -0.7990, -0.5282, -0.2743, -0.0298, 0.0298, 0.2743, 0.5282,
+    0.7990, 1.0993, 1.4371, 1.8435, 2.4008,
 ];
 
 /// Raw N(0,1) decision boundaries (midpoints between adjacent RAW_CENTROIDS).
 pub const RAW_BOUNDARIES: [f32; 15] = [
-    -2.12215,  // mid(-2.4008, -1.8435)
-    -1.6403,   // mid(-1.8435, -1.4371)
-    -1.2682,   // mid(-1.4371, -1.0993)
-    -0.94915,  // mid(-1.0993, -0.7990)
-    -0.6636,   // mid(-0.7990, -0.5282)
-    -0.40125,  // mid(-0.5282, -0.2743)
-    -0.15205,  // mid(-0.2743, -0.0298)
-     0.0,      // mid(-0.0298,  0.0298) — exact zero by symmetry
-     0.15205,  // mid( 0.0298,  0.2743)
-     0.40125,  // mid( 0.2743,  0.5282)
-     0.6636,   // mid( 0.5282,  0.7990)
-     0.94915,  // mid( 0.7990,  1.0993)
-     1.2682,   // mid( 1.0993,  1.4371)
-     1.6403,   // mid( 1.4371,  1.8435)
-     2.12215,  // mid( 1.8435,  2.4008)
+    -2.12215, // mid(-2.4008, -1.8435)
+    -1.6403,  // mid(-1.8435, -1.4371)
+    -1.2682,  // mid(-1.4371, -1.0993)
+    -0.94915, // mid(-1.0993, -0.7990)
+    -0.6636,  // mid(-0.7990, -0.5282)
+    -0.40125, // mid(-0.5282, -0.2743)
+    -0.15205, // mid(-0.2743, -0.0298)
+    0.0,      // mid(-0.0298,  0.0298) — exact zero by symmetry
+    0.15205,  // mid( 0.0298,  0.2743)
+    0.40125,  // mid( 0.2743,  0.5282)
+    0.6636,   // mid( 0.5282,  0.7990)
+    0.94915,  // mid( 0.7990,  1.0993)
+    1.2682,   // mid( 1.0993,  1.4371)
+    1.6403,   // mid( 1.4371,  1.8435)
+    2.12215,  // mid( 1.8435,  2.4008)
 ];
 
 /// Compute dimension-scaled centroids for a given padded dimension.
@@ -77,18 +75,27 @@ pub fn scaled_boundaries(padded_dim: u32) -> [f32; 15] {
 /// Legacy constants for backward compatibility with codebook_version=1.
 /// Scaled by 1/sqrt(768) — ONLY correct for dim=768 with no padding.
 pub const CENTROIDS: [f32; 16] = [
-    -0.086_643, -0.066_523, -0.051_858, -0.039_666,
-    -0.028_829, -0.019_060, -0.009_897, -0.001_075,
-     0.001_075,  0.009_897,  0.019_060,  0.028_829,
-     0.039_666,  0.051_858,  0.066_523,  0.086_643,
+    -0.086_643, -0.066_523, -0.051_858, -0.039_666, -0.028_829, -0.019_060, -0.009_897, -0.001_075,
+    0.001_075, 0.009_897, 0.019_060, 0.028_829, 0.039_666, 0.051_858, 0.066_523, 0.086_643,
 ];
 
 /// Legacy boundaries for backward compatibility.
 pub const BOUNDARIES: [f32; 15] = [
-    -0.076_583, -0.059_190_5, -0.045_762, -0.034_247_5,
-    -0.023_944_5, -0.014_478_5, -0.005_486, 0.0,
-     0.005_486,  0.014_478_5,  0.023_944_5,  0.034_247_5,
-     0.045_762,  0.059_190_5,  0.076_583,
+    -0.076_583,
+    -0.059_190_5,
+    -0.045_762,
+    -0.034_247_5,
+    -0.023_944_5,
+    -0.014_478_5,
+    -0.005_486,
+    0.0,
+    0.005_486,
+    0.014_478_5,
+    0.023_944_5,
+    0.034_247_5,
+    0.045_762,
+    0.059_190_5,
+    0.076_583,
 ];
 
 // ── 1-bit Lloyd-Max codebook for N(0,1) ──────────────────────────────
@@ -111,14 +118,11 @@ pub const RAW_BOUNDARIES_2BIT: [f32; 3] = [-0.9816, 0.0, 0.9816];
 
 /// 3-bit (8 centroids): Lloyd-Max optimal for N(0,1) with 8 levels.
 pub const RAW_CENTROIDS_3BIT: [f32; 8] = [
-    -2.1520, -1.3440, -0.7560, -0.2451,
-     0.2451,  0.7560,  1.3440,  2.1520,
+    -2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520,
 ];
 
 /// 3-bit boundaries: midpoints between adjacent 3-bit centroids.
-pub const RAW_BOUNDARIES_3BIT: [f32; 7] = [
-    -1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480,
-];
+pub const RAW_BOUNDARIES_3BIT: [f32; 7] = [-1.7480, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7480];
 
 /// Compute dimension-scaled centroids for any bit width (1-4).
 ///
@@ -345,7 +349,12 @@ mod tests {
         // Symmetric
         for i in 0..8 {
             let diff = (RAW_CENTROIDS_3BIT[i] + RAW_CENTROIDS_3BIT[7 - i]).abs();
-            assert!(diff < 1e-4, "3-bit symmetry violated at {i}: {} vs {}", RAW_CENTROIDS_3BIT[i], RAW_CENTROIDS_3BIT[7 - i]);
+            assert!(
+                diff < 1e-4,
+                "3-bit symmetry violated at {i}: {} vs {}",
+                RAW_CENTROIDS_3BIT[i],
+                RAW_CENTROIDS_3BIT[7 - i]
+            );
         }
         // Sorted ascending
         for i in 1..8 {
@@ -412,9 +421,9 @@ mod tests {
     #[test]
     fn test_code_bytes_per_vector() {
         let pdim = 1024u32;
-        assert_eq!(code_bytes_per_vector(pdim, 1), 128);  // 1024/8
-        assert_eq!(code_bytes_per_vector(pdim, 2), 256);  // 1024/4
-        assert_eq!(code_bytes_per_vector(pdim, 3), 384);  // (1024*3+7)/8 = 384
-        assert_eq!(code_bytes_per_vector(pdim, 4), 512);  // 1024/2
+        assert_eq!(code_bytes_per_vector(pdim, 1), 128); // 1024/8
+        assert_eq!(code_bytes_per_vector(pdim, 2), 256); // 1024/4
+        assert_eq!(code_bytes_per_vector(pdim, 3), 384); // (1024*3+7)/8 = 384
+        assert_eq!(code_bytes_per_vector(pdim, 4), 512); // 1024/2
     }
 }

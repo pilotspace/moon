@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod conn_accept;
 pub mod coordinator;
 pub mod dispatch;
@@ -5,6 +6,7 @@ pub mod event_loop;
 pub mod mesh;
 pub mod numa;
 pub mod persistence_tick;
+pub mod remote_subscriber_map;
 pub mod shared_databases;
 pub mod spsc_handler;
 pub mod timers;
@@ -175,15 +177,17 @@ mod tests {
         let mut pubsub = PubSubRegistry::new();
         let shard_databases = ShardDatabases::new(vec![vec![Database::new()]]);
 
-        let (tx, rx) = rt_channel::mpsc_bounded::<Frame>(16);
+        let (tx, rx) = rt_channel::mpsc_bounded::<Bytes>(16);
         let sub = Subscriber::new(tx, 42);
         pubsub.subscribe(Bytes::from_static(b"news"), sub);
 
         let rb = HeapRb::new(64);
         let (mut prod, cons) = rb.split();
-        prod.try_push(ShardMessage::PubSubFanOut {
+        let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(0));
+        prod.try_push(ShardMessage::PubSubPublish {
             channel: Bytes::from_static(b"news"),
             message: Bytes::from_static(b"hello from shard 1"),
+            slot,
         })
         .ok()
         .expect("push should succeed");
@@ -213,19 +217,11 @@ mod tests {
             &mut vs,
         );
 
+        // Subscriber now receives pre-serialized RESP bytes
         let msg = rx.try_recv().expect("subscriber should receive message");
-        match msg {
-            Frame::Array(parts) => {
-                assert_eq!(parts.len(), 3);
-                assert_eq!(parts[0], Frame::BulkString(Bytes::from_static(b"message")));
-                assert_eq!(parts[1], Frame::BulkString(Bytes::from_static(b"news")));
-                assert_eq!(
-                    parts[2],
-                    Frame::BulkString(Bytes::from_static(b"hello from shard 1"))
-                );
-            }
-            _ => panic!("expected Array frame"),
-        }
+        // Verify it's valid RESP: *3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$18\r\nhello from shard 1\r\n
+        let expected = b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$18\r\nhello from shard 1\r\n";
+        assert_eq!(&msg[..], &expected[..]);
     }
 
     #[test]
@@ -237,9 +233,11 @@ mod tests {
         let (mut prod, cons) = rb.split();
 
         for _ in 0..300 {
-            prod.try_push(ShardMessage::PubSubFanOut {
+            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(0));
+            prod.try_push(ShardMessage::PubSubPublish {
                 channel: Bytes::from_static(b"ch"),
                 message: Bytes::from_static(b"msg"),
+                slot,
             })
             .ok()
             .unwrap();

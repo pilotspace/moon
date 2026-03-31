@@ -45,7 +45,9 @@ pub fn hnsw_search_f32(
         loop {
             let mut improved = false;
             for &nb in graph.neighbors_upper(current_orig, layer) {
-                if nb == SENTINEL { break; }
+                if nb == SENTINEL {
+                    break;
+                }
                 let nb_bfs = graph.to_bfs(nb);
                 let d = dist_bfs(nb_bfs);
                 if d < current_dist {
@@ -54,7 +56,9 @@ pub fn hnsw_search_f32(
                     improved = true;
                 }
             }
-            if !improved { break; }
+            if !improved {
+                break;
+            }
         }
     }
 
@@ -83,24 +87,34 @@ pub fn hnsw_search_f32(
     while let Some(Reverse((OrderedFloat(c_dist), c_bfs))) = candidates.pop() {
         if results.len() >= ef {
             if let Some(&(OrderedFloat(worst), _)) = results.peek() {
-                if c_dist > worst { break; }
+                if c_dist > worst {
+                    break;
+                }
             }
         }
 
         for &nb_bfs in graph.neighbors_l0(c_bfs) {
-            if nb_bfs == SENTINEL { break; }
-            if nb_bfs >= num_nodes { continue; }
-            if visited[nb_bfs as usize] { continue; }
+            if nb_bfs == SENTINEL {
+                break;
+            }
+            if nb_bfs >= num_nodes {
+                continue;
+            }
+            if visited[nb_bfs as usize] {
+                continue;
+            }
             visited[nb_bfs as usize] = true;
 
             let d = dist_bfs(nb_bfs);
 
-            let dominated = results.len() >= ef && d >= results.peek().unwrap().0 .0;
+            let dominated = results.len() >= ef && d >= results.peek().unwrap().0.0;
             if !dominated {
                 candidates.push(Reverse((OrderedFloat(d), nb_bfs)));
                 if passes(nb_bfs) {
                     results.push((OrderedFloat(d), nb_bfs));
-                    if results.len() > ef { results.pop(); }
+                    if results.len() > ef {
+                        results.pop();
+                    }
                 }
             }
         }
@@ -129,15 +143,25 @@ mod tests {
         let mut rng = seed;
         let mut vecs = Vec::with_capacity(n * d);
         for _ in 0..n {
-            let mut v: Vec<f32> = (0..d).map(|_| {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let u1 = ((rng >> 40) as f32 / (1u64 << 24) as f32).max(1e-7);
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let u2 = (rng >> 40) as f32 / (1u64 << 24) as f32;
-                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-            }).collect();
+            let mut v: Vec<f32> = (0..d)
+                .map(|_| {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u1 = ((rng >> 40) as f32 / (1u64 << 24) as f32).max(1e-7);
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u2 = (rng >> 40) as f32 / (1u64 << 24) as f32;
+                    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+                })
+                .collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 { for x in v.iter_mut() { *x /= norm; } }
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
             vecs.extend_from_slice(&v);
         }
         vecs
@@ -152,8 +176,10 @@ mod tests {
         let mut builder = HnswBuilder::new(16, 200, 42);
         for _ in 0..n {
             builder.insert(|a, b| {
-                (l2_fn)(&vectors[a as usize * d..(a as usize + 1) * d],
-                         &vectors[b as usize * d..(b as usize + 1) * d])
+                (l2_fn)(
+                    &vectors[a as usize * d..(a as usize + 1) * d],
+                    &vectors[b as usize * d..(b as usize + 1) * d],
+                )
             });
         }
         let graph = builder.build(d as u32);
@@ -168,9 +194,14 @@ mod tests {
         let mut total = 0.0;
         for qi in 0..nq {
             let q = &queries[qi * d..(qi + 1) * d];
-            let mut bf: Vec<(f32, u32)> = (0..n).map(|i| {
-                ((l2_fn)(q, &vectors[i as usize * d..(i as usize + 1) * d]), i)
-            }).collect();
+            let mut bf: Vec<(f32, u32)> = (0..n)
+                .map(|i| {
+                    (
+                        (l2_fn)(q, &vectors[i as usize * d..(i as usize + 1) * d]),
+                        i,
+                    )
+                })
+                .collect();
             bf.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
             let gt: Vec<u32> = bf[..k].iter().map(|x| x.1).collect();
 

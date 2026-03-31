@@ -72,17 +72,11 @@ fn test_memory_budget_1m_768d_tq4() {
 
     // 4. BFS order + inverse mappings: 2 * N * sizeof(u32)
     let bfs_maps_total = n * 2 * std::mem::size_of::<u32>();
-    println!(
-        "  BFS order/inverse: {} MB",
-        bfs_maps_total / (1024 * 1024)
-    );
+    println!("  BFS order/inverse: {} MB", bfs_maps_total / (1024 * 1024));
 
     // 5. Node levels: N * sizeof(u8)
     let levels_total = n;
-    println!(
-        "  Node levels: {} MB",
-        levels_total / (1024 * 1024)
-    );
+    println!("  Node levels: {} MB", levels_total / (1024 * 1024));
 
     // 6. Per-vector metadata (immutable segment)
     let entry_size = std::mem::size_of::<MutableEntry>();
@@ -123,8 +117,10 @@ fn test_memory_budget_1m_768d_tq4() {
 
     println!("\n  TOTAL (current): {total_mb:.1} MB");
     println!("  TOTAL (aspirational, CSR upper layers): {aspirational_mb:.1} MB");
-    println!("  SmallVec overhead: {} MB (optimization opportunity)",
-        (upper_layers_total - compressed_upper) / (1024 * 1024));
+    println!(
+        "  SmallVec overhead: {} MB (optimization opportunity)",
+        (upper_layers_total - compressed_upper) / (1024 * 1024)
+    );
 
     // Current budget: 850 MB (realistic with padding + SmallVec overhead)
     assert!(
@@ -173,7 +169,8 @@ fn test_per_vector_overhead_breakdown() {
     // Calculate per-vector overhead for MutableSegment internals:
     // Each vector stores: dim * sizeof(f32) + dim * sizeof(i8) + sizeof(MutableEntry)
     let entry_size = std::mem::size_of::<MutableEntry>();
-    let per_vector_128d = dim * std::mem::size_of::<f32>() + dim * std::mem::size_of::<i8>() + entry_size;
+    let per_vector_128d =
+        dim * std::mem::size_of::<f32>() + dim * std::mem::size_of::<i8>() + entry_size;
 
     println!("\n=== Per-vector overhead (MutableSegment, {dim}d) ===");
     println!("  f32 storage: {} bytes", dim * std::mem::size_of::<f32>());
@@ -190,10 +187,18 @@ fn test_per_vector_overhead_breakdown() {
     let hnsw_overhead_per_node = 32 * 4 + smallvec_struct_size + 8 + 1; // layer0 + upper + bfs maps + level
     let total_per_vector_768d = per_vector_768d_tq + hnsw_overhead_per_node;
 
-    println!("\n  Projected per-vector (768d TQ-4bit + HNSW): {} bytes", total_per_vector_768d);
+    println!(
+        "\n  Projected per-vector (768d TQ-4bit + HNSW): {} bytes",
+        total_per_vector_768d
+    );
     println!("    TQ data: {} bytes", per_vector_768d_tq);
-    println!("    HNSW overhead: {} bytes (layer0: {}, SmallVec: {}, maps+level: {})",
-        hnsw_overhead_per_node, 32 * 4, smallvec_struct_size, 9);
+    println!(
+        "    HNSW overhead: {} bytes (layer0: {}, SmallVec: {}, maps+level: {})",
+        hnsw_overhead_per_node,
+        32 * 4,
+        smallvec_struct_size,
+        9
+    );
 
     // Current budget: 800 bytes/vector (with SmallVec overhead)
     // Aspirational: 600 bytes/vector (with CSR upper layers)
@@ -210,9 +215,14 @@ fn test_per_vector_overhead_breakdown() {
         "Aspirational per-vector {} bytes exceeds 700 byte budget",
         aspirational_per_vector
     );
-    println!("  Current budget: 850 bytes/vector -- PASS (headroom: {} bytes)",
-        850 - total_per_vector_768d);
-    println!("  Aspirational: {} bytes/vector (< 700 with CSR)", aspirational_per_vector);
+    println!(
+        "  Current budget: 850 bytes/vector -- PASS (headroom: {} bytes)",
+        850 - total_per_vector_768d
+    );
+    println!(
+        "  Aspirational: {} bytes/vector (< 700 with CSR)",
+        aspirational_per_vector
+    );
 }
 
 /// AlignedBuffer allocates exactly the right amount with no excessive waste.
@@ -223,7 +233,11 @@ fn test_aligned_buffer_no_waste() {
 
     // AlignedBuffer<f32> for padded dimension
     let buf: AlignedBuffer<f32> = AlignedBuffer::new(padded);
-    assert_eq!(buf.len(), padded, "buffer length should match requested size");
+    assert_eq!(
+        buf.len(),
+        padded,
+        "buffer length should match requested size"
+    );
 
     // Verify alignment: pointer should be 64-byte aligned
     let ptr = buf.as_ptr() as usize;
@@ -258,7 +272,11 @@ fn test_aligned_buffer_no_waste() {
     let buf_small: AlignedBuffer<f32> = AlignedBuffer::new(100);
     assert_eq!(buf_small.len(), 100);
     let ptr_small = buf_small.as_ptr() as usize;
-    assert_eq!(ptr_small % 64, 0, "Small buffer should also be 64-byte aligned");
+    assert_eq!(
+        ptr_small % 64,
+        0,
+        "Small buffer should also be 64-byte aligned"
+    );
 }
 
 /// Verify HnswGraph struct size is reasonable.

@@ -14,12 +14,7 @@ use super::codebook::CENTROIDS;
 /// instead of using the hardcoded (1/sqrt(768)) CENTROIDS constant.
 /// This is the correct version for production use.
 #[inline]
-pub fn tq_l2_adc_scaled(
-    q_rotated: &[f32],
-    code: &[u8],
-    norm: f32,
-    centroids: &[f32; 16],
-) -> f32 {
+pub fn tq_l2_adc_scaled(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32; 16]) -> f32 {
     let padded = q_rotated.len();
     debug_assert_eq!(code.len(), padded / 2);
 
@@ -84,7 +79,11 @@ pub fn tq_l2_adc_scaled_budgeted(
     debug_assert_eq!(code.len(), padded / 2);
 
     let norm_sq = norm * norm;
-    let sum_budget = if norm_sq > 0.0 { budget / norm_sq } else { f32::MAX };
+    let sum_budget = if norm_sq > 0.0 {
+        budget / norm_sq
+    } else {
+        f32::MAX
+    };
 
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
@@ -153,11 +152,7 @@ pub fn tq_l2_adc_scaled_budgeted(
 /// 2. For each dimension: d = q_rotated[i] - CENTROIDS[idx[i]]
 /// 3. Sum d*d, scale by norm^2
 #[inline]
-pub fn tq_l2_adc_scalar(
-    q_rotated: &[f32],
-    code: &[u8],
-    norm: f32,
-) -> f32 {
+pub fn tq_l2_adc_scalar(q_rotated: &[f32], code: &[u8], norm: f32) -> f32 {
     let padded = q_rotated.len();
     debug_assert_eq!(code.len(), padded / 2);
 
@@ -225,18 +220,17 @@ pub fn tq_l2_adc_scalar(
 /// `budget`: the worst distance currently in the results heap. If the partial
 /// distance already exceeds this, the neighbor cannot improve results.
 #[inline]
-pub fn tq_l2_adc_budgeted(
-    q_rotated: &[f32],
-    code: &[u8],
-    norm: f32,
-    budget: f32,
-) -> f32 {
+pub fn tq_l2_adc_budgeted(q_rotated: &[f32], code: &[u8], norm: f32, budget: f32) -> f32 {
     let padded = q_rotated.len();
     debug_assert_eq!(code.len(), padded / 2);
 
     let norm_sq = norm * norm;
     // Pre-divide budget by norm^2 so we compare raw sums in the loop.
-    let sum_budget = if norm_sq > 0.0 { budget / norm_sq } else { f32::MAX };
+    let sum_budget = if norm_sq > 0.0 {
+        budget / norm_sq
+    } else {
+        f32::MAX
+    };
 
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
@@ -295,11 +289,11 @@ pub fn tq_l2_adc_budgeted(
     (sum0 + sum1 + sum2 + sum3) * norm_sq
 }
 
-use smallvec::SmallVec;
-use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::turbo_quant::codebook::code_bytes_per_vector;
+use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::turbo_quant::fwht;
 use crate::vector::types::{SearchResult, VectorId};
+use smallvec::SmallVec;
 
 /// Asymmetric L2 distance for any bit width (1-4).
 ///
@@ -324,7 +318,10 @@ pub fn tq_l2_adc_multibit(
             // Delegate to existing optimized 4-bit path
             debug_assert_eq!(centroids.len(), 16);
             let c: &[f32; 16] = centroids.try_into().unwrap_or_else(|_| {
-                panic!("4-bit ADC requires exactly 16 centroids, got {}", centroids.len())
+                panic!(
+                    "4-bit ADC requires exactly 16 centroids, got {}",
+                    centroids.len()
+                )
             });
             tq_l2_adc_scaled(q_rotated, code, norm, c)
         }
@@ -475,9 +472,8 @@ fn tq_l2_adc_3bit(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32]) 
         // Group 0
         let off0 = group_base * 3;
         let qoff0 = group_base * 8;
-        let bits0 = code[off0] as u32
-            | ((code[off0 + 1] as u32) << 8)
-            | ((code[off0 + 2] as u32) << 16);
+        let bits0 =
+            code[off0] as u32 | ((code[off0 + 1] as u32) << 8) | ((code[off0 + 2] as u32) << 16);
         for j in 0..8 {
             let idx = ((bits0 >> (j * 3)) & 7) as usize;
             let d = q_rotated[qoff0 + j] - centroids[idx];
@@ -487,9 +483,8 @@ fn tq_l2_adc_3bit(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32]) 
         // Group 1
         let off1 = (group_base + 1) * 3;
         let qoff1 = (group_base + 1) * 8;
-        let bits1 = code[off1] as u32
-            | ((code[off1 + 1] as u32) << 8)
-            | ((code[off1 + 2] as u32) << 16);
+        let bits1 =
+            code[off1] as u32 | ((code[off1 + 1] as u32) << 8) | ((code[off1 + 2] as u32) << 16);
         for j in 0..8 {
             let idx = ((bits1 >> (j * 3)) & 7) as usize;
             let d = q_rotated[qoff1 + j] - centroids[idx];
@@ -500,9 +495,8 @@ fn tq_l2_adc_3bit(q_rotated: &[f32], code: &[u8], norm: f32, centroids: &[f32]) 
     if groups_rem > 0 {
         let off = groups_2 * 2 * 3;
         let qoff = groups_2 * 2 * 8;
-        let bits = code[off] as u32
-            | ((code[off + 1] as u32) << 8)
-            | ((code[off + 2] as u32) << 16);
+        let bits =
+            code[off] as u32 | ((code[off + 1] as u32) << 8) | ((code[off + 2] as u32) << 16);
         for j in 0..8 {
             let idx = ((bits >> (j * 3)) & 7) as usize;
             let d = q_rotated[qoff + j] - centroids[idx];
@@ -527,9 +521,9 @@ pub fn tq_l2_adc_multibit_budgeted(
     // The 4-bit path has the optimized inner-loop budget check.
     if bits == 4 {
         debug_assert_eq!(centroids.len(), 16);
-        let c: &[f32; 16] = centroids.try_into().unwrap_or_else(|_| {
-            panic!("4-bit ADC requires exactly 16 centroids")
-        });
+        let c: &[f32; 16] = centroids
+            .try_into()
+            .unwrap_or_else(|_| panic!("4-bit ADC requires exactly 16 centroids"));
         return tq_l2_adc_scaled_budgeted(q_rotated, code, norm, c, budget);
     }
 
@@ -572,7 +566,10 @@ pub fn brute_force_tq_adc_multibit(
             *v *= inv;
         }
     }
-    fwht::fwht(&mut q_rotated[..padded], collection.fwht_sign_flips.as_slice());
+    fwht::fwht(
+        &mut q_rotated[..padded],
+        collection.fwht_sign_flips.as_slice(),
+    );
 
     // Scan with max-heap for top-K
     use std::collections::BinaryHeap;
@@ -598,7 +595,8 @@ pub fn brute_force_tq_adc_multibit(
     let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
     results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    results.into_iter()
+    results
+        .into_iter()
         .map(|(d, id)| SearchResult::new(d, VectorId(id)))
         .collect()
 }
@@ -647,7 +645,10 @@ pub fn brute_force_tq_adc(
             *v *= inv;
         }
     }
-    fwht::fwht(&mut q_rotated[..padded], collection.fwht_sign_flips.as_slice());
+    fwht::fwht(
+        &mut q_rotated[..padded],
+        collection.fwht_sign_flips.as_slice(),
+    );
 
     // Scan all vectors, keep top-K in a max-heap
     use std::collections::BinaryHeap;
@@ -674,7 +675,8 @@ pub fn brute_force_tq_adc(
     let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
     results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    results.into_iter()
+    results
+        .into_iter()
         .map(|(d, id)| SearchResult::new(d, VectorId(id)))
         .collect()
 }
@@ -682,9 +684,7 @@ pub fn brute_force_tq_adc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::turbo_quant::encoder::{
-        encode_tq_mse, decode_tq_mse, padded_dimension,
-    };
+    use crate::vector::turbo_quant::encoder::{decode_tq_mse, encode_tq_mse, padded_dimension};
     use crate::vector::turbo_quant::fwht;
 
     /// Deterministic LCG PRNG for reproducible test vectors.
@@ -777,7 +777,10 @@ mod tests {
         let dist = tq_l2_adc_scalar(&q_rotated, &code1.codes, code1.norm);
         eprintln!("distant-distance (ADC): {dist}");
         // Opposite unit vectors have L2^2 = 4.0. With quantization error, should be close.
-        assert!(dist > 2.0, "distant vectors should have large distance, got {dist}");
+        assert!(
+            dist > 2.0,
+            "distant vectors should have large distance, got {dist}"
+        );
     }
 
     #[test]
@@ -808,12 +811,14 @@ mod tests {
         fwht::fwht(&mut q_rotated, &signs);
 
         // Compute ADC distances
-        let adc_dists: Vec<f32> = codes.iter()
+        let adc_dists: Vec<f32> = codes
+            .iter()
             .map(|c| tq_l2_adc_scalar(&q_rotated, &c.codes, c.norm))
             .collect();
 
         // Compute brute-force L2 via decode
-        let bf_dists: Vec<f32> = codes.iter()
+        let bf_dists: Vec<f32> = codes
+            .iter()
             .map(|c| {
                 let decoded = decode_tq_mse(c, &signs, dim, &mut work_dec);
                 let mut sum = 0.0f32;
@@ -882,7 +887,11 @@ mod tests {
         let n = 1000;
         let dim = 128;
         let collection = Arc::new(CollectionMetadata::new(
-            1, dim as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let padded = collection.padded_dimension as usize;
         let signs = collection.fwht_sign_flips.as_slice();
@@ -913,10 +922,17 @@ mod tests {
             normalize(&mut query);
 
             // True L2 brute force ground truth
-            let mut true_dists: Vec<(f32, usize)> = vectors.iter().enumerate()
+            let mut true_dists: Vec<(f32, usize)> = vectors
+                .iter()
+                .enumerate()
                 .map(|(idx, v)| {
-                    let d: f32 = query.iter().zip(v.iter())
-                        .map(|(a, b)| { let diff = a - b; diff * diff })
+                    let d: f32 = query
+                        .iter()
+                        .zip(v.iter())
+                        .map(|(a, b)| {
+                            let diff = a - b;
+                            diff * diff
+                        })
                         .sum();
                     (d, idx)
                 })
@@ -929,7 +945,10 @@ mod tests {
             let adc_top_k: Vec<usize> = results.iter().map(|r| r.id.0 as usize).collect();
 
             // Count overlap
-            let hits = adc_top_k.iter().filter(|id| true_top_k.contains(id)).count();
+            let hits = adc_top_k
+                .iter()
+                .filter(|id| true_top_k.contains(id))
+                .count();
             total_recall += hits as f64 / k as f64;
         }
 
@@ -937,7 +956,10 @@ mod tests {
         eprintln!("brute_force_tq_adc recall@{k}: {avg_recall:.4}");
         // 4-bit ADC at 128d achieves ~0.80-0.85 recall (dimension-dependent).
         // Higher dimensions (768d) achieve 0.90+ due to better FWHT concentration.
-        assert!(avg_recall >= 0.80, "recall@{k} = {avg_recall:.4}, expected >= 0.80");
+        assert!(
+            avg_recall >= 0.80,
+            "recall@{k} = {avg_recall:.4}, expected >= 0.80"
+        );
     }
 
     #[test]
@@ -948,11 +970,18 @@ mod tests {
 
         fwht::init_fwht();
         let collection = Arc::new(CollectionMetadata::new(
-            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let query = vec![0.1f32; 128];
         let results = brute_force_tq_adc(&query, &[], 0, &collection, 10);
-        assert!(results.is_empty(), "empty buffer should return empty results");
+        assert!(
+            results.is_empty(),
+            "empty buffer should return empty results"
+        );
     }
 
     #[test]
@@ -966,7 +995,11 @@ mod tests {
         let n = 10;
         let dim = 128;
         let collection = Arc::new(CollectionMetadata::new(
-            1, dim as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let padded = collection.padded_dimension as usize;
         let signs = collection.fwht_sign_flips.as_slice();
@@ -993,8 +1026,8 @@ mod tests {
 
     #[test]
     fn test_tq_l2_adc_multibit_self_distance_1bit() {
+        use crate::vector::turbo_quant::codebook::{scaled_boundaries_n, scaled_centroids_n};
         use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
-        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
 
         fwht::init_fwht();
         let dim = 768;
@@ -1022,8 +1055,8 @@ mod tests {
 
     #[test]
     fn test_tq_l2_adc_multibit_self_distance_2bit() {
+        use crate::vector::turbo_quant::codebook::{scaled_boundaries_n, scaled_centroids_n};
         use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
-        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
 
         fwht::init_fwht();
         let dim = 768;
@@ -1050,8 +1083,8 @@ mod tests {
 
     #[test]
     fn test_tq_l2_adc_multibit_self_distance_3bit() {
+        use crate::vector::turbo_quant::codebook::{scaled_boundaries_n, scaled_centroids_n};
         use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
-        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
 
         fwht::init_fwht();
         let dim = 768;
@@ -1078,8 +1111,8 @@ mod tests {
 
     #[test]
     fn test_tq_l2_adc_multibit_ranking() {
-        use crate::vector::turbo_quant::encoder::{encode_tq_mse_multibit, decode_tq_mse_multibit};
-        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
+        use crate::vector::turbo_quant::codebook::{scaled_boundaries_n, scaled_centroids_n};
+        use crate::vector::turbo_quant::encoder::{decode_tq_mse_multibit, encode_tq_mse_multibit};
 
         fwht::init_fwht();
         let dim = 768;
@@ -1099,7 +1132,13 @@ mod tests {
                 let mut v = lcg_f32(dim, seed * 7 + 13);
                 normalize(&mut v);
                 originals.push(v.clone());
-                codes.push(encode_tq_mse_multibit(&v, &signs, &boundaries, bits, &mut work_enc));
+                codes.push(encode_tq_mse_multibit(
+                    &v,
+                    &signs,
+                    &boundaries,
+                    bits,
+                    &mut work_enc,
+                ));
             }
 
             // Query
@@ -1110,14 +1149,17 @@ mod tests {
             fwht::fwht(&mut q_rotated, &signs);
 
             // ADC distances
-            let adc_dists: Vec<f32> = codes.iter()
+            let adc_dists: Vec<f32> = codes
+                .iter()
                 .map(|c| tq_l2_adc_multibit(&q_rotated, &c.codes, c.norm, &centroids, bits))
                 .collect();
 
             // Decoded L2 distances
-            let bf_dists: Vec<f32> = codes.iter()
+            let bf_dists: Vec<f32> = codes
+                .iter()
                 .map(|c| {
-                    let decoded = decode_tq_mse_multibit(c, &signs, &centroids, bits, dim, &mut work_dec);
+                    let decoded =
+                        decode_tq_mse_multibit(c, &signs, &centroids, bits, dim, &mut work_dec);
                     let mut sum = 0.0f32;
                     for (a, b) in query.iter().zip(decoded.iter()) {
                         let d = a - b;
@@ -1137,14 +1179,17 @@ mod tests {
             eprintln!("{bits}-bit BF  ranking: {bf_order:?}");
 
             // Top-1 should match
-            assert_eq!(adc_order[0], bf_order[0], "{bits}-bit: nearest neighbor mismatch");
+            assert_eq!(
+                adc_order[0], bf_order[0],
+                "{bits}-bit: nearest neighbor mismatch"
+            );
         }
     }
 
     #[test]
     fn test_tq_l2_adc_multibit_budgeted_returns_max() {
+        use crate::vector::turbo_quant::codebook::{scaled_boundaries_n, scaled_centroids_n};
         use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
-        use crate::vector::turbo_quant::codebook::{scaled_centroids_n, scaled_boundaries_n};
 
         fwht::init_fwht();
         let dim = 768;
@@ -1168,7 +1213,12 @@ mod tests {
 
             // Use a tiny budget that will be exceeded
             let dist = tq_l2_adc_multibit_budgeted(
-                &q_rotated, &code.codes, code.norm, &centroids, bits, 0.001,
+                &q_rotated,
+                &code.codes,
+                code.norm,
+                &centroids,
+                bits,
+                0.001,
             );
             assert_eq!(dist, f32::MAX, "{bits}-bit: budgeted should return MAX");
         }
@@ -1176,9 +1226,9 @@ mod tests {
 
     #[test]
     fn test_brute_force_tq_adc_multibit_recall() {
+        use crate::vector::turbo_quant::codebook::code_bytes_per_vector;
         use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
         use crate::vector::turbo_quant::encoder::encode_tq_mse_multibit;
-        use crate::vector::turbo_quant::codebook::code_bytes_per_vector;
         use crate::vector::types::DistanceMetric;
         use std::sync::Arc;
 
@@ -1194,7 +1244,11 @@ mod tests {
             (3, QuantizationConfig::TurboQuant3, 0.60),
         ] {
             let collection = Arc::new(CollectionMetadata::new(
-                1, dim as u32, DistanceMetric::L2, quant, 42,
+                1,
+                dim as u32,
+                DistanceMetric::L2,
+                quant,
+                42,
             ));
             let padded = collection.padded_dimension as usize;
             let signs = collection.fwht_sign_flips.as_slice();
@@ -1223,10 +1277,17 @@ mod tests {
                 let mut query = lcg_f32(dim, (qi * 31 + 997) as u32);
                 normalize(&mut query);
 
-                let mut true_dists: Vec<(f32, usize)> = vectors.iter().enumerate()
+                let mut true_dists: Vec<(f32, usize)> = vectors
+                    .iter()
+                    .enumerate()
                     .map(|(idx, v)| {
-                        let d: f32 = query.iter().zip(v.iter())
-                            .map(|(a, b)| { let diff = a - b; diff * diff })
+                        let d: f32 = query
+                            .iter()
+                            .zip(v.iter())
+                            .map(|(a, b)| {
+                                let diff = a - b;
+                                diff * diff
+                            })
                             .sum();
                         (d, idx)
                     })
@@ -1234,10 +1295,14 @@ mod tests {
                 true_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 let true_top_k: Vec<usize> = true_dists.iter().take(k).map(|&(_, id)| id).collect();
 
-                let results = brute_force_tq_adc_multibit(&query, &tq_buffer, n, &collection, k, bits);
+                let results =
+                    brute_force_tq_adc_multibit(&query, &tq_buffer, n, &collection, k, bits);
                 let adc_top_k: Vec<usize> = results.iter().map(|r| r.id.0 as usize).collect();
 
-                let hits = adc_top_k.iter().filter(|id| true_top_k.contains(id)).count();
+                let hits = adc_top_k
+                    .iter()
+                    .filter(|id| true_top_k.contains(id))
+                    .count();
                 total_recall += hits as f64 / k as f64;
             }
 

@@ -4,11 +4,13 @@
 //! are materialized (stored as actual values, not PRNG seeds) to
 //! prevent PRNG implementation drift across Rust versions.
 
-use crate::vector::aligned_buffer::AlignedBuffer;
-use crate::vector::types::DistanceMetric;
-use super::codebook::{CODEBOOK_VERSION, scaled_centroids_n, scaled_boundaries_n, code_bytes_per_vector};
+use super::codebook::{
+    CODEBOOK_VERSION, code_bytes_per_vector, scaled_boundaries_n, scaled_centroids_n,
+};
 use super::encoder::padded_dimension;
 use super::sub_centroid::SubCentroidTable;
+use crate::vector::aligned_buffer::AlignedBuffer;
+use crate::vector::types::DistanceMetric;
 
 /// HNSW build mode: controls whether raw f32 and QJL are retained.
 ///
@@ -53,7 +55,14 @@ impl QuantizationConfig {
     /// Returns true for any TurboQuant variant (1/2/3/4-bit).
     #[inline]
     pub fn is_turbo_quant(&self) -> bool {
-        matches!(self, Self::TurboQuant1 | Self::TurboQuant2 | Self::TurboQuant3 | Self::TurboQuant4 | Self::TurboQuantProd4)
+        matches!(
+            self,
+            Self::TurboQuant1
+                | Self::TurboQuant2
+                | Self::TurboQuant3
+                | Self::TurboQuant4
+                | Self::TurboQuantProd4
+        )
     }
 
     /// Number of centroids for this quantization variant: 2^bits.
@@ -119,8 +128,10 @@ pub enum CollectionMetadataError {
 impl std::fmt::Display for CollectionMetadataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ChecksumMismatch { expected, actual } =>
-                write!(f, "metadata checksum mismatch: expected {expected:#x}, got {actual:#x}"),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "metadata checksum mismatch: expected {expected:#x}, got {actual:#x}"
+            ),
         }
     }
 }
@@ -139,7 +150,14 @@ impl CollectionMetadata {
         quantization: QuantizationConfig,
         seed: u64,
     ) -> Self {
-        Self::with_build_mode(collection_id, dimension, metric, quantization, seed, BuildMode::Light)
+        Self::with_build_mode(
+            collection_id,
+            dimension,
+            metric,
+            quantization,
+            seed,
+            BuildMode::Light,
+        )
     }
 
     /// Create with explicit build mode.
@@ -159,26 +177,29 @@ impl CollectionMetadata {
         let mut rng_state = seed;
         for val in sign_flips.as_mut_slice().iter_mut() {
             // LCG constants from Knuth MMIX
-            rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            rng_state = rng_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
         // QJL matrices: only generated in Exact mode.
         // Light mode skips QJL entirely (sub-centroid handles reranking).
         const QJL_NUM_PROJECTIONS: usize = 8;
-        let (qjl_matrices, qjl_num_projections) = if build_mode == BuildMode::Exact && quantization.is_turbo_quant() {
-            let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
-                .map(|m| {
-                    super::qjl::generate_qjl_matrix(
-                        dimension as usize,
-                        seed.wrapping_add(1 + m as u64),
-                    )
-                })
-                .collect();
-            (matrices, QJL_NUM_PROJECTIONS)
-        } else {
-            (Vec::new(), 0)
-        };
+        let (qjl_matrices, qjl_num_projections) =
+            if build_mode == BuildMode::Exact && quantization.is_turbo_quant() {
+                let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
+                    .map(|m| {
+                        super::qjl::generate_qjl_matrix(
+                            dimension as usize,
+                            seed.wrapping_add(1 + m as u64),
+                        )
+                    })
+                    .collect();
+                (matrices, QJL_NUM_PROJECTIONS)
+            } else {
+                (Vec::new(), 0)
+            };
 
         // Build sub-centroid table for sign-bit refinement (doubles effective resolution).
         let sub_centroid_table = if quantization.is_turbo_quant() {
@@ -253,7 +274,8 @@ impl CollectionMetadata {
     /// Used by legacy `encode_tq_mse_scaled` which requires fixed-size array.
     pub fn codebook_boundaries_15(&self) -> &[f32; 15] {
         assert_eq!(
-            self.codebook_boundaries.len(), 15,
+            self.codebook_boundaries.len(),
+            15,
             "codebook_boundaries_15 requires 4-bit quantization (15 boundaries), got {}",
             self.codebook_boundaries.len()
         );
@@ -266,7 +288,8 @@ impl CollectionMetadata {
     /// Used by legacy `tq_l2_adc_scaled` which requires fixed-size array.
     pub fn codebook_16(&self) -> &[f32; 16] {
         assert_eq!(
-            self.codebook.len(), 16,
+            self.codebook.len(),
+            16,
             "codebook_16 requires 4-bit quantization (16 centroids), got {}",
             self.codebook.len()
         );
@@ -294,7 +317,11 @@ mod tests {
     #[test]
     fn test_new_creates_correct_padded_dimension() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert_eq!(meta.padded_dimension, 1024);
         assert_eq!(meta.dimension, 768);
@@ -303,7 +330,11 @@ mod tests {
     #[test]
     fn test_sign_flips_length_and_values() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert_eq!(meta.fwht_sign_flips.len(), 1024);
         // Every element must be exactly +1.0 or -1.0
@@ -314,17 +345,33 @@ mod tests {
             );
         }
         // Should have both +1 and -1 (probabilistic, but with 1024 elements and seed 42 this is certain)
-        let plus_count = meta.fwht_sign_flips.as_slice().iter().filter(|&&v| v == 1.0).count();
-        assert!(plus_count > 0 && plus_count < 1024, "sign flips should be mixed");
+        let plus_count = meta
+            .fwht_sign_flips
+            .as_slice()
+            .iter()
+            .filter(|&&v| v == 1.0)
+            .count();
+        assert!(
+            plus_count > 0 && plus_count < 1024,
+            "sign flips should be mixed"
+        );
     }
 
     #[test]
     fn test_checksum_deterministic() {
         let meta1 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         let meta2 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert_eq!(meta1.metadata_checksum, meta2.metadata_checksum);
         assert_ne!(meta1.metadata_checksum, 0);
@@ -333,7 +380,11 @@ mod tests {
     #[test]
     fn test_verify_checksum_ok() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert!(meta.verify_checksum().is_ok());
     }
@@ -341,7 +392,11 @@ mod tests {
     #[test]
     fn test_verify_checksum_detects_corruption() {
         let mut meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         // Corrupt the collection_id
         meta.collection_id = 999;
@@ -349,14 +404,22 @@ mod tests {
 
         // Corrupt dimension
         let mut meta2 = CollectionMetadata::new(
-            2, 384, DistanceMetric::Cosine, QuantizationConfig::TurboQuant4, 123,
+            2,
+            384,
+            DistanceMetric::Cosine,
+            QuantizationConfig::TurboQuant4,
+            123,
         );
         meta2.dimension = 999;
         assert!(meta2.verify_checksum().is_err());
 
         // Corrupt a sign flip
         let mut meta3 = CollectionMetadata::new(
-            3, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 77,
+            3,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            77,
         );
         meta3.fwht_sign_flips.as_mut_slice()[0] = 0.5; // invalid value
         assert!(meta3.verify_checksum().is_err());
@@ -365,7 +428,11 @@ mod tests {
     #[test]
     fn test_codebook_version_matches() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert_eq!(meta.codebook_version, CODEBOOK_VERSION);
     }
@@ -373,10 +440,18 @@ mod tests {
     #[test]
     fn test_different_seeds_produce_different_flips() {
         let meta1 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         let meta2 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 99,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            99,
         );
         // Different seeds -> different sign flips -> different checksum
         assert_ne!(meta1.metadata_checksum, meta2.metadata_checksum);
@@ -426,7 +501,11 @@ mod tests {
     #[test]
     fn test_tq1_codebook_has_2_centroids_1_boundary() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant1, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant1,
+            42,
         );
         assert_eq!(meta.codebook.len(), 2);
         assert_eq!(meta.codebook_boundaries.len(), 1);
@@ -436,7 +515,11 @@ mod tests {
     #[test]
     fn test_tq2_codebook_has_4_centroids_3_boundaries() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant2, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant2,
+            42,
         );
         assert_eq!(meta.codebook.len(), 4);
         assert_eq!(meta.codebook_boundaries.len(), 3);
@@ -446,7 +529,11 @@ mod tests {
     #[test]
     fn test_tq3_codebook_has_8_centroids_7_boundaries() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant3, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant3,
+            42,
         );
         assert_eq!(meta.codebook.len(), 8);
         assert_eq!(meta.codebook_boundaries.len(), 7);
@@ -456,7 +543,11 @@ mod tests {
     #[test]
     fn test_tq4_still_has_16_centroids_15_boundaries() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert_eq!(meta.codebook.len(), 16);
         assert_eq!(meta.codebook_boundaries.len(), 15);
@@ -466,19 +557,31 @@ mod tests {
     #[test]
     fn test_code_bytes_per_vector() {
         let meta1 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant1, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant1,
+            42,
         );
         // 768 pads to 1024. 1-bit: 1024/8 = 128
         assert_eq!(meta1.code_bytes_per_vector(), 128);
 
         let meta2 = CollectionMetadata::new(
-            2, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant2, 42,
+            2,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant2,
+            42,
         );
         // 2-bit: 1024/4 = 256
         assert_eq!(meta2.code_bytes_per_vector(), 256);
 
         let meta4 = CollectionMetadata::new(
-            4, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            4,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         // 4-bit: 1024/2 = 512
         assert_eq!(meta4.code_bytes_per_vector(), 512);
@@ -487,10 +590,18 @@ mod tests {
     #[test]
     fn test_checksum_changes_when_quantization_changes() {
         let meta1 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant1, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant1,
+            42,
         );
         let meta4 = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         assert_ne!(meta1.metadata_checksum, meta4.metadata_checksum);
     }
@@ -498,7 +609,11 @@ mod tests {
     #[test]
     fn test_codebook_16_accessor() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         let cb: &[f32; 16] = meta.codebook_16();
         assert_eq!(cb.len(), 16);
@@ -507,7 +622,11 @@ mod tests {
     #[test]
     fn test_codebook_boundaries_15_accessor() {
         let meta = CollectionMetadata::new(
-            1, 768, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
         let bb: &[f32; 15] = meta.codebook_boundaries_15();
         assert_eq!(bb.len(), 15);

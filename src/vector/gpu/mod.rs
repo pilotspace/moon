@@ -18,10 +18,10 @@ mod context;
 mod error;
 mod fwht_kernel;
 
-pub use cagra::{gpu_build_hnsw, MIN_VECTORS_FOR_GPU};
+pub use cagra::{MIN_VECTORS_FOR_GPU, gpu_build_hnsw};
 pub use context::GpuContext;
 pub use error::GpuBuildError;
-pub use fwht_kernel::{gpu_batch_fwht, MIN_BATCH_FOR_GPU};
+pub use fwht_kernel::{MIN_BATCH_FOR_GPU, gpu_batch_fwht};
 
 use super::hnsw::graph::HnswGraph;
 
@@ -60,11 +60,7 @@ pub fn try_gpu_build_hnsw(
 /// Creates a fresh `GpuContext` on device 0, runs the batch FWHT kernel in-place
 /// on `vectors`. On success the slice is modified and `true` is returned. On any
 /// failure the slice is left unmodified and `false` is returned.
-pub fn try_gpu_batch_fwht(
-    vectors: &mut [f32],
-    sign_flips: &[f32],
-    padded_dim: usize,
-) -> bool {
+pub fn try_gpu_batch_fwht(vectors: &mut [f32], sign_flips: &[f32], padded_dim: usize) -> bool {
     match GpuContext::new(0) {
         Ok(ctx) => match gpu_batch_fwht(&ctx, vectors, sign_flips, padded_dim) {
             Ok(()) => true,

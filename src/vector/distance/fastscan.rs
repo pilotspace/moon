@@ -69,18 +69,13 @@ pub fn fastscan_dispatch() -> &'static FastScanDispatch {
 /// `results`: Output accumulated u16 distances for 32 vectors (caller-provided).
 ///
 /// No allocations.
-pub fn fastscan_block_scalar(
-    codes: &[u8],
-    lut: &[u8],
-    dim_half: usize,
-    results: &mut [u16; 32],
-) {
+pub fn fastscan_block_scalar(codes: &[u8], lut: &[u8], dim_half: usize, results: &mut [u16; 32]) {
     // Zero-initialize results.
     *results = [0u16; 32];
 
     for d in 0..dim_half {
         let code_base = d * BLOCK_SIZE;
-        let lut_lo_base = (2 * d) * 16;     // even coordinate LUT
+        let lut_lo_base = (2 * d) * 16; // even coordinate LUT
         let lut_hi_base = (2 * d + 1) * 16; // odd coordinate LUT
 
         for v in 0..BLOCK_SIZE {
@@ -140,12 +135,12 @@ pub unsafe fn fastscan_block_avx2(
 
         // Broadcast 16-byte LUT to both 128-bit lanes.
         // SAFETY: lut has at least padded_dim * 16 bytes.
-        let lut_lo_vec = _mm256_broadcastsi128_si256(
-            _mm_loadu_si128(lut.as_ptr().add(lut_lo_base) as *const __m128i),
-        );
-        let lut_hi_vec = _mm256_broadcastsi128_si256(
-            _mm_loadu_si128(lut.as_ptr().add(lut_hi_base) as *const __m128i),
-        );
+        let lut_lo_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            lut.as_ptr().add(lut_lo_base) as *const __m128i,
+        ));
+        let lut_hi_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            lut.as_ptr().add(lut_hi_base) as *const __m128i,
+        ));
 
         // VPSHUFB: 32 parallel lookups.
         let dist_lo = _mm256_shuffle_epi8(lut_lo_vec, lo_nibbles);
@@ -256,10 +251,7 @@ mod tests {
 
     /// Build a simple interleaved block + LUT for testing.
     /// Returns (codes, lut, dim_half).
-    fn make_test_block(
-        dim_half: usize,
-        n_vectors: usize,
-    ) -> (Vec<u8>, Vec<u8>, usize) {
+    fn make_test_block(dim_half: usize, n_vectors: usize) -> (Vec<u8>, Vec<u8>, usize) {
         let padded_dim = dim_half * 2;
         let mut codes = vec![0u8; dim_half * BLOCK_SIZE];
         let mut lut = vec![0u8; padded_dim * 16];
@@ -301,11 +293,18 @@ mod tests {
         // Per sub-dim: v + v = 2*v.
         // Over dim_half=2: 2 * 2*v = 4*v.
         for v in 0..n_vectors {
-            assert_eq!(results[v], (4 * v) as u16, "scalar distance mismatch for v={v}");
+            assert_eq!(
+                results[v],
+                (4 * v) as u16,
+                "scalar distance mismatch for v={v}"
+            );
         }
         // Zero-padded vectors should have distance 0.
         for v in n_vectors..BLOCK_SIZE {
-            assert_eq!(results[v], 0, "zero-padded vector {v} should have distance 0");
+            assert_eq!(
+                results[v], 0,
+                "zero-padded vector {v} should have distance 0"
+            );
         }
     }
 
@@ -321,7 +320,7 @@ mod tests {
         // LUT for coord 1: [0, 5, 10, 15, ...]  (dist = k * 5)
         for k in 0..16 {
             lut[0 * 16 + k] = (k * 10).min(255) as u8; // coord 0
-            lut[1 * 16 + k] = (k * 5).min(255) as u8;  // coord 1
+            lut[1 * 16 + k] = (k * 5).min(255) as u8; // coord 1
         }
 
         // Vector 0: lo_idx=2, hi_idx=3 -> byte = 0x32
@@ -384,7 +383,16 @@ mod tests {
         let norms = vec![1.0f32; n];
 
         let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
-        scan_posting_list(&codes, &lut, dim_half, &ids, &norms, n as u32, 3, &mut results);
+        scan_posting_list(
+            &codes,
+            &lut,
+            dim_half,
+            &ids,
+            &norms,
+            n as u32,
+            3,
+            &mut results,
+        );
 
         assert_eq!(results.len(), 3, "should return top 3");
         // Vector 0 has distance 0, should be first.

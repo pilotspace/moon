@@ -559,8 +559,13 @@ impl Database {
             None => {
                 // This should not happen — insert was just called above.
                 // Log and return an error instead of panicking.
-                tracing::error!("get_or_create_hash: get_mut returned None after insert for key len={}", key.len());
-                return Err(Frame::Error(bytes::Bytes::from_static(b"ERR internal: hash lookup failed after insert")));
+                tracing::error!(
+                    "get_or_create_hash: get_mut returned None after insert for key len={}",
+                    key.len()
+                );
+                return Err(Frame::Error(bytes::Bytes::from_static(
+                    b"ERR internal: hash lookup failed after insert",
+                )));
             }
         };
         // Upgrade compact listpack to full HashMap if needed

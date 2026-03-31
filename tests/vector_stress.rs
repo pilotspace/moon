@@ -4,10 +4,12 @@
 //! over 10,000 cycles. Single-threaded (matches shard model). Validates zero panics
 //! and data integrity under adversarial operation ordering.
 
+use std::sync::Arc;
+
 use moon::vector::distance;
 use moon::vector::segment::mutable::MutableSegment;
 use moon::vector::store::{IndexMeta, VectorStore};
-use moon::vector::turbo_quant::collection::QuantizationConfig;
+use moon::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
 use moon::vector::turbo_quant::encoder::padded_dimension;
 use moon::vector::types::DistanceMetric;
 
@@ -27,7 +29,10 @@ impl Lcg {
     }
 
     fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.state >> 32) as u32
     }
 
@@ -44,10 +49,24 @@ fn make_index_meta(name: &str, dim: u32) -> IndexMeta {
         metric: DistanceMetric::L2,
         hnsw_m: 16,
         hnsw_ef_construction: 200,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 10000,
         source_field: Bytes::from_static(b"vec"),
         key_prefixes: vec![Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
     }
+}
+
+fn make_test_collection(dim: u32) -> Arc<CollectionMetadata> {
+    Arc::new(CollectionMetadata::with_build_mode(
+        1,
+        dim,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+        BuildMode::Light,
+    ))
 }
 
 fn fill_vectors(rng: &mut Lcg, f32_buf: &mut Vec<f32>, sq_buf: &mut Vec<i8>, dim: usize) {
@@ -66,7 +85,9 @@ fn test_stress_10k_interleaved_operations() {
     distance::init();
 
     let mut store = VectorStore::new();
-    store.create_index(make_index_meta("stress_idx", DIM as u32)).unwrap();
+    store
+        .create_index(make_index_meta("stress_idx", DIM as u32))
+        .unwrap();
 
     let idx = store.get_index_mut(b"stress_idx").unwrap();
     let snap = idx.segments.load();
@@ -79,7 +100,7 @@ fn test_stress_10k_interleaved_operations() {
     // Reusable buffers -- zero allocation in the hot loop
     let mut f32_buf: Vec<f32> = Vec::with_capacity(DIM);
     let mut sq_buf: Vec<i8> = Vec::with_capacity(DIM);
-    let mut query_sq: Vec<i8> = Vec::with_capacity(DIM);
+    let mut query_f32: Vec<f32> = Vec::with_capacity(DIM);
 
     for i in 0..ITERATIONS {
         let op = rng.next_u32() % 100;
@@ -94,11 +115,11 @@ fn test_stress_10k_interleaved_operations() {
             // SEARCH (30%)
             if !inserted_ids.is_empty() {
                 // Generate a random query
-                query_sq.clear();
+                query_f32.clear();
                 for _ in 0..DIM {
-                    query_sq.push(rng.next_u32() as i8);
+                    query_f32.push(rng.next_f32());
                 }
-                let results = mutable.brute_force_search(&query_sq, 10);
+                let results = mutable.brute_force_search(&query_f32, None, 10);
                 assert!(results.len() <= 10, "result count exceeds k");
                 for r in &results {
                     assert!(r.distance >= 0.0, "negative distance at iteration {i}");
@@ -118,7 +139,10 @@ fn test_stress_10k_interleaved_operations() {
             // COMPACT-CHECK (10%)
             if mutable.is_full() {
                 let frozen = mutable.freeze();
-                assert!(!frozen.entries.is_empty(), "frozen segment should be non-empty");
+                assert!(
+                    !frozen.entries.is_empty(),
+                    "frozen segment should be non-empty"
+                );
                 std::hint::black_box(&frozen);
             }
         }
@@ -128,18 +152,21 @@ fn test_stress_10k_interleaved_operations() {
     let total_appended = mutable.len();
     let expected_live = total_appended - deleted_count;
     assert_eq!(
-        inserted_ids.len(), expected_live,
+        inserted_ids.len(),
+        expected_live,
         "tracked live IDs ({}) != total appended ({}) - deleted ({})",
-        inserted_ids.len(), total_appended, deleted_count
+        inserted_ids.len(),
+        total_appended,
+        deleted_count
     );
 
     // Final search should not panic and should return valid results
     if !inserted_ids.is_empty() {
-        query_sq.clear();
+        query_f32.clear();
         for _ in 0..DIM {
-            query_sq.push(0i8);
+            query_f32.push(0.0f32);
         }
-        let final_results = mutable.brute_force_search(&query_sq, 10);
+        let final_results = mutable.brute_force_search(&query_f32, None, 10);
         // At minimum we should get some results (there are live vectors)
         // Could be fewer than 10 if many were deleted
         assert!(
@@ -158,7 +185,8 @@ fn test_stress_interleaved_search_during_compaction() {
     distance::init();
 
     let dim: usize = 64;
-    let seg = MutableSegment::new(dim as u32);
+    let collection = make_test_collection(dim as u32);
+    let seg = MutableSegment::new(dim as u32, collection);
 
     let mut rng = Lcg::new(123);
     let mut f32_buf: Vec<f32> = Vec::with_capacity(dim);
@@ -181,32 +209,34 @@ fn test_stress_interleaved_search_during_compaction() {
 
     // Immediately search the original mutable segment while "compaction" holds the frozen snapshot.
     // This simulates concurrent search during compaction state transition.
-    let mut query_sq: Vec<i8> = Vec::with_capacity(dim);
+    let mut query_f32: Vec<f32> = Vec::with_capacity(dim);
     for _ in 0..dim {
-        query_sq.push(rng.next_u32() as i8);
+        query_f32.push(rng.next_f32());
     }
-    let results = seg.brute_force_search(&query_sq, 10);
+    let results = seg.brute_force_search(&query_f32, None, 10);
     assert!(results.len() <= 10);
-    assert!(!results.is_empty(), "search should find vectors in non-empty segment");
+    assert!(
+        !results.is_empty(),
+        "search should find vectors in non-empty segment"
+    );
     for r in &results {
-        assert!(r.distance >= 0.0, "negative distance during compaction search");
+        assert!(
+            r.distance >= 0.0,
+            "negative distance during compaction search"
+        );
     }
 
     // Search the frozen snapshot too -- validates no stale pointer issues
     // FrozenSegment doesn't have search, but we can verify data integrity
-    assert!(!frozen.vectors_sq.is_empty());
-    assert_eq!(frozen.vectors_sq.len(), insert_count * dim);
-    assert_eq!(frozen.vectors_f32.len(), insert_count * dim);
+    assert!(!frozen.tq_codes.is_empty());
 
-    // Verify no entry has a corrupted vector_offset
+    // Verify all entries have valid internal_ids
     for (i, entry) in frozen.entries.iter().enumerate() {
         assert_eq!(entry.internal_id, i as u32);
-        let offset = entry.vector_offset as usize * dim;
-        assert!(
-            offset + dim <= frozen.vectors_sq.len(),
-            "entry {i} has out-of-bounds vector_offset"
-        );
     }
+    // Verify TQ codes have correct total length
+    let bytes_per_code = frozen.bytes_per_code;
+    assert_eq!(frozen.tq_codes.len(), insert_count * bytes_per_code);
 
     std::hint::black_box(&results);
     std::hint::black_box(&frozen);

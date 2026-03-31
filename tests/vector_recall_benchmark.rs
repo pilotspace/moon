@@ -7,7 +7,7 @@
 
 use moon::vector::distance;
 use moon::vector::hnsw::build::HnswBuilder;
-use moon::vector::hnsw::search::{hnsw_search, SearchScratch};
+use moon::vector::hnsw::search::{SearchScratch, hnsw_search};
 use moon::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use moon::vector::turbo_quant::encoder::{encode_tq_mse_scaled, padded_dimension};
 use moon::vector::turbo_quant::fwht;
@@ -21,7 +21,10 @@ impl Rng {
         Self(seed)
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn next_f32(&mut self) -> f32 {
@@ -72,7 +75,13 @@ fn measure_recall(n: u32, d: usize, n_queries: usize, ef_search: usize, k: usize
     let vectors = generate_unit_vectors(n as usize, d, 42);
     let queries = generate_unit_vectors(n_queries, d, 999);
 
-    let meta = CollectionMetadata::new(0, d as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42);
+    let meta = CollectionMetadata::new(
+        0,
+        d as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+    );
     let padded = padded_dimension(d as u32) as usize;
     let bytes_per_code = padded / 2 + 4;
 
@@ -81,8 +90,17 @@ fn measure_recall(n: u32, d: usize, n_queries: usize, ef_search: usize, k: usize
     let mut work = vec![0.0f32; padded];
     for i in 0..n as usize {
         let v = &vectors[i * d..(i + 1) * d];
-        let boundaries_arr: &[f32; 15] = meta.codebook_boundaries.as_slice().try_into().expect("boundaries must be 15 elements for 4-bit TQ");
-        let code = encode_tq_mse_scaled(v, meta.fwht_sign_flips.as_slice(), boundaries_arr, &mut work);
+        let boundaries_arr: &[f32; 15] = meta
+            .codebook_boundaries
+            .as_slice()
+            .try_into()
+            .expect("boundaries must be 15 elements for 4-bit TQ");
+        let code = encode_tq_mse_scaled(
+            v,
+            meta.fwht_sign_flips.as_slice(),
+            boundaries_arr,
+            &mut work,
+        );
         all_tq.extend_from_slice(&code.codes);
         all_tq.extend_from_slice(&code.norm.to_le_bytes());
     }
@@ -98,21 +116,36 @@ fn measure_recall(n: u32, d: usize, n_queries: usize, ef_search: usize, k: usize
         // Normalize
         let norm: f32 = rot[..d].iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
-            for x in rot[..d].iter_mut() { *x /= norm; }
+            for x in rot[..d].iter_mut() {
+                *x /= norm;
+            }
         }
-        for x in rot[d..padded].iter_mut() { *x = 0.0; }
+        for x in rot[d..padded].iter_mut() {
+            *x = 0.0;
+        }
         fwht::fwht(&mut rot[..padded], meta.fwht_sign_flips.as_slice());
     }
 
-    let codebook: &[f32; 16] = meta.codebook.as_slice().try_into().expect("codebook must be 16 elements for 4-bit TQ");
+    let codebook: &[f32; 16] = meta
+        .codebook
+        .as_slice()
+        .try_into()
+        .expect("codebook must be 16 elements for 4-bit TQ");
     let mut builder = HnswBuilder::new(16, 200, 42);
     for _ in 0..n {
         builder.insert(|a, b| {
             // Use TQ-ADC(a as query, b as code) for symmetric-ish construction
             let q_rot = &rotated_vecs[a as usize * padded..(a as usize + 1) * padded];
-            let b_code = &all_tq[b as usize * bytes_per_code..b as usize * bytes_per_code + padded / 2];
-            let b_norm_bytes = &all_tq[b as usize * bytes_per_code + padded / 2..b as usize * bytes_per_code + padded / 2 + 4];
-            let b_norm = f32::from_le_bytes([b_norm_bytes[0], b_norm_bytes[1], b_norm_bytes[2], b_norm_bytes[3]]);
+            let b_code =
+                &all_tq[b as usize * bytes_per_code..b as usize * bytes_per_code + padded / 2];
+            let b_norm_bytes = &all_tq[b as usize * bytes_per_code + padded / 2
+                ..b as usize * bytes_per_code + padded / 2 + 4];
+            let b_norm = f32::from_le_bytes([
+                b_norm_bytes[0],
+                b_norm_bytes[1],
+                b_norm_bytes[2],
+                b_norm_bytes[3],
+            ]);
             tq_l2_adc_scaled(q_rot, b_code, b_norm, codebook)
         });
     }
@@ -280,7 +313,13 @@ fn recall_debug_1k_128d() {
     let vectors = generate_unit_vectors(n as usize, d, 42);
     let queries = generate_unit_vectors(5, d, 999);
 
-    let meta = CollectionMetadata::new(0, d as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42);
+    let meta = CollectionMetadata::new(
+        0,
+        d as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+    );
     let padded = padded_dimension(d as u32) as usize;
     let bytes_per_code = padded / 2 + 4;
 
@@ -288,8 +327,17 @@ fn recall_debug_1k_128d() {
     let mut work = vec![0.0f32; padded];
     for i in 0..n as usize {
         let v = &vectors[i * d..(i + 1) * d];
-        let boundaries_arr: &[f32; 15] = meta.codebook_boundaries.as_slice().try_into().expect("boundaries must be 15 elements for 4-bit TQ");
-        let code = encode_tq_mse_scaled(v, meta.fwht_sign_flips.as_slice(), boundaries_arr, &mut work);
+        let boundaries_arr: &[f32; 15] = meta
+            .codebook_boundaries
+            .as_slice()
+            .try_into()
+            .expect("boundaries must be 15 elements for 4-bit TQ");
+        let code = encode_tq_mse_scaled(
+            v,
+            meta.fwht_sign_flips.as_slice(),
+            boundaries_arr,
+            &mut work,
+        );
         all_tq.extend_from_slice(&code.codes);
         all_tq.extend_from_slice(&code.norm.to_le_bytes());
     }
@@ -318,8 +366,14 @@ fn recall_debug_1k_128d() {
         println!("         overlap={tp}/{k}");
 
         // Also check: are HNSW results at least close to query?
-        let gt_dists: Vec<f32> = gt.iter().map(|&id| l2_fn(q, &vectors[id as usize * d..(id as usize + 1) * d])).collect();
-        let hnsw_dists: Vec<f32> = predicted.iter().map(|&id| l2_fn(q, &vectors[id as usize * d..(id as usize + 1) * d])).collect();
+        let gt_dists: Vec<f32> = gt
+            .iter()
+            .map(|&id| l2_fn(q, &vectors[id as usize * d..(id as usize + 1) * d]))
+            .collect();
+        let hnsw_dists: Vec<f32> = predicted
+            .iter()
+            .map(|&id| l2_fn(q, &vectors[id as usize * d..(id as usize + 1) * d]))
+            .collect();
         println!("         GT dists: {gt_dists:.4?}");
         println!("         HNSW dists: {hnsw_dists:.4?}");
         println!();

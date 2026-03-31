@@ -309,7 +309,10 @@ mod tests {
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { l2_f32(&a, &b) };
         let rel = (got - expected).abs() / expected.abs().max(1e-10);
-        assert!(rel < 1e-4, "l2_f32 mismatch: scalar={expected}, neon={got}, rel={rel}");
+        assert!(
+            rel < 1e-4,
+            "l2_f32 mismatch: scalar={expected}, neon={got}, rel={rel}"
+        );
     }
 
     #[test]
@@ -319,7 +322,10 @@ mod tests {
         let expected = scalar::l2_i8(&a, &b);
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { l2_i8(&a, &b) };
-        assert_eq!(got, expected, "l2_i8 mismatch: scalar={expected}, neon={got}");
+        assert_eq!(
+            got, expected,
+            "l2_i8 mismatch: scalar={expected}, neon={got}"
+        );
     }
 
     #[test]
@@ -330,7 +336,10 @@ mod tests {
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { dot_f32(&a, &b) };
         let rel = (got - expected).abs() / expected.abs().max(1e-10);
-        assert!(rel < 1e-4, "dot_f32 mismatch: scalar={expected}, neon={got}, rel={rel}");
+        assert!(
+            rel < 1e-4,
+            "dot_f32 mismatch: scalar={expected}, neon={got}, rel={rel}"
+        );
     }
 
     #[test]
@@ -341,7 +350,10 @@ mod tests {
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { cosine_f32(&a, &b) };
         let rel = (got - expected).abs() / expected.abs().max(1e-10);
-        assert!(rel < 1e-3, "cosine_f32 mismatch: scalar={expected}, neon={got}, rel={rel}");
+        assert!(
+            rel < 1e-3,
+            "cosine_f32 mismatch: scalar={expected}, neon={got}, rel={rel}"
+        );
     }
 
     #[test]
@@ -354,13 +366,19 @@ mod tests {
             // SAFETY: NEON is baseline on AArch64.
             let got_l2 = unsafe { l2_f32(&a, &b) };
             let rel = (got_l2 - expected_l2).abs() / expected_l2.abs().max(1e-10);
-            assert!(rel < 1e-4, "l2 tail len={len}: scalar={expected_l2}, neon={got_l2}");
+            assert!(
+                rel < 1e-4,
+                "l2 tail len={len}: scalar={expected_l2}, neon={got_l2}"
+            );
 
             let expected_dot = scalar::dot_f32(&a, &b);
             // SAFETY: NEON is baseline on AArch64.
             let got_dot = unsafe { dot_f32(&a, &b) };
             let rel = (got_dot - expected_dot).abs() / expected_dot.abs().max(1e-10);
-            assert!(rel < 1e-4, "dot tail len={len}: scalar={expected_dot}, neon={got_dot}");
+            assert!(
+                rel < 1e-4,
+                "dot tail len={len}: scalar={expected_dot}, neon={got_dot}"
+            );
 
             let ai = gen_i8(len, 42);
             let bi = gen_i8(len, 99);

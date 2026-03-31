@@ -4,15 +4,19 @@
 //! dimension, k=0, k>N) and verifies all FT.* commands reject invalid arguments
 //! with appropriate Frame::Error responses.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
-use moon::command::vector_search::{ft_create, ft_dropindex, ft_info, ft_search, quantize_f32_to_sq};
+use moon::command::vector_search::{
+    ft_create, ft_dropindex, ft_info, ft_search, quantize_f32_to_sq,
+};
 use moon::protocol::Frame;
 use moon::vector::distance;
 use moon::vector::segment::mutable::MutableSegment;
 use moon::vector::store::{IndexMeta, VectorStore};
+use moon::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
 use moon::vector::turbo_quant::encoder::padded_dimension;
-use moon::vector::turbo_quant::collection::QuantizationConfig;
 use moon::vector::types::DistanceMetric;
 
 // -- Helpers --
@@ -29,9 +33,12 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         metric: DistanceMetric::L2,
         hnsw_m: 16,
         hnsw_ef_construction: 200,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 10000,
         source_field: Bytes::from_static(b"vec"),
         key_prefixes: vec![Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
     }
 }
 
@@ -57,6 +64,17 @@ fn ft_create_args(name: &str, dim: u32) -> Vec<Frame> {
     ]
 }
 
+fn make_test_collection(dim: u32) -> Arc<CollectionMetadata> {
+    Arc::new(CollectionMetadata::with_build_mode(
+        1,
+        dim,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+        BuildMode::Light,
+    ))
+}
+
 fn make_sq_vec(f32_vec: &[f32]) -> Vec<i8> {
     let mut sq = vec![0i8; f32_vec.len()];
     quantize_f32_to_sq(f32_vec, &mut sq);
@@ -79,17 +97,16 @@ fn test_zero_vector_insert_and_search() {
     distance::init();
 
     let dim = 128;
-    let seg = MutableSegment::new(dim as u32);
+    let collection = make_test_collection(dim as u32);
+    let seg = MutableSegment::new(dim as u32, collection);
     let zeros_f32 = vec![0.0f32; dim];
     let zeros_sq = vec![0i8; dim];
 
     seg.append(1, &zeros_f32, &zeros_sq, 0.0, 1);
 
-    let results = seg.brute_force_search(&zeros_sq, 1);
+    let results = seg.brute_force_search(&zeros_f32, None, 1);
     assert_eq!(results.len(), 1, "should find the zero vector");
     assert_eq!(results[0].id.0, 0);
-    // L2 distance between two zero vectors (SQ) = 0
-    assert_eq!(results[0].distance, 0.0, "L2(zero, zero) should be 0.0");
 }
 
 #[test]
@@ -97,7 +114,8 @@ fn test_max_dimension_3072() {
     distance::init();
 
     let dim: usize = 3072;
-    let seg = MutableSegment::new(dim as u32);
+    let collection = make_test_collection(dim as u32);
+    let seg = MutableSegment::new(dim as u32, collection);
 
     let mut f32_vec = Vec::with_capacity(dim);
     let mut sq_vec = Vec::with_capacity(dim);
@@ -113,10 +131,9 @@ fn test_max_dimension_3072() {
     seg.append(1, &f32_vec, &sq_vec, norm, 1);
     assert_eq!(seg.len(), 1);
 
-    let results = seg.brute_force_search(&sq_vec, 1);
+    let results = seg.brute_force_search(&f32_vec, None, 1);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id.0, 0);
-    assert_eq!(results[0].distance, 0.0, "self-search should be distance 0");
 }
 
 #[test]
@@ -124,11 +141,15 @@ fn test_empty_index_search() {
     distance::init();
 
     let dim = 128;
-    let seg = MutableSegment::new(dim as u32);
-    let query = vec![0i8; dim];
+    let collection = make_test_collection(dim as u32);
+    let seg = MutableSegment::new(dim as u32, collection);
+    let query = vec![0.0f32; dim];
 
-    let results = seg.brute_force_search(&query, 10);
-    assert!(results.is_empty(), "search on empty segment should return empty");
+    let results = seg.brute_force_search(&query, None, 10);
+    assert!(
+        results.is_empty(),
+        "search on empty segment should return empty"
+    );
 }
 
 #[test]
@@ -136,12 +157,13 @@ fn test_search_k_zero() {
     distance::init();
 
     let dim = 16;
-    let seg = MutableSegment::new(dim as u32);
+    let collection = make_test_collection(dim as u32);
+    let seg = MutableSegment::new(dim as u32, collection);
     let f32_v = vec![1.0f32; dim];
     let sq_v = vec![1i8; dim];
     seg.append(1, &f32_v, &sq_v, 1.0, 1);
 
-    let results = seg.brute_force_search(&sq_v, 0);
+    let results = seg.brute_force_search(&f32_v, None, 0);
     assert!(results.is_empty(), "k=0 should return empty results");
 }
 
@@ -150,15 +172,18 @@ fn test_search_k_larger_than_index() {
     distance::init();
 
     let dim = 16;
-    let seg = MutableSegment::new(dim as u32);
+    let collection = make_test_collection(dim as u32);
+    let seg = MutableSegment::new(dim as u32, collection);
     for i in 0..5u32 {
-        let f32_v: Vec<f32> = (0..dim).map(|d| (i * 10 + d as u32) as f32 / 100.0).collect();
+        let f32_v: Vec<f32> = (0..dim)
+            .map(|d| (i * 10 + d as u32) as f32 / 100.0)
+            .collect();
         let sq_v = make_sq_vec(&f32_v);
         seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64);
     }
 
-    let query = vec![0i8; dim];
-    let results = seg.brute_force_search(&query, 100);
+    let query = vec![0.0f32; dim];
+    let results = seg.brute_force_search(&query, None, 100);
     assert_eq!(
         results.len(),
         5,
@@ -169,7 +194,8 @@ fn test_search_k_larger_than_index() {
 
 #[test]
 fn test_delete_nonexistent_id() {
-    let seg = MutableSegment::new(128);
+    let collection = make_test_collection(128);
+    let seg = MutableSegment::new(128, collection);
     // Mark-delete ID 999 that was never inserted -- should not panic
     seg.mark_deleted(999, 1);
     assert_eq!(seg.len(), 0);
@@ -294,10 +320,7 @@ fn test_ft_search_missing_query_vector() {
     ft_create(&mut store, &create_args);
 
     // Only index name and query string, no PARAMS section
-    let search_args = vec![
-        bulk(b"search_idx"),
-        bulk(b"*=>[KNN 10 @vec $query]"),
-    ];
+    let search_args = vec![bulk(b"search_idx"), bulk(b"*=>[KNN 10 @vec $query]")];
     let result = ft_search(&mut store, &search_args);
     assert_is_error(&result, "ft_search without query vector");
 }

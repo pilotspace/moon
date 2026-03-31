@@ -69,12 +69,7 @@ impl PostingList {
 ///
 /// No allocations. Caller provides `out` buffer of at least `dim_half * 32` bytes.
 #[inline]
-pub fn interleave_block(
-    codes: &[u8],
-    n_vectors: usize,
-    dim_half: usize,
-    out: &mut [u8],
-) {
+pub fn interleave_block(codes: &[u8], n_vectors: usize, dim_half: usize, out: &mut [u8]) {
     debug_assert!(n_vectors <= BLOCK_SIZE);
     debug_assert!(out.len() >= dim_half * BLOCK_SIZE);
 
@@ -374,7 +369,10 @@ impl Lcg {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
 
@@ -417,8 +415,7 @@ pub fn kmeans_lloyd(
             attempts += 1;
         }
         chosen.push(idx);
-        centroids[i * dim..(i + 1) * dim]
-            .copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
+        centroids[i * dim..(i + 1) * dim].copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
     }
 
     let l2_f32 = crate::vector::distance::table().l2_f32;
@@ -505,7 +502,11 @@ pub fn find_nprobe_nearest(
     // Partial sort would be optimal but full sort is fine for typical n_clusters.
     dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    dists.iter().take(effective_nprobe).map(|&(_, idx)| idx).collect()
+    dists
+        .iter()
+        .take(effective_nprobe)
+        .map(|&(_, idx)| idx)
+        .collect()
 }
 
 /// Build an IvfSegment from raw vectors, TQ codes, norms, and IDs.
@@ -590,7 +591,11 @@ mod tests {
         let mut s = seed;
         for _ in 0..len {
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            if s & 1 == 0 { flips.push(1.0); } else { flips.push(-1.0); }
+            if s & 1 == 0 {
+                flips.push(1.0);
+            } else {
+                flips.push(-1.0);
+            }
         }
         flips
     }
@@ -689,7 +694,9 @@ mod tests {
         let mut norms = Vec::with_capacity(n);
 
         for v in 0..n {
-            let code: Vec<u8> = (0..dim_half).map(|d| ((v * dim_half + d) & 0xFF) as u8).collect();
+            let code: Vec<u8> = (0..dim_half)
+                .map(|d| ((v * dim_half + d) & 0xFF) as u8)
+                .collect();
             packed_codes.push(code);
             ids.push(v as u32);
             norms.push(1.0 + v as f32 * 0.01);
@@ -730,7 +737,8 @@ mod tests {
                 let expected_dist = CENTROIDS[k] * CENTROIDS[k];
                 let expected_u8 = quantize_dist_to_u8(expected_dist);
                 assert_eq!(
-                    lut[coord * 16 + k], expected_u8,
+                    lut[coord * 16 + k],
+                    expected_u8,
                     "LUT mismatch at coord={coord}, k={k}: dist={expected_dist}"
                 );
             }
@@ -765,9 +773,7 @@ mod tests {
         let n_clusters = 4u32;
         let centroids = AlignedBuffer::new((n_clusters * dim) as usize);
 
-        let posting_lists: Vec<PostingList> = (0..n_clusters)
-            .map(|_| PostingList::new())
-            .collect();
+        let posting_lists: Vec<PostingList> = (0..n_clusters).map(|_| PostingList::new()).collect();
 
         let seg = IvfSegment::new(
             centroids,
@@ -885,10 +891,7 @@ mod tests {
         crate::vector::distance::init();
         let dim = 4;
         let centroids = vec![
-            0.0, 0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0, 0.0,
-            2.0, 0.0, 0.0, 0.0,
-            3.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0,
         ];
         let query = vec![0.0, 0.0, 0.0, 0.0];
         let nearest = find_nprobe_nearest(&query, &centroids, dim, 4, 4);
@@ -943,7 +946,11 @@ mod tests {
 
         // All results should be from cluster 0 (ids 0-3).
         for r in &results {
-            assert!(r.id.0 < 4, "nprobe=1 should only return cluster 0 vectors, got id={}", r.id.0);
+            assert!(
+                r.id.0 < 4,
+                "nprobe=1 should only return cluster 0 vectors, got id={}",
+                r.id.0
+            );
         }
     }
 
@@ -1035,7 +1042,11 @@ mod tests {
 
         let results = seg.search_filtered(&query, &q_rotated, 8, 1, &mut lut_buf, &bitmap);
         for r in &results {
-            assert!(bitmap.contains(r.id.0), "filtered result id {} not in bitmap", r.id.0);
+            assert!(
+                bitmap.contains(r.id.0),
+                "filtered result id {} not in bitmap",
+                r.id.0
+            );
         }
     }
 
@@ -1120,7 +1131,12 @@ mod tests {
             // Create TQ codes: encode using real encoder for accurate recall.
             let mut work_buf = vec![0.0f32; pdim];
             let boundaries = crate::vector::turbo_quant::codebook::scaled_boundaries(pdim as u32);
-            let code = crate::vector::turbo_quant::encoder::encode_tq_mse_scaled(v, &signs, &boundaries, &mut work_buf);
+            let code = crate::vector::turbo_quant::encoder::encode_tq_mse_scaled(
+                v,
+                &signs,
+                &boundaries,
+                &mut work_buf,
+            );
             tq_codes.push(code.codes);
         }
 

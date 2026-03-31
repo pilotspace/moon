@@ -257,6 +257,7 @@ pub async fn run_sharded(
     conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
     shutdown: CancellationToken,
     per_shard_accept: bool,
+    affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = TcpListener::bind(&addr).await?;
@@ -352,12 +353,28 @@ pub async fn run_sharded(
                             continue;
                         }
 
-                        debug!("New connection from {} -> shard {}", addr, next_shard);
-                        let tx = &conn_txs[next_shard];
+                        // Affinity-aware routing: check if this IP has a preferred shard
+                        let target_shard = {
+                            let peer_ip = addr.ip();
+                            if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
+                                if preferred < num_shards {
+                                    preferred
+                                } else {
+                                    let s = next_shard;
+                                    next_shard = (next_shard + 1) % num_shards;
+                                    s
+                                }
+                            } else {
+                                let s = next_shard;
+                                next_shard = (next_shard + 1) % num_shards;
+                                s
+                            }
+                        };
+                        debug!("New connection from {} -> shard {}", addr, target_shard);
+                        let tx = &conn_txs[target_shard];
                         if tx.send_async((stream, false)).await.is_err() {
-                            error!("Failed to send connection to shard {}", next_shard);
+                            error!("Failed to send connection to shard {}", target_shard);
                         }
-                        next_shard = (next_shard + 1) % num_shards;
                     }
                     Err(e) => {
                         error!("Accept error: {}", e);
@@ -391,6 +408,7 @@ pub async fn run_sharded(
     conn_txs: Vec<channel::MpscSender<(crate::runtime::TcpStream, bool)>>,
     shutdown: CancellationToken,
     per_shard_accept: bool,
+    affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = monoio::net::TcpListener::bind(&addr)?;
@@ -448,17 +466,31 @@ pub async fn run_sharded(
                                 let _ = monoio::io::AsyncWriteRentExt::write_all(&mut stream, err_msg).await;
                                 continue;
                             }
-                            debug!("New connection from {} -> shard {}", addr, next_shard);
+                            // Affinity-aware routing
+                            let target_shard = {
+                                let peer_ip = addr.ip();
+                                if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
+                                    if preferred < num_shards { preferred } else {
+                                        let s = next_shard;
+                                        next_shard = (next_shard + 1) % num_shards;
+                                        s
+                                    }
+                                } else {
+                                    let s = next_shard;
+                                    next_shard = (next_shard + 1) % num_shards;
+                                    s
+                                }
+                            };
+                            debug!("New connection from {} -> shard {}", addr, target_shard);
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
                                 let fd = stream.into_raw_fd();
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
-                            let tx = &conn_txs[next_shard];
+                            let tx = &conn_txs[target_shard];
                             if tx.send((std_stream, false)).is_err() {
-                                error!("Failed to send connection to shard {}", next_shard);
+                                error!("Failed to send connection to shard {}", target_shard);
                             }
-                            next_shard = (next_shard + 1) % num_shards;
                         }
                         Err(e) => { error!("Accept error: {}", e); }
                     }
@@ -518,17 +550,31 @@ pub async fn run_sharded(
                                 continue;
                             }
 
-                            debug!("New connection from {} -> shard {}", addr, next_shard);
+                            // Affinity-aware routing
+                            let target_shard = {
+                                let peer_ip = addr.ip();
+                                if let Some(preferred) = affinity_tracker.read().lookup(&peer_ip) {
+                                    if preferred < num_shards { preferred } else {
+                                        let s = next_shard;
+                                        next_shard = (next_shard + 1) % num_shards;
+                                        s
+                                    }
+                                } else {
+                                    let s = next_shard;
+                                    next_shard = (next_shard + 1) % num_shards;
+                                    s
+                                }
+                            };
+                            debug!("New connection from {} -> shard {}", addr, target_shard);
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
                                 let fd = stream.into_raw_fd();
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
-                            let tx = &conn_txs[next_shard];
+                            let tx = &conn_txs[target_shard];
                             if tx.send((std_stream, false)).is_err() {
-                                error!("Failed to send connection to shard {}", next_shard);
+                                error!("Failed to send connection to shard {}", target_shard);
                             }
-                            next_shard = (next_shard + 1) % num_shards;
                         }
                         Err(e) => {
                             error!("Accept error: {}", e);

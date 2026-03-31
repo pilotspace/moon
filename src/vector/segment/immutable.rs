@@ -9,7 +9,9 @@ use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
-use crate::vector::hnsw::search::{SearchScratch, hnsw_search, hnsw_search_filtered, hnsw_search_subcent};
+use crate::vector::hnsw::search::{
+    SearchScratch, hnsw_search, hnsw_search_filtered, hnsw_search_subcent,
+};
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
@@ -158,6 +160,7 @@ impl ImmutableSegment {
     ///
     /// 2× effective quantization resolution (32 levels at 4-bit) without
     /// QJL matrix overhead. Better recall than TQ-ADC for the same cost.
+    #[allow(dead_code)]
     fn rerank_with_sub_centroid(
         &self,
         candidates: &mut SmallVec<[SearchResult; 32]>,
@@ -189,7 +192,8 @@ impl ImmutableSegment {
             }
         }
         crate::vector::turbo_quant::fwht::fwht(
-            &mut q_rotated, self.collection_meta.fwht_sign_flips.as_slice(),
+            &mut q_rotated,
+            self.collection_meta.fwht_sign_flips.as_slice(),
         );
 
         let tq_buf = self.vectors_tq.as_slice();
@@ -199,14 +203,14 @@ impl ImmutableSegment {
             let tq_offset = bfs_pos * bytes_per_code;
             let tq_code = &tq_buf[tq_offset..tq_offset + code_len];
             let norm_bytes = &tq_buf[tq_offset + code_len..tq_offset + bytes_per_code];
-            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+            let norm =
+                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
 
             let sub_offset = bfs_pos * sub_bpv;
             let sign_bits = &self.sub_centroid_signs[sub_offset..sub_offset + sub_bpv];
 
-            result.distance = sub_centroid::tq_sign_l2_adc(
-                &q_rotated, tq_code, sign_bits, norm, sub_table,
-            );
+            result.distance =
+                sub_centroid::tq_sign_l2_adc(&q_rotated, tq_code, sign_bits, norm, sub_table);
         }
         candidates.sort_unstable();
     }
@@ -219,11 +223,7 @@ impl ImmutableSegment {
     /// Term 1 (<q, x_mse>) computed in rotated space: O(padded_dim).
     /// Term 2 (QJL correction) uses precomputed S*y: O(dim).
     /// Total per candidate: O(padded_dim) — same cost as TQ-ADC.
-    fn rerank_with_prod(
-        &self,
-        candidates: &mut SmallVec<[SearchResult; 32]>,
-        query: &[f32],
-    ) {
+    fn rerank_with_prod(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32]) {
         if candidates.is_empty() || self.qjl_signs.is_empty() {
             return;
         }
@@ -251,14 +251,22 @@ impl ImmutableSegment {
             let tq_offset = bfs_pos * bytes_per_code;
             let tq_code = &tq_buf[tq_offset..tq_offset + code_len];
             let norm_bytes = &tq_buf[tq_offset + code_len..tq_offset + bytes_per_code];
-            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+            let norm =
+                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
 
             let qjl_offset = bfs_pos * qjl_bpv;
             let qjl_signs = &self.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
             let residual_norm = self.residual_norms[bfs_pos];
 
             result.distance = score_l2_prod(
-                &query_state, tq_code, norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
+                &query_state,
+                tq_code,
+                norm,
+                qjl_signs,
+                residual_norm,
+                centroids,
+                dim,
+                single_qjl_bpv,
             );
         }
         candidates.sort_unstable();
@@ -312,13 +320,9 @@ impl ImmutableSegment {
     ///
     /// Cost: O(N × padded_dim) with 8x compression vs f32.
     /// At 30K/512d on M4 Pro: ~4ms per query, 100% recall.
-    pub fn flat_scan(
-        &self,
-        query: &[f32],
-        k: usize,
-    ) -> SmallVec<[SearchResult; 32]> {
-        use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
+    pub fn flat_scan(&self, query: &[f32], k: usize) -> SmallVec<[SearchResult; 32]> {
         use crate::vector::turbo_quant::fwht;
+        use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
         use std::collections::BinaryHeap;
 
         let n = self.total_count as usize;
@@ -342,7 +346,10 @@ impl ImmutableSegment {
                 *v *= inv;
             }
         }
-        fwht::fwht(&mut q_rotated, self.collection_meta.fwht_sign_flips.as_slice());
+        fwht::fwht(
+            &mut q_rotated,
+            self.collection_meta.fwht_sign_flips.as_slice(),
+        );
 
         // Brute-force scan with max-heap for top-K.
         // TQ codes are in BFS order — use graph.to_original(bfs_pos) for original ID.
@@ -353,7 +360,8 @@ impl ImmutableSegment {
             let offset = bfs_pos * bytes_per_code;
             let code = &tq_buf[offset..offset + code_len];
             let norm_bytes = &tq_buf[offset + code_len..offset + bytes_per_code];
-            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+            let norm =
+                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
 
             // Map BFS position → original ID (same mapping HNSW search uses)
             let original_id = self.graph.to_original(bfs_pos as u32);
@@ -402,14 +410,25 @@ mod tests {
         distance::init();
         // Basic smoke test — just verify construction doesn't panic
         let collection = Arc::new(CollectionMetadata::new(
-            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         // Build an empty graph: 0 nodes, serialize then deserialize
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
+            0,
+            16,
+            32,
+            0,
+            0,
             AlignedBuffer::new(0),
-            Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), 68, // bytes_per_code = 128/2 + 4
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68, // bytes_per_code = 128/2 + 4
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));

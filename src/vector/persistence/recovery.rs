@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use crate::vector::persistence::segment_io::{read_immutable_segment, SegmentIoError};
-use crate::vector::persistence::wal_record::{VectorWalRecord, WalRecordError, VECTOR_RECORD_TAG};
+use crate::vector::persistence::segment_io::{SegmentIoError, read_immutable_segment};
+use crate::vector::persistence::wal_record::{VECTOR_RECORD_TAG, VectorWalRecord, WalRecordError};
 use crate::vector::segment::immutable::ImmutableSegment;
 use crate::vector::segment::mutable::MutableSegment;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
@@ -167,21 +167,12 @@ fn replay_vector_wal(records: &[VectorWalRecord]) -> (HashMap<u64, MutableSegmen
 
                 let internal_id = if *txn_id != 0 {
                     state.mutable.append_transactional(
-                        *point_id,
-                        f32_vector,
-                        sq_vector,
-                        *norm,
-                        next_lsn,
-                        *txn_id,
+                        *point_id, f32_vector, sq_vector, *norm, next_lsn, *txn_id,
                     )
                 } else {
-                    state.mutable.append(
-                        *point_id,
-                        f32_vector,
-                        sq_vector,
-                        *norm,
-                        next_lsn,
-                    )
+                    state
+                        .mutable
+                        .append(*point_id, f32_vector, sq_vector, *norm, next_lsn)
                 };
                 state.point_map.insert(*point_id, internal_id);
                 if *txn_id != 0 {
@@ -275,11 +266,9 @@ pub fn recover_vector_store(
         match read_immutable_segment(persist_dir, *seg_id) {
             Ok((segment, meta)) => {
                 let cid = meta.collection_id;
-                info!(
-                    "Loaded immutable segment {} for collection {}",
-                    seg_id, cid
-                );
-                let entry = collections.entry(cid).or_insert_with(|| RecoveredCollection {
+                info!("Loaded immutable segment {} for collection {}", seg_id, cid);
+                let entry = collections.entry(cid).or_insert_with(|| {
+                    RecoveredCollection {
                     mutable: MutableSegment::new(meta.dimension, std::sync::Arc::new(
                     crate::vector::turbo_quant::collection::CollectionMetadata::new(
                         cid, meta.dimension,
@@ -288,6 +277,7 @@ pub fn recover_vector_store(
                         cid,
                     ))),
                     immutable: Vec::new(),
+                }
                 });
                 entry.immutable.push((segment, meta));
             }
@@ -473,7 +463,10 @@ mod tests {
         let (mutables, _) = replay_vector_wal(&records);
         let seg = mutables.get(&1).unwrap();
         let frozen = seg.freeze();
-        assert_ne!(frozen.entries[0].delete_lsn, 0, "uncommitted txn should be rolled back");
+        assert_ne!(
+            frozen.entries[0].delete_lsn, 0,
+            "uncommitted txn should be rolled back"
+        );
     }
 
     #[test]
@@ -496,7 +489,10 @@ mod tests {
         let (mutables, _) = replay_vector_wal(&records);
         let seg = mutables.get(&1).unwrap();
         let frozen = seg.freeze();
-        assert_eq!(frozen.entries[0].delete_lsn, 0, "committed entry should not be deleted");
+        assert_eq!(
+            frozen.entries[0].delete_lsn, 0,
+            "committed entry should not be deleted"
+        );
     }
 
     #[test]

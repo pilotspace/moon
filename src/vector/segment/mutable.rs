@@ -154,7 +154,8 @@ impl MutableSegment {
 
         // Exact mode: retain raw f32 + zero-fill QJL (recomputed at freeze).
         // Light mode: skip both — saves 1,536 B/vec + avoids O(M×d²) at freeze.
-        let is_exact = self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
+        let is_exact =
+            self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
         let mut extra_bytes = 0usize;
         if is_exact {
             let qjl_bpv = inner.qjl_bytes_per_vec;
@@ -210,26 +211,33 @@ impl MutableSegment {
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
         // Prepare FWHT-rotated query for TQ-ADC path (Light mode or fallback)
-        let use_tq_adc = query_state.is_none() || self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Light;
-        let q_rotated: Vec<f32>;
-        if use_tq_adc {
+        let use_tq_adc = query_state.is_none()
+            || self.collection.build_mode
+                == crate::vector::turbo_quant::collection::BuildMode::Light;
+        let q_rotated: Vec<f32> = if use_tq_adc {
             let mut buf = vec![0.0f32; padded];
             buf[..dim].copy_from_slice(query_f32);
             let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
                 let inv = 1.0 / norm;
-                for v in buf[..dim].iter_mut() { *v *= inv; }
+                for v in buf[..dim].iter_mut() {
+                    *v *= inv;
+                }
             }
             fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
-            q_rotated = buf;
+            buf
         } else {
-            q_rotated = Vec::new();
-        }
+            Vec::new()
+        };
 
         for entry in &inner.entries {
-            if entry.delete_lsn != 0 { continue; }
+            if entry.delete_lsn != 0 {
+                continue;
+            }
             if let Some(bm) = allow_bitmap {
-                if !bm.contains(entry.internal_id) { continue; }
+                if !bm.contains(entry.internal_id) {
+                    continue;
+                }
             }
             let id = entry.internal_id as usize;
             let tq_offset = id * bytes_per_code;
@@ -245,7 +253,14 @@ impl MutableSegment {
                 let residual_norm = inner.residual_norms[id];
                 let single_qjl_bpv = (dim + 7) / 8;
                 crate::vector::turbo_quant::inner_product::score_l2_prod(
-                    qs, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
+                    qs,
+                    tq_code,
+                    entry.norm,
+                    qjl_signs,
+                    residual_norm,
+                    centroids,
+                    dim,
+                    single_qjl_bpv,
                 )
             };
 
@@ -283,22 +298,35 @@ impl MutableSegment {
         let code_len = bytes_per_code - 4;
         let centroids = self.collection.codebook_16();
 
-        let use_tq_adc = query_state.is_none() || self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Light;
+        let use_tq_adc = query_state.is_none()
+            || self.collection.build_mode
+                == crate::vector::turbo_quant::collection::BuildMode::Light;
         let q_rotated: Vec<f32> = if use_tq_adc {
             let mut buf = vec![0.0f32; padded];
             buf[..dim].copy_from_slice(query_f32);
             let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 { let inv = 1.0 / norm; for v in buf[..dim].iter_mut() { *v *= inv; } }
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for v in buf[..dim].iter_mut() {
+                    *v *= inv;
+                }
+            }
             fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
             buf
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
         for entry in &inner.entries {
             if !is_visible(
-                entry.insert_lsn, entry.delete_lsn, entry.txn_id,
-                snapshot_lsn, my_txn_id, committed,
+                entry.insert_lsn,
+                entry.delete_lsn,
+                entry.txn_id,
+                snapshot_lsn,
+                my_txn_id,
+                committed,
             ) {
                 continue;
             }
@@ -321,7 +349,14 @@ impl MutableSegment {
                 let residual_norm = inner.residual_norms[id];
                 let single_qjl_bpv = (dim + 7) / 8;
                 crate::vector::turbo_quant::inner_product::score_l2_prod(
-                    qs, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
+                    qs,
+                    tq_code,
+                    entry.norm,
+                    qjl_signs,
+                    residual_norm,
+                    centroids,
+                    dim,
+                    single_qjl_bpv,
                 )
             };
 
@@ -360,14 +395,15 @@ impl MutableSegment {
 
         let signs = self.collection.fwht_sign_flips.as_slice();
         let boundaries = self.collection.codebook_boundaries_15();
-        let centroids = self.collection.codebook_16();
+        let _centroids = self.collection.codebook_16();
         let mut work_buf = vec![0.0f32; padded];
         let code = encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf);
 
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
 
-        let is_exact = self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
+        let is_exact =
+            self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
         let mut extra_bytes = 0usize;
         if is_exact {
             let qjl_bpv = inner.qjl_bytes_per_vec;
@@ -447,12 +483,16 @@ impl MutableSegment {
                 })
                 .collect(),
             tq_codes: inner.tq_codes.clone(),
-            qjl_signs: if self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact {
+            qjl_signs: if self.collection.build_mode
+                == crate::vector::turbo_quant::collection::BuildMode::Exact
+            {
                 self.recompute_qjl_signs(&inner)
             } else {
                 Vec::new()
             },
-            residual_norms: if self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact {
+            residual_norms: if self.collection.build_mode
+                == crate::vector::turbo_quant::collection::BuildMode::Exact
+            {
                 self.recompute_residual_norms(&inner)
             } else {
                 Vec::new()
@@ -486,14 +526,19 @@ impl MutableSegment {
             let code_end = offset + bytes_per_code - 4;
             let code_slice = &inner.tq_codes[offset..code_end];
             let norm_bytes = &inner.tq_codes[code_end..offset + bytes_per_code];
-            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+            let norm =
+                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
 
             let tq_code = crate::vector::turbo_quant::encoder::TqCode {
                 codes: code_slice.to_vec(),
                 norm,
             };
             let decoded = crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                &tq_code, signs, centroids, dim, &mut work_buf,
+                &tq_code,
+                signs,
+                centroids,
+                dim,
+                &mut work_buf,
             );
 
             // Compute residual
@@ -509,7 +554,7 @@ impl MutableSegment {
             }
             if self.collection.qjl_matrices.is_empty() {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
-                qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
+                qjl_signs.extend(std::iter::repeat_n(0u8, qjl_bpv));
             }
         }
         qjl_signs
@@ -532,14 +577,19 @@ impl MutableSegment {
             let code_end = offset + bytes_per_code - 4;
             let code_slice = &inner.tq_codes[offset..code_end];
             let norm_bytes = &inner.tq_codes[code_end..offset + bytes_per_code];
-            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+            let norm =
+                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
 
             let tq_code = crate::vector::turbo_quant::encoder::TqCode {
                 codes: code_slice.to_vec(),
                 norm,
             };
             let decoded = crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                &tq_code, signs, centroids, dim, &mut work_buf,
+                &tq_code,
+                signs,
+                centroids,
+                dim,
+                &mut work_buf,
             );
 
             let mut r_norm_sq = 0.0f32;
@@ -568,7 +618,11 @@ mod tests {
     fn make_collection(dim: u32) -> Arc<CollectionMetadata> {
         // Use Exact mode in tests to preserve TQ_prod scoring compatibility
         Arc::new(CollectionMetadata::with_build_mode(
-            1, dim, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            dim,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
             crate::vector::turbo_quant::collection::BuildMode::Exact,
         ))
     }
@@ -584,12 +638,17 @@ mod tests {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
             let inv = 1.0 / norm;
-            for x in v.iter_mut() { *x *= inv; }
+            for x in v.iter_mut() {
+                *x *= inv;
+            }
         }
         v
     }
 
-    fn make_query_state(query: &[f32], col: &CollectionMetadata) -> crate::vector::turbo_quant::inner_product::TqProdQueryState {
+    fn make_query_state(
+        query: &[f32],
+        col: &CollectionMetadata,
+    ) -> crate::vector::turbo_quant::inner_product::TqProdQueryState {
         crate::vector::turbo_quant::inner_product::prepare_query_prod(
             query,
             &col.qjl_matrices,
@@ -606,7 +665,9 @@ mod tests {
         let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
         if q_norm > 0.0 {
             let inv = 1.0 / q_norm;
-            for v in q_rot[..dim].iter_mut() { *v *= inv; }
+            for v in q_rot[..dim].iter_mut() {
+                *v *= inv;
+            }
         }
         fwht::fwht(&mut q_rot, collection.fwht_sign_flips.as_slice());
         q_rot

@@ -2,16 +2,15 @@
 
 pub mod aligned_buffer;
 pub mod distance;
-pub mod hnsw;
-pub mod segment;
-pub mod turbo_quant;
 pub mod filter;
-pub mod store;
-pub mod types;
+pub mod hnsw;
+pub mod metrics;
 pub mod mvcc;
 pub mod persistence;
-pub mod metrics;
+pub mod segment;
+pub mod store;
+pub mod turbo_quant;
+pub mod types;
 
 #[cfg(feature = "gpu-cuda")]
 pub mod gpu;
-

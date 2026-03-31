@@ -87,8 +87,8 @@ pub async fn handle_connection(
 
     // Pub/Sub connection-local state
     let mut subscription_count: usize = 0;
-    let mut pubsub_rx: Option<channel::MpscReceiver<Frame>> = None;
-    let mut pubsub_tx: Option<channel::MpscSender<Frame>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<Bytes>> = None;
+    let mut pubsub_tx: Option<channel::MpscSender<Bytes>> = None;
     let mut subscriber_id: u64 = 0;
 
     // Client tracking state
@@ -283,8 +283,9 @@ pub async fn handle_connection(
                 }
                 msg = rx.recv_async() => {
                     match msg {
-                        Ok(frame) => {
-                            if framed.send(frame).await.is_err() {
+                        Ok(data) => {
+                            // Data is pre-serialized RESP — wrap in PreSerialized for framed send
+                            if framed.send(Frame::PreSerialized(data)).await.is_err() {
                                 break;
                             }
                         }
@@ -729,7 +730,7 @@ pub async fn handle_connection(
                             } else {
                                 // Allocate subscriber resources if not yet done
                                 if pubsub_tx.is_none() {
-                                    let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
+                                    let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
                                     subscriber_id = pubsub::next_subscriber_id();
                                     pubsub_tx = Some(tx);
                                     pubsub_rx = Some(rx);

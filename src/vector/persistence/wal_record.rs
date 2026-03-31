@@ -29,7 +29,10 @@ impl std::fmt::Display for WalRecordError {
             Self::InvalidTag(t) => write!(f, "invalid WAL record tag: 0x{t:02x}"),
             Self::InvalidRecordType(t) => write!(f, "invalid WAL record type: {t}"),
             Self::CrcMismatch { expected, actual } => {
-                write!(f, "CRC mismatch: expected 0x{expected:08x}, got 0x{actual:08x}")
+                write!(
+                    f,
+                    "CRC mismatch: expected 0x{expected:08x}, got 0x{actual:08x}"
+                )
             }
             Self::DeserializeFailed(msg) => write!(f, "deserialize failed: {msg}"),
         }
@@ -147,7 +150,8 @@ impl VectorWalRecord {
             if *pos + 4 > data.len() {
                 return Err(WalRecordError::Truncated);
             }
-            let val = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let val =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(val)
         };
@@ -157,8 +161,14 @@ impl VectorWalRecord {
                 return Err(WalRecordError::Truncated);
             }
             let val = u64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(val)
@@ -168,7 +178,8 @@ impl VectorWalRecord {
             if *pos + 4 > data.len() {
                 return Err(WalRecordError::Truncated);
             }
-            let val = f32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let val =
+                f32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(val)
         };

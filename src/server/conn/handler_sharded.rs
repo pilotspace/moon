@@ -15,7 +15,11 @@ use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+/// Type alias to distinguish pre-existing std::sync::RwLock (for ACL, runtime config, etc.)
+/// from parking_lot::RwLock (used for pubsub types added in this PR).
+type StdRwLock<T> = std::sync::RwLock<T>;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
@@ -55,7 +59,7 @@ pub enum HandlerResult {
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
-    is_multi_key_command, restore_migrated_state,
+    is_multi_key_command, propagate_subscription, restore_migrated_state, unpropagate_subscription,
 };
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
@@ -78,24 +82,32 @@ pub async fn handle_connection_sharded(
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
     aof_tx: Option<channel::MpscSender<AofMessage>>,
     tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
-    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
-    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     lua: std::rc::Rc<mlua::Lua>,
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
-    acl_table: Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
+    remote_subscriber_map: Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >,
+    all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
+    all_remote_sub_maps: Vec<
+        Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    >,
+    pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) {
     let peer_addr = stream
         .peer_addr()
@@ -126,6 +138,10 @@ pub async fn handle_connection_sharded(
         spsc_notifiers.clone(),
         snapshot_trigger_tx,
         cached_clock,
+        remote_subscriber_map,
+        all_pubsub_registries,
+        all_remote_sub_maps,
+        pubsub_affinity,
         true, // can_migrate: plain TCP supports FD extraction
         BytesMut::new(),
         None, // fresh connection, no migrated state
@@ -225,24 +241,32 @@ pub async fn handle_connection_sharded_inner<
     shard_id: usize,
     num_shards: usize,
     dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_registry: Rc<RefCell<PubSubRegistry>>,
+    pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shutdown: CancellationToken,
     requirepass: Option<String>,
     aof_tx: Option<channel::MpscSender<AofMessage>>,
     tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
-    repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
-    cluster_state: Option<Arc<RwLock<crate::cluster::ClusterState>>>,
+    repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+    cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     lua: std::rc::Rc<mlua::Lua>,
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
-    acl_table: Arc<RwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
+    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
     cached_clock: CachedClock,
+    remote_subscriber_map: Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >,
+    all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
+    all_remote_sub_maps: Vec<
+        Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+    >,
+    pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
@@ -282,6 +306,13 @@ pub async fn handle_connection_sharded_inner<
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
 
+    // Pub/Sub subscriber mode state
+    use crate::pubsub::{self, subscriber::Subscriber};
+    let mut pubsub_tx: Option<channel::MpscSender<Bytes>> = None;
+    let mut pubsub_rx: Option<channel::MpscReceiver<Bytes>> = None;
+    let mut subscriber_id: u64 = 0;
+    let mut subscription_count: usize = 0;
+
     // RESP3/HELLO connection-local state
     let mut client_name: Option<Bytes> = client_name_restored;
 
@@ -307,6 +338,205 @@ pub async fn handle_connection_sharded_inner<
     // Migration target: set when AffinityTracker triggers, acted on after batch response flush.
     let mut migration_target: Option<usize> = None;
     loop {
+        // --- Subscriber mode: bidirectional select on client commands + published messages ---
+        if subscription_count > 0 {
+            let rx = pubsub_rx.as_mut().unwrap();
+            tokio::select! {
+                n = stream.read_buf(&mut read_buf) => {
+                    match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let mut sub_break = false;
+                    loop {
+                        match crate::protocol::parse(&mut read_buf, &parse_config) {
+                            Ok(Some(frame)) => {
+                                if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                                    if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"));
+                                            write_buf.clear();
+                                            crate::protocol::serialize(&err, &mut write_buf);
+                                            if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            continue;
+                                        }
+                                        for arg in cmd_args {
+                                            if let Some(ch) = extract_bytes(arg) {
+                                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
+                                                if let Some(reason) = acl_deny {
+                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&err, &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                    continue;
+                                                }
+                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                { pubsub_registry.write().subscribe(ch.clone(), sub); }
+                                                subscription_count += 1;
+                                                // Register pub/sub affinity for this client IP
+                                                if subscription_count == 1 {
+                                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                                        pubsub_affinity.write().register(addr.ip(), shard_id);
+                                                    }
+                                                }
+                                                propagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
+                                                write_buf.clear();
+                                                let resp = pubsub::subscribe_response(&ch, subscription_count);
+                                                crate::protocol::serialize(&resp, &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'psubscribe' command"));
+                                            write_buf.clear();
+                                            crate::protocol::serialize(&err, &mut write_buf);
+                                            if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            continue;
+                                        }
+                                        for arg in cmd_args {
+                                            if let Some(pat) = extract_bytes(arg) {
+                                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, pat.as_ref()) };
+                                                if let Some(reason) = acl_deny {
+                                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&err, &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                    continue;
+                                                }
+                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                { pubsub_registry.write().psubscribe(pat.clone(), sub); }
+                                                subscription_count += 1;
+                                                // Register pub/sub affinity for this client IP
+                                                if subscription_count == 1 {
+                                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                                        pubsub_affinity.write().register(addr.ip(), shard_id);
+                                                    }
+                                                }
+                                                propagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
+                                                write_buf.clear();
+                                                let resp = pubsub::psubscribe_response(&pat, subscription_count);
+                                                crate::protocol::serialize(&resp, &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let removed = { pubsub_registry.write().unsubscribe_all(subscriber_id) };
+                                            if removed.is_empty() {
+                                                subscription_count = pubsub_registry.read().total_subscription_count(subscriber_id);
+                                                write_buf.clear();
+                                                crate::protocol::serialize(&pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count), &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            } else {
+                                                for ch in &removed {
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&all_remote_sub_maps, ch, shard_id, num_shards, false);
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(ch, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        } else {
+                                            for arg in cmd_args {
+                                                if let Some(ch) = extract_bytes(arg) {
+                                                    { pubsub_registry.write().unsubscribe(ch.as_ref(), subscriber_id); }
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(&ch, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                                        if cmd_args.is_empty() {
+                                            let removed = { pubsub_registry.write().punsubscribe_all(subscriber_id) };
+                                            if removed.is_empty() {
+                                                subscription_count = pubsub_registry.read().total_subscription_count(subscriber_id);
+                                                write_buf.clear();
+                                                crate::protocol::serialize(&pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count), &mut write_buf);
+                                                if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                            } else {
+                                                for pat in &removed {
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&all_remote_sub_maps, pat, shard_id, num_shards, true);
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(pat, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        } else {
+                                            for arg in cmd_args {
+                                                if let Some(pat) = extract_bytes(arg) {
+                                                    { pubsub_registry.write().punsubscribe(pat.as_ref(), subscriber_id); }
+                                                    subscription_count = subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
+                                                    write_buf.clear();
+                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(&pat, subscription_count), &mut write_buf);
+                                                    if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                                }
+                                            }
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"PING") {
+                                        write_buf.clear();
+                                        let resp = Frame::Array(crate::framevec![
+                                            Frame::BulkString(Bytes::from_static(b"pong")),
+                                            Frame::BulkString(Bytes::from_static(b"")),
+                                        ]);
+                                        crate::protocol::serialize(&resp, &mut write_buf);
+                                        if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                    } else if cmd.eq_ignore_ascii_case(b"QUIT") {
+                                        write_buf.clear();
+                                        crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"OK")), &mut write_buf);
+                                        let _ = stream.write_all(&write_buf).await;
+                                        sub_break = true;
+                                        break;
+                                    } else if cmd.eq_ignore_ascii_case(b"RESET") {
+                                        { pubsub_registry.write().unsubscribe_all(subscriber_id); }
+                                        { pubsub_registry.write().punsubscribe_all(subscriber_id); }
+                                        subscription_count = 0;
+                                        write_buf.clear();
+                                        crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"RESET")), &mut write_buf);
+                                        if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                    } else {
+                                        let cmd_str = String::from_utf8_lossy(cmd);
+                                        let err = Frame::Error(Bytes::from(format!(
+                                            "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+                                            cmd_str.to_lowercase()
+                                        )));
+                                        write_buf.clear();
+                                        crate::protocol::serialize(&err, &mut write_buf);
+                                        if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
+                                    }
+                                }
+                                if subscription_count == 0 { break; }
+                            }
+                            Ok(None) => break,
+                            Err(_) => { return (HandlerResult::Done, None); }
+                        }
+                    }
+                    if sub_break { break; }
+                    if subscription_count == 0 { continue; }
+                }
+                msg = rx.recv_async() => {
+                    match msg {
+                        Ok(data) => {
+                            // Data is pre-serialized RESP bytes — write directly
+                            if stream.write_all(&data).await.is_err() { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    write_buf.clear();
+                    crate::protocol::serialize(&Frame::Error(Bytes::from_static(b"ERR server shutting down")), &mut write_buf);
+                    let _ = stream.write_all(&write_buf).await;
+                    break;
+                }
+            }
+            continue;
+        }
         tokio::select! {
             result = stream.read_buf(&mut read_buf) => {
                 match result {
@@ -334,7 +564,10 @@ pub async fn handle_connection_sharded_inner<
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes)>> = HashMap::with_capacity(num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(num_shards);
+                // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
+                // Key: target shard ID -> Vec of (response_index, channel, message)
+                let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -810,10 +1043,10 @@ pub async fn handle_connection_sharded_inner<
                         if cmd_args.len() != 2 {
                             responses.push(Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'publish' command")));
                         } else {
-                            let channel = extract_bytes(&cmd_args[0]);
-                            let message = extract_bytes(&cmd_args[1]);
+                            let channel_arg = extract_bytes(&cmd_args[0]);
+                            let message_arg = extract_bytes(&cmd_args[1]);
                             // ACL channel permission check for PUBLISH
-                            if let Some(ref ch) = channel {
+                            if let Some(ref ch) = channel_arg {
                                 let acl_guard = acl_table.read().unwrap();
                                 if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
                                     drop(acl_guard);
@@ -821,18 +1054,30 @@ pub async fn handle_connection_sharded_inner<
                                     continue;
                                 }
                             }
-                            match (channel, message) {
+                            match (channel_arg, message_arg) {
                                 (Some(ch), Some(msg)) => {
-                                    let local_count = pubsub_registry.borrow_mut().publish(&ch, &msg);
-                                    let mut producers = dispatch_tx.borrow_mut();
-                                    for target in 0..num_shards {
-                                        if target == shard_id { continue; }
-                                        let idx = ChannelMesh::target_index(shard_id, target);
-                                        let fanout_msg = ShardMessage::PubSubFanOut { channel: ch.clone(), message: msg.clone() };
-                                        if producers[idx].try_push(fanout_msg).is_ok() { spsc_notifiers[target].notify_one(); }
+                                    let local_count = { pubsub_registry.write().publish(&ch, &msg) };
+                                    // Targeted fanout: only send to shards that have subscribers
+                                    let targets = remote_subscriber_map.read().target_shards(&ch);
+                                    if targets.is_empty() {
+                                        // Fast path: no remote subscribers, return local count immediately
+                                        responses.push(Frame::Integer(local_count));
+                                    } else {
+                                        // Filter to remote targets only (skip self)
+                                        let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != shard_id).collect();
+                                        if remote_targets.is_empty() {
+                                            responses.push(Frame::Integer(local_count));
+                                        } else {
+                                            // Accumulate into per-shard batches for coalesced dispatch
+                                            let resp_idx = responses.len();
+                                            responses.push(Frame::Integer(local_count)); // placeholder, updated after batch flush
+                                            for target in &remote_targets {
+                                                publish_batches.entry(*target)
+                                                    .or_default()
+                                                    .push((resp_idx, ch.clone(), msg.clone()));
+                                            }
+                                        }
                                     }
-                                    drop(producers);
-                                    responses.push(Frame::Integer(local_count));
                                 }
                                 _ => responses.push(Frame::Error(Bytes::from_static(b"ERR invalid channel or message"))),
                             }
@@ -842,21 +1087,130 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- SUBSCRIBE / PSUBSCRIBE ---
                     if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
-                        for arg in cmd_args {
-                            if let Some(channel) = extract_bytes(arg) {
-                                let acl_guard = acl_table.read().unwrap();
-                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, channel.as_ref()) {
-                                    drop(acl_guard);
-                                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                                    continue;
+                        let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
+                        let cmd_name = if is_pattern { "psubscribe" } else { "subscribe" };
+                        if cmd_args.is_empty() {
+                            responses.push(Frame::Error(Bytes::from(format!(
+                                "ERR wrong number of arguments for '{}' command", cmd_name
+                            ))));
+                            continue;
+                        }
+                        // Allocate pubsub channel if not yet created
+                        if pubsub_tx.is_none() {
+                            let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
+                            pubsub_tx = Some(tx);
+                            pubsub_rx = Some(rx);
+                        }
+                        if subscriber_id == 0 {
+                            subscriber_id = crate::pubsub::next_subscriber_id();
+                        }
+                        // Flush accumulated responses before entering subscriber mode
+                        if !responses.is_empty() {
+                            write_buf.clear();
+                            for resp in &responses {
+                                if protocol_version >= 3 {
+                                    crate::protocol::serialize_resp3(resp, &mut write_buf);
+                                } else {
+                                    crate::protocol::serialize(resp, &mut write_buf);
                                 }
                             }
+                            if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
+                            responses.clear();
                         }
-                        responses.push(Frame::Error(Bytes::from_static(b"ERR SUBSCRIBE not yet supported in sharded mode")));
+                        // Process subscribe arguments
+                        for arg in cmd_args {
+                            if let Some(ch) = extract_bytes(arg) {
+                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
+                                if let Some(reason) = acl_deny {
+                                    write_buf.clear();
+                                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
+                                    crate::protocol::serialize(&err, &mut write_buf);
+                                    if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
+                                    continue;
+                                }
+                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                if is_pattern {
+                                    { pubsub_registry.write().psubscribe(ch.clone(), sub); }
+                                } else {
+                                    { pubsub_registry.write().subscribe(ch.clone(), sub); }
+                                }
+                                subscription_count += 1;
+                                // Register pub/sub affinity for this client IP
+                                if subscription_count == 1 {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        pubsub_affinity.write().register(addr.ip(), shard_id);
+                                    }
+                                }
+                                propagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, is_pattern);
+                                write_buf.clear();
+                                let resp = if is_pattern {
+                                    pubsub::psubscribe_response(&ch, subscription_count)
+                                } else {
+                                    pubsub::subscribe_response(&ch, subscription_count)
+                                };
+                                crate::protocol::serialize(&resp, &mut write_buf);
+                                if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
+                            }
+                        }
+                        break; // break out of frame batch loop to re-enter main loop in subscriber mode
+                    }
+                    // UNSUBSCRIBE/PUNSUBSCRIBE in normal mode (not subscribed)
+                    if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
+                        let is_pattern = cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE");
+                        let resp = if is_pattern {
+                            pubsub::punsubscribe_response(&Bytes::from_static(b""), 0)
+                        } else {
+                            pubsub::unsubscribe_response(&Bytes::from_static(b""), 0)
+                        };
+                        responses.push(resp);
                         continue;
                     }
-                    if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
-                        responses.push(Frame::Error(Bytes::from_static(b"ERR UNSUBSCRIBE not yet supported in sharded mode")));
+
+                    // --- PUBSUB introspection (zero-SPSC: direct shared-read) ---
+                    if cmd.eq_ignore_ascii_case(b"PUBSUB") {
+                        if cmd_args.is_empty() {
+                            responses.push(Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'pubsub' command")));
+                            continue;
+                        }
+                        let subcmd = extract_bytes(&cmd_args[0]);
+                        match subcmd {
+                            Some(ref sc) if sc.eq_ignore_ascii_case(b"CHANNELS") => {
+                                let pattern = if cmd_args.len() > 1 { extract_bytes(&cmd_args[1]) } else { None };
+                                let mut all_channels: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+                                for reg in &all_pubsub_registries {
+                                    let guard = reg.read();
+                                    all_channels.extend(guard.active_channels(pattern.as_deref()));
+                                }
+                                let arr: Vec<Frame> = all_channels.into_iter().map(Frame::BulkString).collect();
+                                responses.push(Frame::Array(arr.into()));
+                            }
+                            Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
+                                let channels: Vec<Bytes> = cmd_args[1..].iter().filter_map(|a| extract_bytes(a)).collect();
+                                let mut counts: HashMap<Bytes, i64> = HashMap::new();
+                                for reg in &all_pubsub_registries {
+                                    let guard = reg.read();
+                                    for (ch, c) in guard.numsub(&channels) {
+                                        *counts.entry(ch).or_insert(0) += c;
+                                    }
+                                }
+                                let mut arr = Vec::with_capacity(channels.len() * 2);
+                                for ch in &channels {
+                                    arr.push(Frame::BulkString(ch.clone()));
+                                    arr.push(Frame::Integer(*counts.get(ch).unwrap_or(&0)));
+                                }
+                                responses.push(Frame::Array(arr.into()));
+                            }
+                            Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
+                                let mut total: usize = 0;
+                                for reg in &all_pubsub_registries {
+                                    total += reg.read().numpat();
+                                }
+                                responses.push(Frame::Integer(total as i64));
+                            }
+                            _ => {
+                                responses.push(Frame::Error(Bytes::from_static(b"ERR unknown subcommand or wrong number of arguments for 'pubsub' command")));
+                            }
+                        }
                         continue;
                     }
 
@@ -908,6 +1262,7 @@ pub async fn handle_connection_sharded_inner<
                                         crate::shard::coordinator::scatter_vector_search_remote(
                                             index_name, query_blob, k,
                                             shard_id, num_shards,
+                                            &shard_databases,
                                             &dispatch_tx, &spsc_notifiers,
                                         ).await
                                     }
@@ -916,9 +1271,11 @@ pub async fn handle_connection_sharded_inner<
                                 responses.push(response);
                                 continue;
                             }
-                            let response = crate::shard::coordinator::send_vector_command_to_shard0(
+                            let response = crate::shard::coordinator::broadcast_vector_command(
                                 std::sync::Arc::new(frame),
-                                shard_id, &dispatch_tx, &spsc_notifiers,
+                                shard_id, num_shards,
+                                &shard_databases,
+                                &dispatch_tx, &spsc_notifiers,
                             ).await;
                             responses.push(response);
                             continue;
@@ -1109,7 +1466,7 @@ pub async fn handle_connection_sharded_inner<
                         } else {
                             Bytes::new()
                         };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes, selected_db));
                     }
                 }
 
@@ -1118,9 +1475,12 @@ pub async fn handle_connection_sharded_inner<
                     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_ptr = response_pool.slot_ptr(target);
+                        // Use the db_index captured with the first command (all commands in a
+                        // pipeline batch targeting the same shard share the same db_index).
+                        let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(selected_db);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatchSlotted { db_index: selected_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
+                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
                         let target_idx = ChannelMesh::target_index(shard_id, target);
                         {
                             let mut pending = msg;
@@ -1144,6 +1504,42 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                             responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                        }
+                    }
+                }
+
+                // Phase 3: Flush accumulated PUBLISH batches as PubSubPublishBatch messages
+                if !publish_batches.is_empty() {
+                    let mut batch_slots: Vec<(std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>, Vec<usize>)> = Vec::new();
+                    {
+                        let mut producers = dispatch_tx.borrow_mut();
+                        for (target, entries) in publish_batches.drain() {
+                            let n = entries.len();
+                            let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
+                            let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+                            let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
+
+                            let idx = ChannelMesh::target_index(shard_id, target);
+                            let batch_msg = ShardMessage::PubSubPublishBatch {
+                                pairs,
+                                slot: slot.clone(),
+                            };
+                            if producers[idx].try_push(batch_msg).is_ok() {
+                                spsc_notifiers[target].notify_one();
+                            } else {
+                                slot.add(0); // push failed, mark as done
+                            }
+                            batch_slots.push((slot, resp_indices));
+                        }
+                    }
+                    // Resolve all batch slots
+                    for (slot, resp_indices) in &batch_slots {
+                        crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+                        for (i, resp_idx) in resp_indices.iter().enumerate() {
+                            let remote_count = slot.counts[i].load(std::sync::atomic::Ordering::Relaxed);
+                            if remote_count > 0 {
+                                if let Frame::Integer(ref mut total) = responses[*resp_idx] { *total += remote_count; }
+                            }
                         }
                     }
                 }
@@ -1203,6 +1599,22 @@ pub async fn handle_connection_sharded_inner<
                 let _ = stream.write_all(&write_buf).await;
                 break;
             }
+        }
+    }
+
+    // Clean up pub/sub subscriptions on disconnect
+    if subscriber_id > 0 {
+        let removed_channels = { pubsub_registry.write().unsubscribe_all(subscriber_id) };
+        let removed_patterns = { pubsub_registry.write().punsubscribe_all(subscriber_id) };
+        for ch in removed_channels {
+            unpropagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
+        }
+        for pat in removed_patterns {
+            unpropagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
+        }
+        // Remove affinity on disconnect (no subscriptions remain)
+        if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+            pubsub_affinity.write().remove(&addr.ip());
         }
     }
 

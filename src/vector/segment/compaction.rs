@@ -13,17 +13,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use super::immutable::{ImmutableSegment, MvccHeader};
+use super::mutable::FrozenSegment;
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::build::HnswBuilder;
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::persistence::segment_io;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
-use crate::vector::turbo_quant::fwht;
 
-use super::immutable::{ImmutableSegment, MvccHeader};
-use super::mutable::FrozenSegment;
-
+#[allow(dead_code)]
 const RECALL_SAMPLE_SIZE: usize = 1000;
+#[allow(dead_code)]
 const MIN_RECALL: f32 = 0.95;
 const VACUUM_DEAD_THRESHOLD: f32 = 0.20;
 const HNSW_M: u8 = 16;
@@ -40,7 +40,10 @@ impl std::fmt::Display for CompactionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RecallTooLow { recall, required } => {
-                write!(f, "compaction recall {recall:.4} below required {required:.4}")
+                write!(
+                    f,
+                    "compaction recall {recall:.4} below required {required:.4}"
+                )
             }
             Self::EmptySegment => write!(f, "cannot compact empty segment"),
             Self::PersistFailed(msg) => write!(f, "persist failed: {msg}"),
@@ -63,7 +66,7 @@ pub fn compact(
     seed: u64,
     persist: Option<(&Path, u64)>,
 ) -> Result<ImmutableSegment, CompactionError> {
-    let dim = frozen.dimension as usize;
+    let _dim = frozen.dimension as usize;
     let padded = collection.padded_dimension as usize;
     let signs = collection.fwht_sign_flips.as_slice();
     let bytes_per_code = frozen.bytes_per_code;
@@ -88,9 +91,7 @@ pub fn compact(
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
     for entry in &live_entries {
         let offset = entry.internal_id as usize * bytes_per_code;
-        tq_buffer_orig.extend_from_slice(
-            &frozen.tq_codes[offset..offset + bytes_per_code],
-        );
+        tq_buffer_orig.extend_from_slice(&frozen.tq_codes[offset..offset + bytes_per_code]);
     }
 
     // ── Step 3: Build HNSW ───────────────────────────────────────────
@@ -101,7 +102,7 @@ pub fn compact(
     // path returns None and we fall through to the CPU builder below.
     #[cfg(feature = "gpu-cuda")]
     let gpu_graph: Option<crate::vector::hnsw::graph::HnswGraph> = {
-        use crate::vector::gpu::{try_gpu_build_hnsw, MIN_VECTORS_FOR_GPU};
+        use crate::vector::gpu::{MIN_VECTORS_FOR_GPU, try_gpu_build_hnsw};
         if n >= MIN_VECTORS_FOR_GPU {
             try_gpu_build_hnsw(&live_f32_vecs, dim, HNSW_M, HNSW_EF_CONSTRUCTION, seed)
         } else {
@@ -126,10 +127,13 @@ pub fn compact(
     let dim = frozen.dimension as usize;
 
     let live_f32: Vec<&[f32]> = if has_raw && need_cpu_build {
-        live_entries.iter().map(|e| {
-            let start = e.internal_id as usize * dim;
-            &frozen.raw_f32[start..start + dim]
-        }).collect()
+        live_entries
+            .iter()
+            .map(|e| {
+                let start = e.internal_id as usize * dim;
+                &frozen.raw_f32[start..start + dim]
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -176,7 +180,10 @@ pub fn compact(
                     let norm_bytes =
                         &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
                     let norm = f32::from_le_bytes([
-                        norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3],
+                        norm_bytes[0],
+                        norm_bytes[1],
+                        norm_bytes[2],
+                        norm_bytes[3],
                     ]);
                     (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
                 });
@@ -214,7 +221,10 @@ pub fn compact(
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
         // Map orig_id back to live_entries index
-        let live_idx = live_entries.iter().position(|e| e.internal_id as usize == orig_id).unwrap_or(orig_id);
+        let live_idx = live_entries
+            .iter()
+            .position(|e| e.internal_id as usize == orig_id)
+            .unwrap_or(orig_id);
         // QJL signs
         let src_qjl = live_idx * qjl_bpv;
         let dst_qjl = bfs_pos * qjl_bpv;
@@ -238,8 +248,12 @@ pub fn compact(
         let mut work = vec![0.0f32; padded];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            let live_idx = live_entries.iter().position(|e| e.internal_id as usize == orig_id).unwrap_or(orig_id);
-            let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim..(live_entries[live_idx].internal_id as usize + 1) * dim];
+            let live_idx = live_entries
+                .iter()
+                .position(|e| e.internal_id as usize == orig_id)
+                .unwrap_or(orig_id);
+            let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim
+                ..(live_entries[live_idx].internal_id as usize + 1) * dim];
 
             // Normalize + pad + FWHT to get actual rotated coordinates
             let norm_sq: f32 = raw.iter().map(|x| x * x).sum();
@@ -250,9 +264,13 @@ pub fn compact(
                     *dst = src * inv;
                 }
             } else {
-                for v in work[..dim].iter_mut() { *v = 0.0; }
+                for v in work[..dim].iter_mut() {
+                    *v = 0.0;
+                }
             }
-            for v in work[dim..padded].iter_mut() { *v = 0.0; }
+            for v in work[dim..padded].iter_mut() {
+                *v = 0.0;
+            }
             crate::vector::turbo_quant::fwht::fwht(&mut work[..padded], signs);
 
             let code_offset = bfs_pos * bytes_per_code;
@@ -339,6 +357,7 @@ pub fn compact(
 ///
 /// Samples min(RECALL_SAMPLE_SIZE, n) queries deterministically and measures
 /// recall@10. Returns average recall across all sampled queries.
+#[allow(dead_code)]
 fn verify_recall(
     graph: &crate::vector::hnsw::graph::HnswGraph,
     _tq_buffer_bfs: &[u8],
@@ -376,15 +395,7 @@ fn verify_recall(
         let query_slice = &live_vectors[query_orig_idx * dim..(query_orig_idx + 1) * dim];
 
         // HNSW search using f32 L2 (matches production path)
-        let hnsw_results = hnsw_search_f32(
-            graph,
-            &f32_bfs,
-            dim,
-            query_slice,
-            k,
-            ef_verify,
-            None,
-        );
+        let hnsw_results = hnsw_search_f32(graph, &f32_bfs, dim, query_slice, k, ef_verify, None);
 
         // Brute-force f32 L2 ground truth
         let mut dists: Vec<(f32, u32)> = (0..n as u32)
@@ -395,8 +406,7 @@ fn verify_recall(
             .collect();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let gt_ids: std::collections::HashSet<u32> =
-            dists.iter().take(k).map(|d| d.1).collect();
+        let gt_ids: std::collections::HashSet<u32> = dists.iter().take(k).map(|d| d.1).collect();
         let found_ids: std::collections::HashSet<u32> =
             hnsw_results.iter().map(|r| r.id.0).collect();
         let overlap = gt_ids.intersection(&found_ids).count();
@@ -441,7 +451,11 @@ mod tests {
         norm
     }
 
-    fn make_frozen_segment(n: usize, dim: usize, delete_count: usize) -> (FrozenSegment, Arc<CollectionMetadata>) {
+    fn make_frozen_segment(
+        n: usize,
+        dim: usize,
+        delete_count: usize,
+    ) -> (FrozenSegment, Arc<CollectionMetadata>) {
         distance::init();
         let collection = Arc::new(CollectionMetadata::new(
             1,
@@ -455,7 +469,10 @@ mod tests {
         for i in 0..n {
             let mut f32_v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut f32_v);
-            let sq_v: Vec<i8> = f32_v.iter().map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8).collect();
+            let sq_v: Vec<i8> = f32_v
+                .iter()
+                .map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8)
+                .collect();
             seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64 + 1);
         }
 
@@ -481,9 +498,8 @@ mod tests {
         let mut query = lcg_f32(64, 99999);
         normalize(&mut query);
         let padded = collection.padded_dimension;
-        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(
-            imm.graph().num_nodes(), padded,
-        );
+        let mut scratch =
+            crate::vector::hnsw::search::SearchScratch::new(imm.graph().num_nodes(), padded);
         let results = imm.search(&query, 5, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
@@ -516,7 +532,11 @@ mod tests {
         let (frozen, collection) = make_frozen_segment(500, 64, 0);
         // compact() internally verifies recall >= 0.95 and returns Ok only if it passes
         let result = compact(&frozen, &collection, 12345, None);
-        assert!(result.is_ok(), "compact failed (recall too low): {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "compact failed (recall too low): {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -566,7 +586,11 @@ mod tests {
     fn test_gpu_fallback_to_cpu() {
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
         let result = compact(&frozen, &collection, 12345, None);
-        assert!(result.is_ok(), "compact with GPU fallback failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "compact with GPU fallback failed: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap().live_count(), 100);
     }
 }

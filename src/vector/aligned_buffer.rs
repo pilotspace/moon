@@ -43,7 +43,8 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         let byte_size = len
             .checked_mul(std::mem::size_of::<T>())
             .expect("AlignedBuffer: size overflow");
-        let layout = Layout::from_size_align(byte_size, ALIGN).expect("AlignedBuffer: invalid layout");
+        let layout =
+            Layout::from_size_align(byte_size, ALIGN).expect("AlignedBuffer: invalid layout");
 
         // SAFETY: layout has non-zero size (checked above). alloc_zeroed returns a
         // valid pointer to `byte_size` zero-initialized bytes with the requested alignment,
@@ -71,7 +72,8 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         if src_aligned && v.len() == v.capacity() && !v.is_empty() {
             let len = v.len();
             let byte_size = len * std::mem::size_of::<T>();
-            let layout = Layout::from_size_align(byte_size, ALIGN).expect("AlignedBuffer: invalid layout");
+            let layout =
+                Layout::from_size_align(byte_size, ALIGN).expect("AlignedBuffer: invalid layout");
             let ptr = v.as_ptr() as *mut T;
             std::mem::forget(v);
             Self { ptr, len, layout }
@@ -166,7 +168,11 @@ mod tests {
     #[test]
     fn test_alignment() {
         let buf: AlignedBuffer<f32> = AlignedBuffer::new(256);
-        assert_eq!(buf.as_ptr() as usize % 64, 0, "buffer must be 64-byte aligned");
+        assert_eq!(
+            buf.as_ptr() as usize % 64,
+            0,
+            "buffer must be 64-byte aligned"
+        );
         assert_eq!(buf.len(), 256);
     }
 

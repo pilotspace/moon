@@ -173,8 +173,10 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
         crate::vector::metrics::VECTOR_SEARCH_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed),
         crate::vector::metrics::VECTOR_COMPACTION_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-        crate::vector::metrics::VECTOR_COMPACTION_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed),
-        crate::vector::metrics::VECTOR_MUTABLE_SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_COMPACTION_DURATION_MS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::VECTOR_MUTABLE_SEGMENT_BYTES
+            .load(std::sync::atomic::Ordering::Relaxed),
     ));
     sections.push_str("\r\n");
 

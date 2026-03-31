@@ -138,7 +138,10 @@ mod tests {
     fn test_cosine_f32_identical() {
         let a = [1.0f32, 2.0, 3.0];
         let dist = cosine_f32(&a, &a);
-        assert!((dist - 0.0).abs() < 1e-6, "identical vectors should have distance ~0, got {dist}");
+        assert!(
+            (dist - 0.0).abs() < 1e-6,
+            "identical vectors should have distance ~0, got {dist}"
+        );
     }
 
     #[test]
@@ -146,7 +149,10 @@ mod tests {
         let a = [1.0f32, 2.0, 3.0];
         let b = [-1.0f32, -2.0, -3.0];
         let dist = cosine_f32(&a, &b);
-        assert!((dist - 2.0).abs() < 1e-6, "opposite vectors should have distance ~2, got {dist}");
+        assert!(
+            (dist - 2.0).abs() < 1e-6,
+            "opposite vectors should have distance ~2, got {dist}"
+        );
     }
 
     #[test]
@@ -162,6 +168,9 @@ mod tests {
         let a = [1.0f32, 0.0];
         let b = [0.0f32, 1.0];
         let dist = cosine_f32(&a, &b);
-        assert!((dist - 1.0).abs() < 1e-6, "orthogonal vectors should have distance ~1, got {dist}");
+        assert!(
+            (dist - 1.0).abs() < 1e-6,
+            "orthogonal vectors should have distance ~1, got {dist}"
+        );
     }
 }

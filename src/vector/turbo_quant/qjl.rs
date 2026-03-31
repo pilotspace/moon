@@ -124,7 +124,11 @@ mod tests {
     #[test]
     fn test_generate_qjl_matrix_size() {
         let m = generate_qjl_matrix(128, 99);
-        assert_eq!(m.len(), 128 * 128, "128x128 matrix should have 16384 elements");
+        assert_eq!(
+            m.len(),
+            128 * 128,
+            "128x128 matrix should have 16384 elements"
+        );
     }
 
     #[test]

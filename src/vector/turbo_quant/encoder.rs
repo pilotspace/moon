@@ -6,7 +6,9 @@
 //! Achieves 8x compression (768d f32 -> 512 bytes + 4 bytes norm)
 //! at <= 0.009 MSE distortion for unit vectors (Theorem 1).
 
-use super::codebook::{CENTROIDS, quantize_scalar, quantize_with_boundaries, quantize_with_boundaries_n};
+use super::codebook::{
+    CENTROIDS, quantize_scalar, quantize_with_boundaries, quantize_with_boundaries_n,
+};
 use super::fwht;
 
 /// Encoded TurboQuant representation of a single vector.
@@ -255,7 +257,10 @@ pub fn mse_distortion(original: &[f32], reconstructed: &[f32]) -> f32 {
 /// `indices.len()` must be a multiple of 8.
 #[inline]
 pub fn pack_1bit(indices: &[u8]) -> Vec<u8> {
-    debug_assert!(indices.len() % 8 == 0, "pack_1bit requires length multiple of 8");
+    debug_assert!(
+        indices.len() % 8 == 0,
+        "pack_1bit requires length multiple of 8"
+    );
     let mut out = Vec::with_capacity(indices.len() / 8);
     for chunk in indices.chunks_exact(8) {
         let mut byte = 0u8;
@@ -287,7 +292,10 @@ pub fn unpack_1bit(packed: &[u8], count: usize) -> Vec<u8> {
 /// `indices.len()` must be a multiple of 4.
 #[inline]
 pub fn pack_2bit(indices: &[u8]) -> Vec<u8> {
-    debug_assert!(indices.len() % 4 == 0, "pack_2bit requires length multiple of 4");
+    debug_assert!(
+        indices.len() % 4 == 0,
+        "pack_2bit requires length multiple of 4"
+    );
     let mut out = Vec::with_capacity(indices.len() / 4);
     for chunk in indices.chunks_exact(4) {
         let byte = (chunk[0] & 0x03)
@@ -324,7 +332,10 @@ pub fn unpack_2bit(packed: &[u8], count: usize) -> Vec<u8> {
 ///   byte2 = bits [16..24]: idx5[1:3] | idx6[0:3] | idx7[0:3]
 #[inline]
 pub fn pack_3bit(indices: &[u8]) -> Vec<u8> {
-    debug_assert!(indices.len() % 8 == 0, "pack_3bit requires length multiple of 8");
+    debug_assert!(
+        indices.len() % 8 == 0,
+        "pack_3bit requires length multiple of 8"
+    );
     let mut out = Vec::with_capacity(indices.len() * 3 / 8);
     for chunk in indices.chunks_exact(8) {
         // Pack 8 x 3-bit values into 24 bits (3 bytes), LSB-first
@@ -348,9 +359,7 @@ pub fn pack_3bit(indices: &[u8]) -> Vec<u8> {
 pub fn unpack_3bit(packed: &[u8], count: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(count);
     for group in packed.chunks_exact(3) {
-        let bits = group[0] as u32
-            | ((group[1] as u32) << 8)
-            | ((group[2] as u32) << 16);
+        let bits = group[0] as u32 | ((group[1] as u32) << 8) | ((group[2] as u32) << 16);
         for j in 0..8 {
             out.push(((bits >> (j * 3)) & 7) as u8);
         }
@@ -473,11 +482,11 @@ pub fn decode_tq_mse_multibit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::codebook::{
-        scaled_centroids_n, scaled_boundaries_n, code_bytes_per_vector,
-        RAW_CENTROIDS_1BIT, RAW_CENTROIDS_2BIT, RAW_CENTROIDS_3BIT,
+        RAW_CENTROIDS_1BIT, RAW_CENTROIDS_2BIT, RAW_CENTROIDS_3BIT, code_bytes_per_vector,
+        scaled_boundaries_n, scaled_centroids_n,
     };
+    use super::*;
 
     /// Deterministic LCG PRNG for reproducible test vectors.
     fn lcg_f32(dim: usize, seed: u32) -> Vec<f32> {
@@ -570,7 +579,13 @@ mod tests {
         normalize_to_unit(&mut vec);
 
         let code = encode_tq_mse(&vec, &signs, &mut work);
-        assert_eq!(code.codes.len(), padded / 2, "expected {} bytes, got {}", padded / 2, code.codes.len());
+        assert_eq!(
+            code.codes.len(),
+            padded / 2,
+            "expected {} bytes, got {}",
+            padded / 2,
+            code.codes.len()
+        );
         assert_eq!(code.codes.len(), 512); // 1024 / 2
     }
 
@@ -619,7 +634,9 @@ mod tests {
         }
 
         let avg_distortion = total_distortion / num_vectors as f32;
-        eprintln!("TQ 4-bit round-trip: avg MSE = {avg_distortion:.6}, max MSE = {max_distortion:.6}");
+        eprintln!(
+            "TQ 4-bit round-trip: avg MSE = {avg_distortion:.6}, max MSE = {max_distortion:.6}"
+        );
 
         // Theorem 1 bound: distortion <= 0.009 for 4-bit unit vectors
         assert!(
@@ -772,7 +789,8 @@ mod tests {
             let code = encode_tq_mse_multibit(&v, &signs, &boundaries, bits, &mut work);
             let expected = code_bytes_per_vector(padded, bits);
             assert_eq!(
-                code.codes.len(), expected,
+                code.codes.len(),
+                expected,
                 "{bits}-bit: expected {expected} bytes, got {}",
                 code.codes.len()
             );

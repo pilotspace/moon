@@ -129,7 +129,7 @@ pub(crate) fn drain_spsc_shared(
         }
     }
 
-    // Process other messages (PubSubFanOut, SnapshotBegin, etc.)
+    // Process other messages (PubSubPublish, SnapshotBegin, etc.)
     for msg in other_messages {
         handle_shard_message_shared(
             shard_databases,
@@ -744,8 +744,24 @@ pub(crate) fn handle_shard_message_shared(
             let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
         }
-        ShardMessage::PubSubFanOut { channel, message } => {
-            pubsub_registry.publish(&channel, &message);
+        ShardMessage::PubSubPublish {
+            channel,
+            message,
+            slot,
+        } => {
+            let count = pubsub_registry.publish(&channel, &message);
+            slot.add(count);
+        }
+        ShardMessage::PubSubPublishBatch { pairs, slot } => {
+            let mut batch_total: i64 = 0;
+            for (i, (channel, message)) in pairs.iter().enumerate() {
+                let count = pubsub_registry.publish(channel, message);
+                if i < slot.counts.len() {
+                    slot.counts[i].store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+                batch_total += count;
+            }
+            slot.add(batch_total);
         }
         ShardMessage::ScriptLoad { sha1, script } => {
             // Fan-out: cache this script on this shard so EVALSHA works locally
@@ -857,13 +873,16 @@ pub(crate) fn handle_shard_message_shared(
 ///
 /// Public within crate so coordinator can call it directly for local-shard execution
 /// (avoiding SPSC self-send).
-pub(crate) fn dispatch_vector_command(vector_store: &mut VectorStore, command: &crate::protocol::Frame) -> crate::protocol::Frame {
+pub(crate) fn dispatch_vector_command(
+    vector_store: &mut VectorStore,
+    command: &crate::protocol::Frame,
+) -> crate::protocol::Frame {
     let (cmd, args) = match extract_command_static(command) {
         Some(pair) => pair,
         None => {
             return crate::protocol::Frame::Error(bytes::Bytes::from_static(
                 b"ERR invalid command format",
-            ))
+            ));
         }
     };
 
@@ -897,11 +916,7 @@ pub fn auto_index_hset_public(
     auto_index_hset(vector_store, key, args);
 }
 
-fn auto_index_hset(
-    vector_store: &mut VectorStore,
-    key: &[u8],
-    args: &[crate::protocol::Frame],
-) {
+fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::protocol::Frame]) {
     let matching_names = vector_store.find_matching_index_names(key);
     if matching_names.is_empty() {
         return;
@@ -938,7 +953,8 @@ fn auto_index_hset(
                             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
                             // Append to mutable segment
                             let snap = idx.segments.load();
-                            let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+                            let internal_id =
+                                snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
                             crate::vector::metrics::add_vectors(1);
 
                             // Populate payload index with all HASH fields (for filtered search)
@@ -957,9 +973,17 @@ fn auto_index_hset(
                                             .and_then(|s| s.parse::<f64>().ok())
                                             .ok_or(())
                                         {
-                                            idx.payload_index.insert_numeric(f_name, num, internal_id);
+                                            idx.payload_index.insert_numeric(
+                                                f_name,
+                                                num,
+                                                internal_id,
+                                            );
                                         } else {
-                                            idx.payload_index.insert_tag(f_name, f_val, internal_id);
+                                            idx.payload_index.insert_tag(
+                                                f_name,
+                                                f_val,
+                                                internal_id,
+                                            );
                                         }
                                     }
                                 }

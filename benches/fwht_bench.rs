@@ -3,7 +3,7 @@
 //! Measures scalar vs dispatched FWHT at standard embedding dimensions
 //! (128, 256, 512, 768, 1024) and full randomized FWHT pipeline.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use moon::vector::turbo_quant::fwht;
@@ -80,20 +80,16 @@ fn bench_randomized_fwht(c: &mut Criterion) {
         let padded = dim.next_power_of_two();
         let sign_flips = make_sign_flips(padded, 42);
 
-        group.bench_with_input(
-            BenchmarkId::new("full_pipeline", dim),
-            &dim,
-            |bench, _| {
-                let mut data = make_f32_data(padded, 99);
-                bench.iter(|| {
-                    for (i, v) in data.iter_mut().enumerate() {
-                        *v = (i as f32) * 0.001 - 0.5;
-                    }
-                    fwht::randomized_fwht_scalar(black_box(&mut data), black_box(&sign_flips));
-                    black_box(&data);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("full_pipeline", dim), &dim, |bench, _| {
+            let mut data = make_f32_data(padded, 99);
+            bench.iter(|| {
+                for (i, v) in data.iter_mut().enumerate() {
+                    *v = (i as f32) * 0.001 - 0.5;
+                }
+                fwht::randomized_fwht_scalar(black_box(&mut data), black_box(&sign_flips));
+                black_box(&data);
+            });
+        });
     }
     group.finish();
 }

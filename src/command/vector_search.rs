@@ -21,7 +21,9 @@ use crate::vector::types::{DistanceMetric, SearchResult};
 /// args[0] = index_name, args[1..] = ON HASH PREFIX ... SCHEMA ...
 pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     if args.len() < 10 {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'FT.CREATE' command"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.CREATE' command",
+        ));
     }
 
     let index_name = match extract_bulk(&args[0]) {
@@ -98,7 +100,10 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     while pos + 1 < param_end && pos + 1 < args.len() {
         let key = match extract_bulk(&args[pos]) {
             Some(b) => b,
-            None => { pos += 2; continue; }
+            None => {
+                pos += 2;
+                continue;
+            }
         };
         pos += 1;
 
@@ -138,21 +143,33 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         } else if key.eq_ignore_ascii_case(b"EF_CONSTRUCTION") {
             hnsw_ef_construction = match parse_u32(&args[pos]) {
                 Some(n) => n,
-                None => return Frame::Error(Bytes::from_static(b"ERR invalid EF_CONSTRUCTION value")),
+                None => {
+                    return Frame::Error(Bytes::from_static(b"ERR invalid EF_CONSTRUCTION value"));
+                }
             };
             pos += 1;
         } else if key.eq_ignore_ascii_case(b"EF_RUNTIME") {
             hnsw_ef_runtime = match parse_u32(&args[pos]) {
                 Some(n) if n >= 10 && n <= 4096 => n,
-                Some(_) => return Frame::Error(Bytes::from_static(b"ERR EF_RUNTIME must be 10-4096")),
+                Some(_) => {
+                    return Frame::Error(Bytes::from_static(b"ERR EF_RUNTIME must be 10-4096"));
+                }
                 None => return Frame::Error(Bytes::from_static(b"ERR invalid EF_RUNTIME value")),
             };
             pos += 1;
         } else if key.eq_ignore_ascii_case(b"COMPACT_THRESHOLD") {
             compact_threshold = match parse_u32(&args[pos]) {
                 Some(n) if n >= 100 && n <= 100000 => n,
-                Some(_) => return Frame::Error(Bytes::from_static(b"ERR COMPACT_THRESHOLD must be 100-100000")),
-                None => return Frame::Error(Bytes::from_static(b"ERR invalid COMPACT_THRESHOLD value")),
+                Some(_) => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR COMPACT_THRESHOLD must be 100-100000",
+                    ));
+                }
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR invalid COMPACT_THRESHOLD value",
+                    ));
+                }
             };
             pos += 1;
         } else if key.eq_ignore_ascii_case(b"BUILD_MODE") {
@@ -184,7 +201,9 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
             } else if val.eq_ignore_ascii_case(b"SQ8") {
                 QuantizationConfig::Sq8
             } else {
-                return Frame::Error(Bytes::from_static(b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, or SQ8)"));
+                return Frame::Error(Bytes::from_static(
+                    b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, or SQ8)",
+                ));
             };
             pos += 1;
         } else {
@@ -224,7 +243,9 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
 /// FT.DROPINDEX index_name
 pub fn ft_dropindex(store: &mut VectorStore, args: &[Frame]) -> Frame {
     if args.len() != 1 {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'FT.DROPINDEX' command"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.DROPINDEX' command",
+        ));
     }
     let name = match extract_bulk(&args[0]) {
         Some(b) => b,
@@ -266,7 +287,9 @@ pub fn ft_compact(store: &mut VectorStore, args: &[Frame]) -> Frame {
 /// Returns an array of key-value pairs describing the index.
 pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
     if args.len() != 1 {
-        return Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'FT.INFO' command"));
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.INFO' command",
+        ));
     }
     let name = match extract_bulk(&args[0]) {
         Some(b) => b,
@@ -296,10 +319,13 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
         Frame::BulkString(Bytes::from_static(b"index_name")),
         Frame::BulkString(idx.meta.name.clone()),
         Frame::BulkString(Bytes::from_static(b"index_definition")),
-        Frame::Array(vec![
-            Frame::BulkString(Bytes::from_static(b"key_type")),
-            Frame::BulkString(Bytes::from_static(b"HASH")),
-        ].into()),
+        Frame::Array(
+            vec![
+                Frame::BulkString(Bytes::from_static(b"key_type")),
+                Frame::BulkString(Bytes::from_static(b"HASH")),
+            ]
+            .into(),
+        ),
         Frame::BulkString(Bytes::from_static(b"num_docs")),
         Frame::Integer(num_docs as i64),
         Frame::BulkString(Bytes::from_static(b"dimension")),
@@ -367,7 +393,7 @@ pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
         None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR query vector parameter not found in PARAMS",
-            ))
+            ));
         }
     };
 
@@ -409,9 +435,7 @@ pub fn search_local_filtered(
 
     let dim = idx.meta.dimension as usize;
     if query_blob.len() != dim * 4 {
-        return Frame::Error(Bytes::from_static(
-            b"ERR query vector dimension mismatch",
-        ));
+        return Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch"));
     }
     let mut query_f32 = Vec::with_capacity(dim);
     for chunk in query_blob.chunks_exact(4) {
@@ -426,7 +450,7 @@ pub fn search_local_filtered(
     let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
         idx.meta.hnsw_ef_runtime as usize
     } else {
-        (k * 15).max(200).min(500)
+        (k * 15).clamp(200, 500)
     };
 
     let filter_bitmap = filter.map(|f| {
@@ -621,7 +645,9 @@ fn extract_score_from_fields(fields: &Frame) -> f32 {
 /// Used by connection handlers to extract search parameters before dispatching
 /// to the coordinator's scatter_vector_search_remote. Returns Err(Frame::Error)
 /// if args are malformed.
-pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize, Option<FilterExpr>), Frame> {
+pub fn parse_ft_search_args(
+    args: &[Frame],
+) -> Result<(Bytes, Bytes, usize, Option<FilterExpr>), Frame> {
     if args.len() < 2 {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.SEARCH' command",
@@ -643,7 +669,7 @@ pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize, Opti
         None => {
             return Err(Frame::Error(Bytes::from_static(
                 b"ERR invalid KNN query syntax",
-            )))
+            )));
         }
     };
 
@@ -652,7 +678,7 @@ pub fn parse_ft_search_args(args: &[Frame]) -> Result<(Bytes, Bytes, usize, Opti
         None => {
             return Err(Frame::Error(Bytes::from_static(
                 b"ERR query vector parameter not found in PARAMS",
-            )))
+            )));
         }
     };
 
@@ -819,7 +845,7 @@ mod tests {
     /// Build a valid FT.CREATE argument list.
     fn ft_create_args() -> Vec<Frame> {
         vec![
-            bulk(b"myidx"),       // index name
+            bulk(b"myidx"), // index name
             bulk(b"ON"),
             bulk(b"HASH"),
             bulk(b"PREFIX"),
@@ -829,7 +855,7 @@ mod tests {
             bulk(b"vec"),
             bulk(b"VECTOR"),
             bulk(b"HNSW"),
-            bulk(b"6"),           // 6 params = 3 key-value pairs
+            bulk(b"6"), // 6 params = 3 key-value pairs
             bulk(b"TYPE"),
             bulk(b"FLOAT32"),
             bulk(b"DIM"),
@@ -871,7 +897,7 @@ mod tests {
             bulk(b"vec"),
             bulk(b"VECTOR"),
             bulk(b"HNSW"),
-            bulk(b"4"),           // 4 params = 2 key-value pairs
+            bulk(b"4"), // 4 params = 2 key-value pairs
             bulk(b"TYPE"),
             bulk(b"FLOAT32"),
             bulk(b"DISTANCE_METRIC"),
@@ -977,21 +1003,27 @@ mod tests {
         // Shard 1 returns: [2, "vec:10", ["__vec_score", "0.3"], "vec:11", ["__vec_score", "0.9"]]
         // Global top-2 should be: vec:0 (0.1), vec:10 (0.3)
 
-        let shard0 = Frame::Array(vec![
-            Frame::Integer(2),
-            bulk(b"vec:0"),
-            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.1")].into()),
-            bulk(b"vec:1"),
-            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.5")].into()),
-        ].into());
+        let shard0 = Frame::Array(
+            vec![
+                Frame::Integer(2),
+                bulk(b"vec:0"),
+                Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.1")].into()),
+                bulk(b"vec:1"),
+                Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.5")].into()),
+            ]
+            .into(),
+        );
 
-        let shard1 = Frame::Array(vec![
-            Frame::Integer(2),
-            bulk(b"vec:10"),
-            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.3")].into()),
-            bulk(b"vec:11"),
-            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.9")].into()),
-        ].into());
+        let shard1 = Frame::Array(
+            vec![
+                Frame::Integer(2),
+                bulk(b"vec:10"),
+                Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.3")].into()),
+                bulk(b"vec:11"),
+                Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.9")].into()),
+            ]
+            .into(),
+        );
 
         let result = merge_search_results(&[shard0, shard1], 2);
         match result {
@@ -1008,11 +1040,14 @@ mod tests {
     fn test_merge_search_results_handles_errors() {
         // One shard returns error, one returns valid results
         let shard0 = Frame::Error(Bytes::from_static(b"ERR shard unavailable"));
-        let shard1 = Frame::Array(vec![
-            Frame::Integer(1),
-            bulk(b"vec:5"),
-            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.2")].into()),
-        ].into());
+        let shard1 = Frame::Array(
+            vec![
+                Frame::Integer(1),
+                bulk(b"vec:5"),
+                Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.2")].into()),
+            ]
+            .into(),
+        );
 
         let result = merge_search_results(&[shard0, shard1], 5);
         match result {
@@ -1102,15 +1137,25 @@ mod tests {
         match result {
             Frame::Array(items) => {
                 // Should have 20 items (10 key-value pairs)
-                assert!(items.len() >= 20, "FT.INFO should return at least 20 items, got {}", items.len());
-                assert_eq!(items[0], Frame::BulkString(Bytes::from_static(b"index_name")));
+                assert!(
+                    items.len() >= 20,
+                    "FT.INFO should return at least 20 items, got {}",
+                    items.len()
+                );
+                assert_eq!(
+                    items[0],
+                    Frame::BulkString(Bytes::from_static(b"index_name"))
+                );
                 assert_eq!(items[1], Frame::BulkString(Bytes::from("myidx")));
                 assert_eq!(items[5], Frame::Integer(0)); // num_docs = 0
                 assert_eq!(items[7], Frame::Integer(128)); // dimension
                 // New fields
                 assert_eq!(items[10], Frame::BulkString(Bytes::from_static(b"M")));
                 assert_eq!(items[11], Frame::Integer(16)); // default M
-                assert_eq!(items[14], Frame::BulkString(Bytes::from_static(b"EF_RUNTIME")));
+                assert_eq!(
+                    items[14],
+                    Frame::BulkString(Bytes::from_static(b"EF_RUNTIME"))
+                );
             }
             other => panic!("expected Array, got {other:?}"),
         }
@@ -1168,9 +1213,9 @@ mod tests {
         // 2. Insert vectors directly into the mutable segment
         let idx = store.get_index_mut(b"e2eidx").unwrap();
         let vectors: Vec<[f32; 4]> = vec![
-            [1.0, 0.0, 0.0, 0.0],    // vec:0 -- exact match for query (L2=0)
-            [-1.0, 0.0, 0.0, 0.0],   // vec:1 -- opposite direction (L2=4.0)
-            [0.5, 0.0, 0.0, 0.0],    // vec:2 -- same direction, half magnitude (L2=0.25)
+            [1.0, 0.0, 0.0, 0.0],  // vec:0 -- exact match for query (L2=0)
+            [-1.0, 0.0, 0.0, 0.0], // vec:1 -- opposite direction (L2=4.0)
+            [0.5, 0.0, 0.0, 0.0],  // vec:2 -- same direction, half magnitude (L2=0.25)
         ];
 
         let snap = idx.segments.load();
@@ -1208,23 +1253,30 @@ mod tests {
                 let mut found_vec0 = false;
                 for idx in [1, 3].iter() {
                     if let Some(Frame::BulkString(doc_id)) = items.get(*idx) {
-                        if doc_id.as_ref() == b"vec:0" { found_vec0 = true; }
+                        if doc_id.as_ref() == b"vec:0" {
+                            found_vec0 = true;
+                        }
                     }
                 }
-                assert!(found_vec0, "vec:0 should be in top-2 results, got {result:?}");
+                assert!(
+                    found_vec0,
+                    "vec:0 should be in top-2 results, got {result:?}"
+                );
                 // vec:2 should be in top-2 (at dim=4, TQ noise may reorder)
                 let mut found_vec2 = false;
                 for idx in [1, 3].iter() {
                     if let Some(Frame::BulkString(doc_id)) = items.get(*idx) {
-                        if doc_id.as_ref() == b"vec:2" { found_vec2 = true; }
+                        if doc_id.as_ref() == b"vec:2" {
+                            found_vec2 = true;
+                        }
                     }
                 }
-                assert!(found_vec2, "vec:2 should be in top-2 results, got {result:?}");
+                assert!(
+                    found_vec2,
+                    "vec:2 should be in top-2 results, got {result:?}"
+                );
             }
-            Frame::Error(e) => panic!(
-                "FT.SEARCH returned error: {:?}",
-                std::str::from_utf8(e)
-            ),
+            Frame::Error(e) => panic!("FT.SEARCH returned error: {:?}", std::str::from_utf8(e)),
             _ => panic!("FT.SEARCH should return Array, got {result:?}"),
         }
     }
@@ -1354,8 +1406,14 @@ mod tests {
         assert!(filter.is_some());
         match filter.unwrap() {
             crate::vector::filter::FilterExpr::And(left, right) => {
-                assert!(matches!(*left, crate::vector::filter::FilterExpr::TagEq { .. }));
-                assert!(matches!(*right, crate::vector::filter::FilterExpr::NumRange { .. }));
+                assert!(matches!(
+                    *left,
+                    crate::vector::filter::FilterExpr::TagEq { .. }
+                ));
+                assert!(matches!(
+                    *right,
+                    crate::vector::filter::FilterExpr::NumRange { .. }
+                ));
             }
             other => panic!("expected And, got {other:?}"),
         }
@@ -1425,7 +1483,10 @@ mod tests {
         let before_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
         ft_create(&mut store, &args);
         let after_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
-        assert!(after_create > before_create, "FT.CREATE should increment VECTOR_INDEXES");
+        assert!(
+            after_create > before_create,
+            "FT.CREATE should increment VECTOR_INDEXES"
+        );
 
         // FT.SEARCH should increment VECTOR_SEARCH_TOTAL
         crate::vector::distance::init();
@@ -1441,7 +1502,10 @@ mod tests {
         ];
         ft_search(&mut store, &search_args);
         let after_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
-        assert!(after_search > before_search, "FT.SEARCH should increment VECTOR_SEARCH_TOTAL");
+        assert!(
+            after_search > before_search,
+            "FT.SEARCH should increment VECTOR_SEARCH_TOTAL"
+        );
 
         // Latency should be non-zero after a search
         let latency = crate::vector::metrics::VECTOR_SEARCH_LATENCY_US.load(Ordering::Relaxed);
@@ -1451,7 +1515,10 @@ mod tests {
         let before_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
         ft_dropindex(&mut store, &[bulk(b"myidx")]);
         let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
-        assert!(after_drop < before_drop, "FT.DROPINDEX should decrement VECTOR_INDEXES");
+        assert!(
+            after_drop < before_drop,
+            "FT.DROPINDEX should decrement VECTOR_INDEXES"
+        );
 
         // Suppress unused variable warning
         let _ = latency;

@@ -38,7 +38,10 @@ impl std::fmt::Display for SegmentIoError {
             Self::Io(e) => write!(f, "segment I/O error: {e}"),
             Self::GraphDeserialize(msg) => write!(f, "graph deserialize: {msg}"),
             Self::MetadataChecksum { expected, actual } => {
-                write!(f, "metadata checksum mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "metadata checksum mismatch: expected {expected}, got {actual}"
+                )
             }
             Self::InvalidMetadata(msg) => write!(f, "invalid metadata: {msg}"),
         }
@@ -88,7 +91,9 @@ fn string_to_metric(s: &str) -> Result<DistanceMetric, SegmentIoError> {
         "L2" => Ok(DistanceMetric::L2),
         "Cosine" => Ok(DistanceMetric::Cosine),
         "InnerProduct" => Ok(DistanceMetric::InnerProduct),
-        _ => Err(SegmentIoError::InvalidMetadata(format!("unknown metric: {s}"))),
+        _ => Err(SegmentIoError::InvalidMetadata(format!(
+            "unknown metric: {s}"
+        ))),
     }
 }
 
@@ -111,7 +116,9 @@ fn string_to_quant(s: &str) -> Result<QuantizationConfig, SegmentIoError> {
         "TurboQuant3" => Ok(QuantizationConfig::TurboQuant3),
         "TurboQuant4" => Ok(QuantizationConfig::TurboQuant4),
         "TurboQuantProd4" => Ok(QuantizationConfig::TurboQuantProd4),
-        _ => Err(SegmentIoError::InvalidMetadata(format!("unknown quantization: {s}"))),
+        _ => Err(SegmentIoError::InvalidMetadata(format!(
+            "unknown quantization: {s}"
+        ))),
     }
 }
 
@@ -132,7 +139,10 @@ pub fn write_immutable_segment(
     fs::write(seg_dir.join("hnsw_graph.bin"), &graph_bytes)?;
 
     // 2. tq_codes.bin
-    fs::write(seg_dir.join("tq_codes.bin"), segment.vectors_tq().as_slice())?;
+    fs::write(
+        seg_dir.join("tq_codes.bin"),
+        segment.vectors_tq().as_slice(),
+    )?;
 
     // 3. sq_vectors.bin — skipped (SQ8 no longer stored in ImmutableSegment).
     // 3b. f32_vectors.bin — skipped (f32 no longer stored; TQ-ADC used for search).
@@ -194,7 +204,9 @@ pub fn read_immutable_segment(
     let quantization = string_to_quant(&meta.quantization)?;
 
     let mut sign_flips = AlignedBuffer::<f32>::new(meta.fwht_sign_flips.len());
-    sign_flips.as_mut_slice().copy_from_slice(&meta.fwht_sign_flips);
+    sign_flips
+        .as_mut_slice()
+        .copy_from_slice(&meta.fwht_sign_flips);
 
     // Variable-length codebook: validate size matches quantization variant.
     // SQ8 stores empty codebook (no quantization centroids needed).
@@ -204,13 +216,17 @@ pub fn read_immutable_segment(
         if meta.codebook.len() != expected_centroids {
             return Err(SegmentIoError::InvalidMetadata(format!(
                 "codebook must have {} entries for {:?}, got {}",
-                expected_centroids, quantization, meta.codebook.len()
+                expected_centroids,
+                quantization,
+                meta.codebook.len()
             )));
         }
         if meta.codebook_boundaries.len() != expected_boundaries {
             return Err(SegmentIoError::InvalidMetadata(format!(
                 "codebook_boundaries must have {} entries for {:?}, got {}",
-                expected_boundaries, quantization, meta.codebook_boundaries.len()
+                expected_boundaries,
+                quantization,
+                meta.codebook_boundaries.len()
             )));
         }
     }
@@ -221,10 +237,12 @@ pub fn read_immutable_segment(
     const QJL_NUM_PROJECTIONS: usize = 8;
     let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
         let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
-            .map(|m| crate::vector::turbo_quant::qjl::generate_qjl_matrix(
-                meta.dimension as usize,
-                meta.collection_id.wrapping_add(1 + m as u64),
-            ))
+            .map(|m| {
+                crate::vector::turbo_quant::qjl::generate_qjl_matrix(
+                    meta.dimension as usize,
+                    meta.collection_id.wrapping_add(1 + m as u64),
+                )
+            })
             .collect();
         (matrices, QJL_NUM_PROJECTIONS)
     } else {
@@ -232,9 +250,12 @@ pub fn read_immutable_segment(
     };
 
     let sub_centroid_table = if quantization.is_turbo_quant() {
-        Some(crate::vector::turbo_quant::sub_centroid::SubCentroidTable::new(
-            meta.padded_dimension, quantization.bits(),
-        ))
+        Some(
+            crate::vector::turbo_quant::sub_centroid::SubCentroidTable::new(
+                meta.padded_dimension,
+                quantization.bits(),
+            ),
+        )
     } else {
         None
     };
@@ -289,35 +310,53 @@ pub fn read_immutable_segment(
 
     // 4. SQ and f32 vectors — no longer stored (TQ-ADC used for search).
     // Provide empty buffers for ImmutableSegment::new() which drops them.
-    let vectors_sq: AlignedBuffer<i8> = AlignedBuffer::new(0);
-    let vectors_f32: AlignedBuffer<f32> = AlignedBuffer::new(0);
+    let _vectors_sq: AlignedBuffer<i8> = AlignedBuffer::new(0);
+    let _vectors_f32: AlignedBuffer<f32> = AlignedBuffer::new(0);
 
     // 5. Read MVCC headers
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin"))?;
     if mvcc_bytes.len() < 4 {
-        return Err(SegmentIoError::InvalidMetadata("mvcc_headers.bin too short".to_owned()));
+        return Err(SegmentIoError::InvalidMetadata(
+            "mvcc_headers.bin too short".to_owned(),
+        ));
     }
-    let mvcc_count = u32::from_le_bytes([
-        mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3],
-    ]) as usize;
+    let mvcc_count =
+        u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]]) as usize;
     if mvcc_bytes.len() < 4 + mvcc_count * 20 {
-        return Err(SegmentIoError::InvalidMetadata("mvcc_headers.bin truncated".to_owned()));
+        return Err(SegmentIoError::InvalidMetadata(
+            "mvcc_headers.bin truncated".to_owned(),
+        ));
     }
     let mut mvcc = Vec::with_capacity(mvcc_count);
     let mut pos = 4;
     for _ in 0..mvcc_count {
         let internal_id = u32::from_le_bytes([
-            mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
         ]);
         pos += 4;
         let insert_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4], mvcc_bytes[pos + 5], mvcc_bytes[pos + 6], mvcc_bytes[pos + 7],
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
         ]);
         pos += 8;
         let delete_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4], mvcc_bytes[pos + 5], mvcc_bytes[pos + 6], mvcc_bytes[pos + 7],
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
         ]);
         pos += 8;
         mvcc.push(MvccHeader {
@@ -379,7 +418,11 @@ mod tests {
     fn build_test_segment(n: usize, dim: usize) -> (ImmutableSegment, Arc<CollectionMetadata>) {
         distance::init();
         let collection = Arc::new(CollectionMetadata::new(
-            1, dim as u32, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let padded = collection.padded_dimension as usize;
         let signs = collection.fwht_sign_flips.as_slice();
@@ -428,8 +471,14 @@ mod tests {
                 let q_rot = &all_rotated[a as usize];
                 let offset = b as usize * bytes_per_code;
                 let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
-                let norm_bytes = &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
-                let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+                let norm_bytes =
+                    &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
+                let norm = f32::from_le_bytes([
+                    norm_bytes[0],
+                    norm_bytes[1],
+                    norm_bytes[2],
+                    norm_bytes[3],
+                ]);
                 (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
             });
         }
@@ -513,9 +562,8 @@ mod tests {
         let mut query = lcg_f32(64, 99999);
         normalize(&mut query);
         let padded = collection.padded_dimension;
-        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(
-            restored.graph().num_nodes(), padded,
-        );
+        let mut scratch =
+            crate::vector::hnsw::search::SearchScratch::new(restored.graph().num_nodes(), padded);
         let results = restored.search(&query, 5, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
@@ -528,9 +576,9 @@ mod tests {
 
         write_immutable_segment(tmp.path(), 7, &segment, &collection).unwrap();
 
-        let json_str = std::fs::read_to_string(
-            tmp.path().join("segment-7").join("segment_meta.json"),
-        ).unwrap();
+        let json_str =
+            std::fs::read_to_string(tmp.path().join("segment-7").join("segment_meta.json"))
+                .unwrap();
         let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(val["collection_id"], 1);
         assert_eq!(val["dimension"], 64);
@@ -550,10 +598,7 @@ mod tests {
         let meta_path = tmp.path().join("segment-1").join("segment_meta.json");
         let mut json_str = std::fs::read_to_string(&meta_path).unwrap();
         // Replace the checksum value
-        json_str = json_str.replace(
-            &format!("{}", collection.metadata_checksum),
-            "12345",
-        );
+        json_str = json_str.replace(&format!("{}", collection.metadata_checksum), "12345");
         std::fs::write(&meta_path, &json_str).unwrap();
 
         match read_immutable_segment(tmp.path(), 1) {

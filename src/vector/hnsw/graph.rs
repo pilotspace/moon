@@ -90,8 +90,7 @@ impl HnswGraph {
         levels: Vec<u8>,
         bytes_per_code: u32,
     ) -> Self {
-        let (upper_index, upper_offsets, upper_neighbors) =
-            build_upper_csr(&upper_layers, m);
+        let (upper_index, upper_offsets, upper_neighbors) = build_upper_csr(&upper_layers, m);
 
         Self {
             num_nodes,
@@ -249,12 +248,21 @@ impl HnswGraph {
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.num_nodes as usize;
         let layer0_len = self.layer0_neighbors.len();
-        let capacity = 4 + 1 + 1 + 4 + 1 + 4
-            + 4 + layer0_len * 4
-            + n * 4 * 2 + n
+        let capacity = 4
+            + 1
+            + 1
+            + 4
+            + 1
+            + 4
+            + 4
+            + layer0_len * 4
+            + n * 4 * 2
+            + n
             + n * 4
-            + 4 + self.upper_offsets.len() * 4
-            + 4 + self.upper_neighbors.len() * 4;
+            + 4
+            + self.upper_offsets.len() * 4
+            + 4
+            + self.upper_neighbors.len() * 4;
         let mut buf = Vec::with_capacity(capacity);
 
         buf.extend_from_slice(&self.num_nodes.to_le_bytes());
@@ -318,7 +326,8 @@ impl HnswGraph {
 
         let read_u32 = |pos: &mut usize| -> Result<u32, &'static str> {
             ensure(*pos, 4)?;
-            let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let v =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(v)
         };
@@ -382,10 +391,19 @@ impl HnswGraph {
         }
 
         Ok(Self::from_csr(
-            num_nodes, m, m0, entry_point, max_level,
-            layer0_neighbors, bfs_order, bfs_inverse,
-            upper_index, upper_offsets, upper_neighbors,
-            levels, bytes_per_code,
+            num_nodes,
+            m,
+            m0,
+            entry_point,
+            max_level,
+            layer0_neighbors,
+            bfs_order,
+            bfs_inverse,
+            upper_index,
+            upper_offsets,
+            upper_neighbors,
+            levels,
+            bytes_per_code,
         ))
     }
 
@@ -436,10 +454,7 @@ impl HnswGraph {
 /// - `upper_index[node_id]` = starting row in offsets, or SENTINEL if level=0
 /// - `upper_offsets[row]..upper_offsets[row+1]` = neighbor range in upper_neighbors
 /// - `upper_neighbors` = packed neighbor IDs (SENTINELs stripped)
-fn build_upper_csr(
-    upper_layers: &[SmallVec<[u32; 32]>],
-    m: u8,
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+fn build_upper_csr(upper_layers: &[SmallVec<[u32; 32]>], m: u8) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let n = upper_layers.len();
     let mut upper_index = vec![SENTINEL; n];
     let mut upper_offsets: Vec<u32> = Vec::new();
@@ -645,10 +660,17 @@ mod tests {
         let layer0 = AlignedBuffer::from_vec(flat_data);
 
         let graph = HnswGraph::new(
-            2, 16, m0, 0, 0, layer0,
-            vec![0, 1], vec![0, 1],
+            2,
+            16,
+            m0,
+            0,
+            0,
+            layer0,
+            vec![0, 1],
+            vec![0, 1],
             vec![SmallVec::new(), SmallVec::new()],
-            vec![0, 0], 8,
+            vec![0, 0],
+            8,
         );
 
         let n0 = graph.neighbors_l0(0);
@@ -667,11 +689,17 @@ mod tests {
         sv.extend_from_slice(&[10, 20, 30, s]); // level 1: [10,20], level 2: [30, SENTINEL]
 
         let graph = HnswGraph::new(
-            1, m, 4, 0, 2,
+            1,
+            m,
+            4,
+            0,
+            2,
             AlignedBuffer::new(4),
-            vec![0], vec![0],
+            vec![0],
+            vec![0],
             vec![sv],
-            vec![2], 8,
+            vec![2],
+            8,
         );
 
         // CSR strips sentinels, so level 1 has [10, 20] and level 2 has [30]
@@ -685,11 +713,17 @@ mod tests {
     #[test]
     fn test_neighbors_upper_empty_for_level0_node() {
         let graph = HnswGraph::new(
-            1, 16, 32, 0, 0,
+            1,
+            16,
+            32,
+            0,
+            0,
             AlignedBuffer::new(32),
-            vec![0], vec![0],
+            vec![0],
+            vec![0],
             vec![SmallVec::new()],
-            vec![0], 8,
+            vec![0],
+            8,
         );
 
         let n = graph.neighbors_upper(0, 1);
@@ -702,16 +736,28 @@ mod tests {
         let vectors_tq: Vec<u8> = (0..24).collect(); // 3 codes of 8 bytes each
 
         let graph = HnswGraph::new(
-            3, 16, 32, 0, 0,
+            3,
+            16,
+            32,
+            0,
+            0,
             AlignedBuffer::new(96),
-            vec![0, 1, 2], vec![0, 1, 2],
+            vec![0, 1, 2],
+            vec![0, 1, 2],
             vec![SmallVec::new(); 3],
-            vec![0; 3], bytes_per_code,
+            vec![0; 3],
+            bytes_per_code,
         );
 
         assert_eq!(graph.tq_code(0, &vectors_tq), &[0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(graph.tq_code(1, &vectors_tq), &[8, 9, 10, 11, 12, 13, 14, 15]);
-        assert_eq!(graph.tq_code(2, &vectors_tq), &[16, 17, 18, 19, 20, 21, 22, 23]);
+        assert_eq!(
+            graph.tq_code(1, &vectors_tq),
+            &[8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(
+            graph.tq_code(2, &vectors_tq),
+            &[16, 17, 18, 19, 20, 21, 22, 23]
+        );
     }
 
     #[test]
@@ -726,11 +772,17 @@ mod tests {
         vectors_tq[7] = norm_bytes[3];
 
         let graph = HnswGraph::new(
-            1, 16, 32, 0, 0,
+            1,
+            16,
+            32,
+            0,
+            0,
             AlignedBuffer::new(32),
-            vec![0], vec![0],
+            vec![0],
+            vec![0],
             vec![SmallVec::new()],
-            vec![0], bytes_per_code,
+            vec![0],
+            bytes_per_code,
         );
 
         let got = graph.tq_norm(0, &vectors_tq);
@@ -744,10 +796,17 @@ mod tests {
         let vectors_tq = vec![0u8; 16];
 
         let graph = HnswGraph::new(
-            1, 16, m0, 0, 0, layer0,
-            vec![0], vec![0],
+            1,
+            16,
+            m0,
+            0,
+            0,
+            layer0,
+            vec![0],
+            vec![0],
             vec![SmallVec::new()],
-            vec![0], 16,
+            vec![0],
+            16,
         );
 
         // Should compile and not panic
@@ -760,11 +819,17 @@ mod tests {
         let (bfs_order, bfs_inverse) = bfs_reorder(num_nodes, m0, 0, &flat);
 
         let graph = HnswGraph::new(
-            num_nodes, 16, m0, bfs_order[0], 0,
+            num_nodes,
+            16,
+            m0,
+            bfs_order[0],
+            0,
             rearrange_layer0(num_nodes, m0, &flat, &bfs_order, &bfs_inverse),
-            bfs_order, bfs_inverse,
+            bfs_order,
+            bfs_inverse,
             vec![SmallVec::new(); num_nodes as usize],
-            vec![0; num_nodes as usize], 8,
+            vec![0; num_nodes as usize],
+            8,
         );
 
         for orig in 0..num_nodes {
@@ -777,10 +842,17 @@ mod tests {
     #[test]
     fn test_hnsw_graph_new_constructs_without_panic() {
         let graph = HnswGraph::new(
-            0, DEFAULT_M, DEFAULT_M0, 0, 0,
+            0,
+            DEFAULT_M,
+            DEFAULT_M0,
+            0,
+            0,
             AlignedBuffer::new(0),
-            Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), 8,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            8,
         );
         assert_eq!(graph.num_nodes(), 0);
         assert_eq!(graph.entry_point(), 0);
@@ -807,9 +879,17 @@ mod tests {
         let levels = vec![1, 0, 0, 0, 0];
 
         let graph = HnswGraph::new(
-            num_nodes, m, m0, bfs_order[0], 1,
-            layer0, bfs_order, bfs_inverse,
-            upper, levels, 36,
+            num_nodes,
+            m,
+            m0,
+            bfs_order[0],
+            1,
+            layer0,
+            bfs_order,
+            bfs_inverse,
+            upper,
+            levels,
+            36,
         );
 
         let bytes = graph.to_bytes();
@@ -843,10 +923,17 @@ mod tests {
     #[test]
     fn test_graph_serialization_empty() {
         let graph = HnswGraph::new(
-            0, DEFAULT_M, DEFAULT_M0, 0, 0,
+            0,
+            DEFAULT_M,
+            DEFAULT_M0,
+            0,
+            0,
             AlignedBuffer::new(0),
-            Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), 8,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            8,
         );
         let bytes = graph.to_bytes();
         let restored = HnswGraph::from_bytes(&bytes).unwrap();
@@ -856,11 +943,17 @@ mod tests {
     #[test]
     fn test_graph_from_bytes_rejects_truncated() {
         let graph = HnswGraph::new(
-            5, 16, 4, 0, 0,
+            5,
+            16,
+            4,
+            0,
+            0,
             AlignedBuffer::new(20),
-            vec![0, 1, 2, 3, 4], vec![0, 1, 2, 3, 4],
+            vec![0, 1, 2, 3, 4],
+            vec![0, 1, 2, 3, 4],
             vec![SmallVec::new(); 5],
-            vec![0; 5], 8,
+            vec![0; 5],
+            8,
         );
         let bytes = graph.to_bytes();
         // Truncate to half
@@ -914,10 +1007,17 @@ mod tests {
         upper[1] = sv1;
 
         let graph = HnswGraph::new(
-            5, m, 8, 0, 2,
+            5,
+            m,
+            8,
+            0,
+            2,
             AlignedBuffer::new(40),
-            vec![0, 1, 2, 3, 4], vec![0, 1, 2, 3, 4],
-            upper, vec![2, 1, 0, 0, 0], 8,
+            vec![0, 1, 2, 3, 4],
+            vec![0, 1, 2, 3, 4],
+            upper,
+            vec![2, 1, 0, 0, 0],
+            8,
         );
 
         // Node 0, level 1: [1, 2] (sentinels stripped)
@@ -944,10 +1044,17 @@ mod tests {
         upper[0] = sv;
 
         let graph = HnswGraph::new(
-            3, m, 8, 0, 1,
+            3,
+            m,
+            8,
+            0,
+            1,
             AlignedBuffer::new(24),
-            vec![0, 1, 2], vec![0, 1, 2],
-            upper, vec![1, 0, 0], 8,
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+            upper,
+            vec![1, 0, 0],
+            8,
         );
 
         let bytes = graph.to_bytes();
@@ -981,10 +1088,18 @@ mod tests {
                 // Level 2 node: 2 levels * m slots
                 let mut sv = SmallVec::with_capacity(2 * m as usize);
                 for j in 0..m as u32 {
-                    sv.push(if j < 8 { (i as u32 + j + 1) % n as u32 } else { s });
+                    sv.push(if j < 8 {
+                        (i as u32 + j + 1) % n as u32
+                    } else {
+                        s
+                    });
                 }
                 for j in 0..m as u32 {
-                    sv.push(if j < 4 { (i as u32 + j + 100) % n as u32 } else { s });
+                    sv.push(if j < 4 {
+                        (i as u32 + j + 100) % n as u32
+                    } else {
+                        s
+                    });
                 }
                 upper[i] = sv;
                 level2_count += 1;
@@ -992,7 +1107,11 @@ mod tests {
                 // Level 1 node: 1 level * m slots
                 let mut sv = SmallVec::with_capacity(m as usize);
                 for j in 0..m as u32 {
-                    sv.push(if j < 10 { (i as u32 + j + 1) % n as u32 } else { s });
+                    sv.push(if j < 10 {
+                        (i as u32 + j + 1) % n as u32
+                    } else {
+                        s
+                    });
                 }
                 upper[i] = sv;
                 level1_count += 1;
@@ -1013,7 +1132,8 @@ mod tests {
         assert!(
             csr_bytes < 10_000_000, // < 10 MB
             "CSR memory {} bytes ({} avg/node) exceeds 10 MB",
-            csr_bytes, avg_per_node
+            csr_bytes,
+            avg_per_node
         );
         assert!(
             csr_bytes < smallvec_bytes / 10,
@@ -1028,11 +1148,17 @@ mod tests {
         // All nodes at level 0 -- every neighbor_upper should be empty
         let n = 10u32;
         let graph = HnswGraph::new(
-            n, 16, 32, 0, 0,
+            n,
+            16,
+            32,
+            0,
+            0,
             AlignedBuffer::new(n as usize * 32),
-            (0..n).collect(), (0..n).collect(),
+            (0..n).collect(),
+            (0..n).collect(),
             vec![SmallVec::new(); n as usize],
-            vec![0; n as usize], 8,
+            vec![0; n as usize],
+            8,
         );
 
         for i in 0..n {

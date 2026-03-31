@@ -3,7 +3,7 @@ pub mod subscriber;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::command::key::glob_match;
 use crate::protocol::Frame;
@@ -107,46 +107,89 @@ impl PubSubRegistry {
 
     /// Publish a message to a channel. Returns the number of subscribers that received it.
     ///
-    /// Fans out to exact-channel subscribers and pattern subscribers whose glob matches.
+    /// Pre-serializes the RESP message once, then fans out `Bytes` (refcount bump)
+    /// to all matching subscribers. This eliminates per-subscriber Frame allocation
+    /// and serialization — the dominant cost in high fan-out scenarios.
+    ///
     /// Slow subscribers (full channel) are automatically removed.
     pub fn publish(&mut self, channel: &Bytes, message: &Bytes) -> i64 {
         let mut count: i64 = 0;
 
-        // Exact channel subscribers
+        // Exact channel subscribers — pre-serialize once, send Bytes to all
         if let Some(subs) = self.channels.get_mut(channel) {
+            let serialized = serialize_message_bytes(channel, message);
             subs.retain(|sub| {
-                let frame = message_frame(channel, message);
-                if sub.try_send(frame) {
+                if sub.try_send(serialized.clone()) {
                     count += 1;
                     true
                 } else {
                     false // slow subscriber, remove
                 }
             });
-            // Clean up empty channel entry
             if subs.is_empty() {
                 self.channels.remove(channel);
             }
         }
 
-        // Pattern subscribers
-        for (pattern, subs) in &mut self.patterns {
-            if glob_match(pattern, channel) {
-                subs.retain(|sub| {
-                    let frame = pmessage_frame(pattern, channel, message);
-                    if sub.try_send(frame) {
-                        count += 1;
-                        true
-                    } else {
-                        false
+        // Pattern subscribers — only iterate if patterns exist
+        if !self.patterns.is_empty() {
+            let mut had_removals = false;
+            for (pattern, subs) in &mut self.patterns {
+                if glob_match(pattern, channel) {
+                    let serialized = serialize_pmessage_bytes(pattern, channel, message);
+                    let before = subs.len();
+                    subs.retain(|sub| {
+                        if sub.try_send(serialized.clone()) {
+                            count += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if subs.len() < before {
+                        had_removals = true;
                     }
-                });
+                }
+            }
+            // Only clean up if we actually removed subscribers
+            if had_removals {
+                self.patterns.retain(|(_, subs)| !subs.is_empty());
             }
         }
-        // Clean up empty pattern entries
-        self.patterns.retain(|(_, subs)| !subs.is_empty());
 
         count
+    }
+
+    /// List active channels, optionally filtered by glob pattern.
+    pub fn active_channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
+        self.channels
+            .keys()
+            .filter(|ch| match pattern {
+                Some(pat) => crate::command::key::glob_match(pat, ch),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return subscriber counts for specific channels.
+    pub fn numsub(&self, channels: &[Bytes]) -> Vec<(Bytes, i64)> {
+        channels
+            .iter()
+            .map(|ch| {
+                let count = self
+                    .channels
+                    .get(ch)
+                    .map(|subs| subs.len() as i64)
+                    .unwrap_or(0);
+                (ch.clone(), count)
+            })
+            .collect()
+    }
+
+    /// Return total number of pattern subscriptions across all patterns.
+    pub fn numpat(&self) -> usize {
+        self.patterns.iter().map(|(_, subs)| subs.len()).sum()
     }
 
     /// Count channels this subscriber is subscribed to.
@@ -169,6 +212,33 @@ impl PubSubRegistry {
     pub fn total_subscription_count(&self, sub_id: u64) -> usize {
         self.channel_subscription_count(sub_id) + self.pattern_subscription_count(sub_id)
     }
+}
+
+// -- Pre-serialization helpers for zero-copy fan-out --
+//
+// NOTE: Pub/sub messages use Array + BulkString frames, which serialize identically
+// in RESP2 and RESP3. When proper RESP3 Push (`>`) framing is added, these helpers
+// must produce both RESP2 and RESP3 variants, with the subscriber storing which
+// protocol version its client uses.
+
+/// Pre-serialize a "message" delivery into RESP2 wire bytes.
+/// Called once per PUBLISH; the returned Bytes is cloned (refcount bump) per subscriber.
+#[inline]
+fn serialize_message_bytes(channel: &Bytes, payload: &Bytes) -> Bytes {
+    // *3\r\n$7\r\nmessage\r\n$<chlen>\r\n<ch>\r\n$<plen>\r\n<payload>\r\n
+    let capacity = 32 + channel.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(capacity);
+    crate::protocol::serialize(&message_frame(channel, payload), &mut buf);
+    buf.freeze()
+}
+
+/// Pre-serialize a "pmessage" delivery into RESP2 wire bytes.
+#[inline]
+fn serialize_pmessage_bytes(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Bytes {
+    let capacity = 48 + pattern.len() + channel.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(capacity);
+    crate::protocol::serialize(&pmessage_frame(pattern, channel, payload), &mut buf);
+    buf.freeze()
 }
 
 // -- Message frame helpers --
@@ -231,12 +301,21 @@ fn pmessage_frame(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Frame {
 #[cfg(all(test, feature = "runtime-tokio"))]
 mod tests {
     use super::*;
+    use crate::protocol::ParseConfig;
     use crate::runtime::channel;
+
+    /// Parse pre-serialized RESP bytes back into a Frame for assertion.
+    fn parse_resp(data: &[u8]) -> Frame {
+        let mut buf = BytesMut::from(data);
+        crate::protocol::parse(&mut buf, &ParseConfig::default())
+            .expect("valid RESP")
+            .expect("complete frame")
+    }
 
     #[tokio::test]
     async fn test_subscribe_and_publish() {
         let mut registry = PubSubRegistry::new();
-        let (tx, rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -246,16 +325,21 @@ mod tests {
         assert_eq!(count, 1);
 
         let msg = rx.recv_async().await.unwrap();
+        let parsed = parse_resp(&msg);
         assert_eq!(
-            msg,
-            message_frame(&Bytes::from_static(b"news"), &Bytes::from_static(b"hello"))
+            parsed,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"message")),
+                Frame::BulkString(Bytes::from_static(b"news")),
+                Frame::BulkString(Bytes::from_static(b"hello")),
+            ])
         );
     }
 
     #[tokio::test]
     async fn test_psubscribe_glob() {
         let mut registry = PubSubRegistry::new();
-        let (tx, rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
         let sub = Subscriber::new(tx, 1);
         let pattern = Bytes::from_static(b"news.*");
 
@@ -266,20 +350,22 @@ mod tests {
         assert_eq!(count, 1);
 
         let msg = rx.recv_async().await.unwrap();
+        let parsed = parse_resp(&msg);
         assert_eq!(
-            msg,
-            pmessage_frame(
-                &Bytes::from_static(b"news.*"),
-                &Bytes::from_static(b"news.sports"),
-                &Bytes::from_static(b"goal!")
-            )
+            parsed,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"pmessage")),
+                Frame::BulkString(Bytes::from_static(b"news.*")),
+                Frame::BulkString(Bytes::from_static(b"news.sports")),
+                Frame::BulkString(Bytes::from_static(b"goal!")),
+            ])
         );
     }
 
     #[tokio::test]
     async fn test_unsubscribe() {
         let mut registry = PubSubRegistry::new();
-        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -294,7 +380,7 @@ mod tests {
     async fn test_slow_subscriber_disconnected() {
         let mut registry = PubSubRegistry::new();
         // capacity-1 channel: immediately full after one message
-        let (tx, _rx) = channel::mpsc_bounded::<Frame>(1);
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
         let sub = Subscriber::new(tx, 1);
         let channel = Bytes::from_static(b"news");
 
@@ -315,8 +401,8 @@ mod tests {
     #[tokio::test]
     async fn test_publish_returns_count() {
         let mut registry = PubSubRegistry::new();
-        let (tx1, _rx1) = channel::mpsc_bounded::<Frame>(16);
-        let (tx2, _rx2) = channel::mpsc_bounded::<Frame>(16);
+        let (tx1, _rx1) = channel::mpsc_bounded::<Bytes>(16);
+        let (tx2, _rx2) = channel::mpsc_bounded::<Bytes>(16);
         let sub1 = Subscriber::new(tx1, 1);
         let sub2 = Subscriber::new(tx2, 2);
         let channel = Bytes::from_static(b"news");
@@ -330,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_unsubscribe_all() {
-        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
         let mut registry = PubSubRegistry::new();
         let sub1 = Subscriber::new(tx.clone(), 1);
         let sub2 = Subscriber::new(tx, 1); // same id, different channels
@@ -344,8 +430,75 @@ mod tests {
     }
 
     #[test]
+    fn test_active_channels_no_filter() {
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.subscribe(Bytes::from_static(b"news"), Subscriber::new(tx.clone(), 1));
+        registry.subscribe(
+            Bytes::from_static(b"sports"),
+            Subscriber::new(tx.clone(), 2),
+        );
+        registry.subscribe(Bytes::from_static(b"weather"), Subscriber::new(tx, 3));
+
+        let mut channels = registry.active_channels(None);
+        channels.sort();
+        assert_eq!(channels.len(), 3);
+        assert!(channels.contains(&Bytes::from_static(b"news")));
+        assert!(channels.contains(&Bytes::from_static(b"sports")));
+        assert!(channels.contains(&Bytes::from_static(b"weather")));
+    }
+
+    #[test]
+    fn test_active_channels_with_glob() {
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.subscribe(
+            Bytes::from_static(b"news.a"),
+            Subscriber::new(tx.clone(), 1),
+        );
+        registry.subscribe(
+            Bytes::from_static(b"news.b"),
+            Subscriber::new(tx.clone(), 2),
+        );
+        registry.subscribe(Bytes::from_static(b"sports"), Subscriber::new(tx, 3));
+
+        let channels = registry.active_channels(Some(b"news.*"));
+        assert_eq!(channels.len(), 2);
+        assert!(channels.contains(&Bytes::from_static(b"news.a")));
+        assert!(channels.contains(&Bytes::from_static(b"news.b")));
+    }
+
+    #[test]
+    fn test_numsub() {
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.subscribe(Bytes::from_static(b"ch1"), Subscriber::new(tx.clone(), 1));
+        registry.subscribe(Bytes::from_static(b"ch1"), Subscriber::new(tx.clone(), 2));
+        registry.subscribe(Bytes::from_static(b"ch2"), Subscriber::new(tx, 3));
+
+        let result = registry.numsub(&[
+            Bytes::from_static(b"ch1"),
+            Bytes::from_static(b"ch2"),
+            Bytes::from_static(b"ch3"),
+        ]);
+        assert_eq!(result[0], (Bytes::from_static(b"ch1"), 2));
+        assert_eq!(result[1], (Bytes::from_static(b"ch2"), 1));
+        assert_eq!(result[2], (Bytes::from_static(b"ch3"), 0));
+    }
+
+    #[test]
+    fn test_numpat() {
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
+        let mut registry = PubSubRegistry::new();
+        registry.psubscribe(Bytes::from_static(b"a.*"), Subscriber::new(tx.clone(), 1));
+        registry.psubscribe(Bytes::from_static(b"b.*"), Subscriber::new(tx, 2));
+
+        assert_eq!(registry.numpat(), 2);
+    }
+
+    #[test]
     fn test_punsubscribe_all() {
-        let (tx, _rx) = channel::mpsc_bounded::<Frame>(16);
+        let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
         let mut registry = PubSubRegistry::new();
         let sub1 = Subscriber::new(tx.clone(), 1);
         let sub2 = Subscriber::new(tx, 1);

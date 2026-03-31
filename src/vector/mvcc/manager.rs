@@ -1,5 +1,5 @@
-use std::collections::hash_map;
 use std::collections::HashMap;
+use std::collections::hash_map;
 
 use roaring::RoaringBitmap;
 
@@ -91,18 +91,14 @@ impl TransactionManager {
                 if owner == txn_id {
                     // Idempotent re-acquire
                     Ok(())
-                } else if self.committed.contains(owner as u32)
-                    || !self.active.contains_key(&owner)
+                } else if self.committed.contains(owner as u32) || !self.active.contains_key(&owner)
                 {
                     // Owner committed or aborted -- steal the intent
                     e.insert(txn_id);
                     Ok(())
                 } else {
                     // Active owner conflict
-                    Err(ConflictError {
-                        point_id,
-                        owner,
-                    })
+                    Err(ConflictError { point_id, owner })
                 }
             }
         }

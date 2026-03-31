@@ -6,7 +6,7 @@
 //! 3. QJL encode: sign(S * r), store ||r||
 //! 4. Score: <y, x_hat> = <y, x_mse> + sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
 
-use super::encoder::{decode_tq_mse_scaled, encode_tq_mse_scaled, padded_dimension, TqCode};
+use super::encoder::{TqCode, decode_tq_mse_scaled, encode_tq_mse_scaled, padded_dimension};
 use super::qjl;
 
 /// Encoded TurboQuant inner-product representation.
@@ -89,9 +89,7 @@ pub fn encode_tq_prod_v2(
     let padded = padded_dimension(dim as u32) as usize;
 
     // Step 1: MSE encode at (b-1) bits
-    let mse_code = encode_tq_mse_multibit(
-        vector, sign_flips, boundaries_bm1, bits_mse, work_buf,
-    );
+    let mse_code = encode_tq_mse_multibit(vector, sign_flips, boundaries_bm1, bits_mse, work_buf);
     let norm = mse_code.norm;
 
     // Step 2: Decode MSE to compute residual
@@ -126,7 +124,10 @@ pub fn encode_tq_prod_v2(
         _ => {
             let indices = super::encoder::nibble_unpack(code_bytes, padded);
             for j in 0..padded {
-                work_buf[j] = centroids_bm1.get(indices[j] as usize).copied().unwrap_or(0.0);
+                work_buf[j] = centroids_bm1
+                    .get(indices[j] as usize)
+                    .copied()
+                    .unwrap_or(0.0);
             }
         }
     }
@@ -239,18 +240,21 @@ pub fn prepare_query_prod(
     let dim = query.len();
 
     // 1. Compute S_m * y for each projection — O(M × d²) total
-    let s_y_list: Vec<Vec<f32>> = qjl_matrices.iter().map(|matrix| {
-        let mut s_y = vec![0.0f32; dim];
-        for row in 0..dim {
-            let row_start = row * dim;
-            let mut dot = 0.0f32;
-            for col in 0..dim {
-                dot += matrix[row_start + col] * query[col];
+    let s_y_list: Vec<Vec<f32>> = qjl_matrices
+        .iter()
+        .map(|matrix| {
+            let mut s_y = vec![0.0f32; dim];
+            for row in 0..dim {
+                let row_start = row * dim;
+                let mut dot = 0.0f32;
+                for col in 0..dim {
+                    dot += matrix[row_start + col] * query[col];
+                }
+                s_y[row] = dot;
             }
-            s_y[row] = dot;
-        }
-        s_y
-    }).collect();
+            s_y
+        })
+        .collect();
 
     // 2. Compute FWHT-rotated query
     let mut q_rotated = vec![0.0f32; padded_dim];
@@ -297,10 +301,10 @@ pub fn prepare_query_prod(
 #[inline]
 pub fn score_l2_prod(
     state: &TqProdQueryState,
-    tq_code: &[u8],           // nibble-packed TQ codes (padded_dim/2 bytes)
-    norm: f32,                // ||x|| stored with code
-    qjl_signs: &[u8],        // M * ceil(dim/8) sign bits, contiguous
-    residual_norm: f32,       // ||r|| stored with code
+    tq_code: &[u8],     // nibble-packed TQ codes (padded_dim/2 bytes)
+    norm: f32,          // ||x|| stored with code
+    qjl_signs: &[u8],   // M * ceil(dim/8) sign bits, contiguous
+    residual_norm: f32, // ||r|| stored with code
     centroids: &[f32; 16],
     dim: usize,
     qjl_bytes_per_vec: usize, // ceil(dim/8)
@@ -403,7 +407,14 @@ mod tests {
         let mut vec = lcg_f32(dim, 77);
         normalize(&mut vec);
 
-        let code = encode_tq_prod(&vec, &sign_flips, &boundaries, &centroids, &qjl_matrix, &mut work);
+        let code = encode_tq_prod(
+            &vec,
+            &sign_flips,
+            &boundaries,
+            &centroids,
+            &qjl_matrix,
+            &mut work,
+        );
 
         assert!(!code.mse_codes.is_empty(), "MSE codes should be non-empty");
         assert!(!code.qjl_signs.is_empty(), "QJL signs should be non-empty");
@@ -412,7 +423,10 @@ mod tests {
             (dim + 7) / 8,
             "QJL signs should be ceil(dim/8) bytes"
         );
-        assert!(code.original_norm > 0.0, "norm should be positive for non-zero vector");
+        assert!(
+            code.original_norm > 0.0,
+            "norm should be positive for non-zero vector"
+        );
         assert!(
             code.residual_norm >= 0.0,
             "residual norm should be non-negative"
@@ -421,7 +435,8 @@ mod tests {
         assert!(
             code.residual_norm < code.original_norm,
             "residual norm {:.4} should be less than original norm {:.4}",
-            code.residual_norm, code.original_norm
+            code.residual_norm,
+            code.original_norm
         );
     }
 
@@ -453,8 +468,22 @@ mod tests {
             let true_ip: f32 = query.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
 
             // Encode and score
-            let code = encode_tq_prod(&vec, &sign_flips, &boundaries, &centroids, &qjl_matrix, &mut work);
-            let est_ip = score_inner_product(&query, &code, &sign_flips, &centroids, &qjl_matrix, &mut work);
+            let code = encode_tq_prod(
+                &vec,
+                &sign_flips,
+                &boundaries,
+                &centroids,
+                &qjl_matrix,
+                &mut work,
+            );
+            let est_ip = score_inner_product(
+                &query,
+                &code,
+                &sign_flips,
+                &centroids,
+                &qjl_matrix,
+                &mut work,
+            );
 
             sum_true_ip += true_ip as f64;
             sum_est_ip += est_ip as f64;
@@ -492,8 +521,16 @@ mod tests {
         normalize(&mut vec);
 
         let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
-        let code = encode_tq_prod(&vec, &sign_flips, &boundaries, &centroids, &qjl_matrix, &mut work);
-        let self_score = score_inner_product(&vec, &code, &sign_flips, &centroids, &qjl_matrix, &mut work);
+        let code = encode_tq_prod(
+            &vec,
+            &sign_flips,
+            &boundaries,
+            &centroids,
+            &qjl_matrix,
+            &mut work,
+        );
+        let self_score =
+            score_inner_product(&vec, &code, &sign_flips, &centroids, &qjl_matrix, &mut work);
 
         // <x, x> should approximately equal ||x||^2 = 1.0 for unit vectors
         let relative_err = (self_score - norm_sq).abs() / norm_sq;
@@ -525,8 +562,16 @@ mod tests {
         let mut v2 = vec![0.0f32; dim];
         v2[1] = 1.0;
 
-        let code = encode_tq_prod(&v2, &sign_flips, &boundaries, &centroids, &qjl_matrix, &mut work);
-        let score = score_inner_product(&v1, &code, &sign_flips, &centroids, &qjl_matrix, &mut work);
+        let code = encode_tq_prod(
+            &v2,
+            &sign_flips,
+            &boundaries,
+            &centroids,
+            &qjl_matrix,
+            &mut work,
+        );
+        let score =
+            score_inner_product(&v1, &code, &sign_flips, &centroids, &qjl_matrix, &mut work);
 
         eprintln!("Orthogonal score: {:.6} (expected ~0.0)", score);
         assert!(
@@ -551,14 +596,29 @@ mod tests {
         // v1: 4-bit MSE + QJL signs
         let boundaries_4 = scaled_boundaries(padded as u32);
         let centroids_4 = scaled_centroids(padded as u32);
-        let code_v1 = encode_tq_prod(&vec, &sign_flips, &boundaries_4, &centroids_4, &qjl_matrix, &mut work);
+        let code_v1 = encode_tq_prod(
+            &vec,
+            &sign_flips,
+            &boundaries_4,
+            &centroids_4,
+            &qjl_matrix,
+            &mut work,
+        );
         let v1_bytes = code_v1.mse_codes.len() + code_v1.qjl_signs.len();
 
         // v2: 3-bit MSE + QJL signs (paper-correct)
-        let boundaries_3 = crate::vector::turbo_quant::codebook::scaled_boundaries_n(padded as u32, 3);
-        let centroids_3 = crate::vector::turbo_quant::codebook::scaled_centroids_n(padded as u32, 3);
+        let boundaries_3 =
+            crate::vector::turbo_quant::codebook::scaled_boundaries_n(padded as u32, 3);
+        let centroids_3 =
+            crate::vector::turbo_quant::codebook::scaled_centroids_n(padded as u32, 3);
         let code_v2 = encode_tq_prod_v2(
-            &vec, &sign_flips, &boundaries_3, &centroids_3, 3, &qjl_matrix, &mut work,
+            &vec,
+            &sign_flips,
+            &boundaries_3,
+            &centroids_3,
+            3,
+            &qjl_matrix,
+            &mut work,
         );
         let v2_bytes = code_v2.mse_codes.len() + code_v2.qjl_signs.len();
 

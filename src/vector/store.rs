@@ -10,8 +10,8 @@ use bytes::Bytes;
 use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::mvcc::manager::TransactionManager;
-use crate::vector::segment::{SegmentHolder, SegmentList};
 use crate::vector::segment::compaction;
+use crate::vector::segment::{SegmentHolder, SegmentList};
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::types::DistanceMetric;
@@ -87,7 +87,10 @@ impl VectorIndex {
 
         let frozen = self.segments.load().mutable.freeze();
         // Use a deterministic seed based on collection ID for reproducibility
-        let seed = self.collection.collection_id.wrapping_mul(6364136223846793005);
+        let seed = self
+            .collection
+            .collection_id
+            .wrapping_mul(6364136223846793005);
 
         match compaction::compact(&frozen, &self.collection, seed, None) {
             Ok(immutable) => {
@@ -101,12 +104,10 @@ impl VectorIndex {
                 let mut imm_list = old.immutable.clone();
                 imm_list.push(Arc::new(immutable));
                 let new_list = SegmentList {
-                    mutable: Arc::new(
-                        crate::vector::segment::mutable::MutableSegment::new(
-                            self.meta.dimension,
-                            self.collection.clone(),
-                        ),
-                    ),
+                    mutable: Arc::new(crate::vector::segment::mutable::MutableSegment::new(
+                        self.meta.dimension,
+                        self.collection.clone(),
+                    )),
                     immutable: imm_list,
                     ivf: old.ivf.clone(),
                 };
@@ -194,19 +195,23 @@ impl VectorStore {
         let scratch = SearchScratch::new(0, padded);
 
         let name = meta.name.clone();
-        self.indexes.insert(name.clone(), VectorIndex {
-            meta,
-            segments,
-            scratch,
-            collection,
-            payload_index: PayloadIndex::new(),
-        });
+        self.indexes.insert(
+            name.clone(),
+            VectorIndex {
+                meta,
+                segments,
+                scratch,
+                collection,
+                payload_index: PayloadIndex::new(),
+            },
+        );
 
         // Check if recovered segments exist for this collection_id
         if let Some(recovered) = self.pending_segments.remove(&collection_id) {
             if let Some(index) = self.indexes.get(&name) {
-                let mut immutable_arcs: Vec<Arc<crate::vector::segment::immutable::ImmutableSegment>> =
-                    Vec::with_capacity(recovered.immutable.len());
+                let mut immutable_arcs: Vec<
+                    Arc<crate::vector::segment::immutable::ImmutableSegment>,
+                > = Vec::with_capacity(recovered.immutable.len());
                 for (imm, _meta) in recovered.immutable {
                     immutable_arcs.push(Arc::new(imm));
                 }
@@ -245,21 +250,25 @@ impl VectorStore {
     /// Find indexes whose key_prefixes match the given key.
     /// Returns refs to matching VectorIndex entries.
     pub fn find_matching_indexes(&self, key: &[u8]) -> Vec<&VectorIndex> {
-        self.indexes.values().filter(|idx| {
-            idx.meta.key_prefixes.iter().any(|p| key.starts_with(p))
-        }).collect()
+        self.indexes
+            .values()
+            .filter(|idx| idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)))
+            .collect()
     }
 
     /// Find matching index names for auto-indexing.
     /// Caller must collect names first to avoid borrow issues.
     pub fn find_matching_index_names(&self, key: &[u8]) -> Vec<Bytes> {
-        self.indexes.iter().filter_map(|(name, idx)| {
-            if idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)) {
-                Some(name.clone())
-            } else {
-                None
-            }
-        }).collect()
+        self.indexes
+            .iter()
+            .filter_map(|(name, idx)| {
+                if idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Mark vectors as deleted for a key that was removed (DEL/HDEL/UNLINK).
@@ -310,7 +319,10 @@ mod tests {
             hnsw_ef_runtime: 0,
             compact_threshold: 0,
             source_field: Bytes::from_static(b"vec"),
-            key_prefixes: prefixes.iter().map(|p| Bytes::from(p.to_string())).collect(),
+            key_prefixes: prefixes
+                .iter()
+                .map(|p| Bytes::from(p.to_string()))
+                .collect(),
             quantization: QuantizationConfig::TurboQuant4,
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
         }
@@ -371,9 +383,15 @@ mod tests {
     #[test]
     fn test_find_matching_indexes() {
         let mut store = VectorStore::new();
-        store.create_index(make_meta("idx1", 64, &["user:"])).unwrap();
-        store.create_index(make_meta("idx2", 64, &["product:"])).unwrap();
-        store.create_index(make_meta("idx3", 64, &["user:", "item:"])).unwrap();
+        store
+            .create_index(make_meta("idx1", 64, &["user:"]))
+            .unwrap();
+        store
+            .create_index(make_meta("idx2", 64, &["product:"]))
+            .unwrap();
+        store
+            .create_index(make_meta("idx3", 64, &["user:", "item:"]))
+            .unwrap();
 
         let matches = store.find_matching_indexes(b"user:123");
         assert_eq!(matches.len(), 2);
@@ -391,7 +409,9 @@ mod tests {
     #[test]
     fn test_get_index() {
         let mut store = VectorStore::new();
-        store.create_index(make_meta("myidx", 256, &["doc:"])).unwrap();
+        store
+            .create_index(make_meta("myidx", 256, &["doc:"]))
+            .unwrap();
 
         let idx = store.get_index(b"myidx").unwrap();
         assert_eq!(idx.meta.dimension, 256);

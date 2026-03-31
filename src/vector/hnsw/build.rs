@@ -3,7 +3,7 @@
 //! Constructs an `HnswGraph` via incremental insertion, then applies BFS
 //! reordering for cache-friendly layer-0 traversal.
 
-use super::graph::{bfs_reorder, rearrange_layer0, HnswGraph, SENTINEL};
+use super::graph::{HnswGraph, SENTINEL, bfs_reorder, rearrange_layer0};
 use crate::vector::aligned_buffer::AlignedBuffer;
 use smallvec::SmallVec;
 use std::cmp::Reverse;

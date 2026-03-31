@@ -169,7 +169,18 @@ pub fn hnsw_search(
     ef_search: usize,
     scratch: &mut SearchScratch,
 ) -> SmallVec<[SearchResult; 32]> {
-    hnsw_search_filtered(graph, vectors_tq, query, collection, k, ef_search, scratch, None, &[], 0)
+    hnsw_search_filtered(
+        graph,
+        vectors_tq,
+        query,
+        collection,
+        k,
+        ef_search,
+        scratch,
+        None,
+        &[],
+        0,
+    )
 }
 
 /// HNSW search with sub-centroid sign bits for 2× resolution scoring.
@@ -187,7 +198,18 @@ pub fn hnsw_search_subcent(
     sub_centroid_signs: &[u8],
     sub_sign_bytes_per_vec: usize,
 ) -> SmallVec<[SearchResult; 32]> {
-    hnsw_search_filtered(graph, vectors_tq, query, collection, k, ef_search, scratch, None, sub_centroid_signs, sub_sign_bytes_per_vec)
+    hnsw_search_filtered(
+        graph,
+        vectors_tq,
+        query,
+        collection,
+        k,
+        ef_search,
+        scratch,
+        None,
+        sub_centroid_signs,
+        sub_sign_bytes_per_vec,
+    )
 }
 
 /// HNSW search with optional filter bitmap (ACORN 2-hop expansion).
@@ -258,7 +280,7 @@ pub fn hnsw_search_filtered(
     // constant offset and add it once per candidate.
     let original_dim = query.len();
     let padded_dim = q_rotated.len();
-    let active_code_bytes = original_dim / 2; // nibble-packed bytes for original dim
+    let _active_code_bytes = original_dim / 2; // nibble-packed bytes for original dim
     let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
 
     let sub_table = collection.sub_centroid_table.as_ref();
@@ -286,7 +308,7 @@ pub fn hnsw_search_filtered(
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;
     let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 bytes are norm)
-    let epc = entries_per_coord;
+    let _epc = entries_per_coord;
 
     // LUT-based unbounded distance with optional sub-centroid scoring.
     let dist_bfs = |bfs_pos: u32| -> f32 {
@@ -303,15 +325,16 @@ pub fn hnsw_search_filtered(
             for (i, &byte) in code_only.iter().enumerate() {
                 let qi = i * 2;
                 let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
-                let s_hi = ((sub_centroid_signs[sign_off + (qi+1) / 8] >> ((qi+1) % 8)) & 1) as usize;
+                let s_hi =
+                    ((sub_centroid_signs[sign_off + (qi + 1) / 8] >> ((qi + 1) % 8)) & 1) as usize;
                 sum0 += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
-                sum1 += adc_lut[(qi+1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+                sum1 += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
             }
         } else {
             for (i, &byte) in code_only.iter().enumerate() {
                 let qi = i * 2;
                 sum0 += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                sum1 += adc_lut[(qi+1) * 16 + (byte >> 4) as usize];
+                sum1 += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
             }
         }
         (sum0 + sum1) * norm_sq
@@ -324,7 +347,9 @@ pub fn hnsw_search_filtered(
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
         let norm_sq = norm * norm;
-        if norm_sq <= 0.0 { return 0.0; }
+        if norm_sq <= 0.0 {
+            return 0.0;
+        }
         let scaled_budget = budget / norm_sq;
         let mut sum = 0.0f32;
         let check_interval = 16;
@@ -340,11 +365,14 @@ pub fn hnsw_search_filtered(
                     let byte = code_only[i];
                     let qi = i * 2;
                     let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
-                    let s_hi = ((sub_centroid_signs[sign_off + (qi+1) / 8] >> ((qi+1) % 8)) & 1) as usize;
+                    let s_hi = ((sub_centroid_signs[sign_off + (qi + 1) / 8] >> ((qi + 1) % 8)) & 1)
+                        as usize;
                     sum += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
-                    sum += adc_lut[(qi+1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+                    sum += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
                 }
-                if sum > scaled_budget { return f32::MAX; }
+                if sum > scaled_budget {
+                    return f32::MAX;
+                }
             }
             let tail = chunks * check_interval;
             for j in 0..remainder {
@@ -352,9 +380,10 @@ pub fn hnsw_search_filtered(
                 let byte = code_only[i];
                 let qi = i * 2;
                 let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
-                let s_hi = ((sub_centroid_signs[sign_off + (qi+1) / 8] >> ((qi+1) % 8)) & 1) as usize;
+                let s_hi =
+                    ((sub_centroid_signs[sign_off + (qi + 1) / 8] >> ((qi + 1) % 8)) & 1) as usize;
                 sum += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
-                sum += adc_lut[(qi+1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+                sum += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
             }
         } else {
             for chunk in 0..chunks {
@@ -364,9 +393,11 @@ pub fn hnsw_search_filtered(
                     let byte = code_only[i];
                     let qi = i * 2;
                     sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                    sum += adc_lut[(qi+1) * 16 + (byte >> 4) as usize];
+                    sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
                 }
-                if sum > scaled_budget { return f32::MAX; }
+                if sum > scaled_budget {
+                    return f32::MAX;
+                }
             }
             let tail = chunks * check_interval;
             for j in 0..remainder {
@@ -374,7 +405,7 @@ pub fn hnsw_search_filtered(
                 let byte = code_only[i];
                 let qi = i * 2;
                 sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                sum += adc_lut[(qi+1) * 16 + (byte >> 4) as usize];
+                sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
             }
         }
         sum * norm_sq
@@ -573,10 +604,7 @@ mod tests {
     }
 
     fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y) * (x - y))
-            .sum()
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
     }
 
     /// Build a complete test fixture: vectors, TQ codes, HNSW graph, BFS-ordered TQ buffer.
@@ -715,10 +743,8 @@ mod tests {
             .collect();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        let gt_ids: std::collections::HashSet<u32> =
-            dists.iter().take(k).map(|d| d.1).collect();
-        let found_ids: std::collections::HashSet<u32> =
-            found.iter().map(|r| r.id.0).collect();
+        let gt_ids: std::collections::HashSet<u32> = dists.iter().take(k).map(|d| d.1).collect();
+        let found_ids: std::collections::HashSet<u32> = found.iter().map(|r| r.id.0).collect();
         let overlap = gt_ids.intersection(&found_ids).count();
         overlap as f32 / k as f32
     }
@@ -791,9 +817,7 @@ mod tests {
     #[test]
     fn test_search_scratch_clear_preserves_capacity() {
         let mut scratch = SearchScratch::new(1000, 1024);
-        scratch
-            .candidates
-            .push(Reverse(OrdF32Pair(1.0, 0)));
+        scratch.candidates.push(Reverse(OrdF32Pair(1.0, 0)));
         scratch.results.push(OrdF32Pair(1.0, 0));
         let cap_before_cand = scratch.candidates.capacity();
         let cap_before_res = scratch.results.capacity();
@@ -812,11 +836,14 @@ mod tests {
     fn test_search_empty_graph() {
         distance::init();
         let collection = CollectionMetadata::new(
-            1, 64, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            64,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         );
-        let graph = HnswBuilder::new(16, 200, 42).build(
-            (collection.padded_dimension / 2 + 4) as u32,
-        );
+        let graph =
+            HnswBuilder::new(16, 200, 42).build((collection.padded_dimension / 2 + 4) as u32);
         let padded = collection.padded_dimension;
         let mut scratch = SearchScratch::new(0, padded);
         let query = vec![0.0f32; 64];
@@ -859,11 +886,9 @@ mod tests {
         for q_seed in 0..num_queries {
             let mut query = lcg_f32(dim, 10000 + q_seed * 17);
             normalize(&mut query);
-            let results =
-                hnsw_search(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+            let results = hnsw_search(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
             assert!(results.len() <= k);
-            let recall =
-                compute_recall_tq(&results, &graph, &tq_buf, &query, &collection, k);
+            let recall = compute_recall_tq(&results, &graph, &tq_buf, &query, &collection, k);
             total_recall += recall;
         }
         let avg_recall = total_recall / num_queries as f32;
@@ -889,11 +914,9 @@ mod tests {
         for q_seed in 0..num_queries {
             let mut query = lcg_f32(dim, 20000 + q_seed * 31);
             normalize(&mut query);
-            let results =
-                hnsw_search(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+            let results = hnsw_search(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
             assert!(results.len() <= k);
-            let recall =
-                compute_recall_tq(&results, &graph, &tq_buf, &query, &collection, k);
+            let recall = compute_recall_tq(&results, &graph, &tq_buf, &query, &collection, k);
             total_recall += recall;
         }
         let avg_recall = total_recall / num_queries as f32;
@@ -914,8 +937,7 @@ mod tests {
 
         // Search for k=1 with high ef for maximum accuracy
         let query = &vectors[0]; // query IS a database vector
-        let results =
-            hnsw_search(&graph, &tq_buf, query, &collection, 1, 128, &mut scratch);
+        let results = hnsw_search(&graph, &tq_buf, query, &collection, 1, 128, &mut scratch);
         assert_eq!(results.len(), 1);
         // Should find vector 0 itself (or very close to it)
         // Due to TQ quantization, self-distance is non-zero but should still rank #1
@@ -964,8 +986,27 @@ mod tests {
         let padded = collection.padded_dimension;
         let mut scratch = SearchScratch::new(n as u32, padded);
 
-        let unfiltered = hnsw_search(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch);
-        let filtered = hnsw_search_filtered(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch, None, &[], 0);
+        let unfiltered = hnsw_search(
+            &graph,
+            &tq_buf,
+            &vectors[0],
+            &collection,
+            k,
+            ef,
+            &mut scratch,
+        );
+        let filtered = hnsw_search_filtered(
+            &graph,
+            &tq_buf,
+            &vectors[0],
+            &collection,
+            k,
+            ef,
+            &mut scratch,
+            None,
+            &[],
+            0,
+        );
 
         assert_eq!(unfiltered.len(), filtered.len());
         for (u, f) in unfiltered.iter().zip(filtered.iter()) {
@@ -992,11 +1033,29 @@ mod tests {
         let mut query = lcg_f32(dim, 99999);
         normalize(&mut query);
 
-        let results = hnsw_search_filtered(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch, Some(&bitmap), &[], 0);
+        let results = hnsw_search_filtered(
+            &graph,
+            &tq_buf,
+            &query,
+            &collection,
+            k,
+            ef,
+            &mut scratch,
+            Some(&bitmap),
+            &[],
+            0,
+        );
         for r in &results {
-            assert!(bitmap.contains(r.id.0), "result id {} not in bitmap", r.id.0);
+            assert!(
+                bitmap.contains(r.id.0),
+                "result id {} not in bitmap",
+                r.id.0
+            );
         }
-        assert!(!results.is_empty(), "filtered search should return some results");
+        assert!(
+            !results.is_empty(),
+            "filtered search should return some results"
+        );
     }
 
     #[test]

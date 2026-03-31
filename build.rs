@@ -54,10 +54,7 @@ fn cuda_home_nvcc() -> Vec<String> {
 ///
 /// Example output line: `Cuda compilation tools, release 12.4, V12.4.131`
 fn run_nvcc_version(nvcc: &str) -> Option<(u32, u32)> {
-    let output = Command::new(nvcc)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let output = Command::new(nvcc).arg("--version").output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -68,10 +65,16 @@ fn run_nvcc_version(nvcc: &str) -> Option<(u32, u32)> {
     for line in stdout.lines() {
         if let Some(pos) = line.find("release ") {
             let after = &line[pos + 8..];
-            let version_str: String = after.chars().take_while(|c| *c == '.' || c.is_ascii_digit()).collect();
+            let version_str: String = after
+                .chars()
+                .take_while(|c| *c == '.' || c.is_ascii_digit())
+                .collect();
             let mut parts = version_str.split('.');
             let major = parts.next().and_then(|s| s.parse::<u32>().ok())?;
-            let minor = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let minor = parts
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
             return Some((major, minor));
         }
     }
