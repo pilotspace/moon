@@ -32,8 +32,54 @@ impl Ord for OrdF32Pair {
 
 /// Select the `max_neighbors` nearest candidates (simple strategy).
 /// Assumes candidates are sorted by distance ascending.
+#[allow(dead_code)]
 fn select_neighbors_simple(candidates: &[(f32, u32)], max_neighbors: usize) -> Vec<(f32, u32)> {
     candidates.iter().take(max_neighbors).copied().collect()
+}
+
+/// Select neighbors using diversity heuristic (Algorithm 4, Malkov & Yashunin 2018).
+///
+/// Candidates MUST be sorted by distance ascending before calling.
+/// For each candidate: accept if dist(candidate, query) < dist(candidate, every selected neighbor).
+/// After heuristic pass, if fewer than `max_neighbors` selected, fill from pruned (`keepPrunedConnections`).
+fn select_neighbors_heuristic(
+    candidates: &[(f32, u32)],
+    max_neighbors: usize,
+    dist_fn: &impl Fn(u32, u32) -> f32,
+) -> Vec<(f32, u32)> {
+    let mut selected: SmallVec<[(f32, u32); 64]> = SmallVec::new();
+    let mut pruned: SmallVec<[(f32, u32); 64]> = SmallVec::new();
+
+    for &(dist_to_query, candidate_id) in candidates {
+        if selected.len() >= max_neighbors {
+            break;
+        }
+        let mut good = true;
+        for &(_, selected_id) in &selected {
+            let dist_to_selected = dist_fn(candidate_id, selected_id);
+            if dist_to_selected < dist_to_query {
+                good = false;
+                break;
+            }
+        }
+        if good {
+            selected.push((dist_to_query, candidate_id));
+        } else {
+            pruned.push((dist_to_query, candidate_id));
+        }
+    }
+
+    // keepPrunedConnections: fill remaining slots from pruned candidates (already sorted by distance)
+    if selected.len() < max_neighbors {
+        for &item in &pruned {
+            if selected.len() >= max_neighbors {
+                break;
+            }
+            selected.push(item);
+        }
+    }
+
+    selected.into_vec()
 }
 
 /// Single-threaded HNSW index builder.
@@ -191,8 +237,8 @@ impl HnswBuilder {
             // Search layer for ef nearest neighbors
             let candidates = self.search_layer(current, &distance_to, ef, lev);
 
-            // Select neighbors using simple heuristic (nearest M)
-            let selected = select_neighbors_simple(&candidates, max_neighbors);
+            // Select neighbors using diversity heuristic (Algorithm 4, Malkov & Yashunin 2018)
+            let selected = select_neighbors_heuristic(&candidates, max_neighbors, &dist_fn);
 
             // Connect new node -> selected neighbors
             self.set_neighbors(node_id, lev, &selected);
@@ -320,8 +366,9 @@ impl HnswBuilder {
         }
     }
 
-    /// Add node_id as a neighbor of target. If target's neighbor list is full,
-    /// replace the farthest existing neighbor if node_id is closer to target.
+    /// Add `node_id` as a neighbor of `target`. If target's neighbor list is full,
+    /// re-prune using the diversity heuristic (Algorithm 4) on all current neighbors
+    /// plus the new candidate. Uses stack-allocated `SmallVec` to avoid heap allocation.
     fn add_neighbor_with_prune(
         &mut self,
         target: u32,
@@ -352,10 +399,10 @@ impl HnswBuilder {
             }
         }
 
-        // Full: find farthest neighbor and replace if new node is closer to target
-        let new_dist = dist_fn(target, node_id);
-        let mut worst_dist = 0.0f32;
-        let mut worst_idx = 0;
+        // Full: collect all current neighbors + new candidate, re-prune with heuristic.
+        // Stack array sized for M0=64 + 1 new candidate (covers any M up to 32).
+        let mut combined_buf = [(0.0f32, 0u32); 65];
+        let mut combined_len = 0usize;
 
         let neighbors = if level == 0 {
             &self.layer0_flat[start..start + max_nb]
@@ -365,22 +412,44 @@ impl HnswBuilder {
             &sv[start..end]
         };
 
-        for (i, &nb) in neighbors.iter().enumerate() {
+        for &nb in neighbors {
             if nb == SENTINEL {
                 break;
             }
-            let d = dist_fn(target, nb);
-            if d > worst_dist {
-                worst_dist = d;
-                worst_idx = i;
-            }
+            combined_buf[combined_len] = (dist_fn(target, nb), nb);
+            combined_len += 1;
         }
+        combined_buf[combined_len] = (dist_fn(target, node_id), node_id);
+        combined_len += 1;
 
-        if new_dist < worst_dist {
-            if level == 0 {
-                self.layer0_flat[start + worst_idx] = node_id;
-            } else {
-                self.upper_layers[target as usize][start + worst_idx] = node_id;
+        // Sort by distance ascending (required by select_neighbors_heuristic)
+        combined_buf[..combined_len].sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+
+        // Re-prune using diversity heuristic with target as the "query"
+        let pruned = select_neighbors_heuristic(&combined_buf[..combined_len], max_nb, dist_fn);
+
+        // Write back to neighbor array, fill unused slots with SENTINEL
+        if level == 0 {
+            for i in 0..max_nb {
+                self.layer0_flat[start + i] = if i < pruned.len() {
+                    pruned[i].1
+                } else {
+                    SENTINEL
+                };
+            }
+        } else {
+            let sv = &mut self.upper_layers[target as usize];
+            let end = (start + max_nb).min(sv.len());
+            for i in 0..(end - start) {
+                sv[start + i] = if i < pruned.len() {
+                    pruned[i].1
+                } else {
+                    SENTINEL
+                };
             }
         }
     }
@@ -608,5 +677,292 @@ mod tests {
         let candidates: Vec<(f32, u32)> = vec![(1.0, 0), (2.0, 1)];
         let selected = select_neighbors_simple(&candidates, 4);
         assert_eq!(selected.len(), 2);
+    }
+
+    // --- Diversity heuristic tests ---
+
+    /// Brute-force k-NN oracle: compute L2 distance from query to all vectors, return top-k IDs.
+    fn brute_force_knn(query: &[f32], all_vectors: &[Vec<f32>], k: usize) -> Vec<u32> {
+        let mut dists: Vec<(f32, u32)> = all_vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                (d, i as u32)
+            })
+            .collect();
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.iter().take(k).map(|(_, id)| *id).collect()
+    }
+
+    /// Generate a Gaussian blob around `center` with `n` points in `dim` dimensions.
+    fn gaussian_blob(center: &[f32], n: usize, dim: usize, seed: u32) -> Vec<Vec<f32>> {
+        let mut vecs = Vec::with_capacity(n);
+        let mut s = seed;
+        for _ in 0..n {
+            let mut v = Vec::with_capacity(dim);
+            for d in 0..dim {
+                // Box-Muller approximation using LCG pairs
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u1 = (s as f32) / (u32::MAX as f32);
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u2 = (s as f32) / (u32::MAX as f32);
+                // Approximate normal: use simple linear transform of uniform
+                let normal = (u1 - 0.5) * 2.0 * 0.1; // stddev ~ 0.1
+                v.push(center[d] + normal);
+            }
+            vecs.push(v);
+        }
+        vecs
+    }
+
+    #[test]
+    fn test_heuristic_collinear() {
+        // 3 collinear candidates along the same direction from query.
+        // Candidate 0 at distance 1.0, candidate 1 at distance 2.0, candidate 2 at distance 3.0.
+        // With M=2, heuristic should select candidate 0 (nearest).
+        // Candidate 1 is "shadowed" by candidate 0 (closer to 0 than to query).
+        // Candidate 2 is also shadowed. So only 1 selected by heuristic,
+        // then keepPrunedConnections fills 1 more from pruned => total 2.
+        //
+        // We use 1D vectors: query=0, candidates at 1, 2, 3 (IDs 0, 1, 2).
+        // dist_fn(a, b) returns |pos[a] - pos[b]|^2.
+        let positions = [1.0f32, 2.0, 3.0];
+        let dist_fn = |a: u32, b: u32| {
+            let diff = positions[a as usize] - positions[b as usize];
+            diff * diff
+        };
+        // candidates sorted by distance to query (at 0):
+        // (1.0, 0), (4.0, 1), (9.0, 2)
+        let candidates = vec![(1.0, 0u32), (4.0, 1), (9.0, 2)];
+        let selected = select_neighbors_heuristic(&candidates, 2, &dist_fn);
+
+        // Heuristic: candidate 0 accepted (first).
+        // Candidate 1: dist_to_query=4.0, dist_to_selected[0]=(2-1)^2=1.0 < 4.0 => pruned.
+        // Candidate 2: dist_to_query=9.0, dist_to_selected[0]=(3-1)^2=4.0 < 9.0 => pruned.
+        // keepPrunedConnections: fill 1 from pruned => candidate 1 (nearest pruned).
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].1, 0, "nearest should be selected first");
+        assert_eq!(selected[1].1, 1, "keepPruned fills from pruned list");
+    }
+
+    #[test]
+    fn test_heuristic_diverse_candidates() {
+        // 6 candidates in 2D at different angles from query at origin.
+        // M=4, so heuristic should select 4 angularly-spread neighbors.
+        let positions: [(f32, f32); 6] = [
+            (1.0, 0.0),   // 0: east, dist=1
+            (-1.0, 0.0),  // 1: west, dist=1
+            (0.0, 1.0),   // 2: north, dist=1
+            (0.0, -1.0),  // 3: south, dist=1
+            (1.1, 0.1),   // 4: near-east (close to 0), dist~1.21
+            (-1.1, -0.1), // 5: near-west (close to 1), dist~1.22
+        ];
+        let dist_fn = |a: u32, b: u32| {
+            let (ax, ay) = positions[a as usize];
+            let (bx, by) = positions[b as usize];
+            (ax - bx) * (ax - bx) + (ay - by) * (ay - by)
+        };
+        // Query at origin (not a real node, but distances to query are L2 from origin)
+        let mut candidates: Vec<(f32, u32)> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| (x * x + y * y, i as u32))
+            .collect();
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let selected = select_neighbors_heuristic(&candidates, 4, &dist_fn);
+        assert_eq!(selected.len(), 4);
+        // The 4 cardinal directions (0,1,2,3) should be selected, not the redundant 4,5
+        let selected_ids: Vec<u32> = selected.iter().map(|s| s.1).collect();
+        // All 4 cardinal directions should appear
+        assert!(selected_ids.contains(&0), "east should be selected");
+        assert!(selected_ids.contains(&1), "west should be selected");
+        assert!(selected_ids.contains(&2), "north should be selected");
+        assert!(selected_ids.contains(&3), "south should be selected");
+    }
+
+    #[test]
+    fn test_heuristic_keep_pruned_connections() {
+        // 5 candidates where heuristic selects only 2 diverse ones.
+        // M=4, so keepPrunedConnections should fill 2 more from pruned.
+        // All 5 on a line: positions 1, 2, 3, 4, 5 (query at 0)
+        let positions = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let dist_fn = |a: u32, b: u32| {
+            let diff = positions[a as usize] - positions[b as usize];
+            diff * diff
+        };
+        let candidates: Vec<(f32, u32)> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (p * p, i as u32))
+            .collect();
+        let selected = select_neighbors_heuristic(&candidates, 4, &dist_fn);
+        assert_eq!(
+            selected.len(),
+            4,
+            "keepPruned should fill to M=4 from pruned"
+        );
+        // First selected must be the nearest
+        assert_eq!(selected[0].1, 0);
+    }
+
+    #[test]
+    fn test_heuristic_all_reachable() {
+        // Build a 1000-node graph with heuristic and verify BFS reachability.
+        let dim = 32;
+        let n = 1000u32;
+        let vecs: Vec<Vec<f32>> = (0..n).map(|i| lcg_f32(dim, i * 7 + 13)).collect();
+
+        let mut builder = HnswBuilder::new(16, 200, 42);
+        for _i in 0..n {
+            builder.insert(|a, b| l2_vecs(&vecs[a as usize], &vecs[b as usize]));
+        }
+        let graph = builder.build(8);
+        assert_eq!(graph.num_nodes(), n);
+
+        // BFS from entry point
+        let mut visited = vec![false; n as usize];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(graph.entry_point());
+        visited[graph.entry_point() as usize] = true;
+        let mut count = 1u32;
+        while let Some(pos) = queue.pop_front() {
+            let neighbors = graph.neighbors_l0(pos);
+            for &nb in neighbors {
+                if nb == SENTINEL {
+                    break;
+                }
+                if !visited[nb as usize] {
+                    visited[nb as usize] = true;
+                    count += 1;
+                    queue.push_back(nb);
+                }
+            }
+        }
+        assert_eq!(count, n, "not all nodes reachable from entry point via BFS");
+    }
+
+    #[test]
+    fn test_heuristic_recall_improvement() {
+        // 4 Gaussian blobs, 250 vectors each = 1000 total, dim=32.
+        // Build with heuristic, measure recall@10 vs brute-force L2 oracle.
+        // Target: recall@10 >= 0.85.
+        let dim = 32;
+        let centers: Vec<Vec<f32>> = vec![
+            vec![5.0; dim],
+            vec![-5.0; dim],
+            {
+                let mut c = vec![5.0; dim];
+                for i in 0..dim / 2 {
+                    c[i] = -5.0;
+                }
+                c
+            },
+            {
+                let mut c = vec![-5.0; dim];
+                for i in 0..dim / 2 {
+                    c[i] = 5.0;
+                }
+                c
+            },
+        ];
+        let mut all_vecs: Vec<Vec<f32>> = Vec::with_capacity(1000);
+        for (ci, center) in centers.iter().enumerate() {
+            let blob = gaussian_blob(center, 250, dim, (ci as u32 + 1) * 1000);
+            all_vecs.extend(blob);
+        }
+        let n = all_vecs.len() as u32;
+
+        let mut builder = HnswBuilder::new(16, 200, 42);
+        for _ in 0..n {
+            builder.insert(|a, b| l2_vecs(&all_vecs[a as usize], &all_vecs[b as usize]));
+        }
+        let graph = builder.build(8);
+
+        // Use the HNSW graph search to find top-10 for each query, compare vs brute-force
+        let k = 10;
+        let num_queries = 100;
+        let mut total_recall = 0.0f64;
+
+        for qi in 0..num_queries {
+            let query_id = qi * (n / num_queries as u32);
+            let query = &all_vecs[query_id as usize];
+            let gt = brute_force_knn(query, &all_vecs, k);
+
+            // Search using the graph (simple greedy from entry point with ef=64)
+            let distance_to_query =
+                |pos: u32| -> f32 { l2_vecs(&all_vecs[graph.to_original(pos) as usize], query) };
+
+            // Use graph's neighbors_l0 for a basic BFS/greedy search
+            let results = search_graph_knn(&graph, &distance_to_query, k, 64);
+            // Convert BFS positions back to original IDs
+            let result_ids: Vec<u32> = results.iter().map(|&(_, pos)| graph.to_original(pos)).collect();
+
+            let hits = result_ids.iter().filter(|id| gt.contains(id)).count();
+            total_recall += hits as f64 / k as f64;
+        }
+        let avg_recall = total_recall / num_queries as f64;
+        assert!(
+            avg_recall >= 0.85,
+            "recall@10 should be >= 0.85 on clustered data, got {:.3}",
+            avg_recall
+        );
+    }
+
+    /// Simple graph search for testing: greedy beam search over layer 0 of built graph.
+    fn search_graph_knn(
+        graph: &HnswGraph,
+        distance_to_query: &impl Fn(u32) -> f32,
+        k: usize,
+        ef: usize,
+    ) -> Vec<(f32, u32)> {
+        let entry = graph.entry_point();
+        let entry_dist = distance_to_query(entry);
+
+        let mut candidates: BinaryHeap<Reverse<OrdF32Pair>> = BinaryHeap::new();
+        let mut results: BinaryHeap<OrdF32Pair> = BinaryHeap::new();
+        let mut visited = HashSet::new();
+
+        candidates.push(Reverse(OrdF32Pair(entry_dist, entry)));
+        results.push(OrdF32Pair(entry_dist, entry));
+        visited.insert(entry);
+
+        while let Some(Reverse(OrdF32Pair(c_dist, c_id))) = candidates.pop() {
+            if results.len() >= ef {
+                if let Some(&OrdF32Pair(worst, _)) = results.peek() {
+                    if c_dist > worst {
+                        break;
+                    }
+                }
+            }
+            let neighbors = graph.neighbors_l0(c_id);
+            for &nb in neighbors {
+                if nb == SENTINEL {
+                    break;
+                }
+                if !visited.insert(nb) {
+                    continue;
+                }
+                let d = distance_to_query(nb);
+                let should_add = results.len() < ef || d < results.peek().map_or(f32::MAX, |p| p.0);
+                if should_add {
+                    candidates.push(Reverse(OrdF32Pair(d, nb)));
+                    results.push(OrdF32Pair(d, nb));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(f32, u32)> = results
+            .into_vec()
+            .into_iter()
+            .map(|OrdF32Pair(d, id)| (d, id))
+            .collect();
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        out.truncate(k);
+        out
     }
 }
