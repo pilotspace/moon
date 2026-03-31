@@ -31,7 +31,7 @@ pub struct DistanceTable {
     pub cosine_f32: fn(&[f32], &[f32]) -> f32,
     /// TurboQuant asymmetric L2: (rotated_query, nibble_packed_code, norm, centroids) -> distance.
     /// Centroids must be dimension-scaled (from CollectionMetadata.codebook_16()).
-    /// All tiers use scalar ADC for now; AVX2/AVX-512 VPERMPS ADC is Phase 61+ work.
+    /// 4-bit ADC uses AVX2 VPERMPS (tq_adc_avx2.rs); multi-bit ADC remains scalar.
     pub tq_l2: fn(&[f32], &[u8], f32, &[f32; 16]) -> f32,
 }
 

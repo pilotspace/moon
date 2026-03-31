@@ -3,8 +3,8 @@
 //! Computes L2 distance between a full-precision rotated query and a
 //! nibble-packed TQ code. Used by HNSW beam search (Phase 61).
 //!
-//! The scalar version here serves as reference. AVX2/AVX-512 VPERMPS
-//! versions are added in Phase 61+ for production throughput.
+//! The scalar version here serves as reference.
+//! AVX2 VPERMPS version in tq_adc_avx2.rs, dispatched via tq_l2_adc_fast().
 
 use super::codebook::CENTROIDS;
 
@@ -138,6 +138,54 @@ pub fn tq_l2_adc_scaled_budgeted(
     }
 
     (sum0 + sum1 + sum2 + sum3) * norm_sq
+}
+
+/// Production ADC entry point -- selects AVX2 VPERMPS when available.
+///
+/// On x86_64 with AVX2+FMA: uses VPERMPS kernel (~4-8x faster).
+/// On all other platforms: falls back to scalar `tq_l2_adc_scaled`.
+#[inline]
+pub fn tq_l2_adc_fast(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    centroids: &[f32; 16],
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
+            return unsafe {
+                super::tq_adc_avx2::tq_l2_adc_avx2(q_rotated, code, norm, centroids)
+            };
+        }
+    }
+    tq_l2_adc_scaled(q_rotated, code, norm, centroids)
+}
+
+/// Budgeted variant with AVX2 dispatch.
+///
+/// Returns `f32::MAX` when accumulated distance exceeds `budget`.
+#[inline]
+pub fn tq_l2_adc_fast_budgeted(
+    q_rotated: &[f32],
+    code: &[u8],
+    norm: f32,
+    centroids: &[f32; 16],
+    budget: f32,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
+            return unsafe {
+                super::tq_adc_avx2::tq_l2_adc_avx2_budgeted(
+                    q_rotated, code, norm, centroids, budget,
+                )
+            };
+        }
+    }
+    tq_l2_adc_scaled_budgeted(q_rotated, code, norm, centroids, budget)
 }
 
 /// Asymmetric L2 distance: full-precision query vs TQ code.
