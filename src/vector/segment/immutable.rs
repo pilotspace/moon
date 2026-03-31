@@ -146,16 +146,16 @@ impl ImmutableSegment {
         let code_len = bytes_per_code - 4;
         let qjl_bpv = self.qjl_bytes_per_vec;
 
-        // Precompute query state: S*y (O(d²)) + q_rotated (O(d log d))
-        let qjl_matrix = self.collection_meta.qjl_matrix.as_deref().unwrap();
+        // Precompute query state: M × S_m*y (O(M*d²)) + q_rotated (O(d log d))
         let query_state = prepare_query_prod(
             query,
-            qjl_matrix,
+            &self.collection_meta.qjl_matrices,
             self.collection_meta.fwht_sign_flips.as_slice(),
             padded,
         );
 
         let tq_buf = self.vectors_tq.as_slice();
+        let single_qjl_bpv = (dim + 7) / 8;
 
         for result in candidates.iter_mut() {
             let bfs_pos = self.graph.to_bfs(result.id.0) as usize;
@@ -169,7 +169,7 @@ impl ImmutableSegment {
             let residual_norm = self.residual_norms[bfs_pos];
 
             result.distance = score_l2_prod(
-                &query_state, tq_code, norm, qjl_signs, residual_norm, centroids, dim,
+                &query_state, tq_code, norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
             );
         }
         candidates.sort_unstable();

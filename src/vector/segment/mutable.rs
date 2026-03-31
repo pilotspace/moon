@@ -96,7 +96,8 @@ impl MutableSegment {
     pub fn new(dimension: u32, collection: Arc<CollectionMetadata>) -> Self {
         let padded = padded_dimension(dimension);
         let bytes_per_code = padded as usize / 2 + 4; // nibble-packed + 4 bytes norm
-        let qjl_bytes_per_vec = (dimension as usize + 7) / 8;
+        let m = collection.qjl_num_projections.max(1);
+        let qjl_bytes_per_vec = m * ((dimension as usize + 7) / 8);
         Self {
             inner: RwLock::new(MutableSegmentInner {
                 tq_codes: Vec::new(),
@@ -156,14 +157,14 @@ impl MutableSegment {
         let residual_norm = r_norm_sq.sqrt();
         inner.residual_norms.push(residual_norm);
 
-        // Step 3: QJL encode residual → sign bits
-        if let Some(ref qjl_matrix) = self.collection.qjl_matrix {
+        // Step 3: QJL encode residual → M sign vectors
+        let qjl_bpv = inner.qjl_bytes_per_vec;
+        for qjl_matrix in &self.collection.qjl_matrices {
             let qjl_signs = super::super::turbo_quant::qjl::qjl_encode(qjl_matrix, &residual, dim);
             inner.qjl_signs.extend_from_slice(&qjl_signs);
-        } else {
-            // No QJL matrix — fill with zeros (graceful degradation)
-            let qjl_bytes = inner.qjl_bytes_per_vec;
-            inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bytes));
+        }
+        if self.collection.qjl_matrices.is_empty() {
+            inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
         }
 
         inner.entries.push(MutableEntry {
@@ -230,8 +231,9 @@ impl MutableSegment {
             let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
             let residual_norm = inner.residual_norms[id];
 
+            let single_qjl_bpv = (dim + 7) / 8;
             let dist = crate::vector::turbo_quant::inner_product::score_l2_prod(
-                query_state, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim,
+                query_state, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
             );
 
             if heap.len() < k {
@@ -288,8 +290,9 @@ impl MutableSegment {
             let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
             let residual_norm = inner.residual_norms[id];
 
+            let single_qjl_bpv = (dim + 7) / 8;
             let dist = crate::vector::turbo_quant::inner_product::score_l2_prod(
-                query_state, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim,
+                query_state, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
             );
 
             if heap.len() < k {
@@ -347,12 +350,13 @@ impl MutableSegment {
         }
         inner.residual_norms.push(r_norm_sq.sqrt());
 
-        if let Some(ref qjl_matrix) = self.collection.qjl_matrix {
+        let qjl_bpv = inner.qjl_bytes_per_vec;
+        for qjl_matrix in &self.collection.qjl_matrices {
             let qjl_signs = super::super::turbo_quant::qjl::qjl_encode(qjl_matrix, &residual, dim);
             inner.qjl_signs.extend_from_slice(&qjl_signs);
-        } else {
-            let qjl_bytes = inner.qjl_bytes_per_vec;
-            inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bytes));
+        }
+        if self.collection.qjl_matrices.is_empty() {
+            inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
         }
 
         inner.entries.push(MutableEntry {
@@ -470,7 +474,7 @@ mod tests {
     fn make_query_state(query: &[f32], col: &CollectionMetadata) -> crate::vector::turbo_quant::inner_product::TqProdQueryState {
         crate::vector::turbo_quant::inner_product::prepare_query_prod(
             query,
-            col.qjl_matrix.as_ref().unwrap(),
+            &col.qjl_matrices,
             col.fwht_sign_flips.as_slice(),
             col.padded_dimension as usize,
         )

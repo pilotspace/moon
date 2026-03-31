@@ -123,23 +123,21 @@ impl SegmentHolder {
         // Prepare TurboQuant_prod query state for mutable segment search.
         // Precomputes S*y (O(d²)) + q_rotated (O(d log d)), reused across all candidates.
         let collection = snapshot.mutable.collection();
-        let query_state = if let Some(ref qjl_matrix) = collection.qjl_matrix {
+        let query_state = if !collection.qjl_matrices.is_empty() {
             crate::vector::turbo_quant::inner_product::prepare_query_prod(
                 query_f32,
-                qjl_matrix,
+                &collection.qjl_matrices,
                 collection.fwht_sign_flips.as_slice(),
                 collection.padded_dimension as usize,
             )
         } else {
-            // Fallback: no QJL matrix (non-TQ index) — create dummy state
             crate::vector::turbo_quant::inner_product::TqProdQueryState {
-                s_y: Vec::new(),
-                q_rotated: Vec::new(),
-                q_norm_sq: 0.0,
+                s_y_list: Vec::new(), num_projections: 0,
+                q_rotated: Vec::new(), q_norm_sq: 0.0,
             }
         };
 
-        // Mutable: TurboQuant_prod unbiased L2 (no f32 needed).
+        // Mutable: TurboQuant_prod M-projection unbiased L2.
         // Immutable: TQ-ADC HNSW + TurboQuant_prod reranking.
         match strategy {
             FilterStrategy::Unfiltered => {
@@ -266,15 +264,16 @@ impl SegmentHolder {
 
         // Prepare TurboQuant_prod query state for mutable search.
         let collection = snapshot.mutable.collection();
-        let query_state = if let Some(ref qjl_matrix) = collection.qjl_matrix {
+        let query_state = if !collection.qjl_matrices.is_empty() {
             crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                query_f32, qjl_matrix,
+                query_f32, &collection.qjl_matrices,
                 collection.fwht_sign_flips.as_slice(),
                 collection.padded_dimension as usize,
             )
         } else {
             crate::vector::turbo_quant::inner_product::TqProdQueryState {
-                s_y: Vec::new(), q_rotated: Vec::new(), q_norm_sq: 0.0,
+                s_y_list: Vec::new(), num_projections: 0,
+                q_rotated: Vec::new(), q_norm_sq: 0.0,
             }
         };
 

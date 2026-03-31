@@ -217,15 +217,18 @@ pub fn read_immutable_segment(
     let codebook = meta.codebook.clone();
     let boundaries = meta.codebook_boundaries.clone();
 
-    // Reconstruct QJL matrix for TurboQuantProd4 from seed+1.
-    // The QJL matrix is NOT checksummed (derived, not stored).
-    let qjl_matrix = if quantization == QuantizationConfig::TurboQuantProd4 {
-        Some(crate::vector::turbo_quant::qjl::generate_qjl_matrix(
-            meta.dimension as usize,
-            meta.collection_id.wrapping_add(1),
-        ))
+    // Reconstruct QJL matrices from deterministic seeds.
+    const QJL_NUM_PROJECTIONS: usize = 4;
+    let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
+        let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
+            .map(|m| crate::vector::turbo_quant::qjl::generate_qjl_matrix(
+                meta.dimension as usize,
+                meta.collection_id.wrapping_add(1 + m as u64),
+            ))
+            .collect();
+        (matrices, QJL_NUM_PROJECTIONS)
     } else {
-        None
+        (Vec::new(), 0)
     };
 
     let collection = CollectionMetadata {
@@ -240,7 +243,8 @@ pub fn read_immutable_segment(
         codebook: codebook.clone(),
         codebook_boundaries: boundaries.clone(),
         metadata_checksum: meta.metadata_checksum,
-        qjl_matrix,
+        qjl_matrices,
+        qjl_num_projections,
     };
 
     // Verify checksum

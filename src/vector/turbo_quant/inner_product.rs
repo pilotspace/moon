@@ -132,45 +132,45 @@ pub fn score_inner_product(
 
 /// Precomputed query projection for TurboQuant_prod scoring.
 ///
-/// Computed once per query, reused across all candidates. Avoids O(d²)
+/// Computed once per query, reused across all candidates. Avoids O(M*d²)
 /// matrix-vector multiply per candidate.
 pub struct TqProdQueryState {
-    /// S * y (d elements): query projected through QJL matrix.
-    pub s_y: Vec<f32>,
-    /// <q, x_mse> helper: q_rotated values (padded_dim elements).
-    /// Used to compute Term 1 in rotated space: norm * Σ q_rot[i] * centroids[code[i]]
+    /// S_m * y for each of M projection matrices (M × d elements).
+    pub s_y_list: Vec<Vec<f32>>,
+    /// Number of projections M.
+    pub num_projections: usize,
+    /// q_rotated values (padded_dim elements) for Term 1 in rotated space.
     pub q_rotated: Vec<f32>,
     /// ||query||² — constant term for L2 conversion.
     pub q_norm_sq: f32,
 }
 
-/// Precompute query state for TurboQuant_prod scoring.
+/// Precompute query state for M-projection TurboQuant_prod scoring.
 ///
-/// `query`: raw f32 query (dim elements).
-/// `qjl_matrix`: d × d Gaussian matrix (row-major).
-/// `sign_flips`: FWHT sign flips (padded_dim elements).
-///
-/// Cost: O(d²) for S*y + O(d log d) for FWHT rotation. Done once per query.
+/// Cost: O(M*d²) for S_m*y + O(d log d) for FWHT rotation. Done once per query.
 pub fn prepare_query_prod(
     query: &[f32],
-    qjl_matrix: &[f32],
+    qjl_matrices: &[Vec<f32>],
     sign_flips: &[f32],
     padded_dim: usize,
 ) -> TqProdQueryState {
     let dim = query.len();
 
-    // 1. Compute S * y (O(d²))
-    let mut s_y = vec![0.0f32; dim];
-    for row in 0..dim {
-        let row_start = row * dim;
-        let mut dot = 0.0f32;
-        for col in 0..dim {
-            dot += qjl_matrix[row_start + col] * query[col];
+    // 1. Compute S_m * y for each projection (O(M*d²) total)
+    let s_y_list: Vec<Vec<f32>> = qjl_matrices.iter().map(|matrix| {
+        let mut s_y = vec![0.0f32; dim];
+        for row in 0..dim {
+            let row_start = row * dim;
+            let mut dot = 0.0f32;
+            for col in 0..dim {
+                dot += matrix[row_start + col] * query[col];
+            }
+            s_y[row] = dot;
         }
-        s_y[row] = dot;
-    }
+        s_y
+    }).collect();
 
-    // 2. Compute FWHT-rotated query (same as TQ-ADC path)
+    // 2. Compute FWHT-rotated query
     let mut q_rotated = vec![0.0f32; padded_dim];
     q_rotated[..dim].copy_from_slice(query);
     let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
@@ -183,8 +183,10 @@ pub fn prepare_query_prod(
     }
     super::fwht::fwht(&mut q_rotated[..padded_dim], sign_flips);
 
+    let num_projections = s_y_list.len();
     TqProdQueryState {
-        s_y,
+        s_y_list,
+        num_projections,
         q_rotated,
         q_norm_sq,
     }
@@ -203,18 +205,25 @@ pub fn prepare_query_prod(
 ///   S*y is precomputed in TqProdQueryState.
 ///
 /// Total per-candidate cost: O(padded_dim) — same as TQ-ADC.
+/// Score L2 distance using M-projection TurboQuant_prod estimator.
+///
+/// Averages M independent QJL corrections to reduce variance by sqrt(M).
+/// Variance: π/(2dM) · ||r||² · ||y||² (Theorem 2 extended).
+///
+/// `qjl_signs`: M * qjl_bytes_per_vec contiguous sign bits.
+/// `qjl_bytes_per_vec`: ceil(dim/8) bytes per single projection.
 #[inline]
 pub fn score_l2_prod(
     state: &TqProdQueryState,
-    tq_code: &[u8],      // nibble-packed TQ codes (padded_dim/2 bytes)
-    norm: f32,            // ||x|| stored with code
-    qjl_signs: &[u8],    // ceil(dim/8) sign bits
-    residual_norm: f32,   // ||r|| stored with code
+    tq_code: &[u8],           // nibble-packed TQ codes (padded_dim/2 bytes)
+    norm: f32,                // ||x|| stored with code
+    qjl_signs: &[u8],        // M * ceil(dim/8) sign bits, contiguous
+    residual_norm: f32,       // ||r|| stored with code
     centroids: &[f32; 16],
     dim: usize,
+    qjl_bytes_per_vec: usize, // ceil(dim/8)
 ) -> f32 {
-    // Term 1: <q, x_mse> in rotated space
-    // = norm * Σᵢ q_rot[i] * centroids[code[i]]
+    // Term 1: <q, x_mse> in rotated space — exact, no noise
     let mut dot_mse = 0.0f32;
     for (j, &byte) in tq_code.iter().enumerate() {
         let lo_idx = (byte & 0x0F) as usize;
@@ -224,23 +233,33 @@ pub fn score_l2_prod(
     }
     dot_mse *= norm;
 
-    // Term 2: QJL correction
-    // = sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
-    let mut dot_qjl = 0.0f32;
-    for row in 0..dim {
-        let sign_val = if qjl_signs[row / 8] & (1 << (row % 8)) != 0 {
-            1.0f32
-        } else {
-            -1.0f32
-        };
-        dot_qjl += state.s_y[row] * sign_val;
+    // Term 2: Average M QJL corrections for variance reduction
+    let m = state.num_projections;
+    let mut avg_dot_qjl = 0.0f32;
+    for proj in 0..m {
+        let signs_offset = proj * qjl_bytes_per_vec;
+        let proj_signs = &qjl_signs[signs_offset..signs_offset + qjl_bytes_per_vec];
+        let s_y = &state.s_y_list[proj];
+
+        let mut dot_qjl = 0.0f32;
+        for row in 0..dim {
+            let sign_val = if proj_signs[row / 8] & (1 << (row % 8)) != 0 {
+                1.0f32
+            } else {
+                -1.0f32
+            };
+            dot_qjl += s_y[row] * sign_val;
+        }
+        avg_dot_qjl += dot_qjl;
+    }
+    if m > 0 {
+        avg_dot_qjl /= m as f32;
     }
 
     let scale = (std::f32::consts::PI / 2.0).sqrt() / dim as f32;
-    let ip_estimate = dot_mse + scale * residual_norm * dot_qjl;
+    let ip_estimate = dot_mse + scale * residual_norm * avg_dot_qjl;
 
-    // L2 distance from inner product:
-    // ||q - x||² = ||q||² + ||x||² - 2<q, x>
+    // L2 = ||q||² + ||x||² - 2<q, x>
     let x_norm_sq = norm * norm;
     state.q_norm_sq + x_norm_sq - 2.0 * ip_estimate
 }
