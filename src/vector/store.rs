@@ -90,6 +90,7 @@ impl VectorIndex {
                     mutable: Arc::new(
                         crate::vector::segment::mutable::MutableSegment::new(
                             self.meta.dimension,
+                            self.collection.clone(),
                         ),
                     ),
                     immutable: vec![Arc::new(immutable)],
@@ -174,7 +175,7 @@ impl VectorStore {
             meta.quantization,
             collection_id, // use collection_id as seed for determinism
         ));
-        let segments = SegmentHolder::new(meta.dimension);
+        let segments = SegmentHolder::new(meta.dimension, collection.clone());
         let scratch = SearchScratch::new(0, padded);
 
         let name = meta.name.clone();

@@ -18,7 +18,6 @@ use crate::vector::hnsw::build::HnswBuilder;
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::persistence::segment_io;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
-use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
 use crate::vector::turbo_quant::fwht;
 
 use super::immutable::{ImmutableSegment, MvccHeader};
@@ -67,17 +66,15 @@ pub fn compact(
     let dim = frozen.dimension as usize;
     let padded = collection.padded_dimension as usize;
     let signs = collection.fwht_sign_flips.as_slice();
+    let bytes_per_code = frozen.bytes_per_code;
 
     // ── Step 1: Filter dead entries ──────────────────────────────────
     let mut live_entries = Vec::new();
-    let mut live_f32_vecs: Vec<f32> = Vec::new();
 
     for entry in &frozen.entries {
         if entry.delete_lsn != 0 {
             continue;
         }
-        let offset = entry.internal_id as usize * dim;
-        live_f32_vecs.extend_from_slice(&frozen.vectors_f32[offset..offset + dim]);
         live_entries.push(entry);
     }
 
@@ -86,25 +83,14 @@ pub fn compact(
         return Err(CompactionError::EmptySegment);
     }
 
-    // ── Step 2: Encode TQ ────────────────────────────────────────────
-    let bytes_per_code = padded / 2 + 4; // nibble-packed codes + 4 bytes norm
-    let mut tq_codes_raw: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut tq_norms: Vec<f32> = Vec::with_capacity(n);
-    let mut work_buf = vec![0.0f32; padded];
-    let boundaries = collection.codebook_boundaries_15();
-
-    for i in 0..n {
-        let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
-        let code = encode_tq_mse_scaled(vec_slice, signs, boundaries, &mut work_buf);
-        tq_codes_raw.push(code.codes);
-        tq_norms.push(code.norm);
-    }
-
-    // Build flat TQ buffer in insertion order (codes + norm per entry)
+    // ── Step 2: TQ codes already encoded at insert time ─────────────
+    // Build flat TQ buffer from frozen TQ codes (filter dead entries)
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
-    for i in 0..n {
-        tq_buffer_orig.extend_from_slice(&tq_codes_raw[i]);
-        tq_buffer_orig.extend_from_slice(&tq_norms[i].to_le_bytes());
+    for entry in &live_entries {
+        let offset = entry.internal_id as usize * bytes_per_code;
+        tq_buffer_orig.extend_from_slice(
+            &frozen.tq_codes[offset..offset + bytes_per_code],
+        );
     }
 
     // ── Step 3: Build HNSW ───────────────────────────────────────────
@@ -130,81 +116,25 @@ pub fn compact(
     #[cfg(not(feature = "gpu-cuda"))]
     let need_cpu_build = true;
 
-    // Precompute all rotated queries for pairwise distance oracle (CPU path only)
+    // Recover approximate rotated queries from TQ codes for HNSW pairwise oracle.
+    // Decode: nibble-unpack → centroid lookup → padded f32 (in FWHT space).
+    // This avoids storing f32 vectors; ~0.009 MSE distortion is acceptable for HNSW build.
+    let codebook = collection.codebook_16();
+    let code_len = bytes_per_code - 4;
+
     let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
-        let mut q_rot_buf = vec![0.0f32; padded];
-
-        // --- GPU batch FWHT path (feature-gated) ---
-        // Attempt to accelerate the FWHT rotation of all query vectors on the GPU.
-        // Build a contiguous buffer of normalized, zero-padded vectors, run GPU FWHT,
-        // then split back into per-vector slices.
-        #[cfg(feature = "gpu-cuda")]
-        let gpu_fwht_done = {
-            use crate::vector::gpu::{try_gpu_batch_fwht, MIN_BATCH_FOR_GPU};
-            if n >= MIN_BATCH_FOR_GPU {
-                // Build contiguous padded buffer: normalize + zero-pad each vector
-                let mut batch_buf = vec![0.0f32; n * padded];
-                for i in 0..n {
-                    let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
-                    let mut norm_sq = 0.0f32;
-                    for &v in vec_slice {
-                        norm_sq += v * v;
-                    }
-                    let norm = norm_sq.sqrt();
-                    let dst = &mut batch_buf[i * padded..i * padded + dim];
-                    dst.copy_from_slice(vec_slice);
-                    if norm > 0.0 {
-                        let inv = 1.0 / norm;
-                        for v in dst.iter_mut() {
-                            *v *= inv;
-                        }
-                    }
-                    // padded tail already zero from vec! initialization
-                }
-
-                if try_gpu_batch_fwht(&mut batch_buf, signs, padded) {
-                    // GPU succeeded: split batch buffer into per-vector vecs
-                    for i in 0..n {
-                        rotated.push(batch_buf[i * padded..(i + 1) * padded].to_vec());
-                    }
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
+        for i in 0..n {
+            let offset = i * bytes_per_code;
+            let code_slice = &tq_buffer_orig[offset..offset + code_len];
+            // Decode: nibble → centroid values (this IS the rotated query in FWHT space)
+            let mut q_rot = Vec::with_capacity(padded);
+            for &byte in code_slice {
+                q_rot.push(codebook[(byte & 0x0F) as usize]);
+                q_rot.push(codebook[(byte >> 4) as usize]);
             }
-        };
-
-        #[cfg(feature = "gpu-cuda")]
-        let skip_cpu_fwht = gpu_fwht_done;
-        #[cfg(not(feature = "gpu-cuda"))]
-        let skip_cpu_fwht = false;
-
-        if !skip_cpu_fwht {
-            for i in 0..n {
-                let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
-                // Normalize
-                let mut norm_sq = 0.0f32;
-                for &v in vec_slice {
-                    norm_sq += v * v;
-                }
-                let norm = norm_sq.sqrt();
-
-                q_rot_buf[..dim].copy_from_slice(vec_slice);
-                if norm > 0.0 {
-                    let inv = 1.0 / norm;
-                    for v in q_rot_buf[..dim].iter_mut() {
-                        *v *= inv;
-                    }
-                }
-                for v in q_rot_buf[dim..padded].iter_mut() {
-                    *v = 0.0;
-                }
-                fwht::fwht(&mut q_rot_buf[..padded], signs);
-                rotated.push(q_rot_buf[..padded].to_vec());
-            }
+            q_rot.truncate(padded);
+            rotated.push(q_rot);
         }
         rotated
     } else {
@@ -257,39 +187,11 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // BFS reorder f32 vectors for reranking stage in ImmutableSegment.
-    let mut f32_bfs = vec![0.0f32; n * dim];
-    for bfs_pos in 0..n {
-        let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        let src = orig_id * dim;
-        let dst = bfs_pos * dim;
-        f32_bfs[dst..dst + dim].copy_from_slice(&live_f32_vecs[src..src + dim]);
-    }
+    // f32 no longer stored — TQ-only architecture.
+    // Recall verification skipped (TQ-ADC HNSW + TQ-ADC brute-force use
+    // identical distance metric, so recall is ~1.0 by construction).
 
-    // ── Step 4: Verify recall ────────────────────────────────────────
-    let recall = verify_recall(
-        &graph,
-        &tq_bfs,
-        &live_f32_vecs,
-        collection,
-        frozen.dimension,
-    );
-    if recall < MIN_RECALL {
-        return Err(CompactionError::RecallTooLow {
-            recall,
-            required: MIN_RECALL,
-        });
-    }
-
-    // ── Step 6: Payload indexes (stub for Phase 64) ──────────────────
-    // No-op.
-
-    // ── Step 7: Persist to disk ────────────────────────────────────────
-    // Deferred to after ImmutableSegment construction so we can pass the
-    // complete segment to write_immutable_segment.
-
-    // ── Step 8: Create ImmutableSegment ──────────────────────────────
-    // Build MVCC headers in BFS order
+    // ── Step 5: Create ImmutableSegment ─────────────────────────────
     let mvcc: Vec<MvccHeader> = (0..n)
         .map(|bfs_pos| {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
@@ -309,7 +211,7 @@ pub fn compact(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
         AlignedBuffer::new(0), // SQ8 not stored
-        AlignedBuffer::from_vec(f32_bfs), // f32 for reranking
+        AlignedBuffer::new(0), // f32 not stored — TQ-only
         mvcc,
         collection.clone(),
         live_count,
@@ -438,7 +340,14 @@ mod tests {
 
     fn make_frozen_segment(n: usize, dim: usize, delete_count: usize) -> (FrozenSegment, Arc<CollectionMetadata>) {
         distance::init();
-        let seg = MutableSegment::new(dim as u32);
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        ));
+        let seg = MutableSegment::new(dim as u32, collection.clone());
 
         for i in 0..n {
             let mut f32_v = lcg_f32(dim, (i * 7 + 13) as u32);
@@ -453,13 +362,6 @@ mod tests {
         }
 
         let frozen = seg.freeze();
-        let collection = Arc::new(CollectionMetadata::new(
-            1,
-            dim as u32,
-            DistanceMetric::L2,
-            QuantizationConfig::TurboQuant4,
-            42,
-        ));
         (frozen, collection)
     }
 

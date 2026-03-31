@@ -151,7 +151,13 @@ fn replay_vector_wal(records: &[VectorWalRecord]) -> (HashMap<u64, MutableSegmen
                 let dim = f32_vector.len() as u32;
                 let state = states.entry(*collection_id).or_insert_with(|| {
                     CollectionReplayState {
-                        mutable: MutableSegment::new(dim),
+                        mutable: MutableSegment::new(dim, std::sync::Arc::new(
+                        crate::vector::turbo_quant::collection::CollectionMetadata::new(
+                            *collection_id, dim,
+                            crate::vector::types::DistanceMetric::L2,
+                            crate::vector::turbo_quant::collection::QuantizationConfig::TurboQuant4,
+                            *collection_id,
+                        ))),
                         point_map: HashMap::new(),
                         pending_txns: HashMap::new(),
                         committed_txns: HashSet::new(),
@@ -274,7 +280,13 @@ pub fn recover_vector_store(
                     seg_id, cid
                 );
                 let entry = collections.entry(cid).or_insert_with(|| RecoveredCollection {
-                    mutable: MutableSegment::new(meta.dimension),
+                    mutable: MutableSegment::new(meta.dimension, std::sync::Arc::new(
+                    crate::vector::turbo_quant::collection::CollectionMetadata::new(
+                        cid, meta.dimension,
+                        crate::vector::types::DistanceMetric::L2,
+                        crate::vector::turbo_quant::collection::QuantizationConfig::TurboQuant4,
+                        cid,
+                    ))),
                     immutable: Vec::new(),
                 });
                 entry.immutable.push((segment, meta));
