@@ -222,36 +222,77 @@ pub fn hnsw_search_filtered(
     // Apply FWHT with collection's sign flips
     fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
 
-    // Use dimension-scaled TQ-ADC directly (not through DistanceTable function pointer).
-    // The collection's codebook is scaled by 1/sqrt(padded_dim) to match FWHT normalization.
-    use crate::vector::turbo_quant::tq_adc::{tq_l2_adc_scaled, tq_l2_adc_scaled_budgeted};
-
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
     let codebook = collection.codebook_16();
+
+    // Pre-compute per-query distance LUT: lut[j * 16 + idx] = (q_rot[j] - centroid[idx])²
+    // Converts the inner ADC loop from multiply-subtract-square to a single table lookup.
+    // Size: padded * 16 * 4 = 64 KB at 1024d — fits in L1/L2 cache.
+    let padded_dim = q_rotated.len();
+    let mut adc_lut = Vec::with_capacity(padded_dim * 16);
+    for j in 0..padded_dim {
+        let q = q_rotated[j];
+        for c in 0..16 {
+            let d = q - codebook[c];
+            adc_lut.push(d * d);
+        }
+    }
 
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;
     let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 bytes are norm)
 
-    // Unbounded distance: used in upper-layer descent where no budget exists.
+    // LUT-based unbounded distance. Inner loop: 1 table lookup + 1 add per coordinate.
     let dist_bfs = |bfs_pos: u32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        tq_l2_adc_scaled(q_rotated, code_only, norm, codebook)
+        let norm_sq = norm * norm;
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        for (i, &byte) in code_only.iter().enumerate() {
+            let qi = i * 2;
+            sum0 += adc_lut[qi * 16 + (byte & 0x0F) as usize];
+            sum1 += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+        }
+        (sum0 + sum1) * norm_sq
     };
 
-    // Budgeted distance: used in layer 0 beam search. Aborts early when partial
-    // distance exceeds budget, returning f32::MAX. Saves ~30-50% of ADC loop
-    // iterations for clearly-dominated neighbors at high ef.
+    // LUT-based budgeted distance with early termination.
     let dist_bfs_budgeted = |bfs_pos: u32, budget: f32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        tq_l2_adc_scaled_budgeted(q_rotated, code_only, norm, codebook, budget)
+        let norm_sq = norm * norm;
+        if norm_sq <= 0.0 { return 0.0; }
+        let scaled_budget = budget / norm_sq;
+        let mut sum = 0.0f32;
+        let check_interval = 16;
+        let chunks = code_only.len() / check_interval;
+        let remainder = code_only.len() % check_interval;
+        for chunk in 0..chunks {
+            let base = chunk * check_interval;
+            for j in 0..check_interval {
+                let i = base + j;
+                let byte = code_only[i];
+                let qi = i * 2;
+                sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
+                sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+            }
+            if sum > scaled_budget { return f32::MAX; }
+        }
+        let tail = chunks * check_interval;
+        for j in 0..remainder {
+            let i = tail + j;
+            let byte = code_only[i];
+            let qi = i * 2;
+            sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
+            sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+        }
+        sum * norm_sq
     };
 
     // Step 2: Upper layer greedy descent (original node ID space)

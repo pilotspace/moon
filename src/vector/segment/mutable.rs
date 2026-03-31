@@ -42,6 +42,9 @@ pub struct FrozenSegment {
     pub qjl_signs: Vec<u8>,
     /// Residual norms (one f32 per vector).
     pub residual_norms: Vec<f32>,
+    /// Raw f32 vectors for exact pairwise distance during HNSW build.
+    /// Layout: dim floats per vector, contiguous. Dropped after compaction.
+    pub raw_f32: Vec<f32>,
     /// Bytes per TQ code (padded_dim/2 + 4 for norm).
     pub bytes_per_code: usize,
     /// Bytes per QJL sign vector (ceil(dim/8)).
@@ -406,6 +409,7 @@ impl MutableSegment {
             tq_codes: inner.tq_codes.clone(),
             qjl_signs: self.recompute_qjl_signs(&inner),
             residual_norms: self.recompute_residual_norms(&inner),
+            raw_f32: inner.raw_f32.clone(),
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
             dimension: inner.dimension,

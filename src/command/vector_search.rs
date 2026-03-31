@@ -367,8 +367,8 @@ pub fn search_local_filtered(
     idx.try_compact();
 
     // Higher ef compensates for TQ-4bit quantization distortion in HNSW beam search.
-    // TQ-ADC fetches ef candidates, f32 reranking selects top-k with exact distances.
-    let ef_search = (k * 10).max(200).min(500);
+    // TQ-ADC fetches ef candidates, sub-centroid reranking selects top-k.
+    let ef_search = (k * 20).max(300).min(800);
 
     let filter_bitmap = filter.map(|f| {
         let total = idx.segments.total_vectors();

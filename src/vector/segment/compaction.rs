@@ -116,18 +116,30 @@ pub fn compact(
     #[cfg(not(feature = "gpu-cuda"))]
     let need_cpu_build = true;
 
-    // Recover approximate rotated queries from TQ codes for HNSW pairwise oracle.
-    // Decode: nibble-unpack → centroid lookup → padded f32 (in FWHT space).
-    // This avoids storing f32 vectors; ~0.009 MSE distortion is acceptable for HNSW build.
     let codebook = collection.codebook_16();
     let code_len = bytes_per_code - 4;
 
+    // Build raw f32 vectors for live entries (for exact pairwise HNSW build).
+    // If raw_f32 available from freeze(), use exact L2 for graph construction.
+    // Falls back to TQ-decoded centroids if raw_f32 is empty (persistence reload).
+    let has_raw = !frozen.raw_f32.is_empty();
+    let dim = frozen.dimension as usize;
+
+    let live_f32: Vec<&[f32]> = if has_raw && need_cpu_build {
+        live_entries.iter().map(|e| {
+            let start = e.internal_id as usize * dim;
+            &frozen.raw_f32[start..start + dim]
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Also decode TQ → centroid for sub-centroid sign computation (needed later).
     let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
         for i in 0..n {
             let offset = i * bytes_per_code;
             let code_slice = &tq_buffer_orig[offset..offset + code_len];
-            // Decode: nibble → centroid values (this IS the rotated query in FWHT space)
             let mut q_rot = Vec::with_capacity(padded);
             for &byte in code_slice {
                 q_rot.push(codebook[(byte & 0x0F) as usize]);
@@ -143,24 +155,32 @@ pub fn compact(
 
     let graph = if need_cpu_build {
         let dist_table = crate::vector::distance::table();
-        let codebook = collection.codebook_16();
         let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
 
-        for _i in 0..n {
-            builder.insert(|a: u32, b: u32| {
-                let q_rot = &all_rotated[a as usize];
-                let offset = b as usize * bytes_per_code;
-                let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
-                let norm_bytes =
-                    &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
-                let norm = f32::from_le_bytes([
-                    norm_bytes[0],
-                    norm_bytes[1],
-                    norm_bytes[2],
-                    norm_bytes[3],
-                ]);
-                (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
-            });
+        if has_raw {
+            // EXACT f32 L2 pairwise distance — optimal HNSW graph topology
+            for _i in 0..n {
+                builder.insert(|a: u32, b: u32| {
+                    let va = live_f32[a as usize];
+                    let vb = live_f32[b as usize];
+                    (dist_table.l2_f32)(va, vb)
+                });
+            }
+        } else {
+            // Fallback: TQ-ADC pairwise (decoded centroids vs nibble codes)
+            for _i in 0..n {
+                builder.insert(|a: u32, b: u32| {
+                    let q_rot = &all_rotated[a as usize];
+                    let offset = b as usize * bytes_per_code;
+                    let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
+                    let norm_bytes =
+                        &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
+                    let norm = f32::from_le_bytes([
+                        norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3],
+                    ]);
+                    (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
+                });
+            }
         }
 
         builder.build(bytes_per_code as u32)
@@ -208,28 +228,64 @@ pub fn compact(
         }
     }
 
-    // Compute sub-centroid sign bits from BFS-reordered TQ codes.
-    // For each coordinate: compare FWHT-rotated value against centroid.
-    // We extract the rotated value by decoding the TQ code into centroids.
+    // Compute sub-centroid sign bits from raw f32 vectors (FWHT-rotated).
+    // For each coordinate: compare the ACTUAL rotated value against its quantized centroid.
+    // Sign bit = 1 if original >= centroid (upper sub-bin), 0 if below.
     let sub_bpv = (padded + 7) / 8;
     let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
-    for bfs_pos in 0..n {
-        let offset = bfs_pos * bytes_per_code;
-        let code_slice = &tq_bfs[offset..offset + code_len];
-        // Use the all_rotated vectors (already decoded from TQ codes) to determine sign bits
-        if need_cpu_build && bfs_pos < all_rotated.len() {
-            let rotated = &all_rotated[bfs_pos];
+    if has_raw && need_cpu_build {
+        // Use raw f32 → FWHT rotate → compare against centroid per TQ index
+        let mut work = vec![0.0f32; padded];
+        for bfs_pos in 0..n {
+            let orig_id = graph.to_original(bfs_pos as u32) as usize;
+            let live_idx = live_entries.iter().position(|e| e.internal_id as usize == orig_id).unwrap_or(orig_id);
+            let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim..(live_entries[live_idx].internal_id as usize + 1) * dim];
+
+            // Normalize + pad + FWHT to get actual rotated coordinates
+            let norm_sq: f32 = raw.iter().map(|x| x * x).sum();
+            let norm = norm_sq.sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for (dst, &src) in work[..dim].iter_mut().zip(raw.iter()) {
+                    *dst = src * inv;
+                }
+            } else {
+                for v in work[..dim].iter_mut() { *v = 0.0; }
+            }
+            for v in work[dim..padded].iter_mut() { *v = 0.0; }
+            crate::vector::turbo_quant::fwht::fwht(&mut work[..padded], signs);
+
+            let code_offset = bfs_pos * bytes_per_code;
+            let code_slice = &tq_bfs[code_offset..code_offset + code_len];
             let sign_offset = bfs_pos * sub_bpv;
             for j in 0..code_slice.len() {
                 let byte = code_slice[j];
-                let idx_lo = (byte & 0x0F) as usize;
-                let idx_hi = (byte >> 4) as usize;
                 let qi = j * 2;
-                if qi < rotated.len() && rotated[qi] >= codebook[idx_lo] {
+                if work[qi] >= codebook[(byte & 0x0F) as usize] {
                     sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
                 }
-                if qi + 1 < rotated.len() && rotated[qi + 1] >= codebook[idx_hi] {
+                if work[qi + 1] >= codebook[(byte >> 4) as usize] {
                     sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                }
+            }
+        }
+    } else if need_cpu_build {
+        // Fallback: TQ-decoded centroids (sign always matches = useless, but safe)
+        for bfs_pos in 0..n {
+            let code_offset = bfs_pos * bytes_per_code;
+            let code_slice = &tq_bfs[code_offset..code_offset + code_len];
+            if bfs_pos < all_rotated.len() {
+                let rotated = &all_rotated[bfs_pos];
+                let sign_offset = bfs_pos * sub_bpv;
+                for j in 0..code_slice.len() {
+                    let byte = code_slice[j];
+                    let qi = j * 2;
+                    if qi < rotated.len() && rotated[qi] >= codebook[(byte & 0x0F) as usize] {
+                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                    }
+                    if qi + 1 < rotated.len() && rotated[qi + 1] >= codebook[(byte >> 4) as usize] {
+                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                    }
                 }
             }
         }
