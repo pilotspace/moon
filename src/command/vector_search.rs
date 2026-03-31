@@ -83,11 +83,14 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     };
     pos += 1;
 
-    // Parse key-value pairs: TYPE, DIM, DISTANCE_METRIC, M, EF_CONSTRUCTION, QUANTIZATION
+    // Parse key-value pairs: TYPE, DIM, DISTANCE_METRIC, M, EF_CONSTRUCTION, EF_RUNTIME,
+    // COMPACT_THRESHOLD, QUANTIZATION
     let mut dimension: Option<u32> = None;
     let mut metric = DistanceMetric::L2;
     let mut hnsw_m: u32 = 16;
     let mut hnsw_ef_construction: u32 = 200;
+    let mut hnsw_ef_runtime: u32 = 0; // 0 = auto
+    let mut compact_threshold: u32 = 0; // 0 = default (1000)
     let mut quantization = QuantizationConfig::TurboQuant4;
 
     let param_end = pos + num_params;
@@ -137,6 +140,20 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 None => return Frame::Error(Bytes::from_static(b"ERR invalid EF_CONSTRUCTION value")),
             };
             pos += 1;
+        } else if key.eq_ignore_ascii_case(b"EF_RUNTIME") {
+            hnsw_ef_runtime = match parse_u32(&args[pos]) {
+                Some(n) if n >= 10 && n <= 4096 => n,
+                Some(_) => return Frame::Error(Bytes::from_static(b"ERR EF_RUNTIME must be 10-4096")),
+                None => return Frame::Error(Bytes::from_static(b"ERR invalid EF_RUNTIME value")),
+            };
+            pos += 1;
+        } else if key.eq_ignore_ascii_case(b"COMPACT_THRESHOLD") {
+            compact_threshold = match parse_u32(&args[pos]) {
+                Some(n) if n >= 100 && n <= 100000 => n,
+                Some(_) => return Frame::Error(Bytes::from_static(b"ERR COMPACT_THRESHOLD must be 100-100000")),
+                None => return Frame::Error(Bytes::from_static(b"ERR invalid COMPACT_THRESHOLD value")),
+            };
+            pos += 1;
         } else if key.eq_ignore_ascii_case(b"QUANTIZATION") {
             let val = match extract_bulk(&args[pos]) {
                 Some(v) => v,
@@ -173,6 +190,8 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         metric,
         hnsw_m,
         hnsw_ef_construction,
+        hnsw_ef_runtime,
+        compact_threshold,
         source_field,
         key_prefixes: prefixes,
         quantization,
@@ -247,6 +266,17 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
     let snap = idx.segments.load();
     let num_docs = snap.mutable.len();
 
+    let ef_rt_str = if idx.meta.hnsw_ef_runtime > 0 {
+        format!("{}", idx.meta.hnsw_ef_runtime)
+    } else {
+        "auto".to_string()
+    };
+    let ct_str = if idx.meta.compact_threshold > 0 {
+        format!("{}", idx.meta.compact_threshold)
+    } else {
+        "1000".to_string()
+    };
+
     let items = vec![
         Frame::BulkString(Bytes::from_static(b"index_name")),
         Frame::BulkString(idx.meta.name.clone()),
@@ -261,6 +291,16 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
         Frame::Integer(idx.meta.dimension as i64),
         Frame::BulkString(Bytes::from_static(b"distance_metric")),
         Frame::BulkString(metric_to_bytes(idx.meta.metric)),
+        Frame::BulkString(Bytes::from_static(b"M")),
+        Frame::Integer(idx.meta.hnsw_m as i64),
+        Frame::BulkString(Bytes::from_static(b"EF_CONSTRUCTION")),
+        Frame::Integer(idx.meta.hnsw_ef_construction as i64),
+        Frame::BulkString(Bytes::from_static(b"EF_RUNTIME")),
+        Frame::BulkString(Bytes::from(ef_rt_str)),
+        Frame::BulkString(Bytes::from_static(b"COMPACT_THRESHOLD")),
+        Frame::BulkString(Bytes::from(ct_str)),
+        Frame::BulkString(Bytes::from_static(b"QUANTIZATION")),
+        Frame::BulkString(Bytes::from(format!("{:?}", idx.meta.quantization))),
     ];
     Frame::Array(items.into())
 }
@@ -366,9 +406,13 @@ pub fn search_local_filtered(
     // Auto-compact mutable → HNSW if threshold reached (lazy, first search only).
     idx.try_compact();
 
-    // Sub-centroid 32-level LUT in beam gives higher accuracy per candidate,
-    // so we can use lower ef while maintaining recall. Saves ~30% candidates.
-    let ef_search = (k * 15).max(200).min(500);
+    // ef_search: user-configurable via EF_RUNTIME in FT.CREATE, or auto-computed.
+    // Sub-centroid 32-level LUT in beam gives higher accuracy per candidate.
+    let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
+        idx.meta.hnsw_ef_runtime as usize
+    } else {
+        (k * 15).max(200).min(500)
+    };
 
     let filter_bitmap = filter.map(|f| {
         let total = idx.segments.total_vectors();
@@ -1042,12 +1086,16 @@ mod tests {
         let result = ft_info(&store, &[bulk(b"myidx")]);
         match result {
             Frame::Array(items) => {
-                // Should have 10 items (5 key-value pairs)
-                assert_eq!(items.len(), 10);
+                // Should have 20 items (10 key-value pairs)
+                assert!(items.len() >= 20, "FT.INFO should return at least 20 items, got {}", items.len());
                 assert_eq!(items[0], Frame::BulkString(Bytes::from_static(b"index_name")));
                 assert_eq!(items[1], Frame::BulkString(Bytes::from("myidx")));
                 assert_eq!(items[5], Frame::Integer(0)); // num_docs = 0
                 assert_eq!(items[7], Frame::Integer(128)); // dimension
+                // New fields
+                assert_eq!(items[10], Frame::BulkString(Bytes::from_static(b"M")));
+                assert_eq!(items[11], Frame::Integer(16)); // default M
+                assert_eq!(items[14], Frame::BulkString(Bytes::from_static(b"EF_RUNTIME")));
             }
             other => panic!("expected Array, got {other:?}"),
         }

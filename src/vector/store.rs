@@ -30,6 +30,13 @@ pub struct IndexMeta {
     pub hnsw_m: u32,
     /// HNSW ef_construction parameter.
     pub hnsw_ef_construction: u32,
+    /// HNSW ef_runtime (search beam width). 0 = auto: max(k*15, 200).
+    /// Higher = better recall, lower QPS. Range: 10-4096.
+    pub hnsw_ef_runtime: u32,
+    /// Minimum vectors in mutable segment before auto-compaction triggers.
+    /// Lower = more frequent compaction (smaller HNSW graphs, more segments).
+    /// Higher = fewer compactions (larger graphs, better recall). Range: 100-100000.
+    pub compact_threshold: u32,
     /// The HASH field name that contains the vector blob (e.g., "vec").
     pub source_field: Bytes,
     /// Key prefixes to auto-index (from PREFIX clause).
@@ -47,9 +54,9 @@ pub struct VectorIndex {
     pub payload_index: PayloadIndex,
 }
 
-/// Minimum vector count to trigger compaction before search.
-/// Below this threshold, brute-force on mutable segment is fast enough.
-const COMPACT_THRESHOLD: usize = 1000;
+/// Default minimum vector count to trigger compaction before search.
+/// Overridden by IndexMeta.compact_threshold when set via FT.CREATE.
+const DEFAULT_COMPACT_THRESHOLD: usize = 1000;
 
 impl VectorIndex {
     /// Compact the mutable segment into an immutable HNSW segment if beneficial.
@@ -67,8 +74,12 @@ impl VectorIndex {
             mutable_len = snapshot.mutable.len();
         } // drop snapshot guard before freeze/compact
 
-        // Only compact if enough vectors accumulated
-        if mutable_len < COMPACT_THRESHOLD {
+        let threshold = if self.meta.compact_threshold > 0 {
+            self.meta.compact_threshold as usize
+        } else {
+            DEFAULT_COMPACT_THRESHOLD
+        };
+        if mutable_len < threshold {
             return;
         }
 
@@ -293,6 +304,8 @@ mod tests {
             metric: DistanceMetric::L2,
             hnsw_m: 16,
             hnsw_ef_construction: 200,
+            hnsw_ef_runtime: 0,
+            compact_threshold: 0,
             source_field: Bytes::from_static(b"vec"),
             key_prefixes: prefixes.iter().map(|p| Bytes::from(p.to_string())).collect(),
             quantization: QuantizationConfig::TurboQuant4,
@@ -307,6 +320,8 @@ mod tests {
             metric: DistanceMetric::L2,
             hnsw_m: 16,
             hnsw_ef_construction: 200,
+            hnsw_ef_runtime: 0,
+            compact_threshold: 0,
             source_field: Bytes::from_static(b"vec"),
             key_prefixes: vec![Bytes::from_static(b"doc:")],
             quantization: quant,
