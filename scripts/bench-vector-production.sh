@@ -17,14 +17,13 @@
 
 set -euo pipefail
 
-REPORT="target/vector-benchmark-report.md"
 FEATURES="--no-default-features --features runtime-tokio,jemalloc"
 RUSTFLAGS_OPT="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=native"
 SUITE="${1:-all}"
 
 mkdir -p target
 
-cat <<'HEADER'
+cat <<HEADER
 # Moon Vector Engine — Production Benchmark Report
 
 **Date:** $(date -u +"%Y-%m-%d %H:%M UTC")

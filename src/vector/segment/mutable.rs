@@ -395,7 +395,6 @@ impl MutableSegment {
 
         let signs = self.collection.fwht_sign_flips.as_slice();
         let boundaries = self.collection.codebook_boundaries_15();
-        let _centroids = self.collection.codebook_16();
         let mut work_buf = vec![0.0f32; padded];
         let code = encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf);
 

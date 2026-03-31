@@ -322,6 +322,11 @@ impl<K, V> Segment<K, V> {
             }
             let base = g * 16;
 
+            // SAFETY: `g` is bounded by NUM_GROUPS (iterated via 0..NUM_GROUPS),
+            // so `self.ctrl[g]` is a valid Group. `match_h2` uses SSE2 intrinsics
+            // on x86_64 to compare the h2 byte against all 16 control bytes in the
+            // group, returning a bitmask of matching slots. The Group is always
+            // properly aligned and fully initialized at segment creation.
             #[cfg(target_arch = "x86_64")]
             let mask = unsafe { self.ctrl[g].match_h2(h2) };
             #[cfg(not(target_arch = "x86_64"))]

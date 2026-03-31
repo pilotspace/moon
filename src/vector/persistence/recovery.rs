@@ -103,6 +103,13 @@ fn scan_vector_records(wal_data: &[u8]) -> Vec<VectorWalRecord> {
                 wal_data[pos + 2],
                 wal_data[pos + 3],
             ]) as usize;
+            if block_len > 100_000_000 || pos + 4 + block_len > wal_data.len() {
+                warn!(
+                    "Vector WAL: invalid RESP block length {} at offset {}, stopping recovery",
+                    block_len, pos
+                );
+                break;
+            }
             pos += 4 + block_len;
         }
     }

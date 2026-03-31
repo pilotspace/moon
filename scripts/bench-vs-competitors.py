@@ -552,7 +552,7 @@ def mode_bench_qdrant(args):
         "vectors": {"size": d, "distance": "Euclid"},
         "optimizers_config": {"default_segment_number": 2, "indexing_threshold": 0},
         "hnsw_config": {"m": 16, "ef_construct": 200}
-    })
+    }, timeout=30)
     print(f"  Create collection: {resp.json().get('status', '?')}")
 
     # Insert vectors
@@ -570,7 +570,8 @@ def mode_bench_qdrant(args):
         requests.put(
             f"{base}/collections/bench/points",
             json={"points": points},
-            params={"wait": "true"}
+            params={"wait": "true"},
+            timeout=30
         )
         if (start + batch_size) % 10000 == 0:
             print(f"    Inserted {min(start + batch_size, n)}/{n}...", flush=True)
@@ -582,13 +583,13 @@ def mode_bench_qdrant(args):
     # Wait for indexing
     print(">>> Waiting for indexing...")
     for _ in range(60):
-        info = requests.get(f"{base}/collections/bench").json()
+        info = requests.get(f"{base}/collections/bench", timeout=30).json()
         indexed = info.get("result", {}).get("indexed_vectors_count", 0)
         if indexed >= n:
             break
         time.sleep(2)
 
-    info = requests.get(f"{base}/collections/bench").json()
+    info = requests.get(f"{base}/collections/bench", timeout=30).json()
     result_info = info.get("result", {})
     print(f"  Status: {result_info.get('status')}, points: {result_info.get('points_count')}, indexed: {result_info.get('indexed_vectors_count')}")
 
@@ -609,7 +610,7 @@ def mode_bench_qdrant(args):
         try:
             requests.post(f"{base}/collections/bench/points/search", json={
                 "vector": q.tolist(), "limit": k, "params": {"hnsw_ef": ef}
-            })
+            }, timeout=30)
         except Exception:
             pass
 
@@ -625,7 +626,7 @@ def mode_bench_qdrant(args):
                 "vector": q.tolist(),
                 "limit": k,
                 "params": {"hnsw_ef": ef}
-            })
+            }, timeout=30)
             t1 = time.perf_counter()
             latencies.append((t1 - t0) * 1000)
 
@@ -1052,21 +1053,21 @@ def _legacy_bench_qdrant(vectors, queries, gt, k, ef):
         "vectors": {"size": d, "distance": "Euclid"},
         "optimizers_config": {"default_segment_number": 2, "indexing_threshold": 0},
         "hnsw_config": {"m": 16, "ef_construct": 200}
-    })
+    }, timeout=30)
 
     print(f">>> Inserting {n} vectors...")
     t0 = time.perf_counter()
     for start in range(0, n, 100):
         end = min(start + 100, n)
         points = [{"id": i, "vector": vectors[i].tolist()} for i in range(start, end)]
-        requests.put(f"{base}/collections/bench/points", json={"points": points}, params={"wait": "true"})
+        requests.put(f"{base}/collections/bench/points", json={"points": points}, params={"wait": "true"}, timeout=30)
     t1 = time.perf_counter()
 
     insert_sec = t1 - t0
     insert_vps = n / insert_sec
 
     for _ in range(30):
-        info = requests.get(f"{base}/collections/bench").json()
+        info = requests.get(f"{base}/collections/bench", timeout=30).json()
         if info.get("result", {}).get("indexed_vectors_count", 0) >= n:
             break
         time.sleep(2)
@@ -1081,7 +1082,7 @@ def _legacy_bench_qdrant(vectors, queries, gt, k, ef):
         t0 = time.perf_counter()
         resp = requests.post(f"{base}/collections/bench/points/search", json={
             "vector": q.tolist(), "limit": k, "params": {"hnsw_ef": ef}
-        })
+        }, timeout=30)
         t1 = time.perf_counter()
         latencies.append((t1 - t0) * 1000)
         ids = [p["id"] for p in resp.json().get("result", [])]

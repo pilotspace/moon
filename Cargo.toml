@@ -72,6 +72,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 runtime-tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]
+simd-avx512 = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

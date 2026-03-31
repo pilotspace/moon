@@ -11,11 +11,11 @@
 ///
 /// Returns `sum((a[i] - b[i])^2)` — no square root (cheaper for comparison).
 ///
-/// # Panics (debug only)
-/// Debug-asserts that `a.len() == b.len()`.
+/// # Panics
+/// Panics if `a.len() != b.len()`.
 #[inline]
 pub fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "l2_f32: dimension mismatch");
+    assert_eq!(a.len(), b.len(), "l2_f32: dimension mismatch");
     let mut sum = 0.0f32;
     for (x, y) in a.iter().zip(b.iter()) {
         let d = x - y;
@@ -28,11 +28,11 @@ pub fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Accumulates in `i32` to avoid overflow (max per-element: (127 - (-128))^2 = 65025).
 ///
-/// # Panics (debug only)
-/// Debug-asserts that `a.len() == b.len()`.
+/// # Panics
+/// Panics if `a.len() != b.len()`.
 #[inline]
 pub fn l2_i8(a: &[i8], b: &[i8]) -> i32 {
-    debug_assert_eq!(a.len(), b.len(), "l2_i8: dimension mismatch");
+    assert_eq!(a.len(), b.len(), "l2_i8: dimension mismatch");
     let mut sum = 0i32;
     for (x, y) in a.iter().zip(b.iter()) {
         let d = *x as i32 - *y as i32;
@@ -45,11 +45,11 @@ pub fn l2_i8(a: &[i8], b: &[i8]) -> i32 {
 ///
 /// Returns `sum(a[i] * b[i])`.
 ///
-/// # Panics (debug only)
-/// Debug-asserts that `a.len() == b.len()`.
+/// # Panics
+/// Panics if `a.len() != b.len()`.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "dot_f32: dimension mismatch");
+    assert_eq!(a.len(), b.len(), "dot_f32: dimension mismatch");
     let mut sum = 0.0f32;
     for (x, y) in a.iter().zip(b.iter()) {
         sum += x * y;
@@ -64,11 +64,11 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// If either vector has zero norm, returns 1.0 (maximum meaningful distance).
 ///
-/// # Panics (debug only)
-/// Debug-asserts that `a.len() == b.len()`.
+/// # Panics
+/// Panics if `a.len() != b.len()`.
 #[inline]
 pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "cosine_f32: dimension mismatch");
+    assert_eq!(a.len(), b.len(), "cosine_f32: dimension mismatch");
     let mut dot = 0.0f32;
     let mut norm_a_sq = 0.0f32;
     let mut norm_b_sq = 0.0f32;

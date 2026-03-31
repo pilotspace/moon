@@ -26,6 +26,7 @@ pub struct ActiveTxn {
 ///
 /// Note: txn_ids are stored as u32 in RoaringBitmap. This limits the committed
 /// set to 4 billion transactions. For Phase 65 this is acceptable.
+/// All `as u32` casts are guarded against overflow.
 pub struct TransactionManager {
     next_lsn: u64,
     /// Active transactions: txn_id -> snapshot_lsn.
@@ -91,7 +92,8 @@ impl TransactionManager {
                 if owner == txn_id {
                     // Idempotent re-acquire
                     Ok(())
-                } else if self.committed.contains(owner as u32) || !self.active.contains_key(&owner)
+                } else if Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id))
+                    || !self.active.contains_key(&owner)
                 {
                     // Owner committed or aborted -- steal the intent
                     e.insert(txn_id);
@@ -110,7 +112,9 @@ impl TransactionManager {
         if self.active.remove(&txn_id).is_none() {
             return false;
         }
-        self.committed.insert(txn_id as u32);
+        if let Some(id) = Self::txn_id_to_u32(txn_id) {
+            self.committed.insert(id);
+        }
         self.write_intents.retain(|_, owner| *owner != txn_id);
         self.update_oldest_snapshot();
         true
@@ -130,7 +134,7 @@ impl TransactionManager {
     /// Check if a transaction ID has been committed.
     #[inline]
     pub fn is_committed(&self, txn_id: u64) -> bool {
-        self.committed.contains(txn_id as u32)
+        Self::txn_id_to_u32(txn_id).is_some_and(|id| self.committed.contains(id))
     }
 
     /// Get the oldest active snapshot LSN.
@@ -146,7 +150,9 @@ impl TransactionManager {
     pub fn sweep_zombies(&self) -> Vec<(u64, u64)> {
         let mut zombies = Vec::new();
         for (&point_id, &owner) in &self.write_intents {
-            if !self.active.contains_key(&owner) && !self.committed.contains(owner as u32) {
+            let in_committed =
+                Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id));
+            if !self.active.contains_key(&owner) && !in_committed {
                 zombies.push((point_id, owner));
             }
         }
@@ -169,6 +175,21 @@ impl TransactionManager {
     #[inline]
     pub fn committed_bitmap(&self) -> &RoaringBitmap {
         &self.committed
+    }
+
+    /// Try to convert a u64 txn_id to u32 for RoaringBitmap operations.
+    /// Returns `None` and logs an error if the id exceeds u32::MAX.
+    #[inline]
+    fn txn_id_to_u32(id: u64) -> Option<u32> {
+        if id > u32::MAX as u64 {
+            tracing::error!(
+                txn_id = id,
+                "txn_id exceeds u32::MAX, cannot store in RoaringBitmap"
+            );
+            None
+        } else {
+            Some(id as u32)
+        }
     }
 
     /// Recalculate oldest_snapshot from active transactions.

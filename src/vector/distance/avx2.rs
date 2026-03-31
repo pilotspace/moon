@@ -15,7 +15,7 @@ use core::arch::x86_64::*;
 /// then shuffle-add within the remaining 4 lanes.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-#[target_feature(enable = "avx2", "fma")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
     // SAFETY: Caller guarantees AVX2 is available via target_feature.
     let hi128 = _mm256_extractf128_ps(v, 1);
@@ -31,7 +31,7 @@ unsafe fn hsum_f32_avx2(v: __m256) -> f32 {
 /// Horizontal sum of 8 packed i32 lanes in a `__m256i`.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-#[target_feature(enable = "avx2", "fma")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
     // SAFETY: Caller guarantees AVX2 is available via target_feature.
     let hi128 = _mm256_extracti128_si256(v, 1);
@@ -52,7 +52,7 @@ unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
 /// Scalar tail loop handles remaining elements.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "avx2", "fma")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "l2_f32: dimension mismatch");
 
@@ -118,7 +118,7 @@ pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
 /// squared differences as i32. Processes 32 i8 elements per iteration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "avx2", "fma")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn l2_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len(), "l2_i8: dimension mismatch");
 
@@ -168,7 +168,7 @@ pub unsafe fn l2_i8(a: &[i8], b: &[i8]) -> i32 {
 /// Dot product for f32 vectors (AVX2+FMA, 4x unrolled).
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "avx2", "fma")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot_f32: dimension mismatch");
 
@@ -227,7 +227,7 @@ pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Returns 1.0 if either vector has zero norm.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "avx2", "fma")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "cosine_f32: dimension mismatch");
 
@@ -436,6 +436,7 @@ mod tests {
         unsafe {
             assert_eq!(l2_f32(a, b), 0.0);
             assert_eq!(dot_f32(a, b), 0.0);
+            assert_eq!(cosine_f32(a, b), 1.0);
         }
 
         let ai: &[i8] = &[];

@@ -124,7 +124,7 @@ log "Building benchmarks in release mode..."
 cargo bench --bench "$BENCH_NAME" --no-run 2>&1 | tail -5
 
 # Find the benchmark binary
-BENCH_BIN=$(find target/release/deps -name "${BENCH_NAME}-*" -type f -perm +111 2>/dev/null | head -1)
+BENCH_BIN=$(find target/release/deps -name "${BENCH_NAME}-*" -type f -perm /111 2>/dev/null | head -1)
 if [[ -z "$BENCH_BIN" ]]; then
     log "Error: could not find benchmark binary for '$BENCH_NAME'"
     exit 1

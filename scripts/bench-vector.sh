@@ -22,7 +22,6 @@ set -euo pipefail
 
 PORT_MOON=6400
 REQUESTS=1000
-CLIENTS=4
 SHARDS=1
 DIMENSIONS=128
 SCALE=10000
@@ -42,7 +41,6 @@ bench-vector.sh -- Vector engine benchmark suite
 
 OPTIONS:
   --requests N       Number of search requests for server-path bench (default: 1000)
-  --clients N        Client concurrency for server-path bench (default: 4)
   --shards N         Moon shard count (default: 1)
   --dim N            Vector dimension for server-path bench (default: 128)
   --scale N          Number of vectors to insert (default: 10000)
@@ -74,11 +72,6 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --requests requires a numeric value"; exit 1
             fi
             REQUESTS="$2"; shift 2 ;;
-        --clients)
-            if [[ -z "${2:-}" ]] || [[ "$2" == --* ]]; then
-                echo "Error: --clients requires a numeric value"; exit 1
-            fi
-            CLIENTS="$2"; shift 2 ;;
         --shards)
             if [[ -z "${2:-}" ]] || [[ "$2" == --* ]]; then
                 echo "Error: --shards requires a numeric value"; exit 1

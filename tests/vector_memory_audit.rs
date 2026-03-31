@@ -3,10 +3,14 @@
 //! Validates VEC-HARD-02: Memory <= 600 MB for 1M 768d vectors (TQ-4bit hot tier).
 //! Uses structural accounting (std::mem::size_of) to compute expected memory.
 
+use std::sync::Arc;
+
 use moon::vector::aligned_buffer::AlignedBuffer;
 use moon::vector::distance;
 use moon::vector::segment::mutable::{MutableEntry, MutableSegment};
+use moon::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
 use moon::vector::turbo_quant::encoder::padded_dimension;
+use moon::vector::types::DistanceMetric;
 
 /// VEC-HARD-02: Total estimated memory for 1M 768d TQ-4bit vectors.
 ///
@@ -149,7 +153,15 @@ fn test_per_vector_overhead_breakdown() {
 
     let dim: usize = 128;
     let n: usize = 1000;
-    let seg = MutableSegment::new(dim as u32);
+    let collection = Arc::new(CollectionMetadata::with_build_mode(
+        1,
+        dim as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+        BuildMode::Light,
+    ));
+    let seg = MutableSegment::new(dim as u32, collection);
 
     // Generate and insert vectors
     for i in 0..n {

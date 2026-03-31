@@ -6,7 +6,7 @@ use moon::command::vector_search;
 use moon::vector::distance;
 use moon::vector::segment::mutable::MutableSegment;
 use moon::vector::store::VectorStore;
-use moon::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+use moon::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
 use moon::vector::turbo_quant::encoder::padded_dimension;
 use moon::vector::types::DistanceMetric;
 
@@ -17,7 +17,15 @@ fn bench_raw_append_128d() {
     let dim = 128;
     let n = 100_000;
 
-    let seg = MutableSegment::new(dim as u32);
+    let collection = std::sync::Arc::new(CollectionMetadata::with_build_mode(
+        1,
+        dim as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+        BuildMode::Light,
+    ));
+    let seg = MutableSegment::new(dim as u32, collection);
 
     // Pre-generate vectors
     let mut rng: u64 = 42;
@@ -65,7 +73,15 @@ fn bench_raw_append_768d() {
     let dim = 768;
     let n = 10_000;
 
-    let seg = MutableSegment::new(dim as u32);
+    let collection = std::sync::Arc::new(CollectionMetadata::with_build_mode(
+        1,
+        dim as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        42,
+        BuildMode::Light,
+    ));
+    let seg = MutableSegment::new(dim as u32, collection);
 
     let mut rng: u64 = 42;
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
@@ -122,9 +138,12 @@ fn bench_full_insert_pipeline_128d() {
         metric: DistanceMetric::L2,
         hnsw_m: 16,
         hnsw_ef_construction: 200,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 10000,
         source_field: bytes::Bytes::from_static(b"vec"),
         key_prefixes: vec![bytes::Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
     };
     store.create_index(meta);
 
@@ -196,9 +215,12 @@ fn bench_full_insert_pipeline_768d() {
         metric: DistanceMetric::L2,
         hnsw_m: 16,
         hnsw_ef_construction: 200,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 10000,
         source_field: bytes::Bytes::from_static(b"vec"),
         key_prefixes: vec![bytes::Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
     };
     store.create_index(meta);
 

@@ -74,7 +74,7 @@ pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
 /// stabilize, this can be upgraded for ~2x throughput on Ice Lake+.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "avx512f", "avx512bw")]
+#[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn l2_i8_vnni(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len(), "l2_i8_vnni: dimension mismatch");
 

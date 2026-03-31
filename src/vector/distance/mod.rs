@@ -9,7 +9,7 @@ pub mod scalar;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 pub mod avx512;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
@@ -54,6 +54,7 @@ pub fn init() {
     DISTANCE_TABLE.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
         {
+            #[cfg(feature = "simd-avx512")]
             if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
                 return DistanceTable {
                     l2_f32: |a, b| {

@@ -569,9 +569,17 @@ impl Database {
             }
         };
         // Upgrade compact listpack to full HashMap if needed
-        if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
-            let map = lp.to_hash_map();
-            *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
+        let needs_upgrade = matches!(
+            entry.value.as_redis_value_mut(),
+            Some(RedisValue::HashListpack(_))
+        );
+        if needs_upgrade {
+            if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
+                let map = lp.to_hash_map();
+                if let Some(v) = entry.value.as_redis_value_mut() {
+                    *v = RedisValue::Hash(map);
+                }
+            }
         }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Hash(map)) => Ok(map),

@@ -397,6 +397,7 @@ mod tests {
         unsafe {
             assert_eq!(l2_f32(a, b), 0.0);
             assert_eq!(dot_f32(a, b), 0.0);
+            assert_eq!(cosine_f32(a, b), 1.0);
         }
 
         let ai: &[i8] = &[];

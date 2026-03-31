@@ -721,7 +721,11 @@ pub async fn scatter_vector_search(
     for rx in receivers {
         match rx.recv().await {
             Ok(frame) => shard_responses.push(frame),
-            Err(_) => {} // shard disconnected, skip
+            Err(_) => {
+                return Frame::Error(bytes::Bytes::from_static(
+                    b"ERR shard reply channel closed during vector search scatter-gather",
+                ));
+            }
         }
     }
 
@@ -776,7 +780,11 @@ pub async fn scatter_vector_search_remote(
     for rx in receivers {
         match rx.recv().await {
             Ok(frame) => shard_responses.push(frame),
-            Err(_) => {} // shard disconnected, skip
+            Err(_) => {
+                return Frame::Error(bytes::Bytes::from_static(
+                    b"ERR shard reply channel closed during vector search scatter-gather",
+                ));
+            }
         }
     }
 

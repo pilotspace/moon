@@ -55,9 +55,14 @@ pub fn increment_indexes() {
 }
 
 /// Decrement the active index counter (called on FT.DROPINDEX).
+/// Uses saturating subtraction to avoid wrapping from 0 to u64::MAX.
 #[inline]
 pub fn decrement_indexes() {
-    VECTOR_INDEXES.fetch_sub(1, Ordering::Relaxed);
+    VECTOR_INDEXES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        })
+        .ok();
 }
 
 /// Add to total vector count (called on vector insertion).
