@@ -908,7 +908,7 @@ pub async fn handle_connection_sharded_inner<
                                         crate::shard::coordinator::scatter_vector_search_remote(
                                             index_name, query_blob, k,
                                             shard_id, num_shards,
-                                            &dispatch_tx, &spsc_notifiers,
+                                            &shard_databases, &dispatch_tx, &spsc_notifiers,
                                         ).await
                                     }
                                     Err(err_frame) => err_frame,
@@ -916,10 +916,22 @@ pub async fn handle_connection_sharded_inner<
                                 responses.push(response);
                                 continue;
                             }
-                            let response = crate::shard::coordinator::send_vector_command_to_shard0(
-                                std::sync::Arc::new(frame),
-                                shard_id, &dispatch_tx, &spsc_notifiers,
-                            ).await;
+                            // Non-search FT.* commands (CREATE/DROP/INFO/COMPACT):
+                            // Dispatch to local shard's VectorStore directly.
+                            let response = {
+                                let mut vs = shard_databases.vector_store(shard_id);
+                                if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+                                    crate::command::vector_search::ft_create(&mut vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                                    crate::command::vector_search::ft_dropindex(&mut vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                                    crate::command::vector_search::ft_info(&vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                                    crate::command::vector_search::ft_compact(&mut vs, cmd_args)
+                                } else {
+                                    Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
+                                }
+                            };
                             responses.push(response);
                             continue;
                         } else {

@@ -12,3 +12,4 @@ pub mod inner_product;
 pub mod qjl;
 pub mod sub_centroid;
 pub mod tq_adc;
+pub mod tq_adc_avx2;
