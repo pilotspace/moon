@@ -17,11 +17,13 @@ mod cagra;
 mod context;
 mod error;
 mod fwht_kernel;
+pub mod memory_pool;
 
 pub use cagra::{gpu_build_hnsw, MIN_VECTORS_FOR_GPU};
 pub use context::GpuContext;
 pub use error::GpuBuildError;
 pub use fwht_kernel::{gpu_batch_fwht, MIN_BATCH_FOR_GPU};
+pub use memory_pool::GpuMemoryPool;
 
 use super::hnsw::graph::HnswGraph;
 
@@ -55,11 +57,33 @@ pub fn try_gpu_build_hnsw(
     }
 }
 
+/// Attempt GPU batch FWHT using a pre-initialized pool.
+///
+/// Unlike [`try_gpu_batch_fwht`], this does NOT create a new `GpuContext` per call.
+/// The caller (compaction pipeline) should maintain a [`GpuMemoryPool`] on
+/// `VectorStore`, lazily initialized on first compaction.
+pub fn try_gpu_batch_fwht_pooled(
+    pool: &GpuMemoryPool,
+    vectors: &mut [f32],
+    sign_flips: &[f32],
+    padded_dim: usize,
+) -> bool {
+    match gpu_batch_fwht(pool.context(), vectors, sign_flips, padded_dim) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("GPU batch FWHT (pooled) failed, falling back to CPU: {e}");
+            false
+        }
+    }
+}
+
 /// Attempt GPU batch FWHT, return `false` on failure (caller uses CPU path).
 ///
 /// Creates a fresh `GpuContext` on device 0, runs the batch FWHT kernel in-place
 /// on `vectors`. On success the slice is modified and `true` is returned. On any
 /// failure the slice is left unmodified and `false` is returned.
+///
+/// **Deprecated:** Prefer [`try_gpu_batch_fwht_pooled`] with a persistent `GpuMemoryPool`.
 pub fn try_gpu_batch_fwht(
     vectors: &mut [f32],
     sign_flips: &[f32],

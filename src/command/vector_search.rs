@@ -253,11 +253,10 @@ pub fn ft_compact(store: &mut VectorStore, args: &[Frame]) -> Frame {
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
     };
-    let idx = match store.get_index_mut(&name) {
-        Some(i) => i,
-        None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
-    };
-    idx.try_compact();
+    if store.get_index(&name).is_none() {
+        return Frame::Error(Bytes::from_static(b"Unknown Index name"));
+    }
+    store.try_compact_index(&name);
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -402,12 +401,12 @@ pub fn search_local_filtered(
     k: usize,
     filter: Option<&FilterExpr>,
 ) -> Frame {
-    let idx = match store.get_index_mut(index_name) {
-        Some(i) => i,
+    // Validate index exists and get dimension for early checks.
+    let dim = match store.get_index(index_name) {
+        Some(i) => i.meta.dimension as usize,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
 
-    let dim = idx.meta.dimension as usize;
     if query_blob.len() != dim * 4 {
         return Frame::Error(Bytes::from_static(
             b"ERR query vector dimension mismatch",
@@ -418,8 +417,11 @@ pub fn search_local_filtered(
         query_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
 
-    // Auto-compact mutable → HNSW if threshold reached (lazy, first search only).
-    idx.try_compact();
+    // Auto-compact mutable -> HNSW if threshold reached (lazy, first search only).
+    // Uses VectorStore's persistent GPU pool for batch FWHT acceleration.
+    store.try_compact_index(index_name);
+
+    let idx = store.get_index_mut(index_name).expect("index verified above");
 
     // ef_search: user-configurable via EF_RUNTIME in FT.CREATE, or auto-computed.
     // Sub-centroid 32-level LUT in beam gives higher accuracy per candidate.

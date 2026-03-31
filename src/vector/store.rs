@@ -69,7 +69,7 @@ impl VectorIndex {
     ///
     /// This is a blocking operation (builds HNSW graph). For production, this
     /// should be moved to a background task with async notification.
-    pub fn try_compact(&mut self) {
+    pub fn try_compact(&mut self, gpu_pool: compaction::GpuPoolRef<'_>) {
         let mutable_len;
         {
             let snapshot = self.segments.load();
@@ -89,7 +89,7 @@ impl VectorIndex {
         // Use a deterministic seed based on collection ID for reproducibility
         let seed = self.collection.collection_id.wrapping_mul(6364136223846793005);
 
-        match compaction::compact(&frozen, &self.collection, seed, None) {
+        match compaction::compact(&frozen, &self.collection, seed, None, gpu_pool) {
             Ok(immutable) => {
                 // Resize scratch to match new graph size
                 let num_nodes = immutable.graph().num_nodes();
@@ -129,6 +129,10 @@ pub struct VectorStore {
     /// Segments recovered from persistence, awaiting FT.CREATE to claim them.
     /// Key: collection_id. Populated during crash recovery.
     pending_segments: HashMap<u64, crate::vector::persistence::recovery::RecoveredCollection>,
+    /// Persistent GPU context for batch FWHT in the compaction pipeline.
+    /// Lazily initialized on first compaction when `gpu-cuda` feature is enabled.
+    #[cfg(feature = "gpu-cuda")]
+    gpu_pool: Option<crate::vector::gpu::GpuMemoryPool>,
 }
 
 impl VectorStore {
@@ -138,6 +142,8 @@ impl VectorStore {
             next_collection_id: 1,
             txn_manager: TransactionManager::new(),
             pending_segments: HashMap::new(),
+            #[cfg(feature = "gpu-cuda")]
+            gpu_pool: None,
         }
     }
 
@@ -151,6 +157,27 @@ impl VectorStore {
     #[inline]
     pub fn txn_manager_mut(&mut self) -> &mut TransactionManager {
         &mut self.txn_manager
+    }
+
+    /// Lazily initialize and return the GPU memory pool.
+    ///
+    /// On first call, attempts `GpuMemoryPool::new(0)`. If GPU initialization
+    /// fails (no CUDA device, driver issues), logs at debug level and returns
+    /// `None`. Subsequent calls return the cached pool without re-trying init.
+    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn gpu_pool(&mut self) -> Option<&crate::vector::gpu::GpuMemoryPool> {
+        if self.gpu_pool.is_none() {
+            match crate::vector::gpu::GpuMemoryPool::new(0) {
+                Ok(pool) => {
+                    tracing::info!("GPU memory pool initialized for VectorStore");
+                    self.gpu_pool = Some(pool);
+                }
+                Err(e) => {
+                    tracing::debug!("GPU pool init failed (will use CPU): {e}");
+                }
+            }
+        }
+        self.gpu_pool.as_ref()
     }
 
     /// Attach recovered segments from persistence. Called by shard restore.
@@ -281,6 +308,38 @@ impl VectorStore {
                 let snap = idx.segments.load();
                 snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
             }
+        }
+    }
+
+    /// Try to compact the named index using the persistent GPU pool (if available).
+    ///
+    /// This method handles the borrow-splitting problem: it lazily initializes the
+    /// GPU pool (borrowing `&mut self`) then passes a reference to the index's
+    /// `try_compact` method without holding two mutable borrows simultaneously.
+    pub fn try_compact_index(&mut self, name: &[u8]) {
+        // Get GPU pool reference (lazy init). We extract a raw pointer to avoid
+        // holding &mut self across the index lookup.
+        #[cfg(feature = "gpu-cuda")]
+        let gpu_pool: compaction::GpuPoolRef<'_> = {
+            // Lazy init the pool
+            if self.gpu_pool.is_none() {
+                match crate::vector::gpu::GpuMemoryPool::new(0) {
+                    Ok(pool) => {
+                        tracing::info!("GPU memory pool initialized for VectorStore");
+                        self.gpu_pool = Some(pool);
+                    }
+                    Err(e) => {
+                        tracing::debug!("GPU pool init failed (will use CPU): {e}");
+                    }
+                }
+            }
+            self.gpu_pool.as_ref()
+        };
+        #[cfg(not(feature = "gpu-cuda"))]
+        let gpu_pool: compaction::GpuPoolRef<'_> = None;
+
+        if let Some(idx) = self.indexes.get_mut(name) {
+            idx.try_compact(gpu_pool);
         }
     }
 

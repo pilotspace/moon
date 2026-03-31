@@ -29,6 +29,16 @@ const VACUUM_DEAD_THRESHOLD: f32 = 0.20;
 const HNSW_M: u8 = 16;
 const HNSW_EF_CONSTRUCTION: u16 = 200;
 
+/// Optional reference to a persistent GPU memory pool for batch FWHT.
+///
+/// When `gpu-cuda` is enabled, callers may pass `Some(&GpuMemoryPool)` to
+/// use the GPU-accelerated FWHT path. When `None` or when `gpu-cuda` is
+/// disabled, the CPU FWHT path is used automatically.
+#[cfg(feature = "gpu-cuda")]
+pub type GpuPoolRef<'a> = Option<&'a crate::vector::gpu::GpuMemoryPool>;
+#[cfg(not(feature = "gpu-cuda"))]
+pub type GpuPoolRef<'a> = Option<&'a ()>;
+
 #[derive(Debug)]
 pub enum CompactionError {
     RecallTooLow { recall: f32, required: f32 },
@@ -62,6 +72,7 @@ pub fn compact(
     collection: &Arc<CollectionMetadata>,
     seed: u64,
     persist: Option<(&Path, u64)>,
+    gpu_pool: GpuPoolRef<'_>,
 ) -> Result<ImmutableSegment, CompactionError> {
     let dim = frozen.dimension as usize;
     let padded = collection.padded_dimension as usize;
@@ -234,37 +245,74 @@ pub fn compact(
     let sub_bpv = (padded + 7) / 8;
     let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
     if has_raw && need_cpu_build {
-        // Use raw f32 → FWHT rotate → compare against centroid per TQ index
-        let mut work = vec![0.0f32; padded];
+        // Use raw f32 → FWHT rotate → compare against centroid per TQ index.
+        //
+        // GPU batch path: when gpu-cuda is enabled and the batch is large enough,
+        // normalize+pad ALL vectors into a flat buffer, apply GPU batch FWHT in one
+        // kernel launch, then extract sign bits. Falls back to per-vector CPU FWHT
+        // on any GPU failure or small batches.
+
+        // Build flat normalized+padded buffer for all live entries (BFS order).
+        let mut flat_work = vec![0.0f32; n * padded];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
             let live_idx = live_entries.iter().position(|e| e.internal_id as usize == orig_id).unwrap_or(orig_id);
             let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim..(live_entries[live_idx].internal_id as usize + 1) * dim];
 
-            // Normalize + pad + FWHT to get actual rotated coordinates
+            let base = bfs_pos * padded;
             let norm_sq: f32 = raw.iter().map(|x| x * x).sum();
             let norm = norm_sq.sqrt();
             if norm > 0.0 {
                 let inv = 1.0 / norm;
-                for (dst, &src) in work[..dim].iter_mut().zip(raw.iter()) {
+                for (dst, &src) in flat_work[base..base + dim].iter_mut().zip(raw.iter()) {
                     *dst = src * inv;
                 }
-            } else {
-                for v in work[..dim].iter_mut() { *v = 0.0; }
             }
-            for v in work[dim..padded].iter_mut() { *v = 0.0; }
-            crate::vector::turbo_quant::fwht::fwht(&mut work[..padded], signs);
+            // Padding zeros are already initialized by vec![0.0; ...]
+        }
 
+        // Attempt GPU batch FWHT on the entire flat buffer.
+        #[cfg(feature = "gpu-cuda")]
+        let fwht_done_by_gpu = {
+            use crate::vector::gpu::{try_gpu_batch_fwht_pooled, MIN_BATCH_FOR_GPU};
+            if n >= MIN_BATCH_FOR_GPU {
+                if let Some(pool) = gpu_pool {
+                    let ok = try_gpu_batch_fwht_pooled(pool, &mut flat_work, signs, padded);
+                    if ok {
+                        tracing::info!(batch_size = n, padded_dim = padded, "GPU batch FWHT completed (pooled)");
+                    }
+                    ok
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        #[cfg(not(feature = "gpu-cuda"))]
+        let fwht_done_by_gpu = { let _ = &gpu_pool; false };
+
+        if !fwht_done_by_gpu {
+            // CPU FWHT per-vector fallback
+            for bfs_pos in 0..n {
+                let base = bfs_pos * padded;
+                fwht::fwht(&mut flat_work[base..base + padded], signs);
+            }
+        }
+
+        // Extract sub-centroid sign bits from FWHT-rotated coordinates.
+        for bfs_pos in 0..n {
+            let base = bfs_pos * padded;
             let code_offset = bfs_pos * bytes_per_code;
             let code_slice = &tq_bfs[code_offset..code_offset + code_len];
             let sign_offset = bfs_pos * sub_bpv;
             for j in 0..code_slice.len() {
                 let byte = code_slice[j];
                 let qi = j * 2;
-                if work[qi] >= codebook[(byte & 0x0F) as usize] {
+                if flat_work[base + qi] >= codebook[(byte & 0x0F) as usize] {
                     sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
                 }
-                if work[qi + 1] >= codebook[(byte >> 4) as usize] {
+                if flat_work[base + qi + 1] >= codebook[(byte >> 4) as usize] {
                     sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
                 }
             }
@@ -471,7 +519,7 @@ mod tests {
     #[test]
     fn test_compact_100_vectors() {
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_ok(), "compact failed: {:?}", result.err());
         let imm = result.unwrap();
         assert_eq!(imm.live_count(), 100);
@@ -492,7 +540,7 @@ mod tests {
     #[test]
     fn test_compact_filters_deleted() {
         let (frozen, collection) = make_frozen_segment(50, 64, 10);
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_ok(), "compact failed: {:?}", result.err());
         let imm = result.unwrap();
         // 50 total, 10 deleted -> 40 live
@@ -503,7 +551,7 @@ mod tests {
     #[test]
     fn test_compact_empty_returns_error() {
         let (frozen, collection) = make_frozen_segment(5, 64, 5);
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_err());
         match result.err().unwrap() {
             CompactionError::EmptySegment => {}
@@ -515,7 +563,7 @@ mod tests {
     fn test_compact_recall_above_threshold() {
         let (frozen, collection) = make_frozen_segment(500, 64, 0);
         // compact() internally verifies recall >= 0.95 and returns Ok only if it passes
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_ok(), "compact failed (recall too low): {:?}", result.err());
     }
 
@@ -523,7 +571,7 @@ mod tests {
     fn test_needs_vacuum_threshold() {
         // Create segment with 25% dead
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_ok());
         let mut imm = result.unwrap();
 
@@ -538,7 +586,7 @@ mod tests {
 
         // Create another with 10% dead
         let (frozen2, collection2) = make_frozen_segment(100, 64, 0);
-        let result2 = compact(&frozen2, &collection2, 54321, None);
+        let result2 = compact(&frozen2, &collection2, 54321, None, None);
         assert!(result2.is_ok());
         let mut imm2 = result2.unwrap();
 
@@ -554,7 +602,7 @@ mod tests {
     #[test]
     fn test_compact_without_gpu_feature_unchanged() {
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_ok(), "compact failed: {:?}", result.err());
         assert_eq!(result.unwrap().live_count(), 100);
     }
@@ -565,7 +613,7 @@ mod tests {
     #[test]
     fn test_gpu_fallback_to_cpu() {
         let (frozen, collection) = make_frozen_segment(100, 64, 0);
-        let result = compact(&frozen, &collection, 12345, None);
+        let result = compact(&frozen, &collection, 12345, None, None);
         assert!(result.is_ok(), "compact with GPU fallback failed: {:?}", result.err());
         assert_eq!(result.unwrap().live_count(), 100);
     }
