@@ -253,6 +253,11 @@ pub fn read_immutable_segment(
         metadata_checksum: meta.metadata_checksum,
         qjl_matrices,
         qjl_num_projections,
+        build_mode: if qjl_num_projections > 0 {
+            crate::vector::turbo_quant::collection::BuildMode::Exact
+        } else {
+            crate::vector::turbo_quant::collection::BuildMode::Light
+        },
         sub_centroid_table,
     };
 

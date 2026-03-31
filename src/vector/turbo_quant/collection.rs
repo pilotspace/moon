@@ -10,6 +10,21 @@ use super::codebook::{CODEBOOK_VERSION, scaled_centroids_n, scaled_boundaries_n,
 use super::encoder::padded_dimension;
 use super::sub_centroid::SubCentroidTable;
 
+/// HNSW build mode: controls whether raw f32 and QJL are retained.
+///
+/// - **Light** (default): No raw f32 retention, no QJL matrices. Build HNSW with
+///   TQ-decoded centroid pairwise distance. Mutable brute-force uses TQ-ADC.
+///   Memory: ~372 B/vec mutable, ~452 B/vec immutable. Compaction: ~1.6s/10K.
+///
+/// - **Exact**: Retain raw f32 for exact L2 pairwise HNSW build + QJL signs.
+///   Higher recall (+2-3%) at cost of 5× more mutable memory and 5× slower compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BuildMode {
+    Light = 0,
+    Exact = 1,
+}
+
 /// Quantization algorithm selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -86,6 +101,9 @@ pub struct CollectionMetadata {
     /// M=4: ~91% recall. M=8: ~95% recall.
     pub qjl_num_projections: usize,
 
+    /// HNSW build mode: Light (no raw f32/QJL) or Exact (retain raw f32 for build).
+    pub build_mode: BuildMode,
+
     /// Sub-centroid table for sign-bit refinement (from turboquant_search).
     /// Doubles effective quantization resolution from 2^b to 2^(b+1) levels.
     /// Used as Tier 2 reranker — better recall than TQ-ADC, no QJL overhead.
@@ -113,12 +131,25 @@ impl CollectionMetadata {
     /// `seed` controls sign flip generation (deterministic for testing).
     /// Sign flips are materialized: stored as +/-1.0 f32, not as seed.
     /// After generation the seed is discarded -- flips are the source of truth.
+    /// Create with default build mode (Light).
     pub fn new(
         collection_id: u64,
         dimension: u32,
         metric: DistanceMetric,
         quantization: QuantizationConfig,
         seed: u64,
+    ) -> Self {
+        Self::with_build_mode(collection_id, dimension, metric, quantization, seed, BuildMode::Light)
+    }
+
+    /// Create with explicit build mode.
+    pub fn with_build_mode(
+        collection_id: u64,
+        dimension: u32,
+        metric: DistanceMetric,
+        quantization: QuantizationConfig,
+        seed: u64,
+        build_mode: BuildMode,
     ) -> Self {
         let padded = padded_dimension(dimension);
 
@@ -132,11 +163,10 @@ impl CollectionMetadata {
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
-        // Generate M dense Gaussian QJL matrices for unbiased inner product scoring.
-        // Dense Gaussian required — SRHT violates joint Gaussianity for E[V·sign(U)].
-        // M=4: ~91% recall, 9 MB at 768d. M=8: ~95% recall, 18 MB.
+        // QJL matrices: only generated in Exact mode.
+        // Light mode skips QJL entirely (sub-centroid handles reranking).
         const QJL_NUM_PROJECTIONS: usize = 8;
-        let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
+        let (qjl_matrices, qjl_num_projections) = if build_mode == BuildMode::Exact && quantization.is_turbo_quant() {
             let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
                 .map(|m| {
                     super::qjl::generate_qjl_matrix(
@@ -180,6 +210,7 @@ impl CollectionMetadata {
             metadata_checksum: 0, // computed below
             qjl_matrices,
             qjl_num_projections,
+            build_mode,
             sub_centroid_table,
         };
         meta.metadata_checksum = meta.compute_checksum();

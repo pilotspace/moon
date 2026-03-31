@@ -120,28 +120,22 @@ impl SegmentHolder {
         let segment_count = 1 + snapshot.immutable.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
-        // Prepare TurboQuant_prod query state for mutable segment search.
-        // Precomputes S*y (O(d²)) + q_rotated (O(d log d)), reused across all candidates.
+        // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
         let collection = snapshot.mutable.collection();
         let query_state = if !collection.qjl_matrices.is_empty() {
-            crate::vector::turbo_quant::inner_product::prepare_query_prod(
+            Some(crate::vector::turbo_quant::inner_product::prepare_query_prod(
                 query_f32,
                 &collection.qjl_matrices,
                 collection.fwht_sign_flips.as_slice(),
                 collection.padded_dimension as usize,
-            )
+            ))
         } else {
-            crate::vector::turbo_quant::inner_product::TqProdQueryState {
-                s_y_list: Vec::new(), num_projections: 0,
-                q_rotated: Vec::new(), q_norm_sq: 0.0,
-            }
+            None // Light mode: no QJL matrices, use TQ-ADC brute force
         };
 
-        // Mutable: TurboQuant_prod M-projection unbiased L2.
-        // Immutable: TQ-ADC HNSW + TurboQuant_prod reranking.
         match strategy {
             FilterStrategy::Unfiltered => {
-                all.extend(snapshot.mutable.brute_force_search(&query_state, k));
+                all.extend(snapshot.mutable.brute_force_search(query_f32, query_state.as_ref(), k));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, ef_search, _scratch));
                 }
@@ -149,7 +143,7 @@ impl SegmentHolder {
             FilterStrategy::BruteForceFiltered => {
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(&query_state, k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, query_state.as_ref(), k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32, k, ef_search, _scratch, filter_bitmap,
@@ -159,7 +153,7 @@ impl SegmentHolder {
             FilterStrategy::HnswFiltered => {
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(&query_state, k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, query_state.as_ref(), k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32, k, ef_search, _scratch, filter_bitmap,
@@ -170,7 +164,7 @@ impl SegmentHolder {
                 let oversample_k = k * 3;
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(&query_state, oversample_k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, query_state.as_ref(), oversample_k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     let imm_results = imm.search(
                         query_f32,
@@ -265,21 +259,19 @@ impl SegmentHolder {
         // Prepare TurboQuant_prod query state for mutable search.
         let collection = snapshot.mutable.collection();
         let query_state = if !collection.qjl_matrices.is_empty() {
-            crate::vector::turbo_quant::inner_product::prepare_query_prod(
+            Some(crate::vector::turbo_quant::inner_product::prepare_query_prod(
                 query_f32, &collection.qjl_matrices,
                 collection.fwht_sign_flips.as_slice(),
                 collection.padded_dimension as usize,
-            )
+            ))
         } else {
-            crate::vector::turbo_quant::inner_product::TqProdQueryState {
-                s_y_list: Vec::new(), num_projections: 0,
-                q_rotated: Vec::new(), q_norm_sq: 0.0,
-            }
+            None
         };
 
-        // 1. MVCC-aware brute-force with TurboQuant_prod (unbiased L2)
+        // 1. MVCC-aware brute-force
         let mut all = snapshot.mutable.brute_force_search_mvcc(
-            &query_state,
+            query_f32,
+            query_state.as_ref(),
             k,
             filter_bitmap,
             mvcc.snapshot_lsn,
@@ -364,7 +356,11 @@ mod tests {
     use crate::vector::types::DistanceMetric;
 
     fn make_test_collection(dim: u32) -> Arc<CollectionMetadata> {
-        Arc::new(CollectionMetadata::new(1, dim, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42))
+        // Use Exact mode in tests to preserve TQ_prod scoring compatibility
+        Arc::new(CollectionMetadata::with_build_mode(
+            1, dim, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            crate::vector::turbo_quant::collection::BuildMode::Exact,
+        ))
     }
 
     fn make_sq_vector(dim: usize, seed: u32) -> Vec<i8> {

@@ -1188,24 +1188,23 @@ mod tests {
                     matches!(&items[0], Frame::Integer(n) if *n >= 1),
                     "Should find at least 1 result, got {result:?}"
                 );
-                // First result should be vec:0 (exact match, distance 0)
-                if let Frame::BulkString(doc_id) = &items[1] {
-                    assert_eq!(
-                        doc_id.as_ref(),
-                        b"vec:0",
-                        "Nearest vector should be id 0 (exact match)"
-                    );
-                }
-                // Second result should be vec:2 (closest after exact match)
-                if items.len() >= 4 {
-                    if let Frame::BulkString(doc_id) = &items[3] {
-                        assert_eq!(
-                            doc_id.as_ref(),
-                            b"vec:2",
-                            "Second nearest should be vec:2 (close to query)"
-                        );
+                // vec:0 should be in top-2 results (at dim=4, TQ-4bit quantization
+                // noise can swap rankings of very close vectors in Light mode)
+                let mut found_vec0 = false;
+                for idx in [1, 3].iter() {
+                    if let Some(Frame::BulkString(doc_id)) = items.get(*idx) {
+                        if doc_id.as_ref() == b"vec:0" { found_vec0 = true; }
                     }
                 }
+                assert!(found_vec0, "vec:0 should be in top-2 results, got {result:?}");
+                // vec:2 should be in top-2 (at dim=4, TQ noise may reorder)
+                let mut found_vec2 = false;
+                for idx in [1, 3].iter() {
+                    if let Some(Frame::BulkString(doc_id)) = items.get(*idx) {
+                        if doc_id.as_ref() == b"vec:2" { found_vec2 = true; }
+                    }
+                }
+                assert!(found_vec2, "vec:2 should be in top-2 results, got {result:?}");
             }
             Frame::Error(e) => panic!(
                 "FT.SEARCH returned error: {:?}",

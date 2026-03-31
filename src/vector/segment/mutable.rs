@@ -152,15 +152,18 @@ impl MutableSegment {
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
 
-        // QJL deferred to freeze(): zero-fill signs, residual_norm = 0.
-        // score_l2_prod handles this gracefully (QJL correction = scale * 0.0 * dot = 0).
-        let qjl_bpv = inner.qjl_bytes_per_vec;
-        let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
-        inner.qjl_signs.resize(new_qjl_len, 0u8);
-        inner.residual_norms.push(0.0);
-
-        // Retain raw f32 for deferred QJL encoding at freeze time.
-        inner.raw_f32.extend_from_slice(vector_f32);
+        // Exact mode: retain raw f32 + zero-fill QJL (recomputed at freeze).
+        // Light mode: skip both — saves 1,536 B/vec + avoids O(M×d²) at freeze.
+        let is_exact = self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
+        let mut extra_bytes = 0usize;
+        if is_exact {
+            let qjl_bpv = inner.qjl_bytes_per_vec;
+            let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
+            inner.qjl_signs.resize(new_qjl_len, 0u8);
+            inner.residual_norms.push(0.0);
+            inner.raw_f32.extend_from_slice(vector_f32);
+            extra_bytes = qjl_bpv + 4 + dim * 4;
+        }
 
         inner.entries.push(MutableEntry {
             internal_id,
@@ -172,63 +175,79 @@ impl MutableSegment {
             txn_id: 0,
         });
 
-        inner.byte_size += bytes_per_code + qjl_bpv + 4 + dim * 4 + std::mem::size_of::<MutableEntry>();
+        inner.byte_size += bytes_per_code + extra_bytes + std::mem::size_of::<MutableEntry>();
         internal_id
     }
 
-    /// Brute-force search using TurboQuant_prod unbiased L2 distance.
+    /// Brute-force search on mutable segment.
     ///
-    /// Uses the two-term inner product estimator for ranking:
-    ///   ||q - x||² ≈ ||q||² + ||x||² - 2 * (<q, x_mse> + QJL_correction)
-    ///
-    /// The estimator is unbiased (E[estimate] = true IP), giving much better
-    /// ranking than TQ-ADC (which has systematic distance bias).
-    ///
-    /// `query_state`: precomputed S*y and q_rotated from prepare_query_prod().
+    /// Light mode: TQ-ADC scoring (fast, no QJL overhead).
+    /// Exact mode: TurboQuant_prod unbiased L2 (higher accuracy).
     pub fn brute_force_search(
         &self,
-        query_state: &crate::vector::turbo_quant::inner_product::TqProdQueryState,
+        query_f32: &[f32],
+        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
         k: usize,
     ) -> SmallVec<[SearchResult; 32]> {
-        self.brute_force_search_filtered(query_state, k, None)
+        self.brute_force_search_filtered(query_f32, query_state, k, None)
     }
 
-    /// Brute-force filtered search using TurboQuant_prod L2 distance.
+    /// Brute-force filtered search. Routes to TQ-ADC or TQ_prod based on build_mode.
     pub fn brute_force_search_filtered(
         &self,
-        query_state: &crate::vector::turbo_quant::inner_product::TqProdQueryState,
+        query_f32: &[f32],
+        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
         k: usize,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
         let dim = inner.dimension as usize;
+        let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
         let code_len = bytes_per_code - 4;
-        let qjl_bpv = inner.qjl_bytes_per_vec;
         let centroids = self.collection.codebook_16();
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
-        for entry in &inner.entries {
-            if entry.delete_lsn != 0 {
-                continue;
+        // Prepare FWHT-rotated query for TQ-ADC path (Light mode or fallback)
+        let use_tq_adc = query_state.is_none() || self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Light;
+        let q_rotated: Vec<f32>;
+        if use_tq_adc {
+            let mut buf = vec![0.0f32; padded];
+            buf[..dim].copy_from_slice(query_f32);
+            let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for v in buf[..dim].iter_mut() { *v *= inv; }
             }
+            fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
+            q_rotated = buf;
+        } else {
+            q_rotated = Vec::new();
+        }
+
+        for entry in &inner.entries {
+            if entry.delete_lsn != 0 { continue; }
             if let Some(bm) = allow_bitmap {
-                if !bm.contains(entry.internal_id) {
-                    continue;
-                }
+                if !bm.contains(entry.internal_id) { continue; }
             }
             let id = entry.internal_id as usize;
             let tq_offset = id * bytes_per_code;
             let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
-            let qjl_offset = id * qjl_bpv;
-            let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
-            let residual_norm = inner.residual_norms[id];
 
-            let single_qjl_bpv = (dim + 7) / 8;
-            let dist = crate::vector::turbo_quant::inner_product::score_l2_prod(
-                query_state, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
-            );
+            let dist = if use_tq_adc {
+                tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids)
+            } else {
+                let qs = query_state.unwrap();
+                let qjl_bpv = inner.qjl_bytes_per_vec;
+                let qjl_offset = id * qjl_bpv;
+                let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
+                let residual_norm = inner.residual_norms[id];
+                let single_qjl_bpv = (dim + 7) / 8;
+                crate::vector::turbo_quant::inner_product::score_l2_prod(
+                    qs, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
+                )
+            };
 
             if heap.len() < k {
                 heap.push(DistF32(dist, entry.internal_id));
@@ -249,7 +268,8 @@ impl MutableSegment {
     /// MVCC-aware brute-force search using TurboQuant_prod L2 distance.
     pub fn brute_force_search_mvcc(
         &self,
-        query_state: &crate::vector::turbo_quant::inner_product::TqProdQueryState,
+        query_f32: &[f32],
+        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
         k: usize,
         allow_bitmap: Option<&RoaringBitmap>,
         snapshot_lsn: u64,
@@ -258,10 +278,20 @@ impl MutableSegment {
     ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
         let dim = inner.dimension as usize;
+        let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
         let code_len = bytes_per_code - 4;
-        let qjl_bpv = inner.qjl_bytes_per_vec;
         let centroids = self.collection.codebook_16();
+
+        let use_tq_adc = query_state.is_none() || self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Light;
+        let q_rotated: Vec<f32> = if use_tq_adc {
+            let mut buf = vec![0.0f32; padded];
+            buf[..dim].copy_from_slice(query_f32);
+            let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 { let inv = 1.0 / norm; for v in buf[..dim].iter_mut() { *v *= inv; } }
+            fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
+            buf
+        } else { Vec::new() };
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
@@ -280,14 +310,20 @@ impl MutableSegment {
             let id = entry.internal_id as usize;
             let tq_offset = id * bytes_per_code;
             let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
-            let qjl_offset = id * qjl_bpv;
-            let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
-            let residual_norm = inner.residual_norms[id];
 
-            let single_qjl_bpv = (dim + 7) / 8;
-            let dist = crate::vector::turbo_quant::inner_product::score_l2_prod(
-                query_state, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
-            );
+            let dist = if use_tq_adc {
+                tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids)
+            } else {
+                let qs = query_state.unwrap();
+                let qjl_bpv = inner.qjl_bytes_per_vec;
+                let qjl_offset = id * qjl_bpv;
+                let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
+                let residual_norm = inner.residual_norms[id];
+                let single_qjl_bpv = (dim + 7) / 8;
+                crate::vector::turbo_quant::inner_product::score_l2_prod(
+                    qs, tq_code, entry.norm, qjl_signs, residual_norm, centroids, dim, single_qjl_bpv,
+                )
+            };
 
             if heap.len() < k {
                 heap.push(DistF32(dist, entry.internal_id));
@@ -331,12 +367,16 @@ impl MutableSegment {
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
 
-        // QJL deferred to freeze() — same as append()
-        let qjl_bpv = inner.qjl_bytes_per_vec;
-        let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
-        inner.qjl_signs.resize(new_qjl_len, 0u8);
-        inner.residual_norms.push(0.0);
-        inner.raw_f32.extend_from_slice(vector_f32);
+        let is_exact = self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
+        let mut extra_bytes = 0usize;
+        if is_exact {
+            let qjl_bpv = inner.qjl_bytes_per_vec;
+            let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
+            inner.qjl_signs.resize(new_qjl_len, 0u8);
+            inner.residual_norms.push(0.0);
+            inner.raw_f32.extend_from_slice(vector_f32);
+            extra_bytes = qjl_bpv + 4 + dim * 4;
+        }
 
         inner.entries.push(MutableEntry {
             internal_id,
@@ -348,7 +388,7 @@ impl MutableSegment {
             txn_id,
         });
 
-        inner.byte_size += bytes_per_code + qjl_bpv + 4 + dim * 4 + std::mem::size_of::<MutableEntry>();
+        inner.byte_size += bytes_per_code + extra_bytes + std::mem::size_of::<MutableEntry>();
         internal_id
     }
 
@@ -407,9 +447,17 @@ impl MutableSegment {
                 })
                 .collect(),
             tq_codes: inner.tq_codes.clone(),
-            qjl_signs: self.recompute_qjl_signs(&inner),
-            residual_norms: self.recompute_residual_norms(&inner),
-            raw_f32: inner.raw_f32.clone(),
+            qjl_signs: if self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact {
+                self.recompute_qjl_signs(&inner)
+            } else {
+                Vec::new()
+            },
+            residual_norms: if self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact {
+                self.recompute_residual_norms(&inner)
+            } else {
+                Vec::new()
+            },
+            raw_f32: inner.raw_f32.clone(), // empty in Light mode (nothing was appended)
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
             dimension: inner.dimension,
@@ -518,8 +566,10 @@ mod tests {
     use crate::vector::types::DistanceMetric;
 
     fn make_collection(dim: u32) -> Arc<CollectionMetadata> {
-        Arc::new(CollectionMetadata::new(
+        // Use Exact mode in tests to preserve TQ_prod scoring compatibility
+        Arc::new(CollectionMetadata::with_build_mode(
             1, dim, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            crate::vector::turbo_quant::collection::BuildMode::Exact,
         ))
     }
 
@@ -591,7 +641,7 @@ mod tests {
         let q_rot = rotate_query(&vectors[0], &col);
         let codebook = col.codebook_16();
         let qs = make_query_state(&vectors[0], &col);
-        let results = seg.brute_force_search(&qs, 3);
+        let results = seg.brute_force_search(&vectors[0], None, 3);
 
         assert!(results.len() <= 3);
         // First result should be vector 0 (nearest to itself)
@@ -614,8 +664,7 @@ mod tests {
 
         seg.mark_deleted(0, 10);
 
-        let qs = make_query_state(&v0, &col);
-        let results = seg.brute_force_search(&qs, 3);
+        let results = seg.brute_force_search(&v0, None, 3);
         for r in &results {
             assert_ne!(r.id.0, 0, "deleted vector should not appear");
         }
@@ -672,8 +721,8 @@ mod tests {
         let committed = roaring::RoaringBitmap::new();
         let qs = make_query_state(&vectors[0], &col);
 
-        let non_mvcc = seg.brute_force_search(&qs, 3);
-        let mvcc = seg.brute_force_search_mvcc(&qs, 3, None, 0, 0, &committed);
+        let non_mvcc = seg.brute_force_search(&vectors[0], Some(&qs), 3);
+        let mvcc = seg.brute_force_search_mvcc(&vectors[0], Some(&qs), 3, None, 0, 0, &committed);
 
         assert_eq!(non_mvcc.len(), mvcc.len());
         for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {
