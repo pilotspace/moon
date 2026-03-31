@@ -38,15 +38,18 @@ pub struct FrozenSegment {
     pub entries: Vec<MutableEntry>,
     /// TQ-4bit nibble-packed codes, `bytes_per_code` per vector.
     pub tq_codes: Vec<u8>,
+    /// f32 vectors for reranking in ImmutableSegment after compaction.
+    pub vectors_f32: Vec<f32>,
     /// Bytes per TQ code (padded_dim/2 + 4 for norm).
     pub bytes_per_code: usize,
     pub dimension: u32,
 }
 
 struct MutableSegmentInner {
-    /// TQ-encoded codes, contiguous, `bytes_per_code` per vector.
-    /// Layout per vector: [nibble_packed (padded_dim/2 bytes)] [norm (4 bytes f32 LE)]
+    /// TQ-encoded codes for brute-force TQ-ADC search.
     tq_codes: Vec<u8>,
+    /// f32 vectors for compaction → immutable f32 reranking.
+    vectors_f32: Vec<f32>,
     entries: Vec<MutableEntry>,
     dimension: u32,
     padded_dimension: u32,
@@ -89,6 +92,7 @@ impl MutableSegment {
         Self {
             inner: RwLock::new(MutableSegmentInner {
                 tq_codes: Vec::new(),
+                vectors_f32: Vec::new(),
                 entries: Vec::new(),
                 dimension,
                 padded_dimension: padded,
@@ -121,9 +125,12 @@ impl MutableSegment {
         let mut work_buf = vec![0.0f32; padded];
         let code = encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf);
 
-        // Append packed code + norm (4 bytes LE) to flat buffer
+        // Append packed code + norm (4 bytes LE) to TQ buffer
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
+
+        // Also store f32 for compaction → immutable f32 reranking
+        inner.vectors_f32.extend_from_slice(vector_f32);
 
         inner.entries.push(MutableEntry {
             internal_id,
@@ -135,7 +142,7 @@ impl MutableSegment {
             txn_id: 0,
         });
 
-        inner.byte_size += bytes_per_code + std::mem::size_of::<MutableEntry>();
+        inner.byte_size += bytes_per_code + inner.dimension as usize * 4 + std::mem::size_of::<MutableEntry>();
         internal_id
     }
 
@@ -272,6 +279,7 @@ impl MutableSegment {
 
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
+        inner.vectors_f32.extend_from_slice(vector_f32);
 
         inner.entries.push(MutableEntry {
             internal_id,
@@ -283,7 +291,8 @@ impl MutableSegment {
             txn_id,
         });
 
-        inner.byte_size += bytes_per_code + std::mem::size_of::<MutableEntry>();
+        let dim = inner.dimension as usize;
+        inner.byte_size += bytes_per_code + dim * 4 + std::mem::size_of::<MutableEntry>();
         internal_id
     }
 
@@ -342,6 +351,7 @@ impl MutableSegment {
                 })
                 .collect(),
             tq_codes: inner.tq_codes.clone(),
+            vectors_f32: inner.vectors_f32.clone(),
             bytes_per_code: inner.bytes_per_code,
             dimension: inner.dimension,
         }

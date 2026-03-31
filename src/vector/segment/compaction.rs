@@ -70,11 +70,14 @@ pub fn compact(
 
     // ── Step 1: Filter dead entries ──────────────────────────────────
     let mut live_entries = Vec::new();
+    let mut live_f32_vecs: Vec<f32> = Vec::new();
 
     for entry in &frozen.entries {
         if entry.delete_lsn != 0 {
             continue;
         }
+        let offset = entry.internal_id as usize * dim;
+        live_f32_vecs.extend_from_slice(&frozen.vectors_f32[offset..offset + dim]);
         live_entries.push(entry);
     }
 
@@ -187,9 +190,14 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // f32 no longer stored — TQ-only architecture.
-    // Recall verification skipped (TQ-ADC HNSW + TQ-ADC brute-force use
-    // identical distance metric, so recall is ~1.0 by construction).
+    // BFS reorder f32 vectors for immutable segment reranking.
+    let mut f32_bfs = vec![0.0f32; n * dim];
+    for bfs_pos in 0..n {
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let src = orig_id * dim;
+        let dst = bfs_pos * dim;
+        f32_bfs[dst..dst + dim].copy_from_slice(&live_f32_vecs[src..src + dim]);
+    }
 
     // ── Step 5: Create ImmutableSegment ─────────────────────────────
     let mvcc: Vec<MvccHeader> = (0..n)
@@ -211,7 +219,7 @@ pub fn compact(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
         AlignedBuffer::new(0), // SQ8 not stored
-        AlignedBuffer::new(0), // f32 not stored — TQ-only
+        AlignedBuffer::from_vec(f32_bfs), // f32 for reranking
         mvcc,
         collection.clone(),
         live_count,
