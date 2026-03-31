@@ -18,7 +18,7 @@ use crate::vector::hnsw::build::HnswBuilder;
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::persistence::segment_io;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
-use crate::vector::turbo_quant::encoder::encode_tq_mse;
+use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
 use crate::vector::turbo_quant::fwht;
 
 use super::immutable::{ImmutableSegment, MvccHeader};
@@ -71,7 +71,6 @@ pub fn compact(
     // ── Step 1: Filter dead entries ──────────────────────────────────
     let mut live_entries = Vec::new();
     let mut live_f32_vecs: Vec<f32> = Vec::new();
-    let mut live_sq_vecs: Vec<i8> = Vec::new();
 
     for entry in &frozen.entries {
         if entry.delete_lsn != 0 {
@@ -79,7 +78,6 @@ pub fn compact(
         }
         let offset = entry.internal_id as usize * dim;
         live_f32_vecs.extend_from_slice(&frozen.vectors_f32[offset..offset + dim]);
-        live_sq_vecs.extend_from_slice(&frozen.vectors_sq[offset..offset + dim]);
         live_entries.push(entry);
     }
 
@@ -93,10 +91,11 @@ pub fn compact(
     let mut tq_codes_raw: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut tq_norms: Vec<f32> = Vec::with_capacity(n);
     let mut work_buf = vec![0.0f32; padded];
+    let boundaries = collection.codebook_boundaries_15();
 
     for i in 0..n {
         let vec_slice = &live_f32_vecs[i * dim..(i + 1) * dim];
-        let code = encode_tq_mse(vec_slice, signs, &mut work_buf);
+        let code = encode_tq_mse_scaled(vec_slice, signs, boundaries, &mut work_buf);
         tq_codes_raw.push(code.codes);
         tq_norms.push(code.norm);
     }
@@ -214,6 +213,7 @@ pub fn compact(
 
     let graph = if need_cpu_build {
         let dist_table = crate::vector::distance::table();
+        let codebook = collection.codebook_16();
         let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
 
         for _i in 0..n {
@@ -229,7 +229,7 @@ pub fn compact(
                     norm_bytes[2],
                     norm_bytes[3],
                 ]);
-                (dist_table.tq_l2)(q_rot, code_slice, norm)
+                (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
             });
         }
 
@@ -257,16 +257,7 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // BFS reorder SQ vectors
-    let mut sq_bfs = vec![0i8; n * dim];
-    for bfs_pos in 0..n {
-        let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        let src = orig_id * dim;
-        let dst = bfs_pos * dim;
-        sq_bfs[dst..dst + dim].copy_from_slice(&live_sq_vecs[src..src + dim]);
-    }
-
-    // BFS reorder f32 vectors for HNSW search
+    // BFS reorder f32 vectors for reranking stage in ImmutableSegment.
     let mut f32_bfs = vec![0.0f32; n * dim];
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
@@ -317,8 +308,8 @@ pub fn compact(
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        AlignedBuffer::from_vec(sq_bfs),
-        AlignedBuffer::from_vec(f32_bfs),
+        AlignedBuffer::new(0), // SQ8 not stored
+        AlignedBuffer::from_vec(f32_bfs), // f32 for reranking
         mvcc,
         collection.clone(),
         live_count,
@@ -484,7 +475,11 @@ mod tests {
         // Verify search works on the resulting segment
         let mut query = lcg_f32(64, 99999);
         normalize(&mut query);
-        let results = imm.search(&query, 5, 64);
+        let padded = collection.padded_dimension;
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(
+            imm.graph().num_nodes(), padded,
+        );
+        let results = imm.search(&query, 5, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
     }

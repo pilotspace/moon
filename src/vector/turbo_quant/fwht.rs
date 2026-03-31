@@ -276,6 +276,21 @@ pub fn fwht(data: &mut [f32], sign_flips: &[f32]) {
     (unsafe { *FWHT_FN.get().unwrap_unchecked() })(data, sign_flips);
 }
 
+/// Inverse randomized normalized FWHT: R^{-1}(y) = D * H * y.
+///
+/// Forward is: sign_flips → FWHT → normalize.
+/// Inverse is: FWHT → normalize → sign_flips (D is self-inverse, H is self-inverse).
+///
+/// Uses scalar FWHT kernel — the SIMD dispatch is only for the forward path
+/// which fuses all three steps. The inverse order differs and is called less
+/// frequently (decode/reranking), so scalar is acceptable.
+#[inline]
+pub fn inverse_fwht(data: &mut [f32], sign_flips: &[f32]) {
+    fwht_scalar(data);
+    normalize_fwht(data);
+    apply_sign_flips(data, sign_flips);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

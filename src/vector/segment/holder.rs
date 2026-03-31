@@ -30,8 +30,8 @@ pub struct MvccContext<'a> {
     /// Dirty set: uncommitted entries from the active transaction.
     /// Brute-force scanned and merged into results.
     pub dirty_set: &'a [MutableEntry],
-    /// SQ vectors for dirty set entries (contiguous, dimension-strided).
-    pub dirty_vectors_sq: &'a [i8],
+    /// f32 vectors for dirty set entries (contiguous, dimension-strided).
+    pub dirty_vectors_f32: &'a [f32],
     pub dimension: u32,
 }
 
@@ -94,12 +94,11 @@ impl SegmentHolder {
     pub fn search(
         &self,
         query_f32: &[f32],
-        query_sq: &[i8],
         k: usize,
         ef_search: usize,
         scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
-        self.search_filtered(query_f32, query_sq, k, ef_search, scratch, None)
+        self.search_filtered(query_f32, k, ef_search, scratch, None)
     }
 
     /// Fan-out search with optional filter bitmap.
@@ -112,7 +111,6 @@ impl SegmentHolder {
     pub fn search_filtered(
         &self,
         query_f32: &[f32],
-        query_sq: &[i8],
         k: usize,
         ef_search: usize,
         _scratch: &mut SearchScratch,
@@ -128,20 +126,21 @@ impl SegmentHolder {
 
         match strategy {
             FilterStrategy::Unfiltered => {
-                all.extend(snapshot.mutable.brute_force_search(query_sq, k));
+                all.extend(snapshot.mutable.brute_force_search(query_f32, k));
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search(query_f32, k, ef_search));
+                    all.extend(imm.search(query_f32, k, ef_search, _scratch));
                 }
             }
             FilterStrategy::BruteForceFiltered => {
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(query_sq, k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
                         k,
                         ef_search,
+                        _scratch,
                         filter_bitmap,
                     ));
                 }
@@ -149,12 +148,13 @@ impl SegmentHolder {
             FilterStrategy::HnswFiltered => {
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(query_sq, k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
                         k,
                         ef_search,
+                        _scratch,
                         filter_bitmap,
                     ));
                 }
@@ -163,12 +163,13 @@ impl SegmentHolder {
                 let oversample_k = k * 3;
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(query_sq, oversample_k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, oversample_k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     let imm_results = imm.search(
                         query_f32,
                         oversample_k,
                         ef_search.max(oversample_k),
+                        _scratch,
                     );
                     if let Some(bm) = filter_bitmap {
                         for r in imm_results {
@@ -246,7 +247,6 @@ impl SegmentHolder {
     pub fn search_mvcc(
         &self,
         query_f32: &[f32],
-        query_sq: &[i8],
         k: usize,
         ef_search: usize,
         _scratch: &mut SearchScratch,
@@ -255,9 +255,9 @@ impl SegmentHolder {
     ) -> SmallVec<[SearchResult; 32]> {
         let snapshot = self.load();
 
-        // 1. MVCC-aware brute-force on mutable segment
+        // 1. MVCC-aware brute-force on mutable segment (f32 L2 distance)
         let mut all = snapshot.mutable.brute_force_search_mvcc(
-            query_sq,
+            query_f32,
             k,
             filter_bitmap,
             mvcc.snapshot_lsn,
@@ -265,7 +265,7 @@ impl SegmentHolder {
             mvcc.committed,
         );
 
-        // 2. HNSW search on immutable segments.
+        // 2. HNSW search on immutable segments (TQ-ADC distance).
         // Immutable segment entries are committed by definition (compacted only
         // after commit). No visibility post-filter needed for Phase 65.
         for imm in &snapshot.immutable {
@@ -274,10 +274,11 @@ impl SegmentHolder {
                     query_f32,
                     k,
                     ef_search,
+                    _scratch,
                     filter_bitmap,
                 ));
             } else {
-                all.extend(imm.search(query_f32, k, ef_search));
+                all.extend(imm.search(query_f32, k, ef_search, _scratch));
             }
         }
 
@@ -324,23 +325,21 @@ impl SegmentHolder {
         // 3. Brute-force scan dirty set entries (always visible -- own txn's writes).
         if !mvcc.dirty_set.is_empty() {
             let dim = mvcc.dimension as usize;
-            let l2_i8 = crate::vector::distance::table().l2_i8;
+            let l2_f32 = crate::vector::distance::table().l2_f32;
 
             for (idx, entry) in mvcc.dirty_set.iter().enumerate() {
-                // Skip deleted dirty entries
                 if entry.delete_lsn != 0 {
                     continue;
                 }
-                // Apply filter bitmap if present
                 if let Some(bm) = filter_bitmap {
                     if !bm.contains(entry.internal_id) {
                         continue;
                     }
                 }
                 let offset = idx * dim;
-                let vec_sq = &mvcc.dirty_vectors_sq[offset..offset + dim];
-                let dist = l2_i8(query_sq, vec_sq);
-                all.push(SearchResult::new(dist as f32, VectorId(entry.internal_id)));
+                let vec_f32 = &mvcc.dirty_vectors_f32[offset..offset + dim];
+                let dist = l2_f32(query_f32, vec_f32);
+                all.push(SearchResult::new(dist, VectorId(entry.internal_id)));
             }
         }
 
@@ -422,7 +421,7 @@ mod tests {
         let mut scratch =
             crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
-        let results = holder.search(&query_f32, &query_sq, 3, 64, &mut scratch);
+        let results = holder.search(&query_f32, 3, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 3);
         // First result should be vector 0
@@ -446,8 +445,8 @@ mod tests {
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
-        let unfiltered = holder.search(&query_f32, &query_sq, 3, 64, &mut scratch);
-        let filtered = holder.search_filtered(&query_f32, &query_sq, 3, 64, &mut scratch, None);
+        let unfiltered = holder.search(&query_f32, 3, 64, &mut scratch);
+        let filtered = holder.search_filtered(&query_f32, 3, 64, &mut scratch, None);
         assert_eq!(unfiltered.len(), filtered.len());
         for (u, f) in unfiltered.iter().zip(filtered.iter()) {
             assert_eq!(u.id.0, f.id.0);
@@ -477,7 +476,7 @@ mod tests {
         bitmap.insert(3);
         bitmap.insert(4);
 
-        let results = holder.search_filtered(&query_f32, &query_sq, 3, 64, &mut scratch, Some(&bitmap));
+        let results = holder.search_filtered(&query_f32, 3, 64, &mut scratch, Some(&bitmap));
         for r in &results {
             assert!(bitmap.contains(r.id.0), "result id {} not in bitmap", r.id.0);
         }
@@ -502,16 +501,16 @@ mod tests {
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
 
-        let non_mvcc = holder.search(&query_f32, &query_sq, 3, 64, &mut scratch);
+        let non_mvcc = holder.search(&query_f32, 3, 64, &mut scratch);
         let mvcc_ctx = super::MvccContext {
             snapshot_lsn: 0,
             my_txn_id: 0,
             committed: &committed,
             dirty_set: &[],
-            dirty_vectors_sq: &[],
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
-        let mvcc = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_ctx);
+        let mvcc = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
         assert_eq!(non_mvcc.len(), mvcc.len());
         for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {
@@ -540,10 +539,10 @@ mod tests {
             my_txn_id: 99,
             committed: &committed,
             dirty_set: &[],
-            dirty_vectors_sq: &[],
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
-        let results = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_ctx);
+        let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.0, 0);
     }
@@ -556,8 +555,8 @@ mod tests {
         let holder = SegmentHolder::new(dim as u32);
         {
             let snap = holder.load();
-            // One existing entry far from query
-            snap.mutable.append(0, &[0.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
+            // One existing entry far from query (f32 L2 distance)
+            snap.mutable.append(0, &[100.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
         }
         let query_sq = vec![0i8; dim];
         let query_f32 = vec![0.0f32; dim];
@@ -574,17 +573,17 @@ mod tests {
             delete_lsn: 0,
             txn_id: 42,
         };
-        let dirty_sq = vec![0i8; dim]; // identical to query -> distance 0
+        let dirty_f32 = vec![0.0f32; dim]; // identical to query -> distance 0
 
         let mvcc_ctx = super::MvccContext {
             snapshot_lsn: 10,
             my_txn_id: 42,
             committed: &committed,
             dirty_set: std::slice::from_ref(&dirty_entry),
-            dirty_vectors_sq: &dirty_sq,
+            dirty_vectors_f32: &dirty_f32,
             dimension: dim as u32,
         };
-        let results = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_ctx);
+        let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
         // Dirty entry should be first (distance 0)
         assert!(!results.is_empty());
@@ -615,10 +614,10 @@ mod tests {
             my_txn_id: 99,
             committed: &committed,
             dirty_set: &[],
-            dirty_vectors_sq: &[],
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
-        let r1 = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_empty);
+        let r1 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty);
 
         // Same with explicit empty dirty set
         let mvcc_empty2 = super::MvccContext {
@@ -626,10 +625,10 @@ mod tests {
             my_txn_id: 99,
             committed: &committed,
             dirty_set: &[],
-            dirty_vectors_sq: &[],
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
-        let r2 = holder.search_mvcc(&query_f32, &query_sq, 3, 64, &mut scratch, None, &mvcc_empty2);
+        let r2 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty2);
 
         assert_eq!(r1.len(), r2.len());
         for (a, b) in r1.iter().zip(r2.iter()) {
@@ -741,7 +740,7 @@ mod tests {
         let query_sq = make_sq_vector(dim, 1);
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
-        let results = holder.search(&query_f32, &query_sq, 10, 64, &mut scratch);
+        let results = holder.search(&query_f32, 10, 64, &mut scratch);
         assert!(!results.is_empty());
         // Should contain at least some IVF results (ids >= 1000).
         let ivf_count = results.iter().filter(|r| r.id.0 >= 1000).count();

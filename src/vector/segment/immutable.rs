@@ -9,6 +9,8 @@ use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
+use crate::vector::hnsw::search::{SearchScratch, hnsw_search, hnsw_search_filtered};
+#[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::types::SearchResult;
@@ -23,11 +25,13 @@ pub struct MvccHeader {
 }
 
 /// Read-only segment. Truly immutable after construction -- no locks needed.
+///
+/// Two-stage search: HNSW beam search with TQ-ADC (fast, 8x compressed),
+/// then rerank top candidates with exact f32 L2 for high recall.
+/// SQ8 vectors are dropped (not needed).
 pub struct ImmutableSegment {
     graph: HnswGraph,
     vectors_tq: AlignedBuffer<u8>,
-    #[allow(dead_code)]
-    vectors_sq: AlignedBuffer<i8>,
     vectors_f32: AlignedBuffer<f32>,
     mvcc: Vec<MvccHeader>,
     collection_meta: Arc<CollectionMetadata>,
@@ -37,10 +41,12 @@ pub struct ImmutableSegment {
 
 impl ImmutableSegment {
     /// Construct from compaction output.
+    ///
+    /// SQ8 vectors are dropped (not needed). f32 kept for reranking.
     pub fn new(
         graph: HnswGraph,
         vectors_tq: AlignedBuffer<u8>,
-        vectors_sq: AlignedBuffer<i8>,
+        _vectors_sq: AlignedBuffer<i8>,
         vectors_f32: AlignedBuffer<f32>,
         mvcc: Vec<MvccHeader>,
         collection_meta: Arc<CollectionMetadata>,
@@ -50,7 +56,6 @@ impl ImmutableSegment {
         Self {
             graph,
             vectors_tq,
-            vectors_sq,
             vectors_f32,
             mvcc,
             collection_meta,
@@ -59,44 +64,83 @@ impl ImmutableSegment {
         }
     }
 
-    /// Delegated HNSW search using f32 L2 distance (not TQ-ADC).
+    /// Two-stage HNSW search: TQ-ADC beam search + f32 reranking.
     ///
-    /// TQ-ADC is invalid for greedy HNSW navigation (BitVec bug caused 0.00
-    /// recall). f32 L2 with Vec<bool> visited tracking achieves 0.999 recall.
+    /// Stage 1: HNSW beam search with TQ-ADC distance (4-bit quantized).
+    ///   Returns `ef_search` candidates — fast but approximate distances.
+    /// Stage 2: Rerank candidates with exact f32 L2 distance.
+    ///   Returns top-k with exact ordering — high recall.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
+        scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
-        hnsw_search_f32(
+        // Stage 1: TQ-ADC HNSW beam search (returns ef candidates)
+        let mut candidates = hnsw_search(
             &self.graph,
-            self.vectors_f32.as_slice(),
-            self.collection_meta.dimension as usize,
+            self.vectors_tq.as_slice(),
             query,
-            k,
+            &self.collection_meta,
+            ef_search, // fetch ef candidates, not just k
             ef_search,
-            None,
-        )
+            scratch,
+        );
+
+        // Stage 2: Rerank with exact f32 L2 distance
+        if !self.vectors_f32.as_slice().is_empty() {
+            let dim = self.collection_meta.dimension as usize;
+            let l2_f32 = crate::vector::distance::table().l2_f32;
+
+            for result in candidates.iter_mut() {
+                let bfs_pos = self.graph.to_bfs(result.id.0);
+                let offset = bfs_pos as usize * dim;
+                let vec_f32 = &self.vectors_f32.as_slice()[offset..offset + dim];
+                result.distance = l2_f32(query, vec_f32);
+            }
+            candidates.sort_unstable();
+        }
+
+        candidates.truncate(k);
+        candidates
     }
 
-    /// Delegated HNSW search with filter bitmap using f32 L2 distance.
+    /// Two-stage HNSW search with filter bitmap.
     pub fn search_filtered(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
+        scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
-        hnsw_search_f32(
+        let mut candidates = hnsw_search_filtered(
             &self.graph,
-            self.vectors_f32.as_slice(),
-            self.collection_meta.dimension as usize,
+            self.vectors_tq.as_slice(),
             query,
-            k,
+            &self.collection_meta,
             ef_search,
+            ef_search,
+            scratch,
             allow_bitmap,
-        )
+        );
+
+        if !self.vectors_f32.as_slice().is_empty() {
+            let dim = self.collection_meta.dimension as usize;
+            let l2_f32 = crate::vector::distance::table().l2_f32;
+
+            for result in candidates.iter_mut() {
+                let bfs_pos = self.graph.to_bfs(result.id.0);
+                let offset = bfs_pos as usize * dim;
+                let vec_f32 = &self.vectors_f32.as_slice()[offset..offset + dim];
+                result.distance = l2_f32(query, vec_f32);
+            }
+            candidates.sort_unstable();
+        }
+
+        candidates.truncate(k);
+        candidates
     }
 
     /// Access the HNSW graph.
@@ -109,15 +153,8 @@ impl ImmutableSegment {
         &self.vectors_tq
     }
 
-    /// Access the SQ vector buffer.
-    pub fn vectors_sq(&self) -> &AlignedBuffer<i8> {
-        &self.vectors_sq
-    }
-
-    /// Access the f32 vector buffer (BFS-ordered, used for HNSW search).
-    pub fn vectors_f32(&self) -> &AlignedBuffer<f32> {
-        &self.vectors_f32
-    }
+    // vectors_sq and vectors_f32 removed — TQ-ADC is used for search.
+    // This saves ~5x memory per vector (3072 + 768 bytes/vec at dim=768).
 
     /// Access MVCC headers.
     pub fn mvcc_headers(&self) -> &[MvccHeader] {
@@ -192,7 +229,7 @@ mod tests {
     use crate::vector::distance;
     use crate::vector::hnsw::build::HnswBuilder;
     use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
-    use crate::vector::turbo_quant::encoder::{encode_tq_mse, padded_dimension};
+    use crate::vector::turbo_quant::encoder::{encode_tq_mse_scaled, padded_dimension};
     use crate::vector::turbo_quant::fwht;
     use crate::vector::types::DistanceMetric;
 
@@ -241,7 +278,8 @@ mod tests {
         for i in 0..n {
             let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut v);
-            let code = encode_tq_mse(&v, signs, &mut work);
+            let boundaries = collection.codebook_boundaries_15();
+            let code = encode_tq_mse_scaled(&v, signs, boundaries, &mut work);
             // SQ: simple scalar quantization to i8
             for &val in &v {
                 sq_vectors.push((val * 127.0).clamp(-128.0, 127.0) as i8);
@@ -271,6 +309,7 @@ mod tests {
             all_rotated.push(q_rot_buf[..padded].to_vec());
         }
 
+        let codebook = collection.codebook_16();
         let mut builder = HnswBuilder::new(16, 200, 12345);
         for _i in 0..n {
             builder.insert(|a: u32, b: u32| {
@@ -285,7 +324,7 @@ mod tests {
                     norm_bytes[2],
                     norm_bytes[3],
                 ]);
-                (dist_table.tq_l2)(q_rot, code_slice, norm)
+                (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
             });
         }
 
@@ -333,7 +372,11 @@ mod tests {
     #[test]
     fn test_immutable_search_returns_results() {
         let (segment, vectors) = build_immutable_segment(50, 64);
-        let results = segment.search(&vectors[0], 5, 64);
+        let padded = segment.collection_meta().padded_dimension;
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(
+            segment.graph().num_nodes(), padded,
+        );
+        let results = segment.search(&vectors[0], 5, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
     }

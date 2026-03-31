@@ -168,6 +168,9 @@ pub fn encode_tq_mse_scaled(
 
 /// Decode a TQ code back to approximate vector (for verification/reranking).
 ///
+/// **DEPRECATED**: Uses legacy 1/√768-scaled CENTROIDS. Use [`decode_tq_mse_scaled`]
+/// for dimension-adaptive decoding that matches `encode_tq_mse_scaled`.
+///
 /// Applies inverse: unpack -> lookup centroids -> inverse FWHT -> un-pad -> scale by norm.
 ///
 /// The inverse of the randomized FWHT `R(x) = H * D * x` is `R^{-1}(y) = D * H * y`
@@ -189,11 +192,39 @@ pub fn decode_tq_mse(
     }
 
     // Inverse FWHT: R^{-1}(y) = D * H * y
-    // Step 1: Apply plain FWHT (no sign flips) + normalize
-    fwht::fwht_scalar(&mut work_buf[..padded]);
-    fwht::normalize_fwht(&mut work_buf[..padded]);
-    // Step 2: Apply sign flips (D is its own inverse)
-    fwht::apply_sign_flips(&mut work_buf[..padded], sign_flips);
+    fwht::inverse_fwht(&mut work_buf[..padded], sign_flips);
+
+    // Un-pad and scale by norm
+    let mut result = Vec::with_capacity(original_dim);
+    for &val in work_buf[..original_dim].iter() {
+        result.push(val * code.norm);
+    }
+    result
+}
+
+/// Decode a TQ code using dimension-scaled centroids.
+///
+/// Matches `encode_tq_mse_scaled` — uses the provided centroids instead of
+/// the legacy 1/√768-scaled constants. This is the correct decode for any dimension.
+pub fn decode_tq_mse_scaled(
+    code: &TqCode,
+    sign_flips: &[f32],
+    centroids: &[f32; 16],
+    original_dim: usize,
+    work_buf: &mut [f32],
+) -> Vec<f32> {
+    let padded = padded_dimension(original_dim as u32) as usize;
+    debug_assert!(work_buf.len() >= padded);
+    debug_assert_eq!(sign_flips.len(), padded);
+
+    // Unpack nibbles -> centroid indices -> centroid values (scaled)
+    let indices = nibble_unpack(&code.codes, padded);
+    for (dst, &idx) in work_buf[..padded].iter_mut().zip(indices.iter()) {
+        *dst = centroids[idx as usize];
+    }
+
+    // Inverse FWHT: R^{-1}(y) = D * H * y
+    fwht::inverse_fwht(&mut work_buf[..padded], sign_flips);
 
     // Un-pad and scale by norm
     let mut result = Vec::with_capacity(original_dim);
@@ -430,9 +461,7 @@ pub fn decode_tq_mse_multibit(
     }
 
     // Inverse FWHT: R^{-1}(y) = D * H * y
-    fwht::fwht_scalar(&mut work_buf[..padded]);
-    fwht::normalize_fwht(&mut work_buf[..padded]);
-    fwht::apply_sign_flips(&mut work_buf[..padded], sign_flips);
+    fwht::inverse_fwht(&mut work_buf[..padded], sign_flips);
 
     // Un-pad and scale by norm
     let mut result = Vec::with_capacity(original_dim);

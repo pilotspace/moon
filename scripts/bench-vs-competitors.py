@@ -164,15 +164,25 @@ def mode_bench_moon(args):
     print(f" Moon Server Mode (port {port})")
     print(f"{'=' * 65}")
 
-    r = redis_lib.Redis(port=port, decode_responses=False)
+    r = redis_lib.Redis(port=port, decode_responses=False, socket_timeout=600)
 
     # Verify connectivity
     pong = r.ping()
     print(f"  PING: {pong}")
 
-    # Get baseline RSS
+    # Get baseline RSS — try INFO server first, fall back to lsof for port PID
     info = r.info("server")
-    moon_pid = info.get("process_id", 0)
+    moon_pid = info.get("process_id", info.get(b"process_id", 0))
+    if not moon_pid:
+        # Moon doesn't expose process_id in INFO; find PID by port
+        try:
+            lsof = subprocess.check_output(
+                ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                stderr=subprocess.DEVNULL
+            ).decode().strip().split("\n")[0]
+            moon_pid = int(lsof)
+        except Exception:
+            moon_pid = 0
     rss_before = get_rss_mb(int(moon_pid)) if moon_pid else 0
 
     # Create index
@@ -230,6 +240,19 @@ def mode_bench_moon(args):
     print(f"  Insert: {insert_sec:.2f}s ({insert_vps:.0f} vec/s)")
     print(f"  RSS: {rss_before:.1f} MB -> {rss_after:.1f} MB (delta: {rss_after - rss_before:.1f} MB)")
 
+    # Compact: build HNSW index for O(log n) search
+    print(f">>> Compacting (building HNSW index)...")
+    compact_start = time.perf_counter()
+    try:
+        r.execute_command("FT.COMPACT", "idx")
+    except Exception as e:
+        print(f"  FT.COMPACT: {e} (falling back to brute-force search)")
+    compact_sec = time.perf_counter() - compact_start
+    print(f"  Compact: {compact_sec:.2f}s")
+
+    rss_compact = get_rss_mb(int(moon_pid)) if moon_pid else 0
+    print(f"  RSS after compact: {rss_compact:.1f} MB")
+
     # Warmup queries
     print(f">>> Warming up ({min(100, len(queries))} queries)...")
     for q in queries[:min(100, len(queries))]:
@@ -260,7 +283,8 @@ def mode_bench_moon(args):
             t1 = time.perf_counter()
             latencies.append((t1 - t0) * 1000)
 
-            # Parse results: [count, doc_id, fields, doc_id, fields, ...]
+            # Parse results: [count, id, fields, id, fields, ...]
+            # Moon returns "vec:<internal_id>"; accept both "doc:" and "vec:" prefixes
             ids = []
             if isinstance(result, list) and len(result) > 1:
                 j = 1
@@ -268,8 +292,11 @@ def mode_bench_moon(args):
                     doc_id = result[j]
                     if isinstance(doc_id, bytes):
                         name = doc_id.decode()
-                        if name.startswith("doc:"):
-                            ids.append(int(name.split(":")[1]))
+                        if ":" in name:
+                            try:
+                                ids.append(int(name.split(":")[1]))
+                            except ValueError:
+                                pass
                     j += 2  # skip fields array
             all_results.append(ids)
         except Exception as e:

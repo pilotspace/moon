@@ -1119,7 +1119,8 @@ mod tests {
 
             // Create TQ codes: encode using real encoder for accurate recall.
             let mut work_buf = vec![0.0f32; pdim];
-            let code = crate::vector::turbo_quant::encoder::encode_tq_mse(v, &signs, &mut work_buf);
+            let boundaries = crate::vector::turbo_quant::codebook::scaled_boundaries(pdim as u32);
+            let code = crate::vector::turbo_quant::encoder::encode_tq_mse_scaled(v, &signs, &boundaries, &mut work_buf);
             tq_codes.push(code.codes);
         }
 

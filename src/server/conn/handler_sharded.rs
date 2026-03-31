@@ -936,6 +936,8 @@ pub async fn handle_connection_sharded_inner<
                                     crate::command::vector_search::ft_dropindex(&mut vs, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                     crate::command::vector_search::ft_info(&vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                                    crate::command::vector_search::ft_compact(&mut vs, cmd_args)
                                 } else {
                                     Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
                                 }

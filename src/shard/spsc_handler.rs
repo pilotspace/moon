@@ -872,6 +872,8 @@ fn dispatch_vector_command(vector_store: &mut VectorStore, command: &crate::prot
         vector_search::ft_dropindex(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
         vector_search::ft_info(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+        vector_search::ft_compact(vector_store, args)
     } else {
         crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT command"))
     }

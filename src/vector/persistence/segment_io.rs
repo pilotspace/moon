@@ -134,21 +134,8 @@ pub fn write_immutable_segment(
     // 2. tq_codes.bin
     fs::write(seg_dir.join("tq_codes.bin"), segment.vectors_tq().as_slice())?;
 
-    // 3. sq_vectors.bin (i8 as u8 -- safe, same size/alignment)
-    let sq_slice = segment.vectors_sq().as_slice();
-    // SAFETY: i8 and u8 have identical size, alignment, and no invalid bit patterns.
-    let sq_as_u8: &[u8] = unsafe {
-        std::slice::from_raw_parts(sq_slice.as_ptr() as *const u8, sq_slice.len())
-    };
-    fs::write(seg_dir.join("sq_vectors.bin"), sq_as_u8)?;
-
-    // 3b. f32_vectors.bin (f32 as u8 -- safe transmute for persistence)
-    let f32_slice = segment.vectors_f32().as_slice();
-    // SAFETY: f32 and [u8; 4] have identical size; no invalid bit patterns for LE bytes.
-    let f32_as_u8: &[u8] = unsafe {
-        std::slice::from_raw_parts(f32_slice.as_ptr() as *const u8, f32_slice.len() * 4)
-    };
-    fs::write(seg_dir.join("f32_vectors.bin"), f32_as_u8)?;
+    // 3. sq_vectors.bin — skipped (SQ8 no longer stored in ImmutableSegment).
+    // 3b. f32_vectors.bin — skipped (f32 no longer stored; TQ-ADC used for search).
 
     // 4. mvcc_headers.bin: [count:u32 LE][MvccHeader; count]
     let mvcc = segment.mvcc_headers();
@@ -282,27 +269,10 @@ pub fn read_immutable_segment(
     let tq_bytes = fs::read(seg_dir.join("tq_codes.bin"))?;
     let vectors_tq = AlignedBuffer::from_vec(tq_bytes);
 
-    // 4. Read SQ vectors (u8 -> i8, safe transmute)
-    let sq_bytes = fs::read(seg_dir.join("sq_vectors.bin"))?;
-    let sq_i8: Vec<i8> = sq_bytes.into_iter().map(|b| b as i8).collect();
-    let vectors_sq = AlignedBuffer::from_vec(sq_i8);
-
-    // 4b. Read f32 vectors (u8 -> f32, LE byte order)
-    let f32_path = seg_dir.join("f32_vectors.bin");
-    let vectors_f32 = if f32_path.exists() {
-        let f32_bytes = fs::read(&f32_path)?;
-        if f32_bytes.len() % 4 != 0 {
-            return Err(SegmentIoError::InvalidMetadata("f32_vectors.bin not aligned to 4 bytes".to_owned()));
-        }
-        let f32_vec: Vec<f32> = f32_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        AlignedBuffer::from_vec(f32_vec)
-    } else {
-        // Backward compatibility: older segments without f32 vectors
-        AlignedBuffer::new(0)
-    };
+    // 4. SQ and f32 vectors — no longer stored (TQ-ADC used for search).
+    // Provide empty buffers for ImmutableSegment::new() which drops them.
+    let vectors_sq: AlignedBuffer<i8> = AlignedBuffer::new(0);
+    let vectors_f32: AlignedBuffer<f32> = AlignedBuffer::new(0);
 
     // 5. Read MVCC headers
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin"))?;
@@ -359,7 +329,7 @@ mod tests {
     use super::*;
     use crate::vector::distance;
     use crate::vector::hnsw::build::HnswBuilder;
-    use crate::vector::turbo_quant::encoder::encode_tq_mse;
+    use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
     use crate::vector::turbo_quant::fwht;
 
     fn lcg_f32(dim: usize, seed: u32) -> Vec<f32> {
@@ -399,7 +369,8 @@ mod tests {
         for i in 0..n {
             let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut v);
-            let code = encode_tq_mse(&v, signs, &mut work);
+            let boundaries = collection.codebook_boundaries_15();
+            let code = encode_tq_mse_scaled(&v, signs, boundaries, &mut work);
             for &val in &v {
                 sq_vectors.push((val * 127.0).clamp(-128.0, 127.0) as i8);
             }
@@ -408,6 +379,7 @@ mod tests {
         }
 
         let dist_table = distance::table();
+        let codebook = collection.codebook_16();
 
         let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
         for code in &codes {
@@ -434,7 +406,7 @@ mod tests {
                 let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
                 let norm_bytes = &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
                 let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-                (dist_table.tq_l2)(q_rot, code_slice, norm)
+                (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
             });
         }
 
@@ -478,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_creates_6_files() {
+    fn test_write_creates_4_files() {
         let (segment, collection) = build_test_segment(20, 64);
         let tmp = tempfile::tempdir().unwrap();
 
@@ -487,8 +459,7 @@ mod tests {
         let seg_dir = tmp.path().join("segment-42");
         assert!(seg_dir.join("hnsw_graph.bin").exists());
         assert!(seg_dir.join("tq_codes.bin").exists());
-        assert!(seg_dir.join("sq_vectors.bin").exists());
-        assert!(seg_dir.join("f32_vectors.bin").exists());
+        // sq_vectors.bin and f32_vectors.bin no longer written (TQ-ADC used for search)
         assert!(seg_dir.join("mvcc_headers.bin").exists());
         assert!(seg_dir.join("segment_meta.json").exists());
     }
@@ -515,7 +486,11 @@ mod tests {
 
         let mut query = lcg_f32(64, 99999);
         normalize(&mut query);
-        let results = restored.search(&query, 5, 64);
+        let padded = collection.padded_dimension;
+        let mut scratch = crate::vector::hnsw::search::SearchScratch::new(
+            restored.graph().num_nodes(), padded,
+        );
+        let results = restored.search(&query, 5, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
     }

@@ -423,7 +423,7 @@ mod tests {
     use crate::vector::distance;
     use crate::vector::hnsw::build::HnswBuilder;
     use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
-    use crate::vector::turbo_quant::encoder::{encode_tq_mse, padded_dimension};
+    use crate::vector::turbo_quant::encoder::{encode_tq_mse_scaled, padded_dimension};
     use crate::vector::types::DistanceMetric;
 
     fn lcg_f32(dim: usize, seed: u32) -> Vec<f32> {
@@ -479,7 +479,8 @@ mod tests {
         for i in 0..n {
             let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut v);
-            let code = encode_tq_mse(&v, signs, &mut work);
+            let boundaries = collection.codebook_boundaries_15();
+            let code = encode_tq_mse_scaled(&v, signs, boundaries, &mut work);
             vectors.push(v);
             codes.push(code);
         }
@@ -507,6 +508,7 @@ mod tests {
         }
 
         // Build HNSW with true pairwise distance oracle
+        let codebook = collection.codebook_16();
         let mut builder = HnswBuilder::new(m, ef_construction, 12345);
 
         for _i in 0..n {
@@ -523,7 +525,7 @@ mod tests {
                     norm_bytes[2],
                     norm_bytes[3],
                 ]);
-                (dist_table.tq_l2)(q_rot, code_slice, norm)
+                (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
             });
         }
 
@@ -573,13 +575,14 @@ mod tests {
         fwht::fwht(&mut q_rotated[..padded], signs);
 
         // Brute force: compute TQ-ADC distance to every node
+        let codebook = collection.codebook_16();
         let n = graph.num_nodes();
         let mut dists: Vec<(f32, u32)> = (0..n)
             .map(|bfs_pos| {
                 let code = graph.tq_code(bfs_pos, tq_buf);
                 let code_only = &code[..code.len() - 4];
                 let norm = graph.tq_norm(bfs_pos, tq_buf);
-                let d = (dist_table.tq_l2)(&q_rotated, code_only, norm);
+                let d = (dist_table.tq_l2)(&q_rotated, code_only, norm, codebook);
                 let orig_id = graph.to_original(bfs_pos);
                 (d, orig_id)
             })

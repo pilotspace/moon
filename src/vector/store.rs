@@ -10,7 +10,8 @@ use bytes::Bytes;
 use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::mvcc::manager::TransactionManager;
-use crate::vector::segment::SegmentHolder;
+use crate::vector::segment::{SegmentHolder, SegmentList};
+use crate::vector::segment::compaction;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::types::DistanceMetric;
@@ -44,6 +45,63 @@ pub struct VectorIndex {
     pub scratch: SearchScratch,
     pub collection: Arc<CollectionMetadata>,
     pub payload_index: PayloadIndex,
+}
+
+/// Minimum vector count to trigger compaction before search.
+/// Below this threshold, brute-force on mutable segment is fast enough.
+const COMPACT_THRESHOLD: usize = 1000;
+
+impl VectorIndex {
+    /// Compact the mutable segment into an immutable HNSW segment if beneficial.
+    ///
+    /// Triggered lazily on first search when the mutable segment exceeds the
+    /// threshold and no immutable segments exist yet. After compaction, searches
+    /// use HNSW (O(log n)) instead of brute force (O(n)).
+    ///
+    /// This is a blocking operation (builds HNSW graph). For production, this
+    /// should be moved to a background task with async notification.
+    pub fn try_compact(&mut self) {
+        let mutable_len;
+        let has_immutable;
+        {
+            let snapshot = self.segments.load();
+            mutable_len = snapshot.mutable.len();
+            has_immutable = !snapshot.immutable.is_empty();
+        } // drop snapshot guard before freeze/compact
+
+        // Only compact if: enough vectors AND no immutable segments yet
+        if mutable_len < COMPACT_THRESHOLD || has_immutable {
+            return;
+        }
+
+        let frozen = self.segments.load().mutable.freeze();
+        // Use a deterministic seed based on collection ID for reproducibility
+        let seed = self.collection.collection_id.wrapping_mul(6364136223846793005);
+
+        match compaction::compact(&frozen, &self.collection, seed, None) {
+            Ok(immutable) => {
+                // Resize scratch to match new graph size
+                let num_nodes = immutable.graph().num_nodes();
+                let padded = self.collection.padded_dimension;
+                self.scratch = SearchScratch::new(num_nodes, padded);
+
+                // Swap: empty mutable + new immutable
+                let new_list = SegmentList {
+                    mutable: Arc::new(
+                        crate::vector::segment::mutable::MutableSegment::new(
+                            self.meta.dimension,
+                        ),
+                    ),
+                    immutable: vec![Arc::new(immutable)],
+                    ivf: Vec::new(),
+                };
+                self.segments.swap(new_list);
+            }
+            Err(_e) => {
+                // Compaction failed (recall too low, etc.) — fall back to brute force
+            }
+        }
+    }
 }
 
 /// Per-shard store of all vector indexes. Directly owned by shard thread.

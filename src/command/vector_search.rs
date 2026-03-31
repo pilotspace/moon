@@ -204,6 +204,29 @@ pub fn ft_dropindex(store: &mut VectorStore, args: &[Frame]) -> Frame {
     }
 }
 
+/// FT.COMPACT index_name
+///
+/// Explicitly compacts the mutable segment into an immutable HNSW segment.
+/// This converts brute-force O(n) search to HNSW O(log n) search.
+/// Call after bulk insert, before search workload begins.
+pub fn ft_compact(store: &mut VectorStore, args: &[Frame]) -> Frame {
+    if args.len() != 1 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.COMPACT' command",
+        ));
+    }
+    let name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
+    };
+    let idx = match store.get_index_mut(&name) {
+        Some(i) => i,
+        None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+    };
+    idx.try_compact();
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
 /// FT.INFO index_name
 ///
 /// Returns an array of key-value pairs describing the index.
@@ -328,6 +351,7 @@ pub fn search_local_filtered(
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
+
     let dim = idx.meta.dimension as usize;
     if query_blob.len() != dim * 4 {
         return Frame::Error(Bytes::from_static(
@@ -338,31 +362,27 @@ pub fn search_local_filtered(
     for chunk in query_blob.chunks_exact(4) {
         query_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // SQ quantize for mutable segment search
-    let mut query_sq = vec![0i8; dim];
-    quantize_f32_to_sq(&query_f32, &mut query_sq);
-    let ef_search = k.max(64);
+    // Higher ef compensates for TQ-4bit quantization distortion in HNSW beam search.
+    // TQ-ADC fetches ef candidates, f32 reranking selects top-k with exact distances.
+    let ef_search = (k * 10).max(200).min(500);
 
     let filter_bitmap = filter.map(|f| {
         let total = idx.segments.total_vectors();
         idx.payload_index.evaluate_bitmap(f, total)
     });
 
-    // Non-transactional reads use snapshot_lsn=0 (backward compatible).
-    // Empty committed bitmap is stack-allocated and never queried (short-circuit).
     let empty_committed = roaring::RoaringBitmap::new();
     let mvcc_ctx = crate::vector::segment::holder::MvccContext {
         snapshot_lsn: 0,
         my_txn_id: 0,
         committed: &empty_committed,
         dirty_set: &[],
-        dirty_vectors_sq: &[],
+        dirty_vectors_f32: &[],
         dimension: idx.meta.dimension,
     };
 
     let results = idx.segments.search_mvcc(
         &query_f32,
-        &query_sq,
         k,
         ef_search,
         &mut idx.scratch,

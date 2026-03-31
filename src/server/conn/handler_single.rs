@@ -957,6 +957,8 @@ pub async fn handle_connection(
                                         crate::command::vector_search::ft_dropindex(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                         crate::command::vector_search::ft_info(&*store, cmd_args)
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                                        crate::command::vector_search::ft_compact(&mut *store, cmd_args)
                                     } else {
                                         Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                     };
@@ -1045,6 +1047,8 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_search(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                                            crate::command::vector_search::ft_compact(&mut *store, d_args)
                                         } else {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                         };
@@ -1108,6 +1112,8 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_dropindex(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                                            crate::command::vector_search::ft_compact(&mut *store, d_args)
                                         } else {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                         };

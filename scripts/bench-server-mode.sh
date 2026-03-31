@@ -102,8 +102,9 @@ echo "================================================================="
 redis-cli -p "$MOON_PORT" SHUTDOWN NOSAVE 2>/dev/null || true
 sleep 1
 
-# FT.* commands require multi-shard mode (dispatched via SPSC to shard event loops)
-./target/release/moon --port "$MOON_PORT" --shards 2 &
+# Use --shards 1 for correct FT.SEARCH results (multi-shard merge has known issues).
+# Single-shard gives best per-key throughput for non-pipelined workloads anyway.
+./target/release/moon --port "$MOON_PORT" --shards 1 &
 MOON_PID=$!
 echo "  Started Moon server (PID=$MOON_PID)"
 
