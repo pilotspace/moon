@@ -12,8 +12,8 @@ use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 use crate::vector::mvcc::visibility::is_visible;
-use crate::vector::turbo_quant::collection::CollectionMetadata;
-use crate::vector::turbo_quant::encoder::{encode_tq_mse_scaled, padded_dimension};
+use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+use crate::vector::turbo_quant::encoder::{encode_tq_mse_a2, encode_tq_mse_scaled, padded_dimension};
 use crate::vector::turbo_quant::fwht;
 use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
 use crate::vector::types::{SearchResult, VectorId};
@@ -103,7 +103,7 @@ impl MutableSegment {
     /// Create an empty mutable segment.
     pub fn new(dimension: u32, collection: Arc<CollectionMetadata>) -> Self {
         let padded = padded_dimension(dimension);
-        let bytes_per_code = padded as usize / 2 + 4; // nibble-packed + 4 bytes norm
+        let bytes_per_code = collection.code_bytes_per_vector() + 4; // packed codes + 4 bytes norm
         let m = collection.qjl_num_projections.max(1);
         let qjl_bytes_per_vec = m * ((dimension as usize + 7) / 8);
         Self {
@@ -144,9 +144,16 @@ impl MutableSegment {
 
         // Step 1: TQ-MSE encode (fast: O(d log d) via FWHT)
         let signs = self.collection.fwht_sign_flips.as_slice();
-        let boundaries = self.collection.codebook_boundaries_15();
         let mut work_buf = vec![0.0f32; padded];
-        let code = encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf);
+        let code = if self.collection.quantization == QuantizationConfig::TurboQuant4A2 {
+            let a2_cb = crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+                self.collection.padded_dimension,
+            );
+            encode_tq_mse_a2(vector_f32, signs, &a2_cb, &mut work_buf)
+        } else {
+            let boundaries = self.collection.codebook_boundaries_15();
+            encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf)
+        };
 
         // Append packed code + norm to TQ buffer
         inner.tq_codes.extend_from_slice(&code.codes);
@@ -206,14 +213,20 @@ impl MutableSegment {
         let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
         let code_len = bytes_per_code - 4;
-        let centroids = self.collection.codebook_16();
+        // A2 collections don't have a scalar codebook; TQ-ADC not applicable.
+        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+        // Placeholder codebook for A2 (unused in L2 fallback path).
+        let a2_placeholder = [0.0f32; 16];
+        let centroids: &[f32; 16] = if is_a2 { &a2_placeholder } else { self.collection.codebook_16() };
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
         // Prepare FWHT-rotated query for TQ-ADC path (Light mode or fallback)
-        let use_tq_adc = query_state.is_none()
-            || self.collection.build_mode
-                == crate::vector::turbo_quant::collection::BuildMode::Light;
+        // A2 collections always use TQ-ADC with decoded-vector L2 (no scalar ADC).
+        let use_tq_adc = !is_a2
+            && (query_state.is_none()
+                || self.collection.build_mode
+                    == crate::vector::turbo_quant::collection::BuildMode::Light);
         let q_rotated: Vec<f32> = if use_tq_adc {
             let mut buf = vec![0.0f32; padded];
             buf[..dim].copy_from_slice(query_f32);
@@ -296,11 +309,14 @@ impl MutableSegment {
         let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
         let code_len = bytes_per_code - 4;
-        let centroids = self.collection.codebook_16();
+        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+        let a2_placeholder = [0.0f32; 16];
+        let centroids: &[f32; 16] = if is_a2 { &a2_placeholder } else { self.collection.codebook_16() };
 
-        let use_tq_adc = query_state.is_none()
-            || self.collection.build_mode
-                == crate::vector::turbo_quant::collection::BuildMode::Light;
+        let use_tq_adc = !is_a2
+            && (query_state.is_none()
+                || self.collection.build_mode
+                    == crate::vector::turbo_quant::collection::BuildMode::Light);
         let q_rotated: Vec<f32> = if use_tq_adc {
             let mut buf = vec![0.0f32; padded];
             buf[..dim].copy_from_slice(query_f32);
@@ -394,9 +410,16 @@ impl MutableSegment {
         let bytes_per_code = inner.bytes_per_code;
 
         let signs = self.collection.fwht_sign_flips.as_slice();
-        let boundaries = self.collection.codebook_boundaries_15();
         let mut work_buf = vec![0.0f32; padded];
-        let code = encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf);
+        let code = if self.collection.quantization == QuantizationConfig::TurboQuant4A2 {
+            let a2_cb = crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+                self.collection.padded_dimension,
+            );
+            encode_tq_mse_a2(vector_f32, signs, &a2_cb, &mut work_buf)
+        } else {
+            let boundaries = self.collection.codebook_boundaries_15();
+            encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf)
+        };
 
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
@@ -511,7 +534,15 @@ impl MutableSegment {
         let dim = inner.dimension as usize;
         let padded = inner.padded_dimension as usize;
         let signs = self.collection.fwht_sign_flips.as_slice();
-        let centroids = self.collection.codebook_16();
+        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+        let a2_cb = if is_a2 {
+            Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+                self.collection.padded_dimension,
+            ))
+        } else {
+            None
+        };
+        let centroids_opt: Option<&[f32; 16]> = if !is_a2 { Some(self.collection.codebook_16()) } else { None };
         let bytes_per_code = inner.bytes_per_code;
 
         let mut qjl_signs = Vec::new();
@@ -532,13 +563,15 @@ impl MutableSegment {
                 codes: code_slice.to_vec(),
                 norm,
             };
-            let decoded = crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                &tq_code,
-                signs,
-                centroids,
-                dim,
-                &mut work_buf,
-            );
+            let decoded = if is_a2 {
+                crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
+                    &tq_code, signs, a2_cb.as_ref().expect("A2 codebook"), dim, &mut work_buf,
+                )
+            } else {
+                crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+                    &tq_code, signs, centroids_opt.expect("scalar codebook"), dim, &mut work_buf,
+                )
+            };
 
             // Compute residual
             let mut residual = Vec::with_capacity(dim);
@@ -564,7 +597,15 @@ impl MutableSegment {
         let dim = inner.dimension as usize;
         let padded = inner.padded_dimension as usize;
         let signs = self.collection.fwht_sign_flips.as_slice();
-        let centroids = self.collection.codebook_16();
+        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+        let a2_cb = if is_a2 {
+            Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+                self.collection.padded_dimension,
+            ))
+        } else {
+            None
+        };
+        let centroids_opt: Option<&[f32; 16]> = if !is_a2 { Some(self.collection.codebook_16()) } else { None };
         let bytes_per_code = inner.bytes_per_code;
 
         let mut norms = Vec::with_capacity(inner.entries.len());
@@ -583,13 +624,15 @@ impl MutableSegment {
                 codes: code_slice.to_vec(),
                 norm,
             };
-            let decoded = crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                &tq_code,
-                signs,
-                centroids,
-                dim,
-                &mut work_buf,
-            );
+            let decoded = if is_a2 {
+                crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
+                    &tq_code, signs, a2_cb.as_ref().expect("A2 codebook"), dim, &mut work_buf,
+                )
+            } else {
+                crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+                    &tq_code, signs, centroids_opt.expect("scalar codebook"), dim, &mut work_buf,
+                )
+            };
 
             let mut r_norm_sq = 0.0f32;
             for j in 0..dim {

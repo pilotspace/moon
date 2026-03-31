@@ -479,19 +479,71 @@ pub fn compact(
     #[cfg(not(feature = "gpu-cuda"))]
     let need_cpu_build = true;
 
+    let is_a2 = collection.quantization
+        == crate::vector::turbo_quant::collection::QuantizationConfig::TurboQuant4A2;
+    let a2_cb = if is_a2 {
+        Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+            collection.padded_dimension,
+        ))
+    } else {
+        None
+    };
+    let codebook_opt: Option<&[f32; 16]> = if !is_a2 { Some(collection.codebook_16()) } else { None };
+    let _codebook_for_adc: &[f32; 16] = if !is_a2 { collection.codebook_16() } else {
+        &[0.0; 16]
+    };
+    let code_len = bytes_per_code - 4;
+
+    let has_raw = !frozen.raw_f32.is_empty();
+    let dim = frozen.dimension as usize;
+
+    let live_f32: Vec<&[f32]> = if has_raw && need_cpu_build {
+        live_entries
+            .iter()
+            .map(|e| {
+                let start = e.internal_id as usize * dim;
+                &frozen.raw_f32[start..start + dim]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Also decode TQ → centroid for sub-centroid sign computation (needed later).
     let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
-        for i in 0..n {
-            let offset = i * bytes_per_code;
-            let code_slice = &tq_buffer_orig[offset..offset + code_len];
-            let mut q_rot = Vec::with_capacity(padded);
-            for &byte in code_slice {
-                q_rot.push(codebook[(byte & 0x0F) as usize]);
-                q_rot.push(codebook[(byte >> 4) as usize]);
+        if is_a2 {
+            // A2: each nibble is a pair index; decode via A2Codebook
+            let cb = a2_cb.as_ref().expect("A2 codebook required for A2 decode");
+            for i in 0..n {
+                let offset = i * bytes_per_code;
+                let code_slice = &tq_buffer_orig[offset..offset + code_len];
+                let mut q_rot = Vec::with_capacity(padded);
+                for &byte in code_slice {
+                    let (x0, y0) = cb.decode_pair(byte & 0x0F);
+                    let (x1, y1) = cb.decode_pair(byte >> 4);
+                    q_rot.push(x0);
+                    q_rot.push(y0);
+                    q_rot.push(x1);
+                    q_rot.push(y1);
+                }
+                q_rot.truncate(padded);
+                rotated.push(q_rot);
             }
-            q_rot.truncate(padded);
-            rotated.push(q_rot);
+        } else {
+            // Scalar TQ: each nibble is a single-coordinate index
+            let codebook = codebook_opt.expect("scalar codebook required");
+            for i in 0..n {
+                let offset = i * bytes_per_code;
+                let code_slice = &tq_buffer_orig[offset..offset + code_len];
+                let mut q_rot = Vec::with_capacity(padded);
+                for &byte in code_slice {
+                    q_rot.push(codebook[(byte & 0x0F) as usize]);
+                    q_rot.push(codebook[(byte >> 4) as usize]);
+                }
+                q_rot.truncate(padded);
+                rotated.push(q_rot);
+            }
         }
         rotated
     } else {
@@ -514,8 +566,17 @@ pub fn compact(
                     (dist_table.l2_f32)(va, vb)
                 });
             }
+        } else if is_a2 {
+            // A2 fallback: use decoded rotated vectors with L2 (no scalar TQ-ADC for A2)
+            for _i in 0..n {
+                builder.insert(|a: u32, b: u32| {
+                    let ra = &all_rotated[a as usize];
+                    let rb = &all_rotated[b as usize];
+                    (dist_table.l2_f32)(ra, rb)
+                });
+            }
         } else {
-            // Fallback: TQ-ADC pairwise (decoded centroids vs nibble codes)
+            // Scalar TQ fallback: TQ-ADC pairwise (decoded centroids vs nibble codes)
             for _i in 0..n {
                 builder.insert(|a: u32, b: u32| {
                     let q_rot = &all_rotated[a as usize];
@@ -529,7 +590,7 @@ pub fn compact(
                         norm_bytes[2],
                         norm_bytes[3],
                     ]);
-                    (dist_table.tq_l2)(q_rot, code_slice, norm, codebook)
+                    (dist_table.tq_l2)(q_rot, code_slice, norm, codebook_for_adc)
                 });
             }
         }
@@ -613,14 +674,40 @@ pub fn compact(
             let code_offset = bfs_pos * bytes_per_code;
             let code_slice = &tq_bfs[code_offset..code_offset + code_len];
             let sign_offset = bfs_pos * sub_bpv;
-            for j in 0..code_slice.len() {
-                let byte = code_slice[j];
-                let qi = j * 2;
-                if work[qi] >= codebook[(byte & 0x0F) as usize] {
-                    sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+
+            if is_a2 {
+                // A2: each nibble is a pair index, decode via A2Codebook
+                let cb = a2_cb.as_ref().expect("A2 codebook");
+                for j in 0..code_slice.len() {
+                    let byte = code_slice[j];
+                    let qi = j * 4; // each byte = 2 pairs = 4 coordinates
+                    let (x0, y0) = cb.decode_pair(byte & 0x0F);
+                    let (x1, y1) = cb.decode_pair(byte >> 4);
+                    if qi < padded && work[qi] >= x0 {
+                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                    }
+                    if qi + 1 < padded && work[qi + 1] >= y0 {
+                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                    }
+                    if qi + 2 < padded && work[qi + 2] >= x1 {
+                        sub_signs_bfs[sign_offset + (qi + 2) / 8] |= 1 << ((qi + 2) % 8);
+                    }
+                    if qi + 3 < padded && work[qi + 3] >= y1 {
+                        sub_signs_bfs[sign_offset + (qi + 3) / 8] |= 1 << ((qi + 3) % 8);
+                    }
                 }
-                if work[qi + 1] >= codebook[(byte >> 4) as usize] {
-                    sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+            } else {
+                // Scalar TQ: each nibble is a single-coordinate index
+                let codebook = codebook_opt.expect("scalar codebook");
+                for j in 0..code_slice.len() {
+                    let byte = code_slice[j];
+                    let qi = j * 2;
+                    if work[qi] >= codebook[(byte & 0x0F) as usize] {
+                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                    }
+                    if work[qi + 1] >= codebook[(byte >> 4) as usize] {
+                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                    }
                 }
             }
         }
@@ -632,14 +719,40 @@ pub fn compact(
             if bfs_pos < all_rotated.len() {
                 let rotated = &all_rotated[bfs_pos];
                 let sign_offset = bfs_pos * sub_bpv;
-                for j in 0..code_slice.len() {
-                    let byte = code_slice[j];
-                    let qi = j * 2;
-                    if qi < rotated.len() && rotated[qi] >= codebook[(byte & 0x0F) as usize] {
-                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                if is_a2 {
+                    // A2 fallback: compare against decoded pair centroids
+                    let cb = a2_cb.as_ref().expect("A2 codebook");
+                    for j in 0..code_slice.len() {
+                        let byte = code_slice[j];
+                        let qi = j * 4;
+                        let (x0, y0) = cb.decode_pair(byte & 0x0F);
+                        let (x1, y1) = cb.decode_pair(byte >> 4);
+                        if qi < rotated.len() && rotated[qi] >= x0 {
+                            sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                        }
+                        if qi + 1 < rotated.len() && rotated[qi + 1] >= y0 {
+                            sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                        }
+                        if qi + 2 < rotated.len() && rotated[qi + 2] >= x1 {
+                            sub_signs_bfs[sign_offset + (qi + 2) / 8] |= 1 << ((qi + 2) % 8);
+                        }
+                        if qi + 3 < rotated.len() && rotated[qi + 3] >= y1 {
+                            sub_signs_bfs[sign_offset + (qi + 3) / 8] |= 1 << ((qi + 3) % 8);
+                        }
                     }
-                    if qi + 1 < rotated.len() && rotated[qi + 1] >= codebook[(byte >> 4) as usize] {
-                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                } else {
+                    let codebook = codebook_opt.expect("scalar codebook");
+                    for j in 0..code_slice.len() {
+                        let byte = code_slice[j];
+                        let qi = j * 2;
+                        if qi < rotated.len() && rotated[qi] >= codebook[(byte & 0x0F) as usize] {
+                            sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                        }
+                        if qi + 1 < rotated.len()
+                            && rotated[qi + 1] >= codebook[(byte >> 4) as usize]
+                        {
+                            sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                        }
                     }
                 }
             }
