@@ -17,6 +17,47 @@ fn main() {
             println!("cargo:rustc-cfg=cuda_12_plus");
         }
     }
+
+    #[cfg(feature = "gpu-cuda")]
+    compile_cuda_kernels();
+}
+
+/// Compile CUDA kernel sources (.cu) to PTX via nvcc.
+///
+/// When nvcc is not available or compilation fails, a placeholder PTX file
+/// is written so that `include_str!` in the Rust source still compiles.
+/// The runtime detects the placeholder and returns `CudaNotAvailable`.
+#[cfg(feature = "gpu-cuda")]
+fn compile_cuda_kernels() {
+    let kernel_src = "src/gpu/kernels/turbo_quant_wht.cu";
+    println!("cargo:rerun-if-changed={kernel_src}");
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let ptx_path = format!("{out_dir}/turbo_quant_wht.ptx");
+
+    let status = Command::new("nvcc")
+        .args([
+            "-ptx",
+            "-arch=sm_70",
+            "-O3",
+            "--use_fast_math",
+            "-o",
+            &ptx_path,
+            kernel_src,
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            // Graceful fallback: placeholder PTX so include_str! compiles.
+            // Runtime detects this prefix and returns CudaNotAvailable.
+            std::fs::write(&ptx_path, "// nvcc not available").ok();
+            println!(
+                "cargo:warning=nvcc not found or PTX compilation failed; GPU FWHT disabled at runtime"
+            );
+        }
+    }
 }
 
 /// Attempt to detect CUDA toolkit version by running `nvcc --version`.
