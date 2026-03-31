@@ -149,7 +149,7 @@ impl ImmutableSegment {
         // Precompute query state: M × S_m*y (O(M*d²)) + q_rotated (O(d log d))
         let query_state = prepare_query_prod(
             query,
-            &self.collection_meta.qjl_matrices,
+            &self.collection_meta.qjl_diagonals,
             self.collection_meta.fwht_sign_flips.as_slice(),
             padded,
         );

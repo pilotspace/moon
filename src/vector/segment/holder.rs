@@ -123,10 +123,10 @@ impl SegmentHolder {
         // Prepare TurboQuant_prod query state for mutable segment search.
         // Precomputes S*y (O(d²)) + q_rotated (O(d log d)), reused across all candidates.
         let collection = snapshot.mutable.collection();
-        let query_state = if !collection.qjl_matrices.is_empty() {
+        let query_state = if !collection.qjl_diagonals.is_empty() {
             crate::vector::turbo_quant::inner_product::prepare_query_prod(
                 query_f32,
-                &collection.qjl_matrices,
+                &collection.qjl_diagonals,
                 collection.fwht_sign_flips.as_slice(),
                 collection.padded_dimension as usize,
             )
@@ -264,9 +264,9 @@ impl SegmentHolder {
 
         // Prepare TurboQuant_prod query state for mutable search.
         let collection = snapshot.mutable.collection();
-        let query_state = if !collection.qjl_matrices.is_empty() {
+        let query_state = if !collection.qjl_diagonals.is_empty() {
             crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                query_f32, &collection.qjl_matrices,
+                query_f32, &collection.qjl_diagonals,
                 collection.fwht_sign_flips.as_slice(),
                 collection.padded_dimension as usize,
             )

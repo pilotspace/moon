@@ -157,13 +157,29 @@ impl MutableSegment {
         let residual_norm = r_norm_sq.sqrt();
         inner.residual_norms.push(residual_norm);
 
-        // Step 3: QJL encode residual → M sign vectors
-        let qjl_bpv = inner.qjl_bytes_per_vec;
-        for qjl_matrix in &self.collection.qjl_matrices {
-            let qjl_signs = super::super::turbo_quant::qjl::qjl_encode(qjl_matrix, &residual, dim);
-            inner.qjl_signs.extend_from_slice(&qjl_signs);
+        // Step 3: QJL encode residual → M sign vectors via SRHT
+        // S_m · r = FWHT(D_m · r), then sign() — O(M × d log d) total
+        let single_qjl_bpv = (dim + 7) / 8;
+        for diag in &self.collection.qjl_diagonals {
+            // Apply diagonal: D_m · residual
+            let mut buf = vec![0.0f32; padded];
+            for i in 0..dim {
+                buf[i] = residual[i] * diag[i];
+            }
+            // FWHT
+            super::super::turbo_quant::fwht::fwht_scalar(&mut buf);
+            super::super::turbo_quant::fwht::normalize_fwht(&mut buf);
+            // Sign-encode first dim elements
+            let mut sign_bytes = vec![0u8; single_qjl_bpv];
+            for row in 0..dim {
+                if buf[row] >= 0.0 {
+                    sign_bytes[row / 8] |= 1 << (row % 8);
+                }
+            }
+            inner.qjl_signs.extend_from_slice(&sign_bytes);
         }
-        if self.collection.qjl_matrices.is_empty() {
+        if self.collection.qjl_diagonals.is_empty() {
+            let qjl_bpv = inner.qjl_bytes_per_vec;
             inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
         }
 
@@ -350,12 +366,24 @@ impl MutableSegment {
         }
         inner.residual_norms.push(r_norm_sq.sqrt());
 
-        let qjl_bpv = inner.qjl_bytes_per_vec;
-        for qjl_matrix in &self.collection.qjl_matrices {
-            let qjl_signs = super::super::turbo_quant::qjl::qjl_encode(qjl_matrix, &residual, dim);
-            inner.qjl_signs.extend_from_slice(&qjl_signs);
+        let single_qjl_bpv = (dim + 7) / 8;
+        for diag in &self.collection.qjl_diagonals {
+            let mut buf = vec![0.0f32; padded];
+            for i in 0..dim {
+                buf[i] = residual[i] * diag[i];
+            }
+            super::super::turbo_quant::fwht::fwht_scalar(&mut buf);
+            super::super::turbo_quant::fwht::normalize_fwht(&mut buf);
+            let mut sign_bytes = vec![0u8; single_qjl_bpv];
+            for row in 0..dim {
+                if buf[row] >= 0.0 {
+                    sign_bytes[row / 8] |= 1 << (row % 8);
+                }
+            }
+            inner.qjl_signs.extend_from_slice(&sign_bytes);
         }
-        if self.collection.qjl_matrices.is_empty() {
+        if self.collection.qjl_diagonals.is_empty() {
+            let qjl_bpv = inner.qjl_bytes_per_vec;
             inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
         }
 
@@ -474,7 +502,7 @@ mod tests {
     fn make_query_state(query: &[f32], col: &CollectionMetadata) -> crate::vector::turbo_quant::inner_product::TqProdQueryState {
         crate::vector::turbo_quant::inner_product::prepare_query_prod(
             query,
-            &col.qjl_matrices,
+            &col.qjl_diagonals,
             col.fwht_sign_flips.as_slice(),
             col.padded_dimension as usize,
         )

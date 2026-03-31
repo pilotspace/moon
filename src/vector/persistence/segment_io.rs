@@ -217,16 +217,23 @@ pub fn read_immutable_segment(
     let codebook = meta.codebook.clone();
     let boundaries = meta.codebook_boundaries.clone();
 
-    // Reconstruct QJL matrices from deterministic seeds.
+    // Reconstruct QJL diagonal signs from deterministic seeds.
     const QJL_NUM_PROJECTIONS: usize = 4;
-    let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
-        let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
-            .map(|m| crate::vector::turbo_quant::qjl::generate_qjl_matrix(
-                meta.dimension as usize,
-                meta.collection_id.wrapping_add(1 + m as u64),
-            ))
+    let padded_for_qjl = crate::vector::turbo_quant::encoder::padded_dimension(meta.dimension);
+    let (qjl_diagonals, qjl_num_projections) = if quantization.is_turbo_quant() {
+        let diags: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
+            .map(|m| {
+                let mut diag = vec![0.0f32; padded_for_qjl as usize];
+                let mut rng_state = meta.collection_id.wrapping_add(100 + m as u64);
+                for val in diag.iter_mut() {
+                    rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
+                }
+                diag
+            })
             .collect();
-        (matrices, QJL_NUM_PROJECTIONS)
+        (diags, QJL_NUM_PROJECTIONS)
     } else {
         (Vec::new(), 0)
     };
@@ -243,7 +250,7 @@ pub fn read_immutable_segment(
         codebook: codebook.clone(),
         codebook_boundaries: boundaries.clone(),
         metadata_checksum: meta.metadata_checksum,
-        qjl_matrices,
+        qjl_diagonals,
         qjl_num_projections,
     };
 

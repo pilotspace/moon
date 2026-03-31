@@ -72,11 +72,16 @@ pub struct CollectionMetadata {
     /// XXHash64 of all fields above. Verified at load and search init.
     pub metadata_checksum: u64,
 
-    /// QJL projection matrices for TurboQuant_prod unbiased inner product scoring.
-    /// M independent d×d Gaussian matrices. M=4 gives 91% recall, M=8 gives 95%.
-    /// Memory: M * dim² * 4 bytes (e.g., M=4 × 768² × 4 = 9 MB for dim=768).
-    /// NOT included in metadata_checksum (derived deterministically from seed).
-    pub qjl_matrices: Vec<Vec<f32>>,
+    /// QJL projection sign flips for structured random projections (SRHT).
+    ///
+    /// Instead of dense d×d Gaussian matrices (O(d²) storage + compute),
+    /// use S_m = FWHT · D_m where D_m = diag(±1). This gives O(d log d)
+    /// projection via S_m · x = FWHT(D_m · x).
+    ///
+    /// M independent diagonal sign vectors (M × padded_dim elements).
+    /// Memory: M × padded_dim × 4 bytes (e.g., M=4 × 1024 × 4 = 16 KB at 768d).
+    /// Compare: dense Gaussian would be M × d² × 4 = 9 MB.
+    pub qjl_diagonals: Vec<Vec<f32>>,
     /// Number of QJL projections (M). Higher M = lower variance = better recall.
     pub qjl_num_projections: usize,
 }
@@ -121,21 +126,25 @@ impl CollectionMetadata {
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
-        // Generate M QJL matrices for TurboQuant_prod variance reduction.
-        // M=4 gives 91% recall at 768d, M=8 gives 95%. Default M=4 balances
-        // memory (9 MB at 768d) vs recall quality.
-        // Each matrix uses seed+1+m to ensure independence.
+        // Generate M diagonal sign vectors for structured QJL projections (SRHT).
+        // S_m · x = FWHT(D_m · x), where D_m = diag(qjl_diagonals[m]).
+        // O(d log d) per projection instead of O(d²) with dense Gaussian.
+        // M=4 gives ~91% recall. Memory: M × padded_dim × 4 bytes (16 KB at 768d).
         const QJL_NUM_PROJECTIONS: usize = 4;
-        let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
-            let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
+        let (qjl_diagonals, qjl_num_projections) = if quantization.is_turbo_quant() {
+            let diags: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
                 .map(|m| {
-                    super::qjl::generate_qjl_matrix(
-                        dimension as usize,
-                        seed.wrapping_add(1 + m as u64),
-                    )
+                    let mut diag = vec![0.0f32; padded as usize];
+                    let mut rng_state = seed.wrapping_add(100 + m as u64);
+                    for val in diag.iter_mut() {
+                        rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
+                    }
+                    diag
                 })
                 .collect();
-            (matrices, QJL_NUM_PROJECTIONS)
+            (diags, QJL_NUM_PROJECTIONS)
         } else {
             (Vec::new(), 0)
         };
@@ -161,7 +170,7 @@ impl CollectionMetadata {
                 Vec::new()
             },
             metadata_checksum: 0, // computed below
-            qjl_matrices,
+            qjl_diagonals,
             qjl_num_projections,
         };
         meta.metadata_checksum = meta.compute_checksum();
