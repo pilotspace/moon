@@ -28,6 +28,7 @@ const MIN_RECALL: f32 = 0.95;
 const VACUUM_DEAD_THRESHOLD: f32 = 0.20;
 const HNSW_M: u8 = 16;
 const HNSW_EF_CONSTRUCTION: u16 = 200;
+const PARALLEL_THRESHOLD: usize = 10_000;
 
 #[derive(Debug)]
 pub enum CompactionError {
@@ -49,6 +50,35 @@ impl std::fmt::Display for CompactionError {
             Self::PersistFailed(msg) => write!(f, "persist failed: {msg}"),
         }
     }
+}
+
+/// Assign vectors to spatial cells based on first two f32 coordinates.
+/// Returns a vector of cells, where each cell contains the indices of its member vectors.
+fn assign_to_cells(vectors: &[&[f32]], num_cells: usize) -> Vec<Vec<usize>> {
+    let _ = (vectors, num_cells);
+    todo!("assign_to_cells not yet implemented")
+}
+
+/// Build HNSW sub-graphs per cell in parallel, then stitch into unified graph.
+fn compact_parallel(
+    live_f32: &[&[f32]],
+    _tq_buffer: &[u8],
+    bytes_per_code: usize,
+    _dim: usize,
+    seed: u64,
+) -> crate::vector::hnsw::graph::HnswGraph {
+    let _ = (live_f32, bytes_per_code, seed);
+    todo!("compact_parallel not yet implemented")
+}
+
+/// Stitch sub-graphs into a unified HnswGraph with cross-cell boundary edges.
+fn stitch_subgraphs(
+    sub_graphs: &[(crate::vector::hnsw::graph::HnswGraph, Vec<usize>)],
+    live_f32: &[&[f32]],
+    bytes_per_code: usize,
+) -> crate::vector::hnsw::graph::HnswGraph {
+    let _ = (sub_graphs, live_f32, bytes_per_code);
+    todo!("stitch_subgraphs not yet implemented")
 }
 
 /// Convert a frozen mutable segment into an optimized immutable segment.
@@ -585,5 +615,206 @@ mod tests {
             result.err()
         );
         assert_eq!(result.unwrap().live_count(), 100);
+    }
+
+    // ── Cell-parallel compaction tests ──────────────────────────────
+
+    /// Brute-force k-NN oracle: compute L2 distance from query to all vectors,
+    /// return top-k IDs sorted by ascending distance.
+    fn brute_force_knn(query: &[f32], all_vectors: &[&[f32]], k: usize) -> Vec<u32> {
+        let mut dists: Vec<(f32, u32)> = all_vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                (d, i as u32)
+            })
+            .collect();
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.iter().take(k).map(|(_, id)| *id).collect()
+    }
+
+    #[test]
+    fn test_assign_to_cells_partitions_all_vectors() {
+        let dim = 64;
+        let vecs_owned: Vec<Vec<f32>> = (0..200)
+            .map(|i| lcg_f32(dim, (i * 7 + 13) as u32))
+            .collect();
+        let vecs: Vec<&[f32]> = vecs_owned.iter().map(|v| v.as_slice()).collect();
+
+        let cells = assign_to_cells(&vecs, 4);
+
+        // Every vector index must appear exactly once across all cells
+        let mut all_indices: Vec<usize> = cells.iter().flat_map(|c| c.iter().copied()).collect();
+        all_indices.sort();
+        let expected: Vec<usize> = (0..200).collect();
+        assert_eq!(all_indices, expected, "all vectors must be assigned to exactly one cell");
+    }
+
+    #[test]
+    fn test_parallel_compact_bfs_reaches_all() {
+        distance::init();
+        let dim = 64;
+        let n = 500;
+        let vecs_owned: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+                normalize(&mut v);
+                v
+            })
+            .collect();
+        let vecs: Vec<&[f32]> = vecs_owned.iter().map(|v| v.as_slice()).collect();
+
+        // Dummy TQ buffer (not used for graph topology, just sizing)
+        let bytes_per_code = 36; // padded_dim/2 + 4 for 64d -> padded 64 -> 32+4
+        let tq_buffer = vec![0u8; n * bytes_per_code];
+
+        let graph = compact_parallel(&vecs, &tq_buffer, bytes_per_code, dim, 12345);
+
+        assert_eq!(graph.num_nodes(), n as u32);
+
+        // BFS from entry point should reach all nodes
+        let mut visited = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(graph.entry_point());
+        visited[graph.entry_point() as usize] = true;
+        let mut count = 1usize;
+
+        while let Some(pos) = queue.pop_front() {
+            let neighbors = graph.neighbors_l0(pos);
+            for &nb in neighbors {
+                if nb == crate::vector::hnsw::graph::SENTINEL {
+                    break;
+                }
+                if !visited[nb as usize] {
+                    visited[nb as usize] = true;
+                    count += 1;
+                    queue.push_back(nb);
+                }
+            }
+        }
+
+        assert_eq!(count, n, "BFS from entry must reach all {} nodes, only reached {}", n, count);
+    }
+
+    #[test]
+    fn test_compact_parallel_recall() {
+        distance::init();
+        let dim = 64;
+        let n = 1000;
+        let vecs_owned: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+                normalize(&mut v);
+                v
+            })
+            .collect();
+        let vecs: Vec<&[f32]> = vecs_owned.iter().map(|v| v.as_slice()).collect();
+
+        let bytes_per_code = 36;
+        let tq_buffer = vec![0u8; n * bytes_per_code];
+
+        let graph = compact_parallel(&vecs, &tq_buffer, bytes_per_code, dim, 42);
+
+        // Measure recall@10 using brute-force L2 oracle
+        let k = 10;
+        let num_queries = 100;
+        let dist_table = crate::vector::distance::table();
+        let mut total_recall = 0.0f64;
+
+        for qi in 0..num_queries {
+            let query_idx = qi * (n / num_queries);
+            let query = vecs[query_idx];
+            let gt = brute_force_knn(query, &vecs, k);
+
+            // Search the graph using beam search on layer 0
+            let hnsw_results = crate::vector::hnsw::search_sq::hnsw_search_f32(
+                &graph,
+                &vecs_owned.iter().map(|v| v.as_slice()).collect::<Vec<_>>()
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(_, v)| v.iter().copied())
+                    .collect::<Vec<f32>>(),
+                dim,
+                query,
+                k,
+                128,
+                None,
+            );
+
+            // Map BFS positions back to original IDs for comparison
+            let result_ids: std::collections::HashSet<u32> =
+                hnsw_results.iter().map(|r| r.id.0).collect();
+            let gt_set: std::collections::HashSet<u32> = gt.into_iter().collect();
+            let hits = result_ids.intersection(&gt_set).count();
+            total_recall += hits as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / num_queries as f64;
+        assert!(
+            avg_recall >= 0.90,
+            "recall@10 should be >= 0.90, got {:.4}",
+            avg_recall
+        );
+    }
+
+    #[test]
+    fn test_stitch_cross_cell_edges() {
+        distance::init();
+        let dim = 64;
+        let n = 200;
+        let vecs_owned: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+                normalize(&mut v);
+                v
+            })
+            .collect();
+        let vecs: Vec<&[f32]> = vecs_owned.iter().map(|v| v.as_slice()).collect();
+
+        let cells = assign_to_cells(&vecs, 4);
+
+        // Build sub-graphs per cell
+        let dist_table = crate::vector::distance::table();
+        let mut sub_graphs: Vec<(crate::vector::hnsw::graph::HnswGraph, Vec<usize>)> = Vec::new();
+
+        for cell in &cells {
+            if cell.is_empty() {
+                continue;
+            }
+            let cell_vecs: Vec<&[f32]> = cell.iter().map(|&idx| vecs[idx]).collect();
+            let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, 42);
+            for _ in 0..cell_vecs.len() {
+                builder.insert(|a: u32, b: u32| {
+                    (dist_table.l2_f32)(cell_vecs[a as usize], cell_vecs[b as usize])
+                });
+            }
+            let graph = builder.build(36);
+            sub_graphs.push((graph, cell.clone()));
+        }
+
+        let stitched = stitch_subgraphs(&sub_graphs, &vecs, 36);
+
+        // Verify stitching produced a connected graph
+        let mut visited = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(stitched.entry_point());
+        visited[stitched.entry_point() as usize] = true;
+        let mut count = 1usize;
+
+        while let Some(pos) = queue.pop_front() {
+            for &nb in stitched.neighbors_l0(pos) {
+                if nb == crate::vector::hnsw::graph::SENTINEL {
+                    break;
+                }
+                if !visited[nb as usize] {
+                    visited[nb as usize] = true;
+                    count += 1;
+                    queue.push_back(nb);
+                }
+            }
+        }
+
+        assert_eq!(count, n, "stitched graph must be fully connected, only reached {}/{}", count, n);
     }
 }
