@@ -119,9 +119,11 @@ impl CollectionMetadata {
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
-        // Generate QJL matrix only for inner-product quantization mode.
+        // Generate QJL matrix for all TQ variants — used for TurboQuant_prod
+        // unbiased inner product scoring in L2 search (not just IP mode).
         // Uses seed+1 to avoid collision with sign flip seed.
-        let qjl_matrix = if quantization == QuantizationConfig::TurboQuantProd4 {
+        // Memory: dim² × 4 bytes (e.g., 2.25 MB for dim=768).
+        let qjl_matrix = if quantization.is_turbo_quant() {
             Some(super::qjl::generate_qjl_matrix(dimension as usize, seed.wrapping_add(1)))
         } else {
             None

@@ -310,11 +310,14 @@ pub fn read_immutable_segment(
     }
 
     // 6. Construct ImmutableSegment
+    let dim = meta.dimension as usize;
+    let qjl_bpv = (dim + 7) / 8;
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
-        vectors_sq,
-        vectors_f32,
+        Vec::new(), // QJL signs — not persisted yet
+        Vec::new(), // residual norms — not persisted yet
+        qjl_bpv,
         mvcc,
         collection.clone(),
         meta.live_count,
@@ -413,18 +416,16 @@ mod tests {
         let graph = builder.build(bytes_per_code as u32);
 
         let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
-        let mut sq_bfs = vec![0i8; n * dim];
-        let mut f32_bfs = vec![0.0f32; n * dim];
+        let qjl_bytes_per_vec = (dim + 7) / 8;
+        let mut qjl_signs_bfs = vec![0u8; n * qjl_bytes_per_vec];
+        let mut residual_norms_bfs = vec![0.0f32; n];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
             let src = orig_id * bytes_per_code;
             let dst = bfs_pos * bytes_per_code;
             tq_buffer_bfs[dst..dst + bytes_per_code]
                 .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
-            let sq_src = orig_id * dim;
-            let sq_dst = bfs_pos * dim;
-            sq_bfs[sq_dst..sq_dst + dim].copy_from_slice(&sq_vectors[sq_src..sq_src + dim]);
-            f32_bfs[sq_dst..sq_dst + dim].copy_from_slice(&vectors[orig_id]);
+            // QJL signs and residual norms: use zeros for test
         }
 
         let mvcc: Vec<MvccHeader> = (0..n as u32)
@@ -438,8 +439,9 @@ mod tests {
         let segment = ImmutableSegment::new(
             graph,
             AlignedBuffer::from_vec(tq_buffer_bfs),
-            AlignedBuffer::from_vec(sq_bfs),
-            AlignedBuffer::from_vec(f32_bfs),
+            qjl_signs_bfs,
+            residual_norms_bfs,
+            qjl_bytes_per_vec,
             mvcc,
             collection.clone(),
             n as u32,

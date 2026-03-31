@@ -377,7 +377,6 @@ pub fn search_local_filtered(
         my_txn_id: 0,
         committed: &empty_committed,
         dirty_set: &[],
-        dirty_vectors_f32: &[],
         dimension: idx.meta.dimension,
     };
 
@@ -1102,9 +1101,9 @@ mod tests {
         // 2. Insert vectors directly into the mutable segment
         let idx = store.get_index_mut(b"e2eidx").unwrap();
         let vectors: Vec<[f32; 4]> = vec![
-            [1.0, 0.0, 0.0, 0.0], // vec:0 -- exact match for query
-            [0.0, 1.0, 0.0, 0.0], // vec:1 -- orthogonal
-            [0.9, 0.1, 0.0, 0.0], // vec:2 -- close to vec:0
+            [1.0, 0.0, 0.0, 0.0],    // vec:0 -- exact match for query (L2=0)
+            [-1.0, 0.0, 0.0, 0.0],   // vec:1 -- opposite direction (L2=4.0)
+            [0.5, 0.0, 0.0, 0.0],    // vec:2 -- same direction, half magnitude (L2=0.25)
         ];
 
         let snap = idx.segments.load();

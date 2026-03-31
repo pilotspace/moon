@@ -70,14 +70,11 @@ pub fn compact(
 
     // ── Step 1: Filter dead entries ──────────────────────────────────
     let mut live_entries = Vec::new();
-    let mut live_f32_vecs: Vec<f32> = Vec::new();
 
     for entry in &frozen.entries {
         if entry.delete_lsn != 0 {
             continue;
         }
-        let offset = entry.internal_id as usize * dim;
-        live_f32_vecs.extend_from_slice(&frozen.vectors_f32[offset..offset + dim]);
         live_entries.push(entry);
     }
 
@@ -190,13 +187,25 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // BFS reorder f32 vectors for immutable segment reranking.
-    let mut f32_bfs = vec![0.0f32; n * dim];
+    // BFS reorder QJL signs and residual norms for TurboQuant_prod reranking.
+    let qjl_bpv = frozen.qjl_bytes_per_vec;
+    let mut qjl_signs_bfs = vec![0u8; n * qjl_bpv];
+    let mut residual_norms_bfs = vec![0.0f32; n];
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        let src = orig_id * dim;
-        let dst = bfs_pos * dim;
-        f32_bfs[dst..dst + dim].copy_from_slice(&live_f32_vecs[src..src + dim]);
+        // Map orig_id back to live_entries index
+        let live_idx = live_entries.iter().position(|e| e.internal_id as usize == orig_id).unwrap_or(orig_id);
+        // QJL signs
+        let src_qjl = live_idx * qjl_bpv;
+        let dst_qjl = bfs_pos * qjl_bpv;
+        if src_qjl + qjl_bpv <= frozen.qjl_signs.len() {
+            qjl_signs_bfs[dst_qjl..dst_qjl + qjl_bpv]
+                .copy_from_slice(&frozen.qjl_signs[src_qjl..src_qjl + qjl_bpv]);
+        }
+        // Residual norms
+        if live_idx < frozen.residual_norms.len() {
+            residual_norms_bfs[bfs_pos] = frozen.residual_norms[live_idx];
+        }
     }
 
     // ── Step 5: Create ImmutableSegment ─────────────────────────────
@@ -218,8 +227,9 @@ pub fn compact(
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        AlignedBuffer::new(0), // SQ8 not stored
-        AlignedBuffer::from_vec(f32_bfs), // f32 for reranking
+        qjl_signs_bfs,
+        residual_norms_bfs,
+        qjl_bpv,
         mvcc,
         collection.clone(),
         live_count,

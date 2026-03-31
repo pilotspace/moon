@@ -128,6 +128,123 @@ pub fn score_inner_product(
     dot_mse + scale * code.residual_norm * dot_qjl
 }
 
+// ── Optimized scoring for HNSW search ────────────────────────────────
+
+/// Precomputed query projection for TurboQuant_prod scoring.
+///
+/// Computed once per query, reused across all candidates. Avoids O(d²)
+/// matrix-vector multiply per candidate.
+pub struct TqProdQueryState {
+    /// S * y (d elements): query projected through QJL matrix.
+    pub s_y: Vec<f32>,
+    /// <q, x_mse> helper: q_rotated values (padded_dim elements).
+    /// Used to compute Term 1 in rotated space: norm * Σ q_rot[i] * centroids[code[i]]
+    pub q_rotated: Vec<f32>,
+    /// ||query||² — constant term for L2 conversion.
+    pub q_norm_sq: f32,
+}
+
+/// Precompute query state for TurboQuant_prod scoring.
+///
+/// `query`: raw f32 query (dim elements).
+/// `qjl_matrix`: d × d Gaussian matrix (row-major).
+/// `sign_flips`: FWHT sign flips (padded_dim elements).
+///
+/// Cost: O(d²) for S*y + O(d log d) for FWHT rotation. Done once per query.
+pub fn prepare_query_prod(
+    query: &[f32],
+    qjl_matrix: &[f32],
+    sign_flips: &[f32],
+    padded_dim: usize,
+) -> TqProdQueryState {
+    let dim = query.len();
+
+    // 1. Compute S * y (O(d²))
+    let mut s_y = vec![0.0f32; dim];
+    for row in 0..dim {
+        let row_start = row * dim;
+        let mut dot = 0.0f32;
+        for col in 0..dim {
+            dot += qjl_matrix[row_start + col] * query[col];
+        }
+        s_y[row] = dot;
+    }
+
+    // 2. Compute FWHT-rotated query (same as TQ-ADC path)
+    let mut q_rotated = vec![0.0f32; padded_dim];
+    q_rotated[..dim].copy_from_slice(query);
+    let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
+    let q_norm = q_norm_sq.sqrt();
+    if q_norm > 0.0 {
+        let inv = 1.0 / q_norm;
+        for v in q_rotated[..dim].iter_mut() {
+            *v *= inv;
+        }
+    }
+    super::fwht::fwht(&mut q_rotated[..padded_dim], sign_flips);
+
+    TqProdQueryState {
+        s_y,
+        q_rotated,
+        q_norm_sq,
+    }
+}
+
+/// Score L2 distance using TurboQuant_prod estimator (unbiased).
+///
+/// `||q - x||² ≈ ||q||² + ||x||² - 2 * <q, x>_prod`
+///
+/// where `<q, x>_prod = <q, x_mse> + sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>`
+///
+/// Term 1 (`<q, x_mse>`): computed in rotated space as
+///   `norm * Σ q_rot[i] * centroids[code[i]]` — O(padded_dim), no inverse FWHT.
+///
+/// Term 2 (QJL correction): `<S*y, sign(S*r)>` — O(dim) dot with sign bits.
+///   S*y is precomputed in TqProdQueryState.
+///
+/// Total per-candidate cost: O(padded_dim) — same as TQ-ADC.
+#[inline]
+pub fn score_l2_prod(
+    state: &TqProdQueryState,
+    tq_code: &[u8],      // nibble-packed TQ codes (padded_dim/2 bytes)
+    norm: f32,            // ||x|| stored with code
+    qjl_signs: &[u8],    // ceil(dim/8) sign bits
+    residual_norm: f32,   // ||r|| stored with code
+    centroids: &[f32; 16],
+    dim: usize,
+) -> f32 {
+    // Term 1: <q, x_mse> in rotated space
+    // = norm * Σᵢ q_rot[i] * centroids[code[i]]
+    let mut dot_mse = 0.0f32;
+    for (j, &byte) in tq_code.iter().enumerate() {
+        let lo_idx = (byte & 0x0F) as usize;
+        let hi_idx = (byte >> 4) as usize;
+        dot_mse += state.q_rotated[j * 2] * centroids[lo_idx];
+        dot_mse += state.q_rotated[j * 2 + 1] * centroids[hi_idx];
+    }
+    dot_mse *= norm;
+
+    // Term 2: QJL correction
+    // = sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
+    let mut dot_qjl = 0.0f32;
+    for row in 0..dim {
+        let sign_val = if qjl_signs[row / 8] & (1 << (row % 8)) != 0 {
+            1.0f32
+        } else {
+            -1.0f32
+        };
+        dot_qjl += state.s_y[row] * sign_val;
+    }
+
+    let scale = (std::f32::consts::PI / 2.0).sqrt() / dim as f32;
+    let ip_estimate = dot_mse + scale * residual_norm * dot_qjl;
+
+    // L2 distance from inner product:
+    // ||q - x||² = ||q||² + ||x||² - 2<q, x>
+    let x_norm_sq = norm * norm;
+    state.q_norm_sq + x_norm_sq - 2.0 * ip_estimate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
