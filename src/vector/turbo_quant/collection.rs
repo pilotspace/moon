@@ -37,6 +37,11 @@ pub enum QuantizationConfig {
     TurboQuant1 = 3,
     TurboQuant2 = 4,
     TurboQuant3 = 5,
+    /// Hexagonal A2 lattice quantization: 4 bits per dimension pair.
+    /// Pairs consecutive FWHT-rotated coordinates and jointly quantizes
+    /// to one of 16 A2 lattice cells. 2x more compressed than scalar TQ4,
+    /// with better quality than scalar TQ2 thanks to hexagonal advantage.
+    TurboQuant4A2 = 6,
 }
 
 impl QuantizationConfig {
@@ -47,7 +52,7 @@ impl QuantizationConfig {
             Self::TurboQuant1 => 1,
             Self::TurboQuant2 => 2,
             Self::TurboQuant3 => 3,
-            Self::TurboQuant4 | Self::TurboQuantProd4 => 4,
+            Self::TurboQuant4 | Self::TurboQuantProd4 | Self::TurboQuant4A2 => 4,
             Self::Sq8 => 8,
         }
     }
@@ -62,6 +67,7 @@ impl QuantizationConfig {
                 | Self::TurboQuant3
                 | Self::TurboQuant4
                 | Self::TurboQuantProd4
+                | Self::TurboQuant4A2
         )
     }
 
@@ -275,9 +281,17 @@ impl CollectionMetadata {
     }
 
     /// Packed code size in bytes per vector for this collection's quantization.
+    ///
+    /// For TQ4A2, each 4-bit index covers a PAIR of dimensions (not one), so
+    /// packed size is `padded_dim / 4` instead of the scalar TQ4's `padded_dim / 2`.
     #[inline]
     pub fn code_bytes_per_vector(&self) -> usize {
-        code_bytes_per_vector(self.padded_dimension, self.quantization.bits())
+        if self.quantization == QuantizationConfig::TurboQuant4A2 {
+            // A2: padded_dim/2 pairs, each pair → 4-bit index, nibble-packed → padded_dim/4 bytes
+            self.padded_dimension as usize / 4
+        } else {
+            code_bytes_per_vector(self.padded_dimension, self.quantization.bits())
+        }
     }
 
     /// Returns the codebook boundaries as a `&[f32; 15]` reference.
@@ -666,5 +680,91 @@ mod tests {
         );
         let bb: &[f32; 15] = meta.codebook_boundaries_15();
         assert_eq!(bb.len(), 15);
+    }
+
+    // ── TQ4A2 hexagonal lattice tests ───────────────────────────────────
+
+    #[test]
+    fn test_tq4a2_repr_tag() {
+        assert_eq!(QuantizationConfig::TurboQuant4A2 as u8, 6);
+    }
+
+    #[test]
+    fn test_tq4a2_bits_is_4() {
+        assert_eq!(QuantizationConfig::TurboQuant4A2.bits(), 4);
+    }
+
+    #[test]
+    fn test_tq4a2_is_turbo_quant() {
+        assert!(QuantizationConfig::TurboQuant4A2.is_turbo_quant());
+    }
+
+    #[test]
+    fn test_tq4a2_code_bytes_per_vector() {
+        let meta = CollectionMetadata::new(
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4A2,
+            42,
+        );
+        // padded_dim = 1024, A2 code bytes = 1024/4 = 256
+        assert_eq!(meta.code_bytes_per_vector(), 256);
+    }
+
+    #[test]
+    fn test_tq4a2_vs_tq4_code_bytes() {
+        let meta_tq4 = CollectionMetadata::new(
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        );
+        let meta_a2 = CollectionMetadata::new(
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4A2,
+            42,
+        );
+        // A2 should be 2x more compressed than scalar TQ4
+        assert_eq!(meta_tq4.code_bytes_per_vector(), 512); // 1024/2
+        assert_eq!(meta_a2.code_bytes_per_vector(), 256);  // 1024/4
+    }
+
+    #[test]
+    fn test_tq4a2_checksum_differs_from_tq4() {
+        let meta_tq4 = CollectionMetadata::new(
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        );
+        let meta_a2 = CollectionMetadata::new(
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4A2,
+            42,
+        );
+        assert_ne!(meta_tq4.metadata_checksum, meta_a2.metadata_checksum);
+    }
+
+    #[test]
+    fn test_tq4a2_backward_compat_tq4_unchanged() {
+        // Verify that creating a TQ4A2 collection doesn't affect TQ4 collections
+        let meta_tq4 = CollectionMetadata::new(
+            1,
+            768,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        );
+        assert_eq!(meta_tq4.code_bytes_per_vector(), 512);
+        assert_eq!(meta_tq4.codebook.len(), 16);
+        assert_eq!(meta_tq4.codebook_boundaries.len(), 15);
+        assert!(meta_tq4.verify_checksum().is_ok());
     }
 }

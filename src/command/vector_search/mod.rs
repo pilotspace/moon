@@ -198,11 +198,13 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 QuantizationConfig::TurboQuant3
             } else if val.eq_ignore_ascii_case(b"TQ4") {
                 QuantizationConfig::TurboQuant4
+            } else if val.eq_ignore_ascii_case(b"TQ4A2") {
+                QuantizationConfig::TurboQuant4A2
             } else if val.eq_ignore_ascii_case(b"SQ8") {
                 QuantizationConfig::Sq8
             } else {
                 return Frame::Error(Bytes::from_static(
-                    b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, or SQ8)",
+                    b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, TQ4A2, or SQ8)",
                 ));
             };
             pos += 1;

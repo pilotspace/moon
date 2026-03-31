@@ -108,6 +108,7 @@ fn quant_to_string(q: QuantizationConfig) -> String {
         QuantizationConfig::TurboQuant3 => "TurboQuant3".to_owned(),
         QuantizationConfig::TurboQuant4 => "TurboQuant4".to_owned(),
         QuantizationConfig::TurboQuantProd4 => "TurboQuantProd4".to_owned(),
+        QuantizationConfig::TurboQuant4A2 => "TurboQuant4A2".to_owned(),
     }
 }
 
@@ -119,6 +120,7 @@ fn string_to_quant(s: &str) -> Result<QuantizationConfig, SegmentIoError> {
         "TurboQuant3" => Ok(QuantizationConfig::TurboQuant3),
         "TurboQuant4" => Ok(QuantizationConfig::TurboQuant4),
         "TurboQuantProd4" => Ok(QuantizationConfig::TurboQuantProd4),
+        "TurboQuant4A2" => Ok(QuantizationConfig::TurboQuant4A2),
         _ => Err(SegmentIoError::InvalidMetadata(format!(
             "unknown quantization: {s}"
         ))),
