@@ -30,6 +30,20 @@ pub const MIN_VECTORS_FOR_GPU: usize = 10_000;
 
 /// Build an HNSW graph on the GPU using CAGRA.
 ///
+/// **Current status: SCAFFOLD ONLY.**
+/// Returns `CudaNotAvailable` unconditionally. Actual CAGRA kNN graph
+/// construction will be implemented in a future phase once the cuvs
+/// Rust API is validated against real hardware.
+///
+/// When `gpu-cagra` feature is enabled and cuVS is linked, the plan is:
+/// 1. Upload vectors to GPU via `ManagedTensor`
+/// 2. Build kNN graph via CAGRA `Index::build` (base layer)
+/// 3. Export kNN graph, convert to HNSW layer-0 format
+/// 4. Build upper layers on CPU
+/// 5. BFS-reorder and return `HnswGraph`
+///
+/// Without `gpu-cagra` feature: returns `CudaNotAvailable`.
+///
 /// # Arguments
 ///
 /// * `ctx` - GPU context (device must be initialized)
@@ -63,13 +77,30 @@ pub fn gpu_build_hnsw(
         "vectors_f32 length must be a multiple of dim"
     );
 
-    // TODO: Integrate cuVS CAGRA when Rust bindings are available.
-    //
-    // Implementation outline:
-    //   1. let dev_vectors = ctx.device().htod_sync_copy(vectors_f32)?;
-    //   2. let cagra_params = CagraParams { m, ef_construction, .. };
-    //   3. let knn_graph = cagra_build(ctx.device(), &dev_vectors, dim, &cagra_params)?;
-    //   4. let hnsw = convert_knn_to_hnsw(knn_graph, m, seed)?;
-    //   5. Ok(hnsw)
-    Err(GpuBuildError::CudaNotAvailable)
+    #[cfg(feature = "gpu-cagra")]
+    {
+        // Validate cuvs types are importable under this feature gate.
+        // This ensures the feature flag + dependency wiring is correct.
+        #[allow(unused_imports)]
+        use cuvs::cagra::IndexParams;
+
+        // TODO(future-phase): Implement actual CAGRA kNN graph construction:
+        //   1. Create ManagedTensor from vectors_f32 with shape [n, dim]
+        //   2. let res = Resources::new()?;
+        //   3. let params = IndexParams::new()?;
+        //   4. let index = Index::build(&res, &params, &dataset)?;
+        //   5. Extract kNN graph from index
+        //   6. Convert kNN adjacency list to HnswGraph layer-0 format
+        //   7. Build upper layers on CPU using existing HNSW builder
+        //   8. BFS reorder
+
+        // For now, return CudaNotAvailable as scaffold placeholder.
+        return Err(GpuBuildError::CudaNotAvailable);
+    }
+
+    #[cfg(not(feature = "gpu-cagra"))]
+    {
+        // cuVS not linked -- CAGRA graph build unavailable.
+        Err(GpuBuildError::CudaNotAvailable)
+    }
 }

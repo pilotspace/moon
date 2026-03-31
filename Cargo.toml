@@ -57,6 +57,7 @@ socket2 = { version = "0.5", features = ["all"] }
 tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 cudarc = { version = "0.12", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
+cuvs = { version = "26.2", optional = true }
 
 [features]
 # Platform-aware defaults:
@@ -72,6 +73,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 runtime-tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]
+gpu-cagra = ["dep:cuvs", "gpu-cuda"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
