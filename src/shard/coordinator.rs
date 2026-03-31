@@ -731,23 +731,31 @@ pub async fn scatter_vector_search(
 /// Used by connection handlers that don't have direct vector_store access.
 /// Sends VectorSearch to every shard (including local) via SPSC, collects
 /// results, and merges into a global top-K response.
+/// Scatter FT.SEARCH to all shards (local + remote), merge top-K results.
+///
+/// Local shard: direct VectorStore access via shard_databases (no SPSC self-send).
+/// Remote shards: SPSC dispatch with VectorSearch message.
+/// Single-shard (num_shards == 1): local-only, no SPSC needed.
 pub async fn scatter_vector_search_remote(
     index_name: Bytes,
     query_blob: Bytes,
     k: usize,
     my_shard: usize,
     num_shards: usize,
+    shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
-    let mut receivers = Vec::with_capacity(num_shards);
+    // LOCAL: direct vector store access (avoids SPSC self-send)
+    let local_result = {
+        let mut vs = shard_databases.vector_store(my_shard);
+        crate::command::vector_search::search_local(&mut vs, &index_name, &query_blob, k)
+    };
 
+    // REMOTE: SPSC to all other shards
+    let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Cannot SPSC-send to self (ChannelMesh::target_index panics on self-send).
-            // Execute locally on the current shard by sending to shard (my_shard + 1) % num_shards
-            // as a relay. For now, skip self and handle with reduced shard count.
-            // TODO: Execute locally with direct vector_store access.
             continue;
         }
         let (reply_tx, reply_rx) = channel::oneshot();
@@ -762,6 +770,7 @@ pub async fn scatter_vector_search_remote(
     }
 
     let mut shard_responses = Vec::with_capacity(num_shards);
+    shard_responses.push(local_result);
     for rx in receivers {
         match rx.recv().await {
             Ok(frame) => shard_responses.push(frame),
@@ -772,29 +781,51 @@ pub async fn scatter_vector_search_remote(
     crate::command::vector_search::merge_search_results(&shard_responses, k)
 }
 
-/// Send an FT.* management command (FT.CREATE, FT.DROPINDEX, FT.INFO) to shard 0.
+/// Broadcast an FT.* command (FT.CREATE, FT.DROPINDEX) to ALL shards.
 ///
-/// Index management operations are global -- shard 0 is the canonical owner.
-/// Used by connection handlers that don't have direct vector_store access.
-pub async fn send_vector_command_to_shard0(
+/// Each shard creates its own copy of the index so HSET auto-indexing works
+/// regardless of which shard the key routes to.
+///
+/// Local shard: direct VectorStore access via shard_databases.
+/// Remote shards: SPSC dispatch with VectorCommand message.
+/// Single-shard (num_shards == 1): local-only, no SPSC needed.
+pub async fn broadcast_vector_command(
     command: std::sync::Arc<Frame>,
     my_shard: usize,
+    num_shards: usize,
+    shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
-    // If we ARE shard 0, relay through shard 1 → shard 1's SPSC handler
-    // forwards to shard 0 via its own SPSC. This avoids self-send.
-    // If only 2 shards: shard 0 → shard 1 → shard 1 executes locally (it has its own VectorStore).
-    // For FT.CREATE: each shard should create its own index. Send to shard 1 as relay.
-    let target = if my_shard == 0 && spsc_notifiers.len() > 1 { 1 } else if my_shard == 0 { return Frame::Error(Bytes::from_static(b"ERR vector commands require --shards >= 2")); } else { 0 };
-    let (reply_tx, reply_rx) = channel::oneshot();
-    let msg = ShardMessage::VectorCommand { command, reply_tx };
-    spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+    // LOCAL: execute directly on this shard's VectorStore
+    let local_result = {
+        let mut vs = shard_databases.vector_store(my_shard);
+        crate::shard::spsc_handler::dispatch_vector_command(&mut vs, &command)
+    };
 
-    match reply_rx.recv().await {
-        Ok(frame) => frame,
-        Err(_) => Frame::Error(Bytes::from_static(b"ERR shard 0 disconnected")),
+    // REMOTE: send to all other shards via SPSC
+    let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::VectorCommand {
+            command: command.clone(),
+            reply_tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        receivers.push(reply_rx);
     }
+
+    // Check remote results for errors
+    for rx in receivers {
+        match rx.recv().await {
+            Ok(Frame::Error(e)) => return Frame::Error(e),
+            _ => {}
+        }
+    }
+    local_result
 }
 
 #[cfg(test)]

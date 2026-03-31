@@ -231,6 +231,14 @@ pub fn read_immutable_segment(
         (Vec::new(), 0)
     };
 
+    let sub_centroid_table = if quantization.is_turbo_quant() {
+        Some(crate::vector::turbo_quant::sub_centroid::SubCentroidTable::new(
+            meta.padded_dimension, quantization.bits(),
+        ))
+    } else {
+        None
+    };
+
     let collection = CollectionMetadata {
         collection_id: meta.collection_id,
         created_at_lsn: meta.created_at_lsn,
@@ -245,6 +253,7 @@ pub fn read_immutable_segment(
         metadata_checksum: meta.metadata_checksum,
         qjl_matrices,
         qjl_num_projections,
+        sub_centroid_table,
     };
 
     // Verify checksum
@@ -316,12 +325,15 @@ pub fn read_immutable_segment(
     // 6. Construct ImmutableSegment
     let dim = meta.dimension as usize;
     let qjl_bpv = (dim + 7) / 8;
+    let sub_sign_bpv = (meta.padded_dimension as usize + 7) / 8;
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
         Vec::new(), // QJL signs — not persisted yet
         Vec::new(), // residual norms — not persisted yet
         qjl_bpv,
+        Vec::new(), // sub-centroid signs — not persisted yet
+        sub_sign_bpv,
         mvcc,
         collection.clone(),
         meta.live_count,
@@ -440,12 +452,15 @@ mod tests {
             })
             .collect();
 
+        let sub_sign_bpv = (collection.padded_dimension as usize + 7) / 8;
         let segment = ImmutableSegment::new(
             graph,
             AlignedBuffer::from_vec(tq_buffer_bfs),
             qjl_signs_bfs,
             residual_norms_bfs,
             qjl_bytes_per_vec,
+            Vec::new(), // sub-centroid signs — not needed for IO test
+            sub_sign_bpv,
             mvcc,
             collection.clone(),
             n as u32,

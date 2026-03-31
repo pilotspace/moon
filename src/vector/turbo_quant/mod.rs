@@ -10,4 +10,5 @@ pub mod encoder;
 pub mod fwht;
 pub mod inner_product;
 pub mod qjl;
+pub mod sub_centroid;
 pub mod tq_adc;

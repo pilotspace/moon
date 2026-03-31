@@ -8,6 +8,7 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::types::DistanceMetric;
 use super::codebook::{CODEBOOK_VERSION, scaled_centroids_n, scaled_boundaries_n, code_bytes_per_vector};
 use super::encoder::padded_dimension;
+use super::sub_centroid::SubCentroidTable;
 
 /// Quantization algorithm selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,11 @@ pub struct CollectionMetadata {
     /// Number of QJL projections (M). Higher M = lower variance = better recall.
     /// M=4: ~91% recall. M=8: ~95% recall.
     pub qjl_num_projections: usize,
+
+    /// Sub-centroid table for sign-bit refinement (from turboquant_search).
+    /// Doubles effective quantization resolution from 2^b to 2^(b+1) levels.
+    /// Used as Tier 2 reranker — better recall than TQ-ADC, no QJL overhead.
+    pub sub_centroid_table: Option<SubCentroidTable>,
 }
 
 /// Errors related to collection metadata integrity.
@@ -144,6 +150,13 @@ impl CollectionMetadata {
             (Vec::new(), 0)
         };
 
+        // Build sub-centroid table for sign-bit refinement (doubles effective resolution).
+        let sub_centroid_table = if quantization.is_turbo_quant() {
+            Some(SubCentroidTable::new(padded, quantization.bits()))
+        } else {
+            None
+        };
+
         let mut meta = Self {
             collection_id,
             created_at_lsn: 0,
@@ -167,6 +180,7 @@ impl CollectionMetadata {
             metadata_checksum: 0, // computed below
             qjl_matrices,
             qjl_num_projections,
+            sub_centroid_table,
         };
         meta.metadata_checksum = meta.compute_checksum();
         meta

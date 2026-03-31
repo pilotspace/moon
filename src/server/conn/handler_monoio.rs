@@ -1271,32 +1271,6 @@ pub async fn handle_connection_sharded_monoio<
                     continue;
                 }
 
-                // --- FT.* vector search commands ---
-                // Vector commands dispatch via SPSC to shard event loops that own VectorStore.
-                if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
-                    if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                        let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
-                            Ok((index_name, query_blob, k, _filter)) => {
-                                crate::shard::coordinator::scatter_vector_search_remote(
-                                    index_name, query_blob, k,
-                                    shard_id, num_shards,
-                                    &dispatch_tx, &spsc_notifiers,
-                                ).await
-                            }
-                            Err(err_frame) => err_frame,
-                        };
-                        responses.push(response);
-                        continue;
-                    }
-                    // FT.CREATE, FT.DROPINDEX, FT.INFO: send to shard 0
-                    let response = crate::shard::coordinator::send_vector_command_to_shard0(
-                        std::sync::Arc::new(frame),
-                        shard_id, &dispatch_tx, &spsc_notifiers,
-                    ).await;
-                    responses.push(response);
-                    continue;
-                }
-
                 // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
                 if is_multi_key_command(cmd, cmd_args) {
                     let response = crate::shard::coordinator::coordinate_multi_key(
@@ -1315,6 +1289,57 @@ pub async fn handle_connection_sharded_monoio<
                     responses.push(response);
                     continue;
                 }
+            }
+
+            // --- FT.* vector search commands ---
+            // Local shard: direct VectorStore access via shard_databases.
+            // Remote shards: SPSC dispatch. Works with any shard count (including 1).
+            if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                    let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
+                        Ok((index_name, query_blob, k, _filter)) => {
+                            crate::shard::coordinator::scatter_vector_search_remote(
+                                index_name, query_blob, k,
+                                shard_id, num_shards,
+                                &shard_databases,
+                                &dispatch_tx, &spsc_notifiers,
+                            ).await
+                        }
+                        Err(err_frame) => err_frame,
+                    };
+                    responses.push(response);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"FT.CREATE") || cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                    // Broadcast to ALL shards so every shard has the index
+                    let response = crate::shard::coordinator::broadcast_vector_command(
+                        std::sync::Arc::new(frame),
+                        shard_id, num_shards,
+                        &shard_databases,
+                        &dispatch_tx, &spsc_notifiers,
+                    ).await;
+                    responses.push(response);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                    // Read-only: local shard is sufficient
+                    let response = {
+                        let vs = shard_databases.vector_store(shard_id);
+                        crate::command::vector_search::ft_info(&vs, cmd_args)
+                    };
+                    responses.push(response);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                    let response = {
+                        let mut vs = shard_databases.vector_store(shard_id);
+                        crate::command::vector_search::ft_compact(&mut vs, cmd_args)
+                    };
+                    responses.push(response);
+                    continue;
+                }
+                responses.push(Frame::Error(Bytes::from_static(b"ERR unknown FT command")));
+                continue;
             }
 
             // --- Routing: keyless, local, or remote ---
@@ -1375,6 +1400,18 @@ pub async fn handle_connection_sharded_monoio<
                         if let Some(ref tx) = aof_tx {
                             let serialized = aof::serialize_command(&frame);
                             let _ = tx.try_send(AofMessage::Append(serialized));
+                        }
+                    }
+
+                    // Auto-index HSET into vector store (if key matches index prefix)
+                    if !matches!(response, Frame::Error(_))
+                        && cmd.eq_ignore_ascii_case(b"HSET")
+                    {
+                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                            let mut vs = shard_databases.vector_store(shard_id);
+                            crate::shard::spsc_handler::auto_index_hset_public(
+                                &mut vs, key.as_ref(), cmd_args,
+                            );
                         }
                     }
 

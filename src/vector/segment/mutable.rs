@@ -53,9 +53,14 @@ struct MutableSegmentInner {
     /// TQ-encoded codes for HNSW TQ-ADC traversal.
     tq_codes: Vec<u8>,
     /// QJL sign bits per vector — for TurboQuant_prod unbiased IP scoring.
+    /// Zero-filled at insert time; recomputed from raw_f32 during freeze().
     qjl_signs: Vec<u8>,
     /// Residual norms per vector — ||x - decode(TQ(x))||.
+    /// Zero at insert time; recomputed during freeze().
     residual_norms: Vec<f32>,
+    /// Raw f32 vectors retained for deferred QJL encoding at freeze time.
+    /// Layout: dim floats per vector, contiguous.
+    raw_f32: Vec<f32>,
     entries: Vec<MutableEntry>,
     dimension: u32,
     padded_dimension: u32,
@@ -103,6 +108,7 @@ impl MutableSegment {
                 tq_codes: Vec::new(),
                 qjl_signs: Vec::new(),
                 residual_norms: Vec::new(),
+                raw_f32: Vec::new(),
                 entries: Vec::new(),
                 dimension,
                 padded_dimension: padded,
@@ -114,10 +120,11 @@ impl MutableSegment {
         }
     }
 
-    /// Append a vector. TQ-encodes + QJL-encodes for TurboQuant_prod scoring.
+    /// Append a vector. TQ-encodes at insert time; QJL deferred to freeze().
     ///
-    /// Stores: TQ codes (516 B) + QJL signs (96 B) + residual_norm (4 B) = 616 B/vec at 768d.
-    /// No f32 stored — TurboQuant_prod inner product estimator provides unbiased ranking.
+    /// Fast path: only FWHT + quantize + nibble pack (O(d log d)).
+    /// QJL encoding (O(M×d²)) is deferred to freeze() when the segment compacts.
+    /// Mutable brute-force search uses TQ-MSE-only distance (no QJL correction).
     pub fn append(
         &self,
         key_hash: u64,
@@ -132,10 +139,9 @@ impl MutableSegment {
         let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
 
-        // Step 1: TQ-MSE encode
+        // Step 1: TQ-MSE encode (fast: O(d log d) via FWHT)
         let signs = self.collection.fwht_sign_flips.as_slice();
         let boundaries = self.collection.codebook_boundaries_15();
-        let centroids = self.collection.codebook_16();
         let mut work_buf = vec![0.0f32; padded];
         let code = encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf);
 
@@ -143,30 +149,15 @@ impl MutableSegment {
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
 
-        // Step 2: Compute residual = x - decode(TQ(x))
-        let decoded = super::super::turbo_quant::encoder::decode_tq_mse_scaled(
-            &code, signs, centroids, dim, &mut work_buf,
-        );
-        let mut residual = Vec::with_capacity(dim);
-        let mut r_norm_sq = 0.0f32;
-        for i in 0..dim {
-            let r = vector_f32[i] - decoded[i];
-            residual.push(r);
-            r_norm_sq += r * r;
-        }
-        let residual_norm = r_norm_sq.sqrt();
-        inner.residual_norms.push(residual_norm);
+        // QJL deferred to freeze(): zero-fill signs, residual_norm = 0.
+        // score_l2_prod handles this gracefully (QJL correction = scale * 0.0 * dot = 0).
+        let qjl_bpv = inner.qjl_bytes_per_vec;
+        let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
+        inner.qjl_signs.resize(new_qjl_len, 0u8);
+        inner.residual_norms.push(0.0);
 
-        // Step 3: QJL encode residual → M sign vectors via dense Gaussian
-        // sign(S_m · r) for each projection m — O(M × d²) total
-        for matrix in &self.collection.qjl_matrices {
-            let qjl_signs = super::super::turbo_quant::qjl::qjl_encode(matrix, &residual, dim);
-            inner.qjl_signs.extend_from_slice(&qjl_signs);
-        }
-        if self.collection.qjl_matrices.is_empty() {
-            let qjl_bpv = inner.qjl_bytes_per_vec;
-            inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
-        }
+        // Retain raw f32 for deferred QJL encoding at freeze time.
+        inner.raw_f32.extend_from_slice(vector_f32);
 
         inner.entries.push(MutableEntry {
             internal_id,
@@ -178,8 +169,7 @@ impl MutableSegment {
             txn_id: 0,
         });
 
-        // bytes: TQ code + QJL signs + residual_norm(f32) + entry metadata
-        inner.byte_size += bytes_per_code + inner.qjl_bytes_per_vec + 4 + std::mem::size_of::<MutableEntry>();
+        inner.byte_size += bytes_per_code + qjl_bpv + 4 + dim * 4 + std::mem::size_of::<MutableEntry>();
         internal_id
     }
 
@@ -338,27 +328,12 @@ impl MutableSegment {
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
 
-        // QJL encode residual
-        let decoded = super::super::turbo_quant::encoder::decode_tq_mse_scaled(
-            &code, signs, centroids, dim, &mut work_buf,
-        );
-        let mut residual = Vec::with_capacity(dim);
-        let mut r_norm_sq = 0.0f32;
-        for i in 0..dim {
-            let r = vector_f32[i] - decoded[i];
-            residual.push(r);
-            r_norm_sq += r * r;
-        }
-        inner.residual_norms.push(r_norm_sq.sqrt());
-
-        for matrix in &self.collection.qjl_matrices {
-            let qjl_signs = super::super::turbo_quant::qjl::qjl_encode(matrix, &residual, dim);
-            inner.qjl_signs.extend_from_slice(&qjl_signs);
-        }
-        if self.collection.qjl_matrices.is_empty() {
-            let qjl_bpv = inner.qjl_bytes_per_vec;
-            inner.qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
-        }
+        // QJL deferred to freeze() — same as append()
+        let qjl_bpv = inner.qjl_bytes_per_vec;
+        let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
+        inner.qjl_signs.resize(new_qjl_len, 0u8);
+        inner.residual_norms.push(0.0);
+        inner.raw_f32.extend_from_slice(vector_f32);
 
         inner.entries.push(MutableEntry {
             internal_id,
@@ -370,7 +345,7 @@ impl MutableSegment {
             txn_id,
         });
 
-        inner.byte_size += bytes_per_code + inner.qjl_bytes_per_vec + 4 + std::mem::size_of::<MutableEntry>();
+        inner.byte_size += bytes_per_code + qjl_bpv + 4 + dim * 4 + std::mem::size_of::<MutableEntry>();
         internal_id
     }
 
@@ -429,12 +404,100 @@ impl MutableSegment {
                 })
                 .collect(),
             tq_codes: inner.tq_codes.clone(),
-            qjl_signs: inner.qjl_signs.clone(),
-            residual_norms: inner.residual_norms.clone(),
+            qjl_signs: self.recompute_qjl_signs(&inner),
+            residual_norms: self.recompute_residual_norms(&inner),
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
             dimension: inner.dimension,
         }
+    }
+
+    /// Recompute QJL signs from retained raw f32 vectors.
+    ///
+    /// Called during freeze() to produce correct QJL signs for the immutable segment.
+    /// Cost: O(N × M × d²) — amortized, runs once per compaction cycle.
+    fn recompute_qjl_signs(&self, inner: &MutableSegmentInner) -> Vec<u8> {
+        let dim = inner.dimension as usize;
+        let padded = inner.padded_dimension as usize;
+        let signs = self.collection.fwht_sign_flips.as_slice();
+        let centroids = self.collection.codebook_16();
+        let bytes_per_code = inner.bytes_per_code;
+
+        let mut qjl_signs = Vec::new();
+        let mut work_buf = vec![0.0f32; padded];
+
+        for (i, entry) in inner.entries.iter().enumerate() {
+            let raw = &inner.raw_f32[i * dim..(i + 1) * dim];
+
+            // Decode TQ to get residual
+            let offset = entry.internal_id as usize * bytes_per_code;
+            let code_end = offset + bytes_per_code - 4;
+            let code_slice = &inner.tq_codes[offset..code_end];
+            let norm_bytes = &inner.tq_codes[code_end..offset + bytes_per_code];
+            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+
+            let tq_code = crate::vector::turbo_quant::encoder::TqCode {
+                codes: code_slice.to_vec(),
+                norm,
+            };
+            let decoded = crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+                &tq_code, signs, centroids, dim, &mut work_buf,
+            );
+
+            // Compute residual
+            let mut residual = Vec::with_capacity(dim);
+            for j in 0..dim {
+                residual.push(raw[j] - decoded[j]);
+            }
+
+            // QJL encode residual for each projection matrix
+            for matrix in &self.collection.qjl_matrices {
+                let qs = crate::vector::turbo_quant::qjl::qjl_encode(matrix, &residual, dim);
+                qjl_signs.extend_from_slice(&qs);
+            }
+            if self.collection.qjl_matrices.is_empty() {
+                let qjl_bpv = inner.qjl_bytes_per_vec;
+                qjl_signs.extend(std::iter::repeat(0u8).take(qjl_bpv));
+            }
+        }
+        qjl_signs
+    }
+
+    /// Recompute residual norms from retained raw f32 vectors.
+    fn recompute_residual_norms(&self, inner: &MutableSegmentInner) -> Vec<f32> {
+        let dim = inner.dimension as usize;
+        let padded = inner.padded_dimension as usize;
+        let signs = self.collection.fwht_sign_flips.as_slice();
+        let centroids = self.collection.codebook_16();
+        let bytes_per_code = inner.bytes_per_code;
+
+        let mut norms = Vec::with_capacity(inner.entries.len());
+        let mut work_buf = vec![0.0f32; padded];
+
+        for (i, entry) in inner.entries.iter().enumerate() {
+            let raw = &inner.raw_f32[i * dim..(i + 1) * dim];
+            let offset = entry.internal_id as usize * bytes_per_code;
+            let code_end = offset + bytes_per_code - 4;
+            let code_slice = &inner.tq_codes[offset..code_end];
+            let norm_bytes = &inner.tq_codes[code_end..offset + bytes_per_code];
+            let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+
+            let tq_code = crate::vector::turbo_quant::encoder::TqCode {
+                codes: code_slice.to_vec(),
+                norm,
+            };
+            let decoded = crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+                &tq_code, signs, centroids, dim, &mut work_buf,
+            );
+
+            let mut r_norm_sq = 0.0f32;
+            for j in 0..dim {
+                let r = raw[j] - decoded[j];
+                r_norm_sq += r * r;
+            }
+            norms.push(r_norm_sq.sqrt());
+        }
+        norms
     }
 
     /// Access collection metadata.

@@ -6,7 +6,7 @@
 //! 3. QJL encode: sign(S * r), store ||r||
 //! 4. Score: <y, x_hat> = <y, x_mse> + sqrt(pi/2)/d * ||r|| * <S*y, sign(S*r)>
 
-use super::encoder::{decode_tq_mse_scaled, encode_tq_mse_scaled, TqCode};
+use super::encoder::{decode_tq_mse_scaled, encode_tq_mse_scaled, padded_dimension, TqCode};
 use super::qjl;
 
 /// Encoded TurboQuant inner-product representation.
@@ -65,6 +65,86 @@ pub fn encode_tq_prod(
     TqProdCode {
         mse_codes: mse_code.codes,
         original_norm: mse_code.norm,
+        qjl_signs,
+        residual_norm,
+    }
+}
+
+/// Encode using paper-correct bit budget: (b-1)-bit MSE + 1-bit QJL.
+///
+/// Paper Algorithm 2: "Instantiate TurboQuant_mse with bit-width b-1"
+/// For 4-bit total: 3-bit MSE (8 centroids) + 1-bit QJL sign per coordinate.
+/// Total storage: (b-1)*d + d + 32 = b*d + 32 bits (same budget as TQ_mse at b bits).
+pub fn encode_tq_prod_v2(
+    vector: &[f32],
+    sign_flips: &[f32],
+    boundaries_bm1: &[f32],
+    centroids_bm1: &[f32],
+    bits_mse: u8,
+    qjl_matrix: &[f32],
+    work_buf: &mut [f32],
+) -> TqProdCode {
+    use super::encoder::encode_tq_mse_multibit;
+    let dim = vector.len();
+    let padded = padded_dimension(dim as u32) as usize;
+
+    // Step 1: MSE encode at (b-1) bits
+    let mse_code = encode_tq_mse_multibit(
+        vector, sign_flips, boundaries_bm1, bits_mse, work_buf,
+    );
+    let norm = mse_code.norm;
+
+    // Step 2: Decode MSE to compute residual
+    let code_bytes = &mse_code.codes;
+
+    match bits_mse {
+        3 => {
+            let indices = super::encoder::unpack_3bit(code_bytes, padded);
+            for j in 0..padded {
+                work_buf[j] = centroids_bm1[indices[j] as usize];
+            }
+        }
+        2 => {
+            let indices = super::encoder::unpack_2bit(code_bytes, padded);
+            for j in 0..padded {
+                work_buf[j] = centroids_bm1[indices[j] as usize];
+            }
+        }
+        1 => {
+            let indices = super::encoder::unpack_1bit(code_bytes, padded);
+            for j in 0..padded {
+                work_buf[j] = centroids_bm1[indices[j] as usize];
+            }
+        }
+        4 => {
+            for j in 0..code_bytes.len() {
+                let byte = code_bytes[j];
+                work_buf[j * 2] = centroids_bm1[(byte & 0x0F) as usize];
+                work_buf[j * 2 + 1] = centroids_bm1[(byte >> 4) as usize];
+            }
+        }
+        _ => {
+            let indices = super::encoder::nibble_unpack(code_bytes, padded);
+            for j in 0..padded {
+                work_buf[j] = centroids_bm1.get(indices[j] as usize).copied().unwrap_or(0.0);
+            }
+        }
+    }
+    super::fwht::inverse_fwht(&mut work_buf[..padded], sign_flips);
+
+    let mut r_norm_sq = 0.0f32;
+    for i in 0..dim {
+        let r = vector[i] - norm * work_buf[i];
+        work_buf[i] = r;
+        r_norm_sq += r * r;
+    }
+    let residual_norm = r_norm_sq.sqrt();
+
+    let qjl_signs = qjl::qjl_encode(qjl_matrix, &work_buf[..dim], dim);
+
+    TqProdCode {
+        mse_codes: mse_code.codes,
+        original_norm: norm,
         qjl_signs,
         residual_norm,
     }
@@ -454,5 +534,40 @@ mod tests {
             "orthogonal vectors should score near 0, got {:.4}",
             score
         );
+    }
+
+    #[test]
+    fn test_encode_tq_prod_v2_saves_bits() {
+        fwht::init_fwht();
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let sign_flips = test_sign_flips(padded, 42);
+        let qjl_matrix = generate_qjl_matrix(dim, 999);
+        let mut work = vec![0.0f32; padded];
+
+        let mut vec = lcg_f32(dim, 77);
+        normalize(&mut vec);
+
+        // v1: 4-bit MSE + QJL signs
+        let boundaries_4 = scaled_boundaries(padded as u32);
+        let centroids_4 = scaled_centroids(padded as u32);
+        let code_v1 = encode_tq_prod(&vec, &sign_flips, &boundaries_4, &centroids_4, &qjl_matrix, &mut work);
+        let v1_bytes = code_v1.mse_codes.len() + code_v1.qjl_signs.len();
+
+        // v2: 3-bit MSE + QJL signs (paper-correct)
+        let boundaries_3 = crate::vector::turbo_quant::codebook::scaled_boundaries_n(padded as u32, 3);
+        let centroids_3 = crate::vector::turbo_quant::codebook::scaled_centroids_n(padded as u32, 3);
+        let code_v2 = encode_tq_prod_v2(
+            &vec, &sign_flips, &boundaries_3, &centroids_3, 3, &qjl_matrix, &mut work,
+        );
+        let v2_bytes = code_v2.mse_codes.len() + code_v2.qjl_signs.len();
+
+        // v2 should use fewer bytes for MSE codes
+        assert!(
+            v2_bytes < v1_bytes,
+            "v2 ({v2_bytes} bytes) should be smaller than v1 ({v1_bytes} bytes)"
+        );
+        assert!(code_v2.residual_norm >= 0.0);
+        assert!(code_v2.original_norm > 0.0);
     }
 }

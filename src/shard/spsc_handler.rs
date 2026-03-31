@@ -854,7 +854,10 @@ pub(crate) fn handle_shard_message_shared(
 }
 
 /// Dispatch FT.* commands to the appropriate vector_search handler.
-fn dispatch_vector_command(vector_store: &mut VectorStore, command: &crate::protocol::Frame) -> crate::protocol::Frame {
+///
+/// Public within crate so coordinator can call it directly for local-shard execution
+/// (avoiding SPSC self-send).
+pub(crate) fn dispatch_vector_command(vector_store: &mut VectorStore, command: &crate::protocol::Frame) -> crate::protocol::Frame {
     let (cmd, args) = match extract_command_static(command) {
         Some(pair) => pair,
         None => {

@@ -208,6 +208,33 @@ pub fn compact(
         }
     }
 
+    // Compute sub-centroid sign bits from BFS-reordered TQ codes.
+    // For each coordinate: compare FWHT-rotated value against centroid.
+    // We extract the rotated value by decoding the TQ code into centroids.
+    let sub_bpv = (padded + 7) / 8;
+    let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
+    for bfs_pos in 0..n {
+        let offset = bfs_pos * bytes_per_code;
+        let code_slice = &tq_bfs[offset..offset + code_len];
+        // Use the all_rotated vectors (already decoded from TQ codes) to determine sign bits
+        if need_cpu_build && bfs_pos < all_rotated.len() {
+            let rotated = &all_rotated[bfs_pos];
+            let sign_offset = bfs_pos * sub_bpv;
+            for j in 0..code_slice.len() {
+                let byte = code_slice[j];
+                let idx_lo = (byte & 0x0F) as usize;
+                let idx_hi = (byte >> 4) as usize;
+                let qi = j * 2;
+                if qi < rotated.len() && rotated[qi] >= codebook[idx_lo] {
+                    sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
+                }
+                if qi + 1 < rotated.len() && rotated[qi + 1] >= codebook[idx_hi] {
+                    sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
+                }
+            }
+        }
+    }
+
     // ── Step 5: Create ImmutableSegment ─────────────────────────────
     let mvcc: Vec<MvccHeader> = (0..n)
         .map(|bfs_pos| {
@@ -230,6 +257,8 @@ pub fn compact(
         qjl_signs_bfs,
         residual_norms_bfs,
         qjl_bpv,
+        sub_signs_bfs,
+        sub_bpv,
         mvcc,
         collection.clone(),
         live_count,
