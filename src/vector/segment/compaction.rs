@@ -96,6 +96,27 @@ pub fn compact(
 
     // ── Step 3: Build HNSW ───────────────────────────────────────────
 
+    let codebook = collection.codebook_16();
+    let code_len = bytes_per_code - 4;
+
+    // Build raw f32 vectors for live entries (for exact pairwise HNSW build
+    // and GPU path). Also needed later for sub-centroid sign computation.
+    // Falls back to TQ-decoded centroids if raw_f32 is empty (persistence reload).
+    let has_raw = !frozen.raw_f32.is_empty();
+    let dim = frozen.dimension as usize;
+
+    let live_f32: Vec<&[f32]> = if has_raw {
+        live_entries
+            .iter()
+            .map(|e| {
+                let start = e.internal_id as usize * dim;
+                &frozen.raw_f32[start..start + dim]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // --- GPU HNSW build path (feature-gated) ---
     // When gpu-cuda is enabled and the batch is large enough, attempt a
     // GPU-accelerated HNSW construction via CAGRA. On any failure the GPU
@@ -104,7 +125,7 @@ pub fn compact(
     let gpu_graph: Option<crate::vector::hnsw::graph::HnswGraph> = {
         use crate::vector::gpu::{MIN_VECTORS_FOR_GPU, try_gpu_build_hnsw};
         if n >= MIN_VECTORS_FOR_GPU {
-            try_gpu_build_hnsw(&live_f32_vecs, dim, HNSW_M, HNSW_EF_CONSTRUCTION, seed)
+            try_gpu_build_hnsw(&live_f32, dim, HNSW_M, HNSW_EF_CONSTRUCTION, seed)
         } else {
             None
         }
@@ -116,27 +137,6 @@ pub fn compact(
     let need_cpu_build = gpu_graph.is_none();
     #[cfg(not(feature = "gpu-cuda"))]
     let need_cpu_build = true;
-
-    let codebook = collection.codebook_16();
-    let code_len = bytes_per_code - 4;
-
-    // Build raw f32 vectors for live entries (for exact pairwise HNSW build).
-    // If raw_f32 available from freeze(), use exact L2 for graph construction.
-    // Falls back to TQ-decoded centroids if raw_f32 is empty (persistence reload).
-    let has_raw = !frozen.raw_f32.is_empty();
-    let dim = frozen.dimension as usize;
-
-    let live_f32: Vec<&[f32]> = if has_raw && need_cpu_build {
-        live_entries
-            .iter()
-            .map(|e| {
-                let start = e.internal_id as usize * dim;
-                &frozen.raw_f32[start..start + dim]
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     // Also decode TQ → centroid for sub-centroid sign computation (needed later).
     let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
@@ -220,11 +220,7 @@ pub fn compact(
     let mut residual_norms_bfs = vec![0.0f32; n];
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        // Map orig_id back to live_entries index
-        let live_idx = live_entries
-            .iter()
-            .position(|e| e.internal_id as usize == orig_id)
-            .unwrap_or(orig_id);
+        let live_idx = orig_id;
         // QJL signs
         let src_qjl = live_idx * qjl_bpv;
         let dst_qjl = bfs_pos * qjl_bpv;
@@ -243,15 +239,12 @@ pub fn compact(
     // Sign bit = 1 if original >= centroid (upper sub-bin), 0 if below.
     let sub_bpv = (padded + 7) / 8;
     let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
-    if has_raw && need_cpu_build {
+    if has_raw {
         // Use raw f32 → FWHT rotate → compare against centroid per TQ index
         let mut work = vec![0.0f32; padded];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            let live_idx = live_entries
-                .iter()
-                .position(|e| e.internal_id as usize == orig_id)
-                .unwrap_or(orig_id);
+            let live_idx = orig_id;
             let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim
                 ..(live_entries[live_idx].internal_id as usize + 1) * dim];
 
@@ -287,7 +280,7 @@ pub fn compact(
                 }
             }
         }
-    } else if need_cpu_build {
+    } else {
         // Fallback: TQ-decoded centroids (sign always matches = useless, but safe)
         for bfs_pos in 0..n {
             let code_offset = bfs_pos * bytes_per_code;

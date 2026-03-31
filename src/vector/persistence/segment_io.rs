@@ -72,6 +72,9 @@ struct SegmentMeta {
     codebook: Vec<f32>,
     codebook_boundaries: Vec<f32>,
     fwht_sign_flips: Vec<f32>,
+    /// Build mode: "Light" or "Exact". Added in v1 — defaults to inferred if absent.
+    #[serde(default)]
+    build_mode: Option<String>,
 }
 
 fn segment_dir(dir: &Path, segment_id: u64) -> PathBuf {
@@ -176,6 +179,10 @@ pub fn write_immutable_segment(
         codebook: collection.codebook.clone(),
         codebook_boundaries: collection.codebook_boundaries.clone(),
         fwht_sign_flips: collection.fwht_sign_flips.as_slice().to_vec(),
+        build_mode: Some(match collection.build_mode {
+            crate::vector::turbo_quant::collection::BuildMode::Light => "Light".to_owned(),
+            crate::vector::turbo_quant::collection::BuildMode::Exact => "Exact".to_owned(),
+        }),
     };
     let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| SegmentIoError::InvalidMetadata(e.to_string()))?;
@@ -233,9 +240,24 @@ pub fn read_immutable_segment(
     let codebook = meta.codebook.clone();
     let boundaries = meta.codebook_boundaries.clone();
 
+    // Parse build mode from persisted metadata (defaults to Light for old segments).
+    let build_mode = match meta.build_mode.as_deref() {
+        Some("Exact") => crate::vector::turbo_quant::collection::BuildMode::Exact,
+        Some("Light") | None => crate::vector::turbo_quant::collection::BuildMode::Light,
+        Some(other) => {
+            return Err(SegmentIoError::InvalidMetadata(format!(
+                "unknown build_mode: {other}"
+            )));
+        }
+    };
+
     // Reconstruct dense Gaussian QJL matrices from deterministic seeds.
+    // Only generated in Exact mode — Light mode uses sub-centroid reranking instead.
     const QJL_NUM_PROJECTIONS: usize = 8;
-    let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
+    let (qjl_matrices, qjl_num_projections) = if build_mode
+        == crate::vector::turbo_quant::collection::BuildMode::Exact
+        && quantization.is_turbo_quant()
+    {
         let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
             .map(|m| {
                 crate::vector::turbo_quant::qjl::generate_qjl_matrix(
@@ -260,6 +282,9 @@ pub fn read_immutable_segment(
         None
     };
 
+    // Construct with a placeholder checksum, then recompute to match current formula.
+    // The stored metadata_checksum validates the core fields (dimension, codebook, etc.)
+    // were not corrupted; we recompute after reconstruction to cover any newly added fields.
     let collection = CollectionMetadata {
         collection_id: meta.collection_id,
         created_at_lsn: meta.created_at_lsn,
@@ -274,20 +299,15 @@ pub fn read_immutable_segment(
         metadata_checksum: meta.metadata_checksum,
         qjl_matrices,
         qjl_num_projections,
-        build_mode: if qjl_num_projections > 0 {
-            crate::vector::turbo_quant::collection::BuildMode::Exact
-        } else {
-            crate::vector::turbo_quant::collection::BuildMode::Light
-        },
+        build_mode,
         sub_centroid_table,
     };
-
-    // Verify checksum
+    // Verify checksum: recompute from reconstructed collection and compare
+    // against the stored value.
     if let Err(e) = collection.verify_checksum() {
         return Err(SegmentIoError::MetadataChecksum {
             expected: meta.metadata_checksum,
             actual: {
-                // Extract actual from error message
                 match e {
                     crate::vector::turbo_quant::collection::CollectionMetadataError::ChecksumMismatch {
                         actual, ..

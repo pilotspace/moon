@@ -239,7 +239,7 @@ impl CollectionMetadata {
     }
 
     /// Compute XXHash64 over all fields except metadata_checksum itself.
-    fn compute_checksum(&self) -> u64 {
+    pub(crate) fn compute_checksum(&self) -> u64 {
         use xxhash_rust::xxh64::xxh64;
         let mut data = Vec::with_capacity(256);
         data.extend_from_slice(&self.collection_id.to_le_bytes());
@@ -258,6 +258,14 @@ impl CollectionMetadata {
         // Include sign flips (the materialized values, not a seed)
         for &s in self.fwht_sign_flips.as_slice() {
             data.extend_from_slice(&s.to_le_bytes());
+        }
+        // Include build_mode discriminant
+        data.push(self.build_mode as u8);
+        // Include QJL matrices (not reconstructable from other fields)
+        for matrix in &self.qjl_matrices {
+            for &val in matrix {
+                data.extend_from_slice(&val.to_le_bytes());
+            }
         }
         xxh64(&data, 0)
     }

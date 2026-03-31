@@ -304,6 +304,10 @@ impl VectorWalRecord {
         // Payload slice: starts at offset 5, length = payload_len
         let payload = &data[5..5 + payload_len];
 
+        if payload.is_empty() {
+            return Err(WalRecordError::Truncated);
+        }
+
         // CRC32 check
         let stored_crc = u32::from_le_bytes([
             data[5 + payload_len],

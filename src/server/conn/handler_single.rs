@@ -938,6 +938,16 @@ pub async fn handle_connection(
 
                     // --- MULTI queue mode ---
                     if in_multi {
+                        // Reject FT.* commands inside MULTI — vector hooks are not
+                        // wired through the transaction execution path yet.
+                        if let Some((cmd, _)) = extract_command(&frame) {
+                            if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR FT.* commands are not supported inside MULTI/EXEC",
+                                )));
+                                continue;
+                            }
+                        }
                         command_queue.push(frame);
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                         continue;

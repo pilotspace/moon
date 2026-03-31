@@ -27,24 +27,37 @@ unsafe impl<T: Copy + Default + Send> Send for AlignedBuffer<T> {}
 unsafe impl<T: Copy + Default + Sync> Sync for AlignedBuffer<T> {}
 
 impl<T: Copy + Default> AlignedBuffer<T> {
+    /// The effective alignment: at least 64 bytes, but also satisfies `align_of::<T>()`.
+    const EFFECTIVE_ALIGN: usize = if ALIGN > std::mem::align_of::<T>() {
+        ALIGN
+    } else {
+        std::mem::align_of::<T>()
+    };
+
     /// Allocate a zero-initialized buffer of `len` elements at 64-byte alignment.
     ///
     /// # Panics
     /// Panics if the allocation fails (out of memory) or if `len * size_of::<T>()` overflows.
     pub fn new(len: usize) -> Self {
+        let effective_align = Self::EFFECTIVE_ALIGN;
+
         if len == 0 || std::mem::size_of::<T>() == 0 {
             return Self {
-                ptr: ALIGN as *mut T, // dangling but aligned
+                ptr: effective_align as *mut T, // dangling but aligned
                 len: 0,
-                layout: Layout::from_size_align(0, ALIGN).unwrap(),
+                layout: Layout::from_size_align(0, effective_align)
+                    .unwrap_or_else(|_| alloc::handle_alloc_error(Layout::new::<()>())),
             };
         }
 
-        let byte_size = len
-            .checked_mul(std::mem::size_of::<T>())
-            .expect("AlignedBuffer: size overflow");
-        let layout =
-            Layout::from_size_align(byte_size, ALIGN).expect("AlignedBuffer: invalid layout");
+        let byte_size = match len.checked_mul(std::mem::size_of::<T>()) {
+            Some(s) => s,
+            None => alloc::handle_alloc_error(Layout::new::<()>()),
+        };
+        let layout = match Layout::from_size_align(byte_size, effective_align) {
+            Ok(l) => l,
+            Err(_) => alloc::handle_alloc_error(Layout::new::<()>()),
+        };
 
         // SAFETY: layout has non-zero size (checked above). alloc_zeroed returns a
         // valid pointer to `byte_size` zero-initialized bytes with the requested alignment,
@@ -63,32 +76,19 @@ impl<T: Copy + Default> AlignedBuffer<T> {
 
     /// Create an aligned buffer from an existing `Vec<T>`.
     ///
-    /// If the vec's allocation is already 64-byte aligned, this reuses it.
-    /// Otherwise, it copies into a new aligned allocation.
+    /// Always copies into a new aligned allocation to guarantee the stored
+    /// `Layout` matches the actual allocation (required for sound deallocation).
     pub fn from_vec(v: Vec<T>) -> Self {
-        let src_ptr = v.as_ptr();
-        let src_aligned = (src_ptr as usize) % ALIGN == 0;
-
-        if src_aligned && v.len() == v.capacity() && !v.is_empty() {
-            let len = v.len();
-            let byte_size = len * std::mem::size_of::<T>();
-            let layout =
-                Layout::from_size_align(byte_size, ALIGN).expect("AlignedBuffer: invalid layout");
-            let ptr = v.as_ptr() as *mut T;
-            std::mem::forget(v);
-            Self { ptr, len, layout }
-        } else {
-            let buf = Self::new(v.len());
-            if !v.is_empty() {
-                // SAFETY: buf.ptr points to a valid allocation of at least `v.len() * size_of::<T>()`
-                // bytes. src_ptr is valid for `v.len()` elements. The regions do not overlap
-                // because buf.ptr is a fresh allocation.
-                unsafe {
-                    ptr::copy_nonoverlapping(v.as_ptr(), buf.ptr, v.len());
-                }
+        let buf = Self::new(v.len());
+        if !v.is_empty() {
+            // SAFETY: buf.ptr points to a valid allocation of at least `v.len() * size_of::<T>()`
+            // bytes. v.as_ptr() is valid for `v.len()` elements. The regions do not overlap
+            // because buf.ptr is a fresh allocation.
+            unsafe {
+                ptr::copy_nonoverlapping(v.as_ptr(), buf.ptr, v.len());
             }
-            buf
         }
+        buf
     }
 
     /// Returns a shared slice over the buffer contents.

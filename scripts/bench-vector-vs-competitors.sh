@@ -24,10 +24,10 @@ NUM_VECTORS="${1:-10000}"
 DIM="${2:-128}"
 K=10
 EF=128
-MOON_PORT=6399
-REDIS_PORT=6400
-QDRANT_PORT=6333
-QDRANT_GRPC=6334
+MOON_PORT=16399
+REDIS_PORT=16400
+QDRANT_PORT=16333
+QDRANT_GRPC=16334
 
 echo "================================================================="
 echo " Moon vs Redis vs Qdrant — Vector Search Benchmark"
@@ -41,7 +41,13 @@ echo ""
 
 # ── Generate test vectors ───────────────────────────────────────────────
 VECTOR_DIR=$(mktemp -d)
-trap "rm -rf $VECTOR_DIR; redis-cli -p $REDIS_PORT SHUTDOWN NOSAVE 2>/dev/null; docker rm -f qdrant-bench 2>/dev/null; kill %1 2>/dev/null" EXIT
+REDIS_PID=""
+cleanup_bench() {
+    rm -rf "$VECTOR_DIR"
+    [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+    docker rm -f qdrant-bench 2>/dev/null || true
+}
+trap cleanup_bench EXIT
 
 echo ">>> Generating $NUM_VECTORS random vectors (dim=$DIM)..."
 python3 -c "
@@ -185,24 +191,61 @@ n_queries = len(qdata) // bytes_per
 latencies = []
 results_for_recall = []
 
+import socket
+
+def redis_query(sock, qblob, k):
+    \"\"\"Send VSIM via raw RESP protocol over a persistent socket.\"\"\"
+    count_str = str(k).encode()
+    cmd = (
+        b'*6\r\n'
+        b'\$4\r\nVSIM\r\n'
+        b'\$6\r\nvecset\r\n'
+        b'\$4\r\nFP32\r\n'
+        b'\$' + str(len(qblob)).encode() + b'\r\n' + qblob + b'\r\n'
+        b'\$5\r\nCOUNT\r\n'
+        b'\$' + str(len(count_str)).encode() + b'\r\n' + count_str + b'\r\n'
+    )
+    sock.sendall(cmd)
+    # Read RESP array response
+    buf = b''
+    while b'\r\n' not in buf:
+        buf += sock.recv(4096)
+    # Parse array header (*N)
+    header, rest = buf.split(b'\r\n', 1)
+    n_elems = int(header[1:])
+    buf = rest
+    elements = []
+    for _ in range(n_elems):
+        # Read bulk string: \$len\r\ndata\r\n
+        while b'\r\n' not in buf:
+            buf += sock.recv(4096)
+        line, buf = buf.split(b'\r\n', 1)
+        slen = int(line[1:])
+        while len(buf) < slen + 2:
+            buf += sock.recv(4096)
+        elements.append(buf[:slen].decode('utf-8', errors='replace'))
+        buf = buf[slen+2:]
+    return elements
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect(('127.0.0.1', int(port)))
+
 for i in range(n_queries):
     qblob = qdata[i*bytes_per:(i+1)*bytes_per]
 
     start = time.perf_counter()
-    result = subprocess.run(
-        ['redis-cli', '-p', port, 'VSIM', 'vecset', 'FP32', qblob, 'COUNT', str(k)],
-        capture_output=True, text=True
-    )
+    lines = redis_query(sock, qblob, k)
     end = time.perf_counter()
     latencies.append((end - start) * 1000)  # ms
 
     # Parse results
-    lines = result.stdout.strip().split('\n')
     ids = []
     for line in lines:
         if line.startswith('vec:'):
             ids.append(int(line.split(':')[1]))
     results_for_recall.append(ids)
+
+sock.close()
 
 latencies.sort()
 p50 = latencies[len(latencies)//2]
@@ -223,7 +266,8 @@ print(f'Redis recall@{k}: {avg_recall:.4f}')
 
 REDIS_RSS_SEARCH=$(get_rss_mb "$REDIS_PID")
 echo "Redis RSS after search: ${REDIS_RSS_SEARCH} MB"
-redis-cli -p $REDIS_PORT SHUTDOWN NOSAVE 2>/dev/null
+[ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
+REDIS_PID=""
 
 # ═══════════════════════════════════════════════════════════════════════
 # BENCHMARK 2: QDRANT (Docker)

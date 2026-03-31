@@ -807,13 +807,9 @@ pub async fn broadcast_vector_command(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
-    // LOCAL: execute directly on this shard's VectorStore
-    let local_result = {
-        let mut vs = shard_databases.vector_store(my_shard);
-        crate::shard::spsc_handler::dispatch_vector_command(&mut vs, &command)
-    };
-
-    // REMOTE: send to all other shards via SPSC
+    // REMOTE FIRST: send to all other shards via SPSC before local mutation.
+    // This ensures we detect remote failures before committing locally,
+    // avoiding partial index metadata across the cluster.
     let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
         if target == my_shard {
@@ -828,13 +824,24 @@ pub async fn broadcast_vector_command(
         receivers.push(reply_rx);
     }
 
-    // Check remote results for errors
+    // Collect remote results — fail if any shard errors or disconnects
     for rx in receivers {
         match rx.recv().await {
             Ok(Frame::Error(e)) => return Frame::Error(e),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR vector command failed: cross-shard reply channel closed",
+                ));
+            }
             _ => {}
         }
     }
+
+    // LOCAL: execute only after all remote shards succeeded
+    let local_result = {
+        let mut vs = shard_databases.vector_store(my_shard);
+        crate::shard::spsc_handler::dispatch_vector_command(&mut vs, &command)
+    };
     local_result
 }
 

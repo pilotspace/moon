@@ -24,9 +24,9 @@ N_QUERIES="${3:-200}"
 K=10
 EF=128
 
-MOON_PORT=6379
-REDIS_PORT=6400
-QDRANT_PORT=6333
+MOON_PORT=16379
+REDIS_PORT=16400
+QDRANT_PORT=16333
 
 RESULTS_DIR="target/bench-results"
 DATA_DIR="target/bench-data"
@@ -40,11 +40,12 @@ mkdir -p "$RESULTS_DIR" "$DATA_DIR"
 
 # ── Cleanup Trap ─────────────────────────────────────────────────────────
 MOON_PID=""
+REDIS_PID=""
 cleanup() {
     echo ""
     echo ">>> Cleaning up..."
     [ -n "$MOON_PID" ] && kill "$MOON_PID" 2>/dev/null && wait "$MOON_PID" 2>/dev/null || true
-    redis-cli -p "$REDIS_PORT" SHUTDOWN NOSAVE 2>/dev/null || true
+    [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null && wait "$REDIS_PID" 2>/dev/null || true
     docker rm -f qdrant-bench 2>/dev/null || true
     echo ">>> Cleanup complete."
 }
@@ -98,9 +99,9 @@ echo "================================================================="
 echo " MOON (Server Mode, port $MOON_PORT)"
 echo "================================================================="
 
-# Kill any existing Moon on that port
-redis-cli -p "$MOON_PORT" SHUTDOWN NOSAVE 2>/dev/null || true
-sleep 1
+# Kill any existing process on our benchmark port
+EXISTING_PID=$(lsof -ti :"$MOON_PORT" 2>/dev/null || true)
+[ -n "$EXISTING_PID" ] && kill "$EXISTING_PID" 2>/dev/null && sleep 1 || true
 
 # Use --shards 1 for correct FT.SEARCH results (multi-shard merge has known issues).
 # Single-shard gives best per-key throughput for non-pipelined workloads anyway.
