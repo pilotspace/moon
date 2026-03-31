@@ -366,9 +366,9 @@ pub fn search_local_filtered(
     // Auto-compact mutable → HNSW if threshold reached (lazy, first search only).
     idx.try_compact();
 
-    // Higher ef compensates for TQ-4bit quantization distortion in HNSW beam search.
-    // TQ-ADC fetches ef candidates, sub-centroid reranking selects top-k.
-    let ef_search = (k * 20).max(300).min(800);
+    // Sub-centroid 32-level LUT in beam gives higher accuracy per candidate,
+    // so we can use lower ef while maintaining recall. Saves ~30% candidates.
+    let ef_search = (k * 15).max(200).min(500);
 
     let filter_bitmap = filter.map(|f| {
         let total = idx.segments.total_vectors();

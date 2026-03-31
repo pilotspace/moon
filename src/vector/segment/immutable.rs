@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
-use crate::vector::hnsw::search::{SearchScratch, hnsw_search, hnsw_search_filtered};
+use crate::vector::hnsw::search::{SearchScratch, hnsw_search, hnsw_search_filtered, hnsw_search_subcent};
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
@@ -91,23 +91,34 @@ impl ImmutableSegment {
         ef_search: usize,
         scratch: &mut SearchScratch,
     ) -> SmallVec<[SearchResult; 32]> {
-        let mut candidates = hnsw_search(
-            &self.graph,
-            self.vectors_tq.as_slice(),
-            query,
-            &self.collection_meta,
-            ef_search,
-            ef_search,
-            scratch,
-        );
-
-        // Prefer sub-centroid rerank (better recall, no QJL overhead).
-        // Fall back to TurboQuant_prod if sub-centroid data unavailable.
-        if !self.sub_centroid_signs.is_empty() {
-            self.rerank_with_sub_centroid(&mut candidates, query);
+        // Use sub-centroid signs during beam (32-level LUT) when available.
+        // This eliminates the separate rerank pass — beam itself is high-accuracy.
+        let mut candidates = if !self.sub_centroid_signs.is_empty() {
+            hnsw_search_subcent(
+                &self.graph,
+                self.vectors_tq.as_slice(),
+                query,
+                &self.collection_meta,
+                ef_search,
+                ef_search,
+                scratch,
+                &self.sub_centroid_signs,
+                self.sub_sign_bytes_per_vec,
+            )
         } else {
-            self.rerank_with_prod(&mut candidates, query);
-        }
+            let mut cands = hnsw_search(
+                &self.graph,
+                self.vectors_tq.as_slice(),
+                query,
+                &self.collection_meta,
+                ef_search,
+                ef_search,
+                scratch,
+            );
+            // Fallback: rerank with TQ_prod when no sub-centroid data
+            self.rerank_with_prod(&mut cands, query);
+            cands
+        };
         candidates.truncate(k);
         candidates
     }
@@ -130,11 +141,13 @@ impl ImmutableSegment {
             ef_search,
             scratch,
             allow_bitmap,
+            &self.sub_centroid_signs,
+            self.sub_sign_bytes_per_vec,
         );
 
-        if !self.sub_centroid_signs.is_empty() {
-            self.rerank_with_sub_centroid(&mut candidates, query);
-        } else {
+        // When sub-centroid signs are used in beam, no rerank needed.
+        // Only rerank if beam used standard 16-level scoring.
+        if self.sub_centroid_signs.is_empty() {
             self.rerank_with_prod(&mut candidates, query);
         }
         candidates.truncate(k);

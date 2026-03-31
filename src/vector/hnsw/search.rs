@@ -169,7 +169,25 @@ pub fn hnsw_search(
     ef_search: usize,
     scratch: &mut SearchScratch,
 ) -> SmallVec<[SearchResult; 32]> {
-    hnsw_search_filtered(graph, vectors_tq, query, collection, k, ef_search, scratch, None)
+    hnsw_search_filtered(graph, vectors_tq, query, collection, k, ef_search, scratch, None, &[], 0)
+}
+
+/// HNSW search with sub-centroid sign bits for 2× resolution scoring.
+///
+/// When sign bits are provided, builds a 32-entry LUT per query coordinate
+/// instead of 16. This eliminates the need for a separate rerank pass.
+pub fn hnsw_search_subcent(
+    graph: &HnswGraph,
+    vectors_tq: &[u8],
+    query: &[f32],
+    collection: &CollectionMetadata,
+    k: usize,
+    ef_search: usize,
+    scratch: &mut SearchScratch,
+    sub_centroid_signs: &[u8],
+    sub_sign_bytes_per_vec: usize,
+) -> SmallVec<[SearchResult; 32]> {
+    hnsw_search_filtered(graph, vectors_tq, query, collection, k, ef_search, scratch, None, sub_centroid_signs, sub_sign_bytes_per_vec)
 }
 
 /// HNSW search with optional filter bitmap (ACORN 2-hop expansion).
@@ -188,6 +206,8 @@ pub fn hnsw_search_filtered(
     ef_search: usize,
     scratch: &mut SearchScratch,
     allow_bitmap: Option<&RoaringBitmap>,
+    sub_centroid_signs: &[u8],
+    sub_sign_bpv: usize,
 ) -> SmallVec<[SearchResult; 32]> {
     let num_nodes = graph.num_nodes();
     if num_nodes == 0 {
@@ -225,25 +245,50 @@ pub fn hnsw_search_filtered(
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
     let codebook = collection.codebook_16();
+    let use_subcent = !sub_centroid_signs.is_empty() && sub_sign_bpv > 0;
 
-    // Pre-compute per-query distance LUT: lut[j * 16 + idx] = (q_rot[j] - centroid[idx])²
-    // Converts the inner ADC loop from multiply-subtract-square to a single table lookup.
-    // Size: padded * 16 * 4 = 64 KB at 1024d — fits in L1/L2 cache.
+    // Pre-compute per-query distance LUT.
+    //
+    // When sub-centroid signs available: 32-entry LUT (idx*2 + sign_bit) per coordinate.
+    // Otherwise: 16-entry standard LUT per coordinate.
+    //
+    // Optimization: only compute LUT for dim coordinates (not padded zeros).
+    // The padded coordinates (dim..padded) have q_rot[j]=0, so their LUT entries
+    // would be centroid[c]² — a constant per index. We precompute the per-index
+    // constant offset and add it once per candidate.
+    let original_dim = query.len();
     let padded_dim = q_rotated.len();
-    let mut adc_lut = Vec::with_capacity(padded_dim * 16);
-    for j in 0..padded_dim {
-        let q = q_rotated[j];
-        for c in 0..16 {
-            let d = q - codebook[c];
-            adc_lut.push(d * d);
+    let active_code_bytes = original_dim / 2; // nibble-packed bytes for original dim
+    let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
+
+    let sub_table = collection.sub_centroid_table.as_ref();
+    let mut adc_lut = Vec::with_capacity(padded_dim * entries_per_coord);
+
+    if use_subcent {
+        let st = sub_table.unwrap();
+        for j in 0..padded_dim {
+            let q = q_rotated[j];
+            for e in 0..32 {
+                let d = q - st.table[e];
+                adc_lut.push(d * d);
+            }
+        }
+    } else {
+        for j in 0..padded_dim {
+            let q = q_rotated[j];
+            for c in 0..16 {
+                let d = q - codebook[c];
+                adc_lut.push(d * d);
+            }
         }
     }
 
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;
     let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 bytes are norm)
+    let epc = entries_per_coord;
 
-    // LUT-based unbounded distance. Inner loop: 1 table lookup + 1 add per coordinate.
+    // LUT-based unbounded distance with optional sub-centroid scoring.
     let dist_bfs = |bfs_pos: u32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
         let code_only = &vectors_tq[offset..offset + code_len];
@@ -252,10 +297,22 @@ pub fn hnsw_search_filtered(
         let norm_sq = norm * norm;
         let mut sum0 = 0.0f32;
         let mut sum1 = 0.0f32;
-        for (i, &byte) in code_only.iter().enumerate() {
-            let qi = i * 2;
-            sum0 += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-            sum1 += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+
+        if use_subcent {
+            let sign_off = bfs_pos as usize * sub_sign_bpv;
+            for (i, &byte) in code_only.iter().enumerate() {
+                let qi = i * 2;
+                let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
+                let s_hi = ((sub_centroid_signs[sign_off + (qi+1) / 8] >> ((qi+1) % 8)) & 1) as usize;
+                sum0 += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
+                sum1 += adc_lut[(qi+1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+            }
+        } else {
+            for (i, &byte) in code_only.iter().enumerate() {
+                let qi = i * 2;
+                sum0 += adc_lut[qi * 16 + (byte & 0x0F) as usize];
+                sum1 += adc_lut[(qi+1) * 16 + (byte >> 4) as usize];
+            }
         }
         (sum0 + sum1) * norm_sq
     };
@@ -273,24 +330,52 @@ pub fn hnsw_search_filtered(
         let check_interval = 16;
         let chunks = code_only.len() / check_interval;
         let remainder = code_only.len() % check_interval;
-        for chunk in 0..chunks {
-            let base = chunk * check_interval;
-            for j in 0..check_interval {
-                let i = base + j;
+
+        if use_subcent {
+            let sign_off = bfs_pos as usize * sub_sign_bpv;
+            for chunk in 0..chunks {
+                let base = chunk * check_interval;
+                for j in 0..check_interval {
+                    let i = base + j;
+                    let byte = code_only[i];
+                    let qi = i * 2;
+                    let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
+                    let s_hi = ((sub_centroid_signs[sign_off + (qi+1) / 8] >> ((qi+1) % 8)) & 1) as usize;
+                    sum += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
+                    sum += adc_lut[(qi+1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+                }
+                if sum > scaled_budget { return f32::MAX; }
+            }
+            let tail = chunks * check_interval;
+            for j in 0..remainder {
+                let i = tail + j;
+                let byte = code_only[i];
+                let qi = i * 2;
+                let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
+                let s_hi = ((sub_centroid_signs[sign_off + (qi+1) / 8] >> ((qi+1) % 8)) & 1) as usize;
+                sum += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
+                sum += adc_lut[(qi+1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+            }
+        } else {
+            for chunk in 0..chunks {
+                let base = chunk * check_interval;
+                for j in 0..check_interval {
+                    let i = base + j;
+                    let byte = code_only[i];
+                    let qi = i * 2;
+                    sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
+                    sum += adc_lut[(qi+1) * 16 + (byte >> 4) as usize];
+                }
+                if sum > scaled_budget { return f32::MAX; }
+            }
+            let tail = chunks * check_interval;
+            for j in 0..remainder {
+                let i = tail + j;
                 let byte = code_only[i];
                 let qi = i * 2;
                 sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+                sum += adc_lut[(qi+1) * 16 + (byte >> 4) as usize];
             }
-            if sum > scaled_budget { return f32::MAX; }
-        }
-        let tail = chunks * check_interval;
-        for j in 0..remainder {
-            let i = tail + j;
-            let byte = code_only[i];
-            let qi = i * 2;
-            sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-            sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
         }
         sum * norm_sq
     };
@@ -880,7 +965,7 @@ mod tests {
         let mut scratch = SearchScratch::new(n as u32, padded);
 
         let unfiltered = hnsw_search(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch);
-        let filtered = hnsw_search_filtered(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch, None);
+        let filtered = hnsw_search_filtered(&graph, &tq_buf, &vectors[0], &collection, k, ef, &mut scratch, None, &[], 0);
 
         assert_eq!(unfiltered.len(), filtered.len());
         for (u, f) in unfiltered.iter().zip(filtered.iter()) {
@@ -907,7 +992,7 @@ mod tests {
         let mut query = lcg_f32(dim, 99999);
         normalize(&mut query);
 
-        let results = hnsw_search_filtered(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch, Some(&bitmap));
+        let results = hnsw_search_filtered(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch, Some(&bitmap), &[], 0);
         for r in &results {
             assert!(bitmap.contains(r.id.0), "result id {} not in bitmap", r.id.0);
         }
