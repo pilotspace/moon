@@ -103,3 +103,47 @@ pub fn try_gpu_batch_fwht(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gpu_fwht_fallback_no_panic() {
+        // Verifies the try_* wrapper returns false (not panic) when GPU unavailable.
+        let mut vectors = vec![1.0f32; 1024];
+        let sign_flips = vec![1.0f32; 1024];
+        let result = try_gpu_batch_fwht(&mut vectors, &sign_flips, 1024);
+        // On CI without GPU: result is false. On GPU machine: result is true.
+        // Either way, no panic.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_gpu_hnsw_fallback_no_panic() {
+        // Verifies try_gpu_build_hnsw returns None (not panic) when GPU unavailable.
+        let dim = 128;
+        let n = 100;
+        let vectors = vec![0.0f32; n * dim];
+        let result = try_gpu_build_hnsw(&vectors, dim, 16, 200, 42);
+        // On CI: None (either CudaNotAvailable or below MIN_VECTORS_FOR_GPU).
+        // On GPU machine with gpu-cagra: may still be None (100 < 10000 threshold).
+        let _ = result;
+    }
+
+    #[test]
+    fn test_gpu_context_availability_check() {
+        // GpuContext::is_available() should not panic regardless of CUDA presence.
+        let available = GpuContext::is_available();
+        // Just verify it returns a bool without crashing.
+        let _ = available;
+    }
+
+    #[test]
+    fn test_min_batch_thresholds() {
+        // MIN_BATCH_FOR_GPU is from fwht_kernel.rs (gpu-cuda).
+        assert_eq!(MIN_BATCH_FOR_GPU, 1_000);
+        // MIN_VECTORS_FOR_GPU is from cagra.rs (also gpu-cuda, not gated behind gpu-cagra).
+        assert_eq!(MIN_VECTORS_FOR_GPU, 10_000);
+    }
+}
