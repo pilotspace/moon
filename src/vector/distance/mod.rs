@@ -72,7 +72,7 @@ pub fn init() {
                         // SAFETY: AVX-512F verified by is_x86_feature_detected! above.
                         unsafe { avx512::cosine_f32(a, b) }
                     },
-                    tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+                    tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_fast,
                 };
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -93,7 +93,7 @@ pub fn init() {
                         // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
                         unsafe { avx2::cosine_f32(a, b) }
                     },
-                    tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+                    tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_fast,
                 };
             }
         }
@@ -119,7 +119,7 @@ pub fn init() {
                     // SAFETY: NEON is guaranteed on AArch64.
                     unsafe { neon::cosine_f32(a, b) }
                 },
-                tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+                tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_fast,
             };
         }
 
@@ -130,7 +130,7 @@ pub fn init() {
             l2_i8: scalar::l2_i8,
             dot_f32: scalar::dot_f32,
             cosine_f32: scalar::cosine_f32,
-            tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+            tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_fast,
         }
     });
 }
