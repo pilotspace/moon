@@ -147,29 +147,29 @@ pub struct TqProdQueryState {
 
 /// Precompute query state for M-projection TurboQuant_prod scoring.
 ///
-/// Uses SRHT: S_m · y = FWHT(D_m · y), where D_m is a diagonal ±1 matrix.
-/// Cost: O(M × d log d) instead of O(M × d²). Done once per query.
+/// Uses dense Gaussian S_m · y (required for QJL unbiasedness proof).
+/// Cost: O(M × d²) per query. At M=4, d=768: ~2.4M ops, ~0.4ms on M4.
+/// Done once per query, amortized across all candidates.
 pub fn prepare_query_prod(
     query: &[f32],
-    qjl_diagonals: &[Vec<f32>],
+    qjl_matrices: &[Vec<f32>],
     sign_flips: &[f32],
     padded_dim: usize,
 ) -> TqProdQueryState {
     let dim = query.len();
 
-    // 1. Compute S_m * y = FWHT(D_m * y) for each projection — O(M × d log d)
-    let s_y_list: Vec<Vec<f32>> = qjl_diagonals.iter().map(|diag| {
-        // Zero-pad query to padded_dim, apply diagonal, FWHT
-        let mut buf = vec![0.0f32; padded_dim];
-        for i in 0..dim {
-            buf[i] = query[i] * diag[i];
+    // 1. Compute S_m * y for each projection — O(M × d²) total
+    let s_y_list: Vec<Vec<f32>> = qjl_matrices.iter().map(|matrix| {
+        let mut s_y = vec![0.0f32; dim];
+        for row in 0..dim {
+            let row_start = row * dim;
+            let mut dot = 0.0f32;
+            for col in 0..dim {
+                dot += matrix[row_start + col] * query[col];
+            }
+            s_y[row] = dot;
         }
-        // Apply FWHT (in-place, O(d log d))
-        super::fwht::fwht_scalar(&mut buf);
-        super::fwht::normalize_fwht(&mut buf);
-        // Return first dim elements (the projection output)
-        buf.truncate(dim);
-        buf
+        s_y
     }).collect();
 
     // 2. Compute FWHT-rotated query

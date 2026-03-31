@@ -72,17 +72,17 @@ pub struct CollectionMetadata {
     /// XXHash64 of all fields above. Verified at load and search init.
     pub metadata_checksum: u64,
 
-    /// QJL projection sign flips for structured random projections (SRHT).
+    /// QJL dense Gaussian projection matrices for unbiased inner product estimation.
     ///
-    /// Instead of dense d×d Gaussian matrices (O(d²) storage + compute),
-    /// use S_m = FWHT · D_m where D_m = diag(±1). This gives O(d log d)
-    /// projection via S_m · x = FWHT(D_m · x).
+    /// The QJL unbiasedness proof requires rows sᵢ ~ N(0, I) so that
+    /// (sᵢᵀx, sᵢᵀy) is jointly Gaussian. SRHT violates this assumption
+    /// and introduces bias. Dense Gaussian is mathematically correct.
     ///
-    /// M independent diagonal sign vectors (M × padded_dim elements).
-    /// Memory: M × padded_dim × 4 bytes (e.g., M=4 × 1024 × 4 = 16 KB at 768d).
-    /// Compare: dense Gaussian would be M × d² × 4 = 9 MB.
-    pub qjl_diagonals: Vec<Vec<f32>>,
+    /// M independent d×d matrices. Memory: M × d² × 4 bytes.
+    /// M=4 at 768d = 9 MB shared. M=8 for 95%+ recall = 18 MB.
+    pub qjl_matrices: Vec<Vec<f32>>,
     /// Number of QJL projections (M). Higher M = lower variance = better recall.
+    /// M=4: ~91% recall. M=8: ~95% recall.
     pub qjl_num_projections: usize,
 }
 
@@ -126,25 +126,20 @@ impl CollectionMetadata {
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
-        // Generate M diagonal sign vectors for structured QJL projections (SRHT).
-        // S_m · x = FWHT(D_m · x), where D_m = diag(qjl_diagonals[m]).
-        // O(d log d) per projection instead of O(d²) with dense Gaussian.
-        // M=4 gives ~91% recall. Memory: M × padded_dim × 4 bytes (16 KB at 768d).
-        const QJL_NUM_PROJECTIONS: usize = 4;
-        let (qjl_diagonals, qjl_num_projections) = if quantization.is_turbo_quant() {
-            let diags: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
+        // Generate M dense Gaussian QJL matrices for unbiased inner product scoring.
+        // Dense Gaussian required — SRHT violates joint Gaussianity for E[V·sign(U)].
+        // M=4: ~91% recall, 9 MB at 768d. M=8: ~95% recall, 18 MB.
+        const QJL_NUM_PROJECTIONS: usize = 8;
+        let (qjl_matrices, qjl_num_projections) = if quantization.is_turbo_quant() {
+            let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
                 .map(|m| {
-                    let mut diag = vec![0.0f32; padded as usize];
-                    let mut rng_state = seed.wrapping_add(100 + m as u64);
-                    for val in diag.iter_mut() {
-                        rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005)
-                            .wrapping_add(1_442_695_040_888_963_407);
-                        *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
-                    }
-                    diag
+                    super::qjl::generate_qjl_matrix(
+                        dimension as usize,
+                        seed.wrapping_add(1 + m as u64),
+                    )
                 })
                 .collect();
-            (diags, QJL_NUM_PROJECTIONS)
+            (matrices, QJL_NUM_PROJECTIONS)
         } else {
             (Vec::new(), 0)
         };
@@ -170,7 +165,7 @@ impl CollectionMetadata {
                 Vec::new()
             },
             metadata_checksum: 0, // computed below
-            qjl_diagonals,
+            qjl_matrices,
             qjl_num_projections,
         };
         meta.metadata_checksum = meta.compute_checksum();
