@@ -14,7 +14,6 @@ use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::segment::ivf::IvfSegment;
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::turbo_quant::fwht;
-use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
 use crate::vector::types::{SearchResult, VectorId};
 
 use super::immutable::ImmutableSegment;
@@ -30,9 +29,8 @@ pub struct MvccContext<'a> {
     pub committed: &'a roaring::RoaringBitmap,
     /// Dirty set: uncommitted entries from the active transaction.
     pub dirty_set: &'a [MutableEntry],
-    /// TQ codes for dirty set entries (contiguous, bytes_per_code-strided).
-    pub dirty_tq_codes: &'a [u8],
-    pub dirty_bytes_per_code: usize,
+    /// f32 vectors for dirty set entries (contiguous, dimension-strided).
+    pub dirty_vectors_f32: &'a [f32],
     pub dimension: u32,
 }
 
@@ -124,23 +122,11 @@ impl SegmentHolder {
         let segment_count = 1 + snapshot.immutable.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
-        // Prepare FWHT-rotated query for mutable segment TQ-ADC search.
-        let collection = snapshot.mutable.collection();
-        let dim = query_f32.len();
-        let padded = collection.padded_dimension as usize;
-        let mut q_rot = vec![0.0f32; padded];
-        q_rot[..dim].copy_from_slice(query_f32);
-        let q_norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if q_norm > 0.0 {
-            let inv = 1.0 / q_norm;
-            for v in q_rot[..dim].iter_mut() { *v *= inv; }
-        }
-        fwht::fwht(&mut q_rot, collection.fwht_sign_flips.as_slice());
-        let codebook = collection.codebook_16();
-
+        // Mutable: f32 L2 brute force (perfect recall).
+        // Immutable: TQ-ADC HNSW + f32 reranking (98.6%+ recall).
         match strategy {
             FilterStrategy::Unfiltered => {
-                all.extend(snapshot.mutable.brute_force_search(&q_rot, codebook, k));
+                all.extend(snapshot.mutable.brute_force_search(query_f32, k));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, ef_search, _scratch));
                 }
@@ -148,7 +134,7 @@ impl SegmentHolder {
             FilterStrategy::BruteForceFiltered => {
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(&q_rot, codebook, k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
@@ -162,7 +148,7 @@ impl SegmentHolder {
             FilterStrategy::HnswFiltered => {
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(&q_rot, codebook, k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_filtered(
                         query_f32,
@@ -177,7 +163,7 @@ impl SegmentHolder {
                 let oversample_k = k * 3;
                 all.extend(snapshot
                     .mutable
-                    .brute_force_search_filtered(&q_rot, codebook, oversample_k, filter_bitmap));
+                    .brute_force_search_filtered(query_f32, oversample_k, filter_bitmap));
                 for imm in &snapshot.immutable {
                     let imm_results = imm.search(
                         query_f32,
@@ -269,24 +255,9 @@ impl SegmentHolder {
     ) -> SmallVec<[SearchResult; 32]> {
         let snapshot = self.load();
 
-        // Prepare FWHT-rotated query for mutable segment TQ-ADC.
-        let collection = snapshot.mutable.collection();
-        let dim = query_f32.len();
-        let padded = collection.padded_dimension as usize;
-        let mut q_rot = vec![0.0f32; padded];
-        q_rot[..dim].copy_from_slice(query_f32);
-        let q_norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if q_norm > 0.0 {
-            let inv = 1.0 / q_norm;
-            for v in q_rot[..dim].iter_mut() { *v *= inv; }
-        }
-        fwht::fwht(&mut q_rot, collection.fwht_sign_flips.as_slice());
-        let codebook = collection.codebook_16();
-
-        // 1. MVCC-aware brute-force on mutable segment (TQ-ADC distance)
+        // 1. MVCC-aware brute-force on mutable segment (f32 L2 — perfect recall)
         let mut all = snapshot.mutable.brute_force_search_mvcc(
-            &q_rot,
-            codebook,
+            query_f32,
             k,
             filter_bitmap,
             mvcc.snapshot_lsn,
@@ -351,10 +322,10 @@ impl SegmentHolder {
             }
         }
 
-        // 3. Brute-force scan dirty set entries (TQ-ADC distance).
+        // 3. Brute-force scan dirty set entries (f32 L2 distance).
         if !mvcc.dirty_set.is_empty() {
-            let bpc = mvcc.dirty_bytes_per_code;
-            let code_len = bpc - 4;
+            let dim = mvcc.dimension as usize;
+            let l2_f32 = crate::vector::distance::table().l2_f32;
 
             for (idx, entry) in mvcc.dirty_set.iter().enumerate() {
                 if entry.delete_lsn != 0 {
@@ -365,10 +336,9 @@ impl SegmentHolder {
                         continue;
                     }
                 }
-                let offset = idx * bpc;
-                let code_slice = &mvcc.dirty_tq_codes[offset..offset + code_len];
-                let norm = entry.norm;
-                let dist = tq_l2_adc_scaled(&q_rot, code_slice, norm, codebook);
+                let offset = idx * dim;
+                let vec_f32 = &mvcc.dirty_vectors_f32[offset..offset + dim];
+                let dist = l2_f32(query_f32, vec_f32);
                 all.push(SearchResult::new(dist, VectorId(entry.internal_id)));
             }
         }
@@ -565,8 +535,7 @@ mod tests {
             my_txn_id: 0,
             committed: &committed,
             dirty_set: &[],
-            dirty_tq_codes: &[],
-            dirty_bytes_per_code: padded / 2 + 4,
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
         let mvcc = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
@@ -600,8 +569,7 @@ mod tests {
             my_txn_id: 99,
             committed: &committed,
             dirty_set: &[],
-            dirty_tq_codes: &[],
-            dirty_bytes_per_code: padded / 2 + 4,
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
@@ -658,8 +626,7 @@ mod tests {
             my_txn_id: 42,
             committed: &committed,
             dirty_set: std::slice::from_ref(&dirty_entry),
-            dirty_tq_codes: &dirty_tq_bytes,
-            dirty_bytes_per_code: bytes_per_code,
+            dirty_vectors_f32: &dirty_f32,
             dimension: dim as u32,
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
@@ -694,8 +661,7 @@ mod tests {
             my_txn_id: 99,
             committed: &committed,
             dirty_set: &[],
-            dirty_tq_codes: &[],
-            dirty_bytes_per_code: padded / 2 + 4,
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
         let r1 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty);
@@ -706,8 +672,7 @@ mod tests {
             my_txn_id: 99,
             committed: &committed,
             dirty_set: &[],
-            dirty_tq_codes: &[],
-            dirty_bytes_per_code: padded / 2 + 4,
+            dirty_vectors_f32: &[],
             dimension: dim as u32,
         };
         let r2 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty2);

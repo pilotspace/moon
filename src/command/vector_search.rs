@@ -372,14 +372,12 @@ pub fn search_local_filtered(
     });
 
     let empty_committed = roaring::RoaringBitmap::new();
-    let padded = idx.meta.padded_dimension as usize;
     let mvcc_ctx = crate::vector::segment::holder::MvccContext {
         snapshot_lsn: 0,
         my_txn_id: 0,
         committed: &empty_committed,
         dirty_set: &[],
-        dirty_tq_codes: &[],
-        dirty_bytes_per_code: padded / 2 + 4,
+        dirty_vectors_f32: &[],
         dimension: idx.meta.dimension,
     };
 

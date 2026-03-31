@@ -146,30 +146,29 @@ impl MutableSegment {
         internal_id
     }
 
-    /// Brute-force search using TQ-ADC distance on pre-rotated query.
+    /// Brute-force search using exact f32 L2 distance.
     ///
-    /// `q_rotated`: FWHT-rotated, normalized query (padded_dim length).
-    /// `codebook`: dimension-scaled centroids from CollectionMetadata.
+    /// TQ codes are stored for compaction/HNSW build. Search uses f32 directly
+    /// for perfect recall. TQ-ADC ranking error (std ≈ 0.4) exceeds the NN
+    /// distance gap (0.04) at 768d, making it unsuitable for final ranking.
     pub fn brute_force_search(
         &self,
-        q_rotated: &[f32],
-        codebook: &[f32; 16],
+        query_f32: &[f32],
         k: usize,
     ) -> SmallVec<[SearchResult; 32]> {
-        self.brute_force_search_filtered(q_rotated, codebook, k, None)
+        self.brute_force_search_filtered(query_f32, k, None)
     }
 
-    /// Brute-force filtered search using TQ-ADC distance.
+    /// Brute-force filtered search using f32 L2 distance.
     pub fn brute_force_search_filtered(
         &self,
-        q_rotated: &[f32],
-        codebook: &[f32; 16],
+        query_f32: &[f32],
         k: usize,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
-        let bytes_per_code = inner.bytes_per_code;
-        let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 = norm)
+        let dim = inner.dimension as usize;
+        let l2_f32 = crate::vector::distance::table().l2_f32;
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
@@ -182,10 +181,9 @@ impl MutableSegment {
                     continue;
                 }
             }
-            let offset = entry.internal_id as usize * bytes_per_code;
-            let code_slice = &inner.tq_codes[offset..offset + code_len];
-            let norm = entry.norm;
-            let dist = tq_l2_adc_scaled(q_rotated, code_slice, norm, codebook);
+            let offset = entry.internal_id as usize * dim;
+            let vec_f32 = &inner.vectors_f32[offset..offset + dim];
+            let dist = l2_f32(query_f32, vec_f32);
 
             if heap.len() < k {
                 heap.push(DistF32(dist, entry.internal_id));
@@ -203,11 +201,10 @@ impl MutableSegment {
             .collect()
     }
 
-    /// MVCC-aware brute-force search using TQ-ADC distance.
+    /// MVCC-aware brute-force search using f32 L2 distance.
     pub fn brute_force_search_mvcc(
         &self,
-        q_rotated: &[f32],
-        codebook: &[f32; 16],
+        query_f32: &[f32],
         k: usize,
         allow_bitmap: Option<&RoaringBitmap>,
         snapshot_lsn: u64,
@@ -215,8 +212,8 @@ impl MutableSegment {
         committed: &RoaringBitmap,
     ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
-        let bytes_per_code = inner.bytes_per_code;
-        let code_len = bytes_per_code - 4;
+        let dim = inner.dimension as usize;
+        let l2_f32 = crate::vector::distance::table().l2_f32;
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
@@ -236,10 +233,9 @@ impl MutableSegment {
                     continue;
                 }
             }
-            let offset = entry.internal_id as usize * bytes_per_code;
-            let code_slice = &inner.tq_codes[offset..offset + code_len];
-            let norm = entry.norm;
-            let dist = tq_l2_adc_scaled(q_rotated, code_slice, norm, codebook);
+            let offset = entry.internal_id as usize * dim;
+            let vec_f32 = &inner.vectors_f32[offset..offset + dim];
+            let dist = l2_f32(query_f32, vec_f32);
 
             if heap.len() < k {
                 heap.push(DistF32(dist, entry.internal_id));
@@ -434,7 +430,7 @@ mod tests {
 
         let q_rot = rotate_query(&vectors[0], &col);
         let codebook = col.codebook_16();
-        let results = seg.brute_force_search(&q_rot, codebook, 3);
+        let results = seg.brute_force_search(&vectors[0], 3);
 
         assert!(results.len() <= 3);
         // First result should be vector 0 (nearest to itself)
@@ -457,9 +453,7 @@ mod tests {
 
         seg.mark_deleted(0, 10);
 
-        let q_rot = rotate_query(&v0, &col);
-        let codebook = col.codebook_16();
-        let results = seg.brute_force_search(&q_rot, codebook, 3);
+        let results = seg.brute_force_search(&v0, 3);
         for r in &results {
             assert_ne!(r.id.0, 0, "deleted vector should not appear");
         }
@@ -515,8 +509,8 @@ mod tests {
         let codebook = col.codebook_16();
         let committed = roaring::RoaringBitmap::new();
 
-        let non_mvcc = seg.brute_force_search(&q_rot, codebook, 3);
-        let mvcc = seg.brute_force_search_mvcc(&q_rot, codebook, 3, None, 0, 0, &committed);
+        let non_mvcc = seg.brute_force_search(&vectors[0], 3);
+        let mvcc = seg.brute_force_search_mvcc(&vectors[0], 3, None, 0, 0, &committed);
 
         assert_eq!(non_mvcc.len(), mvcc.len());
         for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {
