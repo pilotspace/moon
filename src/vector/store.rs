@@ -43,6 +43,8 @@ pub struct IndexMeta {
     pub key_prefixes: Vec<Bytes>,
     /// Quantization algorithm. Default: TurboQuant4.
     pub quantization: QuantizationConfig,
+    /// Build mode: Light (fast, less memory) or Exact (higher recall).
+    pub build_mode: crate::vector::turbo_quant::collection::BuildMode,
 }
 
 /// A single vector index: meta + segments + scratch + collection config.
@@ -180,12 +182,13 @@ impl VectorStore {
         self.next_collection_id += 1;
 
         let padded = padded_dimension(meta.dimension);
-        let collection = Arc::new(CollectionMetadata::new(
+        let collection = Arc::new(CollectionMetadata::with_build_mode(
             collection_id,
             meta.dimension,
             meta.metric,
             meta.quantization,
             collection_id, // use collection_id as seed for determinism
+            meta.build_mode,
         ));
         let segments = SegmentHolder::new(meta.dimension, collection.clone());
         let scratch = SearchScratch::new(0, padded);
@@ -309,6 +312,7 @@ mod tests {
             source_field: Bytes::from_static(b"vec"),
             key_prefixes: prefixes.iter().map(|p| Bytes::from(p.to_string())).collect(),
             quantization: QuantizationConfig::TurboQuant4,
+            build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
         }
     }
 
@@ -325,6 +329,7 @@ mod tests {
             source_field: Bytes::from_static(b"vec"),
             key_prefixes: vec![Bytes::from_static(b"doc:")],
             quantization: quant,
+            build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
         }
     }
 

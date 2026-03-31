@@ -92,6 +92,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     let mut hnsw_ef_runtime: u32 = 0; // 0 = auto
     let mut compact_threshold: u32 = 0; // 0 = default (1000)
     let mut quantization = QuantizationConfig::TurboQuant4;
+    let mut build_mode = crate::vector::turbo_quant::collection::BuildMode::Light;
 
     let param_end = pos + num_params;
     while pos + 1 < param_end && pos + 1 < args.len() {
@@ -154,6 +155,19 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 None => return Frame::Error(Bytes::from_static(b"ERR invalid COMPACT_THRESHOLD value")),
             };
             pos += 1;
+        } else if key.eq_ignore_ascii_case(b"BUILD_MODE") {
+            let val = match extract_bulk(&args[pos]) {
+                Some(v) => v,
+                None => return Frame::Error(Bytes::from_static(b"ERR invalid BUILD_MODE value")),
+            };
+            build_mode = if val.eq_ignore_ascii_case(b"LIGHT") {
+                crate::vector::turbo_quant::collection::BuildMode::Light
+            } else if val.eq_ignore_ascii_case(b"EXACT") {
+                crate::vector::turbo_quant::collection::BuildMode::Exact
+            } else {
+                return Frame::Error(Bytes::from_static(b"ERR BUILD_MODE must be LIGHT or EXACT"));
+            };
+            pos += 1;
         } else if key.eq_ignore_ascii_case(b"QUANTIZATION") {
             let val = match extract_bulk(&args[pos]) {
                 Some(v) => v,
@@ -195,6 +209,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         source_field,
         key_prefixes: prefixes,
         quantization,
+        build_mode,
     };
 
     match store.create_index(meta) {
