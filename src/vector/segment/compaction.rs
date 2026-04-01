@@ -550,8 +550,9 @@ pub fn compact(
         Vec::new()
     };
 
-    let graph = if need_cpu_build && has_raw && n >= PARALLEL_THRESHOLD {
-        // Cell-parallel HNSW construction for large segments
+    // Cell-parallel disabled: 2-coordinate spatial partitioning is meaningless at 384d+
+    // and produces poorly stitched graphs. TODO: replace with random partitioning or PCA.
+    let graph = if false && need_cpu_build && has_raw && n >= PARALLEL_THRESHOLD {
         compact_parallel(&live_f32, &tq_buffer_orig, bytes_per_code, dim, seed)
     } else if need_cpu_build {
         let dist_table = crate::vector::distance::table();
