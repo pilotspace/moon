@@ -1033,8 +1033,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32) as usize;
         let signs = test_sign_flips(padded, 42);
-        let boundaries = scaled_boundaries_n(padded as u32, 1);
-        let centroids = scaled_centroids_n(padded as u32, 1);
+        let boundaries = scaled_boundaries_n(padded as u32, 1).unwrap();
+        let centroids = scaled_centroids_n(padded as u32, 1).unwrap();
         let mut work = vec![0.0f32; padded];
 
         let mut v = lcg_f32(dim, 99);
@@ -1062,8 +1062,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32) as usize;
         let signs = test_sign_flips(padded, 42);
-        let boundaries = scaled_boundaries_n(padded as u32, 2);
-        let centroids = scaled_centroids_n(padded as u32, 2);
+        let boundaries = scaled_boundaries_n(padded as u32, 2).unwrap();
+        let centroids = scaled_centroids_n(padded as u32, 2).unwrap();
         let mut work = vec![0.0f32; padded];
 
         let mut v = lcg_f32(dim, 99);
@@ -1090,8 +1090,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32) as usize;
         let signs = test_sign_flips(padded, 42);
-        let boundaries = scaled_boundaries_n(padded as u32, 3);
-        let centroids = scaled_centroids_n(padded as u32, 3);
+        let boundaries = scaled_boundaries_n(padded as u32, 3).unwrap();
+        let centroids = scaled_centroids_n(padded as u32, 3).unwrap();
         let mut work = vec![0.0f32; padded];
 
         let mut v = lcg_f32(dim, 99);
@@ -1120,8 +1120,8 @@ mod tests {
         let signs = test_sign_flips(padded, 42);
 
         for bits in [1u8, 2, 3] {
-            let boundaries = scaled_boundaries_n(padded as u32, bits);
-            let centroids = scaled_centroids_n(padded as u32, bits);
+            let boundaries = scaled_boundaries_n(padded as u32, bits).unwrap();
+            let centroids = scaled_centroids_n(padded as u32, bits).unwrap();
             let mut work_enc = vec![0.0f32; padded];
             let mut work_dec = vec![0.0f32; padded];
 
@@ -1197,8 +1197,8 @@ mod tests {
         let signs = test_sign_flips(padded, 42);
 
         for bits in [1u8, 2, 3] {
-            let boundaries = scaled_boundaries_n(padded as u32, bits);
-            let centroids = scaled_centroids_n(padded as u32, bits);
+            let boundaries = scaled_boundaries_n(padded as u32, bits).unwrap();
+            let centroids = scaled_centroids_n(padded as u32, bits).unwrap();
             let mut work = vec![0.0f32; padded];
 
             let mut v = lcg_f32(dim, 99);

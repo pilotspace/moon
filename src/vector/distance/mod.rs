@@ -141,14 +141,17 @@ pub fn init() {
 /// Returns the table initialized by [`init()`]. This is a single pointer load
 /// followed by a direct function call — at most 1 cache miss per call site.
 ///
-/// # Safety contract
-/// Caller must ensure [`init()`] has been called before the first call to `table()`.
-/// In practice, `init()` is called from `main()` at startup.
+/// Auto-initializes on first use if [`init()`] was not called explicitly.
+/// After the first call the hot path is two atomic loads (both always succeed).
 #[inline(always)]
 pub fn table() -> &'static DistanceTable {
+    if DISTANCE_TABLE.get().is_none() {
+        init();
+    }
+    // After init(), DISTANCE_TABLE is guaranteed to be set.
     DISTANCE_TABLE
         .get()
-        .expect("distance::init() must be called before table()")
+        .expect("distance table initialized by init()")
 }
 
 #[cfg(test)]

@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::Mutex;
+
+/// Serialize tests that touch global atomic metrics to avoid flaky interference.
+static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
 fn bulk(s: &[u8]) -> Frame {
     Frame::BulkString(Bytes::from(s.to_vec()))
@@ -636,8 +640,8 @@ fn test_vector_index_has_payload_index() {
 fn test_vector_metrics_increment_decrement() {
     use std::sync::atomic::Ordering;
 
-    // Capture before-snapshot immediately before each operation to handle
-    // parallel test interference on global atomics.
+    let _guard = METRICS_LOCK.lock().unwrap();
+
     let mut store = VectorStore::new();
     let args = ft_create_args();
 

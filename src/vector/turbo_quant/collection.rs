@@ -218,13 +218,19 @@ impl CollectionMetadata {
             fwht_sign_flips: sign_flips,
             codebook_version: CODEBOOK_VERSION,
             codebook: if quantization.is_turbo_quant() {
-                scaled_centroids_n(padded, quantization.bits())
+                scaled_centroids_n(padded, quantization.bits()).unwrap_or_else(|e| {
+                    tracing::error!("failed to compute codebook centroids: {e}");
+                    Vec::new()
+                })
             } else {
                 // SQ8 doesn't use codebooks -- store empty Vec
                 Vec::new()
             },
             codebook_boundaries: if quantization.is_turbo_quant() {
-                scaled_boundaries_n(padded, quantization.bits())
+                scaled_boundaries_n(padded, quantization.bits()).unwrap_or_else(|e| {
+                    tracing::error!("failed to compute codebook boundaries: {e}");
+                    Vec::new()
+                })
             } else {
                 Vec::new()
             },
@@ -284,7 +290,10 @@ impl CollectionMetadata {
         match self.codebook_boundaries.as_slice().try_into() {
             Ok(arr) => arr,
             Err(_) => {
-                // Construction invariant: should never happen for 4-bit quantization
+                tracing::error!(
+                    "codebook_boundaries has {} entries, expected 15 — construction invariant violated",
+                    self.codebook_boundaries.len()
+                );
                 static ZERO: [f32; 15] = [0.0; 15];
                 &ZERO
             }
@@ -299,7 +308,10 @@ impl CollectionMetadata {
         match self.codebook.as_slice().try_into() {
             Ok(arr) => arr,
             Err(_) => {
-                // Construction invariant: should never happen for 4-bit quantization
+                tracing::error!(
+                    "codebook has {} entries, expected 16 — construction invariant violated",
+                    self.codebook.len()
+                );
                 static ZERO: [f32; 16] = [0.0; 16];
                 &ZERO
             }
