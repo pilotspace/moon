@@ -282,11 +282,19 @@ impl CollectionMetadata {
         code_bytes_per_vector(self.padded_dimension, self.quantization.bits())
     }
 
-    /// Convenience accessor: returns the codebook boundaries as a `&[f32; 15]` reference.
+    /// Returns the codebook boundaries as a `&[f32; 15]` reference.
     ///
-    /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
-    /// Used by legacy `encode_tq_mse_scaled` which requires fixed-size array.
+    /// Only valid for 4-bit quantization (TurboQuant4 / TurboQuantProd4).
+    /// The codebook is guaranteed to have exactly 15 boundaries at construction
+    /// for 4-bit configs. If the invariant is violated (programming bug), logs
+    /// an error and returns a zeroed fallback to avoid panicking in production.
     pub fn codebook_boundaries_15(&self) -> &[f32; 15] {
+        debug_assert_eq!(
+            self.codebook_boundaries.len(),
+            15,
+            "codebook_boundaries_15 called on non-4-bit quantization (len={})",
+            self.codebook_boundaries.len()
+        );
         match self.codebook_boundaries.as_slice().try_into() {
             Ok(arr) => arr,
             Err(_) => {
@@ -300,11 +308,19 @@ impl CollectionMetadata {
         }
     }
 
-    /// Convenience accessor: returns the codebook as a `&[f32; 16]` reference.
+    /// Returns the codebook as a `&[f32; 16]` reference.
     ///
-    /// Returns a zero array if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
-    /// Used by legacy `tq_l2_adc_scaled` which requires fixed-size array.
+    /// Only valid for 4-bit quantization (TurboQuant4 / TurboQuantProd4).
+    /// The codebook is guaranteed to have exactly 16 centroids at construction
+    /// for 4-bit configs. If the invariant is violated (programming bug), logs
+    /// an error and returns a zeroed fallback to avoid panicking in production.
     pub fn codebook_16(&self) -> &[f32; 16] {
+        debug_assert_eq!(
+            self.codebook.len(),
+            16,
+            "codebook_16 called on non-4-bit quantization (len={})",
+            self.codebook.len()
+        );
         match self.codebook.as_slice().try_into() {
             Ok(arr) => arr,
             Err(_) => {
