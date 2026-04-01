@@ -4,7 +4,12 @@
 //! A single `sync_data()` call is the atomic commit point.
 //! CRC32C checksum via MoonPageHeader ensures crash-safe recovery.
 
-use crate::persistence::page::PageType;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use crate::persistence::page::{
+    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K,
+};
 
 /// File lifecycle status within the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +176,308 @@ impl FileEntry {
     }
 }
 
+/// Offset of Root A page within the manifest file.
+const ROOT_A_OFFSET: u64 = 0;
+
+/// Offset of Root B page within the manifest file.
+const ROOT_B_OFFSET: u64 = PAGE_4K as u64;
+
+/// Payload starts after 64-byte MoonPageHeader.
+/// Layout: epoch(8) + file_count(4) + overflow_page_count(4) = 16 bytes of metadata,
+/// then file_count * 48 bytes of FileEntry records.
+const ROOT_META_SIZE: usize = 16;
+
+/// Maximum inline FileEntry records per root page.
+/// (4096 - 64 header - 16 meta) / 48 = 83.
+pub const MAX_INLINE_ENTRIES: usize = (PAGE_4K - MOONPAGE_HEADER_SIZE - ROOT_META_SIZE) / FileEntry::SIZE;
+
+/// In-memory representation of one manifest root page.
+#[derive(Debug, Clone)]
+pub struct ManifestRoot {
+    /// Monotonically increasing epoch (commit counter).
+    pub epoch: u64,
+    /// Number of file entries.
+    pub file_count: u32,
+    /// Number of overflow pages (for future use, currently 0).
+    pub overflow_page_count: u32,
+    /// File entries tracked by this root.
+    pub entries: Vec<FileEntry>,
+}
+
+/// Dual-root atomic manifest for tracking shard files.
+///
+/// Uses LMDB-style alternating root pages: writes go to the inactive
+/// slot, and a single `sync_data()` is the atomic commit point.
+#[derive(Debug)]
+pub struct ShardManifest {
+    /// File handle opened for read/write.
+    file: std::fs::File,
+    /// Path to the manifest file on disk.
+    path: PathBuf,
+    /// Currently active root (the last successfully committed state).
+    active_root: ManifestRoot,
+    /// Which slot is currently active: 0 = Root A (offset 0), 1 = Root B (offset 4096).
+    active_slot: u8,
+}
+
+impl ShardManifest {
+    /// Create a new manifest file with an empty Root A at epoch 1.
+    ///
+    /// The file will be exactly 8192 bytes (two 4KB root pages).
+    pub fn create(path: &Path) -> std::io::Result<Self> {
+        let mut buf = vec![0u8; 2 * PAGE_4K];
+
+        // Build Root A at offset 0 with epoch=1, file_count=0
+        let root = ManifestRoot {
+            epoch: 1,
+            file_count: 0,
+            overflow_page_count: 0,
+            entries: Vec::new(),
+        };
+        Self::serialize_root(&root, &mut buf[..PAGE_4K]);
+
+        // Write file
+        std::fs::write(path, &buf)?;
+
+        // Open for R/W and sync
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.sync_data()?;
+
+        // fsync parent directory for metadata durability
+        if let Some(parent) = path.parent() {
+            crate::persistence::fsync::fsync_directory(parent)?;
+        }
+
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            active_root: root,
+            active_slot: 0,
+        })
+    }
+
+    /// Open an existing manifest file and recover the latest valid root.
+    ///
+    /// Reads both root pages, validates CRC32C, and picks the one with
+    /// the higher epoch. If both are corrupted, returns an error.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let buf = std::fs::read(path)?;
+        if buf.len() < 2 * PAGE_4K {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "manifest file too small: {} bytes, expected at least {}",
+                    buf.len(),
+                    2 * PAGE_4K,
+                ),
+            ));
+        }
+
+        let root_a = Self::try_parse_root(&buf[..PAGE_4K]);
+        let root_b = Self::try_parse_root(&buf[PAGE_4K..2 * PAGE_4K]);
+
+        let (active_root, active_slot) = match (root_a, root_b) {
+            (Some(a), Some(b)) => {
+                if b.epoch >= a.epoch {
+                    (b, 1u8)
+                } else {
+                    (a, 0u8)
+                }
+            }
+            (Some(a), None) => (a, 0),
+            (None, Some(b)) => (b, 1),
+            (None, None) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "both manifest root pages are corrupted",
+                ));
+            }
+        };
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            active_root,
+            active_slot,
+        })
+    }
+
+    /// Commit the current state to the inactive root page.
+    ///
+    /// 1. Increment epoch
+    /// 2. Serialize to the inactive slot
+    /// 3. `sync_data()` — this is the atomic commit point
+    /// 4. Flip active_slot
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        if self.active_root.entries.len() > MAX_INLINE_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "too many entries for inline root page: {} > {}",
+                    self.active_root.entries.len(),
+                    MAX_INLINE_ENTRIES,
+                ),
+            ));
+        }
+
+        self.active_root.epoch += 1;
+        self.active_root.file_count = self.active_root.entries.len() as u32;
+
+        let mut page = [0u8; PAGE_4K];
+        Self::serialize_root(&self.active_root, &mut page);
+
+        // Write to the inactive slot
+        let write_offset = if self.active_slot == 0 {
+            ROOT_B_OFFSET
+        } else {
+            ROOT_A_OFFSET
+        };
+
+        self.file.seek(SeekFrom::Start(write_offset))?;
+        self.file.write_all(&page)?;
+        self.file.sync_data()?; // ATOMIC COMMIT POINT
+
+        // Flip active slot
+        self.active_slot = if self.active_slot == 0 { 1 } else { 0 };
+
+        Ok(())
+    }
+
+    /// Add a file entry to the manifest (in-memory only until commit).
+    pub fn add_file(&mut self, entry: FileEntry) {
+        self.active_root.entries.push(entry);
+    }
+
+    /// Mark a file as Tombstone by file_id (in-memory only until commit).
+    pub fn remove_file(&mut self, file_id: u64) {
+        for entry in &mut self.active_root.entries {
+            if entry.file_id == file_id {
+                entry.status = FileStatus::Tombstone;
+            }
+        }
+    }
+
+    /// Update a file entry in-place (in-memory only until commit).
+    pub fn update_file(&mut self, file_id: u64, f: impl FnOnce(&mut FileEntry)) {
+        for entry in &mut self.active_root.entries {
+            if entry.file_id == file_id {
+                f(entry);
+                return;
+            }
+        }
+    }
+
+    /// Return a reference to the active file entries.
+    pub fn files(&self) -> &[FileEntry] {
+        &self.active_root.entries
+    }
+
+    /// Return the current epoch.
+    pub fn epoch(&self) -> u64 {
+        self.active_root.epoch
+    }
+
+    /// Return the currently active slot (0 = Root A, 1 = Root B).
+    pub fn active_slot(&self) -> u8 {
+        self.active_slot
+    }
+
+    /// Return the path to the manifest file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Serialize a ManifestRoot into a 4KB page buffer.
+    fn serialize_root(root: &ManifestRoot, page: &mut [u8]) {
+        assert!(page.len() >= PAGE_4K);
+
+        // Zero the page
+        page[..PAGE_4K].fill(0);
+
+        // Payload: epoch + file_count + overflow_page_count + entries
+        let payload_bytes = ROOT_META_SIZE + root.entries.len() * FileEntry::SIZE;
+
+        // Header
+        let mut hdr = MoonPageHeader::new(PageType::ManifestRoot, 0, 0);
+        hdr.payload_bytes = payload_bytes as u32;
+        hdr.entry_count = root.entries.len() as u32;
+        hdr.write_to(page);
+
+        // Manifest-specific metadata after header
+        let p = MOONPAGE_HEADER_SIZE;
+        page[p..p + 8].copy_from_slice(&root.epoch.to_le_bytes());
+        page[p + 8..p + 12].copy_from_slice(&root.file_count.to_le_bytes());
+        page[p + 12..p + 16].copy_from_slice(&root.overflow_page_count.to_le_bytes());
+
+        // FileEntry records
+        let entries_start = p + ROOT_META_SIZE;
+        for (i, entry) in root.entries.iter().enumerate() {
+            let offset = entries_start + i * FileEntry::SIZE;
+            entry.write_to(&mut page[offset..offset + FileEntry::SIZE]);
+        }
+
+        // Compute CRC32C over payload region
+        MoonPageHeader::compute_checksum(page);
+    }
+
+    /// Try to parse a root page from a 4KB buffer.
+    ///
+    /// Returns `None` if magic/type mismatch or CRC32C fails.
+    fn try_parse_root(page: &[u8]) -> Option<ManifestRoot> {
+        if page.len() < PAGE_4K {
+            return None;
+        }
+
+        // Verify header
+        let hdr = MoonPageHeader::read_from(page)?;
+        if hdr.page_type != PageType::ManifestRoot {
+            return None;
+        }
+
+        // Verify CRC32C
+        if !MoonPageHeader::verify_checksum(page) {
+            return None;
+        }
+
+        // Parse metadata
+        let p = MOONPAGE_HEADER_SIZE;
+        let epoch = u64::from_le_bytes([
+            page[p], page[p + 1], page[p + 2], page[p + 3],
+            page[p + 4], page[p + 5], page[p + 6], page[p + 7],
+        ]);
+        let file_count = u32::from_le_bytes([
+            page[p + 8], page[p + 9], page[p + 10], page[p + 11],
+        ]);
+        let overflow_page_count = u32::from_le_bytes([
+            page[p + 12], page[p + 13], page[p + 14], page[p + 15],
+        ]);
+
+        // Parse entries
+        let entries_start = p + ROOT_META_SIZE;
+        let mut entries = Vec::with_capacity(file_count as usize);
+        for i in 0..file_count as usize {
+            let offset = entries_start + i * FileEntry::SIZE;
+            let entry = FileEntry::read_from(&page[offset..])?;
+            entries.push(entry);
+        }
+
+        Some(ManifestRoot {
+            epoch,
+            file_count,
+            overflow_page_count,
+            entries,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +584,220 @@ mod tests {
     fn file_entry_read_from_short_buffer() {
         let buf = [0u8; 47];
         assert!(FileEntry::read_from(&buf).is_none());
+    }
+
+    // --- ShardManifest tests ---
+
+    fn make_entry(id: u64) -> FileEntry {
+        FileEntry {
+            file_id: id,
+            file_type: PageType::KvData as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: 100,
+            byte_size: 409_600,
+            created_lsn: id,
+            min_key_hash: 0,
+            max_key_hash: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn test_manifest_create_and_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let m = ShardManifest::create(&path).unwrap();
+        assert_eq!(m.epoch(), 1);
+        assert_eq!(m.active_slot(), 0);
+        assert!(m.files().is_empty());
+
+        // File should be exactly 8192 bytes
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 8192);
+
+        // Re-open should recover same state
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.epoch(), 1);
+        assert!(m2.files().is_empty());
+    }
+
+    #[test]
+    fn test_manifest_alternating_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        assert_eq!(m.active_slot(), 0); // Root A is active after create
+
+        // First commit: writes to Root B (inactive), then flips active to 1
+        m.add_file(make_entry(1));
+        m.commit().unwrap();
+        assert_eq!(m.epoch(), 2);
+        assert_eq!(m.active_slot(), 1); // Now Root B is active
+
+        // Second commit: writes to Root A (inactive), then flips active to 0
+        m.add_file(make_entry(2));
+        m.commit().unwrap();
+        assert_eq!(m.epoch(), 3);
+        assert_eq!(m.active_slot(), 0); // Back to Root A
+
+        // Verify recovery picks epoch 3
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.epoch(), 3);
+        assert_eq!(m2.files().len(), 2);
+    }
+
+    #[test]
+    fn test_manifest_recovery_picks_higher_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        // epoch 1 on Root A
+
+        m.add_file(make_entry(1));
+        m.commit().unwrap(); // epoch 2 on Root B
+
+        m.add_file(make_entry(2));
+        m.commit().unwrap(); // epoch 3 on Root A
+
+        m.add_file(make_entry(3));
+        m.commit().unwrap(); // epoch 4 on Root B
+
+        m.add_file(make_entry(4));
+        m.commit().unwrap(); // epoch 5 on Root A
+
+        m.add_file(make_entry(5));
+        m.commit().unwrap(); // epoch 6 on Root B
+
+        // Root A has epoch 5 (entries 1-4), Root B has epoch 6 (entries 1-5)
+        // Recovery should pick Root B (higher epoch)
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.epoch(), 6);
+        assert_eq!(m2.active_slot(), 1);
+        assert_eq!(m2.files().len(), 5);
+    }
+
+    #[test]
+    fn test_manifest_recovery_corrupt_root_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+
+        m.add_file(make_entry(1));
+        m.commit().unwrap(); // epoch 2 on Root B
+
+        m.add_file(make_entry(2));
+        m.commit().unwrap(); // epoch 3 on Root A
+
+        // Corrupt Root A (offset 0) payload
+        let mut buf = std::fs::read(&path).unwrap();
+        buf[MOONPAGE_HEADER_SIZE + 5] ^= 0xFF;
+        std::fs::write(&path, &buf).unwrap();
+
+        // Should fallback to Root B (epoch 2)
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.epoch(), 2);
+        assert_eq!(m2.active_slot(), 1);
+        assert_eq!(m2.files().len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_both_corrupt_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let m = ShardManifest::create(&path).unwrap();
+        drop(m);
+
+        // Corrupt both roots
+        let mut buf = std::fs::read(&path).unwrap();
+        // Corrupt Root A payload
+        buf[MOONPAGE_HEADER_SIZE + 3] ^= 0xFF;
+        // Corrupt Root B payload
+        buf[PAGE_4K + MOONPAGE_HEADER_SIZE + 3] ^= 0xFF;
+        std::fs::write(&path, &buf).unwrap();
+
+        let result = ShardManifest::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("corrupted"),
+            "error should mention corruption: {}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_manifest_max_inline_entries() {
+        assert_eq!(MAX_INLINE_ENTRIES, 83);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+
+        // Add exactly 83 entries
+        for i in 0..83u64 {
+            m.add_file(make_entry(i + 1));
+        }
+        m.commit().unwrap();
+
+        // Verify recovery
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.files().len(), 83);
+
+        // Adding one more should fail on commit
+        drop(m2);
+        let mut m3 = ShardManifest::open(&path).unwrap();
+        m3.add_file(make_entry(84));
+        let result = m3.commit();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_manifest_add_remove_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+
+        m.add_file(make_entry(1));
+        m.add_file(make_entry(2));
+        m.add_file(make_entry(3));
+        m.commit().unwrap();
+
+        // Remove file 2
+        m.remove_file(2);
+        m.commit().unwrap();
+
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.files().len(), 3); // Still 3 entries, one is tombstoned
+        assert_eq!(m2.files()[1].status, FileStatus::Tombstone);
+        assert_eq!(m2.files()[0].status, FileStatus::Active);
+        assert_eq!(m2.files()[2].status, FileStatus::Active);
+    }
+
+    #[test]
+    fn test_manifest_update_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        m.add_file(make_entry(1));
+        m.commit().unwrap();
+
+        m.update_file(1, |e| {
+            e.status = FileStatus::Sealed;
+            e.tier = StorageTier::Warm;
+        });
+        m.commit().unwrap();
+
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.files()[0].status, FileStatus::Sealed);
+        assert_eq!(m2.files()[0].tier, StorageTier::Warm);
     }
 }
