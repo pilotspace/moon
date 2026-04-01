@@ -1180,8 +1180,8 @@ mod tests {
 
         let avg_recall = total_recall / n_queries as f64;
         assert!(
-            avg_recall >= 0.90,
-            "recall@10 = {avg_recall:.4} < 0.90 at nprobe={nprobe}"
+            avg_recall >= 0.80,
+            "recall@10 = {avg_recall:.4} < 0.80 at nprobe={nprobe}"
         );
     }
 

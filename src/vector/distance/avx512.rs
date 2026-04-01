@@ -17,6 +17,9 @@ use core::arch::x86_64::*;
 ///
 /// Processes 32 floats per iteration (2 x 16-lane __m512).
 /// Uses `_mm512_reduce_add_ps` for horizontal reduction.
+///
+/// # Safety
+/// Caller must ensure AVX-512F CPU feature is available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]
@@ -72,6 +75,9 @@ pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Note: VNNI `_mm512_dpwssd_epi32` is not yet stabilized in `core::arch`,
 /// so we use the portable widening approach instead. When VNNI intrinsics
 /// stabilize, this can be upgraded for ~2x throughput on Ice Lake+.
+///
+/// # Safety
+/// Caller must ensure AVX-512F and AVX-512BW CPU features are available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
@@ -121,6 +127,9 @@ pub unsafe fn l2_i8_vnni(a: &[i8], b: &[i8]) -> i32 {
 }
 
 /// Dot product for f32 vectors (AVX-512F, 2x unrolled).
+///
+/// # Safety
+/// Caller must ensure AVX-512F CPU feature is available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]
@@ -168,6 +177,9 @@ pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Computes `1.0 - dot(a,b) / (||a|| * ||b||)` in a single pass.
 /// Returns 1.0 if either vector has zero norm.
+///
+/// # Safety
+/// Caller must ensure AVX-512F CPU feature is available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]

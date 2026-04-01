@@ -50,6 +50,9 @@ unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
 ///
 /// Processes 32 floats per iteration (4 x 8-lane __m256).
 /// Scalar tail loop handles remaining elements.
+///
+/// # Safety
+/// Caller must ensure AVX2 and FMA CPU features are available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -116,6 +119,9 @@ pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Widens i8 to i16, subtracts, then uses `madd_epi16` to compute sum of
 /// squared differences as i32. Processes 32 i8 elements per iteration.
+///
+/// # Safety
+/// Caller must ensure AVX2 and FMA CPU features are available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -166,6 +172,9 @@ pub unsafe fn l2_i8(a: &[i8], b: &[i8]) -> i32 {
 }
 
 /// Dot product for f32 vectors (AVX2+FMA, 4x unrolled).
+///
+/// # Safety
+/// Caller must ensure AVX2 and FMA CPU features are available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -225,6 +234,9 @@ pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Computes `1.0 - dot(a,b) / (||a|| * ||b||)` in a single pass.
 /// Returns 1.0 if either vector has zero norm.
+///
+/// # Safety
+/// Caller must ensure AVX2 and FMA CPU features are available.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
