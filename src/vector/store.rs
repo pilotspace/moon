@@ -99,15 +99,20 @@ impl VectorIndex {
                 let padded = self.collection.padded_dimension;
                 self.scratch = SearchScratch::new(num_nodes, padded);
 
-                // Swap: empty mutable + append new immutable to existing list
+                // Swap: empty mutable + append new immutable to existing list.
+                // The new mutable segment's global_id_base continues from where
+                // the compacted segment left off, ensuring unique IDs across segments.
                 let old = self.segments.load();
+                let next_global = old.mutable.next_global_id();
                 let mut imm_list = old.immutable.clone();
                 imm_list.push(Arc::new(immutable));
+                let new_mutable = Arc::new(crate::vector::segment::mutable::MutableSegment::new(
+                    self.meta.dimension,
+                    self.collection.clone(),
+                ));
+                new_mutable.set_global_id_base(next_global);
                 let new_list = SegmentList {
-                    mutable: Arc::new(crate::vector::segment::mutable::MutableSegment::new(
-                        self.meta.dimension,
-                        self.collection.clone(),
-                    )),
+                    mutable: new_mutable,
                     immutable: imm_list,
                     ivf: old.ivf.clone(),
                 };

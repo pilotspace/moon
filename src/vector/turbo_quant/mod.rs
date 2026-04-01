@@ -4,6 +4,7 @@
 //! quantize via Lloyd-Max codebook, nibble-pack. Achieves 8x compression
 //! at <= 0.009 MSE distortion for unit vectors (Theorem 1).
 
+pub mod a2_lattice;
 pub mod codebook;
 pub mod collection;
 pub mod encoder;

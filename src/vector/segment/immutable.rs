@@ -18,12 +18,17 @@ use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
 use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
+use crate::vector::types::VectorId;
 
 /// MVCC header for immutable segment entries.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MvccHeader {
     pub internal_id: u32,
+    /// Global vector index from the original mutable segment.
+    /// Used to produce globally unique VectorIds in search results.
+    pub global_id: u32,
+    pub key_hash: u64,
     pub insert_lsn: u64,
     pub delete_lsn: u64,
 }
@@ -122,6 +127,7 @@ impl ImmutableSegment {
             cands
         };
         candidates.truncate(k);
+        self.remap_to_global_ids(&mut candidates);
         candidates
     }
 
@@ -153,7 +159,22 @@ impl ImmutableSegment {
             self.rerank_with_prod(&mut candidates, query);
         }
         candidates.truncate(k);
+        self.remap_to_global_ids(&mut candidates);
         candidates
+    }
+
+    /// Remap per-segment internal IDs to globally unique IDs.
+    /// HNSW search returns VectorId(original_id) where original_id is the index
+    /// within this segment's live_entries. We convert to the global sequential ID
+    /// stored in MvccHeader so results can be correctly merged across segments.
+    fn remap_to_global_ids(&self, candidates: &mut SmallVec<[SearchResult; 32]>) {
+        for c in candidates.iter_mut() {
+            let orig_id = c.id.0;
+            let bfs_pos = self.graph.to_bfs(orig_id);
+            if (bfs_pos as usize) < self.mvcc.len() {
+                c.id = VectorId(self.mvcc[bfs_pos as usize].global_id);
+            }
+        }
     }
 
     /// Rerank candidates using sub-centroid sign-bit refinement.
@@ -287,6 +308,13 @@ impl ImmutableSegment {
     /// Access MVCC headers.
     pub fn mvcc_headers(&self) -> &[MvccHeader] {
         &self.mvcc
+    }
+
+    /// Map a BFS-reordered position to the globally unique key_hash.
+    /// Used for building search results that are comparable across segments.
+    #[inline]
+    pub fn key_hash_for_bfs_pos(&self, bfs_pos: u32) -> u64 {
+        self.mvcc[bfs_pos as usize].key_hash
     }
 
     /// Access collection metadata.

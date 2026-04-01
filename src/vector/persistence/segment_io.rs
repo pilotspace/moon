@@ -108,6 +108,7 @@ fn quant_to_string(q: QuantizationConfig) -> String {
         QuantizationConfig::TurboQuant3 => "TurboQuant3".to_owned(),
         QuantizationConfig::TurboQuant4 => "TurboQuant4".to_owned(),
         QuantizationConfig::TurboQuantProd4 => "TurboQuantProd4".to_owned(),
+        QuantizationConfig::TurboQuant4A2 => "TurboQuant4A2".to_owned(),
     }
 }
 
@@ -119,6 +120,7 @@ fn string_to_quant(s: &str) -> Result<QuantizationConfig, SegmentIoError> {
         "TurboQuant3" => Ok(QuantizationConfig::TurboQuant3),
         "TurboQuant4" => Ok(QuantizationConfig::TurboQuant4),
         "TurboQuantProd4" => Ok(QuantizationConfig::TurboQuantProd4),
+        "TurboQuant4A2" => Ok(QuantizationConfig::TurboQuant4A2),
         _ => Err(SegmentIoError::InvalidMetadata(format!(
             "unknown quantization: {s}"
         ))),
@@ -150,13 +152,17 @@ pub fn write_immutable_segment(
     // 3. sq_vectors.bin — skipped (SQ8 no longer stored in ImmutableSegment).
     // 3b. f32_vectors.bin — skipped (f32 no longer stored; TQ-ADC used for search).
 
-    // 4. mvcc_headers.bin: [count:u32 LE][MvccHeader; count]
+    // 4. mvcc_headers.bin: [version:u8][count:u32 LE][MvccHeader; count]
+    // v2 format: 32 bytes/header (internal_id + global_id + key_hash + insert_lsn + delete_lsn)
     let mvcc = segment.mvcc_headers();
     let count = mvcc.len() as u32;
-    let mut mvcc_buf = Vec::with_capacity(4 + mvcc.len() * 20);
+    let mut mvcc_buf = Vec::with_capacity(1 + 4 + mvcc.len() * 32);
+    mvcc_buf.push(2u8); // format version
     mvcc_buf.extend_from_slice(&count.to_le_bytes());
     for h in mvcc {
         mvcc_buf.extend_from_slice(&h.internal_id.to_le_bytes());
+        mvcc_buf.extend_from_slice(&h.global_id.to_le_bytes());
+        mvcc_buf.extend_from_slice(&h.key_hash.to_le_bytes());
         mvcc_buf.extend_from_slice(&h.insert_lsn.to_le_bytes());
         mvcc_buf.extend_from_slice(&h.delete_lsn.to_le_bytes());
     }
@@ -333,22 +339,30 @@ pub fn read_immutable_segment(
     let _vectors_sq: AlignedBuffer<i8> = AlignedBuffer::new(0);
     let _vectors_f32: AlignedBuffer<f32> = AlignedBuffer::new(0);
 
-    // 5. Read MVCC headers
+    // 5. Read MVCC headers (version-aware: v1 = 20 bytes/header, v2 = 32 bytes/header)
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin"))?;
     if mvcc_bytes.len() < 4 {
         return Err(SegmentIoError::InvalidMetadata(
             "mvcc_headers.bin too short".to_owned(),
         ));
     }
-    let mvcc_count =
-        u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]]) as usize;
-    if mvcc_bytes.len() < 4 + mvcc_count * 20 {
+    // Detect format version: v2 starts with version byte 2, v1 starts with count (u32 LE)
+    let (mvcc_version, mvcc_count, mut pos) = if mvcc_bytes[0] == 2 && mvcc_bytes.len() >= 5 {
+        let count = u32::from_le_bytes([mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4]])
+            as usize;
+        (2u8, count, 5usize)
+    } else {
+        let count = u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]])
+            as usize;
+        (1u8, count, 4usize)
+    };
+    let bytes_per_header: usize = if mvcc_version >= 2 { 32 } else { 20 };
+    if mvcc_bytes.len() < pos + mvcc_count * bytes_per_header {
         return Err(SegmentIoError::InvalidMetadata(
             "mvcc_headers.bin truncated".to_owned(),
         ));
     }
     let mut mvcc = Vec::with_capacity(mvcc_count);
-    let mut pos = 4;
     for _ in 0..mvcc_count {
         let internal_id = u32::from_le_bytes([
             mvcc_bytes[pos],
@@ -357,6 +371,29 @@ pub fn read_immutable_segment(
             mvcc_bytes[pos + 3],
         ]);
         pos += 4;
+        let (global_id, key_hash) = if mvcc_version >= 2 {
+            let gid = u32::from_le_bytes([
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+            ]);
+            pos += 4;
+            let kh = u64::from_le_bytes([
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+                mvcc_bytes[pos + 4],
+                mvcc_bytes[pos + 5],
+                mvcc_bytes[pos + 6],
+                mvcc_bytes[pos + 7],
+            ]);
+            pos += 8;
+            (gid, kh)
+        } else {
+            (internal_id, 0u64) // v1 fallback: global_id = internal_id
+        };
         let insert_lsn = u64::from_le_bytes([
             mvcc_bytes[pos],
             mvcc_bytes[pos + 1],
@@ -381,6 +418,8 @@ pub fn read_immutable_segment(
         pos += 8;
         mvcc.push(MvccHeader {
             internal_id,
+            global_id,
+            key_hash,
             insert_lsn,
             delete_lsn,
         });
@@ -521,6 +560,8 @@ mod tests {
         let mvcc: Vec<MvccHeader> = (0..n as u32)
             .map(|i| MvccHeader {
                 internal_id: i,
+                global_id: i,
+                key_hash: 0,
                 insert_lsn: i as u64 + 1,
                 delete_lsn: 0,
             })

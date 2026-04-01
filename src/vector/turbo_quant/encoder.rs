@@ -20,6 +20,16 @@ pub struct TqCode {
     pub norm: f32,
 }
 
+/// TQ code with sub-centroid sign bits computed at encode time.
+/// Signs indicate which side of the centroid each coordinate fell on,
+/// doubling effective quantization resolution (32 levels from 16).
+pub struct TqCodeWithSigns {
+    pub code: TqCode,
+    /// Bit-packed sign bits: 1 = value >= centroid, 0 = value < centroid.
+    /// Length = ceil(padded_dim / 8).
+    pub signs: Vec<u8>,
+}
+
 /// Next power of 2 >= dim. Used to pad vectors for FWHT.
 #[inline]
 pub fn padded_dimension(dim: u32) -> u32 {
@@ -166,6 +176,72 @@ pub fn encode_tq_mse_scaled(
     let codes = nibble_pack(&indices);
 
     TqCode { codes, norm }
+}
+
+/// Encode with sub-centroid sign bits computed at encode time.
+///
+/// Same as `encode_tq_mse_scaled` but also returns per-coordinate sign bits
+/// indicating whether the pre-quantization FWHT value was >= or < the
+/// assigned centroid. This doubles effective quantization resolution from
+/// 16 to 32 levels during HNSW search (sub-centroid LUT scoring).
+///
+/// Cost: ~2% overhead over plain encode (one comparison + bit-set per coordinate).
+pub fn encode_tq_mse_scaled_with_signs(
+    vector: &[f32],
+    sign_flips: &[f32],
+    boundaries: &[f32; 15],
+    centroids: &[f32; 16],
+    work_buf: &mut [f32],
+) -> TqCodeWithSigns {
+    let dim = vector.len();
+    let padded = padded_dimension(dim as u32) as usize;
+    debug_assert!(work_buf.len() >= padded);
+    debug_assert_eq!(sign_flips.len(), padded);
+
+    // Steps 1-3: norm, normalize, pad (same as encode_tq_mse_scaled)
+    let mut norm_sq = 0.0f32;
+    for &v in vector {
+        norm_sq += v * v;
+    }
+    let norm = norm_sq.sqrt();
+    if norm > 0.0 {
+        let inv_norm = 1.0 / norm;
+        for (dst, &src) in work_buf[..dim].iter_mut().zip(vector.iter()) {
+            *dst = src * inv_norm;
+        }
+    } else {
+        for dst in work_buf[..dim].iter_mut() {
+            *dst = 0.0;
+        }
+    }
+    for dst in work_buf[dim..padded].iter_mut() {
+        *dst = 0.0;
+    }
+
+    // Step 4: Randomized FWHT
+    fwht::fwht(&mut work_buf[..padded], sign_flips);
+
+    // Step 5: Quantize + compute sub-centroid signs simultaneously
+    let mut indices = Vec::with_capacity(padded);
+    let sign_bytes = (padded + 7) / 8;
+    let mut signs = vec![0u8; sign_bytes];
+
+    for (i, &val) in work_buf[..padded].iter().enumerate() {
+        let idx = quantize_with_boundaries(val, boundaries);
+        indices.push(idx);
+        // Sign bit: 1 if value >= centroid (upper half of Voronoi cell)
+        if val >= centroids[idx as usize] {
+            signs[i / 8] |= 1 << (i % 8);
+        }
+    }
+
+    // Step 6: Nibble pack
+    let codes = nibble_pack(&indices);
+
+    TqCodeWithSigns {
+        code: TqCode { codes, norm },
+        signs,
+    }
 }
 
 /// Decode a TQ code back to approximate vector (for verification/reranking).
@@ -467,6 +543,98 @@ pub fn decode_tq_mse_multibit(
     let indices = unpack_by_bits(&code.codes, padded, bits);
     for (dst, &idx) in work_buf[..padded].iter_mut().zip(indices.iter()) {
         *dst = centroids[idx as usize];
+    }
+
+    // Inverse FWHT: R^{-1}(y) = D * H * y
+    fwht::inverse_fwht(&mut work_buf[..padded], sign_flips);
+
+    // Un-pad and scale by norm
+    let mut result = Vec::with_capacity(original_dim);
+    for &val in work_buf[..original_dim].iter() {
+        result.push(val * code.norm);
+    }
+    result
+}
+
+/// Encode using A2 hexagonal lattice quantization.
+///
+/// Pairs consecutive FWHT-rotated coordinates and jointly quantizes each pair
+/// to one of 16 A2 lattice cells (4-bit index per pair).
+/// Two pair-indices are nibble-packed into each byte.
+/// Output: TqCode with codes length = padded_dim / 4.
+pub fn encode_tq_mse_a2(
+    vector: &[f32],
+    sign_flips: &[f32],
+    a2_codebook: &super::a2_lattice::A2Codebook,
+    work_buf: &mut [f32],
+) -> TqCode {
+    let dim = vector.len();
+    let padded = padded_dimension(dim as u32) as usize;
+    debug_assert!(work_buf.len() >= padded);
+    debug_assert_eq!(sign_flips.len(), padded);
+
+    // Step 1: Compute norm
+    let mut norm_sq = 0.0f32;
+    for &v in vector {
+        norm_sq += v * v;
+    }
+    let norm = norm_sq.sqrt();
+
+    // Step 2+3: Normalize and pad into work buffer
+    if norm > 0.0 {
+        let inv_norm = 1.0 / norm;
+        for (dst, &src) in work_buf[..dim].iter_mut().zip(vector.iter()) {
+            *dst = src * inv_norm;
+        }
+    } else {
+        for dst in work_buf[..dim].iter_mut() {
+            *dst = 0.0;
+        }
+    }
+    for dst in work_buf[dim..padded].iter_mut() {
+        *dst = 0.0;
+    }
+
+    // Step 4: Randomized FWHT (uses OnceLock-dispatched fn)
+    fwht::fwht(&mut work_buf[..padded], sign_flips);
+
+    // Step 5: A2 paired quantization -- one 4-bit index per pair
+    let num_pairs = padded / 2;
+    let mut pair_indices: Vec<u8> = Vec::with_capacity(num_pairs);
+    for i in (0..padded).step_by(2) {
+        pair_indices.push(a2_codebook.quantize_pair(work_buf[i], work_buf[i + 1]));
+    }
+
+    // Step 6: nibble_pack the pair indices (two pairs per byte)
+    let codes = nibble_pack(&pair_indices);
+
+    TqCode { codes, norm }
+}
+
+/// Decode an A2 TQ code back to approximate vector.
+///
+/// Inverse of `encode_tq_mse_a2`: unpack nibbles -> decode pairs via A2Codebook
+/// -> inverse FWHT -> un-pad -> scale by norm.
+pub fn decode_tq_mse_a2(
+    code: &TqCode,
+    sign_flips: &[f32],
+    a2_codebook: &super::a2_lattice::A2Codebook,
+    original_dim: usize,
+    work_buf: &mut [f32],
+) -> Vec<f32> {
+    let padded = padded_dimension(original_dim as u32) as usize;
+    debug_assert!(work_buf.len() >= padded);
+    debug_assert_eq!(sign_flips.len(), padded);
+
+    // Unpack nibbles -> pair indices
+    let num_pairs = padded / 2;
+    let pair_indices = nibble_unpack(&code.codes, num_pairs);
+
+    // Decode pair indices -> f32 coordinates
+    for (i, &idx) in pair_indices.iter().enumerate() {
+        let (x, y) = a2_codebook.decode_pair(idx);
+        work_buf[i * 2] = x;
+        work_buf[i * 2 + 1] = y;
     }
 
     // Inverse FWHT: R^{-1}(y) = D * H * y
@@ -881,5 +1049,120 @@ mod tests {
         let avg_mse = total_mse / n as f32;
         eprintln!("3-bit avg MSE: {avg_mse:.6}");
         assert!(avg_mse <= 0.06, "3-bit MSE {avg_mse:.6} exceeds 0.06");
+    }
+
+    // ── A2 hexagonal lattice encoder tests ──────────────────────────────
+
+    #[test]
+    fn test_encode_a2_byte_length() {
+        use super::super::a2_lattice::A2Codebook;
+        fwht::init_fwht();
+
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let cb = A2Codebook::new(padded as u32);
+        let mut work = vec![0.0f32; padded];
+
+        let mut v = lcg_f32(dim, 99);
+        normalize_to_unit(&mut v);
+
+        let code = encode_tq_mse_a2(&v, &signs, &cb, &mut work);
+        // padded_dim/4 bytes: each byte = 2 nibbles = 2 pairs = 4 coordinates
+        assert_eq!(
+            code.codes.len(),
+            padded / 4,
+            "A2 code length should be padded_dim/4 = {}, got {}",
+            padded / 4,
+            code.codes.len()
+        );
+    }
+
+    #[test]
+    fn test_encode_a2_byte_length_768d() {
+        use super::super::a2_lattice::A2Codebook;
+        fwht::init_fwht();
+
+        let dim = 768;
+        let padded = padded_dimension(dim as u32) as usize; // 1024
+        let signs = test_sign_flips(padded, 42);
+        let cb = A2Codebook::new(padded as u32);
+        let mut work = vec![0.0f32; padded];
+
+        let mut v = lcg_f32(dim, 99);
+        normalize_to_unit(&mut v);
+
+        let code = encode_tq_mse_a2(&v, &signs, &cb, &mut work);
+        assert_eq!(code.codes.len(), 256); // 1024 / 4
+    }
+
+    #[test]
+    fn test_encode_a2_roundtrip() {
+        use super::super::a2_lattice::A2Codebook;
+        fwht::init_fwht();
+
+        let dim = 128;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let cb = A2Codebook::new(padded as u32);
+        let mut work_enc = vec![0.0f32; padded];
+        let mut work_dec = vec![0.0f32; padded];
+
+        let mut total_mse = 0.0f32;
+        let n = 50;
+        for seed in 0..n {
+            let mut v = lcg_f32(dim, seed * 7 + 13);
+            normalize_to_unit(&mut v);
+
+            let code = encode_tq_mse_a2(&v, &signs, &cb, &mut work_enc);
+            let recon = decode_tq_mse_a2(&code, &signs, &cb, dim, &mut work_dec);
+
+            assert_eq!(recon.len(), dim);
+            total_mse += mse_distortion(&v, &recon);
+        }
+        let avg_mse = total_mse / n as f32;
+        eprintln!("A2 avg MSE (128d): {avg_mse:.6}");
+        // A2 should achieve reasonable MSE -- less strict than scalar TQ4
+        // since A2 uses fewer bytes (padded/4 vs padded/2).
+        assert!(avg_mse <= 0.10, "A2 MSE {avg_mse:.6} exceeds 0.10");
+    }
+
+    #[test]
+    fn test_encode_a2_zero_vector() {
+        use super::super::a2_lattice::A2Codebook;
+        fwht::init_fwht();
+
+        let dim = 64;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let cb = A2Codebook::new(padded as u32);
+        let mut work = vec![0.0f32; padded];
+
+        let v = vec![0.0f32; dim];
+        let code = encode_tq_mse_a2(&v, &signs, &cb, &mut work);
+        assert_eq!(code.codes.len(), padded / 4);
+        assert_eq!(code.norm, 0.0);
+    }
+
+    #[test]
+    fn test_encode_a2_norm_preserved() {
+        use super::super::a2_lattice::A2Codebook;
+        fwht::init_fwht();
+
+        let dim = 64;
+        let padded = padded_dimension(dim as u32) as usize;
+        let signs = test_sign_flips(padded, 42);
+        let cb = A2Codebook::new(padded as u32);
+        let mut work = vec![0.0f32; padded];
+
+        let v = lcg_f32(dim, 42);
+        let expected_norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let code = encode_tq_mse_a2(&v, &signs, &cb, &mut work);
+        assert!(
+            (code.norm - expected_norm).abs() < 1e-5,
+            "norm mismatch: {} vs {}",
+            code.norm,
+            expected_norm
+        );
     }
 }

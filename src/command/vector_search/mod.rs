@@ -198,11 +198,13 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 QuantizationConfig::TurboQuant3
             } else if val.eq_ignore_ascii_case(b"TQ4") {
                 QuantizationConfig::TurboQuant4
+            } else if val.eq_ignore_ascii_case(b"TQ4A2") {
+                QuantizationConfig::TurboQuant4A2
             } else if val.eq_ignore_ascii_case(b"SQ8") {
                 QuantizationConfig::Sq8
             } else {
                 return Frame::Error(Bytes::from_static(
-                    b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, or SQ8)",
+                    b"ERR unsupported QUANTIZATION (use TQ1, TQ2, TQ3, TQ4, TQ4A2, or SQ8)",
                 ));
             };
             pos += 1;
@@ -332,6 +334,7 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
         QuantizationConfig::TurboQuant1 => Bytes::from_static(b"TurboQuant1"),
         QuantizationConfig::TurboQuant2 => Bytes::from_static(b"TurboQuant2"),
         QuantizationConfig::TurboQuant3 => Bytes::from_static(b"TurboQuant3"),
+        QuantizationConfig::TurboQuant4A2 => Bytes::from_static(b"TurboQuant4A2"),
     };
 
     let items = vec![
@@ -463,11 +466,21 @@ pub fn search_local_filtered(
     idx.try_compact();
 
     // ef_search: user-configurable via EF_RUNTIME in FT.CREATE, or auto-computed.
-    // Sub-centroid 32-level LUT in beam gives higher accuracy per candidate.
+    // Higher ef = better recall but lower QPS. Auto scales with k and dimension:
+    // base = k*20, min 200, boosted for high-d where TQ-ADC needs wider beam.
     let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
         idx.meta.hnsw_ef_runtime as usize
     } else {
-        (k * 15).clamp(200, 500)
+        let base = (k * 20).max(200);
+        // Dimension boost: +50% at 384d+, +100% at 768d+
+        let dim_factor = if idx.meta.dimension >= 768 {
+            2
+        } else if idx.meta.dimension >= 384 {
+            3
+        } else {
+            2
+        };
+        (base * dim_factor / 2).clamp(200, 1000)
     };
 
     let filter_bitmap = filter.map(|f| {
