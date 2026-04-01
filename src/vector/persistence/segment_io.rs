@@ -383,6 +383,8 @@ pub fn read_immutable_segment(
         pos += 8;
         mvcc.push(MvccHeader {
             internal_id,
+            global_id: internal_id, // Persistence reload: global_id = internal_id (single segment)
+            key_hash: 0,
             insert_lsn,
             delete_lsn,
         });
@@ -523,6 +525,8 @@ mod tests {
         let mvcc: Vec<MvccHeader> = (0..n as u32)
             .map(|i| MvccHeader {
                 internal_id: i,
+                global_id: i,
+                key_hash: 0,
                 insert_lsn: i as u64 + 1,
                 delete_lsn: 0,
             })

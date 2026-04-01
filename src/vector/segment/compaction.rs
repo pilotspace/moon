@@ -732,6 +732,8 @@ pub fn compact(
             let entry = live_entries[orig_id];
             MvccHeader {
                 internal_id: bfs_pos as u32,
+                global_id: frozen.global_id_base + entry.internal_id,
+                key_hash: entry.key_hash,
                 insert_lsn: entry.insert_lsn,
                 delete_lsn: entry.delete_lsn,
             }

@@ -56,6 +56,8 @@ pub struct FrozenSegment {
     pub bytes_per_code: usize,
     /// Bytes per QJL sign vector (ceil(dim/8)).
     pub qjl_bytes_per_vec: usize,
+    /// Base offset for computing global vector IDs: global_id = base + internal_id.
+    pub global_id_base: u32,
     pub dimension: u32,
 }
 
@@ -75,6 +77,10 @@ struct MutableSegmentInner {
     sub_centroid_signs: Vec<u8>,
     sub_sign_bytes_per_vec: usize,
     entries: Vec<MutableEntry>,
+    /// Base offset for global vector IDs. When a mutable segment is replaced
+    /// after compaction, the new segment starts at base_id = previous max global ID.
+    /// global_id(entry) = base_id + entry.internal_id
+    global_id_base: u32,
     dimension: u32,
     padded_dimension: u32,
     bytes_per_code: usize,
@@ -126,6 +132,7 @@ impl MutableSegment {
                 sub_centroid_signs: Vec::new(),
                 sub_sign_bytes_per_vec,
                 entries: Vec::new(),
+                global_id_base: 0,
                 dimension,
                 padded_dimension: padded,
                 bytes_per_code,
@@ -324,12 +331,13 @@ impl MutableSegment {
                 )
             };
 
+            let global_id = inner.global_id_base + entry.internal_id;
             if heap.len() < k {
-                heap.push(DistF32(dist, entry.internal_id));
+                heap.push(DistF32(dist, global_id));
             } else if let Some(&DistF32(worst, _)) = heap.peek() {
                 if dist < worst {
                     heap.pop();
-                    heap.push(DistF32(dist, entry.internal_id));
+                    heap.push(DistF32(dist, global_id));
                 }
             }
         }
@@ -423,12 +431,13 @@ impl MutableSegment {
                 )
             };
 
+            let global_id = inner.global_id_base + entry.internal_id;
             if heap.len() < k {
-                heap.push(DistF32(dist, entry.internal_id));
+                heap.push(DistF32(dist, global_id));
             } else if let Some(&DistF32(worst, _)) = heap.peek() {
                 if dist < worst {
                     heap.pop();
-                    heap.push(DistF32(dist, entry.internal_id));
+                    heap.push(DistF32(dist, global_id));
                 }
             }
         }
@@ -534,6 +543,23 @@ impl MutableSegment {
         count
     }
 
+    /// Set the global ID base offset. Called when replacing a compacted mutable segment
+    /// with a new empty one — the new segment's IDs start from where the old one left off.
+    pub fn set_global_id_base(&self, base: u32) {
+        self.inner.write().global_id_base = base;
+    }
+
+    /// Get the next global ID that would be assigned (base + current count).
+    pub fn next_global_id(&self) -> u32 {
+        let inner = self.inner.read();
+        inner.global_id_base + inner.entries.len() as u32
+    }
+
+    /// Get the global ID base.
+    pub fn global_id_base(&self) -> u32 {
+        self.inner.read().global_id_base
+    }
+
     /// Freeze: snapshot TQ codes and entries for compaction.
     pub fn freeze(&self) -> FrozenSegment {
         let inner = self.inner.read();
@@ -571,6 +597,7 @@ impl MutableSegment {
             sub_sign_bytes_per_vec: inner.sub_sign_bytes_per_vec,
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
+            global_id_base: inner.global_id_base,
             dimension: inner.dimension,
         }
     }
