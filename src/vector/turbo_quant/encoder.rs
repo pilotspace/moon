@@ -482,10 +482,7 @@ pub fn decode_tq_mse_multibit(
 
 #[cfg(test)]
 mod tests {
-    use super::super::codebook::{
-        RAW_CENTROIDS_1BIT, RAW_CENTROIDS_2BIT, RAW_CENTROIDS_3BIT, code_bytes_per_vector,
-        scaled_boundaries_n, scaled_centroids_n,
-    };
+    use super::super::codebook::{code_bytes_per_vector, scaled_boundaries_n, scaled_centroids_n};
     use super::*;
 
     /// Deterministic LCG PRNG for reproducible test vectors.

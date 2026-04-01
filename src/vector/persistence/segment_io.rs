@@ -507,8 +507,8 @@ mod tests {
 
         let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
         let qjl_bytes_per_vec = (dim + 7) / 8;
-        let mut qjl_signs_bfs = vec![0u8; n * qjl_bytes_per_vec];
-        let mut residual_norms_bfs = vec![0.0f32; n];
+        let qjl_signs_bfs = vec![0u8; n * qjl_bytes_per_vec];
+        let residual_norms_bfs = vec![0.0f32; n];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
             let src = orig_id * bytes_per_code;

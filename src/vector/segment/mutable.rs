@@ -698,9 +698,9 @@ mod tests {
             seg.append(i as u64, v, &[], 1.0, i as u64);
         }
 
-        let q_rot = rotate_query(&vectors[0], &col);
-        let codebook = col.codebook_16();
-        let qs = make_query_state(&vectors[0], &col);
+        let _q_rot = rotate_query(&vectors[0], &col);
+        let _codebook = col.codebook_16();
+        let _qs = make_query_state(&vectors[0], &col);
         let results = seg.brute_force_search(&vectors[0], None, 3);
 
         assert!(results.len() <= 3);
@@ -776,8 +776,8 @@ mod tests {
             seg.append(i as u64, v, &[], 1.0, i as u64);
         }
 
-        let q_rot = rotate_query(&vectors[0], &col);
-        let codebook = col.codebook_16();
+        let _q_rot = rotate_query(&vectors[0], &col);
+        let _codebook = col.codebook_16();
         let committed = roaring::RoaringBitmap::new();
         let qs = make_query_state(&vectors[0], &col);
 

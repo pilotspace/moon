@@ -74,3 +74,4 @@ shard-*.wal
 shard-*.wal.old
 shard-*.rrdshard
 .claude/worktrees/
+moon_*.log

@@ -400,22 +400,6 @@ mod tests {
         v
     }
 
-    fn rotate_query(query: &[f32], collection: &CollectionMetadata) -> Vec<f32> {
-        let dim = query.len();
-        let padded = collection.padded_dimension as usize;
-        let mut q_rot = vec![0.0f32; padded];
-        q_rot[..dim].copy_from_slice(query);
-        let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if q_norm > 0.0 {
-            let inv = 1.0 / q_norm;
-            for v in q_rot[..dim].iter_mut() {
-                *v *= inv;
-            }
-        }
-        crate::vector::turbo_quant::fwht::fwht(&mut q_rot, collection.fwht_sign_flips.as_slice());
-        q_rot
-    }
-
     #[test]
     fn test_holder_new_has_empty_immutable() {
         let collection = make_test_collection(128);
@@ -468,7 +452,7 @@ mod tests {
             }
         }
 
-        let query_sq = make_sq_vector(dim, 1); // same as vector 0
+        let _query_sq = make_sq_vector(dim, 1); // same as vector 0
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
@@ -493,7 +477,7 @@ mod tests {
                 snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
             }
         }
-        let query_sq = make_sq_vector(dim, 1);
+        let _query_sq = make_sq_vector(dim, 1);
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
@@ -519,7 +503,7 @@ mod tests {
                 snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
             }
         }
-        let query_sq = make_sq_vector(dim, 1);
+        let _query_sq = make_sq_vector(dim, 1);
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
@@ -544,7 +528,7 @@ mod tests {
         // search_mvcc with snapshot=0 and empty dirty_set should match search results
         distance::init();
         let dim = 8;
-        let padded = padded_dimension(dim as u32) as usize;
+        let _padded = padded_dimension(dim as u32) as usize;
         let collection = make_test_collection(dim as u32);
         let holder = SegmentHolder::new(dim as u32, collection);
         {
@@ -555,7 +539,7 @@ mod tests {
                 snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
             }
         }
-        let query_sq = make_sq_vector(dim as usize, 1);
+        let _query_sq = make_sq_vector(dim as usize, 1);
         let query_f32 = vec![0.0f32; dim as usize];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
@@ -580,7 +564,7 @@ mod tests {
     fn test_holder_search_mvcc_filters_by_snapshot() {
         distance::init();
         let dim = 4;
-        let padded = padded_dimension(dim as u32) as usize;
+        let _padded = padded_dimension(dim as u32) as usize;
         let collection = make_test_collection(dim as u32);
         let holder = SegmentHolder::new(dim as u32, collection);
         {
@@ -590,7 +574,7 @@ mod tests {
             // insert_lsn=10, NOT visible to snapshot=5
             snap.mutable.append(1, &[0.0f32; 4], &[1i8; 4], 1.0, 10);
         }
-        let query_sq = vec![0i8; dim as usize];
+        let _query_sq = vec![0i8; dim as usize];
         let query_f32 = vec![0.0f32; dim as usize];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
@@ -621,7 +605,7 @@ mod tests {
             snap.mutable
                 .append(0, &[100.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
         }
-        let query_sq = vec![0i8; dim];
+        let _query_sq = vec![0i8; dim];
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
@@ -674,7 +658,7 @@ mod tests {
     fn test_holder_search_mvcc_empty_dirty_set_matches_no_dirty() {
         distance::init();
         let dim = 8;
-        let padded = padded_dimension(dim as u32) as usize;
+        let _padded = padded_dimension(dim as u32) as usize;
         let collection = make_test_collection(dim as u32);
         let holder = SegmentHolder::new(dim as u32, collection);
         {
@@ -685,7 +669,7 @@ mod tests {
                 snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
             }
         }
-        let query_sq = make_sq_vector(dim as usize, 1);
+        let _query_sq = make_sq_vector(dim as usize, 1);
         let query_f32 = vec![0.0f32; dim as usize];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
         let committed = roaring::RoaringBitmap::new();
@@ -749,8 +733,7 @@ mod tests {
 
     #[test]
     fn test_holder_search_with_ivf() {
-        use crate::vector::aligned_buffer::AlignedBuffer;
-        use crate::vector::segment::ivf::{self, IvfQuantization, IvfSegment};
+        use crate::vector::segment::ivf;
 
         distance::init();
         let dim = 8usize;
@@ -825,7 +808,7 @@ mod tests {
 
         // Search should return results from both mutable and IVF.
         let query_f32 = vec![0.0f32; dim];
-        let query_sq = make_sq_vector(dim, 1);
+        let _query_sq = make_sq_vector(dim, 1);
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
 
         let results = holder.search(&query_f32, 10, 64, &mut scratch);

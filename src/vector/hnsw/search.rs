@@ -580,7 +580,7 @@ mod tests {
     use crate::vector::distance;
     use crate::vector::hnsw::build::HnswBuilder;
     use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
-    use crate::vector::turbo_quant::encoder::{encode_tq_mse_scaled, padded_dimension};
+    use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
     use crate::vector::types::DistanceMetric;
 
     fn lcg_f32(dim: usize, seed: u32) -> Vec<f32> {
@@ -601,10 +601,6 @@ mod tests {
             v.iter_mut().for_each(|x| *x *= inv);
         }
         norm
-    }
-
-    fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
     }
 
     /// Build a complete test fixture: vectors, TQ codes, HNSW graph, BFS-ordered TQ buffer.

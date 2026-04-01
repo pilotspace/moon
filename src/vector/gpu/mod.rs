@@ -18,12 +18,10 @@ mod context;
 mod error;
 mod fwht_kernel;
 
+use super::hnsw::graph::HnswGraph;
 pub use cagra::{MIN_VECTORS_FOR_GPU, gpu_build_hnsw};
 pub use context::GpuContext;
 pub use error::GpuBuildError;
-pub use fwht_kernel::{MIN_BATCH_FOR_GPU, gpu_batch_fwht};
-
-use super::hnsw::graph::HnswGraph;
 
 /// Attempt GPU HNSW build, return `None` on any failure (caller uses CPU path).
 ///
@@ -51,27 +49,6 @@ pub fn try_gpu_build_hnsw(
         Err(e) => {
             tracing::debug!("GPU not available for HNSW build: {e}");
             None
-        }
-    }
-}
-
-/// Attempt GPU batch FWHT, return `false` on failure (caller uses CPU path).
-///
-/// Creates a fresh `GpuContext` on device 0, runs the batch FWHT kernel in-place
-/// on `vectors`. On success the slice is modified and `true` is returned. On any
-/// failure the slice is left unmodified and `false` is returned.
-pub fn try_gpu_batch_fwht(vectors: &mut [f32], sign_flips: &[f32], padded_dim: usize) -> bool {
-    match GpuContext::new(0) {
-        Ok(ctx) => match gpu_batch_fwht(&ctx, vectors, sign_flips, padded_dim) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("GPU batch FWHT failed, falling back to CPU: {e}");
-                false
-            }
-        },
-        Err(e) => {
-            tracing::debug!("GPU not available for batch FWHT: {e}");
-            false
         }
     }
 }

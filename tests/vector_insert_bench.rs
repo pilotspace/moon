@@ -145,7 +145,7 @@ fn bench_full_insert_pipeline_128d() {
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
     };
-    store.create_index(meta);
+    let _ = store.create_index(meta);
 
     // Pre-generate vector blobs (like HSET would receive)
     let mut rng: u64 = 42;
@@ -222,7 +222,7 @@ fn bench_full_insert_pipeline_768d() {
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
     };
-    store.create_index(meta);
+    let _ = store.create_index(meta);
 
     let mut rng: u64 = 42;
     let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);

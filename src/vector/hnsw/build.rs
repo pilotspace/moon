@@ -553,7 +553,7 @@ mod tests {
         let vecs: Vec<Vec<f32>> = (0..n).map(|i| lcg_f32(dim, i * 3 + 7)).collect();
 
         let mut builder = HnswBuilder::new(m, 200, 123);
-        for i in 0..n {
+        for _i in 0..n {
             builder.insert(|a, b| l2_vecs(&vecs[a as usize], &vecs[b as usize]));
         }
         let graph = builder.build(8);
@@ -579,7 +579,7 @@ mod tests {
         let vecs: Vec<Vec<f32>> = (0..n).map(|i| lcg_f32(dim, i * 11 + 5)).collect();
 
         let mut builder = HnswBuilder::new(8, 100, 99);
-        for i in 0..n {
+        for _i in 0..n {
             builder.insert(|a, b| l2_vecs(&vecs[a as usize], &vecs[b as usize]));
         }
         let graph = builder.build(8);
