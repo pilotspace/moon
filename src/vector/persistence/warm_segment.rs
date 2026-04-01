@@ -17,6 +17,7 @@ use crate::persistence::fsync::fsync_file;
 use crate::persistence::page::{
     MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K,
 };
+use crate::storage::tiered::SegmentHandle;
 
 /// Generic helper to write data as a sequence of MoonPage-format pages.
 ///
@@ -115,6 +116,141 @@ pub fn write_vectors_mpf(
 /// ((4096 - 64) / 24 = 167, with 24 bytes unused for alignment).
 pub fn write_mvcc_mpf(path: &Path, file_id: u64, mvcc_data: &[u8]) -> std::io::Result<()> {
     write_mpf_pages(path, file_id, PageType::VecMvcc, mvcc_data)
+}
+
+/// Memory-mapped warm segment files for zero-copy access.
+///
+/// Each file is a sequence of MoonPage-format pages. The `SegmentHandle`
+/// prevents the segment directory from being deleted while mmaps are active.
+pub struct WarmSegmentFiles {
+    /// Memory-mapped codes.mpf (VecCodes, 64KB pages).
+    pub codes: memmap2::Mmap,
+    /// Memory-mapped graph.mpf (VecGraph, 4KB pages).
+    pub graph: memmap2::Mmap,
+    /// Memory-mapped vectors.mpf (VecFull, 64KB pages). Optional for f16 reranking.
+    pub vectors: Option<memmap2::Mmap>,
+    /// Memory-mapped mvcc.mpf (VecMvcc, 4KB pages).
+    pub mvcc: memmap2::Mmap,
+    /// Segment handle prevents deletion while mapped.
+    _handle: SegmentHandle,
+}
+
+impl WarmSegmentFiles {
+    /// Open and mmap all .mpf files in a warm segment directory.
+    ///
+    /// Applies madvise policies:
+    /// - codes.mpf: Sequential (scanned during search), optionally mlocked
+    /// - graph.mpf: Random (HNSW traversal is pointer-chasing)
+    /// - mvcc.mpf: Sequential, mlocked (small, always needed)
+    /// - vectors.mpf: Sequential (optional)
+    ///
+    /// Verifies CRC32C on the first page of each file.
+    pub fn open(
+        segment_dir: &Path,
+        handle: SegmentHandle,
+        mlock_codes: bool,
+    ) -> std::io::Result<Self> {
+        // codes.mpf
+        let codes_file = std::fs::File::open(segment_dir.join("codes.mpf"))?;
+        // SAFETY: File is a sealed immutable segment. SegmentHandle refcount
+        // prevents directory deletion while mapped. No concurrent writers exist.
+        let codes = unsafe { memmap2::MmapOptions::new().map(&codes_file)? };
+        codes.advise(memmap2::Advice::Sequential)?;
+        #[cfg(unix)]
+        if mlock_codes {
+            codes.lock()?;
+        }
+
+        // graph.mpf
+        let graph_file = std::fs::File::open(segment_dir.join("graph.mpf"))?;
+        // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+        let graph = unsafe { memmap2::MmapOptions::new().map(&graph_file)? };
+        graph.advise(memmap2::Advice::Random)?;
+
+        // mvcc.mpf
+        let mvcc_file = std::fs::File::open(segment_dir.join("mvcc.mpf"))?;
+        // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+        let mvcc = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
+        mvcc.advise(memmap2::Advice::Sequential)?;
+
+        // vectors.mpf (optional)
+        let vectors = match std::fs::File::open(segment_dir.join("vectors.mpf")) {
+            Ok(vf) => {
+                // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+                let v = unsafe { memmap2::MmapOptions::new().map(&vf)? };
+                v.advise(memmap2::Advice::Sequential)?;
+                Some(v)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+
+        // Verify CRC32C on first page of each mandatory file
+        if !MoonPageHeader::verify_checksum(
+            &codes[..codes.len().min(PAGE_64K)],
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "codes.mpf first page CRC32C verification failed",
+            ));
+        }
+        if !MoonPageHeader::verify_checksum(
+            &graph[..graph.len().min(PAGE_4K)],
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "graph.mpf first page CRC32C verification failed",
+            ));
+        }
+        if !MoonPageHeader::verify_checksum(
+            &mvcc[..mvcc.len().min(PAGE_4K)],
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mvcc.mpf first page CRC32C verification failed",
+            ));
+        }
+
+        Ok(Self {
+            codes,
+            graph,
+            vectors,
+            mvcc,
+            _handle: handle,
+        })
+    }
+
+    /// Return the payload bytes of a codes page (skipping the 64-byte header).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page_index` is out of range.
+    pub fn codes_data(&self, page_index: usize) -> &[u8] {
+        let start = page_index * PAGE_64K + MOONPAGE_HEADER_SIZE;
+        let end = (page_index + 1) * PAGE_64K;
+        &self.codes[start..end]
+    }
+
+    /// Return the payload bytes of a graph page (skipping the 64-byte header).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page_index` is out of range.
+    pub fn graph_data(&self, page_index: usize) -> &[u8] {
+        let start = page_index * PAGE_4K + MOONPAGE_HEADER_SIZE;
+        let end = (page_index + 1) * PAGE_4K;
+        &self.graph[start..end]
+    }
+
+    /// Number of 64KB pages in codes.mpf.
+    pub fn page_count_codes(&self) -> usize {
+        self.codes.len() / PAGE_64K
+    }
+
+    /// Number of 4KB pages in graph.mpf.
+    pub fn page_count_graph(&self) -> usize {
+        self.graph.len() / PAGE_4K
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +408,159 @@ mod tests {
 
         // Verify payload content
         assert_eq!(&file_bytes[MOONPAGE_HEADER_SIZE..MOONPAGE_HEADER_SIZE + 100], &[0xFFu8; 100]);
+    }
+
+    // --- WarmSegmentFiles tests ---
+
+    /// Helper: write .mpf files into a segment directory for testing.
+    fn write_test_segment(seg_dir: &Path, file_id: u64, codes: &[u8], graph: &[u8], mvcc: &[u8]) {
+        std::fs::create_dir_all(seg_dir).unwrap();
+        write_codes_mpf(&seg_dir.join("codes.mpf"), file_id, codes).unwrap();
+        write_graph_mpf(&seg_dir.join("graph.mpf"), file_id, graph).unwrap();
+        write_mvcc_mpf(&seg_dir.join("mvcc.mpf"), file_id, mvcc).unwrap();
+    }
+
+    #[test]
+    fn test_warm_segment_open_and_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-1");
+
+        let codes = vec![0xAAu8; 1000];
+        let graph = vec![0xBBu8; 500];
+        let mvcc = vec![0u8; 24 * 10]; // 10 entries
+        write_test_segment(&seg_dir, 1, &codes, &graph, &mvcc);
+
+        let handle = SegmentHandle::new(1, seg_dir.clone());
+        let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
+
+        // codes_data should return payload (skip header)
+        let page0_data = ws.codes_data(0);
+        assert_eq!(page0_data.len(), PAGE_64K - MOONPAGE_HEADER_SIZE);
+        // First 1000 bytes should be our data
+        assert_eq!(&page0_data[..1000], &[0xAAu8; 1000]);
+
+        assert_eq!(ws.page_count_codes(), 1);
+    }
+
+    #[test]
+    fn test_warm_segment_crc_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-2");
+
+        let codes = vec![0x42u8; 500];
+        let graph = vec![0x43u8; 200];
+        let mvcc = vec![0u8; 24 * 5];
+        write_test_segment(&seg_dir, 2, &codes, &graph, &mvcc);
+
+        let handle = SegmentHandle::new(2, seg_dir.clone());
+        // Should succeed -- CRC verification passes
+        let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
+        assert_eq!(ws.page_count_graph(), 1);
+    }
+
+    #[test]
+    fn test_warm_segment_crc_corruption_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-3");
+
+        let codes = vec![0x42u8; 500];
+        let graph = vec![0x43u8; 200];
+        let mvcc = vec![0u8; 24 * 5];
+        write_test_segment(&seg_dir, 3, &codes, &graph, &mvcc);
+
+        // Corrupt codes.mpf payload
+        let codes_path = seg_dir.join("codes.mpf");
+        let mut data = std::fs::read(&codes_path).unwrap();
+        data[MOONPAGE_HEADER_SIZE + 10] ^= 0xFF;
+        std::fs::write(&codes_path, &data).unwrap();
+
+        let handle = SegmentHandle::new(3, seg_dir.clone());
+        let result = WarmSegmentFiles::open(&seg_dir, handle, false);
+        match result {
+            Err(e) => {
+                assert!(e.to_string().contains("codes.mpf"), "error should mention codes.mpf: {e}");
+            }
+            Ok(_) => panic!("expected CRC verification error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_warm_segment_page_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-4");
+
+        // codes: 100KB = 2 pages (64KB each)
+        let codes = vec![0u8; 100_000];
+        // graph: 5000 bytes = 2 pages (4KB each)
+        let graph = vec![0u8; 5000];
+        let mvcc = vec![0u8; 24 * 10];
+        write_test_segment(&seg_dir, 4, &codes, &graph, &mvcc);
+
+        let handle = SegmentHandle::new(4, seg_dir.clone());
+        let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
+
+        assert_eq!(ws.page_count_codes(), 2);
+        assert_eq!(ws.page_count_graph(), 2);
+    }
+
+    #[test]
+    fn test_warm_segment_without_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-5");
+
+        let codes = vec![0u8; 500];
+        let graph = vec![0u8; 200];
+        let mvcc = vec![0u8; 24 * 5];
+        write_test_segment(&seg_dir, 5, &codes, &graph, &mvcc);
+        // No vectors.mpf written
+
+        let handle = SegmentHandle::new(5, seg_dir.clone());
+        let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
+        assert!(ws.vectors.is_none());
+    }
+
+    #[test]
+    fn test_warm_segment_with_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-6");
+
+        let codes = vec![0u8; 500];
+        let graph = vec![0u8; 200];
+        let mvcc = vec![0u8; 24 * 5];
+        write_test_segment(&seg_dir, 6, &codes, &graph, &mvcc);
+        // Also write vectors.mpf
+        write_vectors_mpf(&seg_dir.join("vectors.mpf"), 6, &vec![0u8; 3000]).unwrap();
+
+        let handle = SegmentHandle::new(6, seg_dir.clone());
+        let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
+        assert!(ws.vectors.is_some());
+    }
+
+    #[test]
+    fn test_warm_segment_data_accessors_correct_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-7");
+
+        // Fill codes with a known pattern
+        let mut codes = vec![0u8; 500];
+        for (i, b) in codes.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let graph = vec![0xEEu8; 200];
+        let mvcc = vec![0u8; 24 * 5];
+        write_test_segment(&seg_dir, 7, &codes, &graph, &mvcc);
+
+        let handle = SegmentHandle::new(7, seg_dir.clone());
+        let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
+
+        // codes_data(0) should skip the 64-byte header
+        let cd = ws.codes_data(0);
+        for i in 0..500 {
+            assert_eq!(cd[i], (i & 0xFF) as u8, "codes byte {i} mismatch");
+        }
+
+        // graph_data(0) should skip the 64-byte header
+        let gd = ws.graph_data(0);
+        assert_eq!(&gd[..200], &[0xEEu8; 200]);
     }
 }
