@@ -55,6 +55,7 @@ impl std::fmt::Display for CompactionError {
 /// Assign vectors to spatial cells based on first two f32 coordinates.
 /// Returns a vector of `num_cells` cells, where each cell contains the indices
 /// of its member vectors. Uses a simple grid partitioning.
+#[allow(dead_code)] // Retained for tests; disabled in production (needs PCA partitioning)
 fn assign_to_cells(vectors: &[&[f32]], num_cells: usize) -> Vec<Vec<usize>> {
     if vectors.is_empty() || num_cells <= 1 {
         return vec![vectors.iter().enumerate().map(|(i, _)| i).collect()];
@@ -105,6 +106,7 @@ fn assign_to_cells(vectors: &[&[f32]], num_cells: usize) -> Vec<Vec<usize>> {
 /// Uses `std::thread::scope` for scoped parallelism (no rayon dependency).
 /// Each cell gets an independent HnswBuilder with local IDs, then sub-graphs
 /// are stitched together with cross-cell boundary edges.
+#[allow(dead_code)]
 fn compact_parallel(
     live_f32: &[&[f32]],
     _tq_buffer: &[u8],
@@ -154,7 +156,7 @@ fn compact_parallel(
                 })
                 .collect();
 
-            handles.into_iter().map(|h| h.join().expect("cell build thread panicked")).collect()
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
         });
 
     stitch_subgraphs(&sub_graphs, live_f32, bytes_per_code)
@@ -167,6 +169,7 @@ fn compact_parallel(
 /// 2. Copy each sub-graph's edges, remapping local IDs to global IDs
 /// 3. For each pair of adjacent cells, find boundary vectors and add cross-cell edges
 /// 4. BFS reorder the merged graph
+#[allow(dead_code)]
 fn stitch_subgraphs(
     sub_graphs: &[(crate::vector::hnsw::graph::HnswGraph, Vec<usize>)],
     live_f32: &[&[f32]],
@@ -343,6 +346,7 @@ fn stitch_subgraphs(
 /// If the list is full, replace the last slot to ensure cross-cell edges are added.
 /// This trades one intra-cell neighbor for a cross-cell edge, which is critical
 /// for global graph connectivity.
+#[allow(dead_code)]
 fn add_neighbor_to_flat(
     layer0_flat: &mut [u32],
     node: u32,
@@ -437,8 +441,8 @@ pub fn compact(
 
     // ── Step 3: Build HNSW ───────────────────────────────────────────
 
-    let codebook = collection.codebook_16();
-    let code_len = bytes_per_code - 4;
+    let _codebook = collection.codebook_16();
+    let _code_len = bytes_per_code - 4;
 
     // Build raw f32 vectors for live entries (for exact pairwise HNSW build
     // and GPU path). Also needed later for sub-centroid sign computation.
@@ -446,7 +450,7 @@ pub fn compact(
     let has_raw = !frozen.raw_f32.is_empty();
     let dim = frozen.dimension as usize;
 
-    let live_f32: Vec<&[f32]> = if has_raw {
+    let _live_f32: Vec<&[f32]> = if has_raw {
         live_entries
             .iter()
             .map(|e| {
@@ -514,7 +518,11 @@ pub fn compact(
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
         if is_a2 {
             // A2: each nibble is a pair index; decode via A2Codebook
-            let cb = a2_cb.as_ref().expect("A2 codebook required for A2 decode");
+            // is_a2 branch guarantees a2_cb is Some
+            let cb = match a2_cb.as_ref() {
+                Some(c) => c,
+                None => return Err(CompactionError::PersistFailed("A2 codebook missing".into())),
+            };
             for i in 0..n {
                 let offset = i * bytes_per_code;
                 let code_slice = &tq_buffer_orig[offset..offset + code_len];
@@ -532,7 +540,10 @@ pub fn compact(
             }
         } else {
             // Scalar TQ: each nibble is a single-coordinate index
-            let codebook = codebook_opt.expect("scalar codebook required");
+            let codebook = match codebook_opt {
+                Some(c) => c,
+                None => return Err(CompactionError::PersistFailed("scalar codebook missing".into())),
+            };
             for i in 0..n {
                 let offset = i * bytes_per_code;
                 let code_slice = &tq_buffer_orig[offset..offset + code_len];
@@ -551,10 +562,10 @@ pub fn compact(
     };
 
     // Cell-parallel disabled: 2-coordinate spatial partitioning is meaningless at 384d+
-    // and produces poorly stitched graphs. TODO: replace with random partitioning or PCA.
-    let graph = if false && need_cpu_build && has_raw && n >= PARALLEL_THRESHOLD {
-        compact_parallel(&live_f32, &tq_buffer_orig, bytes_per_code, dim, seed)
-    } else if need_cpu_build {
+    // and produces poorly stitched graphs. TODO: replace with PCA-based partitioning.
+    // compact_parallel() is retained for tests; production always uses single-threaded builder.
+    let _parallel_threshold = PARALLEL_THRESHOLD; // suppress unused warning
+    let graph = if need_cpu_build {
         let dist_table = crate::vector::distance::table();
         let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
 
@@ -673,7 +684,7 @@ pub fn compact(
 
             if is_a2 {
                 // A2: each nibble is a pair index, decode via A2Codebook
-                let cb = a2_cb.as_ref().expect("A2 codebook");
+                let cb = if let Some(c) = a2_cb.as_ref() { c } else { continue };
                 for j in 0..code_slice.len() {
                     let byte = code_slice[j];
                     let qi = j * 4; // each byte = 2 pairs = 4 coordinates
@@ -694,7 +705,7 @@ pub fn compact(
                 }
             } else {
                 // Scalar TQ: each nibble is a single-coordinate index
-                let codebook = codebook_opt.expect("scalar codebook");
+                let codebook = if let Some(c) = codebook_opt { c } else { continue };
                 for j in 0..code_slice.len() {
                     let byte = code_slice[j];
                     let qi = j * 2;
@@ -710,18 +721,17 @@ pub fn compact(
     } else if need_cpu_build && !frozen.sub_centroid_signs.is_empty() {
         // Light mode with insert-time sub-centroid signs: remap to BFS order.
         // graph.to_original(bfs_pos) returns the builder's sequential ID (0..n-1),
-        // which is the index into live_entries. Use it directly.
+        // which is the index into live_entries. Use it directly, not as internal_id.
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            let live_idx = live_entries
-                .iter()
-                .position(|e| e.internal_id as usize == orig_id)
-                .unwrap_or(orig_id);
-            let src_offset = live_entries[live_idx].internal_id as usize * sub_bpv;
-            let dst_offset = bfs_pos * sub_bpv;
-            if src_offset + sub_bpv <= frozen.sub_centroid_signs.len() {
-                sub_signs_bfs[dst_offset..dst_offset + sub_bpv]
-                    .copy_from_slice(&frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv]);
+            if orig_id < live_entries.len() {
+                let src_internal = live_entries[orig_id].internal_id as usize;
+                let src_offset = src_internal * sub_bpv;
+                let dst_offset = bfs_pos * sub_bpv;
+                if src_offset + sub_bpv <= frozen.sub_centroid_signs.len() {
+                    sub_signs_bfs[dst_offset..dst_offset + sub_bpv]
+                        .copy_from_slice(&frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv]);
+                }
             }
         }
     }

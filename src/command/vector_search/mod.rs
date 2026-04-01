@@ -334,6 +334,7 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
         QuantizationConfig::TurboQuant1 => Bytes::from_static(b"TurboQuant1"),
         QuantizationConfig::TurboQuant2 => Bytes::from_static(b"TurboQuant2"),
         QuantizationConfig::TurboQuant3 => Bytes::from_static(b"TurboQuant3"),
+        QuantizationConfig::TurboQuant4A2 => Bytes::from_static(b"TurboQuant4A2"),
     };
 
     let items = vec![

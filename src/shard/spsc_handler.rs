@@ -946,6 +946,9 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                             let snap = idx.segments.load();
                             let internal_id =
                                 snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+                            // Use global_id for payload index so filter bitmaps match
+                            // search results after compaction advances global_id_base.
+                            let global_id = snap.mutable.global_id_base() + internal_id;
                             crate::vector::metrics::add_vectors(1);
 
                             // Populate payload index with all HASH fields (for filtered search)
@@ -967,13 +970,13 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                                             idx.payload_index.insert_numeric(
                                                 f_name,
                                                 num,
-                                                internal_id,
+                                                global_id,
                                             );
                                         } else {
                                             idx.payload_index.insert_tag(
                                                 f_name,
                                                 f_val,
-                                                internal_id,
+                                                global_id,
                                             );
                                         }
                                     }

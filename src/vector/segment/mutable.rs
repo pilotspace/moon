@@ -275,13 +275,18 @@ impl MutableSegment {
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
-        // Prepare FWHT-rotated query for TQ-ADC path (Light mode or fallback)
-        // A2 collections always use TQ-ADC with decoded-vector L2 (no scalar ADC).
+        // Distance strategy:
+        // - Scalar TQ4 (Light mode or no query_state): TQ-ADC with rotated query
+        // - Scalar TQ4 (Exact mode with query_state): TurboQuant_prod scoring
+        // - A2 TQ4A2: decoded-vector symmetric L2 (no scalar ADC available)
         let use_tq_adc = !is_a2
             && (query_state.is_none()
                 || self.collection.build_mode
                     == crate::vector::turbo_quant::collection::BuildMode::Light);
-        let q_rotated: Vec<f32> = if use_tq_adc {
+        let use_a2_decoded_l2 = is_a2;
+
+        // Prepare FWHT-rotated query for TQ-ADC or A2 decoded-L2 path
+        let q_rotated: Vec<f32> = if use_tq_adc || use_a2_decoded_l2 {
             let mut buf = vec![0.0f32; padded];
             buf[..dim].copy_from_slice(query_f32);
             let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -297,12 +302,22 @@ impl MutableSegment {
             Vec::new()
         };
 
+        // Pre-build A2 codebook for decoded-L2 path
+        let a2_cb_for_search = if use_a2_decoded_l2 {
+            Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+                self.collection.padded_dimension,
+            ))
+        } else {
+            None
+        };
+
         for entry in &inner.entries {
             if entry.delete_lsn != 0 {
                 continue;
             }
             if let Some(bm) = allow_bitmap {
-                if !bm.contains(entry.internal_id) {
+                let gid = inner.global_id_base + entry.internal_id;
+                if !bm.contains(gid) {
                     continue;
                 }
             }
@@ -310,10 +325,34 @@ impl MutableSegment {
             let tq_offset = id * bytes_per_code;
             let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
 
-            let dist = if use_tq_adc {
+            let dist = if use_a2_decoded_l2 {
+                // A2: decode nibble pairs to f32, compute symmetric L2 vs rotated query
+                let cb = a2_cb_for_search.as_ref();
+                if let Some(a2cb) = cb {
+                    let mut decoded = Vec::with_capacity(padded);
+                    for &byte in tq_code {
+                        let (x0, y0) = a2cb.decode_pair(byte & 0x0F);
+                        let (x1, y1) = a2cb.decode_pair(byte >> 4);
+                        decoded.push(x0);
+                        decoded.push(y0);
+                        decoded.push(x1);
+                        decoded.push(y1);
+                    }
+                    decoded.truncate(padded);
+                    // L2 between decoded centroid vector and rotated query, scaled by norm²
+                    let norm_sq = entry.norm * entry.norm;
+                    let mut sum = 0.0f32;
+                    for j in 0..padded.min(decoded.len()).min(q_rotated.len()) {
+                        let d = q_rotated[j] - decoded[j];
+                        sum += d * d;
+                    }
+                    sum * norm_sq
+                } else {
+                    f32::MAX
+                }
+            } else if use_tq_adc {
                 tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids)
-            } else {
-                let qs = query_state.unwrap();
+            } else if let Some(qs) = query_state {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
                 let qjl_offset = id * qjl_bpv;
                 let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
@@ -329,6 +368,8 @@ impl MutableSegment {
                     dim,
                     single_qjl_bpv,
                 )
+            } else {
+                f32::MAX // unreachable: non-A2, non-ADC, no query_state
             };
 
             let global_id = inner.global_id_base + entry.internal_id;
@@ -402,7 +443,8 @@ impl MutableSegment {
                 continue;
             }
             if let Some(bm) = allow_bitmap {
-                if !bm.contains(entry.internal_id) {
+                let gid = inner.global_id_base + entry.internal_id;
+                if !bm.contains(gid) {
                     continue;
                 }
             }
@@ -639,14 +681,14 @@ impl MutableSegment {
                 codes: code_slice.to_vec(),
                 norm,
             };
-            let decoded = if is_a2 {
-                crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
-                    &tq_code, signs, a2_cb.as_ref().expect("A2 codebook"), dim, &mut work_buf,
-                )
-            } else {
-                crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                    &tq_code, signs, centroids_opt.expect("scalar codebook"), dim, &mut work_buf,
-                )
+            let decoded = match (is_a2, a2_cb.as_ref(), centroids_opt) {
+                (true, Some(cb), _) => crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
+                    &tq_code, signs, cb, dim, &mut work_buf,
+                ),
+                (false, _, Some(c)) => crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+                    &tq_code, signs, c, dim, &mut work_buf,
+                ),
+                _ => vec![0.0f32; dim], // fallback: zero vector (should not happen)
             };
 
             // Compute residual
@@ -700,14 +742,14 @@ impl MutableSegment {
                 codes: code_slice.to_vec(),
                 norm,
             };
-            let decoded = if is_a2 {
-                crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
-                    &tq_code, signs, a2_cb.as_ref().expect("A2 codebook"), dim, &mut work_buf,
-                )
-            } else {
-                crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                    &tq_code, signs, centroids_opt.expect("scalar codebook"), dim, &mut work_buf,
-                )
+            let decoded = match (is_a2, a2_cb.as_ref(), centroids_opt) {
+                (true, Some(cb), _) => crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
+                    &tq_code, signs, cb, dim, &mut work_buf,
+                ),
+                (false, _, Some(c)) => crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+                    &tq_code, signs, c, dim, &mut work_buf,
+                ),
+                _ => vec![0.0f32; dim],
             };
 
             let mut r_norm_sq = 0.0f32;

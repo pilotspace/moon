@@ -420,7 +420,8 @@ impl HnswBuilder {
 
         if self.use_heuristic {
             // Heuristic re-prune: collect all neighbors + candidate, re-select with diversity.
-            let mut combined_buf = [(0.0f32, 0u32); 65];
+            // Buffer: M0 can be up to 128 (M=64 max from FT.CREATE) + 1 candidate.
+            let mut combined_buf = [(0.0f32, 0u32); 129];
             let mut combined_len = 0usize;
 
             let neighbors = if level == 0 {
