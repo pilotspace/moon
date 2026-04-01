@@ -706,50 +706,21 @@ pub fn compact(
                 }
             }
         }
-    } else {
-        // Fallback: TQ-decoded centroids (sign always matches = useless, but safe)
+    } else if need_cpu_build && !frozen.sub_centroid_signs.is_empty() {
+        // Light mode with insert-time sub-centroid signs: remap to BFS order.
+        // graph.to_original(bfs_pos) returns the builder's sequential ID (0..n-1),
+        // which is the index into live_entries. Use it directly.
         for bfs_pos in 0..n {
-            let code_offset = bfs_pos * bytes_per_code;
-            let code_slice = &tq_bfs[code_offset..code_offset + code_len];
-            if bfs_pos < all_rotated.len() {
-                let rotated = &all_rotated[bfs_pos];
-                let sign_offset = bfs_pos * sub_bpv;
-                if is_a2 {
-                    // A2 fallback: compare against decoded pair centroids
-                    let cb = a2_cb.as_ref().expect("A2 codebook");
-                    for j in 0..code_slice.len() {
-                        let byte = code_slice[j];
-                        let qi = j * 4;
-                        let (x0, y0) = cb.decode_pair(byte & 0x0F);
-                        let (x1, y1) = cb.decode_pair(byte >> 4);
-                        if qi < rotated.len() && rotated[qi] >= x0 {
-                            sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
-                        }
-                        if qi + 1 < rotated.len() && rotated[qi + 1] >= y0 {
-                            sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
-                        }
-                        if qi + 2 < rotated.len() && rotated[qi + 2] >= x1 {
-                            sub_signs_bfs[sign_offset + (qi + 2) / 8] |= 1 << ((qi + 2) % 8);
-                        }
-                        if qi + 3 < rotated.len() && rotated[qi + 3] >= y1 {
-                            sub_signs_bfs[sign_offset + (qi + 3) / 8] |= 1 << ((qi + 3) % 8);
-                        }
-                    }
-                } else {
-                    let codebook = codebook_opt.expect("scalar codebook");
-                    for j in 0..code_slice.len() {
-                        let byte = code_slice[j];
-                        let qi = j * 2;
-                        if qi < rotated.len() && rotated[qi] >= codebook[(byte & 0x0F) as usize] {
-                            sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
-                        }
-                        if qi + 1 < rotated.len()
-                            && rotated[qi + 1] >= codebook[(byte >> 4) as usize]
-                        {
-                            sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
-                        }
-                    }
-                }
+            let orig_id = graph.to_original(bfs_pos as u32) as usize;
+            let live_idx = live_entries
+                .iter()
+                .position(|e| e.internal_id as usize == orig_id)
+                .unwrap_or(orig_id);
+            let src_offset = live_entries[live_idx].internal_id as usize * sub_bpv;
+            let dst_offset = bfs_pos * sub_bpv;
+            if src_offset + sub_bpv <= frozen.sub_centroid_signs.len() {
+                sub_signs_bfs[dst_offset..dst_offset + sub_bpv]
+                    .copy_from_slice(&frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv]);
             }
         }
     }

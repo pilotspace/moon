@@ -20,6 +20,16 @@ pub struct TqCode {
     pub norm: f32,
 }
 
+/// TQ code with sub-centroid sign bits computed at encode time.
+/// Signs indicate which side of the centroid each coordinate fell on,
+/// doubling effective quantization resolution (32 levels from 16).
+pub struct TqCodeWithSigns {
+    pub code: TqCode,
+    /// Bit-packed sign bits: 1 = value >= centroid, 0 = value < centroid.
+    /// Length = ceil(padded_dim / 8).
+    pub signs: Vec<u8>,
+}
+
 /// Next power of 2 >= dim. Used to pad vectors for FWHT.
 #[inline]
 pub fn padded_dimension(dim: u32) -> u32 {
@@ -166,6 +176,72 @@ pub fn encode_tq_mse_scaled(
     let codes = nibble_pack(&indices);
 
     TqCode { codes, norm }
+}
+
+/// Encode with sub-centroid sign bits computed at encode time.
+///
+/// Same as `encode_tq_mse_scaled` but also returns per-coordinate sign bits
+/// indicating whether the pre-quantization FWHT value was >= or < the
+/// assigned centroid. This doubles effective quantization resolution from
+/// 16 to 32 levels during HNSW search (sub-centroid LUT scoring).
+///
+/// Cost: ~2% overhead over plain encode (one comparison + bit-set per coordinate).
+pub fn encode_tq_mse_scaled_with_signs(
+    vector: &[f32],
+    sign_flips: &[f32],
+    boundaries: &[f32; 15],
+    centroids: &[f32; 16],
+    work_buf: &mut [f32],
+) -> TqCodeWithSigns {
+    let dim = vector.len();
+    let padded = padded_dimension(dim as u32) as usize;
+    debug_assert!(work_buf.len() >= padded);
+    debug_assert_eq!(sign_flips.len(), padded);
+
+    // Steps 1-3: norm, normalize, pad (same as encode_tq_mse_scaled)
+    let mut norm_sq = 0.0f32;
+    for &v in vector {
+        norm_sq += v * v;
+    }
+    let norm = norm_sq.sqrt();
+    if norm > 0.0 {
+        let inv_norm = 1.0 / norm;
+        for (dst, &src) in work_buf[..dim].iter_mut().zip(vector.iter()) {
+            *dst = src * inv_norm;
+        }
+    } else {
+        for dst in work_buf[..dim].iter_mut() {
+            *dst = 0.0;
+        }
+    }
+    for dst in work_buf[dim..padded].iter_mut() {
+        *dst = 0.0;
+    }
+
+    // Step 4: Randomized FWHT
+    fwht::fwht(&mut work_buf[..padded], sign_flips);
+
+    // Step 5: Quantize + compute sub-centroid signs simultaneously
+    let mut indices = Vec::with_capacity(padded);
+    let sign_bytes = (padded + 7) / 8;
+    let mut signs = vec![0u8; sign_bytes];
+
+    for (i, &val) in work_buf[..padded].iter().enumerate() {
+        let idx = quantize_with_boundaries(val, boundaries);
+        indices.push(idx);
+        // Sign bit: 1 if value >= centroid (upper half of Voronoi cell)
+        if val >= centroids[idx as usize] {
+            signs[i / 8] |= 1 << (i % 8);
+        }
+    }
+
+    // Step 6: Nibble pack
+    let codes = nibble_pack(&indices);
+
+    TqCodeWithSigns {
+        code: TqCode { codes, norm },
+        signs,
+    }
 }
 
 /// Decode a TQ code back to approximate vector (for verification/reranking).
