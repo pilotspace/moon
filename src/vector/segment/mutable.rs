@@ -271,7 +271,11 @@ impl MutableSegment {
         let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
         // Placeholder codebook for A2 (unused in L2 fallback path).
         let a2_placeholder = [0.0f32; 16];
-        let centroids: &[f32; 16] = if is_a2 { &a2_placeholder } else { self.collection.codebook_16() };
+        let centroids: &[f32; 16] = if is_a2 {
+            &a2_placeholder
+        } else {
+            self.collection.codebook_16()
+        };
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
@@ -407,7 +411,11 @@ impl MutableSegment {
         let code_len = bytes_per_code - 4;
         let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
         let a2_placeholder = [0.0f32; 16];
-        let centroids: &[f32; 16] = if is_a2 { &a2_placeholder } else { self.collection.codebook_16() };
+        let centroids: &[f32; 16] = if is_a2 {
+            &a2_placeholder
+        } else {
+            self.collection.codebook_16()
+        };
 
         let use_tq_adc = !is_a2
             && (query_state.is_none()
@@ -660,7 +668,11 @@ impl MutableSegment {
         } else {
             None
         };
-        let centroids_opt: Option<&[f32; 16]> = if !is_a2 { Some(self.collection.codebook_16()) } else { None };
+        let centroids_opt: Option<&[f32; 16]> = if !is_a2 {
+            Some(self.collection.codebook_16())
+        } else {
+            None
+        };
         let bytes_per_code = inner.bytes_per_code;
 
         let mut qjl_signs = Vec::new();
@@ -683,10 +695,18 @@ impl MutableSegment {
             };
             let decoded = match (is_a2, a2_cb.as_ref(), centroids_opt) {
                 (true, Some(cb), _) => crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
-                    &tq_code, signs, cb, dim, &mut work_buf,
+                    &tq_code,
+                    signs,
+                    cb,
+                    dim,
+                    &mut work_buf,
                 ),
                 (false, _, Some(c)) => crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                    &tq_code, signs, c, dim, &mut work_buf,
+                    &tq_code,
+                    signs,
+                    c,
+                    dim,
+                    &mut work_buf,
                 ),
                 _ => vec![0.0f32; dim], // fallback: zero vector (should not happen)
             };
@@ -723,7 +743,11 @@ impl MutableSegment {
         } else {
             None
         };
-        let centroids_opt: Option<&[f32; 16]> = if !is_a2 { Some(self.collection.codebook_16()) } else { None };
+        let centroids_opt: Option<&[f32; 16]> = if !is_a2 {
+            Some(self.collection.codebook_16())
+        } else {
+            None
+        };
         let bytes_per_code = inner.bytes_per_code;
 
         let mut norms = Vec::with_capacity(inner.entries.len());
@@ -744,10 +768,18 @@ impl MutableSegment {
             };
             let decoded = match (is_a2, a2_cb.as_ref(), centroids_opt) {
                 (true, Some(cb), _) => crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
-                    &tq_code, signs, cb, dim, &mut work_buf,
+                    &tq_code,
+                    signs,
+                    cb,
+                    dim,
+                    &mut work_buf,
                 ),
                 (false, _, Some(c)) => crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                    &tq_code, signs, c, dim, &mut work_buf,
+                    &tq_code,
+                    signs,
+                    c,
+                    dim,
+                    &mut work_buf,
                 ),
                 _ => vec![0.0f32; dim],
             };

@@ -74,10 +74,18 @@ fn assign_to_cells(vectors: &[&[f32]], num_cells: usize) -> Vec<Vec<usize>> {
     for &v in vectors {
         let x = if !v.is_empty() { v[0] } else { 0.0 };
         let y = if v.len() > 1 { v[1] } else { 0.0 };
-        if x < min_x { min_x = x; }
-        if x > max_x { max_x = x; }
-        if y < min_y { min_y = y; }
-        if y > max_y { max_y = y; }
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
     }
 
     // Add small epsilon to avoid edge-case where max coordinate maps to out-of-bounds cell
@@ -140,14 +148,10 @@ fn compact_parallel(
                             cell.iter().map(|&idx| live_f32[idx]).collect();
                         let cell_n = cell_vecs.len();
 
-                        let mut builder =
-                            HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, cell_seed);
+                        let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, cell_seed);
                         for _ in 0..cell_n {
                             builder.insert(|a: u32, b: u32| {
-                                (dist_table.l2_f32)(
-                                    cell_vecs[a as usize],
-                                    cell_vecs[b as usize],
-                                )
+                                (dist_table.l2_f32)(cell_vecs[a as usize], cell_vecs[b as usize])
                             });
                         }
                         let graph = builder.build(bytes_per_code as u32);
@@ -227,7 +231,11 @@ fn stitch_subgraphs(
     let l2_fn = dist_table.l2_f32;
 
     // Compute cell centroids
-    let dim = if !live_f32.is_empty() { live_f32[0].len() } else { 0 };
+    let dim = if !live_f32.is_empty() {
+        live_f32[0].len()
+    } else {
+        0
+    };
     let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(sub_graphs.len());
     for (_graph, members) in sub_graphs {
         let mut centroid = vec![0.0f32; dim];
@@ -256,8 +264,11 @@ fn stitch_subgraphs(
                 .map(|&idx| ((dist_table.l2_f32)(live_f32[idx], centroid_j), idx))
                 .collect();
             dists_i.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            let boundary_i: Vec<usize> =
-                dists_i.iter().take(boundary_k).map(|&(_, idx)| idx).collect();
+            let boundary_i: Vec<usize> = dists_i
+                .iter()
+                .take(boundary_k)
+                .map(|&(_, idx)| idx)
+                .collect();
 
             // Find boundary_k vectors from cell j closest to cell i's centroid
             let centroid_i = &centroids[ci];
@@ -266,8 +277,11 @@ fn stitch_subgraphs(
                 .map(|&idx| ((dist_table.l2_f32)(live_f32[idx], centroid_i), idx))
                 .collect();
             dists_j.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            let boundary_j: Vec<usize> =
-                dists_j.iter().take(boundary_k).map(|&(_, idx)| idx).collect();
+            let boundary_j: Vec<usize> = dists_j
+                .iter()
+                .take(boundary_k)
+                .map(|&(_, idx)| idx)
+                .collect();
 
             // Add bidirectional cross-cell edges between boundary vectors.
             // Each boundary vector in cell_i connects to its nearest neighbors in cell_j,
@@ -281,8 +295,22 @@ fn stitch_subgraphs(
                     .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 let add_count = 3.min(cross_dists.len());
                 for &(_, bj) in cross_dists.iter().take(add_count) {
-                    add_neighbor_to_flat(&mut layer0_flat, bi as u32, bj as u32, m0_usize, live_f32, l2_fn);
-                    add_neighbor_to_flat(&mut layer0_flat, bj as u32, bi as u32, m0_usize, live_f32, l2_fn);
+                    add_neighbor_to_flat(
+                        &mut layer0_flat,
+                        bi as u32,
+                        bj as u32,
+                        m0_usize,
+                        live_f32,
+                        l2_fn,
+                    );
+                    add_neighbor_to_flat(
+                        &mut layer0_flat,
+                        bj as u32,
+                        bi as u32,
+                        m0_usize,
+                        live_f32,
+                        l2_fn,
+                    );
                 }
             }
             for &bj in &boundary_j {
@@ -294,8 +322,22 @@ fn stitch_subgraphs(
                     .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 let add_count = 3.min(cross_dists.len());
                 for &(_, bi) in cross_dists.iter().take(add_count) {
-                    add_neighbor_to_flat(&mut layer0_flat, bj as u32, bi as u32, m0_usize, live_f32, l2_fn);
-                    add_neighbor_to_flat(&mut layer0_flat, bi as u32, bj as u32, m0_usize, live_f32, l2_fn);
+                    add_neighbor_to_flat(
+                        &mut layer0_flat,
+                        bj as u32,
+                        bi as u32,
+                        m0_usize,
+                        live_f32,
+                        l2_fn,
+                    );
+                    add_neighbor_to_flat(
+                        &mut layer0_flat,
+                        bi as u32,
+                        bj as u32,
+                        m0_usize,
+                        live_f32,
+                        l2_fn,
+                    );
                 }
             }
         }
@@ -317,10 +359,8 @@ fn stitch_subgraphs(
     }
 
     // BFS reorder
-    let (bfs_order, bfs_inverse) =
-        bfs_reorder(n as u32, m0, best_entry, &layer0_flat);
-    let layer0 =
-        rearrange_layer0(n as u32, m0, &layer0_flat, &bfs_order, &bfs_inverse);
+    let (bfs_order, bfs_inverse) = bfs_reorder(n as u32, m0, best_entry, &layer0_flat);
+    let layer0 = rearrange_layer0(n as u32, m0, &layer0_flat, &bfs_order, &bfs_inverse);
 
     let bfs_entry = bfs_order[best_entry as usize];
 
@@ -492,8 +532,14 @@ pub fn compact(
     } else {
         None
     };
-    let codebook_opt: Option<&[f32; 16]> = if !is_a2 { Some(collection.codebook_16()) } else { None };
-    let _codebook_for_adc: &[f32; 16] = if !is_a2 { collection.codebook_16() } else {
+    let codebook_opt: Option<&[f32; 16]> = if !is_a2 {
+        Some(collection.codebook_16())
+    } else {
+        None
+    };
+    let _codebook_for_adc: &[f32; 16] = if !is_a2 {
+        collection.codebook_16()
+    } else {
         &[0.0; 16]
     };
     let code_len = bytes_per_code - 4;
@@ -542,7 +588,11 @@ pub fn compact(
             // Scalar TQ: each nibble is a single-coordinate index
             let codebook = match codebook_opt {
                 Some(c) => c,
-                None => return Err(CompactionError::PersistFailed("scalar codebook missing".into())),
+                None => {
+                    return Err(CompactionError::PersistFailed(
+                        "scalar codebook missing".into(),
+                    ));
+                }
             };
             for i in 0..n {
                 let offset = i * bytes_per_code;
@@ -684,7 +734,11 @@ pub fn compact(
 
             if is_a2 {
                 // A2: each nibble is a pair index, decode via A2Codebook
-                let cb = if let Some(c) = a2_cb.as_ref() { c } else { continue };
+                let cb = if let Some(c) = a2_cb.as_ref() {
+                    c
+                } else {
+                    continue;
+                };
                 for j in 0..code_slice.len() {
                     let byte = code_slice[j];
                     let qi = j * 4; // each byte = 2 pairs = 4 coordinates
@@ -705,7 +759,11 @@ pub fn compact(
                 }
             } else {
                 // Scalar TQ: each nibble is a single-coordinate index
-                let codebook = if let Some(c) = codebook_opt { c } else { continue };
+                let codebook = if let Some(c) = codebook_opt {
+                    c
+                } else {
+                    continue;
+                };
                 for j in 0..code_slice.len() {
                     let byte = code_slice[j];
                     let qi = j * 2;
@@ -729,8 +787,9 @@ pub fn compact(
                 let src_offset = src_internal * sub_bpv;
                 let dst_offset = bfs_pos * sub_bpv;
                 if src_offset + sub_bpv <= frozen.sub_centroid_signs.len() {
-                    sub_signs_bfs[dst_offset..dst_offset + sub_bpv]
-                        .copy_from_slice(&frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv]);
+                    sub_signs_bfs[dst_offset..dst_offset + sub_bpv].copy_from_slice(
+                        &frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv],
+                    );
                 }
             }
         }
@@ -1032,7 +1091,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                let d: f32 = query
+                    .iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
                 (d, i as u32)
             })
             .collect();
@@ -1054,7 +1117,10 @@ mod tests {
         let mut all_indices: Vec<usize> = cells.iter().flat_map(|c| c.iter().copied()).collect();
         all_indices.sort();
         let expected: Vec<usize> = (0..200).collect();
-        assert_eq!(all_indices, expected, "all vectors must be assigned to exactly one cell");
+        assert_eq!(
+            all_indices, expected,
+            "all vectors must be assigned to exactly one cell"
+        );
     }
 
     #[test]
@@ -1100,7 +1166,11 @@ mod tests {
             }
         }
 
-        assert_eq!(count, n, "BFS from entry must reach all {} nodes, only reached {}", n, count);
+        assert_eq!(
+            count, n,
+            "BFS from entry must reach all {} nodes, only reached {}",
+            n, count
+        );
     }
 
     #[test]
@@ -1144,13 +1214,7 @@ mod tests {
             // Search the graph using f32 L2 (matches production path).
             // Use ef=256 for stitched graphs (wider beam compensates for cross-cell edges).
             let hnsw_results = crate::vector::hnsw::search_sq::hnsw_search_f32(
-                &graph,
-                &f32_bfs,
-                dim,
-                query,
-                k,
-                256,
-                None,
+                &graph, &f32_bfs, dim, query, k, 256, None,
             );
 
             // hnsw_search_f32 returns IDs in BFS space mapped back through to_original
@@ -1226,6 +1290,10 @@ mod tests {
             }
         }
 
-        assert_eq!(count, n, "stitched graph must be fully connected, only reached {}/{}", count, n);
+        assert_eq!(
+            count, n,
+            "stitched graph must be fully connected, only reached {}/{}",
+            count, n
+        );
     }
 }

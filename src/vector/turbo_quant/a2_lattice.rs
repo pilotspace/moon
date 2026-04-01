@@ -69,10 +69,7 @@ impl A2Codebook {
         let sigma = 1.0 / (padded_dim as f32).sqrt();
         let mut centroids = [(0.0f32, 0.0f32); 16];
         for i in 0..16 {
-            centroids[i] = (
-                RAW_A2_CENTROIDS[i].0 * sigma,
-                RAW_A2_CENTROIDS[i].1 * sigma,
-            );
+            centroids[i] = (RAW_A2_CENTROIDS[i].0 * sigma, RAW_A2_CENTROIDS[i].1 * sigma);
         }
         Self { centroids }
     }
@@ -92,7 +89,9 @@ impl A2Codebook {
         // LCG PRNG
         let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_1234;
         let next_u64 = |state: &mut u64| -> u64 {
-            *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             *state
         };
         let next_normal = |state: &mut u64, sig: f32| -> f32 {
@@ -304,7 +303,9 @@ mod tests {
         // Simple LCG PRNG for reproducibility
         let mut rng_state: u64 = 0x1234_5678_9ABC_DEF0;
         let next_u64 = |state: &mut u64| -> u64 {
-            *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             *state
         };
         // Box-Muller transform for N(0, sigma^2)

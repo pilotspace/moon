@@ -106,12 +106,10 @@ impl VectorIndex {
                 let next_global = old.mutable.next_global_id();
                 let mut imm_list = old.immutable.clone();
                 imm_list.push(Arc::new(immutable));
-                let new_mutable = Arc::new(
-                    crate::vector::segment::mutable::MutableSegment::new(
-                        self.meta.dimension,
-                        self.collection.clone(),
-                    ),
-                );
+                let new_mutable = Arc::new(crate::vector::segment::mutable::MutableSegment::new(
+                    self.meta.dimension,
+                    self.collection.clone(),
+                ));
                 new_mutable.set_global_id_base(next_global);
                 let new_list = SegmentList {
                     mutable: new_mutable,

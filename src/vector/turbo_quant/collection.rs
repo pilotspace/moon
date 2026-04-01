@@ -730,7 +730,7 @@ mod tests {
         );
         // A2 should be 2x more compressed than scalar TQ4
         assert_eq!(meta_tq4.code_bytes_per_vector(), 512); // 1024/2
-        assert_eq!(meta_a2.code_bytes_per_vector(), 256);  // 1024/4
+        assert_eq!(meta_a2.code_bytes_per_vector(), 256); // 1024/4
     }
 
     #[test]

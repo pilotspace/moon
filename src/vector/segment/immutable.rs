@@ -12,13 +12,13 @@ use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::hnsw::search::{
     SearchScratch, hnsw_search, hnsw_search_filtered, hnsw_search_subcent,
 };
-use crate::vector::types::VectorId;
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
 use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
+use crate::vector::types::VectorId;
 
 /// MVCC header for immutable segment entries.
 #[repr(C)]

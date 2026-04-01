@@ -967,17 +967,10 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                                             .and_then(|s| s.parse::<f64>().ok())
                                             .ok_or(())
                                         {
-                                            idx.payload_index.insert_numeric(
-                                                f_name,
-                                                num,
-                                                global_id,
-                                            );
+                                            idx.payload_index
+                                                .insert_numeric(f_name, num, global_id);
                                         } else {
-                                            idx.payload_index.insert_tag(
-                                                f_name,
-                                                f_val,
-                                                global_id,
-                                            );
+                                            idx.payload_index.insert_tag(f_name, f_val, global_id);
                                         }
                                     }
                                 }

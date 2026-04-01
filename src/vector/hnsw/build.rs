@@ -448,8 +448,7 @@ impl HnswBuilder {
                     .then(a.1.cmp(&b.1))
             });
 
-            let pruned =
-                select_neighbors_heuristic(&combined_buf[..combined_len], max_nb, dist_fn);
+            let pruned = select_neighbors_heuristic(&combined_buf[..combined_len], max_nb, dist_fn);
 
             if level == 0 {
                 for i in 0..max_nb {
@@ -739,7 +738,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                let d: f32 = query
+                    .iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
                 (d, i as u32)
             })
             .collect();
@@ -949,7 +952,10 @@ mod tests {
             // Use graph's neighbors_l0 for a basic BFS/greedy search
             let results = search_graph_knn(&graph, &distance_to_query, k, 64);
             // Convert BFS positions back to original IDs
-            let result_ids: Vec<u32> = results.iter().map(|&(_, pos)| graph.to_original(pos)).collect();
+            let result_ids: Vec<u32> = results
+                .iter()
+                .map(|&(_, pos)| graph.to_original(pos))
+                .collect();
 
             let hits = result_ids.iter().filter(|id| gt.contains(id)).count();
             total_recall += hits as f64 / k as f64;

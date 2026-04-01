@@ -348,14 +348,12 @@ pub fn read_immutable_segment(
     }
     // Detect format version: v2 starts with version byte 2, v1 starts with count (u32 LE)
     let (mvcc_version, mvcc_count, mut pos) = if mvcc_bytes[0] == 2 && mvcc_bytes.len() >= 5 {
-        let count = u32::from_le_bytes([
-            mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4],
-        ]) as usize;
+        let count = u32::from_le_bytes([mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4]])
+            as usize;
         (2u8, count, 5usize)
     } else {
-        let count = u32::from_le_bytes([
-            mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3],
-        ]) as usize;
+        let count = u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]])
+            as usize;
         (1u8, count, 4usize)
     };
     let bytes_per_header: usize = if mvcc_version >= 2 { 32 } else { 20 };
@@ -367,17 +365,29 @@ pub fn read_immutable_segment(
     let mut mvcc = Vec::with_capacity(mvcc_count);
     for _ in 0..mvcc_count {
         let internal_id = u32::from_le_bytes([
-            mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
         ]);
         pos += 4;
         let (global_id, key_hash) = if mvcc_version >= 2 {
             let gid = u32::from_le_bytes([
-                mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
             ]);
             pos += 4;
             let kh = u64::from_le_bytes([
-                mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
-                mvcc_bytes[pos + 4], mvcc_bytes[pos + 5], mvcc_bytes[pos + 6], mvcc_bytes[pos + 7],
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+                mvcc_bytes[pos + 4],
+                mvcc_bytes[pos + 5],
+                mvcc_bytes[pos + 6],
+                mvcc_bytes[pos + 7],
             ]);
             pos += 8;
             (gid, kh)
@@ -385,16 +395,34 @@ pub fn read_immutable_segment(
             (internal_id, 0u64) // v1 fallback: global_id = internal_id
         };
         let insert_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4], mvcc_bytes[pos + 5], mvcc_bytes[pos + 6], mvcc_bytes[pos + 7],
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
         ]);
         pos += 8;
         let delete_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos], mvcc_bytes[pos + 1], mvcc_bytes[pos + 2], mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4], mvcc_bytes[pos + 5], mvcc_bytes[pos + 6], mvcc_bytes[pos + 7],
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
         ]);
         pos += 8;
-        mvcc.push(MvccHeader { internal_id, global_id, key_hash, insert_lsn, delete_lsn });
+        mvcc.push(MvccHeader {
+            internal_id,
+            global_id,
+            key_hash,
+            insert_lsn,
+            delete_lsn,
+        });
     }
 
     // 6. Construct ImmutableSegment
