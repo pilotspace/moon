@@ -218,19 +218,17 @@ impl CollectionMetadata {
             fwht_sign_flips: sign_flips,
             codebook_version: CODEBOOK_VERSION,
             codebook: if quantization.is_turbo_quant() {
-                scaled_centroids_n(padded, quantization.bits()).unwrap_or_else(|e| {
-                    tracing::error!("failed to compute codebook centroids: {e}");
-                    Vec::new()
-                })
+                // Fail fast on invalid bit width — this is a programming invariant,
+                // not user input. Valid bit widths (1-4) are guaranteed by QuantizationConfig.
+                scaled_centroids_n(padded, quantization.bits())
+                    .expect("codebook centroids: invalid bit width is a programming bug")
             } else {
                 // SQ8 doesn't use codebooks -- store empty Vec
                 Vec::new()
             },
             codebook_boundaries: if quantization.is_turbo_quant() {
-                scaled_boundaries_n(padded, quantization.bits()).unwrap_or_else(|e| {
-                    tracing::error!("failed to compute codebook boundaries: {e}");
-                    Vec::new()
-                })
+                scaled_boundaries_n(padded, quantization.bits())
+                    .expect("codebook boundaries: invalid bit width is a programming bug")
             } else {
                 Vec::new()
             },
