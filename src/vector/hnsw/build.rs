@@ -115,6 +115,11 @@ pub struct HnswBuilder {
 
     /// LCG PRNG state for random_level.
     rng_state: u64,
+
+    /// When true, use diversity heuristic (Algorithm 4) for neighbor selection.
+    /// When false, use simple nearest-M. Set to false for noisy distance functions
+    /// (e.g., TQ-ADC) where inter-neighbor distance comparisons amplify quantization error.
+    use_heuristic: bool,
 }
 
 impl HnswBuilder {
@@ -138,7 +143,17 @@ impl HnswBuilder {
             max_level: 0,
             num_nodes: 0,
             rng_state: seed,
+            use_heuristic: true,
         }
+    }
+
+    /// Set whether to use the diversity heuristic for neighbor selection.
+    ///
+    /// Use `true` (default) when distance function is exact (f32 L2).
+    /// Use `false` when distance function is approximate (TQ-ADC) — the heuristic's
+    /// inter-neighbor comparisons amplify quantization noise, causing over-pruning.
+    pub fn set_use_heuristic(&mut self, use_heuristic: bool) {
+        self.use_heuristic = use_heuristic;
     }
 
     /// Generate random level using exponential distribution.
@@ -237,8 +252,12 @@ impl HnswBuilder {
             // Search layer for ef nearest neighbors
             let candidates = self.search_layer(current, &distance_to, ef, lev);
 
-            // Select neighbors using diversity heuristic (Algorithm 4, Malkov & Yashunin 2018)
-            let selected = select_neighbors_heuristic(&candidates, max_neighbors, &dist_fn);
+            // Select neighbors: heuristic for accurate distances, simple for noisy (TQ-ADC)
+            let selected = if self.use_heuristic {
+                select_neighbors_heuristic(&candidates, max_neighbors, &dist_fn)
+            } else {
+                select_neighbors_simple(&candidates, max_neighbors)
+            };
 
             // Connect new node -> selected neighbors
             self.set_neighbors(node_id, lev, &selected);
@@ -399,57 +418,89 @@ impl HnswBuilder {
             }
         }
 
-        // Full: collect all current neighbors + new candidate, re-prune with heuristic.
-        // Stack array sized for M0=64 + 1 new candidate (covers any M up to 32).
-        let mut combined_buf = [(0.0f32, 0u32); 65];
-        let mut combined_len = 0usize;
+        if self.use_heuristic {
+            // Heuristic re-prune: collect all neighbors + candidate, re-select with diversity.
+            let mut combined_buf = [(0.0f32, 0u32); 65];
+            let mut combined_len = 0usize;
 
-        let neighbors = if level == 0 {
-            &self.layer0_flat[start..start + max_nb]
-        } else {
-            let sv = &self.upper_layers[target as usize];
-            let end = (start + max_nb).min(sv.len());
-            &sv[start..end]
-        };
+            let neighbors = if level == 0 {
+                &self.layer0_flat[start..start + max_nb]
+            } else {
+                let sv = &self.upper_layers[target as usize];
+                let end = (start + max_nb).min(sv.len());
+                &sv[start..end]
+            };
 
-        for &nb in neighbors {
-            if nb == SENTINEL {
-                break;
+            for &nb in neighbors {
+                if nb == SENTINEL {
+                    break;
+                }
+                combined_buf[combined_len] = (dist_fn(target, nb), nb);
+                combined_len += 1;
             }
-            combined_buf[combined_len] = (dist_fn(target, nb), nb);
+            combined_buf[combined_len] = (dist_fn(target, node_id), node_id);
             combined_len += 1;
-        }
-        combined_buf[combined_len] = (dist_fn(target, node_id), node_id);
-        combined_len += 1;
 
-        // Sort by distance ascending (required by select_neighbors_heuristic)
-        combined_buf[..combined_len].sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        });
+            combined_buf[..combined_len].sort_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.1.cmp(&b.1))
+            });
 
-        // Re-prune using diversity heuristic with target as the "query"
-        let pruned = select_neighbors_heuristic(&combined_buf[..combined_len], max_nb, dist_fn);
+            let pruned =
+                select_neighbors_heuristic(&combined_buf[..combined_len], max_nb, dist_fn);
 
-        // Write back to neighbor array, fill unused slots with SENTINEL
-        if level == 0 {
-            for i in 0..max_nb {
-                self.layer0_flat[start + i] = if i < pruned.len() {
-                    pruned[i].1
-                } else {
-                    SENTINEL
-                };
+            if level == 0 {
+                for i in 0..max_nb {
+                    self.layer0_flat[start + i] = if i < pruned.len() {
+                        pruned[i].1
+                    } else {
+                        SENTINEL
+                    };
+                }
+            } else {
+                let sv = &mut self.upper_layers[target as usize];
+                let end = (start + max_nb).min(sv.len());
+                for i in 0..(end - start) {
+                    sv[start + i] = if i < pruned.len() {
+                        pruned[i].1
+                    } else {
+                        SENTINEL
+                    };
+                }
             }
         } else {
-            let sv = &mut self.upper_layers[target as usize];
-            let end = (start + max_nb).min(sv.len());
-            for i in 0..(end - start) {
-                sv[start + i] = if i < pruned.len() {
-                    pruned[i].1
+            // Simple farthest-replacement: replace worst neighbor if new is closer.
+            // Avoids inter-neighbor comparisons that amplify TQ-ADC noise.
+            let new_dist = dist_fn(target, node_id);
+            let mut worst_dist = 0.0f32;
+            let mut worst_idx = 0;
+
+            let neighbors = if level == 0 {
+                &self.layer0_flat[start..start + max_nb]
+            } else {
+                let sv = &self.upper_layers[target as usize];
+                let end = (start + max_nb).min(sv.len());
+                &sv[start..end]
+            };
+
+            for (i, &nb) in neighbors.iter().enumerate() {
+                if nb == SENTINEL {
+                    break;
+                }
+                let d = dist_fn(target, nb);
+                if d > worst_dist {
+                    worst_dist = d;
+                    worst_idx = i;
+                }
+            }
+
+            if new_dist < worst_dist {
+                if level == 0 {
+                    self.layer0_flat[start + worst_idx] = node_id;
                 } else {
-                    SENTINEL
-                };
+                    self.upper_layers[target as usize][start + worst_idx] = node_id;
+                }
             }
         }
     }

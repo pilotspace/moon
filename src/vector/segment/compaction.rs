@@ -576,7 +576,10 @@ pub fn compact(
                 });
             }
         } else {
-            // Scalar TQ fallback: TQ-ADC pairwise (decoded centroids vs nibble codes)
+            // Scalar TQ fallback: TQ-ADC pairwise (decoded centroids vs nibble codes).
+            // Disable diversity heuristic — TQ-ADC inter-neighbor comparisons amplify
+            // quantization noise, causing over-pruning and recall loss at high dimensions.
+            builder.set_use_heuristic(false);
             for _i in 0..n {
                 builder.insert(|a: u32, b: u32| {
                     let q_rot = &all_rotated[a as usize];
