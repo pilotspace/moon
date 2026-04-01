@@ -239,7 +239,12 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
             crate::vector::metrics::increment_indexes();
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
-        Err(msg) => Frame::Error(Bytes::from(format!("ERR {msg}"))),
+        Err(msg) => {
+            let mut buf = Vec::with_capacity(4 + msg.len());
+            buf.extend_from_slice(b"ERR ");
+            buf.extend_from_slice(msg.as_bytes());
+            Frame::Error(Bytes::from(buf))
+        }
     }
 }
 
@@ -570,8 +575,11 @@ fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
         doc_id.extend_from_slice(id_str.as_bytes());
         items.push(Frame::BulkString(Bytes::from(doc_id)));
 
-        // Score as nested array (format! acceptable -- end of command path)
-        let score_str = format!("{}", r.distance);
+        // Score as nested array — use write! to pre-allocated buffer
+        let mut score_buf = String::with_capacity(16);
+        use std::fmt::Write;
+        let _ = write!(score_buf, "{}", r.distance);
+        let score_str = score_buf;
         let fields = vec![
             Frame::BulkString(Bytes::from_static(b"__vec_score")),
             Frame::BulkString(Bytes::from(score_str)),

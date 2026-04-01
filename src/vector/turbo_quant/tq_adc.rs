@@ -317,15 +317,21 @@ pub fn tq_l2_adc_multibit(
         4 => {
             // Delegate to existing optimized 4-bit path
             debug_assert_eq!(centroids.len(), 16);
-            let c: &[f32; 16] = centroids.try_into().unwrap_or_else(|_| {
-                panic!(
+            if let Ok(c) = centroids.try_into() {
+                tq_l2_adc_scaled(q_rotated, code, norm, c)
+            } else {
+                // Invariant violated — return max distance rather than panic
+                tracing::error!(
                     "4-bit ADC requires exactly 16 centroids, got {}",
                     centroids.len()
-                )
-            });
-            tq_l2_adc_scaled(q_rotated, code, norm, c)
+                );
+                f32::MAX
+            }
         }
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => {
+            tracing::error!("unsupported bit width: {bits}");
+            f32::MAX
+        }
     }
 }
 

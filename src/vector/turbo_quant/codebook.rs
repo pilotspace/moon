@@ -190,7 +190,10 @@ pub fn code_bytes_per_vector(padded_dim: u32, bits: u8) -> usize {
         2 => pd / 4,
         3 => (pd * 3 + 7) / 8,
         4 => pd / 2,
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => {
+            tracing::error!("unsupported bit width {bits} for code_bytes_per_vector");
+            0
+        }
     }
 }
 
