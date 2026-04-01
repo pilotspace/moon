@@ -9,3 +9,4 @@ pub mod redis_rdb;
 pub mod replay;
 pub mod snapshot;
 pub mod wal;
+pub mod wal_v3;
