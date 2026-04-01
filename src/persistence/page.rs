@@ -16,25 +16,69 @@ pub const PAGE_4K: usize = 4096;
 pub const PAGE_64K: usize = 65536;
 
 /// Page type discriminant — determines page size and interpretation.
+///
+/// Discriminant values are part of the on-disk format and MUST NOT change.
+/// See MOONSTORE-V2-COMPREHENSIVE-DESIGN.md §2.2 for the authoritative list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
-    /// Key-value data page (4KB).
-    KvData = 0x01,
-    /// Vector quantized codes page (64KB).
-    VecCodes = 0x10,
-    /// Vector full-precision page (64KB).
-    VecFull = 0x11,
-    /// Vector HNSW graph adjacency page (4KB).
-    VecGraph = 0x12,
-    /// Vector MVCC metadata page (4KB).
-    VecMvcc = 0x13,
-    /// General metadata page (4KB).
-    Metadata = 0x20,
-    /// Shard control file page (4KB).
-    Control = 0x30,
-    /// Manifest root page (4KB).
-    ManifestRoot = 0x31,
+    // ── Structural ──────────────────────────────────────
+    /// Dual meta-root page (LMDB pattern).
+    ManifestRoot  = 0x01,
+    /// Overflow file table entries.
+    ManifestEntry = 0x02,
+    /// Shard control file (single page).
+    ControlPage   = 0x03,
+    /// Commit log bitmap (2 bits per txn).
+    ClogPage      = 0x04,
+
+    // ── KV Data ─────────────────────────────────────────
+    /// Slotted page of key-value entries (4KB).
+    KvLeaf        = 0x10,
+    /// Large value continuation chain (4KB).
+    KvOverflow    = 0x11,
+    /// Key hash → page_id lookup (4KB).
+    KvIndex       = 0x12,
+
+    // ── Complex Type Overflow ───────────────────────────
+    /// HASH field-value pairs (4KB).
+    HashBucket    = 0x18,
+    /// LIST element sequence (4KB).
+    ListChunk     = 0x19,
+    /// SET member page (4KB).
+    SetBucket     = 0x1A,
+    /// ZSET skip-list nodes (4KB).
+    ZSetSkip      = 0x1B,
+    /// STREAM ID-entry pairs (4KB).
+    StreamEntries = 0x1C,
+
+    // ── Vector Data ─────────────────────────────────────
+    /// Quantized codes (TQ/PQ/SBQ) — 64KB pages.
+    VecCodes      = 0x20,
+    /// Full-precision vectors (f16/f32) — 64KB pages.
+    VecFull       = 0x21,
+    /// HNSW or Vamana adjacency — 4KB pages.
+    VecGraph      = 0x22,
+    /// MVCC visibility headers (4KB).
+    VecMvcc       = 0x23,
+    /// Collection/segment metadata + codebook (4KB).
+    VecMeta       = 0x24,
+    /// Undo log for vector metadata updates (4KB).
+    VecUndo       = 0x25,
+
+    // ── WAL (on-disk only, never in PageCache) ──────────
+    /// RESP command batch.
+    WalBlock      = 0x30,
+    /// Full-page image.
+    WalFpi        = 0x31,
+    /// Checkpoint record.
+    WalCheckpoint = 0x32,
+    /// Vector operation record.
+    WalVectorOp   = 0x33,
+
+    // ── Free Space ──────────────────────────────────────
+    /// Free page bitmap.
+    FreeMap       = 0xF0,
 }
 
 impl PageType {
@@ -51,27 +95,50 @@ impl PageType {
     #[inline]
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0x01 => Some(Self::KvData),
-            0x10 => Some(Self::VecCodes),
-            0x11 => Some(Self::VecFull),
-            0x12 => Some(Self::VecGraph),
-            0x13 => Some(Self::VecMvcc),
-            0x20 => Some(Self::Metadata),
-            0x30 => Some(Self::Control),
-            0x31 => Some(Self::ManifestRoot),
+            // Structural
+            0x01 => Some(Self::ManifestRoot),
+            0x02 => Some(Self::ManifestEntry),
+            0x03 => Some(Self::ControlPage),
+            0x04 => Some(Self::ClogPage),
+            // KV
+            0x10 => Some(Self::KvLeaf),
+            0x11 => Some(Self::KvOverflow),
+            0x12 => Some(Self::KvIndex),
+            // Complex types
+            0x18 => Some(Self::HashBucket),
+            0x19 => Some(Self::ListChunk),
+            0x1A => Some(Self::SetBucket),
+            0x1B => Some(Self::ZSetSkip),
+            0x1C => Some(Self::StreamEntries),
+            // Vector
+            0x20 => Some(Self::VecCodes),
+            0x21 => Some(Self::VecFull),
+            0x22 => Some(Self::VecGraph),
+            0x23 => Some(Self::VecMvcc),
+            0x24 => Some(Self::VecMeta),
+            0x25 => Some(Self::VecUndo),
+            // WAL
+            0x30 => Some(Self::WalBlock),
+            0x31 => Some(Self::WalFpi),
+            0x32 => Some(Self::WalCheckpoint),
+            0x33 => Some(Self::WalVectorOp),
+            // Free space
+            0xF0 => Some(Self::FreeMap),
             _ => None,
         }
     }
 }
 
 /// Bitflags for page-level flags (u16).
+///
+/// Bit assignments match MOONSTORE-V2-COMPREHENSIVE-DESIGN.md §2.1.
 pub mod page_flags {
-    /// Page contains a full-page image (FPI) for torn-page defense.
-    pub const FPI: u16 = 1 << 0;
-    /// Page payload is LZ4-compressed.
-    pub const COMPRESSED: u16 = 1 << 1;
     /// Page has been dirtied since last checkpoint.
-    pub const DIRTY: u16 = 1 << 2;
+    pub const DIRTY: u16 = 0x01;
+    /// Page payload is LZ4-compressed.
+    pub const COMPRESSED: u16 = 0x02;
+    /// Page contains a full-page image (FPI) for torn-page defense.
+    pub const FPI: u16 = 0x04;
 }
 
 /// Universal 64-byte MoonPage header.
@@ -259,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_write_to_produces_64_bytes_with_correct_magic() {
-        let hdr = MoonPageHeader::new(PageType::KvData, 42, 7);
+        let hdr = MoonPageHeader::new(PageType::KvLeaf, 42, 7);
         let mut buf = [0u8; 128];
         hdr.write_to(&mut buf);
 
@@ -295,7 +362,7 @@ mod tests {
     #[test]
     fn test_compute_checksum_embeds_crc32c() {
         let mut page = vec![0u8; PAGE_4K];
-        let mut hdr = MoonPageHeader::new(PageType::KvData, 1, 1);
+        let mut hdr = MoonPageHeader::new(PageType::KvLeaf, 1, 1);
         hdr.payload_bytes = 100;
         hdr.write_to(&mut page);
 
@@ -319,7 +386,7 @@ mod tests {
     #[test]
     fn test_verify_checksum_valid_and_corrupted() {
         let mut page = vec![0u8; PAGE_4K];
-        let mut hdr = MoonPageHeader::new(PageType::Metadata, 5, 5);
+        let mut hdr = MoonPageHeader::new(PageType::VecMeta, 5, 5);
         hdr.payload_bytes = 200;
         hdr.write_to(&mut page);
 
@@ -338,12 +405,20 @@ mod tests {
 
     #[test]
     fn test_page_type_sizes() {
-        assert_eq!(PageType::KvData.page_size(), PAGE_4K);
+        // 4KB types
+        assert_eq!(PageType::ManifestRoot.page_size(), PAGE_4K);
+        assert_eq!(PageType::ManifestEntry.page_size(), PAGE_4K);
+        assert_eq!(PageType::ControlPage.page_size(), PAGE_4K);
+        assert_eq!(PageType::ClogPage.page_size(), PAGE_4K);
+        assert_eq!(PageType::KvLeaf.page_size(), PAGE_4K);
+        assert_eq!(PageType::KvOverflow.page_size(), PAGE_4K);
+        assert_eq!(PageType::KvIndex.page_size(), PAGE_4K);
         assert_eq!(PageType::VecGraph.page_size(), PAGE_4K);
         assert_eq!(PageType::VecMvcc.page_size(), PAGE_4K);
-        assert_eq!(PageType::Metadata.page_size(), PAGE_4K);
-        assert_eq!(PageType::Control.page_size(), PAGE_4K);
-        assert_eq!(PageType::ManifestRoot.page_size(), PAGE_4K);
+        assert_eq!(PageType::VecMeta.page_size(), PAGE_4K);
+        assert_eq!(PageType::VecUndo.page_size(), PAGE_4K);
+        assert_eq!(PageType::FreeMap.page_size(), PAGE_4K);
+        // 64KB types
         assert_eq!(PageType::VecCodes.page_size(), PAGE_64K);
         assert_eq!(PageType::VecFull.page_size(), PAGE_64K);
     }
@@ -351,7 +426,7 @@ mod tests {
     #[test]
     fn test_edge_lsn_values() {
         // page_lsn = 0
-        let mut hdr = MoonPageHeader::new(PageType::Control, 0, 0);
+        let mut hdr = MoonPageHeader::new(PageType::ControlPage, 0, 0);
         hdr.page_lsn = 0;
         let mut buf = [0u8; 64];
         hdr.write_to(&mut buf);
@@ -381,14 +456,29 @@ mod tests {
     #[test]
     fn test_page_type_from_u8_roundtrip() {
         let types = [
-            PageType::KvData,
+            PageType::ManifestRoot,
+            PageType::ManifestEntry,
+            PageType::ControlPage,
+            PageType::ClogPage,
+            PageType::KvLeaf,
+            PageType::KvOverflow,
+            PageType::KvIndex,
+            PageType::HashBucket,
+            PageType::ListChunk,
+            PageType::SetBucket,
+            PageType::ZSetSkip,
+            PageType::StreamEntries,
             PageType::VecCodes,
             PageType::VecFull,
             PageType::VecGraph,
             PageType::VecMvcc,
-            PageType::Metadata,
-            PageType::Control,
-            PageType::ManifestRoot,
+            PageType::VecMeta,
+            PageType::VecUndo,
+            PageType::WalBlock,
+            PageType::WalFpi,
+            PageType::WalCheckpoint,
+            PageType::WalVectorOp,
+            PageType::FreeMap,
         ];
         for pt in types {
             assert_eq!(PageType::from_u8(pt as u8), Some(pt));

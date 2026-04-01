@@ -46,17 +46,19 @@ impl FileStatus {
 }
 
 /// Storage tier for tiered storage placement.
+///
+/// Discriminant values match MOONSTORE-V2-COMPREHENSIVE-DESIGN.md §4.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StorageTier {
-    /// In-memory / fastest storage.
-    Hot = 0,
-    /// SSD / local NVMe.
-    Warm = 1,
-    /// Slower disk or networked storage.
-    Cold = 2,
-    /// Long-term archival storage.
-    Archive = 3,
+    /// Data in RAM (file is WAL/snapshot only).
+    Hot = 0x01,
+    /// File is mmap'd, OS page cache manages residency.
+    Warm = 0x02,
+    /// File on SSD, accessed via io_uring / direct I/O.
+    Cold = 0x03,
+    /// Object storage (S3), accessed via HTTP range reads.
+    Archive = 0x04,
 }
 
 impl StorageTier {
@@ -64,10 +66,10 @@ impl StorageTier {
     #[inline]
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::Hot),
-            1 => Some(Self::Warm),
-            2 => Some(Self::Cold),
-            3 => Some(Self::Archive),
+            0x01 => Some(Self::Hot),
+            0x02 => Some(Self::Warm),
+            0x03 => Some(Self::Cold),
+            0x04 => Some(Self::Archive),
             _ => None,
         }
     }
@@ -183,23 +185,36 @@ const ROOT_A_OFFSET: u64 = 0;
 const ROOT_B_OFFSET: u64 = PAGE_4K as u64;
 
 /// Payload starts after 64-byte MoonPageHeader.
-/// Layout: epoch(8) + file_count(4) + overflow_page_count(4) = 16 bytes of metadata,
+/// Layout per §4.2: epoch(8) + redo_lsn(8) + wal_flush_lsn(8) + file_count(4) +
+/// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) = 64 bytes,
 /// then file_count * 48 bytes of FileEntry records.
-const ROOT_META_SIZE: usize = 16;
+const ROOT_META_SIZE: usize = 64;
 
 /// Maximum inline FileEntry records per root page.
-/// (4096 - 64 header - 16 meta) / 48 = 83.
+/// (4096 - 64 header - 64 meta) / 48 = 82.
 pub const MAX_INLINE_ENTRIES: usize = (PAGE_4K - MOONPAGE_HEADER_SIZE - ROOT_META_SIZE) / FileEntry::SIZE;
 
 /// In-memory representation of one manifest root page.
+///
+/// Fields match MOONSTORE-V2-COMPREHENSIVE-DESIGN.md §4.2.
 #[derive(Debug, Clone)]
 pub struct ManifestRoot {
     /// Monotonically increasing epoch (commit counter).
     pub epoch: u64,
+    /// WAL REDO point from last checkpoint.
+    pub redo_lsn: u64,
+    /// Highest durable WAL LSN.
+    pub wal_flush_lsn: u64,
     /// Number of file entries.
     pub file_count: u32,
-    /// Number of overflow pages (for future use, currently 0).
-    pub overflow_page_count: u32,
+    /// Number of overflow ManifestEntry pages.
+    pub entry_page_count: u32,
+    /// LSN of latest completed snapshot.
+    pub snapshot_lsn: u64,
+    /// Unix timestamp (seconds).
+    pub created_at: u64,
+    /// Unique shard identifier (must match control file).
+    pub shard_uuid: [u8; 16],
     /// File entries tracked by this root.
     pub entries: Vec<FileEntry>,
 }
@@ -230,8 +245,13 @@ impl ShardManifest {
         // Build Root A at offset 0 with epoch=1, file_count=0
         let root = ManifestRoot {
             epoch: 1,
+            redo_lsn: 0,
+            wal_flush_lsn: 0,
             file_count: 0,
-            overflow_page_count: 0,
+            entry_page_count: 0,
+            snapshot_lsn: 0,
+            created_at: 0,
+            shard_uuid: [0u8; 16],
             entries: Vec::new(),
         };
         Self::serialize_root(&root, &mut buf[..PAGE_4K]);
@@ -396,13 +416,16 @@ impl ShardManifest {
     }
 
     /// Serialize a ManifestRoot into a 4KB page buffer.
+    ///
+    /// Layout per §4.2: epoch(8) + redo_lsn(8) + wal_flush_lsn(8) + file_count(4) +
+    /// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) = 64 bytes.
     fn serialize_root(root: &ManifestRoot, page: &mut [u8]) {
         assert!(page.len() >= PAGE_4K);
 
         // Zero the page
         page[..PAGE_4K].fill(0);
 
-        // Payload: epoch + file_count + overflow_page_count + entries
+        // Payload: 64 bytes meta + file_count * 48 bytes entries
         let payload_bytes = ROOT_META_SIZE + root.entries.len() * FileEntry::SIZE;
 
         // Header
@@ -411,11 +434,16 @@ impl ShardManifest {
         hdr.entry_count = root.entries.len() as u32;
         hdr.write_to(page);
 
-        // Manifest-specific metadata after header
+        // Manifest-specific metadata after header (64 bytes)
         let p = MOONPAGE_HEADER_SIZE;
         page[p..p + 8].copy_from_slice(&root.epoch.to_le_bytes());
-        page[p + 8..p + 12].copy_from_slice(&root.file_count.to_le_bytes());
-        page[p + 12..p + 16].copy_from_slice(&root.overflow_page_count.to_le_bytes());
+        page[p + 8..p + 16].copy_from_slice(&root.redo_lsn.to_le_bytes());
+        page[p + 16..p + 24].copy_from_slice(&root.wal_flush_lsn.to_le_bytes());
+        page[p + 24..p + 28].copy_from_slice(&root.file_count.to_le_bytes());
+        page[p + 28..p + 32].copy_from_slice(&root.entry_page_count.to_le_bytes());
+        page[p + 32..p + 40].copy_from_slice(&root.snapshot_lsn.to_le_bytes());
+        page[p + 40..p + 48].copy_from_slice(&root.created_at.to_le_bytes());
+        page[p + 48..p + 64].copy_from_slice(&root.shard_uuid);
 
         // FileEntry records
         let entries_start = p + ROOT_META_SIZE;
@@ -447,18 +475,17 @@ impl ShardManifest {
             return None;
         }
 
-        // Parse metadata
+        // Parse metadata (64 bytes)
         let p = MOONPAGE_HEADER_SIZE;
-        let epoch = u64::from_le_bytes([
-            page[p], page[p + 1], page[p + 2], page[p + 3],
-            page[p + 4], page[p + 5], page[p + 6], page[p + 7],
-        ]);
-        let file_count = u32::from_le_bytes([
-            page[p + 8], page[p + 9], page[p + 10], page[p + 11],
-        ]);
-        let overflow_page_count = u32::from_le_bytes([
-            page[p + 12], page[p + 13], page[p + 14], page[p + 15],
-        ]);
+        let epoch = u64::from_le_bytes(page[p..p + 8].try_into().ok()?);
+        let redo_lsn = u64::from_le_bytes(page[p + 8..p + 16].try_into().ok()?);
+        let wal_flush_lsn = u64::from_le_bytes(page[p + 16..p + 24].try_into().ok()?);
+        let file_count = u32::from_le_bytes(page[p + 24..p + 28].try_into().ok()?);
+        let entry_page_count = u32::from_le_bytes(page[p + 28..p + 32].try_into().ok()?);
+        let snapshot_lsn = u64::from_le_bytes(page[p + 32..p + 40].try_into().ok()?);
+        let created_at = u64::from_le_bytes(page[p + 40..p + 48].try_into().ok()?);
+        let mut shard_uuid = [0u8; 16];
+        shard_uuid.copy_from_slice(&page[p + 48..p + 64]);
 
         // Parse entries
         let entries_start = p + ROOT_META_SIZE;
@@ -471,8 +498,13 @@ impl ShardManifest {
 
         Some(ManifestRoot {
             epoch,
+            redo_lsn,
+            wal_flush_lsn,
             file_count,
-            overflow_page_count,
+            entry_page_count,
+            snapshot_lsn,
+            created_at,
+            shard_uuid,
             entries,
         })
     }
@@ -486,7 +518,7 @@ mod tests {
     fn file_entry_roundtrip_all_fields() {
         let entry = FileEntry {
             file_id: 0x0102_0304_0506_0708,
-            file_type: PageType::KvData as u8,
+            file_type: PageType::KvLeaf as u8,
             status: FileStatus::Active,
             tier: StorageTier::Hot,
             page_size_log2: 12,
@@ -541,11 +573,12 @@ mod tests {
 
     #[test]
     fn file_storage_tier_all_variants() {
-        assert_eq!(StorageTier::from_u8(0), Some(StorageTier::Hot));
-        assert_eq!(StorageTier::from_u8(1), Some(StorageTier::Warm));
-        assert_eq!(StorageTier::from_u8(2), Some(StorageTier::Cold));
-        assert_eq!(StorageTier::from_u8(3), Some(StorageTier::Archive));
-        assert_eq!(StorageTier::from_u8(4), None);
+        assert_eq!(StorageTier::from_u8(0x01), Some(StorageTier::Hot));
+        assert_eq!(StorageTier::from_u8(0x02), Some(StorageTier::Warm));
+        assert_eq!(StorageTier::from_u8(0x03), Some(StorageTier::Cold));
+        assert_eq!(StorageTier::from_u8(0x04), Some(StorageTier::Archive));
+        assert_eq!(StorageTier::from_u8(0), None);
+        assert_eq!(StorageTier::from_u8(5), None);
         assert_eq!(StorageTier::from_u8(255), None);
     }
 
@@ -554,7 +587,7 @@ mod tests {
         // 4KB pages
         let entry_4k = FileEntry {
             file_id: 10,
-            file_type: PageType::KvData as u8,
+            file_type: PageType::KvLeaf as u8,
             status: FileStatus::Active,
             tier: StorageTier::Hot,
             page_size_log2: 12,
@@ -591,7 +624,7 @@ mod tests {
     fn make_entry(id: u64) -> FileEntry {
         FileEntry {
             file_id: id,
-            file_type: PageType::KvData as u8,
+            file_type: PageType::KvLeaf as u8,
             status: FileStatus::Active,
             tier: StorageTier::Hot,
             page_size_log2: 12,
@@ -733,27 +766,28 @@ mod tests {
 
     #[test]
     fn test_manifest_max_inline_entries() {
-        assert_eq!(MAX_INLINE_ENTRIES, 83);
+        // (4096 - 64 header - 64 meta) / 48 = 82
+        assert_eq!(MAX_INLINE_ENTRIES, 82);
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("shard-0.manifest");
 
         let mut m = ShardManifest::create(&path).unwrap();
 
-        // Add exactly 83 entries
-        for i in 0..83u64 {
+        // Add exactly 82 entries
+        for i in 0..82u64 {
             m.add_file(make_entry(i + 1));
         }
         m.commit().unwrap();
 
         // Verify recovery
         let m2 = ShardManifest::open(&path).unwrap();
-        assert_eq!(m2.files().len(), 83);
+        assert_eq!(m2.files().len(), 82);
 
         // Adding one more should fail on commit
         drop(m2);
         let mut m3 = ShardManifest::open(&path).unwrap();
-        m3.add_file(make_entry(84));
+        m3.add_file(make_entry(83));
         let result = m3.commit();
         assert!(result.is_err());
     }

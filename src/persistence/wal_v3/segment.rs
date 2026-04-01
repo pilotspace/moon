@@ -9,13 +9,14 @@
 //! Offset  Size  Field
 //! 0       6     magic "RRDWAL"
 //! 6       1     version = 3
-//! 7       2     shard_id (u16 LE)
-//! 9       8     epoch (u64 LE)
-//! 17      8     redo_lsn (u64 LE) — LSN of first record in segment
-//! 25      8     base_lsn (u64 LE) — LSN of last checkpoint before segment
-//! 33      4     segment_size (u32 LE)
-//! 37      4     flags (u32 LE) — reserved
-//! 41      23    reserved (zeroes)
+//! 7       1     flags (FPI_ENABLED=0x01, COMPRESSED=0x02)
+//! 8       2     shard_id (u16 LE)
+//! 10      2     reserved_0 (zero)
+//! 12      8     epoch (u64 LE)
+//! 20      8     redo_lsn (u64 LE) — REDO point from last checkpoint
+//! 28      8     base_lsn (u64 LE) — LSN of first record in this segment
+//! 36      8     segment_size (u64 LE)
+//! 44      20    reserved_1 (zeroes)
 //! ```
 
 use std::fs::{self, File, OpenOptions};
@@ -200,6 +201,20 @@ impl WalWriterV3 {
     }
 
     /// Write the 64-byte v3 segment header.
+    ///
+    /// Layout per §5.1:
+    /// ```text
+    /// 0..6    magic "RRDWAL"
+    /// 6       version = 3
+    /// 7       flags (FPI_ENABLED=0x01, COMPRESSED=0x02)
+    /// 8..10   shard_id (u16 LE)
+    /// 10..12  reserved_0 (zero)
+    /// 12..20  epoch (u64 LE)
+    /// 20..28  redo_lsn (u64 LE)
+    /// 28..36  base_lsn (u64 LE)
+    /// 36..44  segment_size (u64 LE)
+    /// 44..64  reserved_1 (zero)
+    /// ```
     fn write_segment_header(&self, file: &mut File) -> std::io::Result<()> {
         let mut header = [0u8; WAL_V3_HEADER_SIZE];
 
@@ -207,19 +222,20 @@ impl WalWriterV3 {
         header[0..6].copy_from_slice(WAL_V3_MAGIC);
         // version (1 byte)
         header[6] = WAL_V3_VERSION;
+        // flags (1 byte) — FPI enabled by default
+        header[7] = 0x01; // FPI_ENABLED
         // shard_id (2 bytes LE)
-        header[7..9].copy_from_slice(&(self.shard_id as u16).to_le_bytes());
+        header[8..10].copy_from_slice(&(self.shard_id as u16).to_le_bytes());
+        // reserved_0 (2 bytes, zero)
         // epoch (8 bytes LE)
-        header[9..17].copy_from_slice(&self.epoch.to_le_bytes());
-        // redo_lsn (8 bytes LE) — next LSN to be written
-        header[17..25].copy_from_slice(&self.next_lsn.to_le_bytes());
-        // base_lsn (8 bytes LE) — last checkpoint LSN
-        header[25..33].copy_from_slice(&self.base_lsn.to_le_bytes());
-        // segment_size (4 bytes LE)
-        header[33..37].copy_from_slice(&(self.segment_size as u32).to_le_bytes());
-        // flags (4 bytes LE) — reserved
-        header[37..41].copy_from_slice(&0u32.to_le_bytes());
-        // bytes 41..64 remain zero (reserved)
+        header[12..20].copy_from_slice(&self.epoch.to_le_bytes());
+        // redo_lsn (8 bytes LE) — REDO point from last checkpoint
+        header[20..28].copy_from_slice(&self.base_lsn.to_le_bytes());
+        // base_lsn (8 bytes LE) — LSN of first record in this segment
+        header[28..36].copy_from_slice(&self.next_lsn.to_le_bytes());
+        // segment_size (8 bytes LE)
+        header[36..44].copy_from_slice(&self.segment_size.to_le_bytes());
+        // bytes 44..64 remain zero (reserved_1)
 
         file.write_all(&header)
     }
@@ -352,18 +368,22 @@ mod tests {
         let data = fs::read(&seg_path).unwrap();
         assert_eq!(data.len(), WAL_V3_HEADER_SIZE);
 
-        // Verify header fields
+        // Verify header fields per §5.1 layout:
+        // 0..6: magic, 6: version, 7: flags, 8..10: shard_id, 10..12: reserved_0,
+        // 12..20: epoch, 20..28: redo_lsn, 28..36: base_lsn, 36..44: segment_size
         assert_eq!(&data[0..6], b"RRDWAL");
         assert_eq!(data[6], 3); // version = 3
-        assert_eq!(u16::from_le_bytes([data[7], data[8]]), 7); // shard_id = 7
-        // redo_lsn at offset 17
-        let redo_lsn = u64::from_le_bytes([
-            data[17], data[18], data[19], data[20],
-            data[21], data[22], data[23], data[24],
-        ]);
-        assert_eq!(redo_lsn, 1); // first record LSN
-        // segment_size at offset 33
-        let seg_size = u32::from_le_bytes([data[33], data[34], data[35], data[36]]);
-        assert_eq!(seg_size as u64, DEFAULT_SEGMENT_SIZE);
+        assert_eq!(data[7], 0x01); // flags = FPI_ENABLED
+        assert_eq!(u16::from_le_bytes([data[8], data[9]]), 7); // shard_id = 7
+        assert_eq!(u16::from_le_bytes([data[10], data[11]]), 0); // reserved_0
+        // redo_lsn at offset 20 (base_lsn = last checkpoint = 0)
+        let redo_lsn = u64::from_le_bytes(data[20..28].try_into().unwrap());
+        assert_eq!(redo_lsn, 0); // base_lsn starts at 0
+        // base_lsn at offset 28 (first record LSN)
+        let base_lsn = u64::from_le_bytes(data[28..36].try_into().unwrap());
+        assert_eq!(base_lsn, 1); // first record LSN = 1
+        // segment_size at offset 36 (u64)
+        let seg_size = u64::from_le_bytes(data[36..44].try_into().unwrap());
+        assert_eq!(seg_size, DEFAULT_SEGMENT_SIZE);
     }
 }

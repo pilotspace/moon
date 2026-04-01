@@ -48,6 +48,18 @@ async fn start_server() -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     tokio::spawn(async move {
@@ -96,6 +108,18 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     tokio::spawn(async move {
@@ -1216,6 +1240,18 @@ async fn start_server_with_persistence(
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     tokio::spawn(async move {
@@ -2048,6 +2084,18 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     tokio::spawn(async move {
@@ -2407,6 +2455,18 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     let cancel = token.clone();
@@ -3535,6 +3595,18 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     std::thread::spawn(move || {
@@ -4145,6 +4217,18 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
     };
 
     tokio::spawn(async move {

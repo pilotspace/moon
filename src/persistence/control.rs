@@ -85,7 +85,7 @@ impl ShardControlFile {
         let mut buf = [0u8; PAGE_4K];
 
         // Build header
-        let mut hdr = MoonPageHeader::new(PageType::Control, 0, 0);
+        let mut hdr = MoonPageHeader::new(PageType::ControlPage, 0, 0);
         hdr.payload_bytes = CONTROL_PAYLOAD_SIZE;
         hdr.write_to(&mut buf);
 
@@ -141,7 +141,7 @@ impl ShardControlFile {
             )
         })?;
 
-        if hdr.page_type != PageType::Control {
+        if hdr.page_type != PageType::ControlPage {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
