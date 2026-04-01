@@ -576,24 +576,16 @@ pub fn compact(
                 });
             }
         } else {
-            // Scalar TQ fallback: TQ-ADC pairwise (decoded centroids vs nibble codes).
-            // Disable diversity heuristic — TQ-ADC inter-neighbor comparisons amplify
-            // quantization noise, causing over-pruning and recall loss at high dimensions.
-            builder.set_use_heuristic(false);
+            // Light mode fallback: use decoded centroid vectors with symmetric L2.
+            // TQ-ADC (asymmetric) was previously used here but its noise causes
+            // poor HNSW graph topology at 384d+ — greedy routing gets stuck.
+            // Decoded centroid L2 is symmetric, deterministic, and much more accurate
+            // for pairwise neighbor selection during graph construction.
             for _i in 0..n {
                 builder.insert(|a: u32, b: u32| {
-                    let q_rot = &all_rotated[a as usize];
-                    let offset = b as usize * bytes_per_code;
-                    let code_slice = &tq_buffer_orig[offset..offset + bytes_per_code - 4];
-                    let norm_bytes =
-                        &tq_buffer_orig[offset + bytes_per_code - 4..offset + bytes_per_code];
-                    let norm = f32::from_le_bytes([
-                        norm_bytes[0],
-                        norm_bytes[1],
-                        norm_bytes[2],
-                        norm_bytes[3],
-                    ]);
-                    (dist_table.tq_l2)(q_rot, code_slice, norm, codebook_for_adc)
+                    let ra = &all_rotated[a as usize];
+                    let rb = &all_rotated[b as usize];
+                    (dist_table.l2_f32)(ra, rb)
                 });
             }
         }
