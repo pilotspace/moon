@@ -69,6 +69,9 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Initialize vector distance dispatch table (must happen before any search).
+    moon::vector::distance::init();
+
     // Determine number of shards
     let num_shards = if config.shards == 0 {
         std::thread::available_parallelism()

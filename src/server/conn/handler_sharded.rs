@@ -1252,6 +1252,58 @@ pub async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- FT.* vector search commands ---
+                    if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                        if num_shards > 1 {
+                            // Multi-shard: dispatch via SPSC
+                            if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                                let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
+                                    Ok((index_name, query_blob, k, _filter)) => {
+                                        crate::shard::coordinator::scatter_vector_search_remote(
+                                            index_name, query_blob, k,
+                                            shard_id, num_shards,
+                                            &shard_databases,
+                                            &dispatch_tx, &spsc_notifiers,
+                                        ).await
+                                    }
+                                    Err(err_frame) => err_frame,
+                                };
+                                responses.push(response);
+                                continue;
+                            }
+                            let response = crate::shard::coordinator::broadcast_vector_command(
+                                std::sync::Arc::new(frame),
+                                shard_id, num_shards,
+                                &shard_databases,
+                                &dispatch_tx, &spsc_notifiers,
+                            ).await;
+                            responses.push(response);
+                            continue;
+                        } else {
+                            // Single-shard: no SPSC channels available.
+                            // Dispatch directly to shard's VectorStore via shared access.
+                            let response = {
+                                let shard_databases_ref = &shard_databases;
+                                let mut vs = shard_databases_ref.vector_store(shard_id);
+                                if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+                                    crate::command::vector_search::ft_create(&mut vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                                    crate::command::vector_search::ft_search(&mut vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                                    crate::command::vector_search::ft_dropindex(&mut vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                                    crate::command::vector_search::ft_info(&vs, cmd_args)
+                                } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                                    crate::command::vector_search::ft_compact(&mut vs, cmd_args)
+                                } else {
+                                    Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
+                                }
+                            };
+                            responses.push(response);
+                            continue;
+                        }
+                    }
+
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
                         let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
@@ -1307,6 +1359,24 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
+                            // Auto-index vectors on successful HSET (local write path)
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut vs = shard_databases.vector_store(shard_id);
+                                    crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &key, cmd_args);
+                                }
+                            }
+                            // Auto-delete vectors on DEL/HDEL/UNLINK (local write path)
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") || cmd.eq_ignore_ascii_case(b"HDEL"))
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut vs = shard_databases.vector_store(shard_id);
+                                    vs.mark_deleted_for_key(&key);
+                                }
+                            }
                             if !matches!(response, Frame::Error(_)) {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");

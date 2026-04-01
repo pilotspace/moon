@@ -159,6 +159,19 @@ impl WalWriter {
         self.cmd_count = self.cmd_count.saturating_add(1);
     }
 
+    /// Append a pre-serialized vector WAL record frame to the WAL buffer.
+    ///
+    /// The frame bytes include the VECTOR_RECORD_TAG, length, payload, and CRC.
+    /// This is NOT wrapped in a RESP block frame -- it's a standalone frame type
+    /// that the WAL reader identifies by its first byte (0x56 vs block_len).
+    ///
+    /// Called by vector command handlers after mutation.
+    /// Does NOT increment cmd_count -- vector records are not RESP commands.
+    #[inline]
+    pub fn append_vector_record(&mut self, frame_bytes: &[u8]) {
+        self.buf.extend_from_slice(frame_bytes);
+    }
+
     /// Flush buffered data to OS page cache if the buffer is non-empty.
     ///
     /// Called on the shard's 1ms tick. Only does write_all() (fast, goes to

@@ -789,4 +789,39 @@ mod tests {
             );
         }
     }
+
+    /// Regression test: insert followed by get_mut must always succeed.
+    ///
+    /// This verifies the fix for the "overflow slot" bug where insert's
+    /// last-resort linear scan could place a key in a group that find()
+    /// didn't check (only group_a, group_b, and stash were searched).
+    #[test]
+    fn test_insert_then_get_mut_always_finds() {
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+
+        for i in 0..2000 {
+            let key = CompactKey::from(format!("regress_{:06}", i));
+            let val = test_value(i);
+            table.insert(key, val);
+
+            // Immediately verify the key is findable
+            let lookup_key = format!("regress_{:06}", i);
+            assert!(
+                table.get_mut(lookup_key.as_bytes()).is_some(),
+                "get_mut returned None immediately after insert for regress_{:06} (table len={})",
+                i,
+                table.len()
+            );
+        }
+
+        // Verify all keys are still accessible
+        for i in 0..2000 {
+            let key = format!("regress_{:06}", i);
+            assert!(
+                table.get(key.as_bytes()).is_some(),
+                "get returned None for regress_{:06}",
+                i,
+            );
+        }
+    }
 }

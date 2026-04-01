@@ -554,11 +554,32 @@ impl Database {
             self.used_memory += entry_overhead(key, &entry);
             self.data.insert(k, entry);
         }
-        let entry = self.data.get_mut(key).unwrap();
+        let entry = match self.data.get_mut(key) {
+            Some(e) => e,
+            None => {
+                // This should not happen — insert was just called above.
+                // Log and return an error instead of panicking.
+                tracing::error!(
+                    "get_or_create_hash: get_mut returned None after insert for key len={}",
+                    key.len()
+                );
+                return Err(Frame::Error(bytes::Bytes::from_static(
+                    b"ERR internal: hash lookup failed after insert",
+                )));
+            }
+        };
         // Upgrade compact listpack to full HashMap if needed
-        if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
-            let map = lp.to_hash_map();
-            *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
+        let needs_upgrade = matches!(
+            entry.value.as_redis_value_mut(),
+            Some(RedisValue::HashListpack(_))
+        );
+        if needs_upgrade {
+            if let Some(RedisValue::HashListpack(lp)) = entry.value.as_redis_value_mut() {
+                let map = lp.to_hash_map();
+                if let Some(v) = entry.value.as_redis_value_mut() {
+                    *v = RedisValue::Hash(map);
+                }
+            }
         }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Hash(map)) => Ok(map),

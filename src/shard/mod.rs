@@ -18,6 +18,7 @@ use crate::config::RuntimeConfig;
 use crate::persistence::replay::DispatchReplayEngine;
 use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
+use crate::vector::store::VectorStore;
 
 /// A shard owns all per-core state. No Arc, no Mutex -- fully owned by its thread.
 ///
@@ -35,6 +36,8 @@ pub struct Shard {
     pub runtime_config: RuntimeConfig,
     /// Per-shard Pub/Sub registry -- no global Mutex, fully owned by shard thread.
     pub pubsub_registry: PubSubRegistry,
+    /// Per-shard vector store -- no Arc, no Mutex, fully owned by shard thread.
+    pub vector_store: VectorStore,
 }
 
 impl Shard {
@@ -47,6 +50,7 @@ impl Shard {
             num_shards,
             runtime_config: config,
             pubsub_registry: PubSubRegistry::new(),
+            vector_store: VectorStore::new(),
         }
     }
 
@@ -86,6 +90,35 @@ impl Shard {
                 }
                 Err(e) => {
                     tracing::error!("Shard {}: WAL replay failed: {}", self.id, e);
+                }
+            }
+        }
+
+        // Recover vector store from WAL + on-disk segments
+        let vector_persist_dir = dir.join(format!("shard-{}-vectors", self.id));
+        if vector_persist_dir.exists() || wal_file.exists() {
+            match crate::vector::persistence::recovery::recover_vector_store(
+                &wal_file,
+                &vector_persist_dir,
+            ) {
+                Ok(recovered) => {
+                    let seg_count: usize = recovered
+                        .collections
+                        .values()
+                        .map(|c| c.immutable.len())
+                        .sum();
+                    if !recovered.collections.is_empty() {
+                        info!(
+                            "Shard {}: recovered {} vector collections ({} immutable segments)",
+                            self.id,
+                            recovered.collections.len(),
+                            seg_count
+                        );
+                    }
+                    self.vector_store.attach_recovered(recovered);
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: vector recovery failed: {:?}", self.id, e);
                 }
             }
         }
@@ -165,6 +198,7 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
+        let mut vs = crate::vector::store::VectorStore::new();
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
@@ -180,6 +214,7 @@ mod tests {
             &script_cache,
             &clock,
             &mut Vec::new(),
+            &mut vs,
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -214,6 +249,7 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
+        let mut vs = crate::vector::store::VectorStore::new();
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
@@ -229,6 +265,7 @@ mod tests {
             &script_cache,
             &clock,
             &mut Vec::new(),
+            &mut vs,
         );
     }
 

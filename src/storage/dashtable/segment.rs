@@ -311,6 +311,39 @@ impl<K, V> Segment<K, V> {
             }
         }
 
+        // Fallback: full linear scan of remaining groups.
+        // This handles the rare case where insert placed a key in a group
+        // that is neither group_a nor group_b (overflow during high-occupancy
+        // or split redistribution). Without this, get/get_mut would fail to
+        // find a key that was legitimately inserted.
+        for g in 0..NUM_GROUPS {
+            if g == group_a || g == group_b {
+                continue; // already checked above
+            }
+            let base = g * 16;
+
+            // SAFETY: `g` is bounded by NUM_GROUPS (iterated via 0..NUM_GROUPS),
+            // so `self.ctrl[g]` is a valid Group. `match_h2` uses SSE2 intrinsics
+            // on x86_64 to compare the h2 byte against all 16 control bytes in the
+            // group, returning a bitmask of matching slots. The Group is always
+            // properly aligned and fully initialized at segment creation.
+            #[cfg(target_arch = "x86_64")]
+            let mask = unsafe { self.ctrl[g].match_h2(h2) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let mask = self.ctrl[g].match_h2(h2);
+
+            for pos in mask {
+                let slot = base + pos;
+                if slot < REGULAR_SLOTS {
+                    // SAFETY: ctrl byte matches h2 -> slot is initialized.
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key {
+                        return Some(slot);
+                    }
+                }
+            }
+        }
+
         None
     }
 

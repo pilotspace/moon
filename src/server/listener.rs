@@ -182,6 +182,10 @@ pub async fn run_with_shutdown(
         Arc::new(RwLock::new(table))
     };
 
+    // VectorStore for single-shard FT.* commands
+    let vector_store: Arc<Mutex<crate::vector::store::VectorStore>> =
+        Arc::new(Mutex::new(crate::vector::store::VectorStore::new()));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -217,10 +221,11 @@ pub async fn run_with_shutdown(
                         let cid = conn_cmd::next_client_id();
                         let rs = repl_state.clone();
                         let acl = acl_table.clone();
+                        let vs = vector_store.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
                             aof_tx, change_counter, pubsub, rt_config,
-                            tracking, cid, Some(rs), acl,
+                            tracking, cid, Some(rs), acl, Some(vs),
                         ));
                     }
                     Err(e) => {

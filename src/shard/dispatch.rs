@@ -256,6 +256,22 @@ pub enum ShardMessage {
         commands: Vec<std::sync::Arc<Frame>>,
         response_slot: ResponseSlotPtr,
     },
+    /// Execute a vector search query on this shard's VectorStore.
+    /// Used for cross-shard scatter-gather: coordinator sends to all shards,
+    /// each returns local top-K, coordinator merges.
+    VectorSearch {
+        index_name: Bytes,
+        query_blob: Bytes,
+        k: usize,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
+    /// Execute an FT.* command on this shard's VectorStore.
+    /// For FT.CREATE, FT.DROPINDEX, FT.INFO -- operations that modify/read
+    /// VectorStore state rather than search.
+    VectorCommand {
+        command: std::sync::Arc<Frame>,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
     /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
     PubSubPublish {
         channel: Bytes,

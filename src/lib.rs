@@ -78,3 +78,4 @@ pub mod storage;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-monoio"))]
 pub mod tls;
 pub mod tracking;
+pub mod vector;
