@@ -2,6 +2,7 @@ pub mod aof;
 pub mod auto_save;
 pub mod control;
 pub mod fsync;
+pub mod manifest;
 pub mod page;
 pub mod rdb;
 pub mod redis_rdb;
