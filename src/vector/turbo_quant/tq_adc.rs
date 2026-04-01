@@ -593,7 +593,7 @@ pub fn brute_force_tq_adc_multibit(
     }
 
     let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
-    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    results.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     results
         .into_iter()
@@ -673,7 +673,7 @@ pub fn brute_force_tq_adc(
 
     // Extract sorted results
     let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
-    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    results.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     results
         .into_iter()

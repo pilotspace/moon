@@ -52,8 +52,9 @@ pub fn init_fastscan() {
 /// Caller must ensure [`init_fastscan()`] has been called before first use.
 #[inline(always)]
 pub fn fastscan_dispatch() -> &'static FastScanDispatch {
-    // SAFETY: init_fastscan() is called from distance::init() at startup.
-    unsafe { FASTSCAN_DISPATCH.get().unwrap_unchecked() }
+    FASTSCAN_DISPATCH
+        .get()
+        .expect("init_fastscan() must be called before fastscan_dispatch()")
 }
 
 /// Scalar FastScan: compute distances for 32 vectors in one interleaved block.

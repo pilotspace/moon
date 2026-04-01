@@ -1258,13 +1258,19 @@ pub async fn handle_connection_sharded_inner<
                             // Multi-shard: dispatch via SPSC
                             if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                 let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
-                                    Ok((index_name, query_blob, k, _filter)) => {
-                                        crate::shard::coordinator::scatter_vector_search_remote(
-                                            index_name, query_blob, k,
-                                            shard_id, num_shards,
-                                            &shard_databases,
-                                            &dispatch_tx, &spsc_notifiers,
-                                        ).await
+                                    Ok((index_name, query_blob, k, filter)) => {
+                                        if filter.is_some() {
+                                            Frame::Error(Bytes::from_static(
+                                                b"ERR FILTER not supported in multi-shard mode yet",
+                                            ))
+                                        } else {
+                                            crate::shard::coordinator::scatter_vector_search_remote(
+                                                index_name, query_blob, k,
+                                                shard_id, num_shards,
+                                                &shard_databases,
+                                                &dispatch_tx, &spsc_notifiers,
+                                            ).await
+                                        }
                                     }
                                     Err(err_frame) => err_frame,
                                 };
@@ -1359,24 +1365,6 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
-                            // Auto-index vectors on successful HSET (local write path)
-                            if !matches!(response, Frame::Error(_))
-                                && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
-                            {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut vs = shard_databases.vector_store(shard_id);
-                                    crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &key, cmd_args);
-                                }
-                            }
-                            // Auto-delete vectors on DEL/HDEL/UNLINK (local write path)
-                            if !matches!(response, Frame::Error(_))
-                                && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") || cmd.eq_ignore_ascii_case(b"HDEL"))
-                            {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut vs = shard_databases.vector_store(shard_id);
-                                    vs.mark_deleted_for_key(&key);
-                                }
-                            }
                             if !matches!(response, Frame::Error(_)) {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
@@ -1392,6 +1380,30 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                             drop(guard);
+                            // Auto-index vectors on successful HSET (local write path)
+                            // Placed AFTER drop(guard) to avoid DB→vector_store lock order
+                            // inversion with the shard event loop (vector_store→DB).
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut vs = shard_databases.vector_store(shard_id);
+                                    crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &key, cmd_args);
+                                }
+                            }
+                            // Auto-delete vectors on DEL/UNLINK (local write path)
+                            // Note: HDEL removes fields, not keys — it should NOT trigger
+                            // vector deletion unless the entire key is removed.
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                            {
+                                let mut vs = shard_databases.vector_store(shard_id);
+                                for arg in cmd_args.iter() {
+                                    if let Some(key) = extract_bytes(arg) {
+                                        vs.mark_deleted_for_key(key.as_ref());
+                                    }
+                                }
+                            }
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
                                     if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }

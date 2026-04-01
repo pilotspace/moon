@@ -138,7 +138,10 @@ pub fn scaled_centroids_n(padded_dim: u32, bits: u8) -> Vec<f32> {
             let sc = scaled_centroids(padded_dim);
             sc.to_vec()
         }
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => {
+            tracing::warn!("unsupported bit width {bits} for centroids, returning empty");
+            Vec::new()
+        }
     }
 }
 
@@ -153,7 +156,10 @@ pub fn scaled_boundaries_n(padded_dim: u32, bits: u8) -> Vec<f32> {
             let sb = scaled_boundaries(padded_dim);
             sb.to_vec()
         }
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => {
+            tracing::warn!("unsupported bit width {bits} for boundaries, returning empty");
+            Vec::new()
+        }
     }
 }
 

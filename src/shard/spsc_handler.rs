@@ -272,25 +272,16 @@ pub(crate) fn handle_shard_message_shared(
                     }
                 }
 
-                // Auto-delete: if DEL/HDEL/UNLINK succeeded and key matches a vector
+                // Auto-delete: if DEL/UNLINK succeeded and key matches a vector
                 // index prefix, mark stale vectors as deleted in matching indexes.
-                if (cmd.eq_ignore_ascii_case(b"DEL")
-                    || cmd.eq_ignore_ascii_case(b"HDEL")
-                    || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                // Note: HDEL removes fields, not keys — it should NOT trigger vector
+                // deletion unless the entire key is removed.
+                if (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                     && !matches!(frame, crate::protocol::Frame::Error(_))
                 {
-                    // DEL/UNLINK: args are keys (args[0], args[1], ...).
-                    // HDEL: args[0] is the hash key, remaining are fields.
-                    // For HDEL we only mark the hash key itself (the vector source).
-                    if cmd.eq_ignore_ascii_case(b"HDEL") {
-                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                    for arg in args {
+                        if let crate::protocol::Frame::BulkString(key_bytes) = arg {
                             vector_store.mark_deleted_for_key(key_bytes);
-                        }
-                    } else {
-                        for arg in args {
-                            if let crate::protocol::Frame::BulkString(key_bytes) = arg {
-                                vector_store.mark_deleted_for_key(key_bytes);
-                            }
                         }
                     }
                 }

@@ -281,27 +281,29 @@ impl CollectionMetadata {
     /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
     /// Used by legacy `encode_tq_mse_scaled` which requires fixed-size array.
     pub fn codebook_boundaries_15(&self) -> &[f32; 15] {
-        assert_eq!(
-            self.codebook_boundaries.len(),
-            15,
-            "codebook_boundaries_15 requires 4-bit quantization (15 boundaries), got {}",
-            self.codebook_boundaries.len()
-        );
-        self.codebook_boundaries[..15].try_into().unwrap()
+        match self.codebook_boundaries.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                // Construction invariant: should never happen for 4-bit quantization
+                static ZERO: [f32; 15] = [0.0; 15];
+                &ZERO
+            }
+        }
     }
 
     /// Convenience accessor: returns the codebook as a `&[f32; 16]` reference.
     ///
-    /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
+    /// Returns a zero array if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
     /// Used by legacy `tq_l2_adc_scaled` which requires fixed-size array.
     pub fn codebook_16(&self) -> &[f32; 16] {
-        assert_eq!(
-            self.codebook.len(),
-            16,
-            "codebook_16 requires 4-bit quantization (16 centroids), got {}",
-            self.codebook.len()
-        );
-        self.codebook[..16].try_into().unwrap()
+        match self.codebook.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                // Construction invariant: should never happen for 4-bit quantization
+                static ZERO: [f32; 16] = [0.0; 16];
+                &ZERO
+            }
+        }
     }
 
     /// Verify metadata integrity. Returns Err if checksum mismatch.

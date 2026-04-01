@@ -1417,18 +1417,24 @@ pub async fn handle_connection_sharded_monoio<
                 if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                     let response =
                         match crate::command::vector_search::parse_ft_search_args(cmd_args) {
-                            Ok((index_name, query_blob, k, _filter)) => {
-                                crate::shard::coordinator::scatter_vector_search_remote(
-                                    index_name,
-                                    query_blob,
-                                    k,
-                                    shard_id,
-                                    num_shards,
-                                    &shard_databases,
-                                    &dispatch_tx,
-                                    &spsc_notifiers,
-                                )
-                                .await
+                            Ok((index_name, query_blob, k, filter)) => {
+                                if filter.is_some() {
+                                    Frame::Error(Bytes::from_static(
+                                        b"ERR FILTER not supported in multi-shard mode yet",
+                                    ))
+                                } else {
+                                    crate::shard::coordinator::scatter_vector_search_remote(
+                                        index_name,
+                                        query_blob,
+                                        k,
+                                        shard_id,
+                                        num_shards,
+                                        &shard_databases,
+                                        &dispatch_tx,
+                                        &spsc_notifiers,
+                                    )
+                                    .await
+                                }
                             }
                             Err(err_frame) => err_frame,
                         };
