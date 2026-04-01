@@ -296,9 +296,13 @@ impl SnapshotState {
         let global_crc = hasher.finalize();
         self.output_buf.extend_from_slice(&global_crc.to_le_bytes());
 
-        // Atomic write: write to .tmp, then rename
+        // Atomic write: write to .tmp, fsync file, rename, fsync directory
         let tmp_path = self.file_path.with_extension("rrdshard.tmp");
         std::fs::write(&tmp_path, &self.output_buf).map_err(|e| SnapshotError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        crate::persistence::fsync::fsync_file(&tmp_path).map_err(|e| SnapshotError::Io {
             path: tmp_path.clone(),
             source: e,
         })?;
@@ -306,6 +310,12 @@ impl SnapshotState {
             path: self.file_path.clone(),
             source: e,
         })?;
+        if let Some(parent) = self.file_path.parent() {
+            crate::persistence::fsync::fsync_directory(parent).map_err(|e| SnapshotError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
 
         Ok(())
     }
@@ -339,12 +349,24 @@ impl SnapshotState {
                     path: tmp_path.clone(),
                     source: e,
                 })?;
+            crate::persistence::fsync::fsync_file(&tmp_path).map_err(|e| SnapshotError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
             tokio::fs::rename(&tmp_path, &file_path)
                 .await
                 .map_err(|e| SnapshotError::Io {
                     path: file_path.clone(),
                     source: e,
                 })?;
+            if let Some(parent) = file_path.parent() {
+                crate::persistence::fsync::fsync_directory(parent).map_err(|e| {
+                    SnapshotError::Io {
+                        path: parent.to_path_buf(),
+                        source: e,
+                    }
+                })?;
+            }
         }
 
         #[cfg(feature = "runtime-monoio")]
@@ -353,10 +375,22 @@ impl SnapshotState {
                 path: tmp_path.clone(),
                 source: e,
             })?;
+            crate::persistence::fsync::fsync_file(&tmp_path).map_err(|e| SnapshotError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
             std::fs::rename(&tmp_path, &file_path).map_err(|e| SnapshotError::Io {
                 path: file_path.clone(),
                 source: e,
             })?;
+            if let Some(parent) = file_path.parent() {
+                crate::persistence::fsync::fsync_directory(parent).map_err(|e| {
+                    SnapshotError::Io {
+                        path: parent.to_path_buf(),
+                        source: e,
+                    }
+                })?;
+            }
         }
 
         Ok(())

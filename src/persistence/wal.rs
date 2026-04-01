@@ -291,6 +291,9 @@ impl WalWriter {
         let old_path = self.file_path.with_extension("wal.old");
         if self.file_path.exists() {
             std::fs::rename(&self.file_path, &old_path)?;
+            if let Some(parent) = self.file_path.parent() {
+                crate::persistence::fsync::fsync_directory(parent)?;
+            }
         }
 
         // Open a fresh WAL file

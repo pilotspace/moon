@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::fsync::{fsync_directory, fsync_file};
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
@@ -141,13 +142,14 @@ pub fn write_immutable_segment(
 
     // 1. hnsw_graph.bin
     let graph_bytes = segment.graph().to_bytes();
-    fs::write(seg_dir.join("hnsw_graph.bin"), &graph_bytes)?;
+    let graph_path = seg_dir.join("hnsw_graph.bin");
+    fs::write(&graph_path, &graph_bytes)?;
+    fsync_file(&graph_path)?;
 
     // 2. tq_codes.bin
-    fs::write(
-        seg_dir.join("tq_codes.bin"),
-        segment.vectors_tq().as_slice(),
-    )?;
+    let tq_path = seg_dir.join("tq_codes.bin");
+    fs::write(&tq_path, segment.vectors_tq().as_slice())?;
+    fsync_file(&tq_path)?;
 
     // 3. sq_vectors.bin — skipped (SQ8 no longer stored in ImmutableSegment).
     // 3b. f32_vectors.bin — skipped (f32 no longer stored; TQ-ADC used for search).
@@ -166,7 +168,9 @@ pub fn write_immutable_segment(
         mvcc_buf.extend_from_slice(&h.insert_lsn.to_le_bytes());
         mvcc_buf.extend_from_slice(&h.delete_lsn.to_le_bytes());
     }
-    fs::write(seg_dir.join("mvcc_headers.bin"), &mvcc_buf)?;
+    let mvcc_path = seg_dir.join("mvcc_headers.bin");
+    fs::write(&mvcc_path, &mvcc_buf)?;
+    fsync_file(&mvcc_path)?;
 
     // 5. segment_meta.json
     let meta = SegmentMeta {
@@ -192,7 +196,12 @@ pub fn write_immutable_segment(
     };
     let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| SegmentIoError::InvalidMetadata(e.to_string()))?;
-    fs::write(seg_dir.join("segment_meta.json"), json)?;
+    let meta_path = seg_dir.join("segment_meta.json");
+    fs::write(&meta_path, json)?;
+    fsync_file(&meta_path)?;
+
+    // Fsync the segment directory to make all file entries durable
+    fsync_directory(&seg_dir)?;
 
     Ok(())
 }
