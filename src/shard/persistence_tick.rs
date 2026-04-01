@@ -158,3 +158,98 @@ pub(crate) fn flush_wal_if_needed(wal_writer: &mut Option<WalWriter>) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint protocol handlers (disk-offload path)
+// ---------------------------------------------------------------------------
+
+use crate::persistence::checkpoint::{CheckpointAction, CheckpointManager};
+use crate::persistence::control::ShardControlFile;
+use crate::persistence::manifest::ShardManifest;
+use crate::persistence::page_cache::PageCache;
+use crate::persistence::wal_v3::record::WalRecordType;
+use crate::persistence::wal_v3::segment::WalWriterV3;
+use std::path::Path;
+
+/// Check the trigger and begin a checkpoint if conditions are met.
+///
+/// Called every tick from the event loop when disk-offload is enabled.
+/// No-op if a checkpoint is already in progress.
+#[allow(dead_code)]
+pub(crate) fn maybe_begin_checkpoint(
+    checkpoint_mgr: &mut CheckpointManager,
+    wal: &WalWriterV3,
+    page_cache: &PageCache,
+    wal_bytes_since_checkpoint: u64,
+) {
+    if checkpoint_mgr.is_active() {
+        return;
+    }
+    if checkpoint_mgr.trigger().should_checkpoint(wal_bytes_since_checkpoint) {
+        let lsn = wal.current_lsn();
+        let dirty = page_cache.dirty_page_count();
+        checkpoint_mgr.begin(lsn, dirty);
+    }
+}
+
+/// Handle one checkpoint tick. Called from the event loop every 1ms when
+/// disk-offload is enabled.
+///
+/// Returns `true` if a finalize step was completed this tick.
+///
+/// The caller provides all I/O dependencies — CheckpointManager itself is pure state.
+#[allow(dead_code)]
+pub(crate) fn handle_checkpoint_tick(
+    checkpoint_mgr: &mut CheckpointManager,
+    page_cache: &PageCache,
+    wal: &mut WalWriterV3,
+    manifest: &mut ShardManifest,
+    control: &mut ShardControlFile,
+    control_path: &Path,
+) -> bool {
+    match checkpoint_mgr.advance_tick() {
+        CheckpointAction::Nothing => false,
+        CheckpointAction::FlushPages(count) => {
+            // Flush `count` dirty pages through PageCache.
+            // Iterate dirty frames and flush them with WAL-before-data invariant.
+            // TODO(moonstore-v2): Wire to actual dirty page iteration from PageCache
+            let _ = (count, page_cache);
+            false
+        }
+        CheckpointAction::Finalize { redo_lsn } => {
+            // 1. Write WAL checkpoint record with redo_lsn payload
+            let mut payload = [0u8; 8];
+            payload.copy_from_slice(&redo_lsn.to_le_bytes());
+            wal.append(WalRecordType::Checkpoint, &payload);
+
+            // 2. Flush WAL to disk
+            if let Err(e) = wal.flush_sync() {
+                tracing::error!("Checkpoint WAL flush failed: {}", e);
+                return false;
+            }
+
+            // 3. Commit manifest (atomic dual-root write)
+            if let Err(e) = manifest.commit() {
+                tracing::error!("Checkpoint manifest commit failed: {}", e);
+                return false;
+            }
+
+            // 4. Update control file with new checkpoint LSN
+            control.last_checkpoint_lsn = redo_lsn;
+            control.last_checkpoint_epoch = manifest.epoch();
+            if let Err(e) = control.write(control_path) {
+                tracing::error!("Checkpoint control file update failed: {}", e);
+                return false;
+            }
+
+            // 5. Mark checkpoint complete
+            checkpoint_mgr.complete();
+            tracing::info!(
+                "Checkpoint complete: redo_lsn={}, epoch={}",
+                redo_lsn,
+                manifest.epoch()
+            );
+            true
+        }
+    }
+}

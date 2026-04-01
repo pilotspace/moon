@@ -44,6 +44,11 @@ pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>
     blocking_rc.borrow_mut().expire_timed_out(now);
 }
 
+/// Checkpoint tick interval in milliseconds.
+/// Same 1ms tick as WAL flush — checkpoint manager advances one tick per call.
+#[allow(dead_code)]
+pub const CHECKPOINT_TICK_MS: u64 = 1;
+
 /// WAL fsync on 1-second interval (everysec durability).
 pub(crate) fn sync_wal(wal_writer: &mut Option<WalWriter>) {
     if let Some(wal) = wal_writer {

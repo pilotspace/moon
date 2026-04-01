@@ -293,6 +293,25 @@ impl super::Shard {
             None
         };
 
+        // Per-shard checkpoint manager (None when disk-offload is disabled).
+        // When enabled, drives the fuzzy checkpoint protocol: begin(redo_lsn) ->
+        // advance_tick(flush pages) -> finalize(WAL record + manifest + control).
+        // TODO(moonstore-v2): Wire to actual PageCache/WalWriterV3/ShardManifest/ShardControlFile instances
+        let mut _checkpoint_manager: Option<crate::persistence::checkpoint::CheckpointManager> =
+            if server_config.disk_offload_enabled() {
+                let trigger = crate::persistence::checkpoint::CheckpointTrigger::new(
+                    server_config.checkpoint_timeout,
+                    server_config.max_wal_size_bytes(),
+                    server_config.checkpoint_completion,
+                );
+                info!("Shard {}: checkpoint manager initialized (timeout={}s, max_wal={})",
+                    shard_id, server_config.checkpoint_timeout,
+                    server_config.max_wal_size_bytes());
+                Some(crate::persistence::checkpoint::CheckpointManager::new(trigger))
+            } else {
+                None
+            };
+
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
