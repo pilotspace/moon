@@ -218,13 +218,17 @@ impl CollectionMetadata {
             fwht_sign_flips: sign_flips,
             codebook_version: CODEBOOK_VERSION,
             codebook: if quantization.is_turbo_quant() {
+                // Fail fast on invalid bit width — this is a programming invariant,
+                // not user input. Valid bit widths (1-4) are guaranteed by QuantizationConfig.
                 scaled_centroids_n(padded, quantization.bits())
+                    .expect("codebook centroids: invalid bit width is a programming bug")
             } else {
                 // SQ8 doesn't use codebooks -- store empty Vec
                 Vec::new()
             },
             codebook_boundaries: if quantization.is_turbo_quant() {
                 scaled_boundaries_n(padded, quantization.bits())
+                    .expect("codebook boundaries: invalid bit width is a programming bug")
             } else {
                 Vec::new()
             },
@@ -276,32 +280,56 @@ impl CollectionMetadata {
         code_bytes_per_vector(self.padded_dimension, self.quantization.bits())
     }
 
-    /// Convenience accessor: returns the codebook boundaries as a `&[f32; 15]` reference.
+    /// Returns the codebook boundaries as a `&[f32; 15]` reference.
     ///
-    /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
-    /// Used by legacy `encode_tq_mse_scaled` which requires fixed-size array.
+    /// Only valid for 4-bit quantization (TurboQuant4 / TurboQuantProd4).
+    /// The codebook is guaranteed to have exactly 15 boundaries at construction
+    /// for 4-bit configs. If the invariant is violated (programming bug), logs
+    /// an error and returns a zeroed fallback to avoid panicking in production.
     pub fn codebook_boundaries_15(&self) -> &[f32; 15] {
-        assert_eq!(
+        debug_assert_eq!(
             self.codebook_boundaries.len(),
             15,
-            "codebook_boundaries_15 requires 4-bit quantization (15 boundaries), got {}",
+            "codebook_boundaries_15 called on non-4-bit quantization (len={})",
             self.codebook_boundaries.len()
         );
-        self.codebook_boundaries[..15].try_into().unwrap()
+        match self.codebook_boundaries.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                tracing::error!(
+                    "codebook_boundaries has {} entries, expected 15 — construction invariant violated",
+                    self.codebook_boundaries.len()
+                );
+                static ZERO: [f32; 15] = [0.0; 15];
+                &ZERO
+            }
+        }
     }
 
-    /// Convenience accessor: returns the codebook as a `&[f32; 16]` reference.
+    /// Returns the codebook as a `&[f32; 16]` reference.
     ///
-    /// Panics if quantization is not 4-bit (only valid for TurboQuant4 / TurboQuantProd4).
-    /// Used by legacy `tq_l2_adc_scaled` which requires fixed-size array.
+    /// Only valid for 4-bit quantization (TurboQuant4 / TurboQuantProd4).
+    /// The codebook is guaranteed to have exactly 16 centroids at construction
+    /// for 4-bit configs. If the invariant is violated (programming bug), logs
+    /// an error and returns a zeroed fallback to avoid panicking in production.
     pub fn codebook_16(&self) -> &[f32; 16] {
-        assert_eq!(
+        debug_assert_eq!(
             self.codebook.len(),
             16,
-            "codebook_16 requires 4-bit quantization (16 centroids), got {}",
+            "codebook_16 called on non-4-bit quantization (len={})",
             self.codebook.len()
         );
-        self.codebook[..16].try_into().unwrap()
+        match self.codebook.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                tracing::error!(
+                    "codebook has {} entries, expected 16 — construction invariant violated",
+                    self.codebook.len()
+                );
+                static ZERO: [f32; 16] = [0.0; 16];
+                &ZERO
+            }
+        }
     }
 
     /// Verify metadata integrity. Returns Err if checksum mismatch.

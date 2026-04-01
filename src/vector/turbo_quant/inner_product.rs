@@ -608,9 +608,9 @@ mod tests {
 
         // v2: 3-bit MSE + QJL signs (paper-correct)
         let boundaries_3 =
-            crate::vector::turbo_quant::codebook::scaled_boundaries_n(padded as u32, 3);
+            crate::vector::turbo_quant::codebook::scaled_boundaries_n(padded as u32, 3).unwrap();
         let centroids_3 =
-            crate::vector::turbo_quant::codebook::scaled_centroids_n(padded as u32, 3);
+            crate::vector::turbo_quant::codebook::scaled_centroids_n(padded as u32, 3).unwrap();
         let code_v2 = encode_tq_prod_v2(
             &vec,
             &sign_flips,

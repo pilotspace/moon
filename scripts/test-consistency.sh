@@ -481,6 +481,31 @@ assert_both "GET with 500-char key" GET "$LONGKEY"
 # ===========================================================================
 
 echo ""
+# ===========================================================================
+# Vector Search (moon-only — FT.* not available in Redis)
+# ===========================================================================
+log "=== Vector Search (moon-only) ==="
+
+# Create index on moon only
+FT_CREATE=$(redis-cli -p "$PORT_RUST" FT.CREATE vecidx ON HASH PREFIX 1 vec: SCHEMA embedding VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
+assert_eq "FT.CREATE" "OK" "$FT_CREATE"
+
+# Insert vectors — use python3 to avoid null byte stripping in bash
+python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',1.0,0.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET vec:1 embedding >/dev/null 2>&1
+python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET vec:2 embedding >/dev/null 2>&1
+
+# FT.INFO should show index
+FT_INFO=$(redis-cli -p "$PORT_RUST" FT.INFO vecidx 2>&1)
+if echo "$FT_INFO" | grep -q "vecidx"; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO should show vecidx"
+fi
+
+# FT.DROPINDEX
+FT_DROP=$(redis-cli -p "$PORT_RUST" FT.DROPINDEX vecidx 2>&1)
+assert_eq "FT.DROPINDEX" "OK" "$FT_DROP"
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"

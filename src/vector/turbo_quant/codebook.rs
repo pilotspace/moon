@@ -128,32 +128,36 @@ pub const RAW_BOUNDARIES_3BIT: [f32; 7] = [-1.7480, -1.0500, -0.5006, 0.0, 0.500
 ///
 /// Returns a Vec because the size varies by bit width.
 /// sigma = 1/sqrt(padded_dim), matching FWHT normalization.
-pub fn scaled_centroids_n(padded_dim: u32, bits: u8) -> Vec<f32> {
+///
+/// Returns `Err` for unsupported bit widths (anything outside 1-4).
+pub fn scaled_centroids_n(padded_dim: u32, bits: u8) -> Result<Vec<f32>, &'static str> {
     let sigma = 1.0 / (padded_dim as f32).sqrt();
     match bits {
-        1 => RAW_CENTROIDS_1BIT.iter().map(|&c| c * sigma).collect(),
-        2 => RAW_CENTROIDS_2BIT.iter().map(|&c| c * sigma).collect(),
-        3 => RAW_CENTROIDS_3BIT.iter().map(|&c| c * sigma).collect(),
+        1 => Ok(RAW_CENTROIDS_1BIT.iter().map(|&c| c * sigma).collect()),
+        2 => Ok(RAW_CENTROIDS_2BIT.iter().map(|&c| c * sigma).collect()),
+        3 => Ok(RAW_CENTROIDS_3BIT.iter().map(|&c| c * sigma).collect()),
         4 => {
             let sc = scaled_centroids(padded_dim);
-            sc.to_vec()
+            Ok(sc.to_vec())
         }
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => Err("unsupported bit width"),
     }
 }
 
 /// Compute dimension-scaled boundaries for any bit width (1-4).
-pub fn scaled_boundaries_n(padded_dim: u32, bits: u8) -> Vec<f32> {
+///
+/// Returns `Err` for unsupported bit widths (anything outside 1-4).
+pub fn scaled_boundaries_n(padded_dim: u32, bits: u8) -> Result<Vec<f32>, &'static str> {
     let sigma = 1.0 / (padded_dim as f32).sqrt();
     match bits {
-        1 => RAW_BOUNDARIES_1BIT.iter().map(|&b| b * sigma).collect(),
-        2 => RAW_BOUNDARIES_2BIT.iter().map(|&b| b * sigma).collect(),
-        3 => RAW_BOUNDARIES_3BIT.iter().map(|&b| b * sigma).collect(),
+        1 => Ok(RAW_BOUNDARIES_1BIT.iter().map(|&b| b * sigma).collect()),
+        2 => Ok(RAW_BOUNDARIES_2BIT.iter().map(|&b| b * sigma).collect()),
+        3 => Ok(RAW_BOUNDARIES_3BIT.iter().map(|&b| b * sigma).collect()),
         4 => {
             let sb = scaled_boundaries(padded_dim);
-            sb.to_vec()
+            Ok(sb.to_vec())
         }
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => Err("unsupported bit width"),
     }
 }
 
@@ -186,7 +190,10 @@ pub fn code_bytes_per_vector(padded_dim: u32, bits: u8) -> usize {
         2 => pd / 4,
         3 => (pd * 3 + 7) / 8,
         4 => pd / 2,
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => {
+            tracing::error!("unsupported bit width {bits} for code_bytes_per_vector");
+            0
+        }
     }
 }
 
@@ -377,19 +384,20 @@ mod tests {
     #[test]
     fn test_scaled_centroids_n_sizes() {
         let pdim = 1024u32;
-        assert_eq!(scaled_centroids_n(pdim, 1).len(), 2);
-        assert_eq!(scaled_centroids_n(pdim, 2).len(), 4);
-        assert_eq!(scaled_centroids_n(pdim, 3).len(), 8);
-        assert_eq!(scaled_centroids_n(pdim, 4).len(), 16);
+        assert_eq!(scaled_centroids_n(pdim, 1).unwrap().len(), 2);
+        assert_eq!(scaled_centroids_n(pdim, 2).unwrap().len(), 4);
+        assert_eq!(scaled_centroids_n(pdim, 3).unwrap().len(), 8);
+        assert_eq!(scaled_centroids_n(pdim, 4).unwrap().len(), 16);
+        assert!(scaled_centroids_n(pdim, 5).is_err());
     }
 
     #[test]
     fn test_scaled_centroids_n_values() {
         let pdim = 1024u32;
         let sigma = 1.0 / (pdim as f32).sqrt();
-        let c1 = scaled_centroids_n(pdim, 1);
+        let c1 = scaled_centroids_n(pdim, 1).unwrap();
         assert!((c1[1] - 0.7979 * sigma).abs() < 1e-6);
-        let c2 = scaled_centroids_n(pdim, 2);
+        let c2 = scaled_centroids_n(pdim, 2).unwrap();
         assert!((c2[3] - 1.5104 * sigma).abs() < 1e-5);
     }
 

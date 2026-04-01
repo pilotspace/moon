@@ -782,7 +782,7 @@ mod tests {
         normalize_to_unit(&mut v);
 
         for bits in [1u8, 2, 3, 4] {
-            let boundaries = scaled_boundaries_n(padded, bits);
+            let boundaries = scaled_boundaries_n(padded, bits).unwrap();
             let code = encode_tq_mse_multibit(&v, &signs, &boundaries, bits, &mut work);
             let expected = code_bytes_per_vector(padded, bits);
             assert_eq!(
@@ -794,15 +794,15 @@ mod tests {
         }
 
         // Specific sizes for 768d (padded=1024)
-        let b1 = scaled_boundaries_n(padded, 1);
+        let b1 = scaled_boundaries_n(padded, 1).unwrap();
         let c1 = encode_tq_mse_multibit(&v, &signs, &b1, 1, &mut work);
         assert_eq!(c1.codes.len(), 128); // 1024/8
 
-        let b2 = scaled_boundaries_n(padded, 2);
+        let b2 = scaled_boundaries_n(padded, 2).unwrap();
         let c2 = encode_tq_mse_multibit(&v, &signs, &b2, 2, &mut work);
         assert_eq!(c2.codes.len(), 256); // 1024/4
 
-        let b3 = scaled_boundaries_n(padded, 3);
+        let b3 = scaled_boundaries_n(padded, 3).unwrap();
         let c3 = encode_tq_mse_multibit(&v, &signs, &b3, 3, &mut work);
         assert_eq!(c3.codes.len(), 384); // 1024*3/8
     }
@@ -813,8 +813,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32);
         let signs = test_sign_flips(padded as usize, 12345);
-        let boundaries = scaled_boundaries_n(padded, 1);
-        let centroids = scaled_centroids_n(padded, 1);
+        let boundaries = scaled_boundaries_n(padded, 1).unwrap();
+        let centroids = scaled_centroids_n(padded, 1).unwrap();
         let mut work_enc = vec![0.0f32; padded as usize];
         let mut work_dec = vec![0.0f32; padded as usize];
 
@@ -839,8 +839,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32);
         let signs = test_sign_flips(padded as usize, 12345);
-        let boundaries = scaled_boundaries_n(padded, 2);
-        let centroids = scaled_centroids_n(padded, 2);
+        let boundaries = scaled_boundaries_n(padded, 2).unwrap();
+        let centroids = scaled_centroids_n(padded, 2).unwrap();
         let mut work_enc = vec![0.0f32; padded as usize];
         let mut work_dec = vec![0.0f32; padded as usize];
 
@@ -864,8 +864,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32);
         let signs = test_sign_flips(padded as usize, 12345);
-        let boundaries = scaled_boundaries_n(padded, 3);
-        let centroids = scaled_centroids_n(padded, 3);
+        let boundaries = scaled_boundaries_n(padded, 3).unwrap();
+        let centroids = scaled_centroids_n(padded, 3).unwrap();
         let mut work_enc = vec![0.0f32; padded as usize];
         let mut work_dec = vec![0.0f32; padded as usize];
 

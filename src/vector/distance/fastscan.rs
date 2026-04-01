@@ -48,12 +48,16 @@ pub fn init_fastscan() {
 
 /// Get the static FastScan dispatch table.
 ///
-/// # Safety contract
-/// Caller must ensure [`init_fastscan()`] has been called before first use.
+/// Auto-initializes on first use if [`init_fastscan()`] was not called explicitly.
+/// After the first call the hot path is two atomic loads (both always succeed).
 #[inline(always)]
 pub fn fastscan_dispatch() -> &'static FastScanDispatch {
-    // SAFETY: init_fastscan() is called from distance::init() at startup.
-    unsafe { FASTSCAN_DISPATCH.get().unwrap_unchecked() }
+    if FASTSCAN_DISPATCH.get().is_none() {
+        init_fastscan();
+    }
+    FASTSCAN_DISPATCH
+        .get()
+        .expect("fastscan dispatch initialized by init_fastscan()")
 }
 
 /// Scalar FastScan: compute distances for 32 vectors in one interleaved block.

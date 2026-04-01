@@ -63,6 +63,7 @@ while [[ $# -gt 0 ]]; do
             echo "  pubsub       - Pub/Sub commands (SUBSCRIBE, PUBLISH, etc.)"
             echo "  transaction  - Transaction commands (MULTI, EXEC, DISCARD)"
             echo "  scripting    - Lua scripting (EVAL, EVALSHA)"
+            echo "  vector       - Vector search commands (FT.CREATE, FT.SEARCH, FT.INFO, FT.DROPINDEX)"
             echo "  persistence  - Persistence commands (BGSAVE, BGREWRITEAOF, etc.)"
             echo "  blocking     - Blocking commands (BLPOP, BRPOP, BZPOPMIN, etc.)"
             echo "  benchmark    - redis-benchmark throughput for all benchmarkable commands"
@@ -659,6 +660,42 @@ if should_run "scripting"; then
     rcli SET lua:k1 luaval >/dev/null 2>&1; mcli SET lua:k1 luaval >/dev/null 2>&1
     assert_match "EVAL redis.call"     EVAL "return redis.call('GET', KEYS[1])" 1 lua:k1
     assert_match "EVAL table"          EVAL "return {1,2,3}" 0
+fi
+
+# ===========================================================================
+# PERSISTENCE COMMANDS
+# ===========================================================================
+
+# ===========================================================================
+# VECTOR SEARCH COMMANDS (moon-only — Redis uses different syntax)
+# ===========================================================================
+
+if should_run "vector"; then
+    echo ""
+    echo "=== VECTOR SEARCH COMMANDS ==="
+    mcli FLUSHALL >/dev/null 2>&1
+
+    # FT.CREATE — create a vector index
+    assert_moon "FT.CREATE basic"          "OK"    FT.CREATE myidx ON HASH PREFIX 1 doc: SCHEMA embedding VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32
+
+    # FT.INFO — index metadata
+    TOTAL=$((TOTAL + 1)); FT_INFO=$(mcli FT.INFO myidx 2>&1)
+    if echo "$FT_INFO" | grep -q "myidx"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO returns index name"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO returns index name"; fi
+
+    # Insert vectors via HSET (auto-indexed) — use python3 to avoid null byte stripping in bash
+    python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',1.0,0.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:1 embedding >/dev/null 2>&1
+    python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:2 embedding >/dev/null 2>&1
+
+    # FT.SEARCH — verify command doesn't error (redis-cli can't pass binary args directly)
+    TOTAL=$((TOTAL + 1)); FT_SEARCH=$(mcli FT.SEARCH myidx "*" 2>&1)
+    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH returned error"; fi
+
+    # FT.DROPINDEX — remove index
+    assert_moon "FT.DROPINDEX"             "OK"    FT.DROPINDEX myidx
+
+    # FT.INFO after drop should error
+    TOTAL=$((TOTAL + 1)); FT_INFO_AFTER=$(mcli FT.INFO myidx 2>&1)
+    if echo "$FT_INFO_AFTER" | grep -qi "err\|not found"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after drop errors"; fi
 fi
 
 # ===========================================================================

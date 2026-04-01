@@ -317,15 +317,21 @@ pub fn tq_l2_adc_multibit(
         4 => {
             // Delegate to existing optimized 4-bit path
             debug_assert_eq!(centroids.len(), 16);
-            let c: &[f32; 16] = centroids.try_into().unwrap_or_else(|_| {
-                panic!(
+            if let Ok(c) = centroids.try_into() {
+                tq_l2_adc_scaled(q_rotated, code, norm, c)
+            } else {
+                // Invariant violated — return max distance rather than panic
+                tracing::error!(
                     "4-bit ADC requires exactly 16 centroids, got {}",
                     centroids.len()
-                )
-            });
-            tq_l2_adc_scaled(q_rotated, code, norm, c)
+                );
+                f32::MAX
+            }
         }
-        _ => panic!("unsupported bit width: {bits}"),
+        _ => {
+            tracing::error!("unsupported bit width: {bits}");
+            f32::MAX
+        }
     }
 }
 
@@ -593,7 +599,7 @@ pub fn brute_force_tq_adc_multibit(
     }
 
     let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
-    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    results.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     results
         .into_iter()
@@ -673,7 +679,7 @@ pub fn brute_force_tq_adc(
 
     // Extract sorted results
     let mut results: Vec<(f32, u32)> = heap.into_iter().map(|(d, id)| (d.0, id)).collect();
-    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    results.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     results
         .into_iter()
@@ -1033,8 +1039,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32) as usize;
         let signs = test_sign_flips(padded, 42);
-        let boundaries = scaled_boundaries_n(padded as u32, 1);
-        let centroids = scaled_centroids_n(padded as u32, 1);
+        let boundaries = scaled_boundaries_n(padded as u32, 1).unwrap();
+        let centroids = scaled_centroids_n(padded as u32, 1).unwrap();
         let mut work = vec![0.0f32; padded];
 
         let mut v = lcg_f32(dim, 99);
@@ -1062,8 +1068,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32) as usize;
         let signs = test_sign_flips(padded, 42);
-        let boundaries = scaled_boundaries_n(padded as u32, 2);
-        let centroids = scaled_centroids_n(padded as u32, 2);
+        let boundaries = scaled_boundaries_n(padded as u32, 2).unwrap();
+        let centroids = scaled_centroids_n(padded as u32, 2).unwrap();
         let mut work = vec![0.0f32; padded];
 
         let mut v = lcg_f32(dim, 99);
@@ -1090,8 +1096,8 @@ mod tests {
         let dim = 768;
         let padded = padded_dimension(dim as u32) as usize;
         let signs = test_sign_flips(padded, 42);
-        let boundaries = scaled_boundaries_n(padded as u32, 3);
-        let centroids = scaled_centroids_n(padded as u32, 3);
+        let boundaries = scaled_boundaries_n(padded as u32, 3).unwrap();
+        let centroids = scaled_centroids_n(padded as u32, 3).unwrap();
         let mut work = vec![0.0f32; padded];
 
         let mut v = lcg_f32(dim, 99);
@@ -1120,8 +1126,8 @@ mod tests {
         let signs = test_sign_flips(padded, 42);
 
         for bits in [1u8, 2, 3] {
-            let boundaries = scaled_boundaries_n(padded as u32, bits);
-            let centroids = scaled_centroids_n(padded as u32, bits);
+            let boundaries = scaled_boundaries_n(padded as u32, bits).unwrap();
+            let centroids = scaled_centroids_n(padded as u32, bits).unwrap();
             let mut work_enc = vec![0.0f32; padded];
             let mut work_dec = vec![0.0f32; padded];
 
@@ -1197,8 +1203,8 @@ mod tests {
         let signs = test_sign_flips(padded, 42);
 
         for bits in [1u8, 2, 3] {
-            let boundaries = scaled_boundaries_n(padded as u32, bits);
-            let centroids = scaled_centroids_n(padded as u32, bits);
+            let boundaries = scaled_boundaries_n(padded as u32, bits).unwrap();
+            let centroids = scaled_centroids_n(padded as u32, bits).unwrap();
             let mut work = vec![0.0f32; padded];
 
             let mut v = lcg_f32(dim, 99);

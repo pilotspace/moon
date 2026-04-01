@@ -281,13 +281,13 @@ pub fn hnsw_search_filtered(
     let original_dim = query.len();
     let padded_dim = q_rotated.len();
     let _active_code_bytes = original_dim / 2; // nibble-packed bytes for original dim
-    let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
-
     let sub_table = collection.sub_centroid_table.as_ref();
+    // Guard use_subcent on sub_table availability to avoid panic
+    let use_subcent = use_subcent && sub_table.is_some();
+    let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
     let mut adc_lut = Vec::with_capacity(padded_dim * entries_per_coord);
 
-    if use_subcent {
-        let st = sub_table.unwrap();
+    if let Some(st) = sub_table.filter(|_| use_subcent) {
         for j in 0..padded_dim {
             let q = q_rotated[j];
             for e in 0..32 {
