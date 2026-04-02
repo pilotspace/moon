@@ -37,6 +37,8 @@ pub enum PageType {
     ManifestRoot = 0x31,
     /// CLOG commit-log page (4KB) — 2-bit transaction status.
     ClogPage = 0x32,
+    /// Vector undo log page (4KB) — variable-length undo records for metadata MVCC.
+    VecUndo = 0x25,
 }
 
 impl PageType {
@@ -62,6 +64,7 @@ impl PageType {
             0x30 => Some(Self::Control),
             0x31 => Some(Self::ManifestRoot),
             0x32 => Some(Self::ClogPage),
+            0x25 => Some(Self::VecUndo),
             _ => None,
         }
     }

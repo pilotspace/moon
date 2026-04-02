@@ -6,4 +6,5 @@ pub mod rdb;
 pub mod redis_rdb;
 pub mod replay;
 pub mod snapshot;
+pub mod vec_undo;
 pub mod wal;
