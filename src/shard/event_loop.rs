@@ -77,6 +77,12 @@ impl super::Shard {
     ) {
         let _shard_id = self.id;
 
+        // Publish disk-offload status for INFO moonstore (set once per shard, idempotent).
+        crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED.store(
+            server_config.disk_offload_enabled(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
@@ -312,6 +318,38 @@ impl super::Shard {
                 None
             };
 
+        // Per-shard warm transition state (only when disk-offload enabled).
+        // ShardManifest and next_file_id are needed for warm tier transitions.
+        // TODO(moonstore-v2): These should come from the actual shard manifest instance
+        // once full disk-offload wiring is complete. For now, create per-shard instances.
+        let mut warm_manifest: Option<crate::persistence::manifest::ShardManifest> =
+            if server_config.disk_offload_enabled() {
+                let shard_dir = server_config.effective_disk_offload_dir()
+                    .join(format!("shard-{}", shard_id));
+                std::fs::create_dir_all(&shard_dir).ok();
+                let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
+                if manifest_path.exists() {
+                    match crate::persistence::manifest::ShardManifest::open(&manifest_path) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!("Shard {}: warm manifest open failed: {}", shard_id, e);
+                            None
+                        }
+                    }
+                } else {
+                    match crate::persistence::manifest::ShardManifest::create(&manifest_path) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!("Shard {}: warm manifest create failed: {}", shard_id, e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+        let mut warm_next_file_id: u64 = 1;
+
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
@@ -325,6 +363,9 @@ impl super::Shard {
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
         let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
+        let mut warm_check_interval = TimerImpl::interval(
+            Duration::from_millis(timers::WARM_CHECK_INTERVAL_MS)
+        );
         let spsc_notify_local = spsc_notify;
 
         // Per-shard cached clock: updated once per 1ms tick.
@@ -575,6 +616,23 @@ impl super::Shard {
                 _ = wal_sync_interval.tick() => {
                     timers::sync_wal(&mut wal_writer);
                 }
+                // Warm tier transition check (10s interval, disk-offload only)
+                _ = warm_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() {
+                        if let Some(ref mut manifest) = warm_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_warm_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_warm_after,
+                                &mut warm_next_file_id,
+                                shard_id,
+                            );
+                        }
+                    }
+                }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.tick() => {
                     timers::expire_blocked_clients(&blocking_rc);
@@ -798,6 +856,23 @@ impl super::Shard {
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {
                     timers::sync_wal(&mut wal_writer);
+                }
+                // Warm tier transition check (10s interval, disk-offload only)
+                _ = warm_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() {
+                        if let Some(ref mut manifest) = warm_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_warm_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_warm_after,
+                                &mut warm_next_file_id,
+                                shard_id,
+                            );
+                        }
+                    }
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.tick() => {

@@ -49,6 +49,10 @@ pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>
 #[allow(dead_code)]
 pub const CHECKPOINT_TICK_MS: u64 = 1;
 
+/// Warm tier transition check interval in milliseconds (10 seconds).
+/// Infrequent enough to avoid overhead, responsive enough to catch aged segments.
+pub const WARM_CHECK_INTERVAL_MS: u64 = 10_000;
+
 /// WAL fsync on 1-second interval (everysec durability).
 pub(crate) fn sync_wal(wal_writer: &mut Option<WalWriter>) {
     if let Some(wal) = wal_writer {

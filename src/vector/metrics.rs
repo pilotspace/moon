@@ -6,7 +6,12 @@
 //! No allocations in any metric function -- pure atomic operations only.
 //! These are called from hot paths (FT.SEARCH).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+// -- MoonStore v2 flags --
+
+/// Whether disk offload (tiered storage) is enabled. Set once at startup.
+pub static MOONSTORE_DISK_OFFLOAD_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // -- Counters --
 
