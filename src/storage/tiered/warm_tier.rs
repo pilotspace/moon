@@ -4,7 +4,10 @@
 //! to a staging directory, fsync each file, fsync the directory, update
 //! manifest, rename staging to final, fsync parent.
 
+use std::io::Write as _;
 use std::path::Path;
+
+use roaring::RoaringBitmap;
 
 use crate::persistence::fsync::{fsync_directory, fsync_file};
 use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
@@ -55,6 +58,15 @@ pub fn transition_to_warm(
 
     if let Some(vdata) = vectors_data {
         write_vectors_mpf(&staging.join("vectors.mpf"), file_id, vdata)?;
+    }
+
+    // Write empty deletion bitmap (no vectors deleted in fresh warm segment)
+    {
+        let bitmap = RoaringBitmap::new();
+        let bitmap_path = staging.join("deletion.bitmap");
+        let mut bitmap_file = std::fs::File::create(&bitmap_path)?;
+        bitmap.serialize_into(&mut bitmap_file)?;
+        bitmap_file.flush()?;
     }
 
     // Step 3: Fsync staging directory (file data already fsynced by writers)
@@ -269,6 +281,38 @@ mod tests {
         let cd = ws.codes_data(0);
         assert_eq!(&cd[..1000], &[0xAAu8; 1000]);
         assert_eq!(ws.page_count_codes(), 1);
+    }
+
+    #[test]
+    fn test_transition_creates_deletion_bitmap() {
+        use roaring::RoaringBitmap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        let codes = vec![0xAAu8; 2000];
+        let graph = vec![0xBBu8; 500];
+        let mvcc = vec![0u8; 24 * 10];
+
+        let handle = transition_to_warm(
+            &shard_dir, 1, 100, &codes, &graph, None, &mvcc, &mut manifest, None,
+        )
+        .unwrap();
+
+        let seg_dir = handle.segment_dir();
+
+        // deletion.bitmap must exist in segment directory
+        let bitmap_path = seg_dir.join("deletion.bitmap");
+        assert!(bitmap_path.exists(), "deletion.bitmap should be created during warm transition");
+
+        // Must deserialize to an empty RoaringBitmap
+        let data = std::fs::read(&bitmap_path).unwrap();
+        let bitmap = RoaringBitmap::deserialize_from(&data[..]).unwrap();
+        assert!(bitmap.is_empty(), "fresh warm segment deletion bitmap should be empty");
     }
 
     #[test]
