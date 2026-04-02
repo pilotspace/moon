@@ -5,4 +5,5 @@
 
 pub mod page;
 pub mod pq;
+pub mod segment;
 pub mod vamana;
