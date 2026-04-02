@@ -15,6 +15,8 @@ use tracing::info;
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
 use crate::persistence::snapshot::SnapshotState;
+use crate::persistence::control::ShardControlFile;
+use crate::persistence::page_cache::PageCache;
 use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
@@ -322,14 +324,58 @@ impl super::Shard {
             None
         };
 
+        // Per-shard PageCache (None when disk-offload is disabled).
+        // Manages 4KB + 64KB page frames with clock-sweep eviction.
+        let page_cache: Option<PageCache> = if server_config.disk_offload_enabled() {
+            // Default: pagecache_size_bytes returns configured size or maxmemory/4.
+            // Split: 75% for 4KB frames, 25% for 64KB frames.
+            let budget = server_config.pagecache_size_bytes(server_config.maxmemory as u64);
+            let num_4k = ((budget * 3 / 4) / 4096) as usize;
+            let num_64k = ((budget / 4) / 65536) as usize;
+            let num_4k = num_4k.max(64);   // minimum 64 frames
+            let num_64k = num_64k.max(8);  // minimum 8 frames
+            info!("Shard {}: PageCache initialized ({} x 4KB + {} x 64KB frames, budget={})",
+                shard_id, num_4k, num_64k, budget);
+            Some(PageCache::new(num_4k, num_64k))
+        } else {
+            None
+        };
+
+        // Per-shard control file (disk-offload path).
+        let mut control_file: Option<ShardControlFile> = if server_config.disk_offload_enabled() {
+            let shard_dir = server_config.effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            let ctrl_path = ShardControlFile::control_path(&shard_dir, shard_id);
+            if ctrl_path.exists() {
+                match ShardControlFile::read(&ctrl_path) {
+                    Ok(cf) => Some(cf),
+                    Err(e) => {
+                        tracing::warn!("Shard {}: control file read failed: {}, creating new", shard_id, e);
+                        Some(ShardControlFile::new([0u8; 16]))
+                    }
+                }
+            } else {
+                Some(ShardControlFile::new([0u8; 16]))
+            }
+        } else {
+            None
+        };
+        let control_file_path: Option<std::path::PathBuf> = if server_config.disk_offload_enabled() {
+            let shard_dir = server_config.effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            Some(ShardControlFile::control_path(&shard_dir, shard_id))
+        } else {
+            None
+        };
+
         // Track WAL bytes since last checkpoint for trigger logic.
-        let mut _wal_bytes_since_checkpoint: u64 = 0;
+        let mut wal_bytes_since_checkpoint: u64 = 0;
 
         // Per-shard checkpoint manager (None when disk-offload is disabled).
         // When enabled, drives the fuzzy checkpoint protocol: begin(redo_lsn) ->
         // advance_tick(flush pages) -> finalize(WAL record + manifest + control).
-        // TODO(moonstore-v2): Wire to actual PageCache/WalWriterV3/ShardManifest/ShardControlFile instances
-        let mut _checkpoint_manager: Option<crate::persistence::checkpoint::CheckpointManager> =
+        // Wired to PageCache, WalWriterV3, ShardManifest, and ShardControlFile below.
+        let mut checkpoint_manager: Option<crate::persistence::checkpoint::CheckpointManager> =
             if server_config.disk_offload_enabled() {
                 let trigger = crate::persistence::checkpoint::CheckpointTrigger::new(
                     server_config.checkpoint_timeout,
