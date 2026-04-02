@@ -141,6 +141,7 @@ impl VectorIndex {
         manifest: &mut crate::persistence::manifest::ShardManifest,
         warm_after_secs: u64,
         next_file_id: &mut u64,
+        wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
         let snapshot = self.segments.load();
         let mut to_warm: Vec<usize> = Vec::new();
@@ -176,6 +177,7 @@ impl VectorIndex {
                 None, // vectors_data (f16 reranking -- not used yet)
                 &mvcc_data,
                 manifest,
+                wal.as_mut(),
             ) {
                 Ok(handle) => {
                     // Remove from in-memory immutable list.
@@ -436,13 +438,14 @@ impl VectorStore {
         manifest: &mut crate::persistence::manifest::ShardManifest,
         warm_after_secs: u64,
         next_file_id: &mut u64,
+        wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
         let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
         let mut total = 0;
         for name in names {
             if let Some(idx) = self.indexes.get(&name) {
                 total += idx.try_warm_transitions(
-                    shard_dir, manifest, warm_after_secs, next_file_id,
+                    shard_dir, manifest, warm_after_secs, next_file_id, wal,
                 );
             }
         }
@@ -634,7 +637,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let count = store.try_warm_transitions_all(
-            &shard_dir, &mut manifest, 0, &mut next_file_id,
+            &shard_dir, &mut manifest, 0, &mut next_file_id, &mut None,
         );
         assert_eq!(count, 1);
 
@@ -688,7 +691,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let count = store.try_warm_transitions_all(
-            &shard_dir, &mut manifest, 999_999, &mut next_file_id,
+            &shard_dir, &mut manifest, 999_999, &mut next_file_id, &mut None,
         );
         assert_eq!(count, 0);
 
