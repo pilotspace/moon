@@ -15,3 +15,4 @@ pub mod vec_undo;
 pub mod wal;
 pub mod page_cache;
 pub mod wal_v3;
+pub mod compression;
