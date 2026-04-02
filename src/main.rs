@@ -208,7 +208,12 @@ fn main() -> anyhow::Result<()> {
             let mut shard =
                 Shard::new(id, num_shards, config.databases, config.to_runtime_config());
             if let Some(ref dir) = persistence_dir {
-                shard.restore_from_persistence(dir);
+                let disk_offload_dir = if config.disk_offload_enabled() {
+                    Some(config.effective_disk_offload_dir())
+                } else {
+                    None
+                };
+                shard.restore_from_persistence(dir, disk_offload_dir.as_deref());
             }
             shard
         })

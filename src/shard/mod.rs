@@ -56,10 +56,59 @@ impl Shard {
 
     /// Restore shard state from per-shard snapshot and WAL files at startup.
     ///
-    /// Loads the per-shard RRDSHARD snapshot file first (if it exists), then replays
-    /// the per-shard WAL for any commands written after the last snapshot.
+    /// When `disk_offload_dir` is `Some`, uses the v3 recovery protocol
+    /// (6-phase: control file -> manifest -> data load -> WAL v3 replay ->
+    /// consistency -> ready). Falls back to v2 path on v3 failure.
+    ///
+    /// When `disk_offload_dir` is `None`, uses the existing v2 path:
+    /// load per-shard RRDSHARD snapshot, replay per-shard WAL v2.
+    ///
     /// Returns total keys loaded (snapshot + WAL replay).
-    pub fn restore_from_persistence(&mut self, persistence_dir: &str) -> usize {
+    pub fn restore_from_persistence(
+        &mut self,
+        persistence_dir: &str,
+        disk_offload_dir: Option<&std::path::Path>,
+    ) -> usize {
+        // If disk-offload was enabled, use v3 recovery protocol
+        if let Some(offload_dir) = disk_offload_dir {
+            let shard_dir = offload_dir.join(format!("shard-{}", self.id));
+            if shard_dir.exists() {
+                match crate::persistence::recovery::recover_shard_v3(
+                    &mut self.databases,
+                    self.id,
+                    &shard_dir,
+                    &DispatchReplayEngine,
+                ) {
+                    Ok(result) => {
+                        info!(
+                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={})",
+                            self.id,
+                            result.commands_replayed,
+                            result.fpi_applied,
+                            result.last_lsn
+                        );
+                        // Vector recovery still uses the v2 path for now
+                        self.recover_vectors(persistence_dir);
+                        return result.commands_replayed;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Shard {}: v3 recovery failed, falling back to v2: {}",
+                            self.id,
+                            e
+                        );
+                        // Fall through to v2 path
+                    }
+                }
+            }
+        }
+
+        // Existing v2 path (unchanged)
+        self.restore_from_persistence_v2(persistence_dir)
+    }
+
+    /// V2 recovery path: snapshot load + WAL v2 replay + vector recovery.
+    fn restore_from_persistence_v2(&mut self, persistence_dir: &str) -> usize {
         use crate::persistence::snapshot::shard_snapshot_load;
         use crate::persistence::wal;
 
@@ -94,7 +143,16 @@ impl Shard {
             }
         }
 
-        // Recover vector store from WAL + on-disk segments
+        // Recover vector store
+        self.recover_vectors(persistence_dir);
+
+        total_keys
+    }
+
+    /// Recover vector store from WAL + on-disk segments.
+    fn recover_vectors(&mut self, persistence_dir: &str) {
+        let dir = std::path::Path::new(persistence_dir);
+        let wal_file = crate::persistence::wal::wal_path(dir, self.id);
         let vector_persist_dir = dir.join(format!("shard-{}-vectors", self.id));
         if vector_persist_dir.exists() || wal_file.exists() {
             match crate::vector::persistence::recovery::recover_vector_store(
@@ -122,8 +180,6 @@ impl Shard {
                 }
             }
         }
-
-        total_keys
     }
 }
 
