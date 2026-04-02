@@ -221,6 +221,15 @@ impl WarmSearchSegment {
         self.segment_id
     }
 
+    /// Mark this segment's on-disk directory for deletion.
+    ///
+    /// The directory is only removed once all `SegmentHandle` clones are dropped
+    /// (i.e., no in-flight searches hold a reference). This enables safe cleanup
+    /// after compaction or index drop without racing with concurrent readers.
+    pub fn mark_tombstoned(&self) {
+        self._handle.mark_tombstoned();
+    }
+
     /// Remap per-segment internal IDs to globally unique IDs.
     ///
     /// HNSW search returns VectorId(original_id). We convert through BFS mapping

@@ -340,8 +340,20 @@ impl VectorStore {
     }
 
     /// Drop an index by name. Returns true if it existed.
+    ///
+    /// Tombstones any warm segments so their on-disk directories are cleaned up
+    /// once all in-flight search references (Arc snapshots) are dropped.
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
-        self.indexes.remove(name).is_some()
+        if let Some(index) = self.indexes.remove(name) {
+            // Tombstone warm segments: mark for deletion on last Arc drop.
+            let snapshot = index.segments.load();
+            for warm_seg in &snapshot.warm {
+                warm_seg.mark_tombstoned();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Get index reference by name.
