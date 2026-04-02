@@ -249,6 +249,7 @@ fn test_warm_tier_transition_preserves_search() {
         None, // no raw vectors (TQ encoded)
         &mvcc_data,
         &mut manifest,
+        None, // no WAL in integration test
     )
     .unwrap();
 
@@ -309,6 +310,7 @@ fn test_warm_tier_transition_preserves_search() {
         Some(&vectors_data),
         &mvcc_data,
         &mut manifest,
+        None, // no WAL in integration test
     )
     .unwrap();
 

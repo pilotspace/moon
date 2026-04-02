@@ -37,6 +37,7 @@ pub fn transition_to_warm(
     vectors_data: Option<&[u8]>,
     mvcc_data: &[u8],
     manifest: &mut ShardManifest,
+    wal: Option<&mut crate::persistence::wal_v3::segment::WalWriterV3>,
 ) -> std::io::Result<SegmentHandle> {
     let vectors_dir = shard_dir.join("vectors");
     std::fs::create_dir_all(&vectors_dir)?;
@@ -72,7 +73,7 @@ pub fn transition_to_warm(
         (codes_data.len() + payload_cap - 1) / payload_cap
     };
 
-    manifest.add_file(FileEntry {
+    let entry = FileEntry {
         file_id,
         file_type: PageType::VecCodes as u8,
         status: FileStatus::Active,
@@ -83,7 +84,21 @@ pub fn transition_to_warm(
         created_lsn: 0,
         min_key_hash: 0,
         max_key_hash: u64::MAX,
-    });
+    };
+
+    // Step 4a: Write FileCreate WAL record before manifest commit
+    if let Some(wal) = wal {
+        let mut entry_buf = [0u8; FileEntry::SIZE];
+        entry.write_to(&mut entry_buf);
+        wal.append(
+            crate::persistence::wal_v3::record::WalRecordType::FileCreate,
+            &entry_buf,
+        );
+        // Flush WAL so FileCreate is durable before manifest commit
+        wal.flush_sync()?;
+    }
+
+    manifest.add_file(entry);
     manifest.commit()?;
 
     // Step 6: Rename staging -> final
@@ -115,7 +130,7 @@ mod tests {
         let mvcc = vec![0u8; 24 * 10];
 
         let handle = transition_to_warm(
-            &shard_dir, 1, 100, &codes, &graph, None, &mvcc, &mut manifest,
+            &shard_dir, 1, 100, &codes, &graph, None, &mvcc, &mut manifest, None,
         )
         .unwrap();
 
@@ -140,7 +155,7 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let _handle = transition_to_warm(
-            &shard_dir, 2, 200, &codes, &graph, None, &mvcc, &mut manifest,
+            &shard_dir, 2, 200, &codes, &graph, None, &mvcc, &mut manifest, None,
         )
         .unwrap();
 
@@ -163,7 +178,7 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let _handle = transition_to_warm(
-            &shard_dir, 3, 300, &codes, &graph, None, &mvcc, &mut manifest,
+            &shard_dir, 3, 300, &codes, &graph, None, &mvcc, &mut manifest, None,
         )
         .unwrap();
 
@@ -199,6 +214,7 @@ mod tests {
             Some(&vectors),
             &mvcc,
             &mut manifest,
+            None,
         )
         .unwrap();
 
@@ -219,7 +235,7 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let handle = transition_to_warm(
-            &shard_dir, 5, 500, &codes, &graph, None, &mvcc, &mut manifest,
+            &shard_dir, 5, 500, &codes, &graph, None, &mvcc, &mut manifest, None,
         )
         .unwrap();
 
@@ -242,7 +258,7 @@ mod tests {
         let mvcc = vec![0u8; 24 * 10];
 
         let handle = transition_to_warm(
-            &shard_dir, 6, 600, &codes, &graph, None, &mvcc, &mut manifest,
+            &shard_dir, 6, 600, &codes, &graph, None, &mvcc, &mut manifest, None,
         )
         .unwrap();
 
@@ -253,5 +269,62 @@ mod tests {
         let cd = ws.codes_data(0);
         assert_eq!(&cd[..1000], &[0xAAu8; 1000]);
         assert_eq!(ws.page_count_codes(), 1);
+    }
+
+    #[test]
+    fn test_transition_writes_file_create_wal_record() {
+        use crate::persistence::wal_v3::record::{WalRecordType, read_wal_v3_record};
+        use crate::persistence::wal_v3::segment::{WalSegment, WalWriterV3, WAL_V3_HEADER_SIZE};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let wal_dir = shard_dir.join("wal_v3");
+        let mut wal = WalWriterV3::new(0, &wal_dir, 16 * 1024 * 1024).unwrap();
+
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        let codes = vec![0xAAu8; 500];
+        let graph = vec![0xBBu8; 200];
+        let mvcc = vec![0u8; 24 * 5];
+
+        let _handle = transition_to_warm(
+            &shard_dir, 10, 1000, &codes, &graph, None, &mvcc,
+            &mut manifest, Some(&mut wal),
+        )
+        .unwrap();
+
+        // Read back the WAL segment and verify FileCreate record exists
+        let seg_path = WalSegment::segment_path(&wal_dir, wal.current_segment_sequence());
+        let data = std::fs::read(&seg_path).unwrap();
+        assert!(data.len() > WAL_V3_HEADER_SIZE, "WAL should have records");
+
+        // Parse records after header to find FileCreate
+        let mut offset = WAL_V3_HEADER_SIZE;
+        let mut found_file_create = false;
+        while offset < data.len() {
+            if let Some(record) = read_wal_v3_record(&data[offset..]) {
+                if record.record_type == WalRecordType::FileCreate {
+                    found_file_create = true;
+                    // Verify payload is a serialized FileEntry (48 bytes)
+                    assert_eq!(record.payload.len(), FileEntry::SIZE);
+                    let fe = FileEntry::read_from(&record.payload).unwrap();
+                    assert_eq!(fe.file_id, 1000);
+                    assert_eq!(fe.tier, StorageTier::Warm);
+                    assert_eq!(fe.status, FileStatus::Active);
+                    break;
+                }
+                let record_len = u32::from_le_bytes([
+                    data[offset], data[offset + 1],
+                    data[offset + 2], data[offset + 3],
+                ]) as usize;
+                offset += record_len;
+            } else {
+                break;
+            }
+        }
+        assert!(found_file_create, "FileCreate WAL record should be present");
     }
 }

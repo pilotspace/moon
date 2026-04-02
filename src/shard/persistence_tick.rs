@@ -188,9 +188,10 @@ pub(crate) fn check_warm_transitions(
     warm_after_secs: u64,
     next_file_id: &mut u64,
     shard_id: usize,
+    wal: &mut Option<WalWriterV3>,
 ) {
     let count = vector_store.try_warm_transitions_all(
-        shard_dir, manifest, warm_after_secs, next_file_id,
+        shard_dir, manifest, warm_after_secs, next_file_id, wal,
     );
     if count > 0 {
         info!(

@@ -712,6 +712,7 @@ impl super::Shard {
                                 server_config.segment_warm_after,
                                 &mut next_file_id,
                                 shard_id,
+                                &mut wal_v3_writer,
                             );
                         }
                     }
@@ -968,6 +969,7 @@ impl super::Shard {
                                 server_config.segment_warm_after,
                                 &mut next_file_id,
                                 shard_id,
+                                &mut wal_v3_writer,
                             );
                         }
                     }
