@@ -238,7 +238,7 @@ mod tests {
         let page = ClogPage::new(0);
         let mut buf = page.to_page();
         // Corrupt the page type byte (offset 5)
-        buf[5] = PageType::KvData as u8;
+        buf[5] = PageType::KvLeaf as u8;
         // Recompute checksum so it passes CRC check
         MoonPageHeader::compute_checksum(&mut buf);
         assert!(ClogPage::from_page(&buf).is_none());

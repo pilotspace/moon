@@ -56,7 +56,6 @@ serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
 memmap2 = "0.9"
 lz4_flex = "0.13"
-crc32c = "0.6"
 dashmap = "6"
 
 tikv-jemallocator = { version = "0.6", optional = true }
