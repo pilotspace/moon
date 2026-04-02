@@ -16,6 +16,7 @@ use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
+use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
@@ -298,6 +299,31 @@ impl super::Shard {
         } else {
             None
         };
+
+        // Per-shard WAL v3 writer (created only when disk-offload is enabled).
+        // Provides per-record LSN tracking and FPI support for checkpoint-based recovery.
+        // WAL v2 remains active for non-disk-offload mode; both writers can coexist.
+        let mut wal_v3_writer: Option<WalWriterV3> = if server_config.disk_offload_enabled() {
+            let shard_dir = server_config.effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            let wal_dir = shard_dir.join("wal-v3");
+            match WalWriterV3::new(shard_id, &wal_dir, server_config.wal_segment_size_bytes()) {
+                Ok(w) => {
+                    info!("Shard {}: WAL v3 writer initialized (segment_size={})",
+                        shard_id, server_config.wal_segment_size_bytes());
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::warn!("Shard {}: WAL v3 init failed: {}", shard_id, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Track WAL bytes since last checkpoint for trigger logic.
+        let mut _wal_bytes_since_checkpoint: u64 = 0;
 
         // Per-shard checkpoint manager (None when disk-offload is disabled).
         // When enabled, drives the fuzzy checkpoint protocol: begin(redo_lsn) ->
@@ -598,6 +624,7 @@ impl super::Shard {
                     }
 
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                    persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
 
                     // On Linux: poll io_uring for completions (non-blocking)
                     #[cfg(target_os = "linux")]
@@ -615,6 +642,7 @@ impl super::Shard {
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {
                     timers::sync_wal(&mut wal_writer);
+                    timers::sync_wal_v3(&mut wal_v3_writer);
                 }
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.tick() => {
@@ -649,6 +677,9 @@ impl super::Shard {
                     info!("Shard {} shutting down", self.id);
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
+                    }
+                    if let Some(ref mut wal_v3) = wal_v3_writer {
+                        let _ = wal_v3.flush_sync();
                     }
                     break;
                 }
@@ -852,10 +883,12 @@ impl super::Shard {
                     }
 
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                    persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
                 }
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {
                     timers::sync_wal(&mut wal_writer);
+                    timers::sync_wal_v3(&mut wal_v3_writer);
                 }
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.tick() => {
@@ -891,6 +924,9 @@ impl super::Shard {
                     info!("Shard {} shutting down (monoio)", self.id);
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
+                    }
+                    if let Some(ref mut wal_v3) = wal_v3_writer {
+                        let _ = wal_v3.flush_sync();
                     }
                     break;
                 }
