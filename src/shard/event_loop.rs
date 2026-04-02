@@ -672,6 +672,16 @@ impl super::Shard {
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
                     persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
 
+                    // Checkpoint protocol tick (disk-offload only)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut warm_manifest, &mut control_file, &control_file_path)
+                    {
+                        persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
+                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
+                            wal_bytes_since_checkpoint = 0;
+                        }
+                    }
+
                     // On Linux: poll io_uring for completions (non-blocking)
                     #[cfg(target_os = "linux")]
                     if let Some(ref mut driver) = uring_state {
@@ -930,6 +940,16 @@ impl super::Shard {
 
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
                     persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                    // Checkpoint protocol tick (disk-offload only)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut warm_manifest, &mut control_file, &control_file_path)
+                    {
+                        persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
+                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
+                            wal_bytes_since_checkpoint = 0;
+                        }
+                    }
                 }
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {

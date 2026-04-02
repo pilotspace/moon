@@ -217,7 +217,6 @@ use std::path::Path;
 ///
 /// Called every tick from the event loop when disk-offload is enabled.
 /// No-op if a checkpoint is already in progress.
-#[allow(dead_code)]
 pub(crate) fn maybe_begin_checkpoint(
     checkpoint_mgr: &mut CheckpointManager,
     wal: &WalWriterV3,
@@ -240,7 +239,6 @@ pub(crate) fn maybe_begin_checkpoint(
 /// Returns `true` if a finalize step was completed this tick.
 ///
 /// The caller provides all I/O dependencies — CheckpointManager itself is pure state.
-#[allow(dead_code)]
 pub(crate) fn handle_checkpoint_tick(
     checkpoint_mgr: &mut CheckpointManager,
     page_cache: &PageCache,
