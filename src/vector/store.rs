@@ -615,6 +615,42 @@ impl VectorStore {
             tracing::info!("Registered {}/{} warm segments on startup", loaded, warm_segments.len());
         }
     }
+
+    /// Register cold DiskANN segments recovered from disk into the appropriate indexes.
+    ///
+    /// Called during shard restore after v3 recovery identifies cold-tier segments
+    /// in the manifest. For each (segment_id, segment_dir), logs the discovery.
+    ///
+    /// Full DiskAnnSegment reconstruction from disk requires serialized PQ codebooks
+    /// (future work). For now, this discovers and logs cold segments so they are
+    /// tracked by the system. Full loading will be added when PQ codebook
+    /// serialization is implemented.
+    pub fn register_cold_segments(&mut self, cold_segments: Vec<(u64, std::path::PathBuf)>) {
+        let mut loaded = 0usize;
+        for (segment_id, segment_dir) in &cold_segments {
+            // Try each index -- the segment belongs to whichever collection matches.
+            for idx in self.indexes.values() {
+                let seg_vamana = segment_dir.join("vamana.mpf");
+                if seg_vamana.exists() {
+                    tracing::info!(
+                        "Cold segment {} at {:?} discovered for index {:?} (full loading requires stored PQ codebook)",
+                        segment_id,
+                        segment_dir,
+                        std::str::from_utf8(&idx.meta.name).unwrap_or("<non-utf8>"),
+                    );
+                    loaded += 1;
+                    break; // Segment belongs to one index only
+                }
+            }
+        }
+        if loaded > 0 {
+            tracing::info!(
+                "Discovered {}/{} cold segments on startup",
+                loaded,
+                cold_segments.len()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -900,5 +936,29 @@ mod tests {
         let idx = store.get_index(b"idx_default").unwrap();
         assert_eq!(idx.collection.codebook.len(), 16);
         assert_eq!(idx.collection.quantization, QuantizationConfig::TurboQuant4);
+    }
+
+    // -- Cold segment registration tests (Phase 79-04) --
+
+    #[test]
+    fn test_register_cold_segments_empty() {
+        let mut store = VectorStore::new();
+        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+        // Should not panic with empty input
+        store.register_cold_segments(Vec::new());
+    }
+
+    #[test]
+    fn test_register_cold_segments_discovers() {
+        let mut store = VectorStore::new();
+        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-10-diskann");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        std::fs::write(seg_dir.join("vamana.mpf"), &[0u8; 64]).unwrap();
+
+        // Should discover the segment without panicking
+        store.register_cold_segments(vec![(10, seg_dir)]);
     }
 }

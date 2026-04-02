@@ -81,12 +81,14 @@ impl Shard {
                 ) {
                     Ok(result) => {
                         info!(
-                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={}, warm={}, txn_rollback={})",
+                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={}, warm={}, cold={}, kv_heap={}, txn_rollback={})",
                             self.id,
                             result.commands_replayed,
                             result.fpi_applied,
                             result.last_lsn,
                             result.warm_segments_loaded,
+                            result.cold_segments_loaded,
+                            result.kv_heap_entries_loaded,
                             result.txns_rolled_back,
                         );
                         // Vector recovery still uses the v2 path for now
@@ -99,6 +101,15 @@ impl Shard {
                                 self.id, result.warm_segments.len()
                             );
                             self.vector_store.register_warm_segments(result.warm_segments);
+                        }
+
+                        // Register cold DiskANN segments for discovery
+                        if !result.cold_segments.is_empty() {
+                            info!(
+                                "Shard {}: registering {} cold segment(s)",
+                                self.id, result.cold_segments.len()
+                            );
+                            self.vector_store.register_cold_segments(result.cold_segments);
                         }
                         return result.commands_replayed;
                     }
