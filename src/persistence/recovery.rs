@@ -12,10 +12,12 @@
 
 use std::path::Path;
 
+use bytes::Bytes;
 use tracing::info;
 
 use crate::persistence::clog::{ClogPage, TxnStatus};
 use crate::persistence::control::{ShardControlFile, ShardState};
+use crate::persistence::kv_page::{read_datafile, ValueType};
 use crate::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
 use crate::persistence::page::PageType;
 use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
@@ -39,6 +41,13 @@ pub struct RecoveryResult {
     /// Warm segment paths recovered from manifest, ready for VectorStore registration.
     /// Each tuple: (file_id, segment_dir_path).
     pub warm_segments: Vec<(u64, std::path::PathBuf)>,
+    /// Number of KV entries reloaded from heap DataFiles.
+    pub kv_heap_entries_loaded: usize,
+    /// Cold DiskANN segment paths recovered from manifest.
+    /// Each tuple: (file_id, segment_dir_path).
+    pub cold_segments: Vec<(u64, std::path::PathBuf)>,
+    /// Number of cold segments discovered.
+    pub cold_segments_loaded: usize,
 }
 
 /// 6-phase recovery protocol for disk-offload mode.
@@ -161,6 +170,81 @@ pub fn recover_shard_v3(
                 info!(
                     "Shard {}: discovered {} warm segment(s) from manifest",
                     shard_id, result.warm_segments_loaded
+                );
+            }
+        }
+    }
+
+    // Phase 3 continued: Reload KV heap entries from DataFiles.
+    // Scan manifest for status=Active, file_type=KvLeaf entries.
+    // These represent KV entries spilled to disk before the crash.
+    if manifest_path.exists() {
+        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
+            let data_dir = shard_dir.join("data");
+            for entry in manifest.files() {
+                if entry.status == FileStatus::Active
+                    && entry.file_type == PageType::KvLeaf as u8
+                {
+                    let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
+                    if heap_path.exists() {
+                        match read_datafile(&heap_path) {
+                            Ok(pages) => {
+                                let mut file_entries = 0usize;
+                                for page in &pages {
+                                    for slot_idx in 0..page.slot_count() {
+                                        if let Some(kv_entry) = page.get(slot_idx) {
+                                            if kv_entry.value_type == ValueType::String {
+                                                let key = Bytes::from(kv_entry.key);
+                                                let value = Bytes::from(kv_entry.value);
+                                                if let Some(ttl) = kv_entry.ttl_ms {
+                                                    // ttl_ms is absolute unix millis
+                                                    databases[0].set_string_with_expiry(key, value, ttl);
+                                                } else {
+                                                    databases[0].set_string(key, value);
+                                                }
+                                                file_entries += 1;
+                                            }
+                                            // Non-string types: skip for now (future work)
+                                        }
+                                    }
+                                }
+                                result.kv_heap_entries_loaded += file_entries;
+                                info!(
+                                    "Shard {}: reloaded {} KV entries from heap-{:06}.mpf",
+                                    shard_id, file_entries, entry.file_id
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Shard {}: heap DataFile read failed for file {}: {}",
+                                    shard_id, entry.file_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3 continued: Discover cold DiskANN segments from manifest.
+    // tier=Cold, status=Active entries point to on-disk DiskAnnSegment directories.
+    if manifest_path.exists() {
+        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
+            let vectors_dir = shard_dir.join("vectors");
+            for entry in manifest.files() {
+                if entry.tier == StorageTier::Cold && entry.status == FileStatus::Active {
+                    let seg_dir = vectors_dir.join(format!("segment-{}-diskann", entry.file_id));
+                    if seg_dir.exists() && seg_dir.join("vamana.mpf").exists() {
+                        result.cold_segments.push((entry.file_id, seg_dir));
+                        result.cold_segments_loaded += 1;
+                    }
+                }
+            }
+            if result.cold_segments_loaded > 0 {
+                info!(
+                    "Shard {}: discovered {} cold DiskANN segment(s) from manifest",
+                    shard_id, result.cold_segments_loaded
                 );
             }
         }
@@ -538,5 +622,111 @@ mod tests {
         assert_eq!(result.warm_segments.len(), 1);
         assert_eq!(result.warm_segments[0].0, 42);
         assert_eq!(result.warm_segments[0].1, seg_dir);
+    }
+
+    #[test]
+    fn test_recover_kv_heap_entries() {
+        use crate::persistence::kv_page::{KvLeafPage, ValueType, write_datafile};
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Create manifest with one KvLeaf/Active entry
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        manifest.add_file(FileEntry {
+            file_id: 7,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: 1,
+            byte_size: 4096,
+            created_lsn: 1,
+            min_key_hash: 0,
+            max_key_hash: u64::MAX,
+        });
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        // Create DataFile with 3 string KV entries
+        let data_dir = shard_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut page = KvLeafPage::new(0, 7);
+        page.insert(b"key1", b"val1", ValueType::String, 0, None).unwrap();
+        page.insert(b"key2", b"val2", ValueType::String, 0, None).unwrap();
+        // TTL is stored as absolute unix millis -- use a far-future value
+        page.insert(b"key3", b"val3", ValueType::String, 0, Some(4_000_000_000_000)).unwrap();
+        page.finalize();
+        write_datafile(&data_dir.join("heap-000007.mpf"), &[&page]).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        assert_eq!(result.kv_heap_entries_loaded, 3);
+
+        // Verify entries exist in database
+        assert!(databases[0].get(b"key1").is_some(), "key1 should be in database");
+        assert!(databases[0].get(b"key2").is_some(), "key2 should be in database");
+        assert!(databases[0].get(b"key3").is_some(), "key3 should be in database");
+    }
+
+    #[test]
+    fn test_recover_cold_segments_from_manifest() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Create manifest with a Cold/Active entry
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        manifest.add_file(FileEntry {
+            file_id: 50,
+            file_type: PageType::VecCodes as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Cold,
+            page_size_log2: 16,
+            page_count: 8,
+            byte_size: 524288,
+            created_lsn: 10,
+            min_key_hash: 0,
+            max_key_hash: u64::MAX,
+        });
+        // Also add a non-cold entry that should be ignored
+        manifest.add_file(FileEntry {
+            file_id: 51,
+            file_type: PageType::VecCodes as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Warm,
+            page_size_log2: 16,
+            page_count: 4,
+            byte_size: 262144,
+            created_lsn: 11,
+            min_key_hash: 0,
+            max_key_hash: u64::MAX,
+        });
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        // Create the cold segment directory with vamana.mpf
+        let seg_dir = shard_dir.join("vectors").join("segment-50-diskann");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        std::fs::write(seg_dir.join("vamana.mpf"), &[0u8; 128]).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        assert_eq!(result.cold_segments_loaded, 1);
+        assert_eq!(result.cold_segments.len(), 1);
+        assert_eq!(result.cold_segments[0].0, 50);
+        assert_eq!(result.cold_segments[0].1, seg_dir);
     }
 }
