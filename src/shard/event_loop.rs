@@ -671,6 +671,15 @@ impl super::Shard {
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
                     persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
 
+                    // appendfsync=always: fsync WAL v3 after every SPSC drain batch
+                    if server_config.appendfsync == "always" {
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            if let Err(e) = wal.flush_sync() {
+                                tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                            }
+                        }
+                    }
+
                     // Checkpoint protocol tick (disk-offload only)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
@@ -939,6 +948,15 @@ impl super::Shard {
 
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
                     persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                    // appendfsync=always: fsync WAL v3 after every SPSC drain batch
+                    if server_config.appendfsync == "always" {
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            if let Err(e) = wal.flush_sync() {
+                                tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                            }
+                        }
+                    }
 
                     // Checkpoint protocol tick (disk-offload only)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
