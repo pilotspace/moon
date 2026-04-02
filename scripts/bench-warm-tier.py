@@ -361,11 +361,11 @@ class WarmTierBenchmark:
             query_bytes = vec_to_bytes(self.queries[i])
             t0 = time.monotonic()
             try:
-                # FT.SEARCH idx "*=>[KNN {k} @vec $query_vec EF_RUNTIME {ef}]"
+                # FT.SEARCH idx "*=>[KNN {k} @vec $query_vec]"
                 #   PARAMS 2 query_vec <bytes> DIALECT 2
                 result = self.client.execute_command(
                     "FT.SEARCH", "idx",
-                    f"*=>[KNN {k} @vec $query_vec EF_RUNTIME {ef}]",
+                    f"*=>[KNN {k} @vec $query_vec]",
                     "PARAMS", "2", "query_vec", query_bytes,
                     "DIALECT", "2",
                 )
