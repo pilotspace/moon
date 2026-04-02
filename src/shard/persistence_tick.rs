@@ -181,7 +181,6 @@ pub(crate) fn flush_wal_v3_if_needed(
 /// Called from the event loop on a slower interval (e.g., every 10 seconds)
 /// when disk-offload is enabled. Scans all VectorIndex segments, transitions
 /// those older than `warm_after_secs`.
-#[allow(dead_code)]
 pub(crate) fn check_warm_transitions(
     vector_store: &crate::vector::store::VectorStore,
     shard_dir: &std::path::Path,

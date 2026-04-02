@@ -112,7 +112,9 @@ pub struct ServerConfig {
     #[arg(long = "disk-offload-dir")]
     pub disk_offload_dir: Option<PathBuf>,
 
-    /// RAM pressure threshold to trigger disk offload (0.0-1.0)
+    /// RAM pressure threshold to trigger disk offload (0.0-1.0).
+    /// NOTE: Consumed by the memory pressure cascade (deferred to a future phase).
+    /// Currently parsed and stored but not acted upon at runtime.
     #[arg(long = "disk-offload-threshold", default_value_t = 0.85)]
     pub disk_offload_threshold: f64,
 

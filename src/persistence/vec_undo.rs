@@ -186,22 +186,15 @@ impl VecUndoPage {
     pub fn chain_records(&self, start_offset: u32) -> Vec<UndoRecord> {
         let mut result = Vec::new();
         let mut current = start_offset;
-        loop {
-            if let Some(record) = self.read_record(current) {
-                let next = record.prev_undo_ptr;
-                result.push(record);
-                if next == current {
-                    // Self-referential -- break to avoid infinite loop
-                    break;
-                }
-                if next == 0 {
-                    break;
-                }
-                current = next;
-            } else {
+        while let Some(record) = self.read_record(current) {
+            let next = record.prev_undo_ptr;
+            result.push(record);
+            if next == current || next == 0 {
+                // Self-referential or end-of-chain -- stop traversal.
                 break;
             }
-            // Cycle guard: undo chains should never be this long in a single page
+            current = next;
+            // Cycle guard: undo chains should never be this long in a single page.
             if result.len() >= 1000 {
                 break;
             }
@@ -465,7 +458,7 @@ mod tests {
         use crate::persistence::page::{MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE};
 
         let mut buf = [0u8; 4096];
-        let hdr = MoonPageHeader::new(PageType::KvData, 1, 1);
+        let hdr = MoonPageHeader::new(PageType::KvLeaf, 1, 1);
         hdr.write_to(&mut buf);
         MoonPageHeader::compute_checksum(&mut buf);
 
