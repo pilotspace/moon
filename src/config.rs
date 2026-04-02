@@ -161,6 +161,28 @@ pub struct ServerConfig {
     /// mlock vector codes pages into RAM
     #[arg(long = "vec-codes-mlock", default_value = "enable")]
     pub vec_codes_mlock: String,
+
+    // ── Cold-tier / DiskANN config stubs (not yet consumed) ─────────
+
+    /// Seconds after last access before a WARM segment is promoted to COLD.
+    /// Not yet consumed — reserved for the WARM->COLD transition timer.
+    #[arg(long = "segment-cold-after", default_value_t = 86_400)]
+    pub segment_cold_after: u64,
+
+    /// Minimum queries-per-second threshold; segments below this are COLD candidates.
+    /// Not yet consumed — reserved for the WARM->COLD transition heuristic.
+    #[arg(long = "segment-cold-min-qps", default_value_t = 0.1)]
+    pub segment_cold_min_qps: f64,
+
+    /// DiskANN beam width for disk-resident vector search.
+    /// Not yet consumed — reserved for the DiskANN search implementation.
+    #[arg(long = "vec-diskann-beam-width", default_value_t = 8)]
+    pub vec_diskann_beam_width: u32,
+
+    /// Number of HNSW upper levels cached in memory for DiskANN hybrid search.
+    /// Not yet consumed — reserved for the DiskANN cache layer.
+    #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
+    pub vec_diskann_cache_levels: u32,
 }
 
 impl ServerConfig {
@@ -555,5 +577,33 @@ mod tests {
         let config = ServerConfig::parse_from(["moon", "--aclfile", "/data/users.acl"]);
         let rt = config.to_runtime_config();
         assert_eq!(rt.aclfile, Some("/data/users.acl".to_string()));
+    }
+
+    #[test]
+    fn test_cold_tier_defaults() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.segment_cold_after, 86_400);
+        assert!((config.segment_cold_min_qps - 0.1).abs() < f64::EPSILON);
+        assert_eq!(config.vec_diskann_beam_width, 8);
+        assert_eq!(config.vec_diskann_cache_levels, 3);
+    }
+
+    #[test]
+    fn test_cold_tier_custom() {
+        let config = ServerConfig::parse_from([
+            "moon",
+            "--segment-cold-after",
+            "3600",
+            "--segment-cold-min-qps",
+            "0.5",
+            "--vec-diskann-beam-width",
+            "16",
+            "--vec-diskann-cache-levels",
+            "5",
+        ]);
+        assert_eq!(config.segment_cold_after, 3600);
+        assert!((config.segment_cold_min_qps - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.vec_diskann_beam_width, 16);
+        assert_eq!(config.vec_diskann_cache_levels, 5);
     }
 }
