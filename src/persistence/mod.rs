@@ -1,6 +1,7 @@
 pub mod aof;
 pub mod auto_save;
 pub mod checkpoint;
+pub mod clog;
 pub mod control;
 pub mod fsync;
 pub mod manifest;
