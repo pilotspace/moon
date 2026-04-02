@@ -302,6 +302,18 @@ pub(crate) fn handle_checkpoint_tick(
 
             // 5. Mark checkpoint complete
             checkpoint_mgr.complete();
+
+            // 6. Recycle old WAL segments that are fully before redo_lsn
+            match wal.recycle_segments_before(redo_lsn) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Checkpoint: recycled {} old WAL segment(s)", n);
+                }
+                Err(e) => {
+                    tracing::warn!("WAL segment recycling failed: {}", e);
+                }
+                _ => {}
+            }
+
             tracing::info!(
                 "Checkpoint complete: redo_lsn={}, epoch={}",
                 redo_lsn,

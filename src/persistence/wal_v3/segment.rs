@@ -240,6 +240,56 @@ impl WalWriterV3 {
         file.write_all(&header)
     }
 
+    /// Delete WAL segment files whose records are fully before `redo_lsn`.
+    ///
+    /// Scans `*.wal` files in the WAL directory, reads the base_lsn from each
+    /// segment header (offset 28, u64 LE). If base_lsn < redo_lsn AND the
+    /// segment is not the currently active segment, the file is removed.
+    ///
+    /// Called after checkpoint finalization when redo_lsn advances.
+    /// Returns the number of segments recycled.
+    pub fn recycle_segments_before(&self, redo_lsn: u64) -> std::io::Result<usize> {
+        let mut recycled = 0usize;
+        let entries = fs::read_dir(&self.wal_dir)?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.ends_with(".wal") {
+                continue;
+            }
+            // Parse sequence number from filename
+            let seq = match name_str.strip_suffix(".wal").and_then(|s| s.parse::<u64>().ok()) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Never delete the active segment
+            if seq >= self.current_sequence {
+                continue;
+            }
+            // Read base_lsn from header (offset 28..36)
+            let path = entry.path();
+            let mut header = [0u8; WAL_V3_HEADER_SIZE];
+            use std::io::Read as _;
+            let file = fs::File::open(&path)?;
+            let mut reader = std::io::BufReader::new(file);
+            if reader.read_exact(&mut header).is_err() {
+                continue; // Truncated header, skip
+            }
+            let base_lsn = u64::from_le_bytes(
+                header[28..36].try_into().unwrap_or([0u8; 8]),
+            );
+            // If every record in this segment is before redo_lsn, safe to delete
+            if base_lsn > 0 && base_lsn < redo_lsn {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!("WAL segment recycle failed for {:?}: {}", path, e);
+                } else {
+                    recycled += 1;
+                }
+            }
+        }
+        Ok(recycled)
+    }
+
     /// Scan the WAL directory for existing segment files, return max sequence.
     fn scan_max_sequence(wal_dir: &Path) -> u64 {
         let mut max_seq = 0u64;
@@ -385,5 +435,56 @@ mod tests {
         // segment_size at offset 36 (u64)
         let seg_size = u64::from_le_bytes(data[36..44].try_into().unwrap());
         assert_eq!(seg_size, DEFAULT_SEGMENT_SIZE);
+    }
+
+    #[test]
+    fn test_recycle_segments_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+
+        // Small segment size (512 bytes) to force multiple segments.
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+
+        // Write records and flush frequently to trigger segment rotation.
+        // Each record is ~31 bytes; 512 - 64 (header) = 448 usable per segment.
+        // Flushing every few records forces rotation when write_offset exceeds 512.
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+
+        let active_seq = writer.current_segment_sequence();
+        assert!(active_seq >= 3, "should have 3+ segments, got {}", active_seq);
+
+        // Count total .wal files before recycling.
+        let count_wals = || -> usize {
+            fs::read_dir(&wal_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+                .count()
+        };
+        let before = count_wals();
+        assert!(before >= 3);
+
+        // Segment 1 has base_lsn = 1 (first record). Use redo_lsn = 20 to
+        // recycle segments whose base_lsn < 20 (should include segment 1+).
+        let recycled = writer.recycle_segments_before(20).unwrap();
+        assert!(recycled >= 1, "should recycle at least 1 segment");
+
+        // Active segment must still exist.
+        let active_path = WalSegment::segment_path(&wal_dir, active_seq);
+        assert!(active_path.exists(), "active segment must survive recycling");
+
+        // First segment should be deleted (base_lsn = 1 < 20).
+        let first_path = WalSegment::segment_path(&wal_dir, 1);
+        assert!(!first_path.exists(), "segment 1 should be recycled");
+
+        // Total count should have decreased.
+        let after = count_wals();
+        assert_eq!(after, before - recycled);
     }
 }
