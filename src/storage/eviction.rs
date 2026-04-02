@@ -1,11 +1,17 @@
+use std::path::Path;
+
 use bytes::Bytes;
 use rand::seq::IndexedRandom;
+use tracing::warn;
 
 use crate::config::RuntimeConfig;
+use crate::persistence::manifest::ShardManifest;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
+use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::lfu_decay;
+use crate::storage::tiered::kv_spill;
 
 /// Compare two LRU timestamps with u16 wraparound handling.
 /// Uses signed-distance comparison: treats the 16-bit clock as circular.
@@ -76,11 +82,37 @@ fn oom_error() -> Frame {
     ))
 }
 
+/// Context for spilling evicted entries to disk instead of deleting them.
+///
+/// When provided to `try_evict_if_needed_with_spill`, evicted entries are
+/// serialized to KvLeafPage DataFiles before being removed from RAM.
+pub struct SpillContext<'a> {
+    pub shard_dir: &'a Path,
+    pub manifest: &'a mut ShardManifest,
+    pub next_file_id: &'a mut u64,
+}
+
 /// Check if eviction is needed and attempt to free memory.
 ///
 /// Returns Ok(()) if memory is within limits (or maxmemory is 0).
 /// Returns Err(Frame) with OOM error if eviction fails to free enough memory.
 pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill(db, config, None)
+}
+
+/// Check if eviction is needed, optionally spilling evicted entries to disk.
+///
+/// When `spill` is `Some`, evicted entries are written to a DataFile before
+/// being removed from RAM. When `None`, behaves identically to
+/// `try_evict_if_needed` (entries are simply deleted).
+///
+/// Spill failures are best-effort: if I/O fails, a warning is logged and the
+/// entry is still removed from RAM.
+pub fn try_evict_if_needed_with_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    mut spill: Option<&mut SpillContext<'_>>,
+) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
     }
@@ -91,7 +123,7 @@ pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
-        if !evict_one(db, config, &policy) {
+        if !evict_one_with_spill(db, config, &policy, spill.as_deref_mut()) {
             return Err(oom_error());
         }
     }
@@ -99,28 +131,68 @@ pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<
     Ok(())
 }
 
-/// Evict a single key according to the configured policy.
-/// Returns true if a key was evicted, false if no eligible keys found.
-fn evict_one(db: &mut Database, config: &RuntimeConfig, policy: &EvictionPolicy) -> bool {
-    match policy {
-        EvictionPolicy::NoEviction => false,
-        EvictionPolicy::AllKeysLru => evict_one_lru(db, config.maxmemory_samples, false),
+/// Evict a single key, optionally spilling to disk before removal.
+fn evict_one_with_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+    spill: Option<&mut SpillContext<'_>>,
+) -> bool {
+    // Find victim key using policy-specific sampling
+    let victim = match policy {
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
         EvictionPolicy::AllKeysLfu => {
-            evict_one_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
         }
-        EvictionPolicy::AllKeysRandom => evict_one_random(db, false),
-        EvictionPolicy::VolatileLru => evict_one_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
         EvictionPolicy::VolatileLfu => {
-            evict_one_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
         }
-        EvictionPolicy::VolatileRandom => evict_one_random(db, true),
-        EvictionPolicy::VolatileTtl => evict_one_volatile_ttl(db, config.maxmemory_samples),
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+    };
+
+    let key = match victim {
+        Some(k) => k,
+        None => return false,
+    };
+
+    // Spill to disk before removing, if context provided
+    if let Some(ctx) = spill {
+        if let Some(entry) = db.data().get(key.as_bytes()) {
+            // Only spill string entries (collection types not yet supported)
+            let is_string = matches!(entry.as_redis_value(), RedisValueRef::String(_));
+            if is_string {
+                if let Err(e) = kv_spill::spill_to_datafile(
+                    ctx.shard_dir,
+                    *ctx.next_file_id,
+                    key.as_bytes(),
+                    entry,
+                    ctx.manifest,
+                ) {
+                    warn!(
+                        key = %String::from_utf8_lossy(key.as_bytes()),
+                        error = %e,
+                        "kv_spill: I/O error during spill, proceeding with eviction"
+                    );
+                } else {
+                    *ctx.next_file_id += 1;
+                }
+            }
+        }
     }
+
+    db.remove(key.as_bytes());
+    true
 }
 
-/// Evict the key with the oldest last_access from a random sample.
-fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool {
-    let keys: Vec<CompactKey> = if volatile_only {
+// ── Victim selection helpers ───────────────────────────
+
+/// Collect candidate keys for eviction (all keys or volatile-only).
+fn collect_candidate_keys(db: &Database, volatile_only: bool) -> Vec<CompactKey> {
+    if volatile_only {
         db.data()
             .iter()
             .filter(|(_, e)| e.has_expiry())
@@ -128,10 +200,14 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
             .collect()
     } else {
         db.data().keys().cloned().collect()
-    };
+    }
+}
 
+/// Find the victim key with the oldest last_access from a random sample.
+fn find_victim_lru(db: &Database, samples: usize, volatile_only: bool) -> Option<CompactKey> {
+    let keys = collect_candidate_keys(db, volatile_only);
     if keys.is_empty() {
-        return false;
+        return None;
     }
 
     let mut rng = rand::rng();
@@ -159,33 +235,19 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
         }
     }
 
-    if let Some(key) = oldest_key {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    oldest_key
 }
 
-/// Evict the key with the lowest LFU counter (after decay) from a random sample.
-fn evict_one_lfu(
-    db: &mut Database,
+/// Find the victim key with the lowest LFU counter from a random sample.
+fn find_victim_lfu(
+    db: &Database,
     samples: usize,
     lfu_decay_time: u64,
     volatile_only: bool,
-) -> bool {
-    let keys: Vec<CompactKey> = if volatile_only {
-        db.data()
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        db.data().keys().cloned().collect()
-    };
-
+) -> Option<CompactKey> {
+    let keys = collect_candidate_keys(db, volatile_only);
     if keys.is_empty() {
-        return false;
+        return None;
     }
 
     let mut rng = rand::rng();
@@ -219,41 +281,22 @@ fn evict_one_lfu(
         }
     }
 
-    if let Some(key) = evict_key {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    evict_key
 }
 
-/// Evict one random key.
-fn evict_one_random(db: &mut Database, volatile_only: bool) -> bool {
-    let keys: Vec<CompactKey> = if volatile_only {
-        db.data()
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        db.data().keys().cloned().collect()
-    };
-
+/// Find a random victim key.
+fn find_victim_random(db: &Database, volatile_only: bool) -> Option<CompactKey> {
+    let keys = collect_candidate_keys(db, volatile_only);
     if keys.is_empty() {
-        return false;
+        return None;
     }
 
     let mut rng = rand::rng();
-    if let Some(key) = keys.choose(&mut rng) {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    keys.choose(&mut rng).cloned()
 }
 
-/// Evict the key with the soonest TTL expiration from a random sample.
-fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
+/// Find the victim key with the soonest TTL expiration from a random sample.
+fn find_victim_volatile_ttl(db: &Database, samples: usize) -> Option<CompactKey> {
     let keys: Vec<CompactKey> = db
         .data()
         .iter()
@@ -262,7 +305,7 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
         .collect();
 
     if keys.is_empty() {
-        return false;
+        return None;
     }
 
     let mut rng = rand::rng();
@@ -288,17 +331,33 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
         }
     }
 
-    if let Some(key) = evict_key {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    evict_key
 }
 
 #[cfg(test)]
 mod tests {
+    // Legacy wrappers used only in tests for backward-compatible assertions.
+    fn evict_one_random(db: &mut super::Database, volatile_only: bool) -> bool {
+        if let Some(key) = super::find_victim_random(db, volatile_only) {
+            db.remove(key.as_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn evict_one_volatile_ttl(db: &mut super::Database, samples: usize) -> bool {
+        if let Some(key) = super::find_victim_volatile_ttl(db, samples) {
+            db.remove(key.as_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
     use super::*;
+    use crate::persistence::kv_page::read_datafile;
+    use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
 
     fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
@@ -366,9 +425,7 @@ mod tests {
     #[test]
     fn test_noeviction_returns_oom() {
         let mut db = Database::new();
-        // Set a key to use some memory
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
-        // Configure very small maxmemory with noeviction
         let config = make_config(1, "noeviction");
         let result = try_evict_if_needed(&mut db, &config);
         assert!(result.is_err());
@@ -394,15 +451,14 @@ mod tests {
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
         let config = make_config(1_000_000, "allkeys-lru");
         assert!(try_evict_if_needed(&mut db, &config).is_ok());
-        assert_eq!(db.len(), 1); // Key should still be there
+        assert_eq!(db.len(), 1);
     }
 
     #[test]
     fn test_lru_evicts_oldest() {
         let mut db = Database::new();
-        // Create entries with different last_access times
         let mut entry1 = Entry::new_string(Bytes::from_static(b"val1"));
-        entry1.set_last_access(current_secs() - 100); // oldest
+        entry1.set_last_access(current_secs() - 100);
         db.set(Bytes::from_static(b"old"), entry1);
 
         let mut entry2 = Entry::new_string(Bytes::from_static(b"val2"));
@@ -410,19 +466,15 @@ mod tests {
         db.set(Bytes::from_static(b"medium"), entry2);
 
         let mut entry3 = Entry::new_string(Bytes::from_static(b"val3"));
-        entry3.set_last_access(current_secs()); // newest
+        entry3.set_last_access(current_secs());
         db.set(Bytes::from_static(b"new"), entry3);
 
-        // Set maxmemory to allow only 2 entries (roughly)
         let mem = db.estimated_memory();
-        // We want to trigger eviction of exactly 1 key
         let config = make_config(mem - 1, "allkeys-lru");
 
         let result = try_evict_if_needed(&mut db, &config);
         assert!(result.is_ok());
-        // With samples=5 and only 3 keys, all are sampled -> oldest should be evicted
         assert_eq!(db.len(), 2);
-        // "old" should have been evicted (oldest last_access)
         assert!(db.data().get(b"old" as &[u8]).is_none());
     }
 
@@ -435,7 +487,6 @@ mod tests {
 
         let config = make_config(1, "allkeys-random");
         let result = try_evict_if_needed(&mut db, &config);
-        // Should have evicted keys until under limit (all of them since limit is 1 byte)
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
     }
@@ -443,12 +494,10 @@ mod tests {
     #[test]
     fn test_volatile_only_skips_persistent() {
         let mut db = Database::new();
-        // Persistent key (no TTL)
         db.set_string(
             Bytes::from_static(b"persistent"),
             Bytes::from_static(b"value"),
         );
-        // Volatile key (has TTL)
         let future_ms = current_time_ms() + 3_600_000;
         db.set_string_with_expiry(
             Bytes::from_static(b"volatile"),
@@ -456,7 +505,6 @@ mod tests {
             future_ms,
         );
 
-        // With only 1 volatile key, volatile-random should evict it
         let result = evict_one_random(&mut db, true);
         assert!(result);
         assert_eq!(db.len(), 1);
@@ -481,7 +529,6 @@ mod tests {
         let result = evict_one_volatile_ttl(&mut db, 5);
         assert!(result);
         assert_eq!(db.len(), 1);
-        // "soon" should have been evicted (soonest expiry)
         assert!(db.data().get(b"soon" as &[u8]).is_none());
     }
 
@@ -490,5 +537,54 @@ mod tests {
         assert_eq!(EvictionPolicy::NoEviction.as_str(), "noeviction");
         assert_eq!(EvictionPolicy::AllKeysLru.as_str(), "allkeys-lru");
         assert_eq!(EvictionPolicy::VolatileTtl.as_str(), "volatile-ttl");
+    }
+
+    #[test]
+    fn test_evict_with_spill_creates_datafile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"spill_key"), Bytes::from_static(b"spill_val"));
+
+        let config = make_config(1, "allkeys-lru");
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+        };
+
+        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 0);
+
+        // Verify DataFile was created
+        let file_path = shard_dir.join("data/heap-000001.mpf");
+        assert!(file_path.exists(), "DataFile should have been created");
+
+        // Verify contents
+        let pages = read_datafile(&file_path).unwrap();
+        assert_eq!(pages.len(), 1);
+        let entry = pages[0].get(0).unwrap();
+        assert_eq!(entry.key, b"spill_key");
+        assert_eq!(entry.value, b"spill_val");
+
+        // file_id should have been incremented
+        assert_eq!(next_file_id, 2);
+    }
+
+    #[test]
+    fn test_evict_without_spill_unchanged() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+
+        let config = make_config(1, "allkeys-random");
+        let result = try_evict_if_needed_with_spill(&mut db, &config, None);
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 0);
     }
 }
