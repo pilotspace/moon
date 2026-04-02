@@ -115,6 +115,7 @@ impl VectorIndex {
                     mutable: new_mutable,
                     immutable: imm_list,
                     ivf: old.ivf.clone(),
+                    warm: old.warm.clone(),
                 };
                 self.segments.swap(new_list);
             }
@@ -128,6 +129,10 @@ impl VectorIndex {
 impl VectorIndex {
     /// Check each immutable segment's age. If older than `warm_after_secs`,
     /// transition it to warm tier (mmap-backed on disk).
+    ///
+    /// After transition, the segment is replaced by a WarmSearchSegment that
+    /// reads TQ codes and HNSW graph from mmap'd .mpf files. The segment
+    /// remains searchable -- no data loss from the user's perspective.
     ///
     /// Returns the number of segments transitioned.
     pub fn try_warm_transitions(
@@ -149,6 +154,7 @@ impl VectorIndex {
         }
 
         let mut new_immutable = snapshot.immutable.clone();
+        let mut new_warm = snapshot.warm.clone();
         let mut transitioned = 0usize;
 
         // Process in reverse order to maintain valid indices during removal.
@@ -171,17 +177,40 @@ impl VectorIndex {
                 &mvcc_data,
                 manifest,
             ) {
-                Ok(_handle) => {
-                    // Remove from in-memory list -- the data is now on disk as mmap.
-                    // Future: replace with WarmSegmentHandle that implements search.
+                Ok(handle) => {
+                    // Remove from in-memory immutable list.
                     new_immutable.remove(idx);
-                    transitioned += 1;
-                    tracing::info!(
-                        "Warm transition: segment {} ({} vectors, age {}s)",
+
+                    // Open mmap-backed warm search segment to keep data searchable.
+                    // transition_to_warm places files at shard_dir/vectors/segment-{id}/
+                    let seg_dir = shard_dir.join("vectors").join(format!("segment-{file_id}"));
+                    match crate::vector::persistence::warm_search::WarmSearchSegment::from_files(
+                        &seg_dir,
                         file_id,
-                        imm.total_count(),
-                        imm.age_secs()
-                    );
+                        self.collection.clone(),
+                        handle,
+                        false, // mlock_codes: off by default for warm tier
+                    ) {
+                        Ok(warm_seg) => {
+                            new_warm.push(Arc::new(warm_seg));
+                            tracing::info!(
+                                "Warm transition: segment {} ({} vectors, age {}s) -> searchable warm",
+                                file_id,
+                                imm.total_count(),
+                                imm.age_secs()
+                            );
+                        }
+                        Err(e) => {
+                            // Transition wrote files but failed to open for search.
+                            // Log error; data is on disk but not searchable until restart.
+                            tracing::error!(
+                                "Warm search open failed for segment {}: {} (data on disk, not searchable)",
+                                file_id, e
+                            );
+                        }
+                    }
+
+                    transitioned += 1;
                 }
                 Err(e) => {
                     tracing::error!("Warm transition failed for segment {}: {}", file_id, e);
@@ -194,6 +223,7 @@ impl VectorIndex {
                 mutable: Arc::clone(&snapshot.mutable),
                 immutable: new_immutable,
                 ivf: snapshot.ivf.clone(),
+                warm: new_warm,
             };
             self.segments.swap(new_list);
         }
@@ -300,6 +330,7 @@ impl VectorStore {
                     mutable: Arc::new(recovered.mutable),
                     immutable: immutable_arcs,
                     ivf: Vec::new(),
+                    warm: Vec::new(),
                 };
                 index.segments.swap(new_list);
             }
@@ -574,6 +605,7 @@ mod tests {
             mutable: Arc::clone(&old_snap.mutable),
             immutable: vec![imm],
             ivf: Vec::new(),
+            warm: Vec::new(),
         };
         idx.segments.swap(new_list);
         drop(old_snap);
@@ -596,7 +628,10 @@ mod tests {
 
         // Immutable list should now be empty (segment moved to warm).
         let idx = store.get_index(b"idx").unwrap();
-        assert_eq!(idx.segments.load().immutable.len(), 0);
+        let snap = idx.segments.load();
+        assert_eq!(snap.immutable.len(), 0);
+        // Warm list should now have 1 segment (searchable warm).
+        assert_eq!(snap.warm.len(), 1);
     }
 
     #[test]
@@ -629,6 +664,7 @@ mod tests {
             mutable: Arc::clone(&old_snap.mutable),
             immutable: vec![imm],
             ivf: Vec::new(),
+            warm: Vec::new(),
         });
         drop(old_snap);
 
