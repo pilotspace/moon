@@ -2,6 +2,7 @@
 //! CSR upper-layer storage, and dual prefetch for cache-optimized traversal.
 
 use crate::vector::aligned_buffer::AlignedBuffer;
+use crate::vector::hnsw::neighbor_codec;
 use smallvec::SmallVec;
 
 /// Sentinel value for unused neighbor slots.
@@ -347,6 +348,204 @@ impl HnswGraph {
         let mut layer0_vec = Vec::with_capacity(layer0_len);
         for _ in 0..layer0_len {
             layer0_vec.push(read_u32(&mut pos)?);
+        }
+        let layer0_neighbors = AlignedBuffer::from_vec(layer0_vec);
+
+        // BFS order
+        ensure(pos, n * 4)?;
+        let mut bfs_order = Vec::with_capacity(n);
+        for _ in 0..n {
+            bfs_order.push(read_u32(&mut pos)?);
+        }
+
+        // BFS inverse
+        ensure(pos, n * 4)?;
+        let mut bfs_inverse = Vec::with_capacity(n);
+        for _ in 0..n {
+            bfs_inverse.push(read_u32(&mut pos)?);
+        }
+
+        // Levels
+        ensure(pos, n)?;
+        let levels = data[pos..pos + n].to_vec();
+        pos += n;
+
+        // CSR upper layers
+        ensure(pos, n * 4)?;
+        let mut upper_index = Vec::with_capacity(n);
+        for _ in 0..n {
+            upper_index.push(read_u32(&mut pos)?);
+        }
+
+        let offsets_len = read_u32(&mut pos)? as usize;
+        ensure(pos, offsets_len * 4)?;
+        let mut upper_offsets = Vec::with_capacity(offsets_len);
+        for _ in 0..offsets_len {
+            upper_offsets.push(read_u32(&mut pos)?);
+        }
+
+        let neighbors_len = read_u32(&mut pos)? as usize;
+        ensure(pos, neighbors_len * 4)?;
+        let mut upper_neighbors = Vec::with_capacity(neighbors_len);
+        for _ in 0..neighbors_len {
+            upper_neighbors.push(read_u32(&mut pos)?);
+        }
+
+        Ok(Self::from_csr(
+            num_nodes,
+            m,
+            m0,
+            entry_point,
+            max_level,
+            layer0_neighbors,
+            bfs_order,
+            bfs_inverse,
+            upper_index,
+            upper_offsets,
+            upper_neighbors,
+            levels,
+            bytes_per_code,
+        ))
+    }
+
+    /// Serialize the graph with delta + VByte compression on layer-0 neighbors.
+    ///
+    /// Compressed format v1 (all LE unless noted):
+    ///   num_nodes: u32, m: u8, m0: u8, entry_point: u32, max_level: u8,
+    ///   bytes_per_code: u32,
+    ///   version_tag: u8 (0x01 = compressed),
+    ///   For each of num_nodes layer-0 neighbor lists:
+    ///     blob_len: u16 LE, blob: [u8; blob_len]  (delta+VByte encoded)
+    ///   bfs_order: [u32; num_nodes], bfs_inverse: [u32; num_nodes],
+    ///   levels: [u8; num_nodes],
+    ///   upper_index: [u32; num_nodes],
+    ///   upper_offsets_len: u32, upper_offsets: [u32; upper_offsets_len],
+    ///   upper_neighbors_len: u32, upper_neighbors: [u32; upper_neighbors_len]
+    ///
+    /// Callers in the warm transition path should use this instead of `to_bytes()`
+    /// to reduce on-disk footprint. The in-memory graph remains uncompressed.
+    pub fn to_bytes_compressed(&self) -> Vec<u8> {
+        let n = self.num_nodes as usize;
+        // Estimate: header ~16 bytes + compressed layer0 (much smaller than raw)
+        // + BFS/levels/CSR same as uncompressed
+        let mut buf = Vec::with_capacity(
+            16 + n * 8 // rough estimate for compressed layer0
+            + n * 4 * 2  // bfs_order + bfs_inverse
+            + n          // levels
+            + n * 4      // upper_index
+            + 4 + self.upper_offsets.len() * 4
+            + 4 + self.upper_neighbors.len() * 4,
+        );
+
+        // Header (same as to_bytes)
+        buf.extend_from_slice(&self.num_nodes.to_le_bytes());
+        buf.push(self.m);
+        buf.push(self.m0);
+        buf.extend_from_slice(&self.entry_point.to_le_bytes());
+        buf.push(self.max_level);
+        buf.extend_from_slice(&self.bytes_per_code.to_le_bytes());
+
+        // Version tag: 0x01 = compressed format
+        buf.push(0x01);
+
+        // Layer 0: delta + VByte encoded per node
+        for i in 0..n {
+            let neighbors = self.neighbors_l0(i as u32);
+            let encoded = neighbor_codec::encode_neighbors(neighbors);
+            let blob_len = encoded.len() as u16;
+            buf.extend_from_slice(&blob_len.to_le_bytes());
+            buf.extend_from_slice(&encoded);
+        }
+
+        // BFS order and inverse
+        for &v in &self.bfs_order {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.bfs_inverse {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Levels
+        buf.extend_from_slice(&self.levels);
+
+        // CSR upper layers
+        for &v in &self.upper_index {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.upper_offsets.len() as u32).to_le_bytes());
+        for &v in &self.upper_offsets {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.upper_neighbors.len() as u32).to_le_bytes());
+        for &v in &self.upper_neighbors {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        buf
+    }
+
+    /// Deserialize from compressed format. Returns `Err` on truncation or format mismatch.
+    pub fn from_bytes_compressed(data: &[u8]) -> Result<Self, &'static str> {
+        let mut pos = 0;
+
+        let ensure = |pos: usize, need: usize| -> Result<(), &'static str> {
+            if pos + need > data.len() {
+                Err("truncated compressed graph data")
+            } else {
+                Ok(())
+            }
+        };
+
+        let read_u8 = |pos: &mut usize| -> Result<u8, &'static str> {
+            ensure(*pos, 1)?;
+            let v = data[*pos];
+            *pos += 1;
+            Ok(v)
+        };
+
+        let read_u16 = |pos: &mut usize| -> Result<u16, &'static str> {
+            ensure(*pos, 2)?;
+            let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+            *pos += 2;
+            Ok(v)
+        };
+
+        let read_u32 = |pos: &mut usize| -> Result<u32, &'static str> {
+            ensure(*pos, 4)?;
+            let v =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            *pos += 4;
+            Ok(v)
+        };
+
+        let num_nodes = read_u32(&mut pos)?;
+        let m = read_u8(&mut pos)?;
+        let m0 = read_u8(&mut pos)?;
+        let entry_point = read_u32(&mut pos)?;
+        let max_level = read_u8(&mut pos)?;
+        let bytes_per_code = read_u32(&mut pos)?;
+
+        // Version tag
+        let version = read_u8(&mut pos)?;
+        if version != 0x01 {
+            return Err("unsupported compressed graph version");
+        }
+
+        let n = num_nodes as usize;
+        let m0_usize = m0 as usize;
+
+        // Layer 0: decode each node's compressed neighbors, pad with SENTINEL
+        let total_slots = n * m0_usize;
+        let mut layer0_vec = vec![SENTINEL; total_slots];
+        for i in 0..n {
+            let blob_len = read_u16(&mut pos)? as usize;
+            ensure(pos, blob_len)?;
+            let blob = &data[pos..pos + blob_len];
+            pos += blob_len;
+            let neighbors = neighbor_codec::decode_neighbors(blob);
+            let dst_start = i * m0_usize;
+            let copy_len = neighbors.len().min(m0_usize);
+            layer0_vec[dst_start..dst_start + copy_len].copy_from_slice(&neighbors[..copy_len]);
         }
         let layer0_neighbors = AlignedBuffer::from_vec(layer0_vec);
 
@@ -1164,6 +1363,172 @@ mod tests {
         for i in 0..n {
             assert!(graph.neighbors_upper(i, 1).is_empty());
         }
+    }
+
+    #[test]
+    fn test_graph_compressed_roundtrip() {
+        let (num_nodes, m0, flat) = make_test_graph();
+        let m: u8 = 16;
+        let (bfs_order, bfs_inverse) = bfs_reorder(num_nodes, m0, 0, &flat);
+        let layer0 = rearrange_layer0(num_nodes, m0, &flat, &bfs_order, &bfs_inverse);
+
+        // Build upper layers for node 0 (level 1)
+        let mut upper = vec![SmallVec::new(); num_nodes as usize];
+        let mut sv: SmallVec<[u32; 32]> = SmallVec::new();
+        for i in 0..m as u32 {
+            sv.push(if i < 3 { i + 1 } else { SENTINEL });
+        }
+        upper[0] = sv;
+
+        let levels = vec![1, 0, 0, 0, 0];
+
+        let graph = HnswGraph::new(
+            num_nodes,
+            m,
+            m0,
+            bfs_order[0],
+            1,
+            layer0,
+            bfs_order,
+            bfs_inverse,
+            upper,
+            levels,
+            36,
+        );
+
+        let compressed = graph.to_bytes_compressed();
+        let restored = HnswGraph::from_bytes_compressed(&compressed).unwrap();
+
+        assert_eq!(restored.num_nodes(), graph.num_nodes());
+        assert_eq!(restored.m(), graph.m());
+        assert_eq!(restored.m0(), graph.m0());
+        assert_eq!(restored.entry_point(), graph.entry_point());
+        assert_eq!(restored.max_level(), graph.max_level());
+        assert_eq!(restored.bytes_per_code(), graph.bytes_per_code());
+
+        // Check layer 0 neighbors match
+        for i in 0..num_nodes {
+            assert_eq!(restored.neighbors_l0(i), graph.neighbors_l0(i));
+        }
+
+        // Check BFS mappings
+        for i in 0..num_nodes {
+            assert_eq!(restored.to_bfs(i), graph.to_bfs(i));
+            assert_eq!(restored.to_original(i), graph.to_original(i));
+        }
+
+        // Check upper layers
+        let l1 = restored.neighbors_upper(0, 1);
+        assert_eq!(l1.len(), 3);
+        assert_eq!(l1[0], 1);
+        assert_eq!(l1[1], 2);
+        assert_eq!(l1[2], 3);
+    }
+
+    #[test]
+    fn test_compressed_smaller_than_raw() {
+        // Build a 100-node graph with dense layer-0 neighbors
+        let num_nodes: u32 = 100;
+        let m0: u8 = 32;
+        let m: u8 = 16;
+        let s = SENTINEL;
+
+        // Create layer0 flat: each node has ~16 neighbors in nearby ID range
+        let mut flat = vec![s; num_nodes as usize * m0 as usize];
+        for i in 0..num_nodes as usize {
+            let stride = m0 as usize;
+            for j in 0..16 {
+                let nb = ((i + j + 1) % num_nodes as usize) as u32;
+                flat[i * stride + j] = nb;
+            }
+        }
+
+        let (bfs_order, bfs_inverse) = bfs_reorder(num_nodes, m0, 0, &flat);
+        let layer0 = rearrange_layer0(num_nodes, m0, &flat, &bfs_order, &bfs_inverse);
+
+        let graph = HnswGraph::new(
+            num_nodes,
+            m,
+            m0,
+            bfs_order[0],
+            0,
+            layer0,
+            bfs_order,
+            bfs_inverse,
+            vec![SmallVec::new(); num_nodes as usize],
+            vec![0; num_nodes as usize],
+            8,
+        );
+
+        let raw = graph.to_bytes();
+        let compressed = graph.to_bytes_compressed();
+
+        assert!(
+            compressed.len() < raw.len(),
+            "Compressed ({}) should be smaller than raw ({})",
+            compressed.len(),
+            raw.len()
+        );
+    }
+
+    #[test]
+    fn test_compressed_empty_graph() {
+        let graph = HnswGraph::new(
+            0,
+            DEFAULT_M,
+            DEFAULT_M0,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            8,
+        );
+        let compressed = graph.to_bytes_compressed();
+        let restored = HnswGraph::from_bytes_compressed(&compressed).unwrap();
+        assert_eq!(restored.num_nodes(), 0);
+    }
+
+    #[test]
+    fn test_compressed_rejects_truncated() {
+        let graph = HnswGraph::new(
+            5,
+            16,
+            4,
+            0,
+            0,
+            AlignedBuffer::new(20),
+            vec![0, 1, 2, 3, 4],
+            vec![0, 1, 2, 3, 4],
+            vec![SmallVec::new(); 5],
+            vec![0; 5],
+            8,
+        );
+        let compressed = graph.to_bytes_compressed();
+        assert!(HnswGraph::from_bytes_compressed(&compressed[..compressed.len() / 2]).is_err());
+    }
+
+    #[test]
+    fn test_compressed_rejects_wrong_version() {
+        let graph = HnswGraph::new(
+            1,
+            16,
+            4,
+            0,
+            0,
+            AlignedBuffer::new(4),
+            vec![0],
+            vec![0],
+            vec![SmallVec::new()],
+            vec![0],
+            8,
+        );
+        let mut compressed = graph.to_bytes_compressed();
+        // Version byte is at offset: 4(num_nodes) + 1(m) + 1(m0) + 4(entry_point) + 1(max_level) + 4(bytes_per_code) = 15
+        compressed[15] = 0xFF;
+        assert!(HnswGraph::from_bytes_compressed(&compressed).is_err());
     }
 
     #[test]
