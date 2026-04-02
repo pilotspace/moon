@@ -213,6 +213,42 @@ use crate::persistence::wal_v3::record::WalRecordType;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use std::path::Path;
 
+/// Force a complete checkpoint synchronously (used by BGSAVE and shutdown).
+///
+/// Calls `force_begin` to bypass trigger conditions, then drives the
+/// checkpoint state machine to completion in a tight loop. No-op if a
+/// checkpoint is already active.
+pub(crate) fn force_checkpoint(
+    checkpoint_mgr: &mut CheckpointManager,
+    page_cache: &PageCache,
+    wal: &mut WalWriterV3,
+    manifest: &mut ShardManifest,
+    control: &mut ShardControlFile,
+    control_path: &Path,
+    shard_id: usize,
+) {
+    if checkpoint_mgr.is_active() {
+        tracing::warn!("Shard {}: checkpoint already active, skipping force", shard_id);
+        return;
+    }
+    let lsn = wal.current_lsn();
+    let dirty = page_cache.dirty_page_count();
+    if !checkpoint_mgr.force_begin(lsn, dirty) {
+        return;
+    }
+    // Drive checkpoint to completion synchronously (tick loop)
+    loop {
+        if handle_checkpoint_tick(checkpoint_mgr, page_cache, wal, manifest, control, control_path) {
+            break; // Finalize completed
+        }
+        // If Nothing returned and not active, we're done (empty checkpoint)
+        if !checkpoint_mgr.is_active() {
+            break;
+        }
+    }
+    info!("Shard {}: forced checkpoint complete", shard_id);
+}
+
 /// Check the trigger and begin a checkpoint if conditions are met.
 ///
 /// Called every tick from the event loop when disk-offload is enabled.

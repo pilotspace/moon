@@ -204,6 +204,15 @@ impl CheckpointManager {
         self.trigger.reset();
     }
 
+    /// Force-begin a checkpoint regardless of trigger conditions.
+    ///
+    /// Used by BGSAVE and graceful shutdown to ensure a clean checkpoint
+    /// even when the normal time/WAL-size triggers haven't fired.
+    /// Returns `true` if started, `false` if one is already active.
+    pub fn force_begin(&mut self, current_lsn: u64, dirty_count: usize) -> bool {
+        self.begin(current_lsn, dirty_count)
+    }
+
     /// Returns true if a checkpoint is currently in progress.
     #[inline]
     pub fn is_active(&self) -> bool {
@@ -384,6 +393,27 @@ mod tests {
         assert!(mgr.begin(999, 0));
         let action = mgr.advance_tick();
         assert_eq!(action, CheckpointAction::Finalize { redo_lsn: 999 });
+    }
+
+    #[test]
+    fn test_force_begin_bypasses_trigger() {
+        // High timeout + high max_wal_bytes: normal trigger would NOT fire
+        let trigger = make_trigger(999_999, u64::MAX, 0.9);
+        let mut mgr = CheckpointManager::new(trigger);
+
+        // force_begin should start checkpoint regardless
+        assert!(mgr.force_begin(100, 10));
+        assert!(mgr.is_active());
+        match mgr.state() {
+            CheckpointState::InProgress { redo_lsn, dirty_count, .. } => {
+                assert_eq!(*redo_lsn, 100);
+                assert_eq!(*dirty_count, 10);
+            }
+            _ => panic!("expected InProgress state"),
+        }
+
+        // Second force_begin should fail (already active)
+        assert!(!mgr.force_begin(200, 20));
     }
 
     #[test]

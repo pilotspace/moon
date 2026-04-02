@@ -371,6 +371,9 @@ impl super::Shard {
         // Track WAL bytes since last checkpoint for trigger logic.
         let mut wal_bytes_since_checkpoint: u64 = 0;
 
+        // Flag: BGSAVE snapshot completed, request a forced checkpoint on next tick.
+        let mut bgsave_checkpoint_requested = false;
+
         // Per-shard checkpoint manager (None when disk-offload is disabled).
         // When enabled, drives the fuzzy checkpoint protocol: begin(redo_lsn) ->
         // advance_tick(flush pages) -> finalize(WAL record + manifest + control).
@@ -664,6 +667,7 @@ impl super::Shard {
                                     &mut snapshot_state, &mut snapshot_reply_tx,
                                     &mut wal_writer, shard_id,
                                 );
+                                bgsave_checkpoint_requested = true;
                             }
                         }
                     }
@@ -684,6 +688,13 @@ impl super::Shard {
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
+                        // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
+                        if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
+                            let lsn = wal_v3.current_lsn();
+                            let dirty = page_cache_inst.dirty_page_count();
+                            ckpt_mgr.force_begin(lsn, dirty);
+                            bgsave_checkpoint_requested = false;
+                        }
                         persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
                         if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
                             wal_bytes_since_checkpoint = 0;
@@ -740,6 +751,12 @@ impl super::Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    // Trigger final checkpoint before shutdown (design S9)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
+                    }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
                     }
@@ -943,6 +960,7 @@ impl super::Shard {
                                     &mut wal_writer, shard_id,
                                 );
                                 crate::command::persistence::bgsave_shard_done(true);
+                                bgsave_checkpoint_requested = true;
                             }
                         }
                     }
@@ -963,6 +981,13 @@ impl super::Shard {
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
+                        // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
+                        if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
+                            let lsn = wal_v3.current_lsn();
+                            let dirty = page_cache_inst.dirty_page_count();
+                            ckpt_mgr.force_begin(lsn, dirty);
+                            bgsave_checkpoint_requested = false;
+                        }
                         persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
                         if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
                             wal_bytes_since_checkpoint = 0;
@@ -1007,6 +1032,12 @@ impl super::Shard {
                 // Shutdown
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down (monoio)", self.id);
+                    // Trigger final checkpoint before shutdown (design S9)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
+                    }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
                     }
