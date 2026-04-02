@@ -806,6 +806,7 @@ pub fn compact(
                 key_hash: entry.key_hash,
                 insert_lsn: entry.insert_lsn,
                 delete_lsn: entry.delete_lsn,
+                hint_committed: 0,
             }
         })
         .collect();

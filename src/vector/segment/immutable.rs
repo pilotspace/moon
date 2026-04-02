@@ -32,6 +32,9 @@ pub struct MvccHeader {
     pub key_hash: u64,
     pub insert_lsn: u64,
     pub delete_lsn: u64,
+    /// CLOG hint bit: 1 = transaction is known committed, skip CLOG lookup.
+    /// 0 = unknown, must check CLOG. Set lazily on first successful CLOG lookup.
+    pub hint_committed: u8,
 }
 
 /// Read-only segment. Truly immutable after construction -- no locks needed.
@@ -371,6 +374,42 @@ impl ImmutableSegment {
         buf
     }
 
+    /// Set the CLOG hint-committed bit for an entry, avoiding future CLOG lookups.
+    ///
+    /// Called after a successful CLOG lookup confirms Committed status.
+    pub fn set_hint_committed(&mut self, internal_id: u32) {
+        if let Some(h) = self.mvcc.get_mut(internal_id as usize) {
+            if h.hint_committed == 0 {
+                h.hint_committed = 1;
+            }
+        }
+    }
+
+    /// Check if the CLOG hint-committed bit is set for an entry.
+    #[inline]
+    pub fn is_hint_committed(&self, internal_id: u32) -> bool {
+        self.mvcc
+            .get(internal_id as usize)
+            .map_or(false, |h| h.hint_committed != 0)
+    }
+
+    /// Serialize MVCC headers to raw bytes (v2 format, includes hint_committed).
+    ///
+    /// Each entry: internal_id(u32 LE) + global_id(u32 LE) + key_hash(u64 LE) +
+    /// insert_lsn(u64 LE) + delete_lsn(u64 LE) + hint_committed(u8) = 33 bytes.
+    pub fn mvcc_raw_bytes_v2(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.mvcc.len() * 33);
+        for h in &self.mvcc {
+            buf.extend_from_slice(&h.internal_id.to_le_bytes());
+            buf.extend_from_slice(&h.global_id.to_le_bytes());
+            buf.extend_from_slice(&h.key_hash.to_le_bytes());
+            buf.extend_from_slice(&h.insert_lsn.to_le_bytes());
+            buf.extend_from_slice(&h.delete_lsn.to_le_bytes());
+            buf.push(h.hint_committed);
+        }
+        buf
+    }
+
     /// Flat TQ-ADC scan: brute-force over all 4-bit codes. 100% recall.
     ///
     /// Skips HNSW entirely — sequential scan of nibble-packed TQ codes.
@@ -504,8 +543,8 @@ mod tests {
             .unwrap_or_else(|_| panic!("empty graph"));
 
         let mvcc = vec![
-            MvccHeader { internal_id: 0, global_id: 10, key_hash: 0xDEAD, insert_lsn: 1, delete_lsn: 0 },
-            MvccHeader { internal_id: 1, global_id: 11, key_hash: 0xBEEF, insert_lsn: 2, delete_lsn: 5 },
+            MvccHeader { internal_id: 0, global_id: 10, key_hash: 0xDEAD, insert_lsn: 1, delete_lsn: 0, hint_committed: 0 },
+            MvccHeader { internal_id: 1, global_id: 11, key_hash: 0xBEEF, insert_lsn: 2, delete_lsn: 5, hint_committed: 0 },
         ];
         let seg = ImmutableSegment::new(
             graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
@@ -566,5 +605,82 @@ mod tests {
             0,
             0,
         );
+    }
+
+    #[test]
+    fn test_hint_committed_default_zero() {
+        let h = MvccHeader {
+            internal_id: 0,
+            global_id: 0,
+            key_hash: 0,
+            insert_lsn: 1,
+            delete_lsn: 0,
+            hint_committed: 0,
+        };
+        assert_eq!(h.hint_committed, 0);
+    }
+
+    #[test]
+    fn test_set_hint_committed() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        ));
+        let empty_graph = HnswGraph::new(
+            0, 16, 32, 0, 0,
+            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+
+        let mvcc = vec![
+            MvccHeader { internal_id: 0, global_id: 0, key_hash: 0, insert_lsn: 1, delete_lsn: 0, hint_committed: 0 },
+            MvccHeader { internal_id: 1, global_id: 1, key_hash: 0, insert_lsn: 2, delete_lsn: 0, hint_committed: 0 },
+        ];
+        let mut seg = ImmutableSegment::new(
+            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
+            Vec::new(), 16, mvcc, collection, 2, 2,
+        );
+
+        // Neither should be hint-committed initially
+        assert!(!seg.is_hint_committed(0));
+        assert!(!seg.is_hint_committed(1));
+
+        // Set hint on entry 0
+        seg.set_hint_committed(0);
+        assert!(seg.is_hint_committed(0));
+        assert!(!seg.is_hint_committed(1));
+
+        // Out-of-bounds should return false
+        assert!(!seg.is_hint_committed(99));
+    }
+
+    #[test]
+    fn test_mvcc_raw_bytes_v2_includes_hint() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        ));
+        let empty_graph = HnswGraph::new(
+            0, 16, 32, 0, 0,
+            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+
+        let mvcc = vec![
+            MvccHeader { internal_id: 0, global_id: 10, key_hash: 0xAA, insert_lsn: 1, delete_lsn: 0, hint_committed: 1 },
+        ];
+        let seg = ImmutableSegment::new(
+            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
+            Vec::new(), 16, mvcc, collection, 1, 1,
+        );
+
+        let v1 = seg.mvcc_raw_bytes();
+        assert_eq!(v1.len(), 32); // v1 format unchanged
+
+        let v2 = seg.mvcc_raw_bytes_v2();
+        assert_eq!(v2.len(), 33); // v2 format includes hint byte
+        assert_eq!(v2[32], 1);    // hint_committed byte
     }
 }

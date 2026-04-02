@@ -431,6 +431,7 @@ pub fn read_immutable_segment(
             key_hash,
             insert_lsn,
             delete_lsn,
+            hint_committed: 0,
         });
     }
 
@@ -573,6 +574,7 @@ mod tests {
                 key_hash: 0,
                 insert_lsn: i as u64 + 1,
                 delete_lsn: 0,
+                hint_committed: 0,
             })
             .collect();
 
