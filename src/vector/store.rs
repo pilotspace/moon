@@ -235,6 +235,89 @@ impl VectorIndex {
     }
 }
 
+impl VectorIndex {
+    /// Check each warm segment's age. If older than `cold_after_secs`,
+    /// transition it to cold tier (PQ codes in RAM + Vamana graph on NVMe).
+    ///
+    /// After transition, the warm segment is replaced by a DiskAnnSegment
+    /// that performs approximate search via PQ asymmetric distance and
+    /// Vamana beam traversal from disk. The warm segment is tombstoned.
+    ///
+    /// Returns the number of segments transitioned.
+    pub fn try_cold_transitions(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        cold_after_secs: u64,
+        next_file_id: &mut u64,
+    ) -> usize {
+        let snapshot = self.segments.load();
+        let mut to_cold: Vec<usize> = Vec::new();
+        for (i, warm) in snapshot.warm.iter().enumerate() {
+            if warm.age_secs() >= cold_after_secs {
+                to_cold.push(i);
+            }
+        }
+        if to_cold.is_empty() {
+            return 0;
+        }
+
+        let mut new_warm = snapshot.warm.clone();
+        let mut new_cold = snapshot.cold.clone();
+        let mut transitioned = 0usize;
+        let dim = self.meta.dimension as usize;
+
+        // Process in reverse order to maintain valid indices during removal.
+        for &idx in to_cold.iter().rev() {
+            let warm_seg = &snapshot.warm[idx];
+            let warm_file_id = warm_seg.segment_id();
+            let cold_file_id = *next_file_id;
+            *next_file_id += 1;
+
+            match crate::storage::tiered::cold_tier::transition_to_cold(
+                shard_dir,
+                warm_seg,
+                warm_file_id,
+                cold_file_id,
+                dim,
+                manifest,
+            ) {
+                Ok(diskann_seg) => {
+                    new_warm.remove(idx);
+                    new_cold.push(Arc::new(diskann_seg));
+                    tracing::info!(
+                        "Cold transition: segment {} ({} vectors, age {}s) -> DiskANN cold",
+                        cold_file_id,
+                        warm_seg.total_count(),
+                        warm_seg.age_secs(),
+                    );
+                    // Mark the old warm segment for cleanup when refs drop.
+                    warm_seg.mark_tombstoned();
+                    transitioned += 1;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Cold transition failed for warm segment {}: {}",
+                        warm_file_id, e
+                    );
+                }
+            }
+        }
+
+        if transitioned > 0 {
+            let new_list = SegmentList {
+                mutable: Arc::clone(&snapshot.mutable),
+                immutable: snapshot.immutable.clone(),
+                ivf: snapshot.ivf.clone(),
+                warm: new_warm,
+                cold: new_cold,
+            };
+            self.segments.swap(new_list);
+        }
+        transitioned
+    }
+}
+
 /// Per-shard store of all vector indexes. Directly owned by shard thread.
 pub struct VectorStore {
     indexes: HashMap<Bytes, VectorIndex>,
@@ -449,6 +532,29 @@ impl VectorStore {
             if let Some(idx) = self.indexes.get(&name) {
                 total += idx.try_warm_transitions(
                     shard_dir, manifest, warm_after_secs, next_file_id, wal,
+                );
+            }
+        }
+        total
+    }
+
+    /// Attempt cold transitions for ALL indexes. Called from persistence tick.
+    ///
+    /// Scans warm segments in each index, transitions those older than
+    /// `cold_after_secs` to DiskANN cold tier. Returns total count.
+    pub fn try_cold_transitions_all(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        cold_after_secs: u64,
+        next_file_id: &mut u64,
+    ) -> usize {
+        let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
+        let mut total = 0;
+        for name in names {
+            if let Some(idx) = self.indexes.get(&name) {
+                total += idx.try_cold_transitions(
+                    shard_dir, manifest, cold_after_secs, next_file_id,
                 );
             }
         }

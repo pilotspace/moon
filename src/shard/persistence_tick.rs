@@ -202,6 +202,40 @@ pub(crate) fn check_warm_transitions(
 }
 
 // ---------------------------------------------------------------------------
+// Cold tier transition handler (disk-offload path)
+// ---------------------------------------------------------------------------
+
+/// Periodically check warm segment ages and trigger WARM->COLD transitions.
+///
+/// Called from the event loop on a 60-second timer when disk-offload is enabled
+/// and `server_config.segment_cold_after > 0`. Scans all warm segments across
+/// all VectorIndex instances and transitions those older than `cold_after_secs`
+/// to DiskANN cold tier (PQ codes in RAM + Vamana graph on NVMe).
+///
+/// NOTE: The actual event loop wiring (select! macro integration) is outside
+/// this plan's file ownership and will happen when the shard event loop is
+/// updated in a future plan. This function exists and is callable.
+#[allow(dead_code)] // Event loop wiring deferred to a future plan
+pub(crate) fn check_cold_transitions(
+    vector_store: &crate::vector::store::VectorStore,
+    shard_dir: &std::path::Path,
+    manifest: &mut ShardManifest,
+    cold_after_secs: u64,
+    next_file_id: &mut u64,
+    shard_id: usize,
+) {
+    let count = vector_store.try_cold_transitions_all(
+        shard_dir, manifest, cold_after_secs, next_file_id,
+    );
+    if count > 0 {
+        info!(
+            "Shard {}: transitioned {} segment(s) to cold tier",
+            shard_id, count
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory pressure cascade (design section 8.5)
 // ---------------------------------------------------------------------------
 
