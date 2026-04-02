@@ -404,20 +404,26 @@ pub(crate) fn handle_checkpoint_tick(
                         Ok(())
                     }
                 },
-                &mut |_file_id, _page_offset, _is_large, _data| {
-                    // Warm-tier .mpf pages are immutable after initial write (sealed
-                    // segments never receive further writes). The only dirty pages in
-                    // the current system would be future KV disk-resident pages, which
-                    // are not yet implemented. Once KV pages go disk-resident, this
-                    // closure must pwrite(2) to the data file at the correct offset.
-                    //
-                    // For now, assert the invariant: no dirty pages should reach here
-                    // because warm pages are never dirtied after creation.
-                    debug_assert!(
-                        false,
-                        "write_fn called but no mutable disk pages exist yet; \
-                         warm .mpf pages are immutable — this should not happen"
-                    );
+                &mut |file_id, page_offset, is_large, data| {
+                    // pwrite(2) dirty page to its DataFile at the correct offset.
+                    // KV heap pages: {shard_dir}/data/heap-{file_id:06}.mpf
+                    // Warm-tier .mpf pages are immutable and never dirtied, so
+                    // only KV heap pages reach this path.
+                    use std::os::unix::fs::FileExt;
+                    let page_size = if is_large {
+                        crate::persistence::page::PAGE_64K
+                    } else {
+                        crate::persistence::page::PAGE_4K
+                    };
+                    let byte_offset = page_offset * page_size as u64;
+                    let shard_dir = control_path.parent().unwrap_or(Path::new("."));
+                    let file_path = shard_dir
+                        .join("data")
+                        .join(format!("heap-{:06}.mpf", file_id));
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&file_path)?;
+                    file.write_at(data, byte_offset)?;
                     Ok(())
                 },
             );
