@@ -261,11 +261,19 @@ pub(crate) fn handle_checkpoint_tick(
                     }
                 },
                 &mut |_file_id, _page_offset, _is_large, _data| {
-                    // TODO(moonstore-v2): Write page data to the actual data file
-                    // on disk. The WAL-before-data invariant is enforced above.
-                    // Physical page write to data files requires the data file I/O
-                    // layer (KV disk pages, future phase). Recovery replays WAL
-                    // from redo_lsn so this is safe.
+                    // Warm-tier .mpf pages are immutable after initial write (sealed
+                    // segments never receive further writes). The only dirty pages in
+                    // the current system would be future KV disk-resident pages, which
+                    // are not yet implemented. Once KV pages go disk-resident, this
+                    // closure must pwrite(2) to the data file at the correct offset.
+                    //
+                    // For now, assert the invariant: no dirty pages should reach here
+                    // because warm pages are never dirtied after creation.
+                    debug_assert!(
+                        false,
+                        "write_fn called but no mutable disk pages exist yet; \
+                         warm .mpf pages are immutable — this should not happen"
+                    );
                     Ok(())
                 },
             );
