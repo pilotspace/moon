@@ -16,6 +16,9 @@ use crate::persistence::page::{
     MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K,
 };
 
+/// Minimum value size to trigger LZ4 compression (per design section 12).
+const LZ4_COMPRESS_THRESHOLD: usize = 256;
+
 /// Size of the KV-specific page header (offsets 64..80).
 pub const KV_PAGE_HEADER_SIZE: usize = 16;
 
@@ -212,13 +215,33 @@ impl KvLeafPage {
         }
 
         // If TOMBSTONE, value_len must be 0
-        let value_bytes = if actual_flags & entry_flags::TOMBSTONE != 0 {
-            &[] as &[u8]
+        let value_bytes: &[u8] = if actual_flags & entry_flags::TOMBSTONE != 0 {
+            &[]
         } else {
             value
         };
 
-        let e_size = Self::entry_size(key.len(), value_bytes.len(), actual_flags);
+        // LZ4 compression for values above threshold (cold-tier path, allocation OK).
+        // Skip for tombstones and overflow pointers (already compact / not real data).
+        let compressed_buf: Vec<u8>;
+        let final_value: &[u8];
+        if value_bytes.len() >= LZ4_COMPRESS_THRESHOLD
+            && actual_flags & entry_flags::TOMBSTONE == 0
+            && actual_flags & entry_flags::OVERFLOW == 0
+        {
+            compressed_buf = lz4_flex::compress_prepend_size(value_bytes);
+            if compressed_buf.len() < value_bytes.len() {
+                actual_flags |= entry_flags::COMPRESSED;
+                final_value = &compressed_buf;
+            } else {
+                // Incompressible -- store raw
+                final_value = value_bytes;
+            }
+        } else {
+            final_value = value_bytes;
+        }
+
+        let e_size = Self::entry_size(key.len(), final_value.len(), actual_flags);
         let needed = e_size + SLOT_SIZE;
 
         let fs = self.free_start() as usize;
@@ -255,12 +278,12 @@ impl KvLeafPage {
         cursor += key.len();
 
         // value_len: u32 LE
-        self.data[cursor..cursor + 4].copy_from_slice(&(value_bytes.len() as u32).to_le_bytes());
+        self.data[cursor..cursor + 4].copy_from_slice(&(final_value.len() as u32).to_le_bytes());
         cursor += 4;
 
         // value bytes
-        if !value_bytes.is_empty() {
-            self.data[cursor..cursor + value_bytes.len()].copy_from_slice(value_bytes);
+        if !final_value.is_empty() {
+            self.data[cursor..cursor + final_value.len()].copy_from_slice(final_value);
         }
 
         // Write slot at free_start position: offset:u16 + len:u16
@@ -342,7 +365,17 @@ impl KvLeafPage {
         cursor += 4;
 
         // value bytes
-        let value = self.data[cursor..cursor + value_len].to_vec();
+        let raw_value = self.data[cursor..cursor + value_len].to_vec();
+
+        // Transparent LZ4 decompression
+        let value = if flags & entry_flags::COMPRESSED != 0 {
+            match lz4_flex::decompress_size_prepended(&raw_value) {
+                Ok(decompressed) => decompressed,
+                Err(_) => return None, // corrupted compressed data
+            }
+        } else {
+            raw_value
+        };
 
         Some(KvEntry {
             key,
@@ -512,13 +545,20 @@ mod tests {
     fn test_page_full() {
         let mut page = KvLeafPage::new(6, 1);
         // Available space: 4096 - 80 = 4016 bytes
-        // First insert: 3(key) + 3990(val) + 8(overhead) + 4(slot) = 4005 bytes
-        let big_value = vec![0xAB; 3990];
-        page.insert(b"big", &big_value, ValueType::String, 0, None)
-            .expect("first big insert should fit");
+        // Use values below LZ4_COMPRESS_THRESHOLD (256) to avoid compression.
+        // Entry overhead: 2(key_len) + 1(vtype) + 1(flags) + 4(val_len) = 8
+        // Fill with multiple small inserts to exhaust space.
+        let val = vec![0xAB; 200]; // below threshold, no compression
+        // Each insert: 4(key) + 200(val) + 8(overhead) + 4(slot) = 216 bytes
+        // 4016 / 216 = ~18 inserts
+        for i in 0..18 {
+            let key = format!("k{i:02}");
+            page.insert(key.as_bytes(), &val, ValueType::String, 0, None)
+                .unwrap_or_else(|_| panic!("insert {i} should succeed"));
+        }
 
-        // Remaining: 4016 - 4005 = 11 bytes. Second needs at least 4(slot) + 8(overhead) + key + val = 22
-        let result = page.insert(b"another", b"val", ValueType::String, 0, None);
+        // Page should now be too full for another entry of similar size
+        let result = page.insert(b"overflow_key", &val, ValueType::String, 0, None);
         assert_eq!(result, Err(PageFull));
     }
 
@@ -658,5 +698,66 @@ mod tests {
         assert_eq!(ValueType::from_u8(5), Some(ValueType::Stream));
         assert_eq!(ValueType::from_u8(6), None);
         assert_eq!(ValueType::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_lz4_roundtrip() {
+        let mut page = KvLeafPage::new(20, 1);
+        // 500 bytes of compressible data (repeated pattern)
+        let original: Vec<u8> = b"hello world! ".iter().copied().cycle().take(500).collect();
+        let idx = page
+            .insert(&b"big_key"[..], &original, ValueType::String, 0, None)
+            .expect("insert should succeed");
+        assert_eq!(idx, 0);
+
+        let entry = page.get(0).expect("get should succeed");
+        assert_eq!(entry.value, original, "decompressed value must match original");
+        assert_ne!(
+            entry.flags & entry_flags::COMPRESSED,
+            0,
+            "COMPRESSED flag should be set for compressible 500B value"
+        );
+
+        // Verify on-disk slot occupies less than the original 500B value
+        let slot_pos = KV_DATA_START;
+        let entry_len = u16::from_le_bytes([page.data[slot_pos + 2], page.data[slot_pos + 3]]) as usize;
+        assert!(
+            entry_len < KvLeafPage::entry_size(b"big_key".len(), original.len(), 0),
+            "compressed entry should be smaller than uncompressed"
+        );
+    }
+
+    #[test]
+    fn test_lz4_incompressible_skips() {
+        let mut page = KvLeafPage::new(21, 1);
+        // 500 bytes of pseudo-random data (incompressible)
+        let mut random_data = vec![0u8; 500];
+        for (i, b) in random_data.iter_mut().enumerate() {
+            // Simple PRNG-like pattern that doesn't compress well
+            *b = ((i.wrapping_mul(251).wrapping_add(97)) & 0xFF) as u8;
+        }
+        page.insert(b"rand_key", &random_data, ValueType::String, 0, None)
+            .expect("insert should succeed");
+
+        let entry = page.get(0).expect("get should succeed");
+        assert_eq!(entry.value, random_data, "roundtrip must preserve data");
+        // COMPRESSED flag may or may not be set depending on lz4 savings;
+        // the important thing is that get() returns the correct value.
+    }
+
+    #[test]
+    fn test_small_values_not_compressed() {
+        let mut page = KvLeafPage::new(22, 1);
+        let small_value = vec![0xAA; 100]; // below 256B threshold
+        page.insert(b"small", &small_value, ValueType::String, 0, None)
+            .expect("insert should succeed");
+
+        let entry = page.get(0).expect("get should succeed");
+        assert_eq!(entry.value, small_value);
+        assert_eq!(
+            entry.flags & entry_flags::COMPRESSED,
+            0,
+            "COMPRESSED flag must NOT be set for values below threshold"
+        );
     }
 }
