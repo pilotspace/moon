@@ -466,6 +466,19 @@ mod tests {
     use super::*;
     use crate::persistence::page::MOONPAGE_MAGIC;
 
+    /// Generate pseudo-random incompressible data using a simple LCG.
+    /// This ensures LZ4 compression does NOT reduce size, so tests that
+    /// verify exact payload_bytes values exercise the uncompressed path.
+    fn incompressible_data(len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len);
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for _ in 0..len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            data.push((state >> 33) as u8);
+        }
+        data
+    }
+
     #[test]
     fn test_write_codes_mpf_page_format() {
         let tmp = tempfile::tempdir().unwrap();
@@ -475,8 +488,8 @@ mod tests {
         let data_cap = PAGE_64K - MOONPAGE_HEADER_SIZE - VEC_CODES_SUB_HEADER_SIZE;
         assert_eq!(data_cap, 65440);
 
-        // Write 100KB of codes -- should produce 2 pages
-        let data = vec![0xABu8; 100_000];
+        // Write 100KB of incompressible codes -- should produce 2 pages
+        let data = incompressible_data(100_000);
         write_codes_mpf(&path, 42, &data).unwrap();
 
         let file_bytes = std::fs::read(&path).unwrap();
@@ -518,8 +531,8 @@ mod tests {
         let data_cap = PAGE_4K - MOONPAGE_HEADER_SIZE - VEC_GRAPH_SUB_HEADER_SIZE;
         assert_eq!(data_cap, 4016);
 
-        // Write 5000 bytes of graph data -- should produce 2 pages
-        let data = vec![0xCDu8; 5000];
+        // Write 5000 bytes of incompressible graph data -- should produce 2 pages
+        let data = incompressible_data(5000);
         write_graph_mpf(&path, 7, &data).unwrap();
 
         let file_bytes = std::fs::read(&path).unwrap();
@@ -609,7 +622,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vectors.mpf");
 
-        let data = vec![0x42u8; 2000];
+        let data = incompressible_data(2000);
         write_vectors_mpf(&path, 5, &data).unwrap();
 
         let file_bytes = std::fs::read(&path).unwrap();
@@ -659,8 +672,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let seg_dir = tmp.path().join("segment-1");
 
-        let codes = vec![0xAAu8; 1000];
-        let graph = vec![0xBBu8; 500];
+        let codes = incompressible_data(1000);
+        let graph = incompressible_data(500);
         let mvcc = vec![0u8; 24 * 10]; // 10 entries
         write_test_segment(&seg_dir, 1, &codes, &graph, &mvcc);
 
@@ -671,7 +684,7 @@ mod tests {
         let page0_data = ws.codes_data(0);
         assert_eq!(page0_data.len(), PAGE_64K - MOONPAGE_HEADER_SIZE - VEC_CODES_SUB_HEADER_SIZE);
         // First 1000 bytes should be our data
-        assert_eq!(&page0_data[..1000], &[0xAAu8; 1000]);
+        assert_eq!(&page0_data[..1000], &codes[..1000]);
 
         assert_eq!(ws.page_count_codes(), 1);
     }
@@ -775,12 +788,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let seg_dir = tmp.path().join("segment-7");
 
-        // Fill codes with a known pattern
-        let mut codes = vec![0u8; 500];
-        for (i, b) in codes.iter_mut().enumerate() {
-            *b = (i & 0xFF) as u8;
-        }
-        let graph = vec![0xEEu8; 200];
+        // Fill codes with incompressible data
+        let codes = incompressible_data(500);
+        let graph = incompressible_data(200);
         let mvcc = vec![0u8; 24 * 5];
         write_test_segment(&seg_dir, 7, &codes, &graph, &mvcc);
 
@@ -789,13 +799,11 @@ mod tests {
 
         // codes_data(0) should skip the 64-byte header + 32-byte sub-header
         let cd = ws.codes_data(0);
-        for i in 0..500 {
-            assert_eq!(cd[i], (i & 0xFF) as u8, "codes byte {i} mismatch");
-        }
+        assert_eq!(&cd[..500], &codes[..], "codes data mismatch");
 
         // graph_data(0) should skip the 64-byte header + 16-byte sub-header
         let gd = ws.graph_data(0);
-        assert_eq!(&gd[..200], &[0xEEu8; 200]);
+        assert_eq!(&gd[..200], &graph[..]);
     }
 
     #[test]

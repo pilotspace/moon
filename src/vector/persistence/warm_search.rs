@@ -10,7 +10,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
-use crate::persistence::page::{MoonPageHeader, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K};
+use crate::persistence::page::{MoonPageHeader, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K, page_flags};
 use crate::vector::persistence::warm_segment::{
     VEC_CODES_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE, VEC_MVCC_SUB_HEADER_SIZE,
 };
@@ -69,15 +69,33 @@ fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize)
         // Read the header to get actual payload length (includes sub-header)
         if let Some(hdr) = MoonPageHeader::read_from(&page_slice[..MOONPAGE_HEADER_SIZE]) {
             let total_payload = hdr.payload_bytes as usize;
-            // Subtract sub-header to get actual data length
+            // Subtract sub-header to get actual data length (possibly compressed)
             let data_len = if total_payload > sub_hdr_size {
                 (total_payload - sub_hdr_size).min(data_capacity)
             } else {
                 0
             };
-            result.extend_from_slice(
-                &page_slice[total_header..total_header + data_len],
-            );
+
+            if data_len == 0 {
+                continue;
+            }
+
+            let data_region = &page_slice[total_header..total_header + data_len];
+
+            if hdr.flags & page_flags::COMPRESSED != 0 {
+                // LZ4-compressed page: decompress data region
+                match lz4_flex::decompress_size_prepended(data_region) {
+                    Ok(decompressed) => result.extend_from_slice(&decompressed),
+                    Err(e) => {
+                        tracing::warn!(
+                            "LZ4 decompression failed for page {page_idx}: {e}, skipping"
+                        );
+                    }
+                }
+            } else {
+                // Uncompressed page: copy raw data
+                result.extend_from_slice(data_region);
+            }
         }
     }
 
@@ -383,5 +401,73 @@ mod tests {
 
         let ids = parse_global_ids(&mvcc_data);
         assert_eq!(ids, vec![100, 101, 102]);
+    }
+
+    #[test]
+    fn test_compressed_warm_segment_roundtrip() {
+        use crate::persistence::page::PAGE_4K;
+        use crate::vector::persistence::warm_segment::{
+            write_graph_mpf, VEC_GRAPH_SUB_HEADER_SIZE,
+        };
+
+        // 4KB of repeating compressible pattern (will span 2 pages at 4016 data cap)
+        let mut graph_data = Vec::with_capacity(4096);
+        for i in 0..4096 {
+            graph_data.push((i % 7) as u8);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("graph.mpf");
+        write_graph_mpf(&path, 10, &graph_data).unwrap();
+
+        // Open via mmap and extract payloads (should decompress transparently)
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: test-only, file is immutable after write.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
+
+        let extracted = extract_payloads(&mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
+        assert_eq!(
+            extracted, graph_data,
+            "decompressed data must match original input"
+        );
+    }
+
+    #[test]
+    fn test_extract_payloads_handles_mixed_compressed_uncompressed() {
+        use crate::persistence::page::PAGE_4K;
+        use crate::vector::persistence::warm_segment::{
+            write_graph_mpf, VEC_GRAPH_SUB_HEADER_SIZE,
+        };
+
+        // Test 1: Large compressible data (>256 bytes) -- should be compressed
+        {
+            let mut data = Vec::with_capacity(1024);
+            for i in 0..1024 {
+                data.push((i % 3) as u8);
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("graph.mpf");
+            write_graph_mpf(&path, 20, &data).unwrap();
+
+            let file = std::fs::File::open(&path).unwrap();
+            // SAFETY: test-only, file is immutable after write.
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
+            let extracted = extract_payloads(&mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
+            assert_eq!(extracted, data, "large compressible data roundtrip failed");
+        }
+
+        // Test 2: Small data (<=256 bytes) -- should NOT be compressed
+        {
+            let data = vec![0xCDu8; 100];
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("graph.mpf");
+            write_graph_mpf(&path, 21, &data).unwrap();
+
+            let file = std::fs::File::open(&path).unwrap();
+            // SAFETY: test-only, file is immutable after write.
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
+            let extracted = extract_payloads(&mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
+            assert_eq!(extracted, data, "small uncompressed data roundtrip failed");
+        }
     }
 }
