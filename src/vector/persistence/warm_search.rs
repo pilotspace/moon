@@ -45,6 +45,8 @@ pub struct WarmSearchSegment {
     global_ids: Vec<u32>,
     /// Segment handle prevents directory deletion while this struct is alive.
     _handle: SegmentHandle,
+    /// Timestamp when this warm segment was created (for cold tier aging).
+    created_at: std::time::Instant,
 }
 
 /// Extract contiguous data bytes from a mmap'd .mpf file, skipping sub-headers.
@@ -200,6 +202,7 @@ impl WarmSearchSegment {
             total_count,
             global_ids,
             _handle: handle,
+            created_at: std::time::Instant::now(),
         })
     }
 
@@ -261,6 +264,30 @@ impl WarmSearchSegment {
     #[inline]
     pub fn segment_id(&self) -> u64 {
         self.segment_id
+    }
+
+    /// Segment age in seconds since creation (used for cold tier transition).
+    #[inline]
+    pub fn age_secs(&self) -> u64 {
+        self.created_at.elapsed().as_secs()
+    }
+
+    /// Read-only access to the raw TQ codes (for PQ training during cold transition).
+    #[inline]
+    pub fn codes_data(&self) -> &[u8] {
+        &self.codes_data
+    }
+
+    /// Read-only access to the HNSW graph (for Vamana warm-start during cold transition).
+    #[inline]
+    pub fn graph(&self) -> &HnswGraph {
+        &self.graph
+    }
+
+    /// Read-only access to collection metadata.
+    #[inline]
+    pub fn collection_meta(&self) -> &CollectionMetadata {
+        &self.collection_meta
     }
 
     /// Mark this segment's on-disk directory for deletion.

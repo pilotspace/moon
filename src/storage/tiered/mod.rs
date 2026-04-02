@@ -1,3 +1,4 @@
+pub mod cold_tier;
 pub mod kv_spill;
 pub mod segment_handle;
 pub mod warm_tier;
