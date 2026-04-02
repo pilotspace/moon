@@ -121,13 +121,13 @@ impl WarmSearchSegment {
     /// * `segment_id` - Unique segment identifier
     /// * `collection_meta` - Collection metadata for TQ-ADC distance
     /// * `handle` - Segment handle preventing directory deletion
-    /// * `_mlock_codes` - Whether to mlock codes (reserved for future use)
+    /// * `mlock_codes` - Whether to mlock codes.mpf pages in RAM
     pub fn from_files(
         segment_dir: &Path,
         segment_id: u64,
         collection_meta: Arc<CollectionMetadata>,
         handle: SegmentHandle,
-        _mlock_codes: bool,
+        mlock_codes: bool,
     ) -> std::io::Result<Self> {
         // Open and mmap codes.mpf (64KB pages)
         let codes_file = std::fs::File::open(segment_dir.join("codes.mpf"))?;
@@ -135,6 +135,11 @@ impl WarmSearchSegment {
         // prevents directory deletion while mapped. No concurrent writers exist.
         let codes_mmap = unsafe { memmap2::MmapOptions::new().map(&codes_file)? };
         codes_mmap.advise(memmap2::Advice::Sequential)?;
+        if mlock_codes {
+            if let Err(e) = codes_mmap.lock() {
+                tracing::warn!("mlock codes.mpf failed for segment {segment_id}: {e}");
+            }
+        }
 
         // Open and mmap graph.mpf (4KB pages)
         let graph_file = std::fs::File::open(segment_dir.join("graph.mpf"))?;
@@ -146,6 +151,12 @@ impl WarmSearchSegment {
         let mvcc_file = std::fs::File::open(segment_dir.join("mvcc.mpf"))?;
         // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
         let mvcc_mmap = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
+        mvcc_mmap.advise(memmap2::Advice::Sequential)?;
+        // Lock mvcc pages in RAM -- visibility checks run on every query (design S14).
+        // Failure is non-fatal: mlock may fail in containers or when RLIMIT_MEMLOCK is low.
+        if let Err(e) = mvcc_mmap.lock() {
+            tracing::warn!("mlock mvcc.mpf failed for segment {segment_id}: {e} (continuing without mlock)");
+        }
 
         // Extract contiguous data from each file (skipping per-page sub-headers)
         let codes_data = extract_payloads(&codes_mmap, PAGE_64K, VEC_CODES_SUB_HEADER_SIZE);
