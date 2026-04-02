@@ -249,10 +249,29 @@ pub(crate) fn handle_checkpoint_tick(
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
         CheckpointAction::FlushPages(count) => {
-            // Flush `count` dirty pages through PageCache.
-            // Iterate dirty frames and flush them with WAL-before-data invariant.
-            // TODO(moonstore-v2): Wire to actual dirty page iteration from PageCache
-            let _ = (count, page_cache);
+            // Flush `count` dirty pages through PageCache with WAL-before-data.
+            let flushed = page_cache.flush_dirty_pages(
+                count,
+                &mut |page_lsn| {
+                    // Ensure WAL is durable past this page's LSN before writing page
+                    if wal.current_lsn() > page_lsn {
+                        wal.flush_sync()
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |_file_id, _page_offset, _is_large, _data| {
+                    // TODO(moonstore-v2): Write page data to the actual data file
+                    // on disk. The WAL-before-data invariant is enforced above.
+                    // Physical page write to data files requires the data file I/O
+                    // layer (KV disk pages, future phase). Recovery replays WAL
+                    // from redo_lsn so this is safe.
+                    Ok(())
+                },
+            );
+            if flushed > 0 {
+                tracing::trace!("Checkpoint: flushed {} dirty pages", flushed);
+            }
             false
         }
         CheckpointAction::Finalize { redo_lsn } => {

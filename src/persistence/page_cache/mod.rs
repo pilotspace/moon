@@ -306,6 +306,89 @@ impl PageCache {
         }
         count
     }
+
+    /// Flush up to `max_pages` dirty pages to disk, enforcing WAL-before-data.
+    ///
+    /// Iterates both frame pools (4KB then 64KB), finds dirty+valid frames,
+    /// and flushes each. Returns the number of pages actually flushed.
+    ///
+    /// `wal_flush_fn` is called once per dirty page with that page's LSN to ensure
+    /// WAL durability before the page write. `write_fn` receives (file_id, page_offset,
+    /// is_large, data) for the actual disk write.
+    pub fn flush_dirty_pages(
+        &self,
+        max_pages: usize,
+        wal_flush_fn: &mut impl FnMut(u64) -> std::io::Result<()>,
+        write_fn: &mut impl FnMut(u64, u64, bool, &[u8]) -> std::io::Result<()>,
+    ) -> usize {
+        let mut flushed = 0;
+        // Scan 4KB frames
+        for (idx, frame) in self.frames_4k.iter().enumerate() {
+            if flushed >= max_pages {
+                break;
+            }
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & FLAG_DIRTY != 0 && flags & frame::FLAG_VALID != 0 {
+                let file_id = frame.file_id.load(Ordering::Acquire);
+                let page_offset = frame.page_offset.load(Ordering::Acquire);
+                let page_lsn = frame.page_lsn.load(Ordering::Acquire);
+                // WAL-before-data: ensure WAL durable past this page's LSN
+                if let Err(e) = wal_flush_fn(page_lsn) {
+                    tracing::error!("WAL flush for dirty page failed: {}", e);
+                    continue;
+                }
+                // Write page data to disk
+                {
+                    let buf = self.buffers_4k[idx].read();
+                    if let Err(e) = write_fn(file_id, page_offset, false, &buf) {
+                        tracing::error!(
+                            "Dirty page write failed: file_id={}, offset={}: {}",
+                            file_id,
+                            page_offset,
+                            e
+                        );
+                        continue;
+                    }
+                }
+                // Clear dirty flag
+                frame.state.clear_dirty();
+                flushed += 1;
+            }
+        }
+        // Scan 64KB frames
+        for (idx, frame) in self.frames_64k.iter().enumerate() {
+            if flushed >= max_pages {
+                break;
+            }
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & FLAG_DIRTY != 0 && flags & frame::FLAG_VALID != 0 {
+                let file_id = frame.file_id.load(Ordering::Acquire);
+                let page_offset = frame.page_offset.load(Ordering::Acquire);
+                let page_lsn = frame.page_lsn.load(Ordering::Acquire);
+                if let Err(e) = wal_flush_fn(page_lsn) {
+                    tracing::error!("WAL flush for dirty page failed: {}", e);
+                    continue;
+                }
+                {
+                    let buf = self.buffers_64k[idx].read();
+                    if let Err(e) = write_fn(file_id, page_offset, true, &buf) {
+                        tracing::error!(
+                            "Dirty page write failed: file_id={}, offset={}: {}",
+                            file_id,
+                            page_offset,
+                            e
+                        );
+                        continue;
+                    }
+                }
+                frame.state.clear_dirty();
+                flushed += 1;
+            }
+        }
+        flushed
+    }
 }
 
 #[cfg(test)]
@@ -510,5 +593,62 @@ mod tests {
         // Third fetch should fail — all frames pinned
         let result = cache.fetch_page(3, 0, false, |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flush_dirty_pages_basic() {
+        use std::sync::atomic::AtomicU64;
+        let cache = PageCache::new(4, 2);
+
+        // Load 3 pages, mark 2 dirty
+        let h1 = cache.fetch_page(1, 0, false, |_| Ok(())).unwrap();
+        cache.unpin_page(h1);
+        let h2 = cache.fetch_page(2, 0, false, |_| Ok(())).unwrap();
+        cache.unpin_page(h2);
+        let h3 = cache.fetch_page(3, 0, false, |_| Ok(())).unwrap();
+        cache.unpin_page(h3);
+
+        cache.mark_dirty(1, 0, 100);
+        cache.mark_dirty(3, 0, 300);
+        assert_eq!(cache.dirty_page_count(), 2);
+
+        let wal_max_lsn = AtomicU64::new(0);
+        let mut write_count = 0u32;
+
+        let flushed = cache.flush_dirty_pages(
+            10,
+            &mut |lsn| {
+                wal_max_lsn.fetch_max(lsn, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut |_file_id, _offset, _large, _data| {
+                write_count += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(flushed, 2);
+        assert_eq!(write_count, 2);
+        assert_eq!(cache.dirty_page_count(), 0);
+        // WAL should have been flushed to at least LSN 300
+        assert!(wal_max_lsn.load(Ordering::SeqCst) >= 300);
+    }
+
+    #[test]
+    fn test_flush_dirty_pages_respects_max() {
+        let cache = PageCache::new(4, 2);
+
+        for i in 0..4u64 {
+            let h = cache.fetch_page(i, 0, false, |_| Ok(())).unwrap();
+            cache.unpin_page(h);
+            cache.mark_dirty(i, 0, i * 100);
+        }
+        assert_eq!(cache.dirty_page_count(), 4);
+
+        let flushed =
+            cache.flush_dirty_pages(2, &mut |_| Ok(()), &mut |_, _, _, _| Ok(()));
+
+        assert_eq!(flushed, 2);
+        assert_eq!(cache.dirty_page_count(), 2);
     }
 }
