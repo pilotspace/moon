@@ -11,6 +11,7 @@ use smallvec::SmallVec;
 
 use crate::vector::filter::selectivity::{FilterStrategy, select_strategy};
 use crate::vector::hnsw::search::SearchScratch;
+use crate::vector::persistence::warm_search::WarmSearchSegment;
 use crate::vector::segment::ivf::IvfSegment;
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::turbo_quant::fwht;
@@ -38,6 +39,8 @@ pub struct SegmentList {
     pub immutable: Vec<Arc<ImmutableSegment>>,
     /// IVF segments for billion-scale approximate search.
     pub ivf: Vec<Arc<IvfSegment>>,
+    /// Warm segments: mmap-backed, searchable after HOT->WARM transition.
+    pub warm: Vec<Arc<WarmSearchSegment>>,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -57,6 +60,7 @@ impl SegmentHolder {
                 mutable: Arc::new(MutableSegment::new(dimension, collection)),
                 immutable: Vec::new(),
                 ivf: Vec::new(),
+                warm: Vec::new(),
             }),
         }
     }
@@ -72,7 +76,7 @@ impl SegmentHolder {
         self.segments.store(Arc::new(new_list));
     }
 
-    /// Total vector count across mutable + immutable + IVF segments.
+    /// Total vector count across mutable + immutable + IVF + warm segments.
     pub fn total_vectors(&self) -> u32 {
         let snapshot = self.load();
         let mut total = snapshot.mutable.len() as u32;
@@ -81,6 +85,9 @@ impl SegmentHolder {
         }
         for ivf_seg in &snapshot.ivf {
             total += ivf_seg.total_vectors() as u32;
+        }
+        for warm_seg in &snapshot.warm {
+            total += warm_seg.total_count();
         }
         total
     }
@@ -119,8 +126,8 @@ impl SegmentHolder {
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
-        // Pre-allocate merge buffer: k results per segment (mutable + immutables).
-        let segment_count = 1 + snapshot.immutable.len();
+        // Pre-allocate merge buffer: k results per segment (mutable + immutables + warm).
+        let segment_count = 1 + snapshot.immutable.len() + snapshot.warm.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
         // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
@@ -148,6 +155,9 @@ impl SegmentHolder {
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, ef_search, _scratch));
                 }
+                for warm_seg in &snapshot.warm {
+                    all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));
+                }
             }
             FilterStrategy::BruteForceFiltered => {
                 all.extend(snapshot.mutable.brute_force_search_filtered(
@@ -165,6 +175,11 @@ impl SegmentHolder {
                         filter_bitmap,
                     ));
                 }
+                for warm_seg in &snapshot.warm {
+                    all.extend(warm_seg.search_filtered(
+                        query_f32, k, ef_search, _scratch, filter_bitmap,
+                    ));
+                }
             }
             FilterStrategy::HnswFiltered => {
                 all.extend(snapshot.mutable.brute_force_search_filtered(
@@ -180,6 +195,11 @@ impl SegmentHolder {
                         ef_search,
                         _scratch,
                         filter_bitmap,
+                    ));
+                }
+                for warm_seg in &snapshot.warm {
+                    all.extend(warm_seg.search_filtered(
+                        query_f32, k, ef_search, _scratch, filter_bitmap,
                     ));
                 }
             }
@@ -206,6 +226,20 @@ impl SegmentHolder {
                         }
                     } else {
                         all.extend(imm_results);
+                    }
+                }
+                for warm_seg in &snapshot.warm {
+                    let warm_results = warm_seg.search(
+                        query_f32, oversample_k, ef_search.max(oversample_k), _scratch,
+                    );
+                    if let Some(bm) = filter_bitmap {
+                        for r in warm_results {
+                            if bm.contains(r.id.0) {
+                                all.push(r);
+                            }
+                        }
+                    } else {
+                        all.extend(warm_results);
                     }
                 }
             }
@@ -319,6 +353,17 @@ impl SegmentHolder {
             }
         }
 
+        // 2a. Warm segment search (committed by definition, same as immutable).
+        for warm_seg in &snapshot.warm {
+            if filter_bitmap.is_some() {
+                all.extend(warm_seg.search_filtered(
+                    query_f32, k, ef_search, _scratch, filter_bitmap,
+                ));
+            } else {
+                all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));
+            }
+        }
+
         // 2b. IVF segment search (IVF entries are committed by definition).
         if !snapshot.ivf.is_empty() {
             let dim = query_f32.len();
@@ -429,6 +474,7 @@ mod tests {
             mutable: new_mutable,
             immutable: Vec::new(),
             ivf: Vec::new(),
+            warm: Vec::new(),
         });
 
         let snap = holder.load();
@@ -721,6 +767,7 @@ mod tests {
             mutable: new_mutable,
             immutable: Vec::new(),
             ivf: Vec::new(),
+            warm: Vec::new(),
         });
 
         // Old snapshot still sees the original mutable (1 entry from our append)
@@ -801,6 +848,7 @@ mod tests {
             mutable: Arc::clone(&old_snap.mutable),
             immutable: Vec::new(),
             ivf: vec![Arc::new(ivf_seg)],
+            warm: Vec::new(),
         });
 
         // total_vectors should include IVF vectors.
