@@ -116,6 +116,7 @@ impl VectorIndex {
                     immutable: imm_list,
                     ivf: old.ivf.clone(),
                     warm: old.warm.clone(),
+                    cold: old.cold.clone(),
                 };
                 self.segments.swap(new_list);
             }
@@ -226,6 +227,7 @@ impl VectorIndex {
                 immutable: new_immutable,
                 ivf: snapshot.ivf.clone(),
                 warm: new_warm,
+                cold: snapshot.cold.clone(),
             };
             self.segments.swap(new_list);
         }
@@ -333,6 +335,7 @@ impl VectorStore {
                     immutable: immutable_arcs,
                     ivf: Vec::new(),
                     warm: Vec::new(),
+                    cold: Vec::new(),
                 };
                 index.segments.swap(new_list);
             }
@@ -483,6 +486,7 @@ impl VectorStore {
                             immutable: old.immutable.clone(),
                             ivf: old.ivf.clone(),
                             warm: new_warm,
+                            cold: old.cold.clone(),
                         };
                         idx.segments.swap(new_list);
                         loaded += 1;
@@ -675,6 +679,7 @@ mod tests {
             immutable: vec![imm],
             ivf: Vec::new(),
             warm: Vec::new(),
+            cold: Vec::new(),
         };
         idx.segments.swap(new_list);
         drop(old_snap);
@@ -734,6 +739,7 @@ mod tests {
             immutable: vec![imm],
             ivf: Vec::new(),
             warm: Vec::new(),
+            cold: Vec::new(),
         });
         drop(old_snap);
 

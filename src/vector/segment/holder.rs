@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
+use crate::vector::diskann::segment::DiskAnnSegment;
 use crate::vector::filter::selectivity::{FilterStrategy, select_strategy};
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::persistence::warm_search::WarmSearchSegment;
@@ -41,6 +42,8 @@ pub struct SegmentList {
     pub ivf: Vec<Arc<IvfSegment>>,
     /// Warm segments: mmap-backed, searchable after HOT->WARM transition.
     pub warm: Vec<Arc<WarmSearchSegment>>,
+    /// Cold segments: DiskANN PQ+Vamana search from NVMe.
+    pub cold: Vec<Arc<DiskAnnSegment>>,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -61,6 +64,7 @@ impl SegmentHolder {
                 immutable: Vec::new(),
                 ivf: Vec::new(),
                 warm: Vec::new(),
+                cold: Vec::new(),
             }),
         }
     }
@@ -88,6 +92,9 @@ impl SegmentHolder {
         }
         for warm_seg in &snapshot.warm {
             total += warm_seg.total_count();
+        }
+        for cold_seg in &snapshot.cold {
+            total += cold_seg.total_count();
         }
         total
     }
@@ -126,8 +133,8 @@ impl SegmentHolder {
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
-        // Pre-allocate merge buffer: k results per segment (mutable + immutables + warm).
-        let segment_count = 1 + snapshot.immutable.len() + snapshot.warm.len();
+        // Pre-allocate merge buffer: k results per segment (mutable + immutables + warm + cold).
+        let segment_count = 1 + snapshot.immutable.len() + snapshot.warm.len() + snapshot.cold.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
         // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
@@ -243,6 +250,12 @@ impl SegmentHolder {
                     }
                 }
             }
+        }
+
+        // Fan-out to cold (DiskANN) segments -- unfiltered PQ beam search.
+        // Filter support for cold segments is future work (no global ID mapping yet).
+        for cold_seg in &snapshot.cold {
+            all.extend(cold_seg.search(query_f32, k, 8));
         }
 
         // Fan-out to IVF segments.
@@ -364,7 +377,12 @@ impl SegmentHolder {
             }
         }
 
-        // 2b. IVF segment search (IVF entries are committed by definition).
+        // 2b. Cold segment search (DiskANN, committed by definition).
+        for cold_seg in &snapshot.cold {
+            all.extend(cold_seg.search(query_f32, k, 8));
+        }
+
+        // 2c. IVF segment search (IVF entries are committed by definition).
         if !snapshot.ivf.is_empty() {
             let dim = query_f32.len();
             let pdim = padded_dimension(dim as u32) as usize;
@@ -475,6 +493,7 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: Vec::new(),
+            cold: Vec::new(),
         });
 
         let snap = holder.load();
@@ -768,6 +787,7 @@ mod tests {
             immutable: Vec::new(),
             ivf: Vec::new(),
             warm: Vec::new(),
+            cold: Vec::new(),
         });
 
         // Old snapshot still sees the original mutable (1 entry from our append)
@@ -849,6 +869,7 @@ mod tests {
             immutable: Vec::new(),
             ivf: vec![Arc::new(ivf_seg)],
             warm: Vec::new(),
+            cold: Vec::new(),
         });
 
         // total_vectors should include IVF vectors.
