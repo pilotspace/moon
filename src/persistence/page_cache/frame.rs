@@ -23,6 +23,9 @@ pub const FLAG_DIRTY: u8 = 0x01;
 pub const FLAG_VALID: u8 = 0x02;
 /// An I/O operation is currently in progress on this frame.
 pub const FLAG_IO_IN_PROGRESS: u8 = 0x04;
+/// Frame needs a full-page image written to WAL before its first modification
+/// in the current checkpoint cycle (torn-page defense).
+pub const FLAG_FPI_PENDING: u8 = 0x08;
 
 /// Packed atomic state for a single buffer frame.
 ///
@@ -156,6 +159,52 @@ impl FrameState {
         loop {
             let old = self.state.load(Ordering::Acquire);
             let new = old & !(FLAG_DIRTY as u32);
+            if old == new {
+                return;
+            }
+            if self
+                .state
+                .compare_exchange_weak(old, new, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Check if the FPI_PENDING flag is set.
+    #[inline]
+    pub fn is_fpi_pending(&self) -> bool {
+        let val = self.state.load(Ordering::Acquire);
+        let (_, _, flags) = Self::unpack(val);
+        flags & FLAG_FPI_PENDING != 0
+    }
+
+    /// Set the FPI_PENDING flag.
+    #[inline]
+    pub fn set_fpi_pending(&self) {
+        loop {
+            let old = self.state.load(Ordering::Acquire);
+            let new = old | (FLAG_FPI_PENDING as u32);
+            if old == new {
+                return;
+            }
+            if self
+                .state
+                .compare_exchange_weak(old, new, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Clear the FPI_PENDING flag, preserving all other bits.
+    #[inline]
+    pub fn clear_fpi_pending(&self) {
+        loop {
+            let old = self.state.load(Ordering::Acquire);
+            let new = old & !(FLAG_FPI_PENDING as u32);
             if old == new {
                 return;
             }
@@ -391,6 +440,43 @@ mod tests {
         assert_eq!(state.decrement_usage(), 1);
         assert_eq!(state.decrement_usage(), 0);
         assert_eq!(state.decrement_usage(), 0); // saturates at 0
+    }
+
+    #[test]
+    fn test_fpi_pending_set_clear() {
+        let state = FrameState::new();
+        assert!(!state.is_fpi_pending());
+
+        state.set_fpi_pending();
+        assert!(state.is_fpi_pending());
+
+        state.clear_fpi_pending();
+        assert!(!state.is_fpi_pending());
+    }
+
+    #[test]
+    fn test_fpi_pending_preserves_other_flags() {
+        let state = FrameState::new();
+        state.set_dirty();
+        state.set_fpi_pending();
+        assert!(state.is_dirty());
+        assert!(state.is_fpi_pending());
+
+        // Clear FPI only — dirty must remain
+        state.clear_fpi_pending();
+        assert!(!state.is_fpi_pending());
+        assert!(state.is_dirty());
+
+        // Verify refcount/usage preserved too
+        state.pin();
+        state.touch();
+        state.set_fpi_pending();
+        state.clear_fpi_pending();
+        let (rc, usage, flags) = FrameState::unpack(state.load());
+        assert_eq!(rc, 1);
+        assert!(usage > 0);
+        assert_eq!(flags & FLAG_FPI_PENDING, 0);
+        assert_ne!(flags & FLAG_DIRTY, 0);
     }
 
     #[test]

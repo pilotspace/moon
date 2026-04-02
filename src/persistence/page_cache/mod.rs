@@ -21,6 +21,7 @@ use crate::persistence::page::PAGE_4K;
 use crate::persistence::page::PAGE_64K;
 
 use self::frame::FLAG_DIRTY;
+use self::frame::FLAG_FPI_PENDING;
 
 /// Handle returned by `fetch_page` representing a pinned page in the cache.
 ///
@@ -307,6 +308,27 @@ impl PageCache {
         count
     }
 
+    /// Set FPI_PENDING on all valid frames (called at checkpoint BEGIN).
+    ///
+    /// After this call, every valid page will require a full-page image written
+    /// to WAL before its first flush in the checkpoint cycle — torn-page defense.
+    pub fn clear_all_fpi_pending(&self) {
+        for frame in &self.frames_4k {
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & frame::FLAG_VALID != 0 {
+                frame.state.set_fpi_pending();
+            }
+        }
+        for frame in &self.frames_64k {
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & frame::FLAG_VALID != 0 {
+                frame.state.set_fpi_pending();
+            }
+        }
+    }
+
     /// Flush up to `max_pages` dirty pages to disk, enforcing WAL-before-data.
     ///
     /// Iterates both frame pools (4KB then 64KB), finds dirty+valid frames,
@@ -380,6 +402,95 @@ impl PageCache {
                             page_offset,
                             e
                         );
+                        continue;
+                    }
+                }
+                frame.state.clear_dirty();
+                flushed += 1;
+            }
+        }
+        flushed
+    }
+
+    /// FPI-aware variant of `flush_dirty_pages`.
+    ///
+    /// Before writing a dirty page, checks if FPI_PENDING is set. If so,
+    /// calls `fpi_fn` with the full page data to write a full-page image to
+    /// WAL (torn-page defense), then clears the FPI_PENDING flag.
+    ///
+    /// `fpi_fn` signature matches `write_fn`: (file_id, page_offset, is_large, data).
+    pub fn flush_dirty_pages_with_fpi(
+        &self,
+        max_pages: usize,
+        wal_flush_fn: &mut impl FnMut(u64) -> std::io::Result<()>,
+        fpi_fn: &mut impl FnMut(u64, u64, bool, &[u8]) -> std::io::Result<()>,
+        write_fn: &mut impl FnMut(u64, u64, bool, &[u8]) -> std::io::Result<()>,
+    ) -> usize {
+        let mut flushed = 0;
+        // Scan 4KB frames
+        for (idx, frame) in self.frames_4k.iter().enumerate() {
+            if flushed >= max_pages {
+                break;
+            }
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & FLAG_DIRTY != 0 && flags & frame::FLAG_VALID != 0 {
+                let file_id = frame.file_id.load(Ordering::Acquire);
+                let page_offset = frame.page_offset.load(Ordering::Acquire);
+                let page_lsn = frame.page_lsn.load(Ordering::Acquire);
+                if let Err(e) = wal_flush_fn(page_lsn) {
+                    tracing::error!("WAL flush for dirty page failed: {}", e);
+                    continue;
+                }
+                // FPI: write full-page image before page data if pending
+                if flags & FLAG_FPI_PENDING != 0 {
+                    let buf = self.buffers_4k[idx].read();
+                    if let Err(e) = fpi_fn(file_id, page_offset, false, &buf) {
+                        tracing::error!("FPI write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        continue;
+                    }
+                    drop(buf);
+                    frame.state.clear_fpi_pending();
+                }
+                {
+                    let buf = self.buffers_4k[idx].read();
+                    if let Err(e) = write_fn(file_id, page_offset, false, &buf) {
+                        tracing::error!("Dirty page write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        continue;
+                    }
+                }
+                frame.state.clear_dirty();
+                flushed += 1;
+            }
+        }
+        // Scan 64KB frames
+        for (idx, frame) in self.frames_64k.iter().enumerate() {
+            if flushed >= max_pages {
+                break;
+            }
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & FLAG_DIRTY != 0 && flags & frame::FLAG_VALID != 0 {
+                let file_id = frame.file_id.load(Ordering::Acquire);
+                let page_offset = frame.page_offset.load(Ordering::Acquire);
+                let page_lsn = frame.page_lsn.load(Ordering::Acquire);
+                if let Err(e) = wal_flush_fn(page_lsn) {
+                    tracing::error!("WAL flush for dirty page failed: {}", e);
+                    continue;
+                }
+                if flags & FLAG_FPI_PENDING != 0 {
+                    let buf = self.buffers_64k[idx].read();
+                    if let Err(e) = fpi_fn(file_id, page_offset, true, &buf) {
+                        tracing::error!("FPI write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        continue;
+                    }
+                    drop(buf);
+                    frame.state.clear_fpi_pending();
+                }
+                {
+                    let buf = self.buffers_64k[idx].read();
+                    if let Err(e) = write_fn(file_id, page_offset, true, &buf) {
+                        tracing::error!("Dirty page write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
                         continue;
                     }
                 }
@@ -650,5 +761,108 @@ mod tests {
 
         assert_eq!(flushed, 2);
         assert_eq!(cache.dirty_page_count(), 2);
+    }
+
+    #[test]
+    fn test_clear_all_fpi_pending_sets_on_valid_frames() {
+        let cache = PageCache::new(4, 2);
+
+        // Fetch 2 pages (makes them VALID)
+        let h1 = cache.fetch_page(1, 0, false, |_| Ok(())).unwrap();
+        cache.unpin_page(h1);
+        let h2 = cache.fetch_page(2, 0, false, |_| Ok(())).unwrap();
+        cache.unpin_page(h2);
+
+        // No frames should have FPI_PENDING yet
+        for frame in &cache.frames_4k {
+            assert!(!frame.state.is_fpi_pending());
+        }
+
+        // Checkpoint begin: set FPI on all valid frames
+        cache.clear_all_fpi_pending();
+
+        // The 2 valid frames should have FPI_PENDING
+        let mut fpi_count = 0;
+        for frame in &cache.frames_4k {
+            let val = frame.state.load();
+            let (_, _, flags) = FrameState::unpack(val);
+            if flags & frame::FLAG_VALID != 0 {
+                assert!(frame.state.is_fpi_pending());
+                fpi_count += 1;
+            }
+        }
+        assert_eq!(fpi_count, 2);
+    }
+
+    #[test]
+    fn test_flush_dirty_pages_with_fpi_calls_fpi_fn() {
+        use std::cell::Cell;
+
+        let cache = PageCache::new(4, 2);
+
+        // Fetch, dirty, and set FPI_PENDING on a page
+        let h = cache.fetch_page(1, 0, false, |buf| {
+            buf[0] = 0xCC;
+            Ok(())
+        }).unwrap();
+        cache.unpin_page(h);
+        cache.mark_dirty(1, 0, 100);
+
+        // Simulate checkpoint begin
+        cache.clear_all_fpi_pending();
+
+        let fpi_called = Cell::new(false);
+        let write_called = Cell::new(false);
+
+        let flushed = cache.flush_dirty_pages_with_fpi(
+            10,
+            &mut |_lsn| Ok(()),
+            &mut |_fid, _off, _large, data| {
+                // FPI should see the page data
+                assert_eq!(data[0], 0xCC);
+                fpi_called.set(true);
+                Ok(())
+            },
+            &mut |_fid, _off, _large, _data| {
+                // FPI must have been called BEFORE write
+                assert!(fpi_called.get());
+                write_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(flushed, 1);
+        assert!(fpi_called.get());
+        assert!(write_called.get());
+        // FPI_PENDING should be cleared after flush
+        let entry = cache.page_table.get(&(1, 0)).unwrap();
+        let (idx, _) = *entry;
+        assert!(!cache.frames_4k[idx as usize].state.is_fpi_pending());
+        assert_eq!(cache.dirty_page_count(), 0);
+    }
+
+    #[test]
+    fn test_flush_dirty_pages_with_fpi_skips_non_fpi() {
+        let cache = PageCache::new(4, 2);
+
+        // Fetch and dirty a page but do NOT set FPI_PENDING
+        let h = cache.fetch_page(1, 0, false, |_| Ok(())).unwrap();
+        cache.unpin_page(h);
+        cache.mark_dirty(1, 0, 100);
+
+        let mut fpi_called = false;
+
+        let flushed = cache.flush_dirty_pages_with_fpi(
+            10,
+            &mut |_| Ok(()),
+            &mut |_, _, _, _| {
+                fpi_called = true;
+                Ok(())
+            },
+            &mut |_, _, _, _| Ok(()),
+        );
+
+        assert_eq!(flushed, 1);
+        assert!(!fpi_called, "FPI should not be called when FPI_PENDING is not set");
     }
 }
