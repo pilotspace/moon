@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::persistence::fsync::fsync_file;
 use crate::persistence::page::{
-    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K,
+    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K, page_flags,
 };
 use crate::storage::tiered::SegmentHandle;
 
@@ -216,8 +216,29 @@ fn write_mpf_pages(
             }
         }
 
-        // Copy data after sub-header
-        if data_len > 0 {
+        // Copy data after sub-header, optionally LZ4-compressing large payloads.
+        // The sub-header is NEVER compressed -- only the data region after it.
+        if data_len > 256 {
+            let compressed = lz4_flex::compress_prepend_size(&data[data_offset..data_end]);
+            if compressed.len() < data_len {
+                // Compression helped -- write compressed data and set flag
+                let payload_start = MOONPAGE_HEADER_SIZE + sub_hdr_size;
+                page_buf[payload_start..payload_start + compressed.len()]
+                    .copy_from_slice(&compressed);
+                // Update header: set COMPRESSED flag and adjust payload_bytes
+                let new_payload = (sub_hdr_size + compressed.len()) as u32;
+                // Re-write flags with COMPRESSED bit
+                let flags = page_flags::COMPRESSED;
+                page_buf[6..8].copy_from_slice(&flags.to_le_bytes());
+                // Re-write payload_bytes
+                page_buf[20..24].copy_from_slice(&new_payload.to_le_bytes());
+            } else {
+                // Compression didn't help -- write raw data
+                let payload_start = MOONPAGE_HEADER_SIZE + sub_hdr_size;
+                page_buf[payload_start..payload_start + data_len]
+                    .copy_from_slice(&data[data_offset..data_end]);
+            }
+        } else if data_len > 0 {
             let payload_start = MOONPAGE_HEADER_SIZE + sub_hdr_size;
             page_buf[payload_start..payload_start + data_len]
                 .copy_from_slice(&data[data_offset..data_end]);
@@ -775,5 +796,60 @@ mod tests {
         // graph_data(0) should skip the 64-byte header + 16-byte sub-header
         let gd = ws.graph_data(0);
         assert_eq!(&gd[..200], &[0xEEu8; 200]);
+    }
+
+    #[test]
+    fn test_write_mpf_compressed_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("graph.mpf");
+
+        // 2KB of highly compressible repeating pattern
+        let mut data = Vec::with_capacity(2048);
+        for i in 0..2048 {
+            data.push((i % 4) as u8);
+        }
+
+        write_graph_mpf(&path, 1, &data).unwrap();
+
+        let file_bytes = std::fs::read(&path).unwrap();
+        // Should produce 1 page (4016 data capacity > 2048)
+        assert_eq!(file_bytes.len(), PAGE_4K);
+
+        let hdr = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
+        // COMPRESSED flag should be set since data_len=2048 > 256 and pattern is compressible
+        assert_ne!(
+            hdr.flags & page_flags::COMPRESSED, 0,
+            "COMPRESSED flag should be set for compressible data > 256 bytes"
+        );
+        // payload_bytes should be less than uncompressed (sub_hdr + 2048)
+        assert!(
+            (hdr.payload_bytes as usize) < VEC_GRAPH_SUB_HEADER_SIZE + 2048,
+            "compressed payload_bytes ({}) should be less than uncompressed ({})",
+            hdr.payload_bytes,
+            VEC_GRAPH_SUB_HEADER_SIZE + 2048,
+        );
+        // CRC should still be valid
+        assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_4K]));
+    }
+
+    #[test]
+    fn test_write_mpf_small_payload_not_compressed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("graph.mpf");
+
+        // 100 bytes -- below 256 threshold
+        let data = vec![0xABu8; 100];
+        write_graph_mpf(&path, 2, &data).unwrap();
+
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(file_bytes.len(), PAGE_4K);
+
+        let hdr = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
+        assert_eq!(
+            hdr.flags & page_flags::COMPRESSED, 0,
+            "COMPRESSED flag should NOT be set for small payloads"
+        );
+        // payload_bytes = sub_hdr(16) + 100 = 116
+        assert_eq!(hdr.payload_bytes as usize, VEC_GRAPH_SUB_HEADER_SIZE + 100);
     }
 }
