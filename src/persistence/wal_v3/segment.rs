@@ -60,6 +60,12 @@ impl WalSegment {
     }
 }
 
+/// Default minimum WAL size to retain after recycling (48MB).
+pub const DEFAULT_MIN_WAL_BYTES: u64 = 48 * 1024 * 1024;
+
+/// Default maximum WAL size before aggressive recycling (256MB).
+pub const DEFAULT_MAX_WAL_BYTES: u64 = 256 * 1024 * 1024;
+
 /// WAL v3 writer with segmented files, per-record LSN, and batched fsync.
 pub struct WalWriterV3 {
     shard_id: usize,
@@ -77,6 +83,10 @@ pub struct WalWriterV3 {
     base_lsn: u64,
     /// Current epoch for header metadata.
     epoch: u64,
+    /// Minimum WAL size in bytes to retain after recycling (design section 5.5: 48MB default).
+    min_wal_bytes: u64,
+    /// Maximum WAL size in bytes before aggressive recycling (design section 5.5: 256MB default).
+    max_wal_bytes: u64,
 }
 
 impl WalWriterV3 {
@@ -102,6 +112,8 @@ impl WalWriterV3 {
             next_lsn: 1,
             base_lsn: 0,
             epoch: 0,
+            min_wal_bytes: DEFAULT_MIN_WAL_BYTES,
+            max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
         };
 
         writer.open_new_segment()?;
@@ -167,6 +179,27 @@ impl WalWriterV3 {
     #[inline]
     pub fn wal_dir(&self) -> &Path {
         &self.wal_dir
+    }
+
+    /// Configure minimum and maximum WAL size bounds for recycling.
+    ///
+    /// - `min_bytes`: recycling stops when remaining WAL would drop below this.
+    /// - `max_bytes`: used by checkpoint trigger to force recycling when exceeded.
+    pub fn set_wal_bounds(&mut self, min_bytes: u64, max_bytes: u64) {
+        self.min_wal_bytes = min_bytes;
+        self.max_wal_bytes = max_bytes;
+    }
+
+    /// Return the configured minimum WAL size in bytes.
+    #[inline]
+    pub fn min_wal_bytes(&self) -> u64 {
+        self.min_wal_bytes
+    }
+
+    /// Return the configured maximum WAL size in bytes.
+    #[inline]
+    pub fn max_wal_bytes(&self) -> u64 {
+        self.max_wal_bytes
     }
 
     /// Rotate to a new segment: flush + fsync current, open next.
@@ -240,16 +273,30 @@ impl WalWriterV3 {
         file.write_all(&header)
     }
 
-    /// Delete WAL segment files whose records are fully before `redo_lsn`.
+    /// Delete WAL segment files whose records are fully before `redo_lsn`,
+    /// while respecting minimum WAL size bounds.
     ///
     /// Scans `*.wal` files in the WAL directory, reads the base_lsn from each
-    /// segment header (offset 28, u64 LE). If base_lsn < redo_lsn AND the
-    /// segment is not the currently active segment, the file is removed.
+    /// segment header (offset 28, u64 LE). Eligible segments (base_lsn < redo_lsn,
+    /// not the active segment) are deleted oldest-first, stopping when further
+    /// deletion would reduce total WAL size below `min_wal_bytes`.
     ///
     /// Called after checkpoint finalization when redo_lsn advances.
     /// Returns the number of segments recycled.
     pub fn recycle_segments_before(&self, redo_lsn: u64) -> std::io::Result<usize> {
-        let mut recycled = 0usize;
+        use std::io::Read as _;
+
+        // First pass: collect all .wal segments with their metadata.
+        struct SegInfo {
+            seq: u64,
+            base_lsn: u64,
+            file_size: u64,
+            path: PathBuf,
+        }
+
+        let mut all_segments: Vec<SegInfo> = Vec::new();
+        let mut total_wal_size: u64 = 0;
+
         let entries = fs::read_dir(&self.wal_dir)?;
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -257,34 +304,51 @@ impl WalWriterV3 {
             if !name_str.ends_with(".wal") {
                 continue;
             }
-            // Parse sequence number from filename
             let seq = match name_str.strip_suffix(".wal").and_then(|s| s.parse::<u64>().ok()) {
                 Some(s) => s,
                 None => continue,
             };
-            // Never delete the active segment
-            if seq >= self.current_sequence {
-                continue;
-            }
-            // Read base_lsn from header (offset 28..36)
             let path = entry.path();
+            let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            total_wal_size += file_size;
+
+            // Read base_lsn from header (offset 28..36)
             let mut header = [0u8; WAL_V3_HEADER_SIZE];
-            use std::io::Read as _;
             let file = fs::File::open(&path)?;
             let mut reader = std::io::BufReader::new(file);
-            if reader.read_exact(&mut header).is_err() {
+            let base_lsn = if reader.read_exact(&mut header).is_ok() {
+                u64::from_le_bytes(header[28..36].try_into().unwrap_or([0u8; 8]))
+            } else {
                 continue; // Truncated header, skip
+            };
+
+            all_segments.push(SegInfo { seq, base_lsn, file_size, path });
+        }
+
+        // Sort candidates by sequence ascending (oldest first).
+        all_segments.sort_by_key(|s| s.seq);
+
+        // Delete eligible candidates, respecting min_wal_bytes floor.
+        let mut recycled = 0usize;
+        for seg in &all_segments {
+            // Never delete the active segment.
+            if seg.seq >= self.current_sequence {
+                continue;
             }
-            let base_lsn = u64::from_le_bytes(
-                header[28..36].try_into().unwrap_or([0u8; 8]),
-            );
-            // If every record in this segment is before redo_lsn, safe to delete
-            if base_lsn > 0 && base_lsn < redo_lsn {
-                if let Err(e) = fs::remove_file(&path) {
-                    tracing::warn!("WAL segment recycle failed for {:?}: {}", path, e);
-                } else {
-                    recycled += 1;
-                }
+            // Only recycle segments whose records are fully before redo_lsn.
+            if seg.base_lsn == 0 || seg.base_lsn >= redo_lsn {
+                continue;
+            }
+            // Check min_wal_bytes floor: stop if removing this segment would
+            // drop total WAL below the minimum.
+            if total_wal_size.saturating_sub(seg.file_size) < self.min_wal_bytes {
+                break;
+            }
+            if let Err(e) = fs::remove_file(&seg.path) {
+                tracing::warn!("WAL segment recycle failed for {:?}: {}", seg.path, e);
+            } else {
+                total_wal_size -= seg.file_size;
+                recycled += 1;
             }
         }
         Ok(recycled)
@@ -444,6 +508,8 @@ mod tests {
 
         // Small segment size (512 bytes) to force multiple segments.
         let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        // Disable min floor for backward-compatible test behavior.
+        writer.set_wal_bounds(0, u64::MAX);
 
         // Write records and flush frequently to trigger segment rotation.
         // Each record is ~31 bytes; 512 - 64 (header) = 448 usable per segment.
@@ -486,5 +552,71 @@ mod tests {
         // Total count should have decreased.
         let after = count_wals();
         assert_eq!(after, before - recycled);
+    }
+
+    #[test]
+    fn test_recycle_respects_min_wal_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+
+        // Small segment size (512 bytes) to force multiple segments.
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        // Set min_wal_bytes to 1024 — recycling should keep at least 1024 bytes.
+        writer.set_wal_bounds(1024, 1_000_000);
+
+        // Write enough records to create 4+ segments.
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+
+        let active_seq = writer.current_segment_sequence();
+        assert!(active_seq >= 4, "should have 4+ segments, got {}", active_seq);
+
+        // Sum total WAL size on disk.
+        let total_wal_size = || -> u64 {
+            fs::read_dir(&wal_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+                .map(|e| fs::metadata(e.path()).map(|m| m.len()).unwrap_or(0))
+                .sum()
+        };
+        let before_size = total_wal_size();
+        assert!(before_size > 1024, "total WAL should exceed min_wal_bytes");
+
+        // Recycle with a high redo_lsn — all non-active segments are eligible.
+        let recycled = writer.recycle_segments_before(10_000).unwrap();
+        assert!(recycled >= 1, "should recycle at least 1 segment");
+
+        // Remaining WAL size must be >= min_wal_bytes (1024).
+        let after_size = total_wal_size();
+        assert!(
+            after_size >= 1024,
+            "remaining WAL size {} should be >= min_wal_bytes 1024",
+            after_size
+        );
+    }
+
+    #[test]
+    fn test_wal_bounds_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        assert_eq!(writer.min_wal_bytes(), DEFAULT_MIN_WAL_BYTES);
+        assert_eq!(writer.max_wal_bytes(), DEFAULT_MAX_WAL_BYTES);
+    }
+
+    #[test]
+    fn test_set_wal_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        writer.set_wal_bounds(100, 200);
+        assert_eq!(writer.min_wal_bytes(), 100);
+        assert_eq!(writer.max_wal_bytes(), 200);
     }
 }
