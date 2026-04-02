@@ -12,4 +12,5 @@ pub mod replay;
 pub mod snapshot;
 pub mod wal;
 pub mod page_cache;
+pub mod recovery;
 pub mod wal_v3;
