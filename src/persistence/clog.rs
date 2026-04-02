@@ -124,6 +124,44 @@ impl ClogPage {
     }
 }
 
+/// Scan a directory for CLOG page files (`clog-NNNNNN.page` format),
+/// load each, and return a `Vec<ClogPage>` sorted by page_index.
+pub fn scan_clog_dir(clog_dir: &std::path::Path) -> std::io::Result<Vec<ClogPage>> {
+    let mut pages = Vec::new();
+    if !clog_dir.exists() {
+        return Ok(pages);
+    }
+    for entry in std::fs::read_dir(clog_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.ends_with(".page") {
+            continue;
+        }
+        let data = std::fs::read(entry.path())?;
+        if data.len() < 4096 {
+            continue;
+        }
+        let buf: [u8; 4096] = match data[..4096].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Some(page) = ClogPage::from_page(&buf) {
+            pages.push(page);
+        }
+    }
+    pages.sort_by_key(|p| p.page_index());
+    Ok(pages)
+}
+
+/// Write a ClogPage to `{clog_dir}/clog-{page_index:06}.page`.
+pub fn write_clog_page(clog_dir: &std::path::Path, page: &ClogPage) -> std::io::Result<()> {
+    std::fs::create_dir_all(clog_dir)?;
+    let path = clog_dir.join(format!("clog-{:06}.page", page.page_index()));
+    std::fs::write(&path, page.to_page())?;
+    crate::persistence::fsync::fsync_file(&path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +314,38 @@ mod tests {
             };
             assert_eq!(page.get_status(i), expected, "txn {i}");
         }
+    }
+
+    #[test]
+    fn test_scan_clog_dir_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clog_dir = tmp.path().join("clog");
+
+        // Write 2 ClogPages to disk
+        let mut page0 = ClogPage::new(0);
+        page0.set_status(5, TxnStatus::Committed);
+        page0.set_status(10, TxnStatus::Aborted);
+        write_clog_page(&clog_dir, &page0).unwrap();
+
+        let mut page1 = ClogPage::new(1);
+        page1.set_status(TXNS_PER_PAGE + 3, TxnStatus::SubCommitted);
+        write_clog_page(&clog_dir, &page1).unwrap();
+
+        // Scan and verify
+        let pages = scan_clog_dir(&clog_dir).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].page_index(), 0);
+        assert_eq!(pages[1].page_index(), 1);
+        assert_eq!(pages[0].get_status(5), TxnStatus::Committed);
+        assert_eq!(pages[0].get_status(10), TxnStatus::Aborted);
+        assert_eq!(pages[1].get_status(TXNS_PER_PAGE + 3), TxnStatus::SubCommitted);
+    }
+
+    #[test]
+    fn test_scan_clog_dir_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clog_dir = tmp.path().join("nonexistent");
+        let pages = scan_clog_dir(&clog_dir).unwrap();
+        assert!(pages.is_empty());
     }
 }
