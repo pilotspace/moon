@@ -19,24 +19,166 @@ use crate::persistence::page::{
 };
 use crate::storage::tiered::SegmentHandle;
 
+// ── Per-page-type sub-header sizes (design §7.2-7.5) ──────────────────
+
+/// VecCodes sub-header size in bytes (design Section 7.2). Follows MoonPageHeader.
+pub const VEC_CODES_SUB_HEADER_SIZE: usize = 32;
+
+/// VecFull sub-header size in bytes (design Section 7.3). Follows MoonPageHeader.
+pub const VEC_FULL_SUB_HEADER_SIZE: usize = 24;
+
+/// VecGraph sub-header size in bytes (design Section 7.4). Follows MoonPageHeader.
+pub const VEC_GRAPH_SUB_HEADER_SIZE: usize = 16;
+
+/// VecMvcc sub-header size in bytes (design Section 7.5). Follows MoonPageHeader.
+pub const VEC_MVCC_SUB_HEADER_SIZE: usize = 8;
+
+/// Return the sub-header size for a given page type.
+/// Returns 0 for page types without sub-headers.
+#[inline]
+pub fn sub_header_size(page_type: PageType) -> usize {
+    match page_type {
+        PageType::VecCodes => VEC_CODES_SUB_HEADER_SIZE,
+        PageType::VecFull => VEC_FULL_SUB_HEADER_SIZE,
+        PageType::VecGraph => VEC_GRAPH_SUB_HEADER_SIZE,
+        PageType::VecMvcc => VEC_MVCC_SUB_HEADER_SIZE,
+        _ => 0,
+    }
+}
+
+/// Write VecCodes sub-header (32 bytes) into `buf` starting at offset 0.
+///
+/// Layout (design Section 7.2):
+/// ```text
+/// 0..8    collection_id  (u64 LE)
+/// 8..16   base_vector_id (u64 LE)
+/// 16..18  dimension      (u16 LE)
+/// 18..20  padded_dimension (u16 LE)
+/// 20      quantization   (u8)
+/// 21..23  bytes_per_code (u16 LE)
+/// 23..25  vector_count   (u16 LE)
+/// 25      has_sub_signs  (u8, 0 or 1)
+/// 26..32  reserved       (zeroed)
+/// ```
+pub fn write_vec_codes_sub_header(
+    buf: &mut [u8],
+    collection_id: u64,
+    base_vector_id: u64,
+    dimension: u16,
+    padded_dimension: u16,
+    quantization: u8,
+    bytes_per_code: u16,
+    vector_count: u16,
+    has_sub_signs: bool,
+) {
+    buf[0..8].copy_from_slice(&collection_id.to_le_bytes());
+    buf[8..16].copy_from_slice(&base_vector_id.to_le_bytes());
+    buf[16..18].copy_from_slice(&dimension.to_le_bytes());
+    buf[18..20].copy_from_slice(&padded_dimension.to_le_bytes());
+    buf[20] = quantization;
+    buf[21..23].copy_from_slice(&bytes_per_code.to_le_bytes());
+    buf[23..25].copy_from_slice(&vector_count.to_le_bytes());
+    buf[25] = if has_sub_signs { 1 } else { 0 };
+    // buf[26..32] reserved, already zeroed
+}
+
+/// Write VecFull sub-header (24 bytes) into `buf`.
+///
+/// Layout (design Section 7.3):
+/// ```text
+/// 0..8    collection_id    (u64 LE)
+/// 8..16   base_vector_id   (u64 LE)
+/// 16..18  dimension        (u16 LE)
+/// 18      element_type     (u8: F32=1 F16=2 BF16=3)
+/// 19      element_size     (u8)
+/// 20..22  vectors_per_page (u16 LE)
+/// 22..24  reserved         (zeroed)
+/// ```
+pub fn write_vec_full_sub_header(
+    buf: &mut [u8],
+    collection_id: u64,
+    base_vector_id: u64,
+    dimension: u16,
+    element_type: u8,
+    element_size: u8,
+    vectors_per_page: u16,
+) {
+    buf[0..8].copy_from_slice(&collection_id.to_le_bytes());
+    buf[8..16].copy_from_slice(&base_vector_id.to_le_bytes());
+    buf[16..18].copy_from_slice(&dimension.to_le_bytes());
+    buf[18] = element_type;
+    buf[19] = element_size;
+    buf[20..22].copy_from_slice(&vectors_per_page.to_le_bytes());
+    // buf[22..24] reserved, already zeroed
+}
+
+/// Write VecGraph sub-header (16 bytes) into `buf`.
+///
+/// Layout (design Section 7.4):
+/// ```text
+/// 0..4   base_node_id    (u32 LE)
+/// 4..6   nodes_per_page  (u16 LE)
+/// 6..8   max_degree      (u16 LE)
+/// 8      graph_type      (u8: HNSW=1 Vamana=2)
+/// 9      layer           (u8)
+/// 10..16 reserved        (zeroed)
+/// ```
+pub fn write_vec_graph_sub_header(
+    buf: &mut [u8],
+    base_node_id: u32,
+    nodes_per_page: u16,
+    max_degree: u16,
+    graph_type: u8,
+    layer: u8,
+) {
+    buf[0..4].copy_from_slice(&base_node_id.to_le_bytes());
+    buf[4..6].copy_from_slice(&nodes_per_page.to_le_bytes());
+    buf[6..8].copy_from_slice(&max_degree.to_le_bytes());
+    buf[8] = graph_type;
+    buf[9] = layer;
+    // buf[10..16] reserved, already zeroed
+}
+
+/// Write VecMvcc sub-header (8 bytes) into `buf`.
+///
+/// Layout (design Section 7.5):
+/// ```text
+/// 0..4  base_vector_id (u32 LE)
+/// 4..8  mvcc_count     (u32 LE)
+/// ```
+pub fn write_vec_mvcc_sub_header(buf: &mut [u8], base_vector_id: u32, mvcc_count: u32) {
+    buf[0..4].copy_from_slice(&base_vector_id.to_le_bytes());
+    buf[4..8].copy_from_slice(&mvcc_count.to_le_bytes());
+}
+
 /// Generic helper to write data as a sequence of MoonPage-format pages.
 ///
 /// Splits `data` into pages of `page_size`, each with a 64-byte MoonPage
-/// header. The payload region is `page_size - 64` bytes. Pages are zero-padded.
-/// CRC32C is computed over each page's payload region.
+/// header followed by a type-specific sub-header (size determined by
+/// `sub_header_size(page_type)`). The data payload follows the sub-header.
+/// Effective data capacity per page is `page_size - 64 - sub_hdr_size`.
+///
+/// The `payload_bytes` field in MoonPageHeader includes both the sub-header
+/// and the data bytes so that CRC32C covers the entire region after the
+/// 64-byte header (sub-header + data).
+///
+/// `sub_header_fn` is called for each page to populate the sub-header region.
+/// It receives `(sub_header_slice, page_index, data_bytes_in_page)`.
 fn write_mpf_pages(
     path: &Path,
     file_id: u64,
     page_type: PageType,
     data: &[u8],
+    sub_header_fn: Option<&dyn Fn(&mut [u8], usize, usize)>,
 ) -> std::io::Result<()> {
     let page_size = page_type.page_size();
-    let payload_capacity = page_size - MOONPAGE_HEADER_SIZE;
+    let sub_hdr_size = sub_header_size(page_type);
+    let data_capacity = page_size - MOONPAGE_HEADER_SIZE - sub_hdr_size;
 
     let page_count = if data.is_empty() {
         1 // Write at least one page even for empty data
     } else {
-        (data.len() + payload_capacity - 1) / payload_capacity
+        (data.len() + data_capacity - 1) / data_capacity
     };
 
     let mut file = std::fs::File::create(path)?;
@@ -46,32 +188,42 @@ fn write_mpf_pages(
         // Zero the page buffer
         page_buf.fill(0);
 
-        let data_offset = page_idx * payload_capacity;
-        let data_end = data.len().min(data_offset + payload_capacity);
-        let payload_len = if data_offset < data.len() {
+        let data_offset = page_idx * data_capacity;
+        let data_end = data.len().min(data_offset + data_capacity);
+        let data_len = if data_offset < data.len() {
             data_end - data_offset
         } else {
             0
         };
 
-        // Build header
+        // Build header -- payload_bytes covers sub-header + data
         let mut hdr = MoonPageHeader::new(page_type, page_idx as u64, file_id);
-        hdr.payload_bytes = payload_len as u32;
+        hdr.payload_bytes = (sub_hdr_size + data_len) as u32;
 
         // For MVCC pages, compute entry count (24 bytes per entry)
         if page_type == PageType::VecMvcc {
-            hdr.entry_count = (payload_len / 24) as u32;
+            hdr.entry_count = (data_len / 24) as u32;
         }
 
         hdr.write_to(&mut page_buf);
 
-        // Copy payload data
-        if payload_len > 0 {
-            page_buf[MOONPAGE_HEADER_SIZE..MOONPAGE_HEADER_SIZE + payload_len]
+        // Write sub-header (region is already zeroed)
+        if sub_hdr_size > 0 {
+            if let Some(f) = sub_header_fn {
+                let sub_start = MOONPAGE_HEADER_SIZE;
+                let sub_end = sub_start + sub_hdr_size;
+                f(&mut page_buf[sub_start..sub_end], page_idx, data_len);
+            }
+        }
+
+        // Copy data after sub-header
+        if data_len > 0 {
+            let payload_start = MOONPAGE_HEADER_SIZE + sub_hdr_size;
+            page_buf[payload_start..payload_start + data_len]
                 .copy_from_slice(&data[data_offset..data_end]);
         }
 
-        // Compute CRC32C over payload region
+        // Compute CRC32C over payload region (sub-header + data)
         MoonPageHeader::compute_checksum(&mut page_buf);
 
         file.write_all(&page_buf)?;
@@ -86,36 +238,57 @@ fn write_mpf_pages(
 
 /// Write TQ quantized codes to a .mpf file with 64KB VecCodes pages.
 ///
-/// Each page holds up to 65472 bytes of payload (65536 - 64 header).
+/// Each page holds up to 65440 bytes of data (65536 - 64 header - 32 sub-header).
+/// The 32-byte VecCodes sub-header is written with default values (zeroed
+/// collection/dimension fields). Callers can use `write_codes_mpf_with_meta`
+/// for populated sub-headers once collection metadata is available at write time.
 pub fn write_codes_mpf(path: &Path, file_id: u64, codes_data: &[u8]) -> std::io::Result<()> {
-    write_mpf_pages(path, file_id, PageType::VecCodes, codes_data)
+    let sub_fn = |buf: &mut [u8], _page_idx: usize, data_len: usize| {
+        // Default sub-header: vector_count derived from data, rest zeroed
+        // quantization=4 (TQ4 default), bytes_per_code=0
+        write_vec_codes_sub_header(buf, 0, 0, 0, 0, 4, 0, data_len as u16, false);
+    };
+    write_mpf_pages(path, file_id, PageType::VecCodes, codes_data, Some(&sub_fn))
 }
 
 /// Write HNSW graph adjacency data to a .mpf file with 4KB VecGraph pages.
 ///
-/// Each page holds up to 4032 bytes of payload (4096 - 64 header).
+/// Each page holds up to 4016 bytes of data (4096 - 64 header - 16 sub-header).
+/// The 16-byte VecGraph sub-header is written with graph_type=1 (HNSW), layer=0.
 pub fn write_graph_mpf(path: &Path, file_id: u64, graph_data: &[u8]) -> std::io::Result<()> {
-    write_mpf_pages(path, file_id, PageType::VecGraph, graph_data)
+    let sub_fn = |buf: &mut [u8], _page_idx: usize, _data_len: usize| {
+        write_vec_graph_sub_header(buf, 0, 0, 0, 1, 0); // HNSW=1, layer=0
+    };
+    write_mpf_pages(path, file_id, PageType::VecGraph, graph_data, Some(&sub_fn))
 }
 
-/// Write full-precision f32 vectors to a .mpf file with 64KB VecFull pages.
+/// Write full-precision vectors to a .mpf file with 64KB VecFull pages.
 ///
-/// Each page holds up to 65472 bytes of payload (65536 - 64 header).
+/// Each page holds up to 65448 bytes of data (65536 - 64 header - 24 sub-header).
+/// The 24-byte VecFull sub-header is written with element_type=2 (F16),
+/// element_size=2.
 pub fn write_vectors_mpf(
     path: &Path,
     file_id: u64,
     vectors_data: &[u8],
 ) -> std::io::Result<()> {
-    write_mpf_pages(path, file_id, PageType::VecFull, vectors_data)
+    let sub_fn = |buf: &mut [u8], _page_idx: usize, _data_len: usize| {
+        write_vec_full_sub_header(buf, 0, 0, 0, 2, 2, 0); // F16=2, elem_size=2
+    };
+    write_mpf_pages(path, file_id, PageType::VecFull, vectors_data, Some(&sub_fn))
 }
 
 /// Write MVCC metadata entries to a .mpf file with 4KB VecMvcc pages.
 ///
 /// Each 24-byte entry: internal_id(4) + global_id(4) + insert_lsn(8) +
 /// delete_lsn(4) + undo_ptr(4). Each page holds 167 entries max
-/// ((4096 - 64) / 24 = 167, with 24 bytes unused for alignment).
+/// ((4096 - 64 - 8) / 24 = 167, with 16 bytes unused for alignment).
 pub fn write_mvcc_mpf(path: &Path, file_id: u64, mvcc_data: &[u8]) -> std::io::Result<()> {
-    write_mpf_pages(path, file_id, PageType::VecMvcc, mvcc_data)
+    let sub_fn = |buf: &mut [u8], _page_idx: usize, data_len: usize| {
+        let entry_count = (data_len / 24) as u32;
+        write_vec_mvcc_sub_header(buf, 0, entry_count);
+    };
+    write_mpf_pages(path, file_id, PageType::VecMvcc, mvcc_data, Some(&sub_fn))
 }
 
 /// Memory-mapped warm segment files for zero-copy access.
@@ -220,24 +393,24 @@ impl WarmSegmentFiles {
         })
     }
 
-    /// Return the payload bytes of a codes page (skipping the 64-byte header).
+    /// Return the data bytes of a codes page (skipping header + sub-header).
     ///
     /// # Panics
     ///
     /// Panics if `page_index` is out of range.
     pub fn codes_data(&self, page_index: usize) -> &[u8] {
-        let start = page_index * PAGE_64K + MOONPAGE_HEADER_SIZE;
+        let start = page_index * PAGE_64K + MOONPAGE_HEADER_SIZE + VEC_CODES_SUB_HEADER_SIZE;
         let end = (page_index + 1) * PAGE_64K;
         &self.codes[start..end]
     }
 
-    /// Return the payload bytes of a graph page (skipping the 64-byte header).
+    /// Return the data bytes of a graph page (skipping header + sub-header).
     ///
     /// # Panics
     ///
     /// Panics if `page_index` is out of range.
     pub fn graph_data(&self, page_index: usize) -> &[u8] {
-        let start = page_index * PAGE_4K + MOONPAGE_HEADER_SIZE;
+        let start = page_index * PAGE_4K + MOONPAGE_HEADER_SIZE + VEC_GRAPH_SUB_HEADER_SIZE;
         let end = (page_index + 1) * PAGE_4K;
         &self.graph[start..end]
     }
@@ -263,30 +436,39 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("codes.mpf");
 
-        // Write 100KB of codes -- should produce 2 pages (64KB each, 65472 payload)
+        // Data capacity per page = 65536 - 64 - 32 = 65440
+        let data_cap = PAGE_64K - MOONPAGE_HEADER_SIZE - VEC_CODES_SUB_HEADER_SIZE;
+        assert_eq!(data_cap, 65440);
+
+        // Write 100KB of codes -- should produce 2 pages
         let data = vec![0xABu8; 100_000];
         write_codes_mpf(&path, 42, &data).unwrap();
 
         let file_bytes = std::fs::read(&path).unwrap();
-        // Should be exactly 2 * 64KB = 131072 bytes
         assert_eq!(file_bytes.len(), 2 * PAGE_64K);
 
-        // Verify page 0 header
+        // Verify page 0 header (payload_bytes = sub_hdr + data = 32 + 65440 = 65472)
         let hdr0 = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr0.magic, MOONPAGE_MAGIC);
         assert_eq!(hdr0.page_type, PageType::VecCodes);
         assert_eq!(hdr0.page_id, 0);
         assert_eq!(hdr0.file_id, 42);
-        assert_eq!(hdr0.payload_bytes as usize, PAGE_64K - MOONPAGE_HEADER_SIZE);
+        assert_eq!(
+            hdr0.payload_bytes as usize,
+            VEC_CODES_SUB_HEADER_SIZE + data_cap,
+        );
 
         // Verify page 0 CRC32C
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_64K]));
 
-        // Verify page 1 header
+        // Verify page 1 header (remaining data = 100000 - 65440 = 34560)
         let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_64K..PAGE_64K + MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr1.page_type, PageType::VecCodes);
         assert_eq!(hdr1.page_id, 1);
-        assert_eq!(hdr1.payload_bytes as usize, 100_000 - (PAGE_64K - MOONPAGE_HEADER_SIZE));
+        assert_eq!(
+            hdr1.payload_bytes as usize,
+            VEC_CODES_SUB_HEADER_SIZE + (100_000 - data_cap),
+        );
 
         // Verify page 1 CRC32C
         assert!(MoonPageHeader::verify_checksum(&file_bytes[PAGE_64K..2 * PAGE_64K]));
@@ -297,26 +479,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("graph.mpf");
 
-        // Write 5000 bytes of graph data -- should produce 2 pages (4KB each, 4032 payload)
+        // Data capacity per page = 4096 - 64 - 16 = 4016
+        let data_cap = PAGE_4K - MOONPAGE_HEADER_SIZE - VEC_GRAPH_SUB_HEADER_SIZE;
+        assert_eq!(data_cap, 4016);
+
+        // Write 5000 bytes of graph data -- should produce 2 pages
         let data = vec![0xCDu8; 5000];
         write_graph_mpf(&path, 7, &data).unwrap();
 
         let file_bytes = std::fs::read(&path).unwrap();
         assert_eq!(file_bytes.len(), 2 * PAGE_4K);
 
-        // Verify page 0
+        // Verify page 0 (payload_bytes = sub_hdr + data = 16 + 4016 = 4032)
         let hdr0 = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr0.page_type, PageType::VecGraph);
         assert_eq!(hdr0.page_id, 0);
         assert_eq!(hdr0.file_id, 7);
-        assert_eq!(hdr0.payload_bytes as usize, PAGE_4K - MOONPAGE_HEADER_SIZE);
+        assert_eq!(
+            hdr0.payload_bytes as usize,
+            VEC_GRAPH_SUB_HEADER_SIZE + data_cap,
+        );
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_4K]));
 
-        // Verify page 1
+        // Verify page 1 (remaining data = 5000 - 4016 = 984)
         let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_4K..PAGE_4K + MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr1.page_type, PageType::VecGraph);
         assert_eq!(hdr1.page_id, 1);
-        assert_eq!(hdr1.payload_bytes as usize, 5000 - (PAGE_4K - MOONPAGE_HEADER_SIZE));
+        assert_eq!(
+            hdr1.payload_bytes as usize,
+            VEC_GRAPH_SUB_HEADER_SIZE + (5000 - data_cap),
+        );
         assert!(MoonPageHeader::verify_checksum(&file_bytes[PAGE_4K..2 * PAGE_4K]));
     }
 
@@ -324,6 +516,10 @@ mod tests {
     fn test_write_mvcc_mpf_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mvcc.mpf");
+
+        // Data capacity per page = 4096 - 64 - 8 = 4024
+        let data_cap = PAGE_4K - MOONPAGE_HEADER_SIZE - VEC_MVCC_SUB_HEADER_SIZE;
+        assert_eq!(data_cap, 4024);
 
         // Write 200 entries * 24 bytes = 4800 bytes
         let entry_count = 200;
@@ -340,19 +536,19 @@ mod tests {
         write_mvcc_mpf(&path, 100, &data).unwrap();
 
         let file_bytes = std::fs::read(&path).unwrap();
-        // 4800 bytes / 4032 payload per page = 2 pages
+        // 4800 bytes / 4024 data-cap per page = 2 pages
         assert_eq!(file_bytes.len(), 2 * PAGE_4K);
 
-        // Page 0: 4032 bytes = 168 entries (168 * 24 = 4032)
+        // Page 0: data = 4024, entries = 4024/24 = 167
         let hdr0 = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr0.page_type, PageType::VecMvcc);
-        assert_eq!(hdr0.entry_count, 168); // 4032 / 24 = 168
+        assert_eq!(hdr0.entry_count, 167); // 4024 / 24 = 167
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_4K]));
 
-        // Page 1: remaining 768 bytes = 32 entries
+        // Page 1: remaining 776 bytes = 32 entries (776 / 24 = 32)
         let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_4K..PAGE_4K + MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr1.page_type, PageType::VecMvcc);
-        assert_eq!(hdr1.entry_count, 32); // 768 / 24 = 32
+        assert_eq!(hdr1.entry_count, 32); // 776 / 24 = 32
         assert!(MoonPageHeader::verify_checksum(&file_bytes[PAGE_4K..2 * PAGE_4K]));
     }
 
@@ -386,7 +582,8 @@ mod tests {
 
         let hdr = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(hdr.page_type, PageType::VecFull);
-        assert_eq!(hdr.payload_bytes, 2000);
+        // payload_bytes = sub_hdr(24) + data(2000) = 2024
+        assert_eq!(hdr.payload_bytes as usize, VEC_FULL_SUB_HEADER_SIZE + 2000);
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_64K]));
     }
 
@@ -403,11 +600,13 @@ mod tests {
         assert_eq!(file_bytes.len(), PAGE_64K);
 
         let hdr = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
-        assert_eq!(hdr.payload_bytes, 100);
+        // payload_bytes = sub_hdr(32) + data(100) = 132
+        assert_eq!(hdr.payload_bytes as usize, VEC_CODES_SUB_HEADER_SIZE + 100);
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_64K]));
 
-        // Verify payload content
-        assert_eq!(&file_bytes[MOONPAGE_HEADER_SIZE..MOONPAGE_HEADER_SIZE + 100], &[0xFFu8; 100]);
+        // Verify data content (after header + sub-header)
+        let data_start = MOONPAGE_HEADER_SIZE + VEC_CODES_SUB_HEADER_SIZE;
+        assert_eq!(&file_bytes[data_start..data_start + 100], &[0xFFu8; 100]);
     }
 
     // --- WarmSegmentFiles tests ---
@@ -433,9 +632,9 @@ mod tests {
         let handle = SegmentHandle::new(1, seg_dir.clone());
         let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
 
-        // codes_data should return payload (skip header)
+        // codes_data should return data only (skip header + sub-header)
         let page0_data = ws.codes_data(0);
-        assert_eq!(page0_data.len(), PAGE_64K - MOONPAGE_HEADER_SIZE);
+        assert_eq!(page0_data.len(), PAGE_64K - MOONPAGE_HEADER_SIZE - VEC_CODES_SUB_HEADER_SIZE);
         // First 1000 bytes should be our data
         assert_eq!(&page0_data[..1000], &[0xAAu8; 1000]);
 
@@ -553,13 +752,13 @@ mod tests {
         let handle = SegmentHandle::new(7, seg_dir.clone());
         let ws = WarmSegmentFiles::open(&seg_dir, handle, false).unwrap();
 
-        // codes_data(0) should skip the 64-byte header
+        // codes_data(0) should skip the 64-byte header + 32-byte sub-header
         let cd = ws.codes_data(0);
         for i in 0..500 {
             assert_eq!(cd[i], (i & 0xFF) as u8, "codes byte {i} mismatch");
         }
 
-        // graph_data(0) should skip the 64-byte header
+        // graph_data(0) should skip the 64-byte header + 16-byte sub-header
         let gd = ws.graph_data(0);
         assert_eq!(&gd[..200], &[0xEEu8; 200]);
     }
