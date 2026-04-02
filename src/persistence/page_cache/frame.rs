@@ -237,6 +237,28 @@ impl FrameState {
         }
     }
 
+    /// Clear the VALID flag, preserving all other bits.
+    ///
+    /// Used by explicit PageCache eviction (memory pressure cascade) to mark
+    /// a frame as no longer containing a valid page.
+    #[inline]
+    pub fn clear_valid(&self) {
+        loop {
+            let old = self.state.load(Ordering::Acquire);
+            let new = old & !(FLAG_VALID as u32);
+            if old == new {
+                return;
+            }
+            if self
+                .state
+                .compare_exchange_weak(old, new, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// Check if this frame can be evicted:
     /// refcount == 0, usage_count == 0, and IO_IN_PROGRESS not set.
     #[inline]

@@ -286,6 +286,52 @@ impl PageCache {
         frames[handle.frame_index as usize].state.unpin();
     }
 
+    /// Explicitly evict up to `max_frames` unpinned, non-dirty frames using clock-sweep.
+    ///
+    /// Returns the number of frames evicted. Used by memory pressure cascade
+    /// to proactively free PageCache memory before resorting to KV eviction.
+    pub fn evict_cold_frames(&self, max_frames: usize) -> usize {
+        let mut evicted = 0;
+        // Sweep 4KB frames first (more numerous, smaller payoff per frame)
+        for _ in 0..max_frames {
+            if evicted >= max_frames {
+                break;
+            }
+            if let Some(victim_idx) = self.sweep_4k.find_victim(&self.frames_4k) {
+                let frame = &self.frames_4k[victim_idx];
+                let val = frame.state.load();
+                let (_, _, flags) = FrameState::unpack(val);
+                // Only evict non-dirty, valid frames
+                if flags & FLAG_DIRTY == 0 && flags & frame::FLAG_VALID != 0 {
+                    let old_fid = frame.file_id.load(Ordering::Acquire);
+                    let old_off = frame.page_offset.load(Ordering::Acquire);
+                    self.page_table.remove(&(old_fid, old_off));
+                    frame.state.clear_valid();
+                    evicted += 1;
+                }
+            }
+        }
+        // Sweep 64KB frames (fewer but larger payoff per frame)
+        for _ in 0..max_frames {
+            if evicted >= max_frames {
+                break;
+            }
+            if let Some(victim_idx) = self.sweep_64k.find_victim(&self.frames_64k) {
+                let frame = &self.frames_64k[victim_idx];
+                let val = frame.state.load();
+                let (_, _, flags) = FrameState::unpack(val);
+                if flags & FLAG_DIRTY == 0 && flags & frame::FLAG_VALID != 0 {
+                    let old_fid = frame.file_id.load(Ordering::Acquire);
+                    let old_off = frame.page_offset.load(Ordering::Acquire);
+                    self.page_table.remove(&(old_fid, old_off));
+                    frame.state.clear_valid();
+                    evicted += 1;
+                }
+            }
+        }
+        evicted
+    }
+
     /// Count the number of dirty pages across both pools.
     ///
     /// Used by checkpoint logic to determine how many pages need flushing.

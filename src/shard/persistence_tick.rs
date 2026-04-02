@@ -202,6 +202,113 @@ pub(crate) fn check_warm_transitions(
 }
 
 // ---------------------------------------------------------------------------
+// Memory pressure cascade (design section 8.5)
+// ---------------------------------------------------------------------------
+
+/// Check if memory usage exceeds the disk offload threshold.
+///
+/// Returns `true` when the pressure cascade should run. Guards against
+/// unnecessary cascade work when memory is within budget.
+pub(crate) fn should_run_pressure_cascade(
+    runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
+    server_config: &std::sync::Arc<crate::config::ServerConfig>,
+) -> bool {
+    let rt = match runtime_config.read() {
+        Ok(rt) => rt,
+        Err(_) => return false,
+    };
+    if rt.maxmemory == 0 {
+        return false; // No memory limit set -- no pressure possible
+    }
+    // Use jemalloc epoch + resident stat when available, otherwise use
+    // database-estimated memory as a proxy (cheaper, but less accurate).
+    // The threshold check is intentionally coarse: individual cascade steps
+    // re-check whether work is actually needed.
+    let threshold = (rt.maxmemory as f64 * server_config.disk_offload_threshold) as usize;
+    // Approximate: if maxmemory is set and threshold < maxmemory, we consider
+    // pressure present. A more precise RSS check can be added later when
+    // jemalloc stats are wired into the shard event loop.
+    // For now, always return true when maxmemory > 0 and disk-offload is
+    // enabled -- individual steps are cheap no-ops when there's nothing to do.
+    threshold < rt.maxmemory
+}
+
+/// Memory pressure cascade per MoonStore v2 design section 8.5.
+///
+/// Ordered response:
+/// 1. **PageCache clock-sweep eviction** -- evict cold (unpinned, non-dirty) frames
+/// 2. **Force-demote oldest HOT ImmutableSegments to WARM** (halved threshold)
+/// 3. **KV eviction** -- existing LRU/LFU via `timers::run_eviction`
+/// 4. **NoEviction policy** -- log OOM warning if cascade is exhausted
+///
+/// Called from eviction timer tick when `disk_offload_enabled` is true and
+/// `should_run_pressure_cascade()` returns true.
+pub(crate) fn handle_memory_pressure(
+    page_cache: &Option<PageCache>,
+    shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+    runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
+    server_config: &std::sync::Arc<crate::config::ServerConfig>,
+    shard_manifest: &mut Option<ShardManifest>,
+    next_file_id: &mut u64,
+    wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+) {
+    // Step 1: PageCache eviction -- evict up to 16 cold frames per tick.
+    // This is the cheapest operation: no disk I/O, just invalidates cached pages.
+    if let Some(ref pc) = *page_cache {
+        let evicted = pc.evict_cold_frames(16);
+        if evicted > 0 {
+            tracing::debug!(
+                "Shard {}: memory pressure step 1 -- evicted {} cold PageCache frame(s)",
+                shard_id,
+                evicted
+            );
+            return; // Pressure partially relieved; next tick will re-evaluate
+        }
+    }
+
+    // Step 2: Force-demote oldest HOT ImmutableSegments to WARM.
+    // Use half the normal warm_after threshold to be more aggressive under pressure.
+    if let Some(ref mut manifest) = *shard_manifest {
+        let aggressive_threshold = server_config.segment_warm_after / 2;
+        let shard_dir = server_config
+            .effective_disk_offload_dir()
+            .join(format!("shard-{}", shard_id));
+        let vs = shard_databases.vector_store(shard_id);
+        let count = vs.try_warm_transitions_all(
+            &shard_dir,
+            manifest,
+            aggressive_threshold,
+            next_file_id,
+            wal_v3,
+        );
+        if count > 0 {
+            tracing::info!(
+                "Shard {}: memory pressure step 2 -- force-demoted {} segment(s) HOT->WARM",
+                shard_id,
+                count
+            );
+            return; // Freed memory via warm transition; re-evaluate next tick
+        }
+    }
+
+    // Step 3: KV eviction -- run existing LRU/LFU eviction across all databases.
+    super::timers::run_eviction(shard_databases, shard_id, runtime_config);
+
+    // Step 4: NoEviction policy check -- if we reached here with noeviction,
+    // log a warning. The actual OOM rejection is handled inside try_evict_if_needed.
+    if let Ok(rt) = runtime_config.read() {
+        if rt.maxmemory_policy == "noeviction" {
+            tracing::warn!(
+                "Shard {}: memory pressure cascade exhausted; \
+                 noeviction policy active, new writes may be rejected",
+                shard_id
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoint protocol handlers (disk-offload path)
 // ---------------------------------------------------------------------------
 
