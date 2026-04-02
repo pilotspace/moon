@@ -3,6 +3,7 @@
 //! Truly immutable after construction -- no locks needed for search.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
@@ -54,6 +55,8 @@ pub struct ImmutableSegment {
     collection_meta: Arc<CollectionMetadata>,
     live_count: u32,
     total_count: u32,
+    /// Timestamp when this segment was created (for warm tier age-based transition).
+    created_at: Instant,
 }
 
 impl ImmutableSegment {
@@ -83,6 +86,7 @@ impl ImmutableSegment {
             collection_meta,
             live_count,
             total_count,
+            created_at: Instant::now(),
         }
     }
 
@@ -341,6 +345,32 @@ impl ImmutableSegment {
         }
     }
 
+    /// Timestamp when this segment was created (compaction time).
+    pub fn created_at(&self) -> Instant {
+        self.created_at
+    }
+
+    /// Segment age in seconds since creation.
+    pub fn age_secs(&self) -> u64 {
+        self.created_at.elapsed().as_secs()
+    }
+
+    /// Serialize MVCC headers to raw bytes for warm tier .mpf writing.
+    ///
+    /// Each entry: internal_id(u32 LE) + global_id(u32 LE) + key_hash(u64 LE) +
+    /// insert_lsn(u64 LE) + delete_lsn(u64 LE) = 32 bytes.
+    pub fn mvcc_raw_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.mvcc.len() * 32);
+        for h in &self.mvcc {
+            buf.extend_from_slice(&h.internal_id.to_le_bytes());
+            buf.extend_from_slice(&h.global_id.to_le_bytes());
+            buf.extend_from_slice(&h.key_hash.to_le_bytes());
+            buf.extend_from_slice(&h.insert_lsn.to_le_bytes());
+            buf.extend_from_slice(&h.delete_lsn.to_le_bytes());
+        }
+        buf
+    }
+
     /// Flat TQ-ADC scan: brute-force over all 4-bit codes. 100% recall.
     ///
     /// Skips HNSW entirely — sequential scan of nibble-packed TQ codes.
@@ -432,6 +462,68 @@ mod tests {
     use crate::vector::distance;
     use crate::vector::turbo_quant::collection::QuantizationConfig;
     use crate::vector::types::DistanceMetric;
+
+    #[test]
+    fn test_immutable_segment_has_created_at() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        ));
+        let empty_graph = HnswGraph::new(
+            0, 16, 32, 0, 0,
+            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+
+        let seg = ImmutableSegment::new(
+            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
+            Vec::new(), 16, Vec::new(), collection, 0, 0,
+        );
+        // created_at should be very recent
+        assert!(seg.age_secs() < 2);
+        // created_at() should be accessible
+        let _t = seg.created_at();
+    }
+
+    #[test]
+    fn test_mvcc_raw_bytes_roundtrip() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+        ));
+        let empty_graph = HnswGraph::new(
+            0, 16, 32, 0, 0,
+            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+
+        let mvcc = vec![
+            MvccHeader { internal_id: 0, global_id: 10, key_hash: 0xDEAD, insert_lsn: 1, delete_lsn: 0 },
+            MvccHeader { internal_id: 1, global_id: 11, key_hash: 0xBEEF, insert_lsn: 2, delete_lsn: 5 },
+        ];
+        let seg = ImmutableSegment::new(
+            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
+            Vec::new(), 16, mvcc, collection, 2, 2,
+        );
+
+        let raw = seg.mvcc_raw_bytes();
+        // 2 entries * 32 bytes each = 64 bytes
+        assert_eq!(raw.len(), 64);
+
+        // Verify first entry
+        let id0 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        assert_eq!(id0, 0);
+        let gid0 = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        assert_eq!(gid0, 10);
+        let kh0 = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(kh0, 0xDEAD);
+    }
 
     #[test]
     fn test_immutable_segment_created() {
