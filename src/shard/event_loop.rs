@@ -390,11 +390,10 @@ impl super::Shard {
                 None
             };
 
-        // Per-shard warm transition state (only when disk-offload enabled).
-        // ShardManifest and next_file_id are needed for warm tier transitions.
-        // TODO(moonstore-v2): These should come from the actual shard manifest instance
-        // once full disk-offload wiring is complete. For now, create per-shard instances.
-        let mut warm_manifest: Option<crate::persistence::manifest::ShardManifest> =
+        // Per-shard manifest for tracking segment files and checkpoint state.
+        // Used by both checkpoint protocol (handle_checkpoint_tick) and warm
+        // tier transitions (check_warm_transitions).
+        let mut shard_manifest: Option<crate::persistence::manifest::ShardManifest> =
             if server_config.disk_offload_enabled() {
                 let shard_dir = server_config.effective_disk_offload_dir()
                     .join(format!("shard-{}", shard_id));
@@ -404,7 +403,7 @@ impl super::Shard {
                     match crate::persistence::manifest::ShardManifest::open(&manifest_path) {
                         Ok(m) => Some(m),
                         Err(e) => {
-                            tracing::warn!("Shard {}: warm manifest open failed: {}", shard_id, e);
+                            tracing::warn!("Shard {}: shard manifest open failed: {}", shard_id, e);
                             None
                         }
                     }
@@ -412,7 +411,7 @@ impl super::Shard {
                     match crate::persistence::manifest::ShardManifest::create(&manifest_path) {
                         Ok(m) => Some(m),
                         Err(e) => {
-                            tracing::warn!("Shard {}: warm manifest create failed: {}", shard_id, e);
+                            tracing::warn!("Shard {}: shard manifest create failed: {}", shard_id, e);
                             None
                         }
                     }
@@ -420,7 +419,7 @@ impl super::Shard {
             } else {
                 None
             };
-        let mut warm_next_file_id: u64 = 1;
+        let mut next_file_id: u64 = 1;
 
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
@@ -674,7 +673,7 @@ impl super::Shard {
 
                     // Checkpoint protocol tick (disk-offload only)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut warm_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
                         persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
                         if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
@@ -703,7 +702,7 @@ impl super::Shard {
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.tick() => {
                     if server_config.disk_offload_enabled() {
-                        if let Some(ref mut manifest) = warm_manifest {
+                        if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
                             persistence_tick::check_warm_transitions(
@@ -711,7 +710,7 @@ impl super::Shard {
                                 &shard_dir,
                                 manifest,
                                 server_config.segment_warm_after,
-                                &mut warm_next_file_id,
+                                &mut next_file_id,
                                 shard_id,
                             );
                         }
@@ -943,7 +942,7 @@ impl super::Shard {
 
                     // Checkpoint protocol tick (disk-offload only)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut warm_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
                         persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
                         if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
@@ -959,7 +958,7 @@ impl super::Shard {
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.tick() => {
                     if server_config.disk_offload_enabled() {
-                        if let Some(ref mut manifest) = warm_manifest {
+                        if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
                             persistence_tick::check_warm_transitions(
@@ -967,7 +966,7 @@ impl super::Shard {
                                 &shard_dir,
                                 manifest,
                                 server_config.segment_warm_after,
-                                &mut warm_next_file_id,
+                                &mut next_file_id,
                                 shard_id,
                             );
                         }
