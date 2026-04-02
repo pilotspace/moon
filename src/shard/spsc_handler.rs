@@ -942,10 +942,6 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                             let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
                             // Key hash for the entry
                             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
-                            // Assign global point ID and record key mapping
-                            let point_id = idx.next_point_id;
-                            idx.next_point_id += 1;
-                            idx.id_to_key.insert(point_id, bytes::Bytes::copy_from_slice(key));
                             // Append to mutable segment
                             let snap = idx.segments.load();
                             let internal_id =
