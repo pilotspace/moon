@@ -159,6 +159,19 @@ pub(crate) fn flush_wal_if_needed(wal_writer: &mut Option<WalWriter>) {
     }
 }
 
+/// Flush WAL v3 if buffer exceeds threshold (1ms tick -- mirrors v2 pattern).
+///
+/// Only active when disk-offload is enabled and WalWriterV3 was successfully initialized.
+pub(crate) fn flush_wal_v3_if_needed(
+    wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+) {
+    if let Some(wal) = wal_v3 {
+        if let Err(e) = wal.flush_if_needed() {
+            tracing::error!("WAL v3 flush failed: {}", e);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Warm tier transition handler (disk-offload path)
 // ---------------------------------------------------------------------------

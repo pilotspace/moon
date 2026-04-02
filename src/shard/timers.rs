@@ -61,3 +61,17 @@ pub(crate) fn sync_wal(wal_writer: &mut Option<WalWriter>) {
         }
     }
 }
+
+/// WAL v3 fsync on 1-second interval (mirrors v2 everysec pattern).
+///
+/// Calls `flush_sync()` which writes buffered data and fsyncs the segment file.
+/// Only active when disk-offload is enabled and WalWriterV3 was successfully initialized.
+pub(crate) fn sync_wal_v3(
+    wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+) {
+    if let Some(wal) = wal_v3 {
+        if let Err(e) = wal.flush_sync() {
+            tracing::error!("WAL v3 sync failed: {}", e);
+        }
+    }
+}
