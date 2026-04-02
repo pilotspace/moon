@@ -745,9 +745,27 @@ impl super::Shard {
                 _ = expiry_interval.tick() => {
                     timers::run_active_expiry(&shard_databases, shard_id);
                 }
-                // Background eviction timer
+                // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
+                    if server_config.disk_offload_enabled()
+                        && persistence_tick::should_run_pressure_cascade(
+                            &runtime_config,
+                            &server_config,
+                        )
+                    {
+                        persistence_tick::handle_memory_pressure(
+                            &page_cache,
+                            &shard_databases,
+                            shard_id,
+                            &runtime_config,
+                            &server_config,
+                            &mut shard_manifest,
+                            &mut next_file_id,
+                            &mut wal_v3_writer,
+                        );
+                    } else {
+                        timers::run_eviction(&shard_databases, shard_id, &runtime_config);
+                    }
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
@@ -1025,9 +1043,27 @@ impl super::Shard {
                 _ = expiry_interval.tick() => {
                     timers::run_active_expiry(&shard_databases, shard_id);
                 }
-                // Background eviction timer
+                // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
+                    if server_config.disk_offload_enabled()
+                        && persistence_tick::should_run_pressure_cascade(
+                            &runtime_config,
+                            &server_config,
+                        )
+                    {
+                        persistence_tick::handle_memory_pressure(
+                            &page_cache,
+                            &shard_databases,
+                            shard_id,
+                            &runtime_config,
+                            &server_config,
+                            &mut shard_manifest,
+                            &mut next_file_id,
+                            &mut wal_v3_writer,
+                        );
+                    } else {
+                        timers::run_eviction(&shard_databases, shard_id, &runtime_config);
+                    }
                 }
                 // Shutdown
                 _ = shutdown.cancelled() => {
