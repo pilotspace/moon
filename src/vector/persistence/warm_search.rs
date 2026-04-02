@@ -11,6 +11,9 @@ use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
 use crate::persistence::page::{MoonPageHeader, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K};
+use crate::vector::persistence::warm_segment::{
+    VEC_CODES_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE, VEC_MVCC_SUB_HEADER_SIZE,
+};
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered};
@@ -44,26 +47,36 @@ pub struct WarmSearchSegment {
     _handle: SegmentHandle,
 }
 
-/// Extract contiguous payload bytes from a mmap'd .mpf file.
+/// Extract contiguous data bytes from a mmap'd .mpf file, skipping sub-headers.
 ///
-/// MoonPage files interleave 64-byte headers with payload data. This function
-/// reads each page header to determine payload length and concatenates all
-/// payload regions into a contiguous buffer.
-fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize) -> Vec<u8> {
-    let payload_capacity = page_size - MOONPAGE_HEADER_SIZE;
+/// MoonPage files interleave 64-byte headers with payload data. Each page type
+/// has a type-specific sub-header between the MoonPageHeader and the actual data
+/// (VecCodes: 32B, VecFull: 24B, VecGraph: 16B, VecMvcc: 8B). This function
+/// reads each page header, skips the sub-header, and concatenates all data
+/// regions into a contiguous buffer.
+///
+/// `sub_hdr_size` is the size of the per-page-type sub-header to skip.
+fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize) -> Vec<u8> {
+    let total_header = MOONPAGE_HEADER_SIZE + sub_hdr_size;
+    let data_capacity = page_size - total_header;
     let page_count = mmap.len() / page_size;
-    let mut result = Vec::with_capacity(page_count * payload_capacity);
+    let mut result = Vec::with_capacity(page_count * data_capacity);
 
     for page_idx in 0..page_count {
         let page_start = page_idx * page_size;
         let page_slice = &mmap[page_start..page_start + page_size];
 
-        // Read the header to get actual payload length
+        // Read the header to get actual payload length (includes sub-header)
         if let Some(hdr) = MoonPageHeader::read_from(&page_slice[..MOONPAGE_HEADER_SIZE]) {
-            let payload_len = hdr.payload_bytes as usize;
-            let actual_len = payload_len.min(payload_capacity);
+            let total_payload = hdr.payload_bytes as usize;
+            // Subtract sub-header to get actual data length
+            let data_len = if total_payload > sub_hdr_size {
+                (total_payload - sub_hdr_size).min(data_capacity)
+            } else {
+                0
+            };
             result.extend_from_slice(
-                &page_slice[MOONPAGE_HEADER_SIZE..MOONPAGE_HEADER_SIZE + actual_len],
+                &page_slice[total_header..total_header + data_len],
             );
         }
     }
@@ -134,10 +147,10 @@ impl WarmSearchSegment {
         // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
         let mvcc_mmap = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
 
-        // Extract contiguous payload data from each file
-        let codes_data = extract_payloads(&codes_mmap, PAGE_64K);
-        let graph_payload = extract_payloads(&graph_mmap, PAGE_4K);
-        let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K);
+        // Extract contiguous data from each file (skipping per-page sub-headers)
+        let codes_data = extract_payloads(&codes_mmap, PAGE_64K, VEC_CODES_SUB_HEADER_SIZE);
+        let graph_payload = extract_payloads(&graph_mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
+        let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
 
         // Deserialize HNSW graph from payload bytes
         let graph = HnswGraph::from_bytes(&graph_payload).map_err(|e| {
