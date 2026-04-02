@@ -14,8 +14,10 @@ use std::path::Path;
 
 use tracing::info;
 
+use crate::persistence::clog::{ClogPage, TxnStatus};
 use crate::persistence::control::{ShardControlFile, ShardState};
-use crate::persistence::manifest::ShardManifest;
+use crate::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
+use crate::persistence::page::PageType;
 use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
 use crate::persistence::wal_v3::replay::replay_wal_v3_dir;
 
@@ -30,6 +32,13 @@ pub struct RecoveryResult {
     pub last_lsn: u64,
     /// Manifest epoch at recovery time.
     pub manifest_epoch: u64,
+    /// Number of IN_PROGRESS transactions rolled back via CLOG.
+    pub txns_rolled_back: usize,
+    /// Number of warm segments discovered from manifest.
+    pub warm_segments_loaded: usize,
+    /// Warm segment paths recovered from manifest, ready for VectorStore registration.
+    /// Each tuple: (file_id, segment_dir_path).
+    pub warm_segments: Vec<(u64, std::path::PathBuf)>,
 }
 
 /// 6-phase recovery protocol for disk-offload mode.
@@ -121,6 +130,42 @@ pub fn recover_shard_v3(
         }
     }
 
+    // Phase 3 continued: Reload warm vector segments from manifest.
+    // Scan manifest for tier=Warm, status=Active, file_type=VecCodes entries.
+    // Each represents a segment that was offloaded to disk before the crash.
+    if manifest_path.exists() {
+        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
+            let vectors_dir = shard_dir.join("vectors");
+            for entry in manifest.files() {
+                if entry.tier == StorageTier::Warm
+                    && entry.status == FileStatus::Active
+                    && entry.file_type == PageType::VecCodes as u8
+                {
+                    let seg_dir = vectors_dir.join(format!("segment-{}", entry.file_id));
+                    if seg_dir.exists() && seg_dir.join("codes.mpf").exists() {
+                        result.warm_segments.push((entry.file_id, seg_dir));
+                        info!(
+                            "Shard {}: warm segment {} found ({}B codes)",
+                            shard_id, entry.file_id, entry.byte_size
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Shard {}: manifest references warm segment {} but directory missing",
+                            shard_id, entry.file_id
+                        );
+                    }
+                }
+            }
+            result.warm_segments_loaded = result.warm_segments.len();
+            if result.warm_segments_loaded > 0 {
+                info!(
+                    "Shard {}: discovered {} warm segment(s) from manifest",
+                    shard_id, result.warm_segments_loaded
+                );
+            }
+        }
+    }
+
     // ── Phase 4: WAL REPLAY ───────────────────────────────────────────
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
@@ -187,6 +232,43 @@ pub fn recover_shard_v3(
     // ── Phase 5: CONSISTENCY ──────────────────────────────────────────
     // Cross-check: verify manifest files exist on disk.
     // (Lightweight for now -- full CRC verification is expensive at startup)
+
+    // CLOG rollback: scan all CLOG pages and mark IN_PROGRESS txns as Aborted.
+    // Any transaction still IN_PROGRESS at WAL end was interrupted by a crash.
+    let clog_dir = shard_dir.join("clog");
+    if clog_dir.exists() {
+        let next_txn = control.as_ref().map(|c| c.next_txn_id).unwrap_or(0);
+        match crate::persistence::clog::scan_clog_dir(&clog_dir) {
+            Ok(mut pages) => {
+                let mut rolled_back = 0u64;
+                for txn_id in 0..next_txn {
+                    let page_idx = ClogPage::page_for_txn(txn_id);
+                    if let Some(page) = pages.iter_mut().find(|p| p.page_index() == page_idx) {
+                        if page.get_status(txn_id) == TxnStatus::InProgress {
+                            page.set_status(txn_id, TxnStatus::Aborted);
+                            rolled_back += 1;
+                        }
+                    }
+                }
+                if rolled_back > 0 {
+                    info!(
+                        "Shard {}: rolled back {} uncommitted vector transactions via CLOG",
+                        shard_id, rolled_back
+                    );
+                    // Write modified CLOG pages back to disk
+                    for page in &pages {
+                        if let Err(e) = crate::persistence::clog::write_clog_page(&clog_dir, page) {
+                            tracing::error!("Shard {}: CLOG page write failed: {}", shard_id, e);
+                        }
+                    }
+                }
+                result.txns_rolled_back = rolled_back as usize;
+            }
+            Err(e) => {
+                tracing::warn!("Shard {}: CLOG scan failed: {}", shard_id, e);
+            }
+        }
+    }
 
     // ── Phase 6: READY ────────────────────────────────────────────────
     // Update control file to Running state with recovered LSN position.
@@ -360,5 +442,101 @@ mod tests {
         // Only LSNs 3, 4, 5 should be replayed (skip 1, 2)
         assert_eq!(result.commands_replayed, 3);
         assert_eq!(result.last_lsn, 5);
+    }
+
+    #[test]
+    fn test_recover_shard_v3_clog_rollback() {
+        use crate::persistence::clog::{self, ClogPage, TxnStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Write a control file with next_txn_id = 5
+        let mut ctl = ShardControlFile::new([0u8; 16]);
+        ctl.next_txn_id = 5;
+        ctl.write(&ShardControlFile::control_path(&shard_dir, 0))
+            .unwrap();
+
+        // Write a CLOG page with txns 0=Committed, 1=InProgress, 2=Aborted,
+        // 3=InProgress, 4=Committed
+        let clog_dir = shard_dir.join("clog");
+        let mut page0 = ClogPage::new(0);
+        page0.set_status(0, TxnStatus::Committed);
+        page0.set_status(1, TxnStatus::InProgress);
+        page0.set_status(2, TxnStatus::Aborted);
+        page0.set_status(3, TxnStatus::InProgress);
+        page0.set_status(4, TxnStatus::Committed);
+        clog::write_clog_page(&clog_dir, &page0).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        // Txns 1 and 3 should have been rolled back
+        assert_eq!(result.txns_rolled_back, 2);
+
+        // Verify CLOG pages on disk were updated
+        let pages = clog::scan_clog_dir(&clog_dir).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].get_status(0), TxnStatus::Committed);
+        assert_eq!(pages[0].get_status(1), TxnStatus::Aborted);
+        assert_eq!(pages[0].get_status(2), TxnStatus::Aborted);
+        assert_eq!(pages[0].get_status(3), TxnStatus::Aborted);
+        assert_eq!(pages[0].get_status(4), TxnStatus::Committed);
+    }
+
+    #[test]
+    fn test_recover_warm_segments_from_manifest() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Create a manifest with one warm VecCodes entry and one hot entry
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        manifest.add_file(FileEntry {
+            file_id: 42,
+            file_type: PageType::VecCodes as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Warm,
+            page_size_log2: 16,
+            page_count: 10,
+            byte_size: 655360,
+            created_lsn: 1,
+            min_key_hash: 0,
+            max_key_hash: u64::MAX,
+        });
+        manifest.add_file(FileEntry {
+            file_id: 99,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: 5,
+            byte_size: 20480,
+            created_lsn: 2,
+            min_key_hash: 0,
+            max_key_hash: u64::MAX,
+        });
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        // Create the segment directory with codes.mpf
+        let seg_dir = shard_dir.join("vectors").join("segment-42");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        std::fs::write(seg_dir.join("codes.mpf"), &[0u8; 64]).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        assert_eq!(result.warm_segments_loaded, 1);
+        assert_eq!(result.warm_segments.len(), 1);
+        assert_eq!(result.warm_segments[0].0, 42);
+        assert_eq!(result.warm_segments[0].1, seg_dir);
     }
 }
