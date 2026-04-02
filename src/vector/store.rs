@@ -125,6 +125,82 @@ impl VectorIndex {
     }
 }
 
+impl VectorIndex {
+    /// Check each immutable segment's age. If older than `warm_after_secs`,
+    /// transition it to warm tier (mmap-backed on disk).
+    ///
+    /// Returns the number of segments transitioned.
+    pub fn try_warm_transitions(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        warm_after_secs: u64,
+        next_file_id: &mut u64,
+    ) -> usize {
+        let snapshot = self.segments.load();
+        let mut to_warm: Vec<usize> = Vec::new();
+        for (i, imm) in snapshot.immutable.iter().enumerate() {
+            if imm.age_secs() >= warm_after_secs {
+                to_warm.push(i);
+            }
+        }
+        if to_warm.is_empty() {
+            return 0;
+        }
+
+        let mut new_immutable = snapshot.immutable.clone();
+        let mut transitioned = 0usize;
+
+        // Process in reverse order to maintain valid indices during removal.
+        for &idx in to_warm.iter().rev() {
+            let imm = &snapshot.immutable[idx];
+            let file_id = *next_file_id;
+            *next_file_id += 1;
+
+            let graph_bytes = imm.graph().to_bytes();
+            let codes_data = imm.vectors_tq().as_slice();
+            let mvcc_data = imm.mvcc_raw_bytes();
+
+            match crate::storage::tiered::warm_tier::transition_to_warm(
+                shard_dir,
+                file_id, // segment_id == file_id
+                file_id,
+                codes_data,
+                &graph_bytes,
+                None, // vectors_data (f16 reranking -- not used yet)
+                &mvcc_data,
+                manifest,
+            ) {
+                Ok(_handle) => {
+                    // Remove from in-memory list -- the data is now on disk as mmap.
+                    // Future: replace with WarmSegmentHandle that implements search.
+                    new_immutable.remove(idx);
+                    transitioned += 1;
+                    tracing::info!(
+                        "Warm transition: segment {} ({} vectors, age {}s)",
+                        file_id,
+                        imm.total_count(),
+                        imm.age_secs()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Warm transition failed for segment {}: {}", file_id, e);
+                }
+            }
+        }
+
+        if transitioned > 0 {
+            let new_list = SegmentList {
+                mutable: Arc::clone(&snapshot.mutable),
+                immutable: new_immutable,
+                ivf: snapshot.ivf.clone(),
+            };
+            self.segments.swap(new_list);
+        }
+        transitioned
+    }
+}
+
 /// Per-shard store of all vector indexes. Directly owned by shard thread.
 pub struct VectorStore {
     indexes: HashMap<Bytes, VectorIndex>,
@@ -307,6 +383,28 @@ impl VectorStore {
     pub fn is_empty(&self) -> bool {
         self.indexes.is_empty()
     }
+
+    /// Attempt warm transitions for ALL indexes. Called from persistence tick.
+    ///
+    /// Returns the total number of segments transitioned across all indexes.
+    pub fn try_warm_transitions_all(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        warm_after_secs: u64,
+        next_file_id: &mut u64,
+    ) -> usize {
+        let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
+        let mut total = 0;
+        for name in names {
+            if let Some(idx) = self.indexes.get(&name) {
+                total += idx.try_warm_transitions(
+                    shard_dir, manifest, warm_after_secs, next_file_id,
+                );
+            }
+        }
+        total
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +539,114 @@ mod tests {
         let txn = store.txn_manager_mut().begin();
         assert_eq!(txn.txn_id, 1);
         assert_eq!(store.txn_manager().active_count(), 1);
+    }
+
+    // -- Warm transition tests (Phase 75-11) --
+
+    #[test]
+    fn test_try_warm_transitions_all_immediate() {
+        // With warm_after_secs=0, all immutable segments should transition.
+        use crate::vector::aligned_buffer::AlignedBuffer;
+        use crate::vector::distance;
+        use crate::vector::hnsw::graph::HnswGraph;
+        use crate::vector::segment::immutable::ImmutableSegment;
+
+        distance::init();
+        let mut store = VectorStore::new();
+        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+
+        // Create a minimal immutable segment and swap it in.
+        let idx = store.get_index(b"idx").unwrap();
+        let collection = idx.collection.clone();
+        let empty_graph = HnswGraph::new(
+            0, 16, 32, 0, 0,
+            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+        let imm = Arc::new(ImmutableSegment::new(
+            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
+            Vec::new(), 16, Vec::new(), collection, 0, 0,
+        ));
+
+        let old_snap = idx.segments.load();
+        let new_list = SegmentList {
+            mutable: Arc::clone(&old_snap.mutable),
+            immutable: vec![imm],
+            ivf: Vec::new(),
+        };
+        idx.segments.swap(new_list);
+        drop(old_snap);
+
+        // Verify we have 1 immutable segment.
+        assert_eq!(idx.segments.load().immutable.len(), 1);
+
+        // Try warm transition with age threshold 0 (everything qualifies).
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let count = store.try_warm_transitions_all(
+            &shard_dir, &mut manifest, 0, &mut next_file_id,
+        );
+        assert_eq!(count, 1);
+
+        // Immutable list should now be empty (segment moved to warm).
+        let idx = store.get_index(b"idx").unwrap();
+        assert_eq!(idx.segments.load().immutable.len(), 0);
+    }
+
+    #[test]
+    fn test_try_warm_transitions_high_threshold_skips() {
+        // With warm_after_secs=999999, nothing should transition.
+        use crate::vector::aligned_buffer::AlignedBuffer;
+        use crate::vector::distance;
+        use crate::vector::hnsw::graph::HnswGraph;
+        use crate::vector::segment::immutable::ImmutableSegment;
+
+        distance::init();
+        let mut store = VectorStore::new();
+        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+
+        let idx = store.get_index(b"idx").unwrap();
+        let collection = idx.collection.clone();
+        let empty_graph = HnswGraph::new(
+            0, 16, 32, 0, 0,
+            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+        );
+        let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
+            .unwrap_or_else(|_| panic!("empty graph"));
+        let imm = Arc::new(ImmutableSegment::new(
+            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
+            Vec::new(), 16, Vec::new(), collection, 0, 0,
+        ));
+
+        let old_snap = idx.segments.load();
+        idx.segments.swap(SegmentList {
+            mutable: Arc::clone(&old_snap.mutable),
+            immutable: vec![imm],
+            ivf: Vec::new(),
+        });
+        drop(old_snap);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let count = store.try_warm_transitions_all(
+            &shard_dir, &mut manifest, 999_999, &mut next_file_id,
+        );
+        assert_eq!(count, 0);
+
+        // Immutable list should still have 1 segment.
+        let idx = store.get_index(b"idx").unwrap();
+        assert_eq!(idx.segments.load().immutable.len(), 1);
     }
 
     // -- Multi-bit quantization tests (Phase 72-02) --

@@ -160,6 +160,35 @@ pub(crate) fn flush_wal_if_needed(wal_writer: &mut Option<WalWriter>) {
 }
 
 // ---------------------------------------------------------------------------
+// Warm tier transition handler (disk-offload path)
+// ---------------------------------------------------------------------------
+
+/// Periodically check immutable segment ages and trigger HOT->WARM transitions.
+///
+/// Called from the event loop on a slower interval (e.g., every 10 seconds)
+/// when disk-offload is enabled. Scans all VectorIndex segments, transitions
+/// those older than `warm_after_secs`.
+#[allow(dead_code)]
+pub(crate) fn check_warm_transitions(
+    vector_store: &crate::vector::store::VectorStore,
+    shard_dir: &std::path::Path,
+    manifest: &mut ShardManifest,
+    warm_after_secs: u64,
+    next_file_id: &mut u64,
+    shard_id: usize,
+) {
+    let count = vector_store.try_warm_transitions_all(
+        shard_dir, manifest, warm_after_secs, next_file_id,
+    );
+    if count > 0 {
+        info!(
+            "Shard {}: transitioned {} segment(s) to warm tier",
+            shard_id, count
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoint protocol handlers (disk-offload path)
 // ---------------------------------------------------------------------------
 
