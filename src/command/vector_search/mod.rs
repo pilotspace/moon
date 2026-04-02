@@ -505,7 +505,7 @@ pub fn search_local_filtered(
         filter_bitmap.as_ref(),
         &mvcc_ctx,
     );
-    build_search_response(&results)
+    build_search_response(&results, &idx.id_to_key)
 }
 
 /// Parse "*=>[KNN <k> @<field> $<param>]" query string.
@@ -571,8 +571,14 @@ fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
 }
 
 /// Build FT.SEARCH response array.
-/// Format: [num_results, "vec:0", ["__vec_score", "0.5"], "vec:1", ["__vec_score", "0.8"], ...]
-fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
+/// Format: [num_results, "doc:0", ["__vec_score", "0.5"], "doc:1", ["__vec_score", "0.8"], ...]
+///
+/// Uses `id_to_key` to map internal vector IDs back to original Redis hash keys.
+/// Falls back to "vec:<id>" if the mapping is not found (e.g., legacy data).
+fn build_search_response(
+    results: &SmallVec<[SearchResult; 32]>,
+    id_to_key: &std::collections::HashMap<u32, Bytes>,
+) -> Frame {
     let total = results.len() as i64;
     // NOTE: Vec/format! usage here is acceptable -- this is response building at end
     // of command path, not hot-path dispatch.
@@ -580,13 +586,19 @@ fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
     items.push(Frame::Integer(total));
 
     for r in results {
-        // Document ID as "vec:<internal_id>"
-        let mut doc_id_buf = itoa::Buffer::new();
-        let id_str = doc_id_buf.format(r.id.0);
-        let mut doc_id = Vec::with_capacity(4 + id_str.len());
-        doc_id.extend_from_slice(b"vec:");
-        doc_id.extend_from_slice(id_str.as_bytes());
-        items.push(Frame::BulkString(Bytes::from(doc_id)));
+        // Look up the original Redis hash key from the point_id → key mapping.
+        // If not found (legacy data without mapping), fall back to "vec:<id>".
+        let doc_key = if let Some(key) = id_to_key.get(&r.id.0) {
+            key.clone()
+        } else {
+            let mut doc_id_buf = itoa::Buffer::new();
+            let id_str = doc_id_buf.format(r.id.0);
+            let mut doc_id = Vec::with_capacity(4 + id_str.len());
+            doc_id.extend_from_slice(b"vec:");
+            doc_id.extend_from_slice(id_str.as_bytes());
+            Bytes::from(doc_id)
+        };
+        items.push(Frame::BulkString(doc_key));
 
         // Score as nested array — use write! to pre-allocated buffer
         let mut score_buf = String::with_capacity(16);

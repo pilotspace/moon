@@ -54,6 +54,18 @@ pub struct VectorIndex {
     pub scratch: SearchScratch,
     pub collection: Arc<CollectionMetadata>,
     pub payload_index: PayloadIndex,
+    /// Maps internal vector point_id → original Redis hash key.
+    ///
+    /// Populated at insert time (auto_index_hset). Updated during compaction
+    /// to track BFS-reordered IDs back to original keys. Used by FT.SEARCH
+    /// to return the actual Redis key instead of "vec:<internal_id>".
+    ///
+    /// For multi-segment scenarios, point_id is the global ID assigned at
+    /// insert time (monotonically increasing per index). Compaction preserves
+    /// original IDs via `graph.to_original()`.
+    pub id_to_key: HashMap<u32, Bytes>,
+    /// Next global point ID to assign (monotonically increasing).
+    pub next_point_id: u32,
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -208,6 +220,8 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
+                id_to_key: HashMap::new(),
+                next_point_id: 0,
             },
         );
 
