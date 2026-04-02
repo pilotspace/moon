@@ -1,5 +1,7 @@
 pub mod aof;
 pub mod auto_save;
+pub mod clog;
+pub mod page;
 pub mod rdb;
 pub mod redis_rdb;
 pub mod replay;
