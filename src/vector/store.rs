@@ -451,6 +451,60 @@ impl VectorStore {
         }
         total
     }
+
+    /// Register warm segments recovered from disk into the appropriate indexes.
+    ///
+    /// Called during shard restore after v3 recovery identifies warm-tier segments
+    /// in the manifest. For each (segment_id, segment_dir), tries to open a
+    /// WarmSearchSegment and add it to whatever index matches the collection metadata.
+    pub fn register_warm_segments(&mut self, warm_segments: Vec<(u64, std::path::PathBuf)>) {
+        use crate::storage::tiered::SegmentHandle;
+        use crate::vector::persistence::warm_search::WarmSearchSegment;
+
+        let mut loaded = 0usize;
+        for (segment_id, segment_dir) in &warm_segments {
+            // Try each index — the segment belongs to whichever collection's metadata
+            // matches the codes data. In practice there's usually one index per shard.
+            for idx in self.indexes.values() {
+                let handle = SegmentHandle::new(*segment_id, segment_dir.clone());
+                match WarmSearchSegment::from_files(
+                    segment_dir,
+                    *segment_id,
+                    idx.collection.clone(),
+                    handle,
+                    false, // mlock_codes off during recovery (can be changed later)
+                ) {
+                    Ok(warm_seg) => {
+                        let old = idx.segments.load();
+                        let mut new_warm = old.warm.clone();
+                        new_warm.push(std::sync::Arc::new(warm_seg));
+                        let new_list = crate::vector::segment::SegmentList {
+                            mutable: std::sync::Arc::clone(&old.mutable),
+                            immutable: old.immutable.clone(),
+                            ivf: old.ivf.clone(),
+                            warm: new_warm,
+                        };
+                        idx.segments.swap(new_list);
+                        loaded += 1;
+                        tracing::info!(
+                            "Registered warm segment {} from {:?}",
+                            segment_id, segment_dir
+                        );
+                        break; // Segment belongs to one index only
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Warm segment {} not compatible with index: {}",
+                            segment_id, e
+                        );
+                    }
+                }
+            }
+        }
+        if loaded > 0 {
+            tracing::info!("Registered {}/{} warm segments on startup", loaded, warm_segments.len());
+        }
+    }
 }
 
 #[cfg(test)]

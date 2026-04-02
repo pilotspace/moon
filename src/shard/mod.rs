@@ -81,14 +81,25 @@ impl Shard {
                 ) {
                     Ok(result) => {
                         info!(
-                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={})",
+                            "Shard {}: v3 recovery complete (cmds={}, fpi={}, last_lsn={}, warm={}, txn_rollback={})",
                             self.id,
                             result.commands_replayed,
                             result.fpi_applied,
-                            result.last_lsn
+                            result.last_lsn,
+                            result.warm_segments_loaded,
+                            result.txns_rolled_back,
                         );
                         // Vector recovery still uses the v2 path for now
                         self.recover_vectors(persistence_dir);
+
+                        // Register warm segments into VectorStore so they're searchable
+                        if !result.warm_segments.is_empty() {
+                            info!(
+                                "Shard {}: registering {} warm segment(s)",
+                                self.id, result.warm_segments.len()
+                            );
+                            self.vector_store.register_warm_segments(result.warm_segments);
+                        }
                         return result.commands_replayed;
                     }
                     Err(e) => {

@@ -291,6 +291,20 @@ pub fn write_mvcc_mpf(path: &Path, file_id: u64, mvcc_data: &[u8]) -> std::io::R
     write_mpf_pages(path, file_id, PageType::VecMvcc, mvcc_data, Some(&sub_fn))
 }
 
+/// Write collection metadata to a .mpf file with 4KB VecMeta pages.
+pub fn write_meta_mpf(path: &Path, file_id: u64, meta_data: &[u8]) -> std::io::Result<()> {
+    write_mpf_pages(path, file_id, PageType::VecMeta, meta_data, None)
+}
+
+/// Write an empty undo.mpf file as a VecUndo placeholder.
+///
+/// The undo log starts empty for new warm segments — populated when
+/// metadata updates occur (future).
+pub fn write_undo_mpf(path: &Path, file_id: u64) -> std::io::Result<()> {
+    // Write a single page with just the header (no undo records yet)
+    write_mpf_pages(path, file_id, PageType::VecUndo, &[], None)
+}
+
 /// Memory-mapped warm segment files for zero-copy access.
 ///
 /// Each file is a sequence of MoonPage-format pages. The `SegmentHandle`
