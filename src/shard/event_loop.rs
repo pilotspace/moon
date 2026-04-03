@@ -326,7 +326,7 @@ impl super::Shard {
 
         // Per-shard WAL append channel for local writes.
         // Connection handlers send serialized write commands here; we drain on the 1ms tick.
-        let (wal_append_tx, mut wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
+        let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
         if appendonly_enabled || server_config.disk_offload_enabled() {
             shard_databases.set_wal_append_tx(shard_id, wal_append_tx);
         }
@@ -447,6 +447,9 @@ impl super::Shard {
         let mut warm_check_interval = TimerImpl::interval(
             Duration::from_millis(timers::WARM_CHECK_INTERVAL_MS)
         );
+        // Cold tier transition check: segment_cold_after seconds (default 86400).
+        // Uses 60s polling interval — actual transition depends on segment age.
+        let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(60));
         let spsc_notify_local = spsc_notify;
 
         // Per-shard cached clock: updated once per 1ms tick.
@@ -753,6 +756,23 @@ impl super::Shard {
                                 &mut next_file_id,
                                 shard_id,
                                 &mut wal_v3_writer,
+                            );
+                        }
+                    }
+                }
+                // Cold tier transition check (60s, disk-offload only)
+                _ = cold_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
+                        if let Some(ref mut manifest) = shard_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_cold_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_cold_after,
+                                &mut next_file_id,
+                                shard_id,
                             );
                         }
                     }
@@ -1064,6 +1084,23 @@ impl super::Shard {
                                 &mut next_file_id,
                                 shard_id,
                                 &mut wal_v3_writer,
+                            );
+                        }
+                    }
+                }
+                // Cold tier transition check (60s, disk-offload only)
+                _ = cold_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
+                        if let Some(ref mut manifest) = shard_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_cold_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_cold_after,
+                                &mut next_file_id,
+                                shard_id,
                             );
                         }
                     }

@@ -215,7 +215,6 @@ pub(crate) fn check_warm_transitions(
 /// NOTE: The actual event loop wiring (select! macro integration) is outside
 /// this plan's file ownership and will happen when the shard event loop is
 /// updated in a future plan. This function exists and is callable.
-#[allow(dead_code)] // Event loop wiring deferred to a future plan
 pub(crate) fn check_cold_transitions(
     vector_store: &crate::vector::store::VectorStore,
     shard_dir: &std::path::Path,
@@ -326,8 +325,31 @@ pub(crate) fn handle_memory_pressure(
         }
     }
 
-    // Step 3: KV eviction -- run existing LRU/LFU eviction across all databases.
-    super::timers::run_eviction(shard_databases, shard_id, runtime_config);
+    // Step 3: KV eviction -- run existing LRU/LFU eviction, with spill-to-disk
+    // when disk-offload is enabled (evicted entries written to KvLeaf DataFiles).
+    if let Ok(rt) = runtime_config.read() {
+        if rt.maxmemory > 0 {
+            let db_count = shard_databases.db_count();
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            for i in 0..db_count {
+                let mut guard = shard_databases.write_db(shard_id, i);
+                if let Some(ref mut manifest) = *shard_manifest {
+                    let mut ctx = crate::storage::eviction::SpillContext {
+                        shard_dir: &shard_dir,
+                        manifest,
+                        next_file_id,
+                    };
+                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill(
+                        &mut guard, &rt, Some(&mut ctx),
+                    );
+                } else {
+                    let _ = crate::storage::eviction::try_evict_if_needed(&mut guard, &rt);
+                }
+            }
+        }
+    }
 
     // Step 4: NoEviction policy check -- if we reached here with noeviction,
     // log a warning. The actual OOM rejection is handled inside try_evict_if_needed.
