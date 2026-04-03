@@ -302,6 +302,13 @@ impl super::Shard {
             None
         };
 
+        // Disk-offload base directory (None when disk-offload is disabled).
+        let disk_offload_base: Option<std::path::PathBuf> = if server_config.disk_offload_enabled() {
+            Some(server_config.effective_disk_offload_dir())
+        } else {
+            None
+        };
+
         // Per-shard WAL v3 writer (created only when disk-offload is enabled).
         // Provides per-record LSN tracking and FPI support for checkpoint-based recovery.
         // WAL v2 remains active for non-disk-offload mode; both writers can coexist.
@@ -569,7 +576,7 @@ impl super::Shard {
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -619,7 +626,7 @@ impl super::Shard {
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -657,7 +664,8 @@ impl super::Shard {
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir,
+                        disk_offload_base.as_deref(), shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
@@ -903,7 +911,7 @@ impl super::Shard {
                     }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -958,7 +966,7 @@ impl super::Shard {
                     }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -996,7 +1004,8 @@ impl super::Shard {
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir,
+                        disk_offload_base.as_deref(), shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)

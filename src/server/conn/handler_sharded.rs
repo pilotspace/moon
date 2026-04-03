@@ -32,7 +32,7 @@ use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
-use crate::storage::eviction::try_evict_if_needed;
+use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_with_spill_and_total};
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
@@ -1349,8 +1349,10 @@ pub async fn handle_connection_sharded_inner<
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
                             let rt = runtime_config.read().unwrap();
+                            // Compute aggregate memory BEFORE write lock to avoid deadlock.
+                            let total_mem = shard_databases.aggregate_memory(shard_id);
                             let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
+                            if let Err(oom_frame) = try_evict_if_needed_with_spill_and_total(&mut guard, &rt, None, total_mem) {
                                 drop(guard);
                                 drop(rt);
                                 responses.push(oom_frame);

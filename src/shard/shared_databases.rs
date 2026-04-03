@@ -140,6 +140,19 @@ impl ShardDatabases {
         self.db_count
     }
 
+    /// Aggregate estimated memory across all databases in a shard.
+    ///
+    /// Acquires read locks briefly on each DB. Used for maxmemory eviction
+    /// decisions (Redis maxmemory is a server-wide limit, not per-DB).
+    pub fn aggregate_memory(&self, shard_id: usize) -> usize {
+        let mut total = 0usize;
+        for db_idx in 0..self.db_count {
+            let guard = self.read_db(shard_id, db_idx);
+            total += guard.estimated_memory();
+        }
+        total
+    }
+
     /// Collect snapshot metadata (segment counts, base timestamps) for a shard.
     ///
     /// Acquires brief read locks on each database to gather metadata needed

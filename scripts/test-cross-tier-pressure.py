@@ -546,14 +546,21 @@ class CrossTierTest:
             if size > 0 and (size % 4096 == 0 or size % 65536 == 0):
                 mpf_valid += 1
 
-        # Check server logs for panics
-        log_output = b""
-        if self.proc and self.proc.stdout:
-            # Non-blocking read of available output
-            import select
-            if select.select([self.proc.stdout], [], [], 0.1)[0]:
-                log_output = self.proc.stdout.read(65536)
-        panic_count = log_output.count(b"panic") + log_output.count(b"PANIC")
+        # Check server logs for panics (non-blocking)
+        panic_count = 0
+        try:
+            if self.proc and self.proc.stdout:
+                import fcntl
+                fd = self.proc.stdout.fileno()
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                try:
+                    log_output = self.proc.stdout.read(65536) or b""
+                    panic_count = log_output.count(b"panic") + log_output.count(b"PANIC")
+                except (BlockingIOError, IOError):
+                    pass
+        except Exception:
+            pass
 
         result = {
             "manifest_exists": manifest_exists,

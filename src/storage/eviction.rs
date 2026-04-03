@@ -113,19 +113,39 @@ pub fn try_evict_if_needed_with_spill(
     config: &RuntimeConfig,
     mut spill: Option<&mut SpillContext<'_>>,
 ) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill_and_total(db, config, spill, db.estimated_memory())
+}
+
+/// Eviction with explicit total_memory parameter (for aggregate checking).
+///
+/// When called from the memory pressure cascade, `total_memory` should be the
+/// aggregate across all databases. When called from the connection handler,
+/// pass `db.estimated_memory()` for single-DB behavior (Redis-compatible).
+pub fn try_evict_if_needed_with_spill_and_total(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    mut spill: Option<&mut SpillContext<'_>>,
+    total_memory: usize,
+) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
     }
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
-    while db.estimated_memory() > config.maxmemory {
+    // Check aggregate memory (server-wide maxmemory limit per Redis semantics).
+    // Evict from this DB until total memory drops below limit.
+    let mut current_total = total_memory;
+    while current_total > config.maxmemory {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
+        let before = db.estimated_memory();
         if !evict_one_with_spill(db, config, &policy, spill.as_deref_mut()) {
             return Err(oom_error());
         }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
     }
 
     Ok(())

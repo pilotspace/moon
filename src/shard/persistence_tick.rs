@@ -26,13 +26,20 @@ pub(crate) fn handle_pending_snapshot(
     snapshot_state: &mut Option<SnapshotState>,
     snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
     shard_databases: &Arc<ShardDatabases>,
+    disk_offload_dir: Option<&std::path::Path>,
     shard_id: usize,
 ) {
     if let Some((epoch, snap_dir, reply_tx)) = pending {
         if snapshot_state.is_some() {
             let _ = reply_tx.send(Err("Snapshot already in progress".to_string()));
         } else {
-            let snap_path = snap_dir.join(format!("shard-{}.rrdshard", shard_id));
+            let snap_path = if let Some(offload) = disk_offload_dir {
+                let shard_dir = offload.join(format!("shard-{}", shard_id));
+                let _ = std::fs::create_dir_all(&shard_dir);
+                shard_dir.join(format!("shard-{}.rrdshard", shard_id))
+            } else {
+                snap_dir.join(format!("shard-{}.rrdshard", shard_id))
+            };
             let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
             let db_count = shard_databases.db_count();
             *snapshot_state = Some(SnapshotState::new_from_metadata(
@@ -57,14 +64,22 @@ pub(crate) fn check_auto_save_trigger(
     snapshot_state: &mut Option<SnapshotState>,
     shard_databases: &Arc<ShardDatabases>,
     persistence_dir: &Option<String>,
+    disk_offload_dir: Option<&std::path::Path>,
     shard_id: usize,
 ) {
     let new_epoch = snapshot_trigger_rx.borrow();
     if new_epoch > *last_snapshot_epoch && snapshot_state.is_none() {
         *last_snapshot_epoch = new_epoch;
         if let Some(dir) = persistence_dir {
-            let snap_path =
-                std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id));
+            // When disk-offload is enabled, write snapshot to the offload shard directory
+            // so v3 recovery can find it alongside WAL v3 segments and manifest.
+            let snap_path = if let Some(offload) = disk_offload_dir {
+                let shard_dir = offload.join(format!("shard-{}", shard_id));
+                let _ = std::fs::create_dir_all(&shard_dir);
+                shard_dir.join(format!("shard-{}.rrdshard", shard_id))
+            } else {
+                std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
+            };
             let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
             let db_count = shard_databases.db_count();
             *snapshot_state = Some(SnapshotState::new_from_metadata(
