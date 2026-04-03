@@ -370,6 +370,7 @@ mod tests {
         assert_eq!(key_to_shard(b"{tag}.key", 1), 0);
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_pubsub_slot_waker() {
         let slot = Arc::new(PubSubResponseSlot::new(1));
@@ -387,6 +388,7 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_pubsub_slot_multiple_shards() {
         let slot = Arc::new(PubSubResponseSlot::new(3));
@@ -412,6 +414,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn test_pubsub_slot_already_ready() {
         // Slot with 0 pending should resolve immediately
