@@ -45,6 +45,21 @@ pub enum QuantizationConfig {
 }
 
 impl QuantizationConfig {
+    /// Deserialize from raw u8 (repr value). Defaults to TurboQuant4.
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Sq8,
+            1 => Self::TurboQuant4,
+            2 => Self::TurboQuantProd4,
+            3 => Self::TurboQuant1,
+            4 => Self::TurboQuant2,
+            5 => Self::TurboQuant3,
+            6 => Self::TurboQuant4A2,
+            _ => Self::TurboQuant4,
+        }
+    }
+
     /// Number of bits per coordinate for this quantization variant.
     #[inline]
     pub fn bits(&self) -> u8 {

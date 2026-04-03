@@ -255,11 +255,13 @@ pub(crate) fn check_cold_transitions(
 
 /// Check if memory usage exceeds the disk offload threshold.
 ///
-/// Returns `true` when the pressure cascade should run. Guards against
-/// unnecessary cascade work when memory is within budget.
+/// Returns `true` when the pressure cascade should run. Uses actual
+/// aggregate database memory estimate vs maxmemory * threshold.
 pub(crate) fn should_run_pressure_cascade(
     runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
+    shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
 ) -> bool {
     let rt = match runtime_config.read() {
         Ok(rt) => rt,
@@ -268,17 +270,9 @@ pub(crate) fn should_run_pressure_cascade(
     if rt.maxmemory == 0 {
         return false; // No memory limit set -- no pressure possible
     }
-    // Use jemalloc epoch + resident stat when available, otherwise use
-    // database-estimated memory as a proxy (cheaper, but less accurate).
-    // The threshold check is intentionally coarse: individual cascade steps
-    // re-check whether work is actually needed.
     let threshold = (rt.maxmemory as f64 * server_config.disk_offload_threshold) as usize;
-    // Approximate: if maxmemory is set and threshold < maxmemory, we consider
-    // pressure present. A more precise RSS check can be added later when
-    // jemalloc stats are wired into the shard event loop.
-    // For now, always return true when maxmemory > 0 and disk-offload is
-    // enabled -- individual steps are cheap no-ops when there's nothing to do.
-    threshold < rt.maxmemory
+    let used = shard_databases.aggregate_memory(shard_id);
+    used > threshold
 }
 
 /// Memory pressure cascade per MoonStore v2 design section 8.5.
@@ -342,25 +336,32 @@ pub(crate) fn handle_memory_pressure(
 
     // Step 3: KV eviction -- run existing LRU/LFU eviction, with spill-to-disk
     // when disk-offload is enabled (evicted entries written to KvLeaf DataFiles).
+    // Use aggregate memory (server-wide) to match Redis maxmemory semantics.
     if let Ok(rt) = runtime_config.read() {
         if rt.maxmemory > 0 {
-            let db_count = shard_databases.db_count();
-            let shard_dir = server_config
-                .effective_disk_offload_dir()
-                .join(format!("shard-{}", shard_id));
-            for i in 0..db_count {
-                let mut guard = shard_databases.write_db(shard_id, i);
-                if let Some(ref mut manifest) = *shard_manifest {
-                    let mut ctx = crate::storage::eviction::SpillContext {
-                        shard_dir: &shard_dir,
-                        manifest,
-                        next_file_id,
-                    };
-                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill(
-                        &mut guard, &rt, Some(&mut ctx),
-                    );
-                } else {
-                    let _ = crate::storage::eviction::try_evict_if_needed(&mut guard, &rt);
+            // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
+            let total_mem = shard_databases.aggregate_memory(shard_id);
+            if total_mem > rt.maxmemory {
+                let db_count = shard_databases.db_count();
+                let shard_dir = server_config
+                    .effective_disk_offload_dir()
+                    .join(format!("shard-{}", shard_id));
+                for i in 0..db_count {
+                    let mut guard = shard_databases.write_db(shard_id, i);
+                    if let Some(ref mut manifest) = *shard_manifest {
+                        let mut ctx = crate::storage::eviction::SpillContext {
+                            shard_dir: &shard_dir,
+                            manifest,
+                            next_file_id,
+                        };
+                        let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                            &mut guard, &rt, Some(&mut ctx), total_mem,
+                        );
+                    } else {
+                        let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                            &mut guard, &rt, None, total_mem,
+                        );
+                    }
                 }
             }
         }

@@ -111,7 +111,7 @@ pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<
 pub fn try_evict_if_needed_with_spill(
     db: &mut Database,
     config: &RuntimeConfig,
-    mut spill: Option<&mut SpillContext<'_>>,
+    spill: Option<&mut SpillContext<'_>>,
 ) -> Result<(), Frame> {
     try_evict_if_needed_with_spill_and_total(db, config, spill, db.estimated_memory())
 }

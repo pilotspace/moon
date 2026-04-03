@@ -5,6 +5,7 @@ pub mod diskann;
 pub mod distance;
 pub mod filter;
 pub mod hnsw;
+pub mod index_persist;
 pub mod metrics;
 pub mod mvcc;
 pub mod persistence;

@@ -17,6 +17,7 @@ use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::types::DistanceMetric;
 
 /// Metadata describing a vector index (from FT.CREATE).
+#[derive(Clone)]
 pub struct IndexMeta {
     /// Index name (e.g., "idx").
     pub name: Bytes,
@@ -328,6 +329,9 @@ pub struct VectorStore {
     /// Segments recovered from persistence, awaiting FT.CREATE to claim them.
     /// Key: collection_id. Populated during crash recovery.
     pending_segments: HashMap<u64, crate::vector::persistence::recovery::RecoveredCollection>,
+    /// Shard directory for persisting index metadata sidecar.
+    /// Set once during event loop init when disk-offload is enabled.
+    persist_dir: Option<std::path::PathBuf>,
 }
 
 impl VectorStore {
@@ -337,6 +341,24 @@ impl VectorStore {
             next_collection_id: 1,
             txn_manager: TransactionManager::new(),
             pending_segments: HashMap::new(),
+            persist_dir: None,
+        }
+    }
+
+    /// Set the shard directory for index metadata persistence.
+    /// Called once during event loop init when disk-offload is enabled.
+    pub fn set_persist_dir(&mut self, dir: std::path::PathBuf) {
+        self.persist_dir = Some(dir);
+    }
+
+    /// Persist current index metadata to the sidecar file.
+    /// No-op if persist_dir is not set (disk-offload disabled).
+    fn save_index_meta_sidecar(&self) {
+        if let Some(ref dir) = self.persist_dir {
+            let metas = self.collect_index_metas();
+            if let Err(e) = crate::vector::index_persist::save_index_metadata(dir, &metas) {
+                tracing::warn!("Failed to save vector index metadata: {}", e);
+            }
         }
     }
 
@@ -404,6 +426,9 @@ impl VectorStore {
             },
         );
 
+        // Persist index metadata sidecar
+        self.save_index_meta_sidecar();
+
         // Check if recovered segments exist for this collection_id
         if let Some(recovered) = self.pending_segments.remove(&collection_id) {
             if let Some(index) = self.indexes.get(&name) {
@@ -438,6 +463,8 @@ impl VectorStore {
             for warm_seg in &snapshot.warm {
                 warm_seg.mark_tombstoned();
             }
+            // Persist index metadata sidecar
+            self.save_index_meta_sidecar();
             true
         } else {
             false
@@ -513,6 +540,11 @@ impl VectorStore {
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
         self.indexes.is_empty()
+    }
+
+    /// Collect references to all active IndexMeta for persistence.
+    pub fn collect_index_metas(&self) -> Vec<&IndexMeta> {
+        self.indexes.values().map(|idx| &idx.meta).collect()
     }
 
     /// Attempt warm transitions for ALL indexes. Called from persistence tick.

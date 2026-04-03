@@ -451,12 +451,23 @@ impl super::Shard {
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
         let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
+        // Warm check interval adapts to segment_warm_after for fast testing:
+        // default 10s, but if warm_after < 10s, poll at warm_after frequency.
+        let warm_poll_ms = (server_config.segment_warm_after * 1000).min(
+            timers::WARM_CHECK_INTERVAL_MS
+        ).max(1000); // floor 1s
         let mut warm_check_interval = TimerImpl::interval(
-            Duration::from_millis(timers::WARM_CHECK_INTERVAL_MS)
+            Duration::from_millis(warm_poll_ms)
         );
-        // Cold tier transition check: segment_cold_after seconds (default 86400).
-        // Uses 60s polling interval — actual transition depends on segment age.
-        let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(60));
+        // Cold tier transition check: poll at min(60s, segment_cold_after) so the
+        // timer fires within one cold-age window. Default cold_after=86400 → 60s poll.
+        // Short cold_after (e.g. 15s for testing) → poll every 15s.
+        let cold_poll_secs = if server_config.segment_cold_after > 0 {
+            server_config.segment_cold_after.min(60)
+        } else {
+            60
+        };
+        let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
         let spsc_notify_local = spsc_notify;
 
         // Per-shard cached clock: updated once per 1ms tick.
@@ -478,6 +489,114 @@ impl super::Shard {
             &mut self.vector_store,
             crate::vector::store::VectorStore::new(),
         );
+
+        // Restore vector index metadata from sidecar file (disk-offload path).
+        // This re-creates FT.CREATE indexes before any connections are accepted,
+        // then auto-indexes existing HASH keys from the restored databases.
+        if server_config.disk_offload_enabled() {
+            let shard_dir = server_config.effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            let mut vs = shard_databases.vector_store(shard_id);
+            vs.set_persist_dir(shard_dir.clone());
+            match crate::vector::index_persist::load_index_metadata(&shard_dir) {
+                Ok(metas) if !metas.is_empty() => {
+                    info!(
+                        "Shard {}: restoring {} vector index(es) from sidecar",
+                        shard_id, metas.len()
+                    );
+                    for meta in &metas {
+                        if let Err(e) = vs.create_index(meta.clone()) {
+                            tracing::warn!(
+                                "Shard {}: failed to restore index '{}': {}",
+                                shard_id,
+                                String::from_utf8_lossy(&meta.name),
+                                e
+                            );
+                        }
+                    }
+                    drop(vs); // release VectorStore lock before scanning databases
+
+                    // Auto-reindex existing HASH keys that match index prefixes.
+                    let db_count = shard_databases.db_count();
+                    let mut reindexed = 0usize;
+                    for db_idx in 0..db_count {
+                        let guard = shard_databases.read_db(shard_id, db_idx);
+                        // Collect matching keys (to avoid holding both DB lock and VS lock)
+                        let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
+                        for (key, entry) in guard.data().iter() {
+                            let key_bytes = key.as_bytes();
+                            // Check if key matches any index prefix
+                            let matches_prefix = metas.iter().any(|m| {
+                                m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
+                            });
+                            if !matches_prefix {
+                                continue;
+                            }
+                            // Build HSET-style args: [key, field1, val1, field2, val2, ...]
+                            let mut args = Vec::new();
+                            args.push(crate::protocol::Frame::BulkString(
+                                bytes::Bytes::copy_from_slice(key_bytes),
+                            ));
+                            match entry.as_redis_value() {
+                                crate::storage::compact_value::RedisValueRef::Hash(map) => {
+                                    for (field, value) in map.iter() {
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::copy_from_slice(field),
+                                        ));
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::copy_from_slice(value),
+                                        ));
+                                    }
+                                }
+                                crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
+                                    // Listpack stores field/value as alternating entries
+                                    let entries: Vec<_> = lp.iter().collect();
+                                    let mut j = 0;
+                                    while j + 1 < entries.len() {
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::from(entries[j].as_bytes()),
+                                        ));
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::from(entries[j + 1].as_bytes()),
+                                        ));
+                                        j += 2;
+                                    }
+                                }
+                                _ => continue, // Not a hash — skip
+                            }
+                            if args.len() > 1 {
+                                matching.push((key_bytes.to_vec(), args));
+                            }
+                        }
+                        drop(guard); // release DB read lock
+
+                        // Now auto-index with VectorStore lock
+                        if !matching.is_empty() {
+                            let mut vs = shard_databases.vector_store(shard_id);
+                            for (key, args) in &matching {
+                                crate::shard::spsc_handler::auto_index_hset_public(
+                                    &mut vs, key, args,
+                                );
+                                reindexed += 1;
+                            }
+                        }
+                    }
+                    if reindexed > 0 {
+                        info!(
+                            "Shard {}: auto-reindexed {} HASH key(s) into restored vector indexes",
+                            shard_id, reindexed
+                        );
+                    }
+                }
+                Ok(_) => {} // No saved indexes
+                Err(e) => {
+                    tracing::warn!(
+                        "Shard {}: failed to load vector index metadata: {}",
+                        shard_id, e
+                    );
+                }
+            }
+        }
 
         // Pending wakers for monoio cross-shard write dispatch.
         // monoio's !Send single-threaded executor doesn't see cross-thread Waker::wake()
@@ -799,6 +918,8 @@ impl super::Shard {
                         && persistence_tick::should_run_pressure_cascade(
                             &runtime_config,
                             &server_config,
+                            &shard_databases,
+                            shard_id,
                         )
                     {
                         persistence_tick::handle_memory_pressure(
@@ -1128,6 +1249,8 @@ impl super::Shard {
                         && persistence_tick::should_run_pressure_cascade(
                             &runtime_config,
                             &server_config,
+                            &shard_databases,
+                            shard_id,
                         )
                     {
                         persistence_tick::handle_memory_pressure(

@@ -32,7 +32,7 @@ use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
-use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_with_spill_and_total};
+use crate::storage::eviction::try_evict_if_needed_with_spill_and_total;
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
