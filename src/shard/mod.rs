@@ -285,6 +285,7 @@ mod tests {
             &mut pending_snap,
             &mut snap_state,
             &mut wal_w,
+            &mut None, // wal_v3_writer
             &mut None,
             &mut Vec::new(),
             &None,
@@ -336,6 +337,7 @@ mod tests {
             &mut pending_snap,
             &mut snap_state,
             &mut wal_w,
+            &mut None, // wal_v3_writer
             &mut None,
             &mut Vec::new(),
             &None,

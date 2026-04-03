@@ -95,6 +95,7 @@ fn test_warm_transition_end_to_end() {
         &mut manifest,
         0, // warm_after_secs=0 means everything qualifies
         &mut next_file_id,
+        &mut None, // no WAL writer in test
     );
     assert!(transitioned > 0, "should transition at least one segment");
 
@@ -205,6 +206,7 @@ fn test_warm_transition_respects_age_threshold() {
         &mut manifest,
         999_999, // 999999 seconds ~ 11.5 days -- nothing qualifies
         &mut next_file_id,
+        &mut None, // no WAL writer in test
     );
     assert_eq!(
         transitioned, 0,
@@ -259,7 +261,7 @@ fn test_warm_transition_search_still_works_on_mutable() {
     {
         let idx = store.get_index(b"idx").unwrap();
         let mut next_file_id = 1u64;
-        let transitioned = idx.try_warm_transitions(&shard_dir, &mut manifest, 0, &mut next_file_id);
+        let transitioned = idx.try_warm_transitions(&shard_dir, &mut manifest, 0, &mut next_file_id, &mut None);
         assert!(transitioned > 0, "should transition at least one segment");
     }
 

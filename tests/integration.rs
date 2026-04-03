@@ -60,6 +60,10 @@ async fn start_server() -> (u16, CancellationToken) {
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     tokio::spawn(async move {
@@ -120,6 +124,10 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     tokio::spawn(async move {
@@ -1252,6 +1260,10 @@ async fn start_server_with_persistence(
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     tokio::spawn(async move {
@@ -2096,6 +2108,10 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     tokio::spawn(async move {
@@ -2467,6 +2483,10 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     let cancel = token.clone();
@@ -3607,6 +3627,10 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     std::thread::spawn(move || {
@@ -4229,6 +4253,10 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         wal_compression: "lz4".to_string(),
         wal_segment_size: "16mb".to_string(),
         vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
     };
 
     tokio::spawn(async move {
