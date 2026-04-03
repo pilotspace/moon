@@ -324,6 +324,13 @@ impl super::Shard {
             None
         };
 
+        // Per-shard WAL append channel for local writes.
+        // Connection handlers send serialized write commands here; we drain on the 1ms tick.
+        let (wal_append_tx, mut wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
+        if appendonly_enabled || server_config.disk_offload_enabled() {
+            shard_databases.set_wal_append_tx(shard_id, wal_append_tx);
+        }
+
         // Per-shard PageCache (None when disk-offload is disabled).
         // Manages 4KB + 64KB page frames with clock-sweep eviction.
         let page_cache: Option<PageCache> = if server_config.disk_offload_enabled() {
@@ -553,7 +560,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -603,7 +610,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -669,6 +676,19 @@ impl super::Shard {
                                 );
                                 bgsave_checkpoint_requested = true;
                             }
+                        }
+                    }
+
+                    // Drain local-write WAL channel (connection handler inline writes)
+                    while let Ok(data) = wal_append_rx.try_recv() {
+                        if let Some(ref mut wal) = wal_writer {
+                            wal.append(&data);
+                        }
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            wal.append(
+                                crate::persistence::wal_v3::record::WalRecordType::Command,
+                                &data,
+                            );
                         }
                     }
 
@@ -852,7 +872,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -908,7 +928,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -980,6 +1000,19 @@ impl super::Shard {
                                 crate::command::persistence::bgsave_shard_done(true);
                                 bgsave_checkpoint_requested = true;
                             }
+                        }
+                    }
+
+                    // Drain local-write WAL channel (connection handler inline writes)
+                    while let Ok(data) = wal_append_rx.try_recv() {
+                        if let Some(ref mut wal) = wal_writer {
+                            wal.append(&data);
+                        }
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            wal.append(
+                                crate::persistence::wal_v3::record::WalRecordType::Command,
+                                &data,
+                            );
                         }
                     }
 

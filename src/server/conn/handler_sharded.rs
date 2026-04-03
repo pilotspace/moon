@@ -1404,9 +1404,12 @@ pub async fn handle_connection_sharded_inner<
                                     }
                                 }
                             }
-                            if let Some(bytes) = aof_bytes {
+                            if let Some(ref bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
-                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
+                                    // AOF append (background writer)
+                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
+                                    // Per-shard WAL append (drained by event loop on 1ms tick)
+                                    shard_databases.wal_append(shard_id, bytes.clone());
                                 }
                             }
                             if tracking_state.enabled && !matches!(response, Frame::Error(_)) {

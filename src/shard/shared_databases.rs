@@ -14,6 +14,10 @@ pub struct ShardDatabases {
     shards: Vec<Vec<RwLock<Database>>>,
     /// Per-shard VectorStore for FT.* commands in single-shard mode.
     vector_stores: Vec<Mutex<VectorStore>>,
+    /// Per-shard WAL append channel sender. Connection handlers send serialized
+    /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
+    /// Mutex<Option<>> for single-writer init, then read-only via wal_append().
+    wal_append_txs: Vec<Mutex<Option<crate::runtime::channel::MpscSender<bytes::Bytes>>>>,
     num_shards: usize,
     db_count: usize,
 }
@@ -30,12 +34,37 @@ impl ShardDatabases {
         let vector_stores = (0..num_shards)
             .map(|_| Mutex::new(VectorStore::new()))
             .collect();
+        let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
         Arc::new(Self {
             shards,
             vector_stores,
+            wal_append_txs,
             num_shards,
             db_count,
         })
+    }
+
+    /// Set the WAL append channel sender for a shard.
+    ///
+    /// Called once during event loop startup. Uses interior mutability via
+    /// unsafe transmutation of the Arc — safe because this is called exactly
+    /// once per shard before any connections are accepted.
+    /// Set the WAL append channel sender for a shard.
+    /// Called once during event loop startup before connections are accepted.
+    pub fn set_wal_append_tx(&self, shard_id: usize, tx: crate::runtime::channel::MpscSender<bytes::Bytes>) {
+        *self.wal_append_txs[shard_id].lock() = Some(tx);
+    }
+
+    /// Send serialized command bytes to the WAL append channel for a shard.
+    ///
+    /// Called by connection handlers for local write commands. The event loop
+    /// drains this channel on the 1ms tick into WAL v2/v3.
+    /// No-op when persistence is disabled.
+    #[inline]
+    pub fn wal_append(&self, shard_id: usize, data: bytes::Bytes) {
+        if let Some(ref tx) = *self.wal_append_txs[shard_id].lock() {
+            let _ = tx.try_send(data);
+        }
     }
 
     /// Acquire exclusive access to a shard's VectorStore.

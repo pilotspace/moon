@@ -17,6 +17,7 @@ use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
+use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
@@ -47,6 +48,7 @@ pub(crate) fn drain_spsc_shared(
     )>,
     snapshot_state: &mut Option<SnapshotState>,
     wal_writer: &mut Option<WalWriter>,
+    wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &mut Option<ReplicationBacklog>,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
@@ -118,6 +120,7 @@ pub(crate) fn drain_spsc_shared(
                 pending_snapshot,
                 snapshot_state,
                 wal_writer,
+                wal_v3_writer,
                 repl_backlog,
                 replica_txs,
                 repl_state,
@@ -139,6 +142,7 @@ pub(crate) fn drain_spsc_shared(
             pending_snapshot,
             snapshot_state,
             wal_writer,
+            wal_v3_writer,
             repl_backlog,
             replica_txs,
             repl_state,
@@ -166,6 +170,7 @@ pub(crate) fn handle_shard_message_shared(
     )>,
     snapshot_state: &mut Option<SnapshotState>,
     wal_writer: &mut Option<WalWriter>,
+    wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &mut Option<ReplicationBacklog>,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
@@ -216,6 +221,7 @@ pub(crate) fn handle_shard_message_shared(
                     wal_append_and_fanout(
                         &serialized,
                         wal_writer,
+                        wal_v3_writer,
                         repl_backlog,
                         replica_txs,
                         repl_state,
@@ -331,6 +337,7 @@ pub(crate) fn handle_shard_message_shared(
                     wal_append_and_fanout(
                         &serialized,
                         wal_writer,
+                        wal_v3_writer,
                         repl_backlog,
                         replica_txs,
                         repl_state,
@@ -418,6 +425,7 @@ pub(crate) fn handle_shard_message_shared(
                     wal_append_and_fanout(
                         &serialized,
                         wal_writer,
+                        wal_v3_writer,
                         repl_backlog,
                         replica_txs,
                         repl_state,
@@ -511,6 +519,7 @@ pub(crate) fn handle_shard_message_shared(
                     wal_append_and_fanout(
                         &serialized,
                         wal_writer,
+                        wal_v3_writer,
                         repl_backlog,
                         replica_txs,
                         repl_state,
@@ -599,6 +608,7 @@ pub(crate) fn handle_shard_message_shared(
                     wal_append_and_fanout(
                         &serialized,
                         wal_writer,
+                        wal_v3_writer,
                         repl_backlog,
                         replica_txs,
                         repl_state,
@@ -685,6 +695,7 @@ pub(crate) fn handle_shard_message_shared(
                     wal_append_and_fanout(
                         &serialized,
                         wal_writer,
+                        wal_v3_writer,
                         repl_backlog,
                         replica_txs,
                         repl_state,
@@ -1022,14 +1033,22 @@ pub(crate) fn cow_intercept(
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
     wal_writer: &mut Option<WalWriter>,
+    wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &mut Option<ReplicationBacklog>,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
 ) {
-    // 1. WAL append (disk durability, unchanged behavior)
+    // 1a. WAL v2 append (disk durability, legacy path)
     if let Some(w) = wal_writer {
         w.append(data);
+    }
+    // 1b. WAL v3 append (disk-offload mode: per-record LSN, CRC32C)
+    if let Some(w3) = wal_v3_writer {
+        w3.append(
+            crate::persistence::wal_v3::record::WalRecordType::Command,
+            data,
+        );
     }
     // 2. Replication backlog (in-memory circular buffer for partial resync)
     if let Some(backlog) = repl_backlog {

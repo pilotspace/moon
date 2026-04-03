@@ -257,13 +257,28 @@ pub fn recover_shard_v3(
         let on_command = &mut |record: &WalRecord| {
             match record.record_type {
                 WalRecordType::Command => {
-                    engine.replay_command(
-                        databases,
-                        &record.payload,
-                        &[],
-                        &mut selected_db,
-                    );
-                    result.commands_replayed += 1;
+                    // Parse RESP frames from the serialized command payload.
+                    // The payload is RESP-encoded (same format as AOF/WAL v2 blocks).
+                    let mut buf = bytes::BytesMut::from(&record.payload[..]);
+                    let parse_cfg = crate::protocol::ParseConfig::default();
+                    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
+                        if let crate::protocol::Frame::Array(ref arr) = frame {
+                            if !arr.is_empty() {
+                                let cmd_name = match &arr[0] {
+                                    crate::protocol::Frame::BulkString(s) => s.as_ref(),
+                                    crate::protocol::Frame::SimpleString(s) => s.as_ref(),
+                                    _ => continue,
+                                };
+                                engine.replay_command(
+                                    databases,
+                                    cmd_name,
+                                    &arr[1..],
+                                    &mut selected_db,
+                                );
+                                result.commands_replayed += 1;
+                            }
+                        }
+                    }
                 }
                 WalRecordType::VectorUpsert
                 | WalRecordType::VectorDelete
