@@ -273,10 +273,33 @@ pub fn init_fwht() {
 /// [`init_fwht()`] must have been called before first use.
 #[inline(always)]
 pub fn fwht(data: &mut [f32], sign_flips: &[f32]) {
-    // SAFETY: init_fwht() is called at startup before any encode/search operation.
-    // The OnceLock is guaranteed to be initialized by the time any TurboQuant
-    // path reaches this function.
-    (unsafe { *FWHT_FN.get().unwrap_unchecked() })(data, sign_flips);
+    // Fast path: already initialized (zero-cost after first call).
+    // Lazy init on first use avoids UB when tests bypass server startup.
+    let f = FWHT_FN.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                return |d: &mut [f32], s: &[f32]| {
+                    // SAFETY: AVX2 verified above.
+                    unsafe { fwht_avx2(d, s) }
+                };
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            return |d: &mut [f32], s: &[f32]| {
+                // SAFETY: NEON is baseline on all AArch64 CPUs.
+                unsafe { fwht_neon(d, s) }
+            };
+        }
+        #[allow(unreachable_code)]
+        (|d: &mut [f32], s: &[f32]| {
+            apply_sign_flips(d, s);
+            fwht_scalar(d);
+            normalize_fwht(d);
+        })
+    });
+    f(data, sign_flips);
 }
 
 /// Inverse randomized normalized FWHT: R^{-1}(y) = D * H * y.
