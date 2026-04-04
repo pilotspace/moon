@@ -16,6 +16,7 @@ use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, Storage
 use crate::persistence::page::{PageType, PAGE_4K};
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::Entry;
+use super::kv_serde;
 
 /// Spill a single evicted KV entry to a DataFile on disk.
 ///
@@ -38,45 +39,23 @@ pub fn spill_to_datafile(
     manifest: &mut ShardManifest,
     cold_index: Option<&mut super::cold_index::ColdIndex>,
 ) -> io::Result<()> {
-    // Determine value type and extract bytes
-    let (value_type, value_bytes): (ValueType, &[u8]) = match entry.as_redis_value() {
+    // Determine value type and extract bytes.
+    // For collections, serialize via kv_serde; for strings, borrow directly.
+    let collection_buf: Vec<u8>;
+    let val_ref = entry.as_redis_value();
+    let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
         RedisValueRef::String(s) => (ValueType::String, s),
-        RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => {
-            warn!(
-                key = %String::from_utf8_lossy(key),
-                "kv_spill: skipping Hash entry (collection serialization not yet supported)"
-            );
-            return Ok(());
-        }
-        RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => {
-            warn!(
-                key = %String::from_utf8_lossy(key),
-                "kv_spill: skipping List entry (collection serialization not yet supported)"
-            );
-            return Ok(());
-        }
-        RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => {
-            warn!(
-                key = %String::from_utf8_lossy(key),
-                "kv_spill: skipping Set entry (collection serialization not yet supported)"
-            );
-            return Ok(());
-        }
-        RedisValueRef::SortedSet { .. }
-        | RedisValueRef::SortedSetBPTree { .. }
-        | RedisValueRef::SortedSetListpack(_) => {
-            warn!(
-                key = %String::from_utf8_lossy(key),
-                "kv_spill: skipping ZSet entry (collection serialization not yet supported)"
-            );
-            return Ok(());
-        }
-        RedisValueRef::Stream(_) => {
-            warn!(
-                key = %String::from_utf8_lossy(key),
-                "kv_spill: skipping Stream entry (collection serialization not yet supported)"
-            );
-            return Ok(());
+        ref other => {
+            let vt = match other {
+                RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => ValueType::Hash,
+                RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
+                RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => ValueType::Set,
+                RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetBPTree { .. } | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+                RedisValueRef::Stream(_) => ValueType::Stream,
+                RedisValueRef::String(_) => unreachable!(),
+            };
+            collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
+            (vt, collection_buf.as_slice())
         }
     };
 
@@ -98,7 +77,7 @@ pub fn spill_to_datafile(
                 key = %String::from_utf8_lossy(key),
                 key_len = key.len(),
                 value_len = value_bytes.len(),
-                "kv_spill: entry too large for single 4KB page, skipping (overflow pages TODO)"
+                "kv_spill: entry too large for single 4KB page, skipping (overflow pages pending)"
             );
             return Ok(());
         }
@@ -146,9 +125,12 @@ pub fn spill_to_datafile(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
     use crate::persistence::kv_page::read_datafile;
     use crate::persistence::manifest::ShardManifest;
-    use crate::storage::entry::{Entry, current_time_ms};
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::entry::{Entry, RedisValue, current_time_ms};
 
     #[test]
     fn test_spill_string_roundtrip() {
@@ -232,5 +214,82 @@ mod tests {
 
         // Manifest should not have a new entry
         assert!(manifest.files().is_empty());
+    }
+
+    #[test]
+    fn test_spill_hash_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
+        map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
+
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = CompactValue::from_redis_value(RedisValue::Hash(map));
+
+        spill_to_datafile(shard_dir, 10, b"hash_key", &entry, &mut manifest, None).unwrap();
+
+        let file_path = shard_dir.join("data/heap-000010.mpf");
+        assert!(file_path.exists(), "DataFile should exist for hash entry");
+
+        let pages = read_datafile(&file_path).unwrap();
+        assert_eq!(pages.len(), 1);
+
+        let kv_entry = pages[0].get(0).unwrap();
+        assert_eq!(kv_entry.key, b"hash_key");
+        assert_eq!(kv_entry.value_type, ValueType::Hash);
+
+        // Verify deserialization
+        let deserialized = kv_serde::deserialize_collection(&kv_entry.value, ValueType::Hash)
+            .expect("should deserialize hash");
+        match deserialized {
+            RedisValue::Hash(result_map) => {
+                assert_eq!(result_map.len(), 2);
+                assert_eq!(result_map.get(&Bytes::from_static(b"f1")).unwrap(), &Bytes::from_static(b"v1"));
+                assert_eq!(result_map.get(&Bytes::from_static(b"f2")).unwrap(), &Bytes::from_static(b"v2"));
+            }
+            _ => panic!("expected Hash"),
+        }
+    }
+
+    #[test]
+    fn test_spill_list_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        let mut list = VecDeque::new();
+        list.push_back(Bytes::from_static(b"elem1"));
+        list.push_back(Bytes::from_static(b"elem2"));
+        list.push_back(Bytes::from_static(b"elem3"));
+
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = CompactValue::from_redis_value(RedisValue::List(list));
+
+        spill_to_datafile(shard_dir, 11, b"list_key", &entry, &mut manifest, None).unwrap();
+
+        let file_path = shard_dir.join("data/heap-000011.mpf");
+        assert!(file_path.exists(), "DataFile should exist for list entry");
+
+        let pages = read_datafile(&file_path).unwrap();
+        let kv_entry = pages[0].get(0).unwrap();
+        assert_eq!(kv_entry.key, b"list_key");
+        assert_eq!(kv_entry.value_type, ValueType::List);
+
+        let deserialized = kv_serde::deserialize_collection(&kv_entry.value, ValueType::List)
+            .expect("should deserialize list");
+        match deserialized {
+            RedisValue::List(result_list) => {
+                assert_eq!(result_list.len(), 3);
+                assert_eq!(result_list[0], Bytes::from_static(b"elem1"));
+                assert_eq!(result_list[1], Bytes::from_static(b"elem2"));
+                assert_eq!(result_list[2], Bytes::from_static(b"elem3"));
+            }
+            _ => panic!("expected List"),
+        }
     }
 }
