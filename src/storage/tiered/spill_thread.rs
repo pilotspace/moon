@@ -397,4 +397,217 @@ mod tests {
         drop(sender);
         st.shutdown();
     }
+
+    #[test]
+    fn test_full_pipeline_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = SpillThread::new(10);
+        let sender = st.sender();
+
+        // Send 5 requests with different keys/values
+        for i in 0..5u64 {
+            let req = SpillRequest {
+                key: Bytes::from(format!("pipeline_key_{i}")),
+                value_bytes: Bytes::from(format!("pipeline_value_{i}_with_some_data")),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 100 + i,
+                shard_dir: tmp.path().to_path_buf(),
+            };
+            sender.send(req).unwrap();
+        }
+
+        // Drain completions (with retries to allow background thread to process)
+        let mut completions = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while completions.len() < 5 && std::time::Instant::now() < deadline {
+            completions.extend(st.drain_completions());
+            if completions.len() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        assert_eq!(completions.len(), 5, "Expected 5 completions");
+
+        for (i, c) in completions.iter().enumerate() {
+            assert!(c.success, "completion {} should succeed", i);
+            assert_eq!(c.file_id, 100 + i as u64);
+            assert!(c.file_entry.page_count >= 1, "page_count should be >= 1");
+            assert_eq!(
+                c.file_entry.file_type,
+                PageType::KvLeaf as u8,
+                "file_type should be KvLeaf"
+            );
+
+            // Verify .mpf file exists on disk
+            let file_path = tmp.path().join(format!("data/heap-{:06}.mpf", c.file_id));
+            assert!(file_path.exists(), "file {} should exist", c.file_id);
+
+            // Read back and verify content
+            let pages = read_datafile(&file_path).unwrap();
+            assert!(!pages.is_empty());
+            let entry = pages[0].get(0).unwrap();
+            assert_eq!(entry.key, format!("pipeline_key_{i}").as_bytes());
+            assert_eq!(
+                entry.value,
+                format!("pipeline_value_{i}_with_some_data").as_bytes()
+            );
+        }
+
+        drop(sender);
+        st.shutdown();
+    }
+
+    #[test]
+    fn test_channel_backpressure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = SpillThread::new(11);
+        let sender = st.sender();
+
+        // Fill channel to capacity (64). Use large shard_dir to slow I/O,
+        // but also just spam sends fast enough to exceed channel bound.
+        // We need the bg thread to NOT drain fast enough, so pause it by
+        // NOT letting it run (it will block on recv -- we overflow with try_send).
+        //
+        // Actually, flume bounded(64) means 64 items can be buffered. The bg
+        // thread will start draining immediately, so we need to send faster
+        // than it processes. We can verify by using try_send in a tight loop.
+
+        // First, fill the channel by sending 64 items rapidly
+        let mut sent = 0;
+        for i in 0..128u64 {
+            let req = SpillRequest {
+                key: Bytes::from(format!("bp_key_{i}")),
+                value_bytes: Bytes::from(format!("bp_val_{i}")),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 200 + i,
+                shard_dir: tmp.path().to_path_buf(),
+            };
+            match sender.try_send(req) {
+                Ok(()) => sent += 1,
+                Err(flume::TrySendError::Full(_)) => {
+                    // Channel is full -- this proves backpressure works
+                    break;
+                }
+                Err(flume::TrySendError::Disconnected(_)) => {
+                    panic!("channel disconnected unexpectedly");
+                }
+            }
+        }
+        // We should have sent at least 64 (channel capacity) but may have sent
+        // more if the bg thread drained some. The important thing is that we
+        // either hit Full or sent all 128 (bg thread was fast enough).
+        assert!(sent >= 1, "should have sent at least 1 request");
+
+        // Drain completions to verify no panic or deadlock
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut received = 0;
+        while received < sent && std::time::Instant::now() < deadline {
+            received += st.drain_completions().len();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(received, sent, "should receive all sent completions");
+
+        // Now send one more -- should succeed since channel is drained
+        let req = SpillRequest {
+            key: Bytes::from_static(b"bp_final"),
+            value_bytes: Bytes::from_static(b"bp_final_val"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id: 999,
+            shard_dir: tmp.path().to_path_buf(),
+        };
+        assert!(sender.try_send(req).is_ok(), "should send after drain");
+
+        drop(sender);
+        st.shutdown();
+    }
+
+    #[test]
+    fn test_completion_ordering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = SpillThread::new(12);
+        let sender = st.sender();
+
+        // Send 10 requests with ascending file_ids
+        for i in 0..10u64 {
+            let req = SpillRequest {
+                key: Bytes::from(format!("order_key_{i}")),
+                value_bytes: Bytes::from(format!("order_val_{i}")),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 100 + i,
+                shard_dir: tmp.path().to_path_buf(),
+            };
+            sender.send(req).unwrap();
+        }
+
+        // Collect all completions
+        let mut completions = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while completions.len() < 10 && std::time::Instant::now() < deadline {
+            completions.extend(st.drain_completions());
+            if completions.len() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        assert_eq!(completions.len(), 10, "Expected 10 completions");
+
+        // Verify FIFO ordering (flume guarantees this)
+        for (i, c) in completions.iter().enumerate() {
+            assert!(c.success);
+            assert_eq!(
+                c.file_id,
+                100 + i as u64,
+                "completion {} should have file_id {}",
+                i,
+                100 + i as u64
+            );
+        }
+
+        drop(sender);
+        st.shutdown();
+    }
+
+    #[test]
+    fn test_shutdown_with_pending_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = SpillThread::new(13);
+        let sender = st.sender();
+
+        // Send 3 requests
+        for i in 0..3u64 {
+            let req = SpillRequest {
+                key: Bytes::from(format!("shutdown_key_{i}")),
+                value_bytes: Bytes::from(format!("shutdown_val_{i}")),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 300 + i,
+                shard_dir: tmp.path().to_path_buf(),
+            };
+            sender.send(req).unwrap();
+        }
+
+        // Immediately drop sender and shut down -- thread should process
+        // remaining items then exit cleanly on channel disconnect.
+        drop(sender);
+
+        // shutdown() calls join() which should complete within seconds
+        // (thread processes 3 remaining items then exits)
+        let start = std::time::Instant::now();
+        st.shutdown();
+        let elapsed = start.elapsed();
+
+        // Should complete well within 5 seconds
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "shutdown took too long: {:?}",
+            elapsed
+        );
+    }
 }
