@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_from_page_rejects_wrong_type() {
-        use crate::persistence::page::{MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE};
+        use crate::persistence::page::{MoonPageHeader, PageType};
 
         let mut buf = [0u8; 4096];
         let hdr = MoonPageHeader::new(PageType::KvLeaf, 1, 1);
