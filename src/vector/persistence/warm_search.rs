@@ -183,8 +183,18 @@ impl WarmSearchSegment {
         let graph_payload = extract_payloads(&graph_mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
         let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
 
-        // Deserialize HNSW graph from payload bytes
-        let graph = HnswGraph::from_bytes(&graph_payload).map_err(|e| {
+        // Auto-detect compressed vs uncompressed graph format.
+        // Compressed format (Phase 84+) has version_tag=0x01 at byte offset 15.
+        // Uncompressed format has layer0_len (u32 LE) starting at offset 15.
+        // Detect by checking: if byte 15 is 0x01, try compressed first;
+        // fall back to uncompressed for legacy segments.
+        let graph = if graph_payload.len() > 15 && graph_payload[15] == 0x01 {
+            HnswGraph::from_bytes_compressed(&graph_payload).or_else(|_| {
+                HnswGraph::from_bytes(&graph_payload)
+            })
+        } else {
+            HnswGraph::from_bytes(&graph_payload)
+        }.map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("graph deserialization failed: {e}"),

@@ -166,7 +166,7 @@ impl VectorIndex {
             let file_id = *next_file_id;
             *next_file_id += 1;
 
-            let graph_bytes = imm.graph().to_bytes();
+            let graph_bytes = imm.graph().to_bytes_compressed();
             let codes_data = imm.vectors_tq().as_slice();
             let mvcc_data = imm.mvcc_raw_bytes();
 
