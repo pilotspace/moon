@@ -412,6 +412,159 @@ impl KvLeafPage {
     }
 }
 
+// ── KvOverflowPage ─────────────────────────────────────
+
+/// A 4KB overflow continuation page for large KV values.
+///
+/// Layout: `[MoonPageHeader 64B][payload up to 4032B]`
+/// Chain: `prev_page`/`next_page` in header link overflow pages.
+pub struct KvOverflowPage {
+    data: [u8; PAGE_4K],
+}
+
+/// Maximum payload bytes per overflow page (4096 - 64 header).
+pub const OVERFLOW_PAYLOAD_CAP: usize = PAGE_4K - MOONPAGE_HEADER_SIZE;
+
+impl KvOverflowPage {
+    /// Create a new overflow page with the given identifiers.
+    pub fn new(page_id: u64, file_id: u64) -> Self {
+        let mut data = [0u8; PAGE_4K];
+        let hdr = MoonPageHeader::new(PageType::KvOverflow, page_id, file_id);
+        hdr.write_to(&mut data);
+        Self { data }
+    }
+
+    /// Write payload bytes starting at offset 64.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `payload.len() > OVERFLOW_PAYLOAD_CAP`.
+    pub fn write_payload(&mut self, payload: &[u8]) {
+        assert!(
+            payload.len() <= OVERFLOW_PAYLOAD_CAP,
+            "overflow payload {} exceeds capacity {}",
+            payload.len(),
+            OVERFLOW_PAYLOAD_CAP,
+        );
+        self.data[MOONPAGE_HEADER_SIZE..MOONPAGE_HEADER_SIZE + payload.len()]
+            .copy_from_slice(payload);
+        // Store payload_bytes in header (offset 20..24)
+        self.data[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    }
+
+    /// Read payload bytes from offset 64..64+payload_bytes.
+    pub fn read_payload(&self) -> &[u8] {
+        let payload_bytes =
+            u32::from_le_bytes([self.data[20], self.data[21], self.data[22], self.data[23]])
+                as usize;
+        &self.data[MOONPAGE_HEADER_SIZE..MOONPAGE_HEADER_SIZE + payload_bytes]
+    }
+
+    /// Set prev_page (offset 40..44) and next_page (offset 44..48) in header.
+    pub fn set_prev_next(&mut self, prev: u32, next: u32) {
+        self.data[40..44].copy_from_slice(&prev.to_le_bytes());
+        self.data[44..48].copy_from_slice(&next.to_le_bytes());
+    }
+
+    /// Finalize: compute CRC32C checksum over the payload region.
+    pub fn finalize(&mut self) {
+        MoonPageHeader::compute_checksum(&mut self.data);
+    }
+
+    /// Return the raw page bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; PAGE_4K] {
+        &self.data
+    }
+
+    /// Construct from raw bytes, validating the header.
+    ///
+    /// Returns `None` if magic or page_type is invalid.
+    pub fn from_bytes(data: [u8; PAGE_4K]) -> Option<Self> {
+        let hdr = MoonPageHeader::read_from(&data)?;
+        if hdr.page_type != PageType::KvOverflow {
+            return None;
+        }
+        Some(Self { data })
+    }
+
+    /// Read next_page from header (offset 44..48).
+    #[inline]
+    pub fn next_page(&self) -> u32 {
+        u32::from_le_bytes([self.data[44], self.data[45], self.data[46], self.data[47]])
+    }
+}
+
+/// Build a chain of overflow pages for data that exceeds inline KvLeaf capacity.
+///
+/// Returns a `Vec` of overflow page buffers. The caller writes them to the DataFile
+/// after the KvLeaf page. Page IDs are sequential starting at `start_page_id`.
+/// Chain links: `page[i].next_page = i+1` (1-based), last page `next_page = 0`.
+pub fn build_overflow_chain(data: &[u8], file_id: u64, start_page_id: u64) -> Vec<KvOverflowPage> {
+    let chunk_count = (data.len() + OVERFLOW_PAYLOAD_CAP - 1) / OVERFLOW_PAYLOAD_CAP;
+    let mut pages = Vec::with_capacity(chunk_count);
+
+    for (i, chunk) in data.chunks(OVERFLOW_PAYLOAD_CAP).enumerate() {
+        let page_id = start_page_id + i as u64;
+        let mut page = KvOverflowPage::new(page_id, file_id);
+        page.write_payload(chunk);
+
+        // prev_page: 0 for first, otherwise i (1-based index of previous overflow page)
+        let prev = if i == 0 { 0 } else { i as u32 };
+        // next_page: i+2 for non-last (1-based index of next overflow page), 0 for last
+        let next = if i + 1 < chunk_count { (i + 2) as u32 } else { 0 };
+        page.set_prev_next(prev, next);
+        page.finalize();
+        pages.push(page);
+    }
+
+    pages
+}
+
+/// Read and reassemble overflow chain payload from raw file data.
+///
+/// `file_data` is the complete raw file contents. `start_page_idx` is the
+/// 1-based page index of the first overflow page (page 0 is the KvLeaf).
+/// Reads sequential overflow pages until `next_page == 0`.
+pub fn read_overflow_chain(file_data: &[u8], start_page_idx: usize) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut page_idx = start_page_idx;
+
+    loop {
+        let offset = page_idx * PAGE_4K;
+        if offset + PAGE_4K > file_data.len() {
+            return None; // truncated file
+        }
+        let mut buf = [0u8; PAGE_4K];
+        buf.copy_from_slice(&file_data[offset..offset + PAGE_4K]);
+        let page = KvOverflowPage::from_bytes(buf)?;
+        result.extend_from_slice(page.read_payload());
+
+        let next = page.next_page();
+        if next == 0 {
+            break;
+        }
+        page_idx = next as usize;
+    }
+
+    Some(result)
+}
+
+/// Write a KvLeaf page followed by overflow pages to a `.mpf` DataFile.
+///
+/// The file is fsynced after writing.
+pub fn write_datafile_mixed(path: &Path, leaf: &KvLeafPage, overflow: &[KvOverflowPage]) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&leaf.data)?;
+    for page in overflow {
+        file.write_all(&page.data)?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
 // ── DataFile I/O ────────────────────────────────────────
 
 /// Write a sequence of KvLeaf pages to a `.mpf` DataFile.
@@ -759,5 +912,36 @@ mod tests {
             0,
             "COMPRESSED flag must NOT be set for values below threshold"
         );
+    }
+
+    #[test]
+    fn test_overflow_page_roundtrip() {
+        let mut page = KvOverflowPage::new(1, 42);
+        let payload = b"hello overflow world";
+        page.write_payload(payload);
+        page.set_prev_next(0, 2);
+        page.finalize();
+
+        let bytes = *page.as_bytes();
+        let restored = KvOverflowPage::from_bytes(bytes).expect("should parse overflow page");
+        assert_eq!(restored.read_payload(), payload);
+        assert_eq!(restored.next_page(), 2);
+    }
+
+    #[test]
+    fn test_overflow_chain_build_read() {
+        // 6KB data = 2 overflow pages (4032 + 1968 bytes)
+        let data: Vec<u8> = (0..6000u32).map(|i| (i % 256) as u8).collect();
+        let chain = build_overflow_chain(&data, 99, 1);
+        assert_eq!(chain.len(), 2, "6KB should need 2 overflow pages");
+
+        // Simulate writing to a file buffer: leaf page + overflow pages
+        let mut file_data = vec![0u8; PAGE_4K]; // dummy leaf page at index 0
+        for page in &chain {
+            file_data.extend_from_slice(page.as_bytes());
+        }
+
+        let reassembled = read_overflow_chain(&file_data, 1).expect("should read chain");
+        assert_eq!(reassembled, data, "reassembled data must match original");
     }
 }

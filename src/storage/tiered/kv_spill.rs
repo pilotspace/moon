@@ -11,6 +11,7 @@ use tracing::warn;
 
 use crate::persistence::kv_page::{
     KvLeafPage, PageFull, ValueType, entry_flags, write_datafile,
+    build_overflow_chain, write_datafile_mixed,
 };
 use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
 use crate::persistence::page::{PageType, PAGE_4K};
@@ -70,16 +71,37 @@ pub fn spill_to_datafile(
 
     // Create page and insert entry
     let mut page = KvLeafPage::new(0, file_id);
+    let overflow_pages: Vec<crate::persistence::kv_page::KvOverflowPage>;
+    let total_pages: u32;
+
     match page.insert(key, value_bytes, value_type, flags, ttl_ms) {
-        Ok(_) => {}
+        Ok(_) => {
+            overflow_pages = Vec::new();
+            total_pages = 1;
+        }
         Err(PageFull) => {
-            warn!(
-                key = %String::from_utf8_lossy(key),
-                key_len = key.len(),
-                value_len = value_bytes.len(),
-                "kv_spill: entry too large for single 4KB page, skipping (overflow pages pending)"
-            );
-            return Ok(());
+            // Build overflow chain for the full value
+            let chain = build_overflow_chain(value_bytes, file_id, 1);
+            let chain_len = chain.len() as u32;
+
+            // Build overflow pointer: start_page_idx u32 LE (= 1, first page after leaf)
+            let overflow_ptr = 1u32.to_le_bytes();
+            // Insert the pointer into the leaf with OVERFLOW flag
+            let overflow_flags = flags | entry_flags::OVERFLOW;
+            match page.insert(key, &overflow_ptr, value_type, overflow_flags, ttl_ms) {
+                Ok(_) => {}
+                Err(PageFull) => {
+                    // Key itself is too large even for the overflow pointer
+                    warn!(
+                        key = %String::from_utf8_lossy(key),
+                        key_len = key.len(),
+                        "kv_spill: key too large for leaf page even with overflow pointer"
+                    );
+                    return Ok(());
+                }
+            }
+            overflow_pages = chain;
+            total_pages = 1 + chain_len;
         }
     }
     page.finalize();
@@ -90,7 +112,11 @@ pub fn spill_to_datafile(
 
     // Write DataFile
     let file_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
-    write_datafile(&file_path, &[&page])?;
+    if overflow_pages.is_empty() {
+        write_datafile(&file_path, &[&page])?;
+    } else {
+        write_datafile_mixed(&file_path, &page, &overflow_pages)?;
+    }
 
     // Register in manifest
     manifest.add_file(FileEntry {
@@ -99,8 +125,8 @@ pub fn spill_to_datafile(
         status: FileStatus::Active,
         tier: StorageTier::Hot,
         page_size_log2: 12, // 4KB = 2^12
-        page_count: 1,
-        byte_size: PAGE_4K as u64,
+        page_count: total_pages,
+        byte_size: (total_pages as u64) * (PAGE_4K as u64),
         created_lsn: 0,
         min_key_hash: 0,
         max_key_hash: 0,
@@ -187,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spill_oversized_entry_skips() {
+    fn test_spill_oversized_uses_overflow() {
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path();
         let manifest_path = shard_dir.join("shard.manifest");
@@ -208,12 +234,21 @@ mod tests {
 
         spill_to_datafile(shard_dir, 3, b"big_key", &entry, &mut manifest, None).unwrap();
 
-        // No file should have been written
+        // File SHOULD now exist with overflow pages
         let file_path = shard_dir.join("data/heap-000003.mpf");
-        assert!(!file_path.exists());
+        assert!(file_path.exists(), "oversized entry should use overflow pages");
 
-        // Manifest should not have a new entry
-        assert!(manifest.files().is_empty());
+        // Manifest should have an entry with page_count > 1
+        assert_eq!(manifest.files().len(), 1);
+        assert!(manifest.files()[0].page_count > 1, "should have overflow pages");
+
+        // Verify the leaf page has OVERFLOW flag
+        let file_data = std::fs::read(&file_path).unwrap();
+        let mut leaf_buf = [0u8; PAGE_4K];
+        leaf_buf.copy_from_slice(&file_data[..PAGE_4K]);
+        let leaf = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf).unwrap();
+        let kv_entry = leaf.get(0).unwrap();
+        assert_ne!(kv_entry.flags & entry_flags::OVERFLOW, 0, "OVERFLOW flag should be set");
     }
 
     #[test]
@@ -290,6 +325,47 @@ mod tests {
                 assert_eq!(result_list[2], Bytes::from_static(b"elem3"));
             }
             _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn test_spill_overflow_string_roundtrip() {
+        use crate::storage::tiered::cold_read::cold_read_through;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        // 6KB of incompressible data (xorshift PRNG)
+        let mut big_value = vec![0u8; 6000];
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for b in big_value.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = state as u8;
+        }
+        let entry = Entry::new_string(Bytes::from(big_value.clone()));
+
+        spill_to_datafile(shard_dir, 50, b"overflow_key", &entry, &mut manifest, Some(&mut cold_index)).unwrap();
+
+        // Verify file is multi-page
+        let file_path = shard_dir.join("data/heap-000050.mpf");
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        assert!(file_size > PAGE_4K as u64, "file should have overflow pages");
+
+        // Read back via cold_read_through
+        let result = cold_read_through(&cold_index, shard_dir, b"overflow_key", 0);
+        assert!(result.is_some(), "should read overflow entry");
+        let (value, _ttl) = result.unwrap();
+        match value {
+            RedisValue::String(data) => {
+                assert_eq!(data.as_ref(), big_value.as_slice());
+            }
+            _ => panic!("expected String"),
         }
     }
 }

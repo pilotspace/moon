@@ -375,14 +375,16 @@ impl Database {
                 crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)
             })
         });
-        if let Some((value, ttl_ms)) = cold_result {
+        if let Some((redis_value, ttl_ms)) = cold_result {
             let key_bytes = Bytes::copy_from_slice(key);
-            let value_bytes = Bytes::from(value);
+            // Build an entry from the RedisValue (works for strings and collections)
+            let mut entry = Entry::new_string(Bytes::new()); // placeholder
+            entry.value =
+                crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
             if let Some(ttl) = ttl_ms {
-                self.set_string_with_expiry(key_bytes, value_bytes, ttl);
-            } else {
-                self.set_string(key_bytes, value_bytes);
+                entry.set_expires_at_ms(self.base_timestamp, ttl);
             }
+            self.set(key_bytes, entry);
             if let Some(ref mut ci) = self.cold_index {
                 ci.remove(key);
             }
