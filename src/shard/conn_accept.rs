@@ -478,6 +478,7 @@ pub(crate) fn spawn_monoio_connection(
                                 BytesMut::new(),
                                 pw,
                                 None, // fresh connection
+                                -1,   // TLS: inner fd not accessible for shutdown
                             )
                             .await;
                         }
@@ -501,6 +502,14 @@ pub(crate) fn spawn_monoio_connection(
                         Ok(cfg) => cfg.requirepass.clone(),
                         Err(poisoned) => poisoned.into_inner().requirepass.clone(),
                     };
+                    // Extract raw fd for graceful shutdown (SHUT_WR) on client half-close.
+                    #[cfg(target_os = "linux")]
+                    let conn_raw_fd = {
+                        use std::os::fd::AsRawFd;
+                        tcp_stream.as_raw_fd()
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let conn_raw_fd: i32 = -1;
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
@@ -534,6 +543,7 @@ pub(crate) fn spawn_monoio_connection(
                         BytesMut::new(),
                         pw,
                         None, // fresh connection
+                        conn_raw_fd,
                     )
                     .await;
 
@@ -685,6 +695,13 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let migration_buf = take_migration_read_buf(&mut state);
 
             monoio::spawn(async move {
+                #[cfg(unix)]
+                let conn_raw_fd = {
+                    use std::os::fd::AsRawFd;
+                    tcp_stream.as_raw_fd()
+                };
+                #[cfg(not(unix))]
+                let conn_raw_fd: i32 = -1;
                 let _ = handle_connection_sharded_monoio(
                     tcp_stream,
                     peer_addr,
@@ -718,6 +735,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     migration_buf,
                     pw,
                     Some(&state),
+                    conn_raw_fd,
                 )
                 .await;
             });

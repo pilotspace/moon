@@ -113,6 +113,9 @@ pub async fn handle_connection_sharded_monoio<
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
+    // Raw socket fd for graceful shutdown (SHUT_WR) on client half-close.
+    // Pass -1 if fd is unknown (TLS path where inner fd isn't accessible).
+    raw_fd: i32,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -194,7 +197,16 @@ pub async fn handle_connection_sharded_monoio<
                 read_result = stream.read(sub_tmp_buf) => {
                     let (result, buf) = read_result;
                     match result {
-                        Ok(0) => break, // connection closed
+                        Ok(0) => {
+                            // Client half-closed: send FIN back to avoid CLOSE_WAIT.
+                            // SAFETY: raw_fd is a valid open socket passed from caller.
+                            #[cfg(target_os = "linux")]
+                            if raw_fd >= 0 {
+                                // SAFETY: raw_fd is a valid open socket; SHUT_WR sends FIN.
+                                unsafe { libc::shutdown(raw_fd, libc::SHUT_WR); }
+                            }
+                            break;
+                        }
                         Ok(n) => {
                             read_buf.extend_from_slice(&buf[..n]);
                             // Parse frames from buffer
@@ -441,7 +453,16 @@ pub async fn handle_connection_sharded_monoio<
         let (result, returned_buf) = stream.read(tmp_buf).await;
         tmp_buf = returned_buf;
         match result {
-            Ok(0) => break, // connection closed
+            Ok(0) => {
+                // Client half-closed: send FIN back to avoid CLOSE_WAIT.
+                // SAFETY: raw_fd is a valid open socket passed from caller.
+                #[cfg(target_os = "linux")]
+                if raw_fd >= 0 {
+                    // SAFETY: raw_fd is a valid open socket; SHUT_WR sends FIN.
+                    unsafe { libc::shutdown(raw_fd, libc::SHUT_WR); }
+                }
+                break;
+            }
             Ok(n) => {
                 read_buf.extend_from_slice(&tmp_buf[..n]);
             }
