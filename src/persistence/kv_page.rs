@@ -945,4 +945,71 @@ mod tests {
         let reassembled = read_overflow_chain(&file_data, 1).expect("should read chain");
         assert_eq!(reassembled, data, "reassembled data must match original");
     }
+
+    #[test]
+    fn test_fpi_lz4_roundtrip() {
+        // Simulate FPI payload construction (same format as persistence_tick.rs)
+        let file_id: u64 = 42;
+        let page_offset: u64 = 7;
+
+        // Create a compressible 4KB page (repeating pattern)
+        let mut page_data = vec![0u8; 4096];
+        for (i, b) in page_data.iter_mut().enumerate() {
+            *b = (i % 13) as u8;
+        }
+
+        // Build compressed FPI payload
+        let mut payload = Vec::with_capacity(17 + page_data.len());
+        payload.extend_from_slice(&file_id.to_le_bytes());
+        payload.extend_from_slice(&page_offset.to_le_bytes());
+        let compressed = lz4_flex::compress_prepend_size(&page_data);
+        assert!(compressed.len() < page_data.len(), "test data should be compressible");
+        payload.push(0x01); // compressed flag
+        payload.extend_from_slice(&compressed);
+
+        // Verify payload is smaller than uncompressed would be
+        let uncompressed_size = 16 + 1 + page_data.len();
+        assert!(
+            payload.len() < uncompressed_size,
+            "compressed FPI payload ({}) should be smaller than uncompressed ({})",
+            payload.len(),
+            uncompressed_size
+        );
+
+        // Simulate replay: extract and decompress
+        let recovered_file_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let recovered_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        assert_eq!(recovered_file_id, file_id);
+        assert_eq!(recovered_offset, page_offset);
+        assert_eq!(payload[16], 0x01); // compressed flag
+
+        let decompressed = lz4_flex::decompress_size_prepended(&payload[17..])
+            .expect("decompression should succeed");
+        assert_eq!(decompressed, page_data, "roundtrip must preserve page data");
+
+        // Print WAL size savings for measurement
+        let savings_pct = 100.0 * (1.0 - (payload.len() as f64 / uncompressed_size as f64));
+        eprintln!(
+            "FPI LZ4 roundtrip: {} -> {} bytes ({:.1}% savings)",
+            uncompressed_size,
+            payload.len(),
+            savings_pct
+        );
+    }
+
+    #[test]
+    fn test_fpi_uncompressed_flag() {
+        // Small page data (below threshold) uses flag=0x00
+        let page_data = vec![0xABu8; 100];
+        let mut payload = Vec::with_capacity(17 + page_data.len());
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.push(0x00); // uncompressed flag
+        payload.extend_from_slice(&page_data);
+
+        // Verify replay extracts correctly
+        assert_eq!(payload[16], 0x00);
+        let recovered_data = &payload[17..];
+        assert_eq!(recovered_data, &page_data[..]);
+    }
 }
