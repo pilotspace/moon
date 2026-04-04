@@ -221,6 +221,26 @@ pub fn read_vamana_node_at(
     Ok(read_vamana_node(&page, dim))
 }
 
+/// Read a Vamana node from an already-open file descriptor via pread.
+///
+/// Same as `read_vamana_node_at` but uses an existing File handle,
+/// avoiding open/close syscalls per graph hop. `FileExt::read_at`
+/// (pread) is thread-safe and does not move the file cursor.
+#[cfg(unix)]
+pub fn read_vamana_node_with_fd(
+    file: &std::fs::File,
+    node_index: u32,
+    dim: usize,
+) -> io::Result<Option<VamanaNode>> {
+    use std::os::unix::fs::FileExt;
+
+    let offset = node_index as u64 * PAGE_4K as u64;
+    let mut page = [0u8; PAGE_4K];
+    file.read_at(&mut page, offset)?;
+
+    Ok(read_vamana_node(&page, dim))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
