@@ -507,4 +507,93 @@ mod tests {
             assert_eq!(extracted, data, "small uncompressed data roundtrip failed");
         }
     }
+
+    #[test]
+    fn test_compressed_graph_mpf_size_reduction() {
+        use crate::vector::hnsw::graph::SENTINEL;
+
+        // Build a realistic graph: 100 nodes, m0=32, with sequential neighbor IDs
+        // (delta-friendly: sorted ascending, small deltas -> high compression)
+        let m0: u8 = 32;
+        let num_nodes: u32 = 100;
+        let total_slots = num_nodes as usize * m0 as usize;
+        let mut layer0 = vec![SENTINEL; total_slots];
+        for node in 0..num_nodes as usize {
+            // Each node connects to ~16 neighbors in its vicinity
+            let neighbors_count = 16.min(num_nodes as usize);
+            for j in 0..neighbors_count {
+                let neighbor = (node + j + 1) % num_nodes as usize;
+                layer0[node * m0 as usize + j] = neighbor as u32;
+            }
+            // Sort the neighbor slice (required for delta encoding)
+            let start = node * m0 as usize;
+            let end = start + neighbors_count;
+            layer0[start..end].sort_unstable();
+        }
+
+        let graph = HnswGraph::new(
+            num_nodes,
+            16,
+            m0,
+            0,
+            0,
+            crate::vector::aligned_buffer::AlignedBuffer::from_vec(layer0),
+            (0..num_nodes).collect(),
+            (0..num_nodes).collect(),
+            vec![smallvec::SmallVec::new(); num_nodes as usize],
+            vec![0; num_nodes as usize],
+            68,
+        );
+
+        // Serialize both ways
+        let raw = graph.to_bytes();
+        let compressed = graph.to_bytes_compressed();
+
+        eprintln!(
+            "Graph size: raw={} bytes, compressed={} bytes, ratio={:.2}x",
+            raw.len(),
+            compressed.len(),
+            raw.len() as f64 / compressed.len() as f64
+        );
+        assert!(
+            compressed.len() < raw.len(),
+            "compressed ({}) should be smaller than raw ({})",
+            compressed.len(),
+            raw.len()
+        );
+
+        // Write both to graph.mpf and compare file sizes
+        let tmp = tempfile::tempdir().unwrap();
+
+        let raw_path = tmp.path().join("graph_raw.mpf");
+        write_graph_mpf(&raw_path, 1, &raw).unwrap();
+        let raw_file_size = std::fs::metadata(&raw_path).unwrap().len();
+
+        let comp_path = tmp.path().join("graph_comp.mpf");
+        write_graph_mpf(&comp_path, 2, &compressed).unwrap();
+        let comp_file_size = std::fs::metadata(&comp_path).unwrap().len();
+
+        eprintln!(
+            "graph.mpf size: raw={} bytes, compressed={} bytes, ratio={:.2}x",
+            raw_file_size,
+            comp_file_size,
+            raw_file_size as f64 / comp_file_size as f64
+        );
+        assert!(
+            comp_file_size < raw_file_size,
+            "compressed graph.mpf ({}) should be smaller than raw ({})",
+            comp_file_size,
+            raw_file_size
+        );
+
+        // Verify roundtrip through compressed format
+        let restored = HnswGraph::from_bytes_compressed(&compressed).unwrap();
+        assert_eq!(restored.num_nodes(), graph.num_nodes());
+        // Verify neighbor data preserved for a few nodes
+        for node in [0u32, 1, 50, 99] {
+            let orig = graph.neighbors_l0(node);
+            let rest = restored.neighbors_l0(node);
+            assert_eq!(orig, rest, "neighbors mismatch for node {node}");
+        }
+    }
 }
