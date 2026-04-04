@@ -579,3 +579,203 @@ pub(crate) fn handle_checkpoint_tick(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::checkpoint::CheckpointTrigger;
+    use crate::persistence::wal_v3::record::{WalRecordType, read_wal_v3_record};
+    use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE};
+
+    /// Count FullPageImage records in a raw WAL segment file.
+    fn count_fpi_records(raw_data: &[u8]) -> usize {
+        let mut offset = WAL_V3_HEADER_SIZE;
+        let mut fpi_count = 0usize;
+        while offset + 4 <= raw_data.len() {
+            let record_len = u32::from_le_bytes(
+                raw_data[offset..offset + 4].try_into().unwrap(),
+            ) as usize;
+            if record_len < 20 || offset + record_len > raw_data.len() {
+                break;
+            }
+            if let Some(record) = read_wal_v3_record(&raw_data[offset..]) {
+                if record.record_type == WalRecordType::FullPageImage {
+                    fpi_count += 1;
+                }
+            }
+            offset += record_len;
+        }
+        fpi_count
+    }
+
+    #[test]
+    fn test_checkpoint_tick_produces_fpi_wal_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        let data_dir = shard_dir.join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create PageCache with 4 frames of 4KB, 0 of 64KB
+        let page_cache = PageCache::new(4, 0);
+
+        // Set up 2 frames: fetch pages to make them VALID, then mark dirty
+        for i in 0..2usize {
+            let handle = page_cache
+                .fetch_page(1, i as u64, false, |buf| {
+                    buf[0] = 0xDE;
+                    buf[1] = (i as u8) + 1;
+                    Ok(())
+                })
+                .unwrap();
+            page_cache.unpin_page(handle);
+            page_cache.mark_dirty(1, i as u64, (i + 1) as u64);
+        }
+
+        // Set FPI_PENDING on all valid frames (simulates checkpoint begin)
+        page_cache.clear_all_fpi_pending();
+
+        assert_eq!(page_cache.dirty_page_count(), 2, "Should have 2 dirty pages");
+
+        // Create a dummy heap file (at least 8KB so pwrite succeeds for 2 pages)
+        let heap_path = data_dir.join("heap-000001.mpf");
+        std::fs::write(&heap_path, vec![0u8; 8192]).unwrap();
+
+        // Create WAL writer
+        let mut wal = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        // Create checkpoint manager and begin checkpoint with dirty_count=2
+        let trigger = CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9);
+        let mut checkpoint_mgr = CheckpointManager::new(trigger);
+        checkpoint_mgr.begin(wal.current_lsn(), 2);
+
+        // Create manifest and control file
+        let manifest_path = shard_dir.join("manifest.dat");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut control = ShardControlFile::new([0u8; 16]);
+        let control_path = ShardControlFile::control_path(&shard_dir, 0);
+        control.write(&control_path).unwrap();
+
+        // Drive checkpoint ticks until all pages are flushed.
+        // pages_per_tick is 1 (2 dirty / 270000 ticks, clamped to 1), so we need
+        // 2 ticks of FlushPages before reaching Finalize.
+        let mut tick_count = 0;
+        loop {
+            let finalized = handle_checkpoint_tick(
+                &mut checkpoint_mgr,
+                &page_cache,
+                &mut wal,
+                &mut manifest,
+                &mut control,
+                &control_path,
+            );
+            tick_count += 1;
+            if finalized || !checkpoint_mgr.is_active() {
+                break;
+            }
+            // Safety: don't loop forever
+            assert!(tick_count < 100, "Checkpoint should complete within 100 ticks");
+        }
+
+        // Flush WAL to disk
+        wal.flush_sync().unwrap();
+
+        // Read back the WAL segment and count FullPageImage records
+        let seg_path = wal_dir.join("000000000001.wal");
+        let raw_data = std::fs::read(&seg_path).unwrap();
+        let fpi_count = count_fpi_records(&raw_data);
+
+        assert_eq!(fpi_count, 2, "Expected exactly 2 FPI WAL records");
+
+        // Verify dirty pages were flushed (DIRTY cleared via public API)
+        assert_eq!(
+            page_cache.dirty_page_count(),
+            0,
+            "All dirty pages should be flushed"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_tick_no_fpi_when_flag_not_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        let data_dir = shard_dir.join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create PageCache with 4 frames of 4KB, 0 of 64KB
+        let page_cache = PageCache::new(4, 0);
+
+        // Set up 2 frames: VALID + DIRTY only (NO FPI_PENDING)
+        for i in 0..2usize {
+            let handle = page_cache
+                .fetch_page(1, i as u64, false, |buf| {
+                    buf[0] = 0xAB;
+                    Ok(())
+                })
+                .unwrap();
+            page_cache.unpin_page(handle);
+            page_cache.mark_dirty(1, i as u64, (i + 1) as u64);
+        }
+        // Do NOT call clear_all_fpi_pending -- no FPI_PENDING set
+
+        // Create a dummy heap file
+        let heap_path = data_dir.join("heap-000001.mpf");
+        std::fs::write(&heap_path, vec![0u8; 8192]).unwrap();
+
+        // Create WAL writer
+        let mut wal = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        // Create checkpoint manager and begin
+        let trigger = CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9);
+        let mut checkpoint_mgr = CheckpointManager::new(trigger);
+        checkpoint_mgr.begin(wal.current_lsn(), 2);
+
+        // Create manifest and control file
+        let manifest_path = shard_dir.join("manifest.dat");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut control = ShardControlFile::new([0u8; 16]);
+        let control_path = ShardControlFile::control_path(&shard_dir, 0);
+        control.write(&control_path).unwrap();
+
+        // Drive checkpoint ticks until all pages are flushed.
+        let mut tick_count = 0;
+        loop {
+            let finalized = handle_checkpoint_tick(
+                &mut checkpoint_mgr,
+                &page_cache,
+                &mut wal,
+                &mut manifest,
+                &mut control,
+                &control_path,
+            );
+            tick_count += 1;
+            if finalized || !checkpoint_mgr.is_active() {
+                break;
+            }
+            assert!(tick_count < 100, "Checkpoint should complete within 100 ticks");
+        }
+
+        // Flush WAL to disk
+        wal.flush_sync().unwrap();
+
+        // Read back and count FPI records -- should be 0
+        let seg_path = wal_dir.join("000000000001.wal");
+        let raw_data = std::fs::read(&seg_path).unwrap();
+        let fpi_count = count_fpi_records(&raw_data);
+
+        assert_eq!(
+            fpi_count, 0,
+            "Expected 0 FPI WAL records when FPI_PENDING not set"
+        );
+
+        // DIRTY should still be cleared (pages were flushed to disk)
+        assert_eq!(
+            page_cache.dirty_page_count(),
+            0,
+            "All dirty pages should be flushed even without FPI"
+        );
+    }
+}
