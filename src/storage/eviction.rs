@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use rand::seq::IndexedRandom;
 use tracing::warn;
 
 use crate::config::RuntimeConfig;
+use crate::persistence::kv_page::{ValueType, entry_flags};
 use crate::persistence::manifest::ShardManifest;
 use crate::protocol::Frame;
 use crate::storage::Database;
@@ -12,6 +13,8 @@ use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::lfu_decay;
 use crate::storage::tiered::kv_spill;
+use crate::storage::tiered::kv_serde;
+use crate::storage::tiered::spill_thread::SpillRequest;
 
 /// Compare two LRU timestamps with u16 wraparound handling.
 /// Uses signed-distance comparison: treats the 16-bit clock as circular.
@@ -149,6 +152,160 @@ pub fn try_evict_if_needed_with_spill_and_total(
     }
 
     Ok(())
+}
+
+/// Check if eviction is needed, spilling evicted entries asynchronously via
+/// a background `SpillThread` instead of doing synchronous pwrite.
+///
+/// The async path: extracts key/value bytes, removes entry from DashTable
+/// (freeing RAM immediately), then sends a `SpillRequest` to the background
+/// thread. The pwrite is best-effort -- if the channel is full, the request
+/// is dropped (entry already removed from RAM).
+///
+/// Callers must poll `SpillThread::drain_completions()` to apply manifest
+/// and ColdIndex updates from completed spills.
+pub fn try_evict_if_needed_async_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+) -> Result<(), Frame> {
+    try_evict_if_needed_async_spill_with_total(
+        db,
+        config,
+        sender,
+        shard_dir,
+        next_file_id,
+        db.estimated_memory(),
+    )
+}
+
+/// Async spill eviction with explicit total_memory parameter.
+pub fn try_evict_if_needed_async_spill_with_total(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    total_memory: usize,
+) -> Result<(), Frame> {
+    if config.maxmemory == 0 {
+        return Ok(());
+    }
+
+    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
+
+    let mut current_total = total_memory;
+    while current_total > config.maxmemory {
+        if policy == EvictionPolicy::NoEviction {
+            return Err(oom_error());
+        }
+        let before = db.estimated_memory();
+        if !evict_one_async_spill(db, config, &policy, sender, shard_dir, next_file_id) {
+            return Err(oom_error());
+        }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
+    }
+
+    Ok(())
+}
+
+/// Evict a single key via the async spill path.
+///
+/// Extracts the entry, removes it from DashTable (immediate RAM relief),
+/// then sends a SpillRequest to the background thread for pwrite.
+fn evict_one_async_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+) -> bool {
+    // Find victim key using same policy logic as sync path
+    let victim = match policy {
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
+        EvictionPolicy::AllKeysLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+        }
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::VolatileLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+        }
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+    };
+
+    let key = match victim {
+        Some(k) => k,
+        None => return false,
+    };
+
+    // Build SpillRequest from the entry BEFORE removing it from DashTable.
+    // This is CPU work only -- no I/O on the event loop.
+    if let Some(entry) = db.data().get(key.as_bytes()) {
+        let val_ref = entry.as_redis_value();
+
+        // Determine value_type and serialize value bytes
+        let collection_buf: Vec<u8>;
+        let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
+            RedisValueRef::String(s) => (ValueType::String, s),
+            ref other => {
+                let vt = match other {
+                    RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => ValueType::Hash,
+                    RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
+                    RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => ValueType::Set,
+                    RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetBPTree { .. } | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+                    RedisValueRef::Stream(_) => ValueType::Stream,
+                    RedisValueRef::String(_) => unreachable!(),
+                };
+                collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
+                (vt, collection_buf.as_slice())
+            }
+        };
+
+        // Determine flags and TTL
+        let mut flags: u8 = 0;
+        let ttl_ms = if entry.has_expiry() {
+            flags |= entry_flags::HAS_TTL;
+            Some(entry.expires_at_ms(0))
+        } else {
+            None
+        };
+
+        let file_id = *next_file_id;
+        *next_file_id += 1;
+
+        let req = SpillRequest {
+            key: Bytes::copy_from_slice(key.as_bytes()),
+            value_bytes: Bytes::copy_from_slice(value_bytes),
+            value_type,
+            flags,
+            ttl_ms,
+            file_id,
+            shard_dir: PathBuf::from(shard_dir),
+        };
+
+        // Remove from DashTable FIRST -- frees RAM immediately
+        db.remove(key.as_bytes());
+
+        // Send to background thread (best-effort)
+        if let Err(_e) = sender.try_send(req) {
+            warn!(
+                file_id,
+                "async_spill: channel full or disconnected, spill request dropped"
+            );
+        }
+    } else {
+        // Entry disappeared (race with expiry), just remove
+        db.remove(key.as_bytes());
+    }
+
+    true
 }
 
 /// Evict a single key, optionally spilling to disk before removal.
