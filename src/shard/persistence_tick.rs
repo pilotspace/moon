@@ -415,6 +415,7 @@ pub(crate) fn force_checkpoint(
     if !checkpoint_mgr.force_begin(lsn, dirty) {
         return;
     }
+    page_cache.clear_all_fpi_pending();
     // Drive checkpoint to completion synchronously (tick loop)
     loop {
         if handle_checkpoint_tick(checkpoint_mgr, page_cache, wal, manifest, control, control_path) {
@@ -445,6 +446,7 @@ pub(crate) fn maybe_begin_checkpoint(
         let lsn = wal.current_lsn();
         let dirty = page_cache.dirty_page_count();
         checkpoint_mgr.begin(lsn, dirty);
+        page_cache.clear_all_fpi_pending();
     }
 }
 
@@ -465,8 +467,11 @@ pub(crate) fn handle_checkpoint_tick(
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
         CheckpointAction::FlushPages(count) => {
-            // Flush `count` dirty pages through PageCache with WAL-before-data.
-            let flushed = page_cache.flush_dirty_pages(
+            // Collect FPI payloads during sweep, then append to WAL after.
+            // This avoids dual-mutable-borrow of `wal` across closures.
+            let mut fpi_payloads: Vec<Vec<u8>> = Vec::new();
+
+            let flushed = page_cache.flush_dirty_pages_with_fpi(
                 count,
                 &mut |page_lsn| {
                     // Ensure WAL is durable past this page's LSN before writing page
@@ -475,6 +480,16 @@ pub(crate) fn handle_checkpoint_tick(
                     } else {
                         Ok(())
                     }
+                },
+                &mut |file_id, page_offset, _is_large, data| {
+                    // Collect FPI payload for deferred WAL append.
+                    // Payload format: file_id(8 LE) + page_offset(8 LE) + page_data
+                    let mut payload = Vec::with_capacity(16 + data.len());
+                    payload.extend_from_slice(&file_id.to_le_bytes());
+                    payload.extend_from_slice(&page_offset.to_le_bytes());
+                    payload.extend_from_slice(data);
+                    fpi_payloads.push(payload);
+                    Ok(())
                 },
                 &mut |file_id, page_offset, is_large, data| {
                     // pwrite(2) dirty page to its DataFile at the correct offset.
@@ -499,8 +514,19 @@ pub(crate) fn handle_checkpoint_tick(
                     Ok(())
                 },
             );
+
+            // Deferred FPI WAL append -- now safe since flush_dirty_pages_with_fpi
+            // returned and the closures no longer borrow `wal`.
+            for payload in &fpi_payloads {
+                wal.append(WalRecordType::FullPageImage, payload);
+            }
+
             if flushed > 0 {
-                tracing::trace!("Checkpoint: flushed {} dirty pages", flushed);
+                tracing::trace!(
+                    "Checkpoint: flushed {} dirty pages (with FPI, {} FPI records)",
+                    flushed,
+                    fpi_payloads.len()
+                );
             }
             false
         }
