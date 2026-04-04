@@ -5,6 +5,10 @@
 //! approximate nearest neighbor scoring. Vamana graph pages are read
 //! from an `.mpf` file via `read_vamana_node_at` (one 4KB pread per
 //! graph hop). No exact reranking in this version.
+//!
+//! On Linux, each segment optionally holds a dedicated `DiskAnnUring`
+//! ring for io_uring-based batch reads with O_DIRECT (bypassing the
+//! page cache). The pread fallback is always available.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +20,10 @@ use crate::vector::diskann::pq::ProductQuantizer;
 use crate::vector::types::{SearchResult, VectorId};
 
 /// Cold-tier segment backed by PQ codes in RAM + Vamana graph on NVMe.
+///
+/// On Linux, optionally holds a dedicated `DiskAnnUring` for io_uring-based
+/// batch reads with O_DIRECT. Falls back to pread on non-Linux or when
+/// O_DIRECT is unsupported (e.g., tmpfs in tests).
 pub struct DiskAnnSegment {
     /// PQ codes for all vectors: `num_vectors * m` bytes (kept in RAM).
     pq_codes: Vec<u8>,
@@ -28,6 +36,10 @@ pub struct DiskAnnSegment {
     /// Persistent file handle for vamana.mpf (opened once, pread per hop).
     #[cfg(unix)]
     vamana_file: std::fs::File,
+    /// Dedicated io_uring ring for batch O_DIRECT reads (Linux only).
+    /// `None` when O_DIRECT is unsupported (tmpfs, non-ext4/xfs) or on non-Linux.
+    #[cfg(target_os = "linux")]
+    uring: Option<super::uring_search::DiskAnnUring>,
     /// Vector dimensionality.
     dim: usize,
     /// Number of vectors in this segment.
@@ -60,12 +72,35 @@ impl DiskAnnSegment {
         #[cfg(unix)]
         let vamana_file = std::fs::File::open(&vamana_path)
             .unwrap_or_else(|e| panic!("DiskAnnSegment: cannot open {:?}: {}", vamana_path, e));
+
+        // Try to open with O_DIRECT for io_uring beam search. Falls back
+        // gracefully on filesystems that don't support O_DIRECT (e.g., tmpfs
+        // used in tests) -- pread path remains available via `vamana_file`.
+        #[cfg(target_os = "linux")]
+        let uring = match super::uring_search::open_vamana_direct(&vamana_path) {
+            Ok(fd) => match super::uring_search::DiskAnnUring::new(fd, 32) {
+                Ok(u) => Some(u),
+                Err(_e) => {
+                    // io_uring setup failed -- close the FD and fall back.
+                    // SAFETY: `fd` is a valid FD we just opened.
+                    unsafe { libc::close(fd); }
+                    None
+                }
+            },
+            Err(_e) => {
+                // O_DIRECT not supported on this filesystem -- fall back to pread.
+                None
+            }
+        };
+
         Self {
             pq_codes,
             pq,
             vamana_path,
             #[cfg(unix)]
             vamana_file,
+            #[cfg(target_os = "linux")]
+            uring,
             dim,
             num_vectors,
             entry_point,
@@ -106,12 +141,28 @@ impl DiskAnnSegment {
         // writes entry_point metadata; for MVP we default to 0.
         let _ = node0;
 
+        // Try O_DIRECT + io_uring (same pattern as new()).
+        #[cfg(target_os = "linux")]
+        let uring = match super::uring_search::open_vamana_direct(&vamana_path) {
+            Ok(fd) => match super::uring_search::DiskAnnUring::new(fd, 32) {
+                Ok(u) => Some(u),
+                Err(_e) => {
+                    // SAFETY: `fd` is a valid FD we just opened.
+                    unsafe { libc::close(fd); }
+                    None
+                }
+            },
+            Err(_e) => None,
+        };
+
         Ok(Self {
             pq_codes,
             pq,
             vamana_path,
             #[cfg(unix)]
             vamana_file,
+            #[cfg(target_os = "linux")]
+            uring,
             dim,
             num_vectors: num_vectors as u32,
             entry_point: 0,
@@ -255,6 +306,16 @@ impl DiskAnnSegment {
     #[inline]
     pub fn file_id(&self) -> u64 {
         self.file_id
+    }
+
+    /// Access the io_uring ring for batch beam search (Linux only).
+    ///
+    /// Returns `None` if O_DIRECT was not available (e.g., tmpfs) or
+    /// io_uring setup failed. The pread fallback is always available.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn uring(&mut self) -> Option<&mut super::uring_search::DiskAnnUring> {
+        self.uring.as_mut()
     }
 }
 
