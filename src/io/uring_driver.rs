@@ -40,7 +40,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 struct ConnState {
     /// Fixed FD index in the registered table.
     fixed_fd_idx: u32,
-    /// Raw file descriptor (kept for future diagnostic/close use).
+    /// Raw file descriptor (kept for diagnostic use; graceful shutdown retrieves from fd_table).
     _raw_fd: RawFd,
     /// Accumulation buffer for partial RESP frames spanning multiple recvs.
     read_buf: BytesMut,
@@ -599,6 +599,44 @@ impl UringDriver {
             let raw_fd = self
                 .fd_table
                 .remove_and_register(conn.fixed_fd_idx, &self.ring)?;
+            unsafe {
+                libc::close(raw_fd);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gracefully close a connection: shutdown(SHUT_WR) to send FIN, then close.
+    ///
+    /// Called when recv returns 0 (client half-close). The shutdown(SHUT_WR)
+    /// sends a TCP FIN to the peer, which redis-benchmark 8.x needs to
+    /// detect completion. Without this, close() on a fd with pending state
+    /// may send RST instead.
+    pub fn shutdown_and_close_connection(&mut self, conn_id: u32) -> std::io::Result<()> {
+        if let Some(conn) = self.connections.remove(&conn_id) {
+            let raw_fd = self
+                .fd_table
+                .remove_and_register(conn.fixed_fd_idx, &self.ring)?;
+
+            // Send FIN to peer via shutdown(SHUT_WR).
+            // Ignore ENOTCONN -- peer may have already fully closed.
+            // SAFETY: raw_fd is a valid open socket fd obtained from fd_table.remove_and_register.
+            unsafe {
+                let ret = libc::shutdown(raw_fd, libc::SHUT_WR);
+                if ret < 0 {
+                    let errno = *libc::__errno_location();
+                    if errno != libc::ENOTCONN {
+                        tracing::debug!(
+                            "shutdown(SHUT_WR) for conn {} fd {}: {}",
+                            conn_id,
+                            raw_fd,
+                            std::io::Error::from_raw_os_error(errno)
+                        );
+                    }
+                }
+            }
+
+            // SAFETY: raw_fd is a valid open fd; we have exclusive ownership after removing from fd_table.
             unsafe {
                 libc::close(raw_fd);
             }
