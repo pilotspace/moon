@@ -87,7 +87,6 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::collections::HashMap;
-    use crate::persistence::kv_page::ValueType;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::compact_value::CompactValue;
     use crate::storage::entry::Entry;
