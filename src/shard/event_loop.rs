@@ -438,6 +438,18 @@ impl super::Shard {
             };
         let mut next_file_id: u64 = 1;
 
+        // Per-shard background spill thread for async eviction pwrite.
+        // When disk-offload is enabled, evicted KV entries are written to disk
+        // on a background std::thread instead of blocking the event loop.
+        let mut spill_thread: Option<crate::storage::tiered::spill_thread::SpillThread> =
+            if server_config.disk_offload_enabled() {
+                let st = crate::storage::tiered::spill_thread::SpillThread::new(shard_id);
+                info!("Shard {}: spill background thread initialized", shard_id);
+                Some(st)
+            } else {
+                None
+            };
+
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
@@ -453,9 +465,10 @@ impl super::Shard {
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
         // Warm check interval adapts to segment_warm_after for fast testing:
         // default 10s, but if warm_after < 10s, poll at warm_after frequency.
-        let warm_poll_ms = (server_config.segment_warm_after * 1000).min(
-            timers::WARM_CHECK_INTERVAL_MS
-        ).max(1000); // floor 1s
+        let warm_poll_ms = (server_config.segment_warm_after * 1000).clamp(
+            1000,
+            timers::WARM_CHECK_INTERVAL_MS,
+        );
         let mut warm_check_interval = TimerImpl::interval(
             Duration::from_millis(warm_poll_ms)
         );
@@ -914,6 +927,16 @@ impl super::Shard {
                 }
                 // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
+                    // Poll spill completions from background thread
+                    if let Some(ref spill_t) = spill_thread {
+                        persistence_tick::apply_spill_completions(
+                            spill_t,
+                            &mut shard_manifest,
+                            &shard_databases,
+                            shard_id,
+                        );
+                    }
+
                     if server_config.disk_offload_enabled()
                         && persistence_tick::should_run_pressure_cascade(
                             &runtime_config,
@@ -931,6 +954,7 @@ impl super::Shard {
                             &mut shard_manifest,
                             &mut next_file_id,
                             &mut wal_v3_writer,
+                            spill_thread.as_ref(),
                         );
                     } else {
                         timers::run_eviction(&shard_databases, shard_id, &runtime_config);
@@ -938,6 +962,16 @@ impl super::Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    // Drain final spill completions before shutdown
+                    if let Some(ref spill_t) = spill_thread {
+                        persistence_tick::apply_spill_completions(
+                            spill_t, &mut shard_manifest, &shard_databases, shard_id,
+                        );
+                    }
+                    if let Some(st) = spill_thread.take() {
+                        st.shutdown();
+                        info!("Shard {}: spill background thread shut down", shard_id);
+                    }
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
@@ -1245,6 +1279,16 @@ impl super::Shard {
                 }
                 // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
+                    // Poll spill completions from background thread
+                    if let Some(ref spill_t) = spill_thread {
+                        persistence_tick::apply_spill_completions(
+                            spill_t,
+                            &mut shard_manifest,
+                            &shard_databases,
+                            shard_id,
+                        );
+                    }
+
                     if server_config.disk_offload_enabled()
                         && persistence_tick::should_run_pressure_cascade(
                             &runtime_config,
@@ -1262,6 +1306,7 @@ impl super::Shard {
                             &mut shard_manifest,
                             &mut next_file_id,
                             &mut wal_v3_writer,
+                            spill_thread.as_ref(),
                         );
                     } else {
                         timers::run_eviction(&shard_databases, shard_id, &runtime_config);
@@ -1270,6 +1315,16 @@ impl super::Shard {
                 // Shutdown
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down (monoio)", self.id);
+                    // Drain final spill completions before shutdown
+                    if let Some(ref spill_t) = spill_thread {
+                        persistence_tick::apply_spill_completions(
+                            spill_t, &mut shard_manifest, &shard_databases, shard_id,
+                        );
+                    }
+                    if let Some(st) = spill_thread.take() {
+                        st.shutdown();
+                        info!("Shard {}: spill background thread shut down", shard_id);
+                    }
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)

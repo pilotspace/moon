@@ -250,6 +250,56 @@ pub(crate) fn check_cold_transitions(
 }
 
 // ---------------------------------------------------------------------------
+// Async spill completion polling (background pwrite thread)
+// ---------------------------------------------------------------------------
+
+/// Poll background spill thread for completed pwrite operations.
+/// For each successful completion: update manifest and ColdIndex.
+/// Called on each eviction tick from the event loop.
+pub(crate) fn apply_spill_completions(
+    spill_thread: &crate::storage::tiered::spill_thread::SpillThread,
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+) {
+    let completions = spill_thread.drain_completions();
+    if completions.is_empty() {
+        return;
+    }
+
+    for c in completions {
+        if !c.success {
+            tracing::warn!(
+                key = %String::from_utf8_lossy(&c.key),
+                file_id = c.file_id,
+                "Spill pwrite failed on background thread"
+            );
+            continue;
+        }
+
+        // Update manifest
+        if let Some(ref mut manifest) = *shard_manifest {
+            manifest.add_file(c.file_entry);
+            if let Err(e) = manifest.commit() {
+                tracing::warn!(file_id = c.file_id, error = %e, "Manifest commit failed for spill completion");
+            }
+        }
+
+        // Update ColdIndex in db 0 (eviction currently operates on db 0)
+        let mut guard = shard_databases.write_db(shard_id, 0);
+        if let Some(ref mut ci) = guard.cold_index {
+            ci.insert(
+                c.key,
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: c.file_id,
+                    slot_idx: c.slot_idx,
+                },
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory pressure cascade (design section 8.5)
 // ---------------------------------------------------------------------------
 
@@ -294,6 +344,7 @@ pub(crate) fn handle_memory_pressure(
     shard_manifest: &mut Option<ShardManifest>,
     next_file_id: &mut u64,
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    spill_thread: Option<&crate::storage::tiered::spill_thread::SpillThread>,
 ) {
     // Step 1: PageCache eviction -- evict up to 16 cold frames per tick.
     // This is the cheapest operation: no disk I/O, just invalidates cached pages.
@@ -337,6 +388,10 @@ pub(crate) fn handle_memory_pressure(
     // Step 3: KV eviction -- run existing LRU/LFU eviction, with spill-to-disk
     // when disk-offload is enabled (evicted entries written to KvLeaf DataFiles).
     // Use aggregate memory (server-wide) to match Redis maxmemory semantics.
+    //
+    // When a SpillThread is available, use the async path: entries are removed
+    // from DashTable immediately (freeing RAM) and pwrite is deferred to the
+    // background thread. Otherwise, fall back to synchronous spill.
     if let Ok(rt) = runtime_config.read() {
         if rt.maxmemory > 0 {
             // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
@@ -346,21 +401,36 @@ pub(crate) fn handle_memory_pressure(
                 let shard_dir = server_config
                     .effective_disk_offload_dir()
                     .join(format!("shard-{}", shard_id));
-                for i in 0..db_count {
-                    let mut guard = shard_databases.write_db(shard_id, i);
-                    if let Some(ref mut manifest) = *shard_manifest {
-                        let mut ctx = crate::storage::eviction::SpillContext {
-                            shard_dir: &shard_dir,
-                            manifest,
-                            next_file_id,
-                        };
-                        let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
-                            &mut guard, &rt, Some(&mut ctx), total_mem,
+
+                if let Some(spill_t) = spill_thread {
+                    // Async spill path: background thread does pwrite
+                    let sender = spill_t.sender();
+                    for i in 0..db_count {
+                        let mut guard = shard_databases.write_db(shard_id, i);
+                        let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
+                            &mut guard, &rt, &sender, &shard_dir, next_file_id, total_mem,
                         );
-                    } else {
-                        let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
-                            &mut guard, &rt, None, total_mem,
-                        );
+                    }
+                    // Drop sender clone immediately to avoid shutdown deadlock
+                    drop(sender);
+                } else {
+                    // Sync spill fallback
+                    for i in 0..db_count {
+                        let mut guard = shard_databases.write_db(shard_id, i);
+                        if let Some(ref mut manifest) = *shard_manifest {
+                            let mut ctx = crate::storage::eviction::SpillContext {
+                                shard_dir: &shard_dir,
+                                manifest,
+                                next_file_id,
+                            };
+                            let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                &mut guard, &rt, Some(&mut ctx), total_mem,
+                            );
+                        } else {
+                            let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                &mut guard, &rt, None, total_mem,
+                            );
+                        }
                     }
                 }
             }
