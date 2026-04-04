@@ -598,10 +598,11 @@ pub fn read_datafile(path: &Path) -> io::Result<Vec<KvLeafPage>> {
     for chunk in contents.chunks_exact(PAGE_4K) {
         let mut buf = [0u8; PAGE_4K];
         buf.copy_from_slice(chunk);
-        let page = KvLeafPage::from_bytes(buf).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid KvLeaf page in DataFile")
-        })?;
-        pages.push(page);
+        // Skip non-KvLeaf pages (e.g. KvOverflow pages in mixed DataFiles).
+        // Only collect KvLeaf pages for ColdIndex reconstruction.
+        if let Some(page) = KvLeafPage::from_bytes(buf) {
+            pages.push(page);
+        }
     }
 
     Ok(pages)
