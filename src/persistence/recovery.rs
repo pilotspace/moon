@@ -298,16 +298,60 @@ pub fn recover_shard_v3(
             }
         };
         let on_fpi = &mut |record: &WalRecord| {
-            // FPI: overwrite page unconditionally (torn page repair).
-            // Full page write integration requires PageCache wiring;
-            // deferred to when KV pages are disk-resident. For now,
-            // log the encounter and count for metrics.
-            info!(
-                "Shard {}: FPI record at LSN {} ({} bytes)",
-                shard_id,
-                record.lsn,
-                record.payload.len()
-            );
+            use std::os::unix::fs::FileExt;
+
+            let payload = &record.payload;
+            if payload.len() < 16 {
+                tracing::warn!(
+                    "Shard {}: FPI record at LSN {} too short ({} bytes), skipping",
+                    shard_id, record.lsn, payload.len()
+                );
+                return;
+            }
+            let file_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let page_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let page_data = &payload[16..];
+
+            // Determine page size from data length
+            let page_size = if page_data.len() > crate::persistence::page::PAGE_4K {
+                crate::persistence::page::PAGE_64K
+            } else {
+                crate::persistence::page::PAGE_4K
+            };
+            let byte_offset = page_offset * page_size as u64;
+
+            let data_dir = shard_dir.join("data");
+            let _ = std::fs::create_dir_all(&data_dir);
+            let file_path = data_dir.join(format!("heap-{:06}.mpf", file_id));
+
+            // Open or create the DataFile and pwrite unconditionally (torn page repair).
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&file_path)
+            {
+                Ok(file) => {
+                    if let Err(e) = file.write_at(page_data, byte_offset) {
+                        tracing::error!(
+                            "Shard {}: FPI pwrite failed for file_id={}, offset={}: {}",
+                            shard_id, file_id, page_offset, e
+                        );
+                        return;
+                    }
+                    info!(
+                        "Shard {}: FPI applied at LSN {} (file_id={}, offset={}, {} bytes)",
+                        shard_id, record.lsn, file_id, page_offset, page_data.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Shard {}: FPI cannot open DataFile heap-{:06}.mpf: {}",
+                        shard_id, file_id, e
+                    );
+                    return;
+                }
+            }
             result.fpi_applied += 1;
         };
 
@@ -497,11 +541,16 @@ mod tests {
 
         let mut data = make_v3_header(0);
         write_wal_v3_record(&mut data, 1, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+        // FPI payload: file_id(8 LE) + page_offset(8 LE) + page_data
+        let mut fpi_payload = Vec::new();
+        fpi_payload.extend_from_slice(&1u64.to_le_bytes()); // file_id = 1
+        fpi_payload.extend_from_slice(&0u64.to_le_bytes()); // page_offset = 0
+        fpi_payload.extend_from_slice(&vec![0xABu8; 128]); // page_data
         write_wal_v3_record(
             &mut data,
             2,
             WalRecordType::FullPageImage,
-            &vec![0xABu8; 128],
+            &fpi_payload,
         );
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
