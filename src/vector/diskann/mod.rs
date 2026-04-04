@@ -3,7 +3,10 @@
 //! This module provides cold-tier vector search data structures per MoonStore v2
 //! design sections 7.4 and 11.2. Scaffold only -- no io_uring or O_DIRECT.
 
+pub mod aligned_buf;
 pub mod page;
 pub mod pq;
 pub mod segment;
+#[cfg(target_os = "linux")]
+pub mod uring_search;
 pub mod vamana;
