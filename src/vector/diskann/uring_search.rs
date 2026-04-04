@@ -54,12 +54,20 @@ impl DiskAnnUring {
     /// Each node occupies one 4KB page at offset `node_index * PAGE_4K`.
     /// Allocates one aligned buffer per read from the pool.
     /// After submission, call `collect_completions` to harvest results.
-    pub fn submit_reads(&mut self, node_indices: &[u32]) -> io::Result<()> {
+    ///
+    /// Returns the number of reads actually submitted. May be less than
+    /// `node_indices.len()` if the buffer pool is exhausted.
+    pub fn submit_reads(&mut self, node_indices: &[u32]) -> io::Result<usize> {
+        if node_indices.is_empty() {
+            return Ok(0);
+        }
+
+        let mut submitted = 0usize;
         for &node_index in node_indices {
-            let (buf_idx, _) = self
-                .buf_pool
-                .alloc()
-                .expect("AlignedBufPool exhausted during submit_reads");
+            let Some((buf_idx, _)) = self.buf_pool.alloc() else {
+                // Pool exhausted — submit what we have so far.
+                break;
+            };
 
             let file_offset = node_index as u64 * PAGE_4K as u64;
             let read_op = opcode::Read::new(
@@ -74,15 +82,21 @@ impl DiskAnnUring {
             // SAFETY: The SQE references a buffer from our pool that will
             // remain valid until we reclaim it after completion.
             unsafe {
-                self.ring
-                    .submission()
-                    .push(&read_op)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+                if self.ring.submission().push(&read_op).is_err() {
+                    // SQ full — reclaim buffer and stop.
+                    self.buf_pool.reclaim(buf_idx);
+                    break;
+                }
             }
+            submitted += 1;
         }
 
-        self.ring.submit_and_wait(node_indices.len())?;
-        Ok(())
+        if submitted == 0 {
+            return Ok(0);
+        }
+
+        self.ring.submit_and_wait(submitted)?;
+        Ok(submitted)
     }
 
     /// Drain `count` CQEs from the completion queue.

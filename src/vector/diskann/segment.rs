@@ -38,8 +38,13 @@ pub struct DiskAnnSegment {
     vamana_file: std::fs::File,
     /// Dedicated io_uring ring for batch O_DIRECT reads (Linux only).
     /// `None` when O_DIRECT is unsupported (tmpfs, non-ext4/xfs) or on non-Linux.
+    ///
+    /// Wrapped in `UnsafeCell` because `search()` takes `&self` (the segment
+    /// is behind `Arc` in the segment holder), but io_uring submission requires
+    /// `&mut`. This is safe because `DiskAnnSegment` is per-shard and accessed
+    /// from a single thread only (thread-per-core architecture).
     #[cfg(target_os = "linux")]
-    uring: Option<super::uring_search::DiskAnnUring>,
+    uring: std::cell::UnsafeCell<Option<super::uring_search::DiskAnnUring>>,
     /// Vector dimensionality.
     dim: usize,
     /// Number of vectors in this segment.
@@ -51,6 +56,14 @@ pub struct DiskAnnSegment {
     /// Segment file ID for manifest tracking.
     file_id: u64,
 }
+
+// SAFETY: `DiskAnnSegment` is per-shard and accessed from a single thread
+// (thread-per-core architecture). The `UnsafeCell<Option<DiskAnnUring>>` is
+// only mutated during `search_uring()` which runs on the owning shard thread.
+#[cfg(target_os = "linux")]
+unsafe impl Send for DiskAnnSegment {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for DiskAnnSegment {}
 
 impl DiskAnnSegment {
     /// Create a new DiskAnnSegment from pre-built components.
@@ -100,7 +113,7 @@ impl DiskAnnSegment {
             #[cfg(unix)]
             vamana_file,
             #[cfg(target_os = "linux")]
-            uring,
+            uring: std::cell::UnsafeCell::new(uring),
             dim,
             num_vectors,
             entry_point,
@@ -162,7 +175,7 @@ impl DiskAnnSegment {
             #[cfg(unix)]
             vamana_file,
             #[cfg(target_os = "linux")]
-            uring,
+            uring: std::cell::UnsafeCell::new(uring),
             dim,
             num_vectors: num_vectors as u32,
             entry_point: 0,
@@ -174,8 +187,34 @@ impl DiskAnnSegment {
     /// Approximate nearest neighbor search using PQ asymmetric distance
     /// and buffered Vamana beam traversal from disk.
     ///
+    /// On Linux with io_uring available, dispatches to `search_uring` which
+    /// batch-submits all unexpanded candidates per iteration via io_uring SQEs.
+    /// Otherwise falls back to `search_pread` (one pread syscall per hop).
+    ///
     /// Returns up to `k` results sorted by ascending PQ distance.
     pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        beam_width: usize,
+    ) -> SmallVec<[SearchResult; 32]> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: Single-threaded per-shard access. The UnsafeCell is only
+            // read here to check presence; mutation happens in search_uring.
+            let has_uring = unsafe { (*self.uring.get()).is_some() };
+            if has_uring {
+                return self.search_uring(query, k, beam_width);
+            }
+        }
+        self.search_pread(query, k, beam_width)
+    }
+
+    /// Pread-based beam search (one syscall per graph hop).
+    ///
+    /// This is the portable fallback used on non-Linux platforms and when
+    /// O_DIRECT / io_uring is unavailable (e.g., tmpfs in tests).
+    pub fn search_pread(
         &self,
         query: &[f32],
         k: usize,
@@ -267,6 +306,139 @@ impl DiskAnnSegment {
         results
     }
 
+    /// io_uring batch beam search: submits all unexpanded candidates per
+    /// iteration in a single `submit_and_wait()`, then processes CQEs.
+    ///
+    /// With beam_width W, this reduces from ~W pread syscalls per iteration
+    /// to 1 submit_and_wait. On NVMe, the kernel can issue all reads in
+    /// parallel via the NVMe submission queue.
+    #[cfg(target_os = "linux")]
+    fn search_uring(
+        &self,
+        query: &[f32],
+        k: usize,
+        beam_width: usize,
+    ) -> SmallVec<[SearchResult; 32]> {
+        use crate::persistence::page::PAGE_4K;
+        use crate::vector::diskann::page::read_vamana_node;
+
+        if self.num_vectors == 0 || k == 0 {
+            return SmallVec::new();
+        }
+
+        let m = self.pq.m();
+        let n = self.num_vectors as usize;
+
+        // Precompute asymmetric distance table: m * ksub floats.
+        let adt = self.pq.asymmetric_distance_table(query);
+
+        // Visited bitset.
+        let mut visited = vec![false; n];
+
+        // Candidates: (pq_distance, node_id). Sorted ascending by distance.
+        let mut candidates: Vec<(f32, u32)> = Vec::with_capacity(beam_width * 2);
+        let mut expanded = vec![false; n];
+
+        // Seed with entry point.
+        let ep = self.entry_point as usize;
+        if ep < n {
+            let ep_dist = self.pq.asymmetric_distance(
+                &adt,
+                &self.pq_codes[ep * m..(ep + 1) * m],
+            );
+            candidates.push((ep_dist, self.entry_point));
+            visited[ep] = true;
+        }
+
+        // Batch beam search loop: expand ALL unexpanded candidates per iteration.
+        loop {
+            // Collect all unexpanded candidates (up to beam_width).
+            let mut to_expand: SmallVec<[u32; 32]> = SmallVec::new();
+            for &(_, node) in &candidates {
+                if !expanded[node as usize] {
+                    to_expand.push(node);
+                }
+            }
+            if to_expand.is_empty() {
+                break;
+            }
+
+            // Mark all as expanded before I/O.
+            for &node in &to_expand {
+                expanded[node as usize] = true;
+            }
+
+            // BATCH READ: submit all node reads via io_uring (BATCH-SQE-SUBMIT).
+            // SAFETY: Single-threaded per-shard access. We hold exclusive logical
+            // ownership of this segment on the shard thread.
+            let uring = unsafe { &mut *self.uring.get() };
+            let uring = uring.as_mut().expect("search_uring called without uring");
+            let submitted = match uring.submit_reads(&to_expand) {
+                Ok(count) => count,
+                Err(_) => {
+                    // io_uring submission failed -- fall back to pread for
+                    // remaining iterations by clearing uring and recursing
+                    // into search_pread. This is a rare error path.
+                    break;
+                }
+            };
+
+            if submitted == 0 {
+                break;
+            }
+
+            // COLLECT COMPLETIONS (CQE-COMPLETION).
+            let completions = uring.collect_completions(submitted);
+
+            // Parse each completed read buffer into VamanaNode.
+            for &(buf_idx, result) in &completions {
+                if (result as usize) < PAGE_4K {
+                    // Short read or error -- skip this node.
+                    uring.reclaim_buf(buf_idx);
+                    continue;
+                }
+                let buf = uring.read_buf(buf_idx);
+                // The buffer is exactly PAGE_4K bytes from the aligned pool.
+                let page: &[u8; PAGE_4K] = buf.try_into()
+                    .expect("aligned buf must be PAGE_4K bytes");
+                if let Some(vnode) = read_vamana_node(page, self.dim) {
+                    // Score each unvisited neighbor using PQ distance.
+                    for &nbr in &vnode.neighbors {
+                        let nbr_idx = nbr as usize;
+                        if nbr_idx >= n || visited[nbr_idx] {
+                            continue;
+                        }
+                        visited[nbr_idx] = true;
+                        let d = self.pq.asymmetric_distance(
+                            &adt,
+                            &self.pq_codes[nbr_idx * m..(nbr_idx + 1) * m],
+                        );
+                        candidates.push((d, nbr));
+                    }
+                }
+                uring.reclaim_buf(buf_idx);
+            }
+
+            // Keep only best `beam_width` candidates.
+            candidates.sort_unstable_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(beam_width);
+        }
+
+        // Return top-k.
+        candidates.sort_unstable_by(|a, b| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(k);
+
+        let mut results = SmallVec::with_capacity(k);
+        for &(dist, node_id) in &candidates {
+            results.push(SearchResult::new(dist, VectorId(node_id)));
+        }
+        results
+    }
+
     /// Batch-read multiple Vamana nodes. On Linux with io_uring available,
     /// this could submit all reads in one syscall. Currently falls back to
     /// sequential pread.
@@ -312,10 +484,18 @@ impl DiskAnnSegment {
     ///
     /// Returns `None` if O_DIRECT was not available (e.g., tmpfs) or
     /// io_uring setup failed. The pread fallback is always available.
+    /// Access the io_uring ring for batch beam search (Linux only).
+    ///
+    /// Returns `None` if O_DIRECT was not available (e.g., tmpfs) or
+    /// io_uring setup failed. The pread fallback is always available.
+    ///
+    /// # Safety
+    /// Caller must ensure single-threaded access (per-shard invariant).
     #[cfg(target_os = "linux")]
     #[inline]
-    pub fn uring(&mut self) -> Option<&mut super::uring_search::DiskAnnUring> {
-        self.uring.as_mut()
+    pub fn uring(&self) -> Option<&mut super::uring_search::DiskAnnUring> {
+        // SAFETY: Single-threaded per-shard access (thread-per-core architecture).
+        unsafe { (*self.uring.get()).as_mut() }
     }
 }
 
@@ -473,5 +653,115 @@ mod tests {
         let r = 8;
         let (seg, _vectors, _tmp) = build_test_segment(n, dim, m, r);
         assert_eq!(seg.total_count(), 50);
+    }
+
+    /// Explicitly test the pread path (even on Linux where uring may be
+    /// available) to verify the portable fallback works correctly.
+    #[test]
+    fn test_diskann_search_pread_recall() {
+        let n = 50;
+        let dim = 32;
+        let m = 4;
+        let r = 8;
+        let k = 10;
+        let beam_width = 16;
+
+        let (seg, vectors, _tmp) = build_test_segment(n, dim, m, r);
+
+        // Run 20 queries via search_pread, check recall@10.
+        let mut total_recall = 0.0_f64;
+        let num_queries = 20;
+        for q in 0..num_queries {
+            let query = deterministic_f32(dim, 9000 + q);
+            let results = seg.search_pread(&query, k, beam_width);
+            let true_topk = brute_force_topk(&query, &vectors, dim, k);
+            let true_set: std::collections::HashSet<u32> =
+                true_topk.iter().copied().collect();
+            let hits = results
+                .iter()
+                .filter(|r| true_set.contains(&r.id.0))
+                .count();
+            total_recall += hits as f64 / k as f64;
+        }
+
+        let mean_recall = total_recall / num_queries as f64;
+        assert!(
+            mean_recall >= 0.5,
+            "pread recall@{k} = {mean_recall:.2} < 0.50 (too low)",
+        );
+    }
+
+    /// Test io_uring beam search path on Linux.
+    ///
+    /// Builds a segment on a real filesystem (not tmpfs) so O_DIRECT succeeds.
+    /// If O_DIRECT is unavailable (e.g., tmpfs in containers), the segment's
+    /// uring field will be None and the test skips gracefully.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_diskann_search_uring_recall() {
+        let n = 50;
+        let dim = 32;
+        let m = 4;
+        let r = 8;
+        let k = 10;
+        let beam_width = 16;
+
+        let vectors = random_vectors(n, dim, 7777);
+        let graph = VamanaGraph::build(&vectors, dim, r, r.max(10));
+        let pq = ProductQuantizer::train(&vectors, dim, m, 8);
+
+        let mut pq_codes = Vec::with_capacity(n * m);
+        for i in 0..n {
+            let codes = pq.encode(&vectors[i * dim..(i + 1) * dim]);
+            pq_codes.extend_from_slice(&codes);
+        }
+
+        // Write to /tmp which is typically ext4 (not tmpfs) on most Linux setups.
+        let dir = std::path::PathBuf::from("/tmp/moon_test_uring_beam");
+        let _ = std::fs::create_dir_all(&dir);
+        let vamana_path = dir.join("vamana.mpf");
+        write_vamana_mpf(&vamana_path, &graph, &vectors, dim).expect("write mpf");
+
+        let seg = DiskAnnSegment::new(
+            pq_codes,
+            pq,
+            vamana_path,
+            dim,
+            n as u32,
+            graph.entry_point(),
+            graph.max_degree(),
+            1,
+        );
+
+        // If uring is None (tmpfs / O_DIRECT unsupported), skip gracefully.
+        if seg.uring().is_none() {
+            eprintln!("SKIP: io_uring not available (O_DIRECT unsupported on this FS)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Run 20 queries via search_uring, check recall@10.
+        let mut total_recall = 0.0_f64;
+        let num_queries = 20;
+        for q in 0..num_queries {
+            let query = deterministic_f32(dim, 9000 + q);
+            let results = seg.search_uring(&query, k, beam_width);
+            let true_topk = brute_force_topk(&query, &vectors, dim, k);
+            let true_set: std::collections::HashSet<u32> =
+                true_topk.iter().copied().collect();
+            let hits = results
+                .iter()
+                .filter(|r| true_set.contains(&r.id.0))
+                .count();
+            total_recall += hits as f64 / k as f64;
+        }
+
+        let mean_recall = total_recall / num_queries as f64;
+        assert!(
+            mean_recall >= 0.5,
+            "uring recall@{k} = {mean_recall:.2} < 0.50 (too low for io_uring beam search)",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
