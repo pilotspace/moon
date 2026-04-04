@@ -46,6 +46,8 @@ struct ConnState {
     read_buf: BytesMut,
     /// Whether this connection has an active multishot recv.
     recv_active: bool,
+    /// Monotonic tick counter at last recv activity (for idle reaping).
+    last_recv_tick: u64,
 }
 
 /// Default number of pre-registered send buffers per shard.
@@ -206,6 +208,8 @@ pub struct UringDriver {
     config: UringConfig,
     /// Number of SQEs queued in current batch (not yet submitted).
     pending_sqes: usize,
+    /// Monotonic tick counter (incremented each drain_completions call).
+    tick: u64,
 }
 
 impl UringDriver {
@@ -233,6 +237,7 @@ impl UringDriver {
             next_conn_id: 0,
             config,
             pending_sqes: 0,
+            tick: 0,
         })
     }
 
@@ -308,6 +313,7 @@ impl UringDriver {
                 _raw_fd: raw_fd,
                 read_buf: BytesMut::with_capacity(0), // allocated on-demand for partial frames
                 recv_active: false,
+                last_recv_tick: 0,
             },
         );
 
@@ -499,6 +505,8 @@ impl UringDriver {
     /// Buffer lifecycle: recv data is copied from the provided buffer before
     /// the buffer is returned to the ring (per pitfall 1 in research).
     pub fn drain_completions(&mut self) -> Vec<IoEvent> {
+        self.tick += 1;
+        let current_tick = self.tick;
         let mut events = Vec::new();
 
         // Collect CQEs first to release the mutable borrow on self.ring,
@@ -542,9 +550,19 @@ impl UringDriver {
                         // Return buffer immediately since data is copied
                         let _ = self.buf_ring.return_buf(&self.ring, buf_id);
 
+                        // Stamp connection activity for idle reaping
+                        if let Some(conn) = self.connections.get_mut(&conn_id) {
+                            conn.last_recv_tick = current_tick;
+                        }
+
                         events.push(IoEvent::Recv { conn_id, data });
 
-                        // Check if multishot recv was cancelled (MORE flag absent)
+                        // Check if multishot recv ended (MORE flag absent).
+                        // MORE=0 can mean: buffer ring exhaustion, kernel cancellation,
+                        // OR client FIN. We cannot distinguish these reliably at CQE
+                        // time when result>0 (there IS data). Rearm recv — if the
+                        // client truly closed, the rearmed recv will produce result=0
+                        // which triggers Disconnect via the branch below.
                         if !cqueue::more(flags) {
                             if let Some(conn) = self.connections.get_mut(&conn_id) {
                                 conn.recv_active = false;
@@ -552,7 +570,7 @@ impl UringDriver {
                             events.push(IoEvent::RecvNeedsRearm { conn_id });
                         }
                     } else if result == 0 {
-                        // Connection closed by peer
+                        // Connection closed by peer (explicit 0-byte recv)
                         events.push(IoEvent::Disconnect { conn_id });
                     } else {
                         // Error on recv
@@ -642,6 +660,29 @@ impl UringDriver {
             }
         }
         Ok(())
+    }
+
+    /// Reap connections idle for more than `max_idle_ticks` drain_completions cycles.
+    ///
+    /// Returns conn_ids that were reaped. Called periodically from the event loop
+    /// (e.g. every 5 seconds) to clean up CLOSE_WAIT connections where the client
+    /// closed but the multishot recv didn't produce a 0-byte CQE.
+    pub fn reap_idle_connections(&mut self, max_idle_ticks: u64) -> Vec<u32> {
+        let current = self.tick;
+        let idle_ids: Vec<u32> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| {
+                let idle = current.saturating_sub(c.last_recv_tick);
+                idle > max_idle_ticks && !c.recv_active
+            })
+            .map(|(&id, _)| id)
+            .collect();
+
+        for &conn_id in &idle_ids {
+            let _ = self.shutdown_and_close_connection(conn_id);
+        }
+        idle_ids
     }
 
     /// Get mutable reference to a connection's read buffer (for partial frame accumulation).

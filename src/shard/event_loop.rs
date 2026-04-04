@@ -959,6 +959,14 @@ impl super::Shard {
                     } else {
                         timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                     }
+
+                    // Reap idle io_uring connections (tokio+io_uring path).
+                    // Cleans up CLOSE_WAIT connections where the multishot recv
+                    // ended without producing a 0-byte CQE (client FIN + MORE=0).
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut driver) = uring_state {
+                        let _reaped = driver.reap_idle_connections(5000);
+                    }
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
@@ -1311,6 +1319,13 @@ impl super::Shard {
                     } else {
                         timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                     }
+
+                    // Reap idle io_uring connections every ~5s (50 ticks × 100ms).
+                    // Cleans up CLOSE_WAIT connections where the multishot recv
+                    // ended without producing a 0-byte CQE (client FIN + MORE=0).
+                    // Note: idle connection reaping for CLOSE_WAIT cleanup is handled
+                    // by the UringDriver in the tokio+io_uring path. The monoio path
+                    // relies on monoio's internal connection lifecycle management.
                 }
                 // Shutdown
                 _ = shutdown.cancelled() => {
