@@ -483,11 +483,24 @@ pub(crate) fn handle_checkpoint_tick(
                 },
                 &mut |file_id, page_offset, _is_large, data| {
                     // Collect FPI payload for deferred WAL append.
-                    // Payload format: file_id(8 LE) + page_offset(8 LE) + page_data
-                    let mut payload = Vec::with_capacity(16 + data.len());
+                    // Payload format: file_id(8 LE) + page_offset(8 LE) + flag(1) + page_data
+                    // Flag: 0x00 = uncompressed, 0x01 = LZ4-compressed
+                    let mut payload = Vec::with_capacity(17 + data.len());
                     payload.extend_from_slice(&file_id.to_le_bytes());
                     payload.extend_from_slice(&page_offset.to_le_bytes());
-                    payload.extend_from_slice(data);
+                    if data.len() > 256 {
+                        let compressed = lz4_flex::compress_prepend_size(data);
+                        if compressed.len() < data.len() {
+                            payload.push(0x01);
+                            payload.extend_from_slice(&compressed);
+                        } else {
+                            payload.push(0x00);
+                            payload.extend_from_slice(data);
+                        }
+                    } else {
+                        payload.push(0x00);
+                        payload.extend_from_slice(data);
+                    }
                     fpi_payloads.push(payload);
                     Ok(())
                 },

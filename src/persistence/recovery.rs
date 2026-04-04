@@ -331,7 +331,36 @@ pub fn recover_shard_v3(
             }
             let file_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
             let page_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-            let page_data = &payload[16..];
+
+            // Check compression flag at offset 16 (added in Phase 84).
+            // Pre-Phase-84 FPI records start page_data at offset 16 (first byte is
+            // MoonPage magic 0x4D), so 0x00/0x01 flag bytes are unambiguous.
+            let (page_data_owned, page_data_slice): (Vec<u8>, &[u8]) =
+                if payload.len() > 17 && payload[16] == 0x01 {
+                    // LZ4-compressed FPI payload
+                    match lz4_flex::decompress_size_prepended(&payload[17..]) {
+                        Ok(decompressed) => (decompressed, &[]),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: FPI LZ4 decompression failed at LSN {}: {}, skipping",
+                                shard_id, record.lsn, e
+                            );
+                            return;
+                        }
+                    }
+                } else if payload.len() > 17 && payload[16] == 0x00 {
+                    // Uncompressed FPI with flag byte
+                    (Vec::new(), &payload[17..])
+                } else {
+                    // Legacy FPI (pre-Phase-84): no flag byte, page_data at offset 16
+                    (Vec::new(), &payload[16..])
+                };
+
+            let page_data: &[u8] = if !page_data_owned.is_empty() {
+                &page_data_owned
+            } else {
+                page_data_slice
+            };
 
             // Determine page size from data length
             let page_size = if page_data.len() > crate::persistence::page::PAGE_4K {
