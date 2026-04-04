@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use smallvec::SmallVec;
 
+#[cfg(not(unix))]
 use crate::vector::diskann::page::read_vamana_node_at;
 use crate::vector::diskann::pq::ProductQuantizer;
 use crate::vector::types::{SearchResult, VectorId};
@@ -21,7 +22,12 @@ pub struct DiskAnnSegment {
     /// Trained product quantizer (codebooks in RAM).
     pq: ProductQuantizer,
     /// Path to `vamana.mpf` file (graph on disk, read via pread).
+    /// On unix, reads go through `vamana_file` (pread); path kept for non-unix fallback.
+    #[cfg_attr(unix, allow(dead_code))]
     vamana_path: PathBuf,
+    /// Persistent file handle for vamana.mpf (opened once, pread per hop).
+    #[cfg(unix)]
+    vamana_file: std::fs::File,
     /// Vector dimensionality.
     dim: usize,
     /// Number of vectors in this segment.
@@ -51,10 +57,15 @@ impl DiskAnnSegment {
             num_vectors as usize * pq.m(),
             "pq_codes length must be num_vectors * m"
         );
+        #[cfg(unix)]
+        let vamana_file = std::fs::File::open(&vamana_path)
+            .unwrap_or_else(|e| panic!("DiskAnnSegment: cannot open {:?}: {}", vamana_path, e));
         Self {
             pq_codes,
             pq,
             vamana_path,
+            #[cfg(unix)]
+            vamana_file,
             dim,
             num_vectors,
             entry_point,
@@ -80,7 +91,14 @@ impl DiskAnnSegment {
         let num_vectors = if m > 0 { pq_codes.len() / m } else { 0 };
 
         let vamana_path = segment_dir.join("vamana.mpf");
+        #[cfg(unix)]
+        let vamana_file = std::fs::File::open(&vamana_path)?;
+
         // Read first node to get entry_point and infer max_degree.
+        #[cfg(unix)]
+        let node0 = crate::vector::diskann::page::read_vamana_node_with_fd(&vamana_file, 0, dim)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty vamana file"))?;
+        #[cfg(not(unix))]
         let node0 = read_vamana_node_at(&vamana_path, 0, dim)?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty vamana file"))?;
         // Entry point is the medoid stored during build -- for from_files we
@@ -92,6 +110,8 @@ impl DiskAnnSegment {
             pq_codes,
             pq,
             vamana_path,
+            #[cfg(unix)]
+            vamana_file,
             dim,
             num_vectors: num_vectors as u32,
             entry_point: 0,
@@ -155,7 +175,13 @@ impl DiskAnnSegment {
             expanded[node as usize] = true;
 
             // Read Vamana page from disk to get neighbors.
-            let neighbors = match read_vamana_node_at(&self.vamana_path, node, self.dim) {
+            #[cfg(unix)]
+            let read_result = crate::vector::diskann::page::read_vamana_node_with_fd(
+                &self.vamana_file, node, self.dim,
+            );
+            #[cfg(not(unix))]
+            let read_result = read_vamana_node_at(&self.vamana_path, node, self.dim);
+            let neighbors = match read_result {
                 Ok(Some(vnode)) => vnode.neighbors,
                 _ => continue, // I/O error or corrupt page -- skip this node
             };
@@ -188,6 +214,29 @@ impl DiskAnnSegment {
             results.push(SearchResult::new(dist, VectorId(node_id)));
         }
         results
+    }
+
+    /// Batch-read multiple Vamana nodes. On Linux with io_uring available,
+    /// this could submit all reads in one syscall. Currently falls back to
+    /// sequential pread.
+    ///
+    /// Returns nodes in the same order as `node_indices`. Missing/corrupt
+    /// nodes are None.
+    #[cfg(unix)]
+    pub fn batch_read_nodes(
+        &self,
+        node_indices: &[u32],
+    ) -> Vec<Option<crate::vector::diskann::page::VamanaNode>> {
+        node_indices
+            .iter()
+            .map(|&idx| {
+                crate::vector::diskann::page::read_vamana_node_with_fd(
+                    &self.vamana_file, idx, self.dim,
+                )
+                .ok()
+                .flatten()
+            })
+            .collect()
     }
 
     /// Total number of vectors in this cold segment.
