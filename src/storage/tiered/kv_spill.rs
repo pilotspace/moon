@@ -6,6 +6,7 @@
 use std::io;
 use std::path::Path;
 
+use bytes::Bytes;
 use tracing::warn;
 
 use crate::persistence::kv_page::{
@@ -35,6 +36,7 @@ pub fn spill_to_datafile(
     key: &[u8],
     entry: &Entry,
     manifest: &mut ShardManifest,
+    cold_index: Option<&mut super::cold_index::ColdIndex>,
 ) -> io::Result<()> {
     // Determine value type and extract bytes
     let (value_type, value_bytes): (ValueType, &[u8]) = match entry.as_redis_value() {
@@ -126,6 +128,17 @@ pub fn spill_to_datafile(
     });
     manifest.commit()?;
 
+    // Update cold index with the spilled key's disk location
+    if let Some(ci) = cold_index {
+        ci.insert(
+            Bytes::copy_from_slice(key),
+            super::cold_index::ColdLocation {
+                file_id,
+                slot_idx: 0,
+            },
+        );
+    }
+
     Ok(())
 }
 
@@ -145,7 +158,7 @@ mod tests {
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
 
         let entry = Entry::new_string(Bytes::from_static(b"hello world"));
-        spill_to_datafile(shard_dir, 1, b"mykey", &entry, &mut manifest).unwrap();
+        spill_to_datafile(shard_dir, 1, b"mykey", &entry, &mut manifest, None).unwrap();
 
         // Verify file was created
         let file_path = shard_dir.join("data/heap-000001.mpf");
@@ -177,7 +190,7 @@ mod tests {
         let future_ms = current_time_ms() + 60_000;
         entry.set_expires_at_ms(0, future_ms);
 
-        spill_to_datafile(shard_dir, 2, b"ttl_key", &entry, &mut manifest).unwrap();
+        spill_to_datafile(shard_dir, 2, b"ttl_key", &entry, &mut manifest, None).unwrap();
 
         let file_path = shard_dir.join("data/heap-000002.mpf");
         let pages = read_datafile(&file_path).unwrap();
@@ -211,7 +224,7 @@ mod tests {
         }
         let entry = Entry::new_string(Bytes::from(big_value));
 
-        spill_to_datafile(shard_dir, 3, b"big_key", &entry, &mut manifest).unwrap();
+        spill_to_datafile(shard_dir, 3, b"big_key", &entry, &mut manifest, None).unwrap();
 
         // No file should have been written
         let file_path = shard_dir.join("data/heap-000003.mpf");

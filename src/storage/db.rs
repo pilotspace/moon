@@ -277,6 +277,10 @@ pub struct Database {
     /// Set once at database creation time and never changed, ensuring
     /// TTL deltas remain stable across the database lifetime.
     base_timestamp: u32,
+    /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
+    pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
+    /// Shard directory for cold reads (None when disk-offload disabled).
+    pub cold_shard_dir: Option<std::path::PathBuf>,
 }
 
 impl Database {
@@ -288,6 +292,8 @@ impl Database {
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
+            cold_index: None,
+            cold_shard_dir: None,
         }
     }
 
@@ -358,8 +364,31 @@ impl Database {
                 .saturating_sub(entry_overhead(key, &removed));
             return None;
         }
-        // Return immutable ref (same slot, fast re-probe)
-        self.data.get(key)
+        // Hot path: DashTable lookup
+        if self.data.get(key).is_some() {
+            return self.data.get(key);
+        }
+        // Cold fallback: read from disk DataFile via cold_read helper.
+        // Extract owned result first to drop immutable borrows before mutation.
+        let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
+            self.cold_index.as_ref().and_then(|ci| {
+                crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)
+            })
+        });
+        if let Some((value, ttl_ms)) = cold_result {
+            let key_bytes = Bytes::copy_from_slice(key);
+            let value_bytes = Bytes::from(value);
+            if let Some(ttl) = ttl_ms {
+                self.set_string_with_expiry(key_bytes, value_bytes, ttl);
+            } else {
+                self.set_string(key_bytes, value_bytes);
+            }
+            if let Some(ref mut ci) = self.cold_index {
+                ci.remove(key);
+            }
+            return self.data.get(key);
+        }
+        None
     }
 
     /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.

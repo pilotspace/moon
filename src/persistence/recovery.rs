@@ -48,6 +48,8 @@ pub struct RecoveryResult {
     pub cold_segments: Vec<(u64, std::path::PathBuf)>,
     /// Number of cold segments discovered.
     pub cold_segments_loaded: usize,
+    /// Cold index rebuilt from heap DataFiles (None if no KvLeaf entries).
+    pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
 }
 
 /// 6-phase recovery protocol for disk-offload mode.
@@ -223,6 +225,25 @@ pub fn recover_shard_v3(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Phase 3 continued: Build ColdIndex from manifest KvLeaf entries.
+    // Used by Database::get() for read-through on DashTable miss.
+    if manifest_path.exists() {
+        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
+            let cold_idx =
+                crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest(
+                    shard_dir, &manifest,
+                );
+            if cold_idx.len() > 0 {
+                info!(
+                    "Shard {}: rebuilt cold index with {} entries",
+                    shard_id,
+                    cold_idx.len()
+                );
+                result.cold_index = Some(cold_idx);
             }
         }
     }

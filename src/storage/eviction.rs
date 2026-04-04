@@ -191,6 +191,7 @@ fn evict_one_with_spill(
                     key.as_bytes(),
                     entry,
                     ctx.manifest,
+                    None,
                 ) {
                     warn!(
                         key = %String::from_utf8_lossy(key.as_bytes()),
