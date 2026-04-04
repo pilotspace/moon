@@ -507,6 +507,218 @@ fn test_disk_offload_disable_is_noop() {
     assert!((config.checkpoint_completion - 0.9).abs() < f64::EPSILON);
 }
 
+// ======================================================================
+// Test 6: FPI torn-page crash recovery
+// ======================================================================
+
+#[test]
+fn test_fpi_torn_page_crash_recovery() {
+    use moon::persistence::control::ShardControlFile;
+    use moon::persistence::recovery::recover_shard_v3;
+    use moon::storage::Database;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shard_dir = tmp.path().join("shard-0");
+    let wal_dir = shard_dir.join("wal-v3");
+    let data_dir = shard_dir.join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // 1. Build a valid 4KB page with known content
+    let mut page = vec![0u8; 4096];
+    let mut hdr = MoonPageHeader::new(PageType::KvLeaf, 0, 1);
+    hdr.payload_bytes = 256;
+    hdr.page_lsn = 10;
+    hdr.write_to(&mut page);
+    // Fill payload region with known pattern
+    for j in 0..256 {
+        page[MOONPAGE_HEADER_SIZE + j] = 0xDE;
+    }
+    MoonPageHeader::compute_checksum(&mut page);
+
+    // Save the original page for later comparison
+    let original_page = page.clone();
+
+    // Verify the original page has a valid checksum
+    assert!(
+        MoonPageHeader::verify_checksum(&original_page),
+        "Original page CRC should verify"
+    );
+
+    // 2. Write the valid page to the heap file at offset 0
+    let heap_path = data_dir.join("heap-000001.mpf");
+    std::fs::write(&heap_path, &page).unwrap();
+
+    // 3. Build FPI WAL payload: file_id(8 LE) + page_offset(8 LE) + full page data
+    let mut fpi_payload = Vec::with_capacity(16 + 4096);
+    fpi_payload.extend_from_slice(&1u64.to_le_bytes()); // file_id = 1
+    fpi_payload.extend_from_slice(&0u64.to_le_bytes()); // page_offset = 0
+    fpi_payload.extend_from_slice(&page);
+
+    // 4. Write a WAL segment: header + 1 Command (dummy) + 1 FullPageImage
+    let mut wal_data = make_v3_header(0);
+    write_wal_v3_record(&mut wal_data, 1, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+    write_wal_v3_record(&mut wal_data, 2, WalRecordType::FullPageImage, &fpi_payload);
+    std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+    // 5. CORRUPT the on-disk page: overwrite first 64 bytes with 0xFF
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&heap_path)
+            .unwrap();
+        file.write_all(&[0xFF; 64]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // Verify corruption: CRC should fail
+    let corrupted = std::fs::read(&heap_path).unwrap();
+    assert!(
+        !MoonPageHeader::verify_checksum(&corrupted),
+        "Corrupted page CRC should fail"
+    );
+
+    // 6. Create control file with last_checkpoint_lsn = 0 (replay all records)
+    let ctl = ShardControlFile::new([0u8; 16]);
+    ctl.write(&ShardControlFile::control_path(&shard_dir, 0))
+        .unwrap();
+
+    // 7. Run recovery
+    let mut databases = vec![Database::new()];
+    let engine = moon::persistence::replay::DispatchReplayEngine;
+    let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+    // 8. Assertions
+    assert_eq!(result.fpi_applied, 1, "Should apply exactly 1 FPI record");
+
+    // Read back the heap file -- should be restored to original
+    let restored = std::fs::read(&heap_path).unwrap();
+    assert_eq!(
+        &restored[..4096],
+        &original_page[..],
+        "Restored page should match original page exactly"
+    );
+    assert!(
+        MoonPageHeader::verify_checksum(&restored[..4096]),
+        "Restored page CRC should verify"
+    );
+}
+
+#[test]
+fn test_fpi_selective_recovery_only_fpi_pages_restored() {
+    use moon::persistence::control::ShardControlFile;
+    use moon::persistence::recovery::recover_shard_v3;
+    use moon::storage::Database;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shard_dir = tmp.path().join("shard-0");
+    let wal_dir = shard_dir.join("wal-v3");
+    let data_dir = shard_dir.join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Build 2 valid 4KB pages
+    let mut page0 = vec![0u8; 4096];
+    let mut hdr0 = MoonPageHeader::new(PageType::KvLeaf, 0, 1);
+    hdr0.payload_bytes = 128;
+    hdr0.page_lsn = 5;
+    hdr0.write_to(&mut page0);
+    for j in 0..128 {
+        page0[MOONPAGE_HEADER_SIZE + j] = 0xAA;
+    }
+    MoonPageHeader::compute_checksum(&mut page0);
+    let original_page0 = page0.clone();
+
+    let mut page1 = vec![0u8; 4096];
+    let mut hdr1 = MoonPageHeader::new(PageType::KvLeaf, 1, 1);
+    hdr1.payload_bytes = 128;
+    hdr1.page_lsn = 6;
+    hdr1.write_to(&mut page1);
+    for j in 0..128 {
+        page1[MOONPAGE_HEADER_SIZE + j] = 0xBB;
+    }
+    MoonPageHeader::compute_checksum(&mut page1);
+
+    // Write both pages to heap file (page0 at offset 0, page1 at offset 4096)
+    let heap_path = data_dir.join("heap-000001.mpf");
+    let mut heap_data = Vec::with_capacity(8192);
+    heap_data.extend_from_slice(&page0);
+    heap_data.extend_from_slice(&page1);
+    std::fs::write(&heap_path, &heap_data).unwrap();
+
+    // FPI WAL record only for page 0
+    let mut fpi_payload = Vec::with_capacity(16 + 4096);
+    fpi_payload.extend_from_slice(&1u64.to_le_bytes()); // file_id = 1
+    fpi_payload.extend_from_slice(&0u64.to_le_bytes()); // page_offset = 0
+    fpi_payload.extend_from_slice(&page0);
+
+    let mut wal_data = make_v3_header(0);
+    write_wal_v3_record(&mut wal_data, 1, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+    write_wal_v3_record(&mut wal_data, 2, WalRecordType::FullPageImage, &fpi_payload);
+    std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+    // Corrupt BOTH pages on disk
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&heap_path)
+            .unwrap();
+        // Corrupt page 0 header
+        file.write_all(&[0xFF; 64]).unwrap();
+    }
+    {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&heap_path)
+            .unwrap();
+        // Corrupt page 1 header (at offset 4096)
+        file.write_at(&[0xFF; 64], 4096).unwrap();
+    }
+
+    // Verify both pages are corrupted
+    let corrupted = std::fs::read(&heap_path).unwrap();
+    assert!(
+        !MoonPageHeader::verify_checksum(&corrupted[..4096]),
+        "Page 0 should be corrupted"
+    );
+    assert!(
+        !MoonPageHeader::verify_checksum(&corrupted[4096..8192]),
+        "Page 1 should be corrupted"
+    );
+
+    // Create control file and run recovery
+    let ctl = ShardControlFile::new([0u8; 16]);
+    ctl.write(&ShardControlFile::control_path(&shard_dir, 0))
+        .unwrap();
+
+    let mut databases = vec![Database::new()];
+    let engine = moon::persistence::replay::DispatchReplayEngine;
+    let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+    assert_eq!(result.fpi_applied, 1, "Only 1 FPI record should be applied");
+
+    // Page 0 should be restored (has FPI)
+    let restored = std::fs::read(&heap_path).unwrap();
+    assert_eq!(
+        &restored[..4096],
+        &original_page0[..],
+        "Page 0 should be restored from FPI"
+    );
+    assert!(
+        MoonPageHeader::verify_checksum(&restored[..4096]),
+        "Page 0 CRC should verify after FPI restore"
+    );
+
+    // Page 1 should remain corrupted (no FPI)
+    assert!(
+        !MoonPageHeader::verify_checksum(&restored[4096..8192]),
+        "Page 1 should remain corrupted (no FPI record)"
+    );
+}
+
 /// Recursively check if any .mpf files exist under a directory.
 fn walkdir_find_mpf(dir: &std::path::Path) -> bool {
     if !dir.exists() {
