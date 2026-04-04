@@ -223,7 +223,9 @@ pub(crate) fn handle_uring_event(
                     }
                 }
             }
-            let _ = driver.close_connection(conn_id);
+            // Graceful close: shutdown(SHUT_WR) sends TCP FIN to peer before close().
+            // redis-benchmark 8.x requires FIN (not RST) to detect benchmark completion.
+            let _ = driver.shutdown_and_close_connection(conn_id);
             parse_bufs.remove(&conn_id);
         }
         IoEvent::RecvNeedsRearm { conn_id } => {
