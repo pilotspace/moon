@@ -66,6 +66,12 @@ pub struct UringConfig {
     pub buf_ring: BufRingConfig,
     /// Number of pre-registered send buffers. Default: 256 (= 2MB per shard).
     pub send_buf_pool_size: u16,
+    /// Enable SQPOLL mode with the given idle timeout in milliseconds.
+    ///
+    /// When set, the kernel spins a dedicated SQ poll thread that submits SQEs
+    /// without requiring `io_uring_enter()` syscalls, reducing submission latency.
+    /// Requires `CAP_SYS_NICE` or root; falls back gracefully on EPERM.
+    pub sqpoll_idle_ms: Option<u32>,
 }
 
 impl Default for UringConfig {
@@ -75,6 +81,7 @@ impl Default for UringConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             buf_ring: BufRingConfig::default(),
             send_buf_pool_size: DEFAULT_SEND_BUF_POOL_SIZE,
+            sqpoll_idle_ms: None,
         }
     }
 }
@@ -218,11 +225,41 @@ impl UringDriver {
     /// MUST be called from the shard thread that will own this driver
     /// (`SINGLE_ISSUER` flag requires single-thread access).
     pub fn new(config: UringConfig) -> std::io::Result<Self> {
-        let ring = IoUring::builder()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
-            .setup_coop_taskrun()
-            .build(config.ring_size)?;
+        let ring = if let Some(ms) = config.sqpoll_idle_ms {
+            // SQPOLL: kernel thread polls SQ, avoiding io_uring_enter() per submit.
+            // Note: SQPOLL is incompatible with DEFER_TASKRUN (kernel thread != issuer),
+            // so we only set SINGLE_ISSUER + COOP_TASKRUN + SQPOLL here.
+            match IoUring::builder()
+                .setup_single_issuer()
+                .setup_coop_taskrun()
+                .setup_sqpoll(ms)
+                .build(config.ring_size)
+            {
+                Ok(ring) => {
+                    tracing::info!("io_uring SQPOLL enabled (idle {}ms)", ms);
+                    ring
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                    // EPERM: insufficient privileges for SQPOLL. Fall back to
+                    // standard mode without SQPOLL (requires CAP_SYS_NICE or root).
+                    tracing::warn!(
+                        "io_uring SQPOLL failed (EPERM, need CAP_SYS_NICE), falling back to standard mode"
+                    );
+                    IoUring::builder()
+                        .setup_single_issuer()
+                        .setup_defer_taskrun()
+                        .setup_coop_taskrun()
+                        .build(config.ring_size)?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            IoUring::builder()
+                .setup_single_issuer()
+                .setup_defer_taskrun()
+                .setup_coop_taskrun()
+                .build(config.ring_size)?
+        };
 
         let fd_table = FdTable::new(config.max_connections);
         let buf_ring = BufRingManager::new(config.buf_ring.clone());

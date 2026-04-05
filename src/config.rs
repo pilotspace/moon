@@ -102,6 +102,15 @@ pub struct ServerConfig {
     #[arg(long)]
     pub tls_ciphersuites: Option<String>,
 
+    // ── io_uring tuning ─────────────────────────────────────────────
+
+    /// Enable io_uring SQPOLL mode with the given idle timeout in milliseconds.
+    /// The kernel spins a dedicated SQ poll thread, eliminating io_uring_enter()
+    /// syscalls on the submission path. Requires CAP_SYS_NICE or root; falls back
+    /// gracefully if unprivileged. Linux-only; ignored on other platforms.
+    #[arg(long = "uring-sqpoll")]
+    pub uring_sqpoll_ms: Option<u32>,
+
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
 
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)

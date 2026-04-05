@@ -95,6 +95,10 @@ codegen-units = 1     # Single codegen unit for global optimization
 opt-level = 3         # Full optimization
 strip = true          # Strip symbols
 
+[[bin]]
+name = "moon-bench"
+path = "src/bin/moon-bench.rs"
+
 [[bench]]
 name = "resp_parsing"
 harness = false

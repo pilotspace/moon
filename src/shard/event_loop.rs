@@ -93,7 +93,10 @@ impl super::Shard {
                 info!("Shard {} io_uring disabled via MOON_NO_URING", self.id);
                 None
             } else {
-                match UringDriver::new(UringConfig::default()) {
+                match UringDriver::new(UringConfig {
+                    sqpoll_idle_ms: server_config.uring_sqpoll_ms,
+                    ..UringConfig::default()
+                }) {
                     Ok(mut d) => match d.init() {
                         Ok(()) => {
                             info!("Shard {} started (io_uring mode)", self.id);
