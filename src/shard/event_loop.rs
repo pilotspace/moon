@@ -622,6 +622,27 @@ impl super::Shard {
         let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
 
         loop {
+            // Poll io_uring for completions on EVERY iteration, not just the 1ms timer tick.
+            // With DEFER_TASKRUN, completions only become visible after io_uring_enter(GETEVENTS).
+            // Without this, each request-response needs ~3 timer ticks (3ms) to complete,
+            // limiting throughput to ~333 rps/connection.
+            #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+            if let Some(ref mut driver) = uring_state {
+                loop {
+                    let _ = driver.submit_and_wait_nonblocking();
+                    let events = driver.drain_completions();
+                    if events.is_empty() {
+                        break;
+                    }
+                    for event in events {
+                        uring_handler::handle_uring_event(
+                            event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
+                            &mut inflight_sends, uring_listener_fd, &cached_clock,
+                        );
+                    }
+                }
+            }
+
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
                 // Per-shard SO_REUSEPORT accept (Linux only, non-uring tokio path)
@@ -867,18 +888,8 @@ impl super::Shard {
                         }
                     }
 
-                    // On Linux: poll io_uring for completions (non-blocking)
-                    #[cfg(target_os = "linux")]
-                    if let Some(ref mut driver) = uring_state {
-                        let _ = driver.submit_and_wait_nonblocking();
-                        let events = driver.drain_completions();
-                        for event in events {
-                            uring_handler::handle_uring_event(
-                                event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
-                                &mut inflight_sends, uring_listener_fd, &cached_clock,
-                            );
-                        }
-                    }
+                    // io_uring completions are polled at the top of the main loop
+                    // (before tokio::select!), so no additional poll needed here.
                 }
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {

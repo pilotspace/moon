@@ -528,11 +528,27 @@ impl UringDriver {
     /// Used in the hybrid Tokio+io_uring path where the shard event loop
     /// polls io_uring completions on a timer rather than blocking.
     pub fn submit_and_wait_nonblocking(&mut self) -> std::io::Result<usize> {
-        if self.pending_sqes == 0 {
-            return Ok(0);
+        // Step 1: Submit any pending SQEs via the crate's submit() which properly
+        // syncs the SQ ring tail before calling io_uring_enter().
+        let n = if self.pending_sqes > 0 {
+            self.pending_sqes = 0;
+            self.ring.submit()?
+        } else {
+            0
+        };
+        // Step 2: With DEFER_TASKRUN, the kernel only processes completions when
+        // io_uring_enter(GETEVENTS) is called. The crate's submit()/submit_and_wait(0)
+        // skip GETEVENTS when want=0, so we must always call enter() with GETEVENTS
+        // to flush deferred task work (e.g. multishot accept CQEs).
+        // SAFETY: IORING_ENTER_GETEVENTS=1, no sigset arg, size=0.
+        unsafe {
+            self.ring.submitter().enter::<libc::sigset_t>(
+                0,
+                0,
+                1, // IORING_ENTER_GETEVENTS
+                None,
+            )?;
         }
-        let n = self.ring.submit()?;
-        self.pending_sqes = 0;
         Ok(n)
     }
 
