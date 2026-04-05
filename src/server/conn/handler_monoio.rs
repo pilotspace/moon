@@ -113,8 +113,6 @@ pub async fn handle_connection_sharded_monoio<
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
-    // Raw socket fd (unused after removing libc::shutdown — kept for API compat).
-    _raw_fd: i32,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -1948,6 +1946,11 @@ pub async fn handle_connection_sharded_monoio<
             tmp_buf = vec![0u8; 8192];
         }
     }
+
+    // --- Graceful TCP shutdown: send FIN to client to avoid CLOSE_WAIT ---
+    // Uses monoio's own shutdown() which properly manages the fd through
+    // the runtime (unlike raw libc::shutdown which corrupts monoio state).
+    let _ = stream.shutdown().await;
 
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if subscriber_id > 0 {
