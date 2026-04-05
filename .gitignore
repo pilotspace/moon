@@ -75,3 +75,6 @@ shard-*.wal.old
 shard-*.rrdshard
 .claude/worktrees/
 moon_*.log
+ssh
+.qdrant-initialized
+libnull.rlib
