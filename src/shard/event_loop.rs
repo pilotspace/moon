@@ -148,6 +148,32 @@ impl super::Shard {
             }
         }
 
+        // Wrap io_uring's CQE eventfd in tokio AsyncFd for select! integration.
+        // When io_uring has completions, the kernel signals this eventfd, which
+        // wakes tokio's epoll and fires the select! branch — instant CQE processing
+        // with zero polling overhead.
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+        let uring_cqe_fd: Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'_>>> = {
+            if let Some(ref d) = uring_state {
+                use std::os::fd::BorrowedFd;
+                // SAFETY: cqe_eventfd is a valid, open fd created by eventfd() in UringDriver::new().
+                // The BorrowedFd lifetime is tied to uring_state which outlives this variable.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(d.cqe_eventfd()) };
+                match tokio::io::unix::AsyncFd::with_interest(
+                    borrowed,
+                    tokio::io::Interest::READABLE,
+                ) {
+                    Ok(afd) => Some(afd),
+                    Err(e) => {
+                        tracing::warn!("Shard {}: AsyncFd for io_uring eventfd failed: {}", self.id, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
         // Track per-connection parse state for io_uring path (Linux + tokio only).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_parse_bufs: std::collections::HashMap<u32, bytes::BytesMut> =
@@ -622,29 +648,39 @@ impl super::Shard {
         let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
 
         loop {
-            // Poll io_uring for completions on EVERY iteration, not just the 1ms timer tick.
-            // With DEFER_TASKRUN, completions only become visible after io_uring_enter(GETEVENTS).
-            // Without this, each request-response needs ~3 timer ticks (3ms) to complete,
-            // limiting throughput to ~333 rps/connection.
-            #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-            if let Some(ref mut driver) = uring_state {
-                loop {
-                    let _ = driver.submit_and_wait_nonblocking();
-                    let events = driver.drain_completions();
-                    if events.is_empty() {
-                        break;
-                    }
-                    for event in events {
-                        uring_handler::handle_uring_event(
-                            event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
-                            &mut inflight_sends, uring_listener_fd, &cached_clock,
-                        );
-                    }
-                }
-            }
-
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
+                // io_uring CQE notification: eventfd becomes readable when completions arrive.
+                // This wakes tokio's epoll instantly — no polling, no timer latency.
+                // Processes ALL pending completions in a drain loop (accept → recv → send chain).
+                _ = async {
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref afd) = uring_cqe_fd {
+                        if let Ok(mut guard) = afd.readable().await {
+                            guard.clear_ready();
+                            return;
+                        }
+                    }
+                    std::future::pending::<()>().await
+                } => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut driver) = uring_state {
+                        driver.drain_eventfd();
+                        loop {
+                            let _ = driver.submit_and_wait_nonblocking();
+                            let events = driver.drain_completions();
+                            if events.is_empty() {
+                                break;
+                            }
+                            for event in events {
+                                uring_handler::handle_uring_event(
+                                    event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
+                                    &mut inflight_sends, uring_listener_fd, &cached_clock,
+                                );
+                            }
+                        }
+                    }
+                }
                 // Per-shard SO_REUSEPORT accept (Linux only, non-uring tokio path)
                 result = async {
                     #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]

@@ -376,12 +376,7 @@ fn main() -> anyhow::Result<()> {
                 info!("Cluster bus and gossip ticker started");
             }
 
-            // Per-shard SO_REUSEPORT accept only works reliably with io_uring
-            // multishot accept. The tokio per-shard listener fallback has a polling
-            // mismatch where the 1ms timer tick starves connection handlers.
-            // Disable per-shard accept when MOON_NO_URING is set.
-            let per_shard_accept = cfg!(target_os = "linux")
-                && std::env::var("MOON_NO_URING").is_err();
+            let per_shard_accept = cfg!(target_os = "linux");
             if let Err(e) = server::listener::run_sharded(
                 config,
                 conn_txs,

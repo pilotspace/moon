@@ -197,9 +197,12 @@ impl SendBufPool {
 
 /// Per-shard io_uring driver.
 ///
-/// Owns one io_uring instance with `SINGLE_ISSUER` + `DEFER_TASKRUN` + `COOP_TASKRUN`.
+/// Owns one io_uring instance with `SINGLE_ISSUER` + `COOP_TASKRUN`.
 /// Manages connection lifecycle via multishot accept/recv, registered FDs,
 /// provided buffer ring, and batched SQE submission.
+///
+/// An eventfd is registered with the io_uring instance so that the tokio
+/// event loop can be woken up instantly when CQEs arrive (no polling needed).
 ///
 /// # Thread Safety
 ///
@@ -217,6 +220,9 @@ pub struct UringDriver {
     pending_sqes: usize,
     /// Monotonic tick counter (incremented each drain_completions call).
     tick: u64,
+    /// Eventfd registered with io_uring for CQE notifications.
+    /// When CQEs arrive, the kernel writes to this fd, waking tokio's epoll.
+    cqe_eventfd: RawFd,
 }
 
 impl UringDriver {
@@ -247,16 +253,23 @@ impl UringDriver {
                     );
                     IoUring::builder()
                         .setup_single_issuer()
-                        .setup_defer_taskrun()
                         .setup_coop_taskrun()
                         .build(config.ring_size)?
                 }
                 Err(e) => return Err(e),
             }
         } else {
+            // COOP_TASKRUN without DEFER_TASKRUN: kernel processes task-work
+            // during any io_uring_enter() call (submit, submit_and_wait).
+            // This ensures CQEs from multishot accept/recv become visible
+            // after submit() without needing explicit enter(GETEVENTS).
+            //
+            // DEFER_TASKRUN was removed because it requires GETEVENTS on every
+            // enter() call, but tokio::select! blocks between iterations and
+            // can't call enter() during that window — causing completions to
+            // pile up and connections to time out.
             IoUring::builder()
                 .setup_single_issuer()
-                .setup_defer_taskrun()
                 .setup_coop_taskrun()
                 .build(config.ring_size)?
         };
@@ -264,6 +277,12 @@ impl UringDriver {
         let fd_table = FdTable::new(config.max_connections);
         let buf_ring = BufRingManager::new(config.buf_ring.clone());
         let send_buf_pool = SendBufPool::new(config.send_buf_pool_size, DEFAULT_SEND_BUF_SIZE);
+
+        // SAFETY: EFD_NONBLOCK | EFD_CLOEXEC are valid flags for eventfd.
+        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if efd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
 
         Ok(Self {
             ring,
@@ -275,6 +294,7 @@ impl UringDriver {
             config,
             pending_sqes: 0,
             tick: 0,
+            cqe_eventfd: efd,
         })
     }
 
@@ -294,7 +314,20 @@ impl UringDriver {
             }
         }
 
+        // Register eventfd for CQE notifications. The kernel writes to this fd
+        // when completions arrive, allowing tokio's epoll to wake up instantly
+        // instead of waiting for the next timer tick.
+        self.ring.submitter().register_eventfd(self.cqe_eventfd)?;
+
         Ok(())
+    }
+
+    /// Returns the raw fd of the CQE notification eventfd.
+    ///
+    /// The event loop should wrap this in `tokio::io::unix::AsyncFd` and
+    /// poll it in the `select!` macro to get instant CQE wakeups.
+    pub fn cqe_eventfd(&self) -> RawFd {
+        self.cqe_eventfd
     }
 
     // -----------------------------------------------------------------------
@@ -527,28 +560,25 @@ impl UringDriver {
     ///
     /// Used in the hybrid Tokio+io_uring path where the shard event loop
     /// polls io_uring completions on a timer rather than blocking.
+    /// Drain the CQE eventfd counter (must be called after being woken by eventfd).
+    /// Returns true if the eventfd had a non-zero value (CQEs were signaled).
+    pub fn drain_eventfd(&self) -> bool {
+        let mut buf = [0u8; 8];
+        // SAFETY: cqe_eventfd is a valid eventfd with EFD_NONBLOCK.
+        let n = unsafe { libc::read(self.cqe_eventfd, buf.as_mut_ptr().cast(), 8) };
+        n == 8
+    }
+
     pub fn submit_and_wait_nonblocking(&mut self) -> std::io::Result<usize> {
-        // Step 1: Submit any pending SQEs via the crate's submit() which properly
-        // syncs the SQ ring tail before calling io_uring_enter().
-        let n = if self.pending_sqes > 0 {
-            self.pending_sqes = 0;
-            self.ring.submit()?
-        } else {
-            0
-        };
-        // Step 2: With DEFER_TASKRUN, the kernel only processes completions when
-        // io_uring_enter(GETEVENTS) is called. The crate's submit()/submit_and_wait(0)
-        // skip GETEVENTS when want=0, so we must always call enter() with GETEVENTS
-        // to flush deferred task work (e.g. multishot accept CQEs).
-        // SAFETY: IORING_ENTER_GETEVENTS=1, no sigset arg, size=0.
-        unsafe {
-            self.ring.submitter().enter::<libc::sigset_t>(
-                0,
-                0,
-                1, // IORING_ENTER_GETEVENTS
-                None,
-            )?;
-        }
+        // With COOP_TASKRUN (no DEFER_TASKRUN), the kernel processes task-work
+        // during any io_uring_enter() call. submit() calls enter() internally,
+        // which flushes pending completions (multishot accept, recv, etc.).
+        //
+        // When no SQEs are pending, we still need enter() to flush completions
+        // from previously submitted multishot operations. submit() with an empty
+        // SQ still calls enter(0, 0, 0) which triggers cooperative task-work.
+        let n = self.ring.submit()?;
+        self.pending_sqes = 0;
         Ok(n)
     }
 
@@ -776,6 +806,13 @@ impl UringDriver {
     /// Reference to the buffer ring manager.
     pub fn buf_ring(&self) -> &BufRingManager {
         &self.buf_ring
+    }
+}
+
+impl Drop for UringDriver {
+    fn drop(&mut self) {
+        // SAFETY: cqe_eventfd is a valid fd created by eventfd().
+        unsafe { libc::close(self.cqe_eventfd); }
     }
 }
 
