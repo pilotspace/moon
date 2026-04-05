@@ -376,7 +376,11 @@ fn main() -> anyhow::Result<()> {
                 info!("Cluster bus and gossip ticker started");
             }
 
-            let per_shard_accept = cfg!(target_os = "linux");
+            // Per-shard accept via io_uring multishot accept is not yet reliable
+            // under tokio on kernel 6.1 (eventfd wakeup integration incomplete).
+            // Use central listener MPSC dispatch when MOON_NO_URING is set.
+            let per_shard_accept = cfg!(target_os = "linux")
+                && std::env::var("MOON_NO_URING").is_err();
             if let Err(e) = server::listener::run_sharded(
                 config,
                 conn_txs,

@@ -152,22 +152,34 @@ impl super::Shard {
         // When io_uring has completions, the kernel signals this eventfd, which
         // wakes tokio's epoll and fires the select! branch — instant CQE processing
         // with zero polling overhead.
+        //
+        // We dup() the eventfd so AsyncFd can take ownership without conflicting
+        // with io_uring's registered eventfd (which must stay open).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-        let uring_cqe_fd: Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'_>>> = {
+        let uring_cqe_fd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> = {
             if let Some(ref d) = uring_state {
-                use std::os::fd::BorrowedFd;
-                // SAFETY: cqe_eventfd is a valid, open fd created by eventfd() in UringDriver::new().
-                // The BorrowedFd lifetime is tied to uring_state which outlives this variable.
-                let borrowed = unsafe { BorrowedFd::borrow_raw(d.cqe_eventfd()) };
-                match tokio::io::unix::AsyncFd::with_interest(
-                    borrowed,
-                    tokio::io::Interest::READABLE,
-                ) {
-                    Ok(afd) => Some(afd),
-                    Err(e) => {
-                        tracing::warn!("Shard {}: AsyncFd for io_uring eventfd failed: {}", self.id, e);
-                        None
+                use std::os::fd::{FromRawFd, OwnedFd};
+                // SAFETY: dup() creates a new fd referencing the same eventfd.
+                // OwnedFd takes ownership and will close the dup'd fd on drop.
+                let dup_fd = unsafe { libc::dup(d.cqe_eventfd()) };
+                if dup_fd >= 0 {
+                    let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                    match tokio::io::unix::AsyncFd::with_interest(
+                        owned,
+                        tokio::io::Interest::READABLE,
+                    ) {
+                        Ok(afd) => {
+                            tracing::info!("Shard {}: io_uring eventfd registered with tokio (fd={})", self.id, dup_fd);
+                            Some(afd)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Shard {}: AsyncFd for io_uring eventfd failed: {}", self.id, e);
+                            None
+                        }
                     }
+                } else {
+                    tracing::warn!("Shard {}: dup(eventfd) failed: {}", self.id, std::io::Error::last_os_error());
+                    None
                 }
             } else {
                 None
@@ -924,8 +936,20 @@ impl super::Shard {
                         }
                     }
 
-                    // io_uring completions are polled at the top of the main loop
-                    // (before tokio::select!), so no additional poll needed here.
+                    // Also poll io_uring in the timer tick as a fallback.
+                    // The eventfd select! branch should handle most CQEs instantly,
+                    // but this catches any that slip through.
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut driver) = uring_state {
+                        let _ = driver.submit_and_wait_nonblocking();
+                        let events = driver.drain_completions();
+                        for event in events {
+                            uring_handler::handle_uring_event(
+                                event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
+                                &mut inflight_sends, uring_listener_fd, &cached_clock,
+                            );
+                        }
+                    }
                 }
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {

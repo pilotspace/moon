@@ -253,24 +253,23 @@ impl UringDriver {
                     );
                     IoUring::builder()
                         .setup_single_issuer()
-                        .setup_coop_taskrun()
                         .build(config.ring_size)?
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            // COOP_TASKRUN without DEFER_TASKRUN: kernel processes task-work
-            // during any io_uring_enter() call (submit, submit_and_wait).
-            // This ensures CQEs from multishot accept/recv become visible
-            // after submit() without needing explicit enter(GETEVENTS).
+            // Default io_uring mode (SINGLE_ISSUER only):
+            // The kernel processes task-work immediately via interrupts and
+            // signals the registered eventfd when CQEs arrive. This allows
+            // tokio::select! to wake up instantly via AsyncFd when completions
+            // are ready — no polling needed.
             //
-            // DEFER_TASKRUN was removed because it requires GETEVENTS on every
-            // enter() call, but tokio::select! blocks between iterations and
-            // can't call enter() during that window — causing completions to
-            // pile up and connections to time out.
+            // COOP_TASKRUN/DEFER_TASKRUN are NOT used because they defer CQE
+            // generation to the next enter() call. With tokio::select! blocking
+            // between iterations, deferred CQEs would never be generated and
+            // the eventfd would never fire — causing connection timeouts.
             IoUring::builder()
                 .setup_single_issuer()
-                .setup_coop_taskrun()
                 .build(config.ring_size)?
         };
 
