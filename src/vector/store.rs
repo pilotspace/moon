@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::storage::tiered::SegmentHandle;
 use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::mvcc::manager::TransactionManager;
@@ -182,7 +183,16 @@ impl VectorIndex {
                 wal.as_mut(),
             ) {
                 Ok(handle) => {
-                    // Remove from in-memory immutable list.
+                    // Remove the old ImmutableSegment from the in-memory list.
+                    // The ImmutableSegment is purely in-memory (no on-disk files),
+                    // so it needs no SegmentHandle tombstoning -- it's simply dropped.
+                    //
+                    // Tombstone lifecycle for the NEW warm segment:
+                    //   1. `handle` (SegmentHandle) is passed to WarmSearchSegment below
+                    //   2. WarmSearchSegment stores it as `_handle` (Arc refcount)
+                    //   3. When later transitioned to cold: mark_tombstoned() is called
+                    //   4. On index drop: mark_tombstoned() is called
+                    //   5. Directory is deleted only when last Arc ref drops AND tombstoned
                     new_immutable.remove(idx);
 
                     // Open mmap-backed warm search segment to keep data searchable.
@@ -599,7 +609,6 @@ impl VectorStore {
     /// in the manifest. For each (segment_id, segment_dir), tries to open a
     /// WarmSearchSegment and add it to whatever index matches the collection metadata.
     pub fn register_warm_segments(&mut self, warm_segments: Vec<(u64, std::path::PathBuf)>) {
-        use crate::storage::tiered::SegmentHandle;
         use crate::vector::persistence::warm_search::WarmSearchSegment;
 
         let mut loaded = 0usize;
