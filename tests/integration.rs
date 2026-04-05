@@ -64,6 +64,7 @@ async fn start_server() -> (u16, CancellationToken) {
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {
@@ -128,6 +129,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {
@@ -1264,6 +1266,7 @@ async fn start_server_with_persistence(
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {
@@ -2112,6 +2115,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {
@@ -2487,6 +2491,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     let cancel = token.clone();
@@ -3631,6 +3636,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     std::thread::spawn(move || {
@@ -4257,6 +4263,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {

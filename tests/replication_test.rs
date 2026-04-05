@@ -62,6 +62,7 @@ async fn start_server() -> (u16, CancellationToken) {
         segment_cold_min_qps: 0.1,
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {

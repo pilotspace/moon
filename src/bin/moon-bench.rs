@@ -129,6 +129,7 @@ fn pre_populate(addr: &str, total_keys: usize, data_size: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_client(
     addr: &str, cmd: &str, pipeline: usize, data_size: usize,
     counter: &AtomicUsize, total: usize, tid: usize, barrier: &Barrier, warmup: usize,
