@@ -1511,8 +1511,12 @@ pub async fn handle_connection_sharded_inner<
                         }
                         reply_futures.push((meta, target));
                     }
+                    // Collect all shard replies in parallel (not sequentially).
+                    // With sequential await, shard 0 blocks collection from shards 1..N.
                     let proto_ver = protocol_version;
-                    for (meta, target) in reply_futures {
+                    if reply_futures.len() == 1 {
+                        // Fast path: single target, no need for join
+                        let (meta, target) = reply_futures.pop().unwrap();
                         let shard_responses = response_pool.future_for(target).await;
                         for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
                             if let Some(bytes) = aof_bytes {
@@ -1521,6 +1525,22 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                             responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                        }
+                    } else {
+                        // Parallel collection: await all shard replies concurrently
+                        let futures: Vec<_> = reply_futures.iter()
+                            .map(|(_, target)| response_pool.future_for(*target))
+                            .collect();
+                        let all_responses = futures::future::join_all(futures).await;
+                        for ((meta, _target), shard_responses) in reply_futures.into_iter().zip(all_responses) {
+                            for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                                if let Some(bytes) = aof_bytes {
+                                    if !matches!(resp, Frame::Error(_)) {
+                                        if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
+                                    }
+                                }
+                                responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                            }
                         }
                     }
                 }
