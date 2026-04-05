@@ -448,13 +448,8 @@ pub async fn handle_connection_sharded_monoio<
         tmp_buf = returned_buf;
         match result {
             Ok(0) => {
-                // Client half-closed: send FIN back to avoid CLOSE_WAIT.
-                // SAFETY: raw_fd is a valid open socket passed from caller.
-                #[cfg(target_os = "linux")]
-                if raw_fd >= 0 {
-                    // SAFETY: raw_fd is a valid open socket; SHUT_WR sends FIN.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_WR); }
-                }
+                // Client half-closed — break out of loop.
+                // Stream drop (end of function) triggers monoio's cleanup.
                 break;
             }
             Ok(n) => {
