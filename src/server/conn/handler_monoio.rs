@@ -113,9 +113,8 @@ pub async fn handle_connection_sharded_monoio<
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
-    // Raw socket fd for graceful shutdown (SHUT_WR) on client half-close.
-    // Pass -1 if fd is unknown (TLS path where inner fd isn't accessible).
-    raw_fd: i32,
+    // Raw socket fd (unused after removing libc::shutdown — kept for API compat).
+    _raw_fd: i32,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -198,13 +197,8 @@ pub async fn handle_connection_sharded_monoio<
                     let (result, buf) = read_result;
                     match result {
                         Ok(0) => {
-                            // Client half-closed: send FIN back to avoid CLOSE_WAIT.
-                            // SAFETY: raw_fd is a valid open socket passed from caller.
-                            #[cfg(target_os = "linux")]
-                            if raw_fd >= 0 {
-                                // SAFETY: raw_fd is a valid open socket; SHUT_WR sends FIN.
-                                unsafe { libc::shutdown(raw_fd, libc::SHUT_WR); }
-                            }
+                            // Client half-closed — break out of loop.
+                            // Stream drop (end of function) triggers monoio's cleanup.
                             break;
                         }
                         Ok(n) => {
