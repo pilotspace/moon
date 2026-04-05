@@ -102,28 +102,18 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
 fn drain_replies(stream: &mut TcpStream, read_buf: &mut [u8], expected: usize) {
     let (mut got, mut leftover) = (0, Vec::new());
     while got < expected {
-        match stream.read(read_buf) {
-            Ok(0) => panic!("server closed connection unexpectedly"),
-            Ok(n) => {
-                leftover.extend_from_slice(&read_buf[..n]);
-                let (replies, consumed) = count_resp_replies(&leftover);
-                got += replies;
-                leftover.drain(..consumed);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Read timeout — retry (server is processing)
-                continue;
-            }
-            Err(e) => panic!("read error: {e}"),
-        }
+        let n = stream.read(read_buf).expect("read failed");
+        assert!(n > 0, "server closed connection unexpectedly");
+        leftover.extend_from_slice(&read_buf[..n]);
+        let (replies, consumed) = count_resp_replies(&leftover);
+        got += replies;
+        leftover.drain(..consumed);
     }
 }
 
 fn pre_populate(addr: &str, total_keys: usize, data_size: usize) {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_nodelay(true).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let value = "x".repeat(data_size);
     let (batch, mut cmd_buf, mut read_buf) = (500, Vec::with_capacity(500 * 64), vec![0u8; 64 * 1024]);
     let mut sent = 0;
@@ -145,7 +135,8 @@ fn run_client(
 ) -> Vec<Duration> {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_nodelay(true).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // No read timeout — blocking socket waits for server response.
+    // Timeout-based error handling causes busy-wait on single-core VMs.
     let value = "x".repeat(data_size);
     let mut cmd_buf = Vec::with_capacity(pipeline * 128);
     let mut read_buf = vec![0u8; 256 * 1024];
