@@ -99,11 +99,11 @@ See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK
 - **Lock-free channels** - Custom oneshot channels replacing tokio::oneshot (12% CPU reduction)
 
 ### Persistence
-- **Multi-part AOF** - Redis 7+ compatible format: `base.rdb` + `incr.aof` + manifest in `appendonlydir/`
+- **Multi-part AOF** - Inspired by Redis 7+ design: `moon.aof.<seq>.base.rdb` + `moon.aof.<seq>.incr.aof` + `moon.aof.manifest` in `appendonlydir/`. Note: Moon's AOF format is **not compatible** with Redis — file naming, manifest format, and RDB encoding differ. Direct migration between Moon and Redis AOF files is not supported.
 - **BGREWRITEAOF** - RDB preamble compaction, automatic old file cleanup, 100% crash recovery
 - **RDB snapshots** - Forkless compartmentalized snapshots (no COW memory spike)
 - **Per-shard WAL** - CRC32-checksummed block frames, configurable everysec/always/no fsync
-- **Fast RDB loader** - 5.9M keys/sec with pre-sized hash tables and direct Vec→CompactValue path
+- **Fast RDB loader** - Significantly faster bulk loading than Redis (pre-sized hash tables, direct deserialization, skipped duplicate checks during restore)
 
 ### Networking & Protocol
 - **RESP2/RESP3** - Full protocol support with HELLO negotiation
