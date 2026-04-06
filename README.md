@@ -51,7 +51,9 @@ Moon implements 200+ Redis commands with a thread-per-core shared-nothing archit
   <img src="assets/shard-scaling-chart.png" alt="Shard Scaling & Production Value" width="100%">
 </p>
 
-Benchmarked against Redis 8.6.1 on Apple M4 Pro (co-located, `redis-benchmark`):
+> **Note:** All benchmarks are run on **ARM64** hardware — Apple M4 Pro (macOS) and OrbStack Linux VM (aarch64). x86_64 results may differ due to architectural differences in io_uring, memory subsystem, and SIMD paths.
+
+#### macOS ARM64 (Apple M4 Pro, co-located, Redis 8.6.1)
 
 | Metric | Moon vs Redis | Conditions |
 |--------|:------------:|------------|
@@ -63,7 +65,19 @@ Benchmarked against Redis 8.6.1 on Apple M4 Pro (co-located, `redis-benchmark`):
 | Memory (1KB+ values) | **27-35% less** | Per-key RSS measurement |
 | p50 latency (8 shards) | **8-10x lower** | 0.031ms vs 0.26ms |
 | CPU efficiency (p=64) | **45x better** | 1.9% vs 43.9% CPU |
-| Data correctness | **132/132 tests** | All types, 1/4/12 shards |
+
+#### Linux ARM64 (OrbStack aarch64, Ubuntu 25.10, Redis 8.0.2, monoio io_uring)
+
+| Metric | Moon vs Redis | Conditions |
+|--------|:------------:|------------|
+| Peak GET throughput | **11.7M ops/sec** | 1 shard, pipeline=64 |
+| Peak SET throughput | **5.4M ops/sec** | 1 shard, pipeline=64 |
+| SET with AOF (p=64) | **2.15x faster** | Per-shard WAL, appendfsync=everysec |
+| GET with AOF (p=64) | **2.17x faster** | io_uring batched submission |
+| SET with AOF (p=16) | **2.06x faster** | Per-shard WAL eliminates global bottleneck |
+| Crash recovery | **100%** | 38/38 consistency checks, all data types |
+| RDB load speed | **5.9M keys/sec** | 632K keys in 107ms |
+| AOF compaction | **1.16x Redis** | Multi-part AOF (base.rdb + incr.aof) |
 
 See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK-PRODUCTION.md](BENCHMARK-PRODUCTION.md) for production workload patterns.
 
@@ -85,9 +99,11 @@ See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK
 - **Lock-free channels** - Custom oneshot channels replacing tokio::oneshot (12% CPU reduction)
 
 ### Persistence
+- **Multi-part AOF** - Redis 7+ compatible format: `base.rdb` + `incr.aof` + manifest in `appendonlydir/`
+- **BGREWRITEAOF** - RDB preamble compaction, automatic old file cleanup, 100% crash recovery
 - **RDB snapshots** - Forkless compartmentalized snapshots (no COW memory spike)
-- **AOF** - Per-shard WAL with batched fsync, configurable everysec/always/no
-- **WAL v2** - Checksums, block framing, corruption isolation
+- **Per-shard WAL** - CRC32-checksummed block frames, configurable everysec/always/no fsync
+- **Fast RDB loader** - 5.9M keys/sec with pre-sized hash tables and direct Vec→CompactValue path
 
 ### Networking & Protocol
 - **RESP2/RESP3** - Full protocol support with HELLO negotiation
