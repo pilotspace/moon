@@ -31,7 +31,7 @@
 
 ---
 
-Moon implements 200+ Redis commands with a thread-per-core shared-nothing architecture, dual-runtime support (Tokio + Monoio), SIMD-accelerated parsing, forkless persistence, and memory-optimized data structures. It consistently outperforms Redis 8.x by **1.5-3x** on throughput while using **27-35% less memory** for real-world value sizes.
+Moon implements 200+ Redis commands with a thread-per-core shared-nothing architecture, dual-runtime support (Tokio + Monoio), SIMD-accelerated parsing, forkless persistence, tiered disk offload, and memory-optimized data structures. It consistently outperforms Redis 8.x by **2x** on throughput (4.8M GET/s vs 2.4M) while using **27-35% less memory** for real-world value sizes and providing **100% crash recovery** across all persistence tiers.
 
 ## Moon vs Redis Architecture
 
@@ -51,7 +51,38 @@ Moon implements 200+ Redis commands with a thread-per-core shared-nothing archit
   <img src="assets/shard-scaling-chart.png" alt="Shard Scaling & Production Value" width="100%">
 </p>
 
-Benchmarked against Redis 8.6.1 on Apple M4 Pro (co-located, `redis-benchmark`):
+### x86_64 (GCP c3-standard-8, Intel Xeon 8481C, CPU-pinned, monoio io_uring)
+
+| Metric | Moon | Redis | Ratio |
+|--------|-----:|------:|:-----:|
+| Peak GET (c=50 p=64) | **4.81M ops/s** | 2.36M | **2.04x** |
+| Peak SET (c=50 p=64) | **3.60M ops/s** | 1.79M | **2.01x** |
+| GET with AOF | **4.57M ops/s** | 2.24M | **2.04x** |
+| GET with Disk Offload | **4.81M ops/s** | 2.36M | **2.04x** |
+| Single-conn GET (c=1 p=64) | **2.08M ops/s** | 1.30M | **1.60x** |
+| Single-conn latency (c=1 p=1) | **0.020ms** | 0.020ms | **parity** |
+| p99 latency (c=10 p=64) | **0.079ms** | 0.263ms | **3.3x lower** |
+| Crash recovery (5K keys) | **100%** | 100% | **parity** |
+| Memory (1KB+ values) | | | **27-35% less** |
+
+### 3-Tier Throughput (GET ops/s, c=10 p=64)
+
+| Tier | Moon | Redis | Ratio |
+|------|-----:|------:|:-----:|
+| In-Memory (no persist) | **4.71M** | 2.29M | **2.06x** |
+| AOF everysec | **4.57M** | 2.24M | **2.04x** |
+| Disk Offload + AOF | **4.71M** | 2.29M | **2.06x** |
+
+### Crash Recovery (SIGKILL, 5000 keys)
+
+| Configuration | Moon | Redis |
+|---------------|:----:|:-----:|
+| AOF everysec | 5000/5000 (100%) | 5000/5000 (100%) |
+| AOF always | 5000/5000 (100%) | 5000/5000 (100%) |
+| Disk Offload + AOF | 5000/5000 (100%) | N/A |
+| Disk Offload + maxmemory | 5000/5000 (100%) | N/A |
+
+### ARM64 (Apple M4 Pro, OrbStack Linux VM)
 
 | Metric | Moon vs Redis | Conditions |
 |--------|:------------:|------------|
@@ -60,10 +91,8 @@ Benchmarked against Redis 8.6.1 on Apple M4 Pro (co-located, `redis-benchmark`):
 | Throughput (pipeline=64) | **3.17x faster** | 1 shard, SET |
 | Throughput (8 shards) | **1.84-1.99x faster** | GET/SET, pipeline=16 |
 | With AOF persistence | **2.75x faster** | Per-shard WAL vs global fsync |
-| Memory (1KB+ values) | **27-35% less** | Per-key RSS measurement |
 | p50 latency (8 shards) | **8-10x lower** | 0.031ms vs 0.26ms |
 | CPU efficiency (p=64) | **45x better** | 1.9% vs 43.9% CPU |
-| Data correctness | **132/132 tests** | All types, 1/4/12 shards |
 
 See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK-PRODUCTION.md](BENCHMARK-PRODUCTION.md) for production workload patterns.
 
@@ -88,6 +117,7 @@ See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK
 - **RDB snapshots** - Forkless compartmentalized snapshots (no COW memory spike)
 - **AOF** - Per-shard WAL with batched fsync, configurable everysec/always/no
 - **WAL v2** - Checksums, block framing, corruption isolation
+- **Disk Offload** - Tiered storage (RAM -> NVMe) with async spill, cold read-through, and crash recovery. Keys evicted under maxmemory are spilled to NVMe instead of being deleted. `--disk-offload enable`
 
 ### Networking & Protocol
 - **RESP2/RESP3** - Full protocol support with HELLO negotiation

@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Disk Offload & x86_64 Performance
+
+Tiered storage, crash recovery, and 2x Redis on x86_64 (Intel Xeon, io_uring).
+
+### Added
+
+#### Disk Offload (Tiered Storage)
+- `--disk-offload enable` — evicted keys under maxmemory are spilled to NVMe instead of being deleted
+- Async SpillThread: background pwrite via dedicated `std::thread` per shard (no event loop blocking)
+- Cold read-through: GET transparently reads spilled keys from NVMe DataFiles
+- ColdIndex: in-memory key→file mapping, updated immediately on eviction for consistent reads
+- SpillThread channel capacity: 4096 bounded flume channel for burst absorption
+- `--disk-offload-dir`, `--disk-offload-threshold` configuration flags
+
+#### Crash Recovery
+- V3 recovery falls back to appendonly.aof when WAL v3 has 0 commands
+- V2 recovery falls back to appendonly.aof when shard WAL has 0 commands
+- Automatic `--dir` creation before AOF writer starts (fixes silent write failure)
+- Cold index rebuilt from manifest during v3 recovery
+- Verified: 100% recovery (5000/5000 keys) across 7 persistence configurations after SIGKILL
+
+#### Inline GET Optimization
+- `read_db` + `get_if_alive` replaces `write_db` + triple-lookup `get()` — single DashTable probe
+- Removed unnecessary write lock for timestamp refresh before inline dispatch
+- Multi-shard inline dispatch: local keys bypass Frame construction via `key_to_shard()` check
+- Cold storage fallback in `get_readonly` and inline GET dispatch paths
+
+### Changed
+
+- Connection handler eviction uses `try_evict_if_needed_async_spill` when disk offload enabled
+- `spawn_monoio_connection` passes spill sender, file ID counter, and offload dir to handlers
+- Event loop syncs `next_file_id` between `Rc<Cell<u64>>` (handlers) and local variable (timer tick)
+- Inline dispatch `try_inline_dispatch` takes `now_ms` and `num_shards` parameters
+
+### Fixed
+
+- **Data loss under maxmemory**: evicted keys were silently deleted instead of spilled to disk (6 bugs)
+- **Crash recovery = 0 keys**: appendonly.aof never tried as fallback source
+- **AOF writer silent failure**: `--dir` directory not created before AOF writer task started
+- **Cold read miss**: `get_if_alive` (read path) didn't check cold storage; `get_readonly` returned NULL for spilled keys
+- **ColdIndex never initialized**: `cold_index` and `cold_shard_dir` were None on all databases at startup
+
+### Performance (GCP c3-standard-8, Intel Xeon 8481C, CPU-pinned)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| c=1 p=1 GET vs Redis | 0.35x (47K) | **1.0x (47K)** — parity |
+| c=10 p=64 GET | 2.29M | **4.71M** (2.06x Redis) |
+| c=50 p=64 GET | 2.36M | **4.81M** (2.04x Redis) |
+| Disk offload GET overhead | N/A | **<1%** vs no-persist |
+| Recovery (SIGKILL) | 0/5000 | **5000/5000** (100%) |
+
+---
+
 ## [0.1.2] - 2026-03-29
 
 Multi-shard scaling milestone. Eliminated negative scaling, achieving 5M GET/s and 2.5M SET/s at 4 shards — both exceeding Redis 8.6.1.
