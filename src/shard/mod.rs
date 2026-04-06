@@ -171,16 +171,38 @@ impl Shard {
             }
         }
 
-        // Replay per-shard WAL
+        // Replay per-shard WAL, then fall back to appendonly.aof if WAL has 0 commands.
+        // The per-shard WalWriter writes to shard-N.wal but the global AOF writer
+        // (aof_writer_task) writes to appendonly.aof. Both may exist; try both.
         let wal_file = wal::wal_path(dir, self.id);
+        let mut wal_replayed = 0usize;
         if wal_file.exists() {
             match wal::replay_wal(&mut self.databases, &wal_file, &DispatchReplayEngine) {
                 Ok(n) => {
                     info!("Shard {}: replayed {} WAL commands", self.id, n);
+                    wal_replayed = n;
                     total_keys += n;
                 }
                 Err(e) => {
                     tracing::error!("Shard {}: WAL replay failed: {}", self.id, e);
+                }
+            }
+        }
+        // Fall back to appendonly.aof when per-shard WAL has 0 commands
+        if wal_replayed == 0 {
+            let aof_path = dir.join("appendonly.aof");
+            if aof_path.exists() {
+                info!("Shard {}: WAL empty, falling back to appendonly.aof", self.id);
+                match crate::persistence::aof::replay_aof(
+                    &mut self.databases, &aof_path, &DispatchReplayEngine,
+                ) {
+                    Ok(n) => {
+                        info!("Shard {}: replayed {} AOF commands", self.id, n);
+                        total_keys += n;
+                    }
+                    Err(e) => {
+                        tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
+                    }
                 }
             }
         }
