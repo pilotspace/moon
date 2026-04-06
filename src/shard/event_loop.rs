@@ -1076,7 +1076,31 @@ impl super::Shard {
                 }
             }
 
-            // Monoio runtime: full event loop mirroring the tokio path.
+            // Non-blocking drain: process all pending connections before entering select!.
+            // monoio::select! drops and recreates conn_rx.recv_async() every iteration
+            // (when timer tick fires), leaving queued connections unprocessed for ~1ms.
+            // try_recv() is zero-cost when empty (atomic load + early return).
+            #[cfg(feature = "runtime-monoio")]
+            while let Ok((std_tcp_stream, is_tls)) = conn_rx.try_recv() {
+                conn_accept::spawn_monoio_connection(
+                    std_tcp_stream, is_tls, &tls_config,
+                    &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
+                    &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                    &acl_table, &runtime_config, &server_config, &all_notifiers,
+                    &snapshot_trigger_tx, &repl_state, &cluster_state,
+                    &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                    &all_remote_sub_maps, &affinity_tracker,
+                    shard_id, num_shards, config_port,
+                    &pending_wakers,
+                );
+            }
+            // Wake cross-shard response tasks that registered during the previous iteration.
+            #[cfg(feature = "runtime-monoio")]
+            for waker in pending_wakers.borrow_mut().drain(..) {
+                waker.wake();
+            }
+
+            // Monoio runtime: full event loop.
             #[cfg(feature = "runtime-monoio")]
             monoio::select! {
                 // Per-shard SO_REUSEPORT accept (Linux only, monoio path)
