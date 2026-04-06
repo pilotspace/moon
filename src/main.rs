@@ -92,6 +92,10 @@ fn main() -> anyhow::Result<()> {
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
+    // Ensure persistence directory exists before spawning AOF writer.
+    // Without this, the AOF writer silently fails when --dir is a new path.
+    let _ = std::fs::create_dir_all(&config.dir);
+
     // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
     // The AOF writer task will be spawned on the listener runtime.
     let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {

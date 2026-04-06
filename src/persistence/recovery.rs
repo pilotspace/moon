@@ -445,35 +445,37 @@ pub fn recover_shard_v3_with_fallback(
     // but write commands logged to the v2 AOF (standard appendonly path).
     if result.commands_replayed == 0 {
         if let Some(v2_dir) = v2_persistence_dir {
-            // Try v2 per-shard WAL first, then global appendonly.aof
-            let v2_wal_path = crate::persistence::wal::wal_path(v2_dir, shard_id);
-            let aof_path = v2_dir.join("appendonly.aof");
-            let replay_path = if v2_wal_path.exists() {
-                Some(v2_wal_path)
-            } else if aof_path.exists() {
-                Some(aof_path)
-            } else {
-                None
-            };
-            if let Some(ref path) = replay_path {
+            // Try all v2 persistence sources in order:
+            // 1. Per-shard binary WAL (shard-N.wal)
+            // 2. Global RESP-format AOF (appendonly.aof)
+            let v2_sources: &[(&std::path::Path, bool)] = &[
+                (&crate::persistence::wal::wal_path(v2_dir, shard_id), false),
+                (&v2_dir.join("appendonly.aof"), true),
+            ];
+            for &(ref path, is_aof) in v2_sources {
+                if !path.exists() {
+                    continue;
+                }
                 info!(
                     "Shard {}: v3 WAL empty, falling back to v2 replay from {:?}",
                     shard_id, path
                 );
-                // appendonly.aof uses RESP format → replay_aof
-                // shard-N.wal uses binary format → replay_wal
-                let replay_result = if path.extension().map_or(false, |e| e == "aof") {
+                let replay_result = if is_aof {
                     crate::persistence::aof::replay_aof(databases, path, engine)
                 } else {
                     crate::persistence::wal::replay_wal(databases, path, engine)
                 };
                 match replay_result {
-                    Ok(n) => {
+                    Ok(n) if n > 0 => {
                         result.commands_replayed = n;
                         info!("Shard {}: v2 fallback replayed {} commands", shard_id, n);
+                        break;
+                    }
+                    Ok(_) => {
+                        info!("Shard {}: v2 source {:?} had 0 commands, trying next", shard_id, path);
                     }
                     Err(e) => {
-                        tracing::error!("Shard {}: v2 fallback replay failed: {}", shard_id, e);
+                        tracing::error!("Shard {}: v2 fallback {:?} failed: {}", shard_id, path, e);
                     }
                 }
             }
