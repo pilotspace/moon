@@ -73,11 +73,12 @@ impl Shard {
         if let Some(offload_dir) = disk_offload_dir {
             let shard_dir = offload_dir.join(format!("shard-{}", self.id));
             if shard_dir.exists() {
-                match crate::persistence::recovery::recover_shard_v3(
+                match crate::persistence::recovery::recover_shard_v3_with_fallback(
                     &mut self.databases,
                     self.id,
                     &shard_dir,
                     &DispatchReplayEngine,
+                    Some(std::path::Path::new(persistence_dir)),
                 ) {
                     Ok(result) => {
                         info!(
