@@ -91,6 +91,25 @@ impl Shard {
                             result.kv_heap_entries_loaded,
                             result.txns_rolled_back,
                         );
+                        // Initialize cold_index + cold_shard_dir on all databases
+                        // so cold_read_through can find keys spilled to NVMe.
+                        {
+                            let cold_dir = shard_dir.clone();
+                            for db in &mut self.databases {
+                                db.cold_shard_dir = Some(cold_dir.clone());
+                                if db.cold_index.is_none() {
+                                    db.cold_index = Some(
+                                        crate::storage::tiered::cold_index::ColdIndex::new(),
+                                    );
+                                }
+                            }
+                            if let Some(recovered_ci) = result.cold_index {
+                                if let Some(ref mut ci) = self.databases[0].cold_index {
+                                    ci.merge(recovered_ci);
+                                }
+                            }
+                        }
+
                         // Vector recovery still uses the v2 path for now
                         self.recover_vectors(persistence_dir);
 

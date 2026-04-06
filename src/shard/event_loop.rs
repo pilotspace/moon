@@ -479,8 +479,6 @@ impl super::Shard {
             } else {
                 None
             };
-        let mut next_file_id: u64 = 1;
-
         // Per-shard background spill thread for async eviction pwrite.
         // When disk-offload is enabled, evicted KV entries are written to disk
         // on a background std::thread instead of blocking the event loop.
@@ -492,6 +490,21 @@ impl super::Shard {
             } else {
                 None
             };
+
+        // Shared spill file ID counter for connection handlers + event loop.
+        // Rc<Cell<u64>> is safe: monoio is single-threaded per shard.
+        // Event loop syncs its local `next_file_id` TO this Cell before spawning
+        // connections, and syncs FROM this Cell at top of each timer tick (in case
+        // handlers incremented it via async spill eviction).
+        let spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>> =
+            spill_thread.as_ref().map(|st| st.sender());
+        let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(1));
+        let mut next_file_id: u64 = 1;
+        let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
+        // Suppress unused warnings for tokio path (these are used in monoio handler only)
+        let _ = &spill_sender;
+        let _ = &spill_file_id;
+        let _ = &disk_offload_dir;
 
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
@@ -818,6 +831,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
@@ -825,6 +839,8 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.tick() => {
                     cached_clock.update();
+                    // Sync file ID from shared Cell (handlers may have incremented it)
+                    next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
@@ -868,6 +884,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
@@ -1039,6 +1056,8 @@ impl super::Shard {
                     } else {
                         timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                     }
+                    // Sync file ID back to shared Cell for connection handlers
+                    spill_file_id.set(next_file_id);
 
                     // Reap idle io_uring connections (tokio+io_uring path).
                     // Cleans up CLOSE_WAIT connections where the multishot recv
@@ -1092,6 +1111,7 @@ impl super::Shard {
                     &all_remote_sub_maps, &affinity_tracker,
                     shard_id, num_shards, config_port,
                     &pending_wakers,
+                    &spill_sender, &spill_file_id, &disk_offload_dir,
                 );
             }
             // Wake cross-shard response tasks that registered during the previous iteration.
@@ -1130,6 +1150,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(e) => {
@@ -1152,6 +1173,7 @@ impl super::Shard {
                                 &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(_) => {
@@ -1210,6 +1232,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
@@ -1218,6 +1241,8 @@ impl super::Shard {
                 _ = periodic_interval.tick() => {
                     tracing::trace!("Shard {}: periodic tick", shard_id);
                     cached_clock.update();
+                    // Sync file ID from shared Cell (handlers may have incremented it)
+                    next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
@@ -1265,6 +1290,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
@@ -1423,6 +1449,8 @@ impl super::Shard {
                     } else {
                         timers::run_eviction(&shard_databases, shard_id, &runtime_config);
                     }
+                    // Sync file ID back to shared Cell for connection handlers
+                    spill_file_id.set(next_file_id);
 
                     // Reap idle io_uring connections every ~5s (50 ticks × 100ms).
                     // Cleans up CLOSE_WAIT connections where the multishot recv

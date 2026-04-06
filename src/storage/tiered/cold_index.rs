@@ -48,6 +48,11 @@ impl ColdIndex {
         self.map.get(key).copied()
     }
 
+    /// Merge another ColdIndex into this one (used during recovery).
+    pub fn merge(&mut self, other: ColdIndex) {
+        self.map.extend(other.map);
+    }
+
     /// Number of entries tracked.
     pub fn len(&self) -> usize {
         self.map.len()

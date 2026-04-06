@@ -1028,6 +1028,18 @@ impl Database {
         Some(entry)
     }
 
+    /// Read-only cold storage lookup for evicted keys.
+    ///
+    /// When `get_if_alive` returns None, call this to check if the key was
+    /// spilled to disk by the eviction path. Returns the value as owned Bytes
+    /// (read from disk file). Does NOT promote the entry back to RAM.
+    pub fn get_cold_value(&self, key: &[u8], now_ms: u64) -> Option<crate::storage::entry::RedisValue> {
+        let shard_dir = self.cold_shard_dir.as_ref()?;
+        let ci = self.cold_index.as_ref()?;
+        let (value, _ttl) = crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)?;
+        Some(value)
+    }
+
     /// Read-only existence check: returns false if expired.
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
         let base_ts = self.base_timestamp;

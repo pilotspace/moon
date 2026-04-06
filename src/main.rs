@@ -203,12 +203,29 @@ fn main() -> anyhow::Result<()> {
 
     // Create and restore all shards on main thread, then extract databases
     // into centralized ShardDatabases for cross-shard direct read access.
+    let disk_offload_base = if config.disk_offload_enabled() {
+        Some(config.effective_disk_offload_dir())
+    } else {
+        None
+    };
     let mut shards: Vec<Shard> = (0..num_shards)
         .map(|id| {
             let mut shard =
                 Shard::new(id, num_shards, config.databases, config.to_runtime_config());
             if let Some(ref dir) = persistence_dir {
-                shard.restore_from_persistence(dir, None);
+                shard.restore_from_persistence(dir, disk_offload_base.as_deref());
+            }
+            // Initialize cold_index + cold_shard_dir for disk offload
+            if let Some(ref offload_base) = disk_offload_base {
+                let shard_dir = offload_base.join(format!("shard-{}", id));
+                for db in &mut shard.databases {
+                    db.cold_shard_dir = Some(shard_dir.clone());
+                    if db.cold_index.is_none() {
+                        db.cold_index = Some(
+                            moon::storage::tiered::cold_index::ColdIndex::new(),
+                        );
+                    }
+                }
             }
             shard
         })

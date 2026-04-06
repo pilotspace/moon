@@ -29,7 +29,7 @@ use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
-use crate::storage::eviction::try_evict_if_needed;
+use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_spill};
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
@@ -112,6 +112,9 @@ pub async fn handle_connection_sharded_monoio<
     can_migrate: bool,
     initial_read_buf: BytesMut,
     pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
+    spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    spill_file_id: Rc<std::cell::Cell<u64>>,
+    disk_offload_dir: Option<std::path::PathBuf>,
     migrated_state: Option<&MigratedConnectionState>,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
@@ -456,15 +459,11 @@ pub async fn handle_connection_sharded_monoio<
             Err(_) => break,
         }
 
-        // Inline dispatch: for single-shard mode, handle GET/SET directly from raw
-        // bytes without Frame construction or dispatch table lookup.
+        // Inline dispatch: handle GET/SET directly from raw bytes without Frame
+        // construction or dispatch table lookup. For multi-shard, only local keys
+        // are inlined; remote keys fall through to normal cross-shard dispatch.
         // Skip inline dispatch when not authenticated — AUTH must go through normal path.
-        if num_shards == 1 && authenticated {
-            // Refresh time once before inline dispatch (same as batch refresh below)
-            {
-                let mut guard = shard_databases.write_db(shard_id, selected_db);
-                guard.refresh_now_from_cache(&cached_clock);
-            }
+        if authenticated {
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -472,6 +471,8 @@ pub async fn handle_connection_sharded_monoio<
                 shard_id,
                 selected_db,
                 &aof_tx,
+                cached_clock.ms(),
+                num_shards,
             );
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
@@ -1542,10 +1543,23 @@ pub async fn handle_connection_sharded_monoio<
                 // Using read_db for local reads eliminates RwLock contention with
                 // cross-shard shared reads from other shard threads.
                 if metadata::is_write(cmd) {
-                    // WRITE PATH: single lock acquisition for eviction + dispatch
+                    // WRITE PATH: eviction + dispatch under write lock.
+                    // When disk offload is enabled, use async spill: evicted keys
+                    // are sent to SpillThread for background pwrite to NVMe.
                     let rt = runtime_config.read().unwrap();
                     let mut guard = shard_databases.write_db(shard_id, selected_db);
-                    if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
+                    let evict_result = if let Some(ref sender) = spill_sender {
+                        let mut fid = spill_file_id.get();
+                        let dir = disk_offload_dir.as_deref().unwrap_or(std::path::Path::new("."));
+                        let res = try_evict_if_needed_async_spill(
+                            &mut guard, &rt, sender, dir, &mut fid,
+                        );
+                        spill_file_id.set(fid);
+                        res
+                    } else {
+                        try_evict_if_needed(&mut guard, &rt)
+                    };
+                    if let Err(oom_frame) = evict_result {
                         drop(guard);
                         drop(rt);
                         responses.push(oom_frame);

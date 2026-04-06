@@ -129,7 +129,7 @@ impl SpillThread {
     /// - `request`: bounded(64), event loop -> bg thread
     /// - `completion`: unbounded, bg thread -> event loop
     pub fn new(shard_id: usize) -> Self {
-        let (request_tx, request_rx) = flume::bounded::<SpillRequest>(64);
+        let (request_tx, request_rx) = flume::bounded::<SpillRequest>(4096);
         let (completion_tx, completion_rx) = flume::unbounded::<SpillCompletion>();
 
         let join_handle = std::thread::Builder::new()

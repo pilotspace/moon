@@ -212,6 +212,74 @@ pub fn try_evict_if_needed_async_spill_with_total(
     Ok(())
 }
 
+/// Evict entries to bring memory under maxmemory, returning removed
+/// (key, Entry) pairs for deferred spill OUTSIDE the write lock.
+///
+/// Inside the lock: only find_victim + db.remove (~600ns per eviction).
+/// The caller extracts value bytes from the owned Entry after releasing
+/// the lock, then sends SpillRequests to the background thread.
+pub fn try_evict_deferred(
+    db: &mut Database,
+    config: &RuntimeConfig,
+) -> Result<smallvec::SmallVec<[(Bytes, crate::storage::entry::Entry); 2]>, Frame> {
+    if config.maxmemory == 0 {
+        return Ok(smallvec::SmallVec::new());
+    }
+
+    let total_memory = db.estimated_memory();
+    if total_memory <= config.maxmemory {
+        return Ok(smallvec::SmallVec::new());
+    }
+
+    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
+    let mut evicted = smallvec::SmallVec::new();
+    let mut current_total = total_memory;
+
+    while current_total > config.maxmemory {
+        if policy == EvictionPolicy::NoEviction {
+            return Err(oom_error());
+        }
+
+        let victim = find_victim_for_policy(db, config, &policy);
+        let key = match victim {
+            Some(k) => k,
+            None => return Err(oom_error()),
+        };
+
+        let before = db.estimated_memory();
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        if let Some(entry) = db.remove(key.as_bytes()) {
+            evicted.push((key_bytes, entry));
+        }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
+    }
+
+    Ok(evicted)
+}
+
+/// Find a victim key using the given eviction policy.
+fn find_victim_for_policy(
+    db: &Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+) -> Option<CompactKey> {
+    match policy {
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
+        EvictionPolicy::AllKeysLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+        }
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::VolatileLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+        }
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+    }
+}
+
 /// Evict a single key via the async spill path.
 ///
 /// Extracts the entry, removes it from DashTable (immediate RAM relief),
@@ -290,16 +358,24 @@ fn evict_one_async_spill(
             shard_dir: PathBuf::from(shard_dir),
         };
 
-        // Remove from DashTable FIRST -- frees RAM immediately
+        // Remove from DashTable -- frees RAM immediately
         db.remove(key.as_bytes());
 
-        // Send to background thread (best-effort)
-        if let Err(_e) = sender.try_send(req) {
-            warn!(
-                file_id,
-                "async_spill: channel full or disconnected, spill request dropped"
+        // Update cold_index IMMEDIATELY so subsequent GETs can find the key.
+        // The file may not exist on disk yet (SpillThread processes async),
+        // but cold_read_through will handle the race (file appears shortly).
+        if let Some(ref mut ci) = db.cold_index {
+            ci.insert(
+                Bytes::copy_from_slice(key.as_bytes()),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id,
+                    slot_idx: 0,
+                },
             );
         }
+
+        // Send to background thread (best-effort, drop if full)
+        let _ = sender.try_send(req);
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());

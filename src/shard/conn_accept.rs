@@ -391,6 +391,9 @@ pub(crate) fn spawn_monoio_connection(
     num_shards: usize,
     config_port: u16,
     pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
+    spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    spill_file_id: &Rc<std::cell::Cell<u64>>,
+    disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
     use crate::server::connection::handle_connection_sharded_monoio;
 
@@ -407,6 +410,9 @@ pub(crate) fn spawn_monoio_connection(
             let trk = tracking_rc.clone();
             let cid = conn_cmd::next_client_id();
             let rs = repl_state.clone();
+            let spill_tx = spill_sender.clone();
+            let spill_fid = spill_file_id.clone();
+            let do_dir = disk_offload_dir.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
             let lua = {
@@ -477,6 +483,9 @@ pub(crate) fn spawn_monoio_connection(
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
+                                spill_tx.clone(),
+                                spill_fid.clone(),
+                                do_dir.clone(),
                                 None, // fresh connection
                             )
                             .await;
@@ -533,6 +542,9 @@ pub(crate) fn spawn_monoio_connection(
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
+                        spill_tx,
+                        spill_fid,
+                        do_dir,
                         None, // fresh connection
                     )
                     .await;
@@ -630,6 +642,9 @@ pub(crate) fn spawn_migrated_monoio_connection(
     num_shards: usize,
     config_port: u16,
     pending_wakers: &Rc<RefCell<Vec<std::task::Waker>>>,
+    spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    spill_file_id: &Rc<std::cell::Cell<u64>>,
+    disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
     use std::os::unix::io::FromRawFd;
 
@@ -680,6 +695,9 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let all_rsm = all_remote_sub_maps.to_vec();
             let aff = pubsub_affinity.clone();
             let pw = pending_wakers.clone();
+            let spill_tx = spill_sender.clone();
+            let spill_fid = spill_file_id.clone();
+            let do_dir = disk_offload_dir.clone();
             let peer_addr = state.peer_addr.clone();
 
             let migration_buf = take_migration_read_buf(&mut state);
@@ -717,6 +735,9 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     pw,
+                    spill_tx,
+                    spill_fid,
+                    do_dir,
                     Some(&state),
                 )
                 .await;

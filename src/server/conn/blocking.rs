@@ -790,6 +790,8 @@ pub(crate) fn try_inline_dispatch(
     shard_id: usize,
     selected_db: usize,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    now_ms: u64,
+    num_shards: usize,
 ) -> usize {
     let buf = &read_buf[..];
     let len = buf.len();
@@ -872,14 +874,22 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // Multi-shard: bail if key routes to a remote shard (fall through to normal dispatch)
+    if num_shards > 1 {
+        let key_bytes = &buf[key_start..key_end];
+        if key_to_shard(key_bytes, num_shards) != shard_id {
+            return 0;
+        }
+    }
+
     if is_get {
         // GET: done parsing -- total consumed = key_end + 2
         let consumed = key_end + 2;
         let key_bytes = &buf[key_start..key_end];
 
-        // Lookup in database
-        let mut guard = shard_databases.write_db(shard_id, selected_db);
-        match guard.get(key_bytes) {
+        // Read path: shared lock + single DashTable lookup via get_if_alive
+        let guard = shard_databases.read_db(shard_id, selected_db);
+        match guard.get_if_alive(key_bytes, now_ms) {
             Some(entry) => {
                 match entry.value.as_bytes() {
                     Some(val) => {
@@ -900,8 +910,23 @@ pub(crate) fn try_inline_dispatch(
                 }
             }
             None => {
-                // Null bulk string
-                write_buf.extend_from_slice(b"$-1\r\n");
+                // Cold storage fallback: key may have been evicted to NVMe
+                if let Some(value) = guard.get_cold_value(key_bytes, now_ms) {
+                    if let crate::storage::entry::RedisValue::String(v) = value {
+                        write_buf.extend_from_slice(b"$");
+                        let mut itoa_buf2 = itoa::Buffer::new();
+                        write_buf.extend_from_slice(itoa_buf2.format(v.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&v);
+                        write_buf.extend_from_slice(b"\r\n");
+                    } else {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                } else {
+                    write_buf.extend_from_slice(b"$-1\r\n");
+                }
             }
         }
         drop(guard);
@@ -975,6 +1000,8 @@ pub(crate) fn try_inline_dispatch_loop(
     shard_id: usize,
     selected_db: usize,
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    now_ms: u64,
+    num_shards: usize,
 ) -> usize {
     let mut total = 0;
     loop {
@@ -985,6 +1012,8 @@ pub(crate) fn try_inline_dispatch_loop(
             shard_id,
             selected_db,
             aof_tx,
+            now_ms,
+            num_shards,
         );
         if n == 0 {
             break;
