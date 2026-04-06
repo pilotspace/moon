@@ -747,11 +747,10 @@ pub fn load_from_bytes(
     // immediately followed by a valid CRC32 of the preceding bytes.
     let mut rdb_end = None;
     // Start scanning after header (MOON + version = 5 bytes)
-    for i in 5..data.len().saturating_sub(3) {
+    for i in 5..data.len().saturating_sub(4) {
         if data[i] == EOF_MARKER {
             let payload = &data[..=i]; // everything up to and including EOF_MARKER
-            let checksum_bytes = &data[i + 1..i + 5];
-            if checksum_bytes.len() == 4 {
+            if let Some(checksum_bytes) = data.get(i + 1..i + 5) {
                 let stored = u32::from_le_bytes([
                     checksum_bytes[0],
                     checksum_bytes[1],
