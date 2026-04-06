@@ -208,12 +208,7 @@ fn main() -> anyhow::Result<()> {
             let mut shard =
                 Shard::new(id, num_shards, config.databases, config.to_runtime_config());
             if let Some(ref dir) = persistence_dir {
-                let disk_offload_dir = if config.disk_offload_enabled() {
-                    Some(config.effective_disk_offload_dir())
-                } else {
-                    None
-                };
-                shard.restore_from_persistence(dir, disk_offload_dir.as_deref());
+                shard.restore_from_persistence(dir, None);
             }
             shard
         })
@@ -376,11 +371,7 @@ fn main() -> anyhow::Result<()> {
                 info!("Cluster bus and gossip ticker started");
             }
 
-            // Per-shard accept via io_uring multishot accept is not yet reliable
-            // under tokio on kernel 6.1 (eventfd wakeup integration incomplete).
-            // Use central listener MPSC dispatch when MOON_NO_URING is set.
-            let per_shard_accept = cfg!(target_os = "linux")
-                && std::env::var("MOON_NO_URING").is_err();
+            let per_shard_accept = cfg!(target_os = "linux");
             if let Err(e) = server::listener::run_sharded(
                 config,
                 conn_txs,

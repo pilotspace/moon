@@ -32,7 +32,7 @@ use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
-use crate::storage::eviction::try_evict_if_needed_with_spill_and_total;
+use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
@@ -1349,10 +1349,8 @@ pub async fn handle_connection_sharded_inner<
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
                             let rt = runtime_config.read().unwrap();
-                            // Compute aggregate memory BEFORE write lock to avoid deadlock.
-                            let total_mem = shard_databases.aggregate_memory(shard_id);
                             let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            if let Err(oom_frame) = try_evict_if_needed_with_spill_and_total(&mut guard, &rt, None, total_mem) {
+                            if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
                                 drop(guard);
                                 drop(rt);
                                 responses.push(oom_frame);
@@ -1406,12 +1404,9 @@ pub async fn handle_connection_sharded_inner<
                                     }
                                 }
                             }
-                            if let Some(ref bytes) = aof_bytes {
+                            if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
-                                    // AOF append (background writer)
-                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
-                                    // Per-shard WAL append (drained by event loop on 1ms tick)
-                                    shard_databases.wal_append(shard_id, bytes.clone());
+                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
                                 }
                             }
                             if tracking_state.enabled && !matches!(response, Frame::Error(_)) {
@@ -1511,12 +1506,8 @@ pub async fn handle_connection_sharded_inner<
                         }
                         reply_futures.push((meta, target));
                     }
-                    // Collect all shard replies in parallel (not sequentially).
-                    // With sequential await, shard 0 blocks collection from shards 1..N.
                     let proto_ver = protocol_version;
-                    if reply_futures.len() == 1 {
-                        // Fast path: single target, no need for join
-                        let (meta, target) = reply_futures.pop().unwrap();
+                    for (meta, target) in reply_futures {
                         let shard_responses = response_pool.future_for(target).await;
                         for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
                             if let Some(bytes) = aof_bytes {
@@ -1525,22 +1516,6 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                             responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
-                        }
-                    } else {
-                        // Parallel collection: await all shard replies concurrently
-                        let futures: Vec<_> = reply_futures.iter()
-                            .map(|(_, target)| response_pool.future_for(*target))
-                            .collect();
-                        let all_responses = futures::future::join_all(futures).await;
-                        for ((meta, _target), shard_responses) in reply_futures.into_iter().zip(all_responses) {
-                            for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
-                                if let Some(bytes) = aof_bytes {
-                                    if !matches!(resp, Frame::Error(_)) {
-                                        if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
-                                    }
-                                }
-                                responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
-                            }
                         }
                     }
                 }

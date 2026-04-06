@@ -260,18 +260,6 @@ pub async fn run_sharded(
     affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
-    // When per_shard_accept is true, bind with SO_REUSEPORT so shard-level
-    // SO_REUSEPORT listeners can also bind to the same address.
-    // Without this, the central listener holds the address exclusively and
-    // shard binds fail with EADDRINUSE.
-    #[cfg(target_os = "linux")]
-    let listener = if per_shard_accept {
-        let std_listener = crate::shard::conn_accept::create_reuseport_socket(&addr)?;
-        TcpListener::from_std(std_listener)?
-    } else {
-        TcpListener::bind(&addr).await?
-    };
-    #[cfg(not(target_os = "linux"))]
     let listener = TcpListener::bind(&addr).await?;
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards)", addr, num_shards);
@@ -423,16 +411,6 @@ pub async fn run_sharded(
     affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
-    // Bind with SO_REUSEPORT when per_shard_accept is true so shard-level
-    // SO_REUSEPORT listeners can also bind to the same address.
-    #[cfg(target_os = "linux")]
-    let listener = if per_shard_accept {
-        let std_listener = crate::shard::conn_accept::create_reuseport_socket(&addr)?;
-        monoio::net::TcpListener::from_std(std_listener)?
-    } else {
-        monoio::net::TcpListener::bind(&addr)?
-    };
-    #[cfg(not(target_os = "linux"))]
     let listener = monoio::net::TcpListener::bind(&addr)?;
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards, monoio)", addr, num_shards);
