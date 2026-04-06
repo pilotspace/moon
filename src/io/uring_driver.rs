@@ -253,23 +253,22 @@ impl UringDriver {
                     );
                     IoUring::builder()
                         .setup_single_issuer()
+                        .setup_coop_taskrun()
                         .build(config.ring_size)?
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            // Default io_uring mode (SINGLE_ISSUER only):
-            // The kernel processes task-work immediately via interrupts and
-            // signals the registered eventfd when CQEs arrive. This allows
-            // tokio::select! to wake up instantly via AsyncFd when completions
-            // are ready — no polling needed.
+            // SINGLE_ISSUER + COOP_TASKRUN: kernel processes task-work during
+            // io_uring_enter() rather than via signals (which tokio masks).
+            // Without COOP_TASKRUN, default mode uses TIF_NOTIFY_SIGNAL which
+            // is masked by tokio's runtime — CQEs are never generated.
             //
-            // COOP_TASKRUN/DEFER_TASKRUN are NOT used because they defer CQE
-            // generation to the next enter() call. With tokio::select! blocking
-            // between iterations, deferred CQEs would never be generated and
-            // the eventfd would never fire — causing connection timeouts.
+            // DEFER_TASKRUN is NOT used because it requires GETEVENTS flag on
+            // every enter(), which the io-uring crate skips when want=0.
             IoUring::builder()
                 .setup_single_issuer()
+                .setup_coop_taskrun()
                 .build(config.ring_size)?
         };
 
@@ -333,6 +332,25 @@ impl UringDriver {
     // SQE submission methods
     // -----------------------------------------------------------------------
 
+    /// Push an SQE to the submission queue and sync the tail pointer.
+    ///
+    /// The io-uring crate's `SubmissionQueue::push()` writes to a local tail
+    /// but does NOT flush it to the kernel-shared tail pointer. Without calling
+    /// `sync()`, `submit()` sees `sq_len() == 0` and skips the syscall.
+    fn push_sqe(&mut self, entry: &io_uring::squeue::Entry) -> std::io::Result<()> {
+        {
+            let mut sq = self.ring.submission();
+            unsafe {
+                sq.push(entry).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "SQ full")
+                })?;
+            }
+            sq.sync();
+        }
+        self.pending_sqes += 1;
+        Ok(())
+    }
+
     /// Submit multishot accept on a listener socket fd.
     ///
     /// The listener fd does NOT need to be in the registered table.
@@ -341,13 +359,7 @@ impl UringDriver {
         let entry = opcode::AcceptMulti::new(types::Fd(listener_fd))
             .build()
             .user_data(encode_user_data(EVENT_ACCEPT, 0, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit accept")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -398,13 +410,7 @@ impl UringDriver {
             .build()
             .user_data(encode_user_data(EVENT_RECV, conn_id, 0))
             .flags(Flags::BUFFER_SELECT);
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit recv")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
 
         if let Some(conn) = self.connections.get_mut(&conn_id) {
             conn.recv_active = true;
@@ -431,13 +437,7 @@ impl UringDriver {
         let entry = opcode::Writev::new(types::Fixed(conn.fixed_fd_idx), iovecs, iovec_count)
             .build()
             .user_data(encode_user_data(EVENT_SEND, conn_id, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit writev")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -450,13 +450,7 @@ impl UringDriver {
         let entry = opcode::Send::new(types::Fixed(conn.fixed_fd_idx), data, len)
             .build()
             .user_data(encode_user_data(EVENT_SEND, conn_id, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit send")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -483,16 +477,7 @@ impl UringDriver {
         let entry = opcode::WriteFixed::new(types::Fixed(conn.fixed_fd_idx), ptr, len, buf_idx)
             .build()
             .user_data(encode_user_data(EVENT_SEND, conn_id, buf_idx as u32));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "SQ full: cannot submit send_fixed",
-                )
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -526,13 +511,7 @@ impl UringDriver {
         let entry = opcode::Timeout::new(&ts as *const _)
             .build()
             .user_data(encode_user_data(EVENT_TIMEOUT, 0, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit timeout")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -569,15 +548,31 @@ impl UringDriver {
     }
 
     pub fn submit_and_wait_nonblocking(&mut self) -> std::io::Result<usize> {
-        // With COOP_TASKRUN (no DEFER_TASKRUN), the kernel processes task-work
-        // during any io_uring_enter() call. submit() calls enter() internally,
-        // which flushes pending completions (multishot accept, recv, etc.).
+        // Two-step approach for COOP_TASKRUN:
+        // 1. Submit pending SQEs (syncs SQ ring tail)
+        // 2. Call enter(GETEVENTS) to trigger cooperative task-work processing
         //
-        // When no SQEs are pending, we still need enter() to flush completions
-        // from previously submitted multishot operations. submit() with an empty
-        // SQ still calls enter(0, 0, 0) which triggers cooperative task-work.
-        let n = self.ring.submit()?;
-        self.pending_sqes = 0;
+        // The io-uring crate's submit_and_wait(0) skips GETEVENTS when want=0,
+        // so we must call enter() directly. With COOP_TASKRUN, GETEVENTS causes
+        // the kernel to process deferred task-work and generate CQEs.
+        let n = if self.pending_sqes > 0 {
+            self.pending_sqes = 0;
+            self.ring.submit()?
+        } else {
+            0
+        };
+        // SAFETY: IORING_ENTER_GETEVENTS=1. min_complete=0 means nonblocking.
+        // With COOP_TASKRUN, this flushes task-work (multishot accept/recv CQEs).
+        match unsafe {
+            self.ring.submitter().enter::<libc::sigset_t>(
+                0, 0, 1, /* IORING_ENTER_GETEVENTS */ None,
+            )
+        } {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => return Err(e),
+        }
         Ok(n)
     }
 

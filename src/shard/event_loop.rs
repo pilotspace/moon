@@ -130,6 +130,8 @@ impl super::Shard {
                                 e
                             );
                         } else {
+                            // Flush the accept SQE to the kernel immediately.
+                            let _ = d.submit_and_wait_nonblocking();
                             info!(
                                 "Shard {}: multishot accept armed on fd {}",
                                 self.id, listener_fd
@@ -734,7 +736,11 @@ impl super::Shard {
                                                 use std::os::unix::io::IntoRawFd;
                                                 let raw_fd = std_stream.into_raw_fd();
                                                 match driver.register_connection(raw_fd) {
-                                                    Ok(Some(_conn_id)) => {}
+                                                    Ok(Some(_conn_id)) => {
+                                                        // Immediately submit the recv SQE so the
+                                                        // client doesn't wait for the next timer tick.
+                                                        let _ = driver.submit_and_wait_nonblocking();
+                                                    }
                                                     Ok(None) => {}
                                                     Err(e) => {
                                                         tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
