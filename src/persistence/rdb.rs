@@ -163,6 +163,46 @@ pub fn save_from_snapshot(
     Ok(())
 }
 
+/// Serialize snapshot data (with correct base_ts per database) to RDB bytes in memory.
+///
+/// Unlike `save_to_bytes(&[Database])` which reads base_ts from each Database,
+/// this takes explicit (entries, base_ts) tuples — critical for AOF rewrite where
+/// entries are cloned into temporary storage and the original base_ts must be preserved.
+pub fn save_snapshot_to_bytes(
+    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
+) -> Result<Vec<u8>, MoonError> {
+    let mut buf = Vec::new();
+
+    buf.write_all(RDB_MAGIC)?;
+    buf.write_all(&[RDB_VERSION])?;
+
+    let now_ms = current_time_ms();
+
+    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
+        let live: Vec<_> = entries
+            .iter()
+            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+
+        buf.write_all(&[DB_SELECTOR])?;
+        buf.write_all(&[db_idx as u8])?;
+
+        for (key, entry) in live {
+            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
+        }
+    }
+
+    buf.write_all(&[EOF_MARKER])?;
+    let mut hasher = Hasher::new();
+    hasher.update(&buf);
+    buf.write_all(&hasher.finalize().to_le_bytes())?;
+
+    Ok(buf)
+}
+
 /// Load an RDB file and populate databases. Returns total keys loaded.
 ///
 /// On any error (missing file, corrupt data, bad checksum), returns Err.

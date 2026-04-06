@@ -159,45 +159,78 @@ pub async fn aof_writer_task(
 
         let mut last_fsync = Instant::now();
 
+        let mut write_error = false;
+
         loop {
             match rx.recv() {
                 Ok(AofMessage::Append(data)) => {
-                    let _ = file.write_all(&data);
+                    if write_error {
+                        continue; // Drop appends after persistent I/O failure
+                    }
+                    if let Err(e) = file.write_all(&data) {
+                        error!(
+                            "AOF write failed (seq {}): {}. Persistence degraded.",
+                            manifest.seq, e
+                        );
+                        write_error = true;
+                        continue;
+                    }
                     match fsync {
                         FsyncPolicy::Always => {
-                            let _ = file.flush();
-                            let _ = file.sync_data();
+                            if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                error!("AOF sync failed (seq {}, always): {}", manifest.seq, e);
+                                write_error = true;
+                            }
                         }
                         FsyncPolicy::EverySec => {
                             if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
-                                let _ = file.flush();
-                                let _ = file.sync_data();
-                                last_fsync = Instant::now();
+                                if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                    error!(
+                                        "AOF sync failed (seq {}, everysec): {}",
+                                        manifest.seq, e
+                                    );
+                                    // Non-fatal for everysec: retry next interval
+                                } else {
+                                    last_fsync = Instant::now();
+                                }
                             }
                         }
                         FsyncPolicy::No => {}
                     }
                 }
                 Ok(AofMessage::Shutdown) | Err(_) => {
-                    let _ = file.flush();
-                    let _ = file.sync_data();
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF final sync failed (seq {}): {}", manifest.seq, e);
+                        }
+                    }
                     info!("AOF writer shutting down (monoio, seq {})", manifest.seq);
                     break;
                 }
                 Ok(AofMessage::Rewrite(db)) => {
-                    let _ = file.flush();
-                    let _ = file.sync_data();
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
+                        }
+                    }
                     match do_rewrite_single(&db, &mut manifest, &mut file) {
-                        Ok(()) => {}
-                        Err(e) => error!("AOF rewrite failed: {}", e),
+                        Ok(()) => {
+                            write_error = false; // Reset on successful rewrite
+                        }
+                        Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
                     }
                 }
                 Ok(AofMessage::RewriteSharded(shard_dbs)) => {
-                    let _ = file.flush();
-                    let _ = file.sync_data();
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
+                        }
+                    }
                     match do_rewrite_sharded(&shard_dbs, &mut manifest, &mut file) {
-                        Ok(()) => {}
-                        Err(e) => error!("AOF rewrite failed: {}", e),
+                        Ok(()) => {
+                            write_error = false;
+                        }
+                        Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
                     }
                 }
             }
@@ -657,22 +690,28 @@ fn do_rewrite_single(
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
 ) -> Result<(), MoonError> {
-    let snapshot: Vec<Database> = db
+    // Capture (entries, base_ts) per database — preserves original base_ts for correct TTL.
+    let snapshot: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = db
         .iter()
         .map(|lock| {
             let guard = lock.read();
-            let now_ms = current_time_ms();
-            let mut temp = Database::new();
-            for (k, v) in guard.data().iter() {
-                if !v.is_expired_at(guard.base_timestamp(), now_ms) {
-                    temp.set(k.to_bytes(), v.clone());
-                }
-            }
-            temp
+            let base_ts = guard.base_timestamp();
+            let entries = guard
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (entries, base_ts)
         })
         .collect();
 
-    let rdb_bytes = crate::persistence::rdb::save_to_bytes(&snapshot)?;
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let new_incr = manifest.advance(&rdb_bytes)?;
 
     // Switch writer to new incr file
@@ -695,22 +734,33 @@ fn do_rewrite_sharded(
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
 ) -> Result<(), MoonError> {
+    // Capture (entries, base_ts) per merged database, preserving original base_ts for TTL.
     let db_count = shard_dbs.db_count();
-    let now_ms = current_time_ms();
-    let mut merged_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
+    let mut merged: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = (0..db_count).map(|_| (Vec::new(), 0u32)).collect();
 
     for shard_locks in shard_dbs.all_shard_dbs() {
         for (db_idx, lock) in shard_locks.iter().enumerate() {
             let guard = lock.read();
+            let base_ts = guard.base_timestamp();
+            let now_ms = current_time_ms();
+            if merged[db_idx].0.is_empty() {
+                merged[db_idx].1 = base_ts;
+            }
             for (key, entry) in guard.data().iter() {
-                if !entry.is_expired_at(guard.base_timestamp(), now_ms) {
-                    merged_dbs[db_idx].set(key.to_bytes(), entry.clone());
+                if !entry.is_expired_at(base_ts, now_ms) {
+                    merged[db_idx].0.push((key.clone(), entry.clone()));
                 }
             }
         }
     }
 
-    let rdb_bytes = crate::persistence::rdb::save_to_bytes(&merged_dbs)?;
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&merged)?;
     let new_incr = manifest.advance(&rdb_bytes)?;
 
     *file = std::fs::OpenOptions::new()
