@@ -457,10 +457,10 @@ fn skip_bytes_field(data: &[u8], pos: usize) -> Option<usize> {
 fn read_entry_zero_copy(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
-    shared_buf: &Bytes,
+    _shared_buf: &Bytes,
     cached_secs: u32,
 ) -> Result<(Bytes, Entry), MoonError> {
-    let key = read_bytes_zero_copy(cursor, shared_buf)?;
+    let key = read_bytes(cursor)?;
 
     let mut ttl_buf = [0u8; 8];
     cursor.read_exact(&mut ttl_buf)?;
@@ -469,15 +469,33 @@ fn read_entry_zero_copy(
 
     let value = match type_tag {
         TYPE_STRING => {
-            RedisValue::String(read_bytes_zero_copy(cursor, shared_buf)?)
+            // Fast path: build CompactValue directly from Vec, skipping RedisValue intermediate.
+            // This avoids: Vec → Bytes → RedisValue::String → from_redis_value → heap_string_vec
+            // and instead does: Vec → CompactValue directly (one Box alloc, zero copy).
+            let vec = read_bytes_vec(cursor)?;
+            let cv = if vec.len() <= 12 {
+                crate::storage::compact_value::CompactValue::from_redis_value(
+                    RedisValue::String(Bytes::from(vec))
+                )
+            } else {
+                crate::storage::compact_value::CompactValue::heap_string_vec_direct(vec)
+            };
+            let mut entry = Entry::new_string(Bytes::new());
+            entry.value = cv;
+            if expires_at_ms > 0 {
+                entry.set_expires_at_ms(cached_secs, expires_at_ms);
+            }
+            entry.set_last_access(cached_secs);
+            entry.set_access_counter(5);
+            return Ok((key, entry));
         }
         TYPE_HASH => {
             let count = read_u32(cursor)? as usize;
             validate_count(cursor, count, 8, "hash")?;
             let mut map = HashMap::with_capacity(count);
             for _ in 0..count {
-                let field = read_bytes_zero_copy(cursor, shared_buf)?;
-                let val = read_bytes_zero_copy(cursor, shared_buf)?;
+                let field = read_bytes(cursor)?;
+                let val = read_bytes(cursor)?;
                 map.insert(field, val);
             }
             RedisValue::Hash(map)
@@ -487,7 +505,7 @@ fn read_entry_zero_copy(
             validate_count(cursor, count, 4, "list")?;
             let mut list = VecDeque::with_capacity(count);
             for _ in 0..count {
-                list.push_back(read_bytes_zero_copy(cursor, shared_buf)?);
+                list.push_back(read_bytes(cursor)?);
             }
             RedisValue::List(list)
         }
@@ -496,7 +514,7 @@ fn read_entry_zero_copy(
             validate_count(cursor, count, 4, "set")?;
             let mut set = HashSet::with_capacity(count);
             for _ in 0..count {
-                set.insert(read_bytes_zero_copy(cursor, shared_buf)?);
+                set.insert(read_bytes(cursor)?);
             }
             RedisValue::Set(set)
         }
@@ -506,7 +524,7 @@ fn read_entry_zero_copy(
             let mut members = HashMap::with_capacity(count);
             let mut tree = BPTree::new();
             for _ in 0..count {
-                let member = read_bytes_zero_copy(cursor, shared_buf)?;
+                let member = read_bytes(cursor)?;
                 let mut score_buf = [0u8; 8];
                 cursor.read_exact(&mut score_buf)?;
                 let score = f64::from_le_bytes(score_buf);
@@ -1182,6 +1200,23 @@ pub(crate) fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Bytes, MoonError>
     let slice = &cursor.get_ref()[pos..pos + len];
     cursor.set_position((pos + len) as u64);
     Ok(Bytes::copy_from_slice(slice))
+}
+
+/// Read bytes as owned Vec<u8> — avoids Bytes intermediate for RDB load path.
+/// Single allocation directly to the right size, no refcount overhead.
+pub(crate) fn read_bytes_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, MoonError> {
+    let len = read_u32(cursor)? as usize;
+    let pos = cursor.position() as usize;
+    let remaining = cursor.get_ref().len() - pos;
+    if len > remaining {
+        return Err(RdbError::Corrupted {
+            detail: format!("read_bytes_vec: length {} exceeds remaining {}", len, remaining),
+        }
+        .into());
+    }
+    let slice = &cursor.get_ref()[pos..pos + len];
+    cursor.set_position((pos + len) as u64);
+    Ok(slice.to_vec())
 }
 
 /// Zero-copy read: returns a `Bytes` slice of the shared buffer (no heap alloc).
