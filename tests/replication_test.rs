@@ -2,6 +2,9 @@
 //!
 //! Tests REPLICAOF, REPLCONF, INFO replication, READONLY enforcement,
 //! and REPLICAOF NO ONE promotion -- using real TCP connections.
+//!
+//! These tests require the tokio runtime (`run_with_shutdown` is tokio-only).
+#![cfg(feature = "runtime-tokio")]
 
 use moon::runtime::cancel::CancellationToken;
 use tokio::net::TcpListener;

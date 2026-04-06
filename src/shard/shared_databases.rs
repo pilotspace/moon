@@ -111,6 +111,14 @@ impl ShardDatabases {
         self.db_count
     }
 
+    /// Return a reference to all databases across all shards (for AOF rewrite).
+    ///
+    /// Callers iterate shards × dbs and acquire read locks individually.
+    #[inline]
+    pub fn all_shard_dbs(&self) -> &[Vec<RwLock<Database>>] {
+        &self.shards
+    }
+
     /// Collect snapshot metadata (segment counts, base timestamps) for a shard.
     ///
     /// Acquires brief read locks on each database to gather metadata needed

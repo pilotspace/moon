@@ -411,7 +411,15 @@ pub async fn run_sharded(
     affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
-    let listener = monoio::net::TcpListener::bind(&addr)?;
+    // When per_shard_accept is true, each shard creates its own SO_REUSEPORT listener.
+    // We must NOT keep a central listener bound, because SO_REUSEPORT would distribute
+    // connections to it, but nobody would accept them (causing timeouts).
+    // Only bind the central listener when shards don't do per-shard accept.
+    let listener = if per_shard_accept {
+        None
+    } else {
+        Some(monoio::net::TcpListener::bind(&addr)?)
+    };
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards, monoio)", addr, num_shards);
 
@@ -447,12 +455,12 @@ pub async fn run_sharded(
         // If TLS listener is configured, select on both plain and TLS accepts
         if let Some(ref tls_listener) = tls_listener {
             monoio::select! {
-                // Plain TCP accept -- disabled when per-shard SO_REUSEPORT listeners are active.
+                // Plain TCP accept -- only active when central listener exists (non per-shard).
                 result = async {
-                    if per_shard_accept {
-                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
-                    } else {
+                    if let Some(ref listener) = listener {
                         listener.accept().await
+                    } else {
+                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
                     }
                 } => {
                     match result {
@@ -530,12 +538,12 @@ pub async fn run_sharded(
             }
         } else {
             monoio::select! {
-                // Plain TCP accept -- disabled when per-shard SO_REUSEPORT listeners are active.
+                // Plain TCP accept -- only active when central listener exists (non per-shard).
                 result = async {
-                    if per_shard_accept {
-                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
-                    } else {
+                    if let Some(ref listener) = listener {
                         listener.accept().await
+                    } else {
+                        std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
                     }
                 } => {
                     match result {

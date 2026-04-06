@@ -47,7 +47,11 @@ const EOF_MARKER: u8 = 0xFF;
 /// Uses atomic write (write to .tmp, then rename) for crash safety.
 /// Expired keys are skipped. Empty databases are skipped.
 /// Footer contains CRC32 checksum of all preceding bytes.
-pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
+/// Serialize all databases to RDB format in memory.
+///
+/// Returns the complete RDB byte stream (header + entries + footer + CRC32).
+/// Used by both `save()` (file) and AOF RDB-preamble rewrite.
+pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
     let mut buf = Vec::new();
 
     // Header
@@ -60,7 +64,6 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
     for (db_idx, db) in databases.iter().enumerate() {
         let base_ts = db.base_timestamp();
         let data = db.data();
-        // Collect non-expired entries
         let live: Vec<_> = data
             .iter()
             .filter(|(_, entry)| !entry.is_expired_at(base_ts, now_ms))
@@ -85,6 +88,12 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
     hasher.update(&buf);
     let checksum = hasher.finalize();
     buf.write_all(&checksum.to_le_bytes())?;
+
+    Ok(buf)
+}
+
+pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
+    let buf = save_to_bytes(databases)?;
 
     // Atomic write: write to tmp, then rename
     let tmp_path = path.with_extension("rdb.tmp");
@@ -301,6 +310,113 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
     }
 
     Ok(total_keys)
+}
+
+/// Load an RDB snapshot from a byte slice (for AOF RDB-preamble format).
+///
+/// Returns `(keys_loaded, bytes_consumed)`. The caller can use `bytes_consumed`
+/// to find the start of any RESP commands appended after the RDB preamble.
+pub fn load_from_bytes(
+    databases: &mut [Database],
+    data: &[u8],
+) -> Result<(usize, usize), MoonError> {
+    if data.len() < RDB_MAGIC.len() + 1 + 1 + 4 {
+        return Err(RdbError::Corrupted {
+            detail: "RDB preamble too small".into(),
+        }
+        .into());
+    }
+
+    // Find EOF_MARKER to determine RDB section length.
+    // The RDB section is: header + entries + EOF_MARKER(1) + CRC32(4).
+    // We scan for EOF_MARKER (0xFF) — the first one after the header that's
+    // immediately followed by a valid CRC32 of the preceding bytes.
+    let mut rdb_end = None;
+    // Start scanning after header (MOON + version = 5 bytes)
+    for i in 5..data.len().saturating_sub(3) {
+        if data[i] == EOF_MARKER {
+            let payload = &data[..=i]; // everything up to and including EOF_MARKER
+            let checksum_bytes = &data[i + 1..i + 5];
+            if checksum_bytes.len() == 4 {
+                let stored = u32::from_le_bytes([
+                    checksum_bytes[0],
+                    checksum_bytes[1],
+                    checksum_bytes[2],
+                    checksum_bytes[3],
+                ]);
+                let mut hasher = Hasher::new();
+                hasher.update(payload);
+                if hasher.finalize() == stored {
+                    rdb_end = Some(i + 5); // past CRC32
+                    break;
+                }
+            }
+        }
+    }
+
+    let rdb_len = rdb_end.ok_or_else(|| MoonError::from(RdbError::Corrupted {
+        detail: "RDB preamble: no valid EOF+CRC found".into(),
+    }))?;
+
+    // Load using the same logic as `load`, but from the byte slice
+    let payload = &data[..rdb_len - 4]; // exclude CRC32
+    let mut cursor = Cursor::new(payload);
+
+    // Skip magic + version
+    let mut magic = [0u8; 4];
+    cursor.read_exact(&mut magic).map_err(|e| RdbError::Io {
+        path: std::path::PathBuf::from("<aof-preamble>"),
+        source: e,
+    })?;
+    if &magic != RDB_MAGIC {
+        return Err(RdbError::Corrupted {
+            detail: "invalid RDB magic in AOF preamble".into(),
+        }
+        .into());
+    }
+    let mut version = [0u8; 1];
+    cursor.read_exact(&mut version).map_err(|e| RdbError::Io {
+        path: std::path::PathBuf::from("<aof-preamble>"),
+        source: e,
+    })?;
+
+    let now_ms = current_time_ms();
+    let mut total_keys = 0usize;
+    let mut current_db: usize = 0;
+
+    loop {
+        let mut tag = [0u8; 1];
+        if cursor.read_exact(&mut tag).is_err() {
+            break;
+        }
+        match tag[0] {
+            EOF_MARKER => break,
+            DB_SELECTOR => {
+                let mut db_idx = [0u8; 1];
+                cursor.read_exact(&mut db_idx).map_err(|e| RdbError::Io {
+                    path: std::path::PathBuf::from("<aof-preamble>"),
+                    source: e,
+                })?;
+                current_db = db_idx[0] as usize;
+            }
+            type_tag => {
+                match read_entry(&mut cursor, type_tag) {
+                    Ok((key, entry)) => {
+                        if entry.has_expiry() && entry.is_expired_at(current_secs(), now_ms) {
+                            continue;
+                        }
+                        if current_db < databases.len() {
+                            databases[current_db].set(key, entry);
+                            total_keys += 1;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    Ok((total_keys, rdb_len))
 }
 
 /// Distribute keys from loaded databases to the correct per-shard databases.

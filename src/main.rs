@@ -214,6 +214,52 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // Replay AOF data from disk (supplements per-shard WAL restore above).
+    //
+    // Priority order:
+    // 1. Multi-part AOF (appendonlydir/ with manifest) — base RDB + incremental RESP
+    // 2. Legacy single-file AOF (appendonly.aof) — RDB preamble or pure RESP
+    if config.appendonly == "yes" {
+        if let Some(ref dir) = persistence_dir {
+            use moon::persistence::aof_manifest::AofManifest;
+            use moon::persistence::replay::DispatchReplayEngine;
+
+            let base_dir = std::path::PathBuf::from(dir);
+            let target_dbs = &mut shards[0].databases;
+
+            if let Some(manifest) = AofManifest::load(&base_dir) {
+                // Multi-part AOF: load base RDB + replay incremental RESP
+                match moon::persistence::aof_manifest::replay_multi_part(
+                    target_dbs,
+                    &manifest,
+                    &DispatchReplayEngine,
+                ) {
+                    Ok(n) => info!(
+                        "AOF loaded (multi-part seq {}): {} keys/commands",
+                        manifest.seq, n
+                    ),
+                    Err(e) => tracing::error!("AOF multi-part load failed: {}", e),
+                }
+            } else {
+                // Legacy single-file AOF (backward compatible)
+                let aof_path = base_dir.join(&config.appendfilename);
+                if aof_path.exists() {
+                    match aof::replay_aof(
+                        target_dbs,
+                        &aof_path,
+                        &DispatchReplayEngine,
+                    ) {
+                        Ok(n) => info!(
+                            "AOF loaded (legacy): {} commands from {}",
+                            n, aof_path.display()
+                        ),
+                        Err(e) => tracing::error!("AOF load failed: {}", e),
+                    }
+                }
+            }
+        }
+    }
+
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
         .iter_mut()

@@ -2,6 +2,9 @@
 //!
 //! Each test spawns a real TCP server on an OS-assigned port, connects with the
 //! `redis` crate client, exercises commands over real TCP, and shuts down cleanly.
+//!
+//! These tests require the tokio runtime (`run_with_shutdown` is tokio-only).
+#![cfg(feature = "runtime-tokio")]
 
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
