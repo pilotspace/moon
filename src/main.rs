@@ -244,14 +244,11 @@ fn main() -> anyhow::Result<()> {
                 // Legacy single-file AOF (backward compatible)
                 let aof_path = base_dir.join(&config.appendfilename);
                 if aof_path.exists() {
-                    match aof::replay_aof(
-                        target_dbs,
-                        &aof_path,
-                        &DispatchReplayEngine,
-                    ) {
+                    match aof::replay_aof(target_dbs, &aof_path, &DispatchReplayEngine) {
                         Ok(n) => info!(
                             "AOF loaded (legacy): {} commands from {}",
-                            n, aof_path.display()
+                            n,
+                            aof_path.display()
                         ),
                         Err(e) => tracing::error!("AOF load failed: {}", e),
                     }

@@ -42,12 +42,14 @@ impl AofManifest {
 
     /// Path to the base RDB file for the current sequence.
     pub fn base_path(&self) -> PathBuf {
-        self.aof_dir().join(format!("moon.aof.{}.base.rdb", self.seq))
+        self.aof_dir()
+            .join(format!("moon.aof.{}.base.rdb", self.seq))
     }
 
     /// Path to the incremental RESP file for the current sequence.
     pub fn incr_path(&self) -> PathBuf {
-        self.aof_dir().join(format!("moon.aof.{}.incr.aof", self.seq))
+        self.aof_dir()
+            .join(format!("moon.aof.{}.incr.aof", self.seq))
     }
 
     /// Path to the base RDB file for a given sequence.
@@ -130,19 +132,14 @@ impl AofManifest {
     /// update manifest, delete old files.
     ///
     /// Returns the path to the new incremental file (caller should switch writing to it).
-    pub fn advance(
-        &mut self,
-        rdb_bytes: &[u8],
-    ) -> Result<PathBuf, crate::error::MoonError> {
+    pub fn advance(&mut self, rdb_bytes: &[u8]) -> Result<PathBuf, crate::error::MoonError> {
         let old_seq = self.seq;
         let new_seq = old_seq + 1;
 
         let aof_dir = self.aof_dir();
-        std::fs::create_dir_all(&aof_dir).map_err(|e| {
-            crate::error::AofError::Io {
-                path: aof_dir.clone(),
-                source: e,
-            }
+        std::fs::create_dir_all(&aof_dir).map_err(|e| crate::error::AofError::Io {
+            path: aof_dir.clone(),
+            source: e,
         })?;
 
         // 1. Write new base RDB (atomic: tmp + rename)
@@ -152,8 +149,10 @@ impl AofManifest {
             path: tmp_base.clone(),
             source: e,
         })?;
-        std::fs::rename(&tmp_base, &new_base).map_err(|e| crate::error::AofError::RewriteFailed {
-            detail: format!("rename base: {}", e),
+        std::fs::rename(&tmp_base, &new_base).map_err(|e| {
+            crate::error::AofError::RewriteFailed {
+                detail: format!("rename base: {}", e),
+            }
         })?;
 
         // 2. Create empty new incremental file
@@ -165,10 +164,11 @@ impl AofManifest {
 
         // 3. Update manifest (atomic)
         self.seq = new_seq;
-        self.write_manifest().map_err(|e| crate::error::AofError::Io {
-            path: self.manifest_path(),
-            source: e,
-        })?;
+        self.write_manifest()
+            .map_err(|e| crate::error::AofError::Io {
+                path: self.manifest_path(),
+                source: e,
+            })?;
 
         // 4. Delete old files (best-effort)
         let old_base = self.base_path_seq(old_seq);
@@ -210,7 +210,11 @@ pub fn replay_multi_part(
     if base_path.exists() {
         match crate::persistence::rdb::load(databases, &base_path) {
             Ok(n) => {
-                info!("AOF base RDB loaded: {} keys from {}", n, base_path.display());
+                info!(
+                    "AOF base RDB loaded: {} keys from {}",
+                    n,
+                    base_path.display()
+                );
                 total += n;
             }
             Err(e) => {
@@ -246,8 +250,8 @@ fn replay_incr_resp(
     data: &[u8],
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
 ) -> Result<usize, crate::error::MoonError> {
-    use bytes::BytesMut;
     use crate::protocol::{Frame, ParseConfig, parse};
+    use bytes::BytesMut;
 
     let total_len = data.len();
     let mut buf = BytesMut::from(data);
@@ -266,11 +270,17 @@ fn replay_incr_resp(
                         let name = match &arr[0] {
                             Frame::BulkString(s) => s.as_ref(),
                             Frame::SimpleString(s) => s.as_ref(),
-                            _ => { count += 1; continue; }
+                            _ => {
+                                count += 1;
+                                continue;
+                            }
                         };
                         (name as &[u8], &arr[1..])
                     }
-                    _ => { count += 1; continue; }
+                    _ => {
+                        count += 1;
+                        continue;
+                    }
                 };
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
@@ -278,7 +288,11 @@ fn replay_incr_resp(
             Ok(None) => {
                 if !buf.is_empty() {
                     let offset = total_len - buf.len();
-                    warn!("AOF incr truncated: {} bytes at offset {}", buf.len(), offset);
+                    warn!(
+                        "AOF incr truncated: {} bytes at offset {}",
+                        buf.len(),
+                        offset
+                    );
                 }
                 break;
             }

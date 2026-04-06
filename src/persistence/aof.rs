@@ -116,8 +116,8 @@ pub async fn aof_writer_task(
     // On BGREWRITEAOF: snapshot → write new base RDB → create new incr → advance manifest.
     #[cfg(feature = "runtime-monoio")]
     {
-        use std::io::Write;
         use crate::persistence::aof_manifest::AofManifest;
+        use std::io::Write;
 
         // Resolve the persistence base directory from aof_path's parent.
         let base_dir = aof_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -148,11 +148,19 @@ pub async fn aof_writer_task(
         {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to open AOF incr file {}: {}", incr_path.display(), e);
+                error!(
+                    "Failed to open AOF incr file {}: {}",
+                    incr_path.display(),
+                    e
+                );
                 return;
             }
         };
-        info!("AOF writer: seq {}, incr={}", manifest.seq, incr_path.display());
+        info!(
+            "AOF writer: seq {}, incr={}",
+            manifest.seq,
+            incr_path.display()
+        );
 
         let mut last_fsync = Instant::now();
 
@@ -308,7 +316,10 @@ pub fn replay_aof(
     let (rdb_keys, resp_start) = if data.starts_with(b"MOON") {
         match crate::persistence::rdb::load_from_bytes(databases, &data) {
             Ok((keys, consumed)) => {
-                info!("AOF RDB preamble loaded: {} keys ({} bytes)", keys, consumed);
+                info!(
+                    "AOF RDB preamble loaded: {} keys ({} bytes)",
+                    keys, consumed
+                );
                 (keys, consumed)
             }
             Err(e) => {
@@ -644,6 +655,7 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
 }
 
 /// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.
+#[cfg(feature = "runtime-monoio")]
 fn do_rewrite_single(
     db: &SharedDatabases,
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
@@ -672,12 +684,16 @@ fn do_rewrite_single(
         .create(true)
         .append(true)
         .open(&new_incr)
-        .map_err(|e| AofError::Io { path: new_incr, source: e })?;
+        .map_err(|e| AofError::Io {
+            path: new_incr,
+            source: e,
+        })?;
 
     Ok(())
 }
 
 /// Multi-part rewrite: snapshot all shards → merged RDB base → advance manifest.
+#[cfg(feature = "runtime-monoio")]
 fn do_rewrite_sharded(
     shard_dbs: &crate::shard::shared_databases::ShardDatabases,
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
@@ -705,7 +721,10 @@ fn do_rewrite_sharded(
         .create(true)
         .append(true)
         .open(&new_incr)
-        .map_err(|e| AofError::Io { path: new_incr, source: e })?;
+        .map_err(|e| AofError::Io {
+            path: new_incr,
+            source: e,
+        })?;
 
     Ok(())
 }
@@ -743,10 +762,18 @@ fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonErr
         source: e,
     })?;
     std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
-        detail: format!("rename {} -> {}: {}", tmp_path.display(), aof_path.display(), e),
+        detail: format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            aof_path.display(),
+            e
+        ),
     })?;
 
-    info!("AOF rewrite complete (RDB preamble): {} bytes", rdb_bytes.len());
+    info!(
+        "AOF rewrite complete (RDB preamble): {} bytes",
+        rdb_bytes.len()
+    );
     Ok(())
 }
 
@@ -782,10 +809,18 @@ fn rewrite_aof_sharded_sync(
         source: e,
     })?;
     std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
-        detail: format!("rename {} -> {}: {}", tmp_path.display(), aof_path.display(), e),
+        detail: format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            aof_path.display(),
+            e
+        ),
     })?;
 
-    info!("AOF rewrite (sharded, RDB preamble) complete: {} bytes", rdb_bytes.len());
+    info!(
+        "AOF rewrite (sharded, RDB preamble) complete: {} bytes",
+        rdb_bytes.len()
+    );
     Ok(())
 }
 

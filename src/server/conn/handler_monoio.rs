@@ -1202,9 +1202,7 @@ pub async fn handle_connection_sharded_monoio<
                         shard_databases.clone(),
                     ));
                 } else {
-                    responses.push(Frame::Error(Bytes::from_static(
-                        b"ERR AOF is not enabled",
-                    )));
+                    responses.push(Frame::Error(Bytes::from_static(b"ERR AOF is not enabled")));
                 }
                 continue;
             }

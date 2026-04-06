@@ -292,7 +292,9 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                     Err(e) => {
                         tracing::warn!(
                             "RDB load: corrupted entry at offset {}: {}. {} keys loaded.",
-                            cursor.position(), e, total_keys
+                            cursor.position(),
+                            e,
+                            total_keys
                         );
                         break;
                     }
@@ -356,7 +358,9 @@ fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
     pos = skip_bytes_field(data, pos)?;
     // Skip TTL (8 bytes)
     pos = pos.checked_add(8)?;
-    if pos > data.len() { return None; }
+    if pos > data.len() {
+        return None;
+    }
 
     match type_tag {
         TYPE_STRING => {
@@ -382,18 +386,25 @@ fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
             pos += 4;
             for _ in 0..count {
                 pos = skip_bytes_field(data, pos)?; // member
-                pos = pos.checked_add(8)?;          // f64 score
-                if pos > data.len() { return None; }
+                pos = pos.checked_add(8)?; // f64 score
+                if pos > data.len() {
+                    return None;
+                }
             }
         }
         TYPE_STREAM => {
             // entry_count(8) + last_id(16)
             pos = pos.checked_add(24)?;
-            if pos > data.len() { return None; }
-            let entry_count = u64::from_le_bytes(data[pos - 24..pos - 16].try_into().ok()?) as usize;
+            if pos > data.len() {
+                return None;
+            }
+            let entry_count =
+                u64::from_le_bytes(data[pos - 24..pos - 16].try_into().ok()?) as usize;
             for _ in 0..entry_count {
                 pos = pos.checked_add(16)?; // StreamId (ms + seq)
-                if pos > data.len() { return None; }
+                if pos > data.len() {
+                    return None;
+                }
                 let field_count = read_u32_raw(data, pos)?;
                 pos += 4;
                 for _ in 0..field_count {
@@ -406,28 +417,38 @@ fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
             pos += 4;
             for _ in 0..group_count {
                 pos = skip_bytes_field(data, pos)?; // group name
-                pos = pos.checked_add(16)?;         // last_delivered_id
-                if pos > data.len() { return None; }
+                pos = pos.checked_add(16)?; // last_delivered_id
+                if pos > data.len() {
+                    return None;
+                }
                 let pel_count = read_u32_raw(data, pos)?;
                 pos += 4;
                 for _ in 0..pel_count {
                     pos = pos.checked_add(16)?; // StreamId
-                    if pos > data.len() { return None; }
+                    if pos > data.len() {
+                        return None;
+                    }
                     pos = skip_bytes_field(data, pos)?; // consumer name
-                    pos = pos.checked_add(16)?;         // delivery_time + delivery_count
-                    if pos > data.len() { return None; }
+                    pos = pos.checked_add(16)?; // delivery_time + delivery_count
+                    if pos > data.len() {
+                        return None;
+                    }
                 }
                 let consumer_count = read_u32_raw(data, pos)?;
                 pos += 4;
                 for _ in 0..consumer_count {
                     pos = skip_bytes_field(data, pos)?; // consumer name
-                    pos = pos.checked_add(8)?;          // seen_time
-                    if pos > data.len() { return None; }
+                    pos = pos.checked_add(8)?; // seen_time
+                    if pos > data.len() {
+                        return None;
+                    }
                     let pending_count = read_u32_raw(data, pos)?;
                     pos += 4;
                     for _ in 0..pending_count {
                         pos = pos.checked_add(16)?; // StreamId
-                        if pos > data.len() { return None; }
+                        if pos > data.len() {
+                            return None;
+                        }
                     }
                 }
             }
@@ -441,7 +462,9 @@ fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
 /// Read u32 LE from raw bytes without cursor overhead.
 #[inline]
 fn read_u32_raw(data: &[u8], pos: usize) -> Option<usize> {
-    if pos + 4 > data.len() { return None; }
+    if pos + 4 > data.len() {
+        return None;
+    }
     Some(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize)
 }
 
@@ -450,7 +473,11 @@ fn read_u32_raw(data: &[u8], pos: usize) -> Option<usize> {
 fn skip_bytes_field(data: &[u8], pos: usize) -> Option<usize> {
     let len = read_u32_raw(data, pos)?;
     let new_pos = pos.checked_add(4)?.checked_add(len)?;
-    if new_pos > data.len() { None } else { Some(new_pos) }
+    if new_pos > data.len() {
+        None
+    } else {
+        Some(new_pos)
+    }
 }
 
 /// Zero-copy variant of read_entry: uses shared Bytes buffer and cached timestamps.
@@ -474,9 +501,9 @@ fn read_entry_zero_copy(
             // and instead does: Vec → CompactValue directly (one Box alloc, zero copy).
             let vec = read_bytes_vec(cursor)?;
             let cv = if vec.len() <= 12 {
-                crate::storage::compact_value::CompactValue::from_redis_value(
-                    RedisValue::String(Bytes::from(vec))
-                )
+                crate::storage::compact_value::CompactValue::from_redis_value(RedisValue::String(
+                    Bytes::from(vec),
+                ))
             } else {
                 crate::storage::compact_value::CompactValue::heap_string_vec_direct(vec)
             };
@@ -542,14 +569,22 @@ fn read_entry_zero_copy(
             let mut last_id_seq_buf = [0u8; 8];
             cursor.read_exact(&mut last_id_ms_buf)?;
             cursor.read_exact(&mut last_id_seq_buf)?;
-            let last_id = StreamId { ms: u64::from_le_bytes(last_id_ms_buf), seq: u64::from_le_bytes(last_id_seq_buf) };
+            let last_id = StreamId {
+                ms: u64::from_le_bytes(last_id_ms_buf),
+                seq: u64::from_le_bytes(last_id_seq_buf),
+            };
             let mut stream = StreamData::new();
             stream.last_id = last_id;
             validate_count(cursor, entry_count, 20, "stream_entries")?;
             for _ in 0..entry_count {
-                let mut ms_buf = [0u8; 8]; let mut seq_buf = [0u8; 8];
-                cursor.read_exact(&mut ms_buf)?; cursor.read_exact(&mut seq_buf)?;
-                let id = StreamId { ms: u64::from_le_bytes(ms_buf), seq: u64::from_le_bytes(seq_buf) };
+                let mut ms_buf = [0u8; 8];
+                let mut seq_buf = [0u8; 8];
+                cursor.read_exact(&mut ms_buf)?;
+                cursor.read_exact(&mut seq_buf)?;
+                let id = StreamId {
+                    ms: u64::from_le_bytes(ms_buf),
+                    seq: u64::from_le_bytes(seq_buf),
+                };
                 let field_count = read_u32(cursor)? as usize;
                 validate_count(cursor, field_count, 8, "stream_fields")?;
                 let mut fields = Vec::with_capacity(field_count);
@@ -562,21 +597,38 @@ fn read_entry_zero_copy(
             let group_count = read_u32(cursor)? as usize;
             for _ in 0..group_count {
                 let group_name = read_bytes(cursor)?;
-                let mut gld_ms = [0u8; 8]; let mut gld_seq = [0u8; 8];
-                cursor.read_exact(&mut gld_ms)?; cursor.read_exact(&mut gld_seq)?;
-                let last_delivered_id = StreamId { ms: u64::from_le_bytes(gld_ms), seq: u64::from_le_bytes(gld_seq) };
+                let mut gld_ms = [0u8; 8];
+                let mut gld_seq = [0u8; 8];
+                cursor.read_exact(&mut gld_ms)?;
+                cursor.read_exact(&mut gld_seq)?;
+                let last_delivered_id = StreamId {
+                    ms: u64::from_le_bytes(gld_ms),
+                    seq: u64::from_le_bytes(gld_seq),
+                };
                 let pel_count = read_u32(cursor)? as usize;
                 let mut pel = BTreeMap::new();
                 for _ in 0..pel_count {
-                    let mut pid_ms = [0u8; 8]; let mut pid_seq = [0u8; 8];
-                    cursor.read_exact(&mut pid_ms)?; cursor.read_exact(&mut pid_seq)?;
-                    let pid = StreamId { ms: u64::from_le_bytes(pid_ms), seq: u64::from_le_bytes(pid_seq) };
+                    let mut pid_ms = [0u8; 8];
+                    let mut pid_seq = [0u8; 8];
+                    cursor.read_exact(&mut pid_ms)?;
+                    cursor.read_exact(&mut pid_seq)?;
+                    let pid = StreamId {
+                        ms: u64::from_le_bytes(pid_ms),
+                        seq: u64::from_le_bytes(pid_seq),
+                    };
                     let consumer_name = read_bytes(cursor)?;
-                    let mut dt_buf = [0u8; 8]; let mut dc_buf = [0u8; 8];
-                    cursor.read_exact(&mut dt_buf)?; cursor.read_exact(&mut dc_buf)?;
-                    pel.insert(pid, crate::storage::stream::PendingEntry {
-                        consumer: consumer_name, delivery_time: u64::from_le_bytes(dt_buf), delivery_count: u64::from_le_bytes(dc_buf),
-                    });
+                    let mut dt_buf = [0u8; 8];
+                    let mut dc_buf = [0u8; 8];
+                    cursor.read_exact(&mut dt_buf)?;
+                    cursor.read_exact(&mut dc_buf)?;
+                    pel.insert(
+                        pid,
+                        crate::storage::stream::PendingEntry {
+                            consumer: consumer_name,
+                            delivery_time: u64::from_le_bytes(dt_buf),
+                            delivery_count: u64::from_le_bytes(dc_buf),
+                        },
+                    );
                 }
                 let consumer_count = read_u32(cursor)? as usize;
                 let mut consumers = HashMap::new();
@@ -588,13 +640,35 @@ fn read_entry_zero_copy(
                     let pending_count = read_u32(cursor)? as usize;
                     let mut pending = BTreeMap::new();
                     for _ in 0..pending_count {
-                        let mut cid_ms = [0u8; 8]; let mut cid_seq = [0u8; 8];
-                        cursor.read_exact(&mut cid_ms)?; cursor.read_exact(&mut cid_seq)?;
-                        pending.insert(StreamId { ms: u64::from_le_bytes(cid_ms), seq: u64::from_le_bytes(cid_seq) }, ());
+                        let mut cid_ms = [0u8; 8];
+                        let mut cid_seq = [0u8; 8];
+                        cursor.read_exact(&mut cid_ms)?;
+                        cursor.read_exact(&mut cid_seq)?;
+                        pending.insert(
+                            StreamId {
+                                ms: u64::from_le_bytes(cid_ms),
+                                seq: u64::from_le_bytes(cid_seq),
+                            },
+                            (),
+                        );
                     }
-                    consumers.insert(cname.clone(), crate::storage::stream::Consumer { name: cname, pending, seen_time });
+                    consumers.insert(
+                        cname.clone(),
+                        crate::storage::stream::Consumer {
+                            name: cname,
+                            pending,
+                            seen_time,
+                        },
+                    );
                 }
-                stream.groups.insert(group_name, crate::storage::stream::ConsumerGroup { last_delivered_id, pel, consumers });
+                stream.groups.insert(
+                    group_name,
+                    crate::storage::stream::ConsumerGroup {
+                        last_delivered_id,
+                        pel,
+                        consumers,
+                    },
+                );
             }
             RedisValue::Stream(Box::new(stream))
         }
@@ -654,9 +728,11 @@ pub fn load_from_bytes(
         }
     }
 
-    let rdb_len = rdb_end.ok_or_else(|| MoonError::from(RdbError::Corrupted {
-        detail: "RDB preamble: no valid EOF+CRC found".into(),
-    }))?;
+    let rdb_len = rdb_end.ok_or_else(|| {
+        MoonError::from(RdbError::Corrupted {
+            detail: "RDB preamble: no valid EOF+CRC found".into(),
+        })
+    })?;
 
     // Load using the same logic as `load`, but from the byte slice
     let payload = &data[..rdb_len - 4]; // exclude CRC32
@@ -709,20 +785,18 @@ pub fn load_from_bytes(
                 })?;
                 current_db = db_idx[0] as usize;
             }
-            type_tag => {
-                match read_entry_zero_copy(&mut cursor, type_tag, &shared_buf, now_secs) {
-                    Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
-                            continue;
-                        }
-                        if current_db < databases.len() {
-                            databases[current_db].insert_for_load(key, entry);
-                            total_keys += 1;
-                        }
+            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, &shared_buf, now_secs) {
+                Ok((key, entry)) => {
+                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        continue;
                     }
-                    Err(_) => break,
+                    if current_db < databases.len() {
+                        databases[current_db].insert_for_load(key, entry);
+                        total_keys += 1;
+                    }
                 }
-            }
+                Err(_) => break,
+            },
         }
     }
 
@@ -1210,7 +1284,10 @@ pub(crate) fn read_bytes_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, Moon
     let remaining = cursor.get_ref().len() - pos;
     if len > remaining {
         return Err(RdbError::Corrupted {
-            detail: format!("read_bytes_vec: length {} exceeds remaining {}", len, remaining),
+            detail: format!(
+                "read_bytes_vec: length {} exceeds remaining {}",
+                len, remaining
+            ),
         }
         .into());
     }
@@ -1220,6 +1297,7 @@ pub(crate) fn read_bytes_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, Moon
 }
 
 /// Zero-copy read: returns a `Bytes` slice of the shared buffer (no heap alloc).
+#[allow(dead_code)]
 pub(crate) fn read_bytes_zero_copy(
     cursor: &mut Cursor<&[u8]>,
     shared_buf: &Bytes,
