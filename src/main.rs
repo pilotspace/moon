@@ -203,12 +203,13 @@ fn main() -> anyhow::Result<()> {
 
     // Create and restore all shards on main thread, then extract databases
     // into centralized ShardDatabases for cross-shard direct read access.
+    let skip_shard_wal = config.appendonly == "yes";
     let mut shards: Vec<Shard> = (0..num_shards)
         .map(|id| {
             let mut shard =
                 Shard::new(id, num_shards, config.databases, config.to_runtime_config());
             if let Some(ref dir) = persistence_dir {
-                shard.restore_from_persistence(dir);
+                shard.restore_from_persistence(dir, skip_shard_wal);
             }
             shard
         })
@@ -252,6 +253,19 @@ fn main() -> anyhow::Result<()> {
                         ),
                         Err(e) => tracing::error!("AOF load failed: {}", e),
                     }
+                }
+            }
+        }
+
+        // Ensure multi-part AOF manifest exists for the writer thread.
+        // Recovery is now complete, so it's safe to create the manifest
+        // without racing against legacy AOF migration detection.
+        if let Some(ref dir) = persistence_dir {
+            use moon::persistence::aof_manifest::AofManifest;
+            let base_dir = std::path::PathBuf::from(dir);
+            if AofManifest::load(&base_dir).is_none() {
+                if let Err(e) = AofManifest::initialize(&base_dir) {
+                    tracing::error!("Failed to initialize AOF manifest after recovery: {}", e);
                 }
             }
         }

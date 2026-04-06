@@ -218,7 +218,10 @@ pub fn replay_multi_part(
                 total += n;
             }
             Err(e) => {
-                error!("AOF base RDB load failed: {}. Continuing with incr.", e);
+                // Base RDB is corrupt or unreadable — applying incremental
+                // deltas on top of missing/corrupt base gives wrong results.
+                error!("AOF base RDB load failed: {}", e);
+                return Err(e);
             }
         }
     } else {

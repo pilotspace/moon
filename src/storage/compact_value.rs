@@ -338,7 +338,7 @@ impl CompactValue {
 
     /// Get a mutable reference to the heap string bytes.
     /// Returns None for non-string types and inline values.
-    /// Note: returns the underlying Bytes which can be replaced but not mutated in-place.
+    /// Note: returns `Option<&mut Vec<u8>>` for the underlying byte buffer.
     pub fn as_bytes_mut(&mut self) -> Option<&mut Vec<u8>> {
         if self.is_inline() {
             None

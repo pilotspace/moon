@@ -1174,39 +1174,6 @@ pub async fn handle_connection_sharded_monoio<
                 continue;
             }
 
-            // --- BGSAVE: trigger per-shard cooperative snapshot ---
-            if cmd.eq_ignore_ascii_case(b"BGSAVE") {
-                let response = crate::command::persistence::bgsave_start_sharded(
-                    &snapshot_trigger_tx,
-                    num_shards,
-                );
-                responses.push(response);
-                continue;
-            }
-            // SAVE -- not supported in sharded mode
-            if cmd.eq_ignore_ascii_case(b"SAVE") {
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"ERR SAVE not supported in sharded mode, use BGSAVE",
-                )));
-                continue;
-            }
-            // LASTSAVE -- return timestamp of last successful save
-            if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
-                responses.push(crate::command::persistence::handle_lastsave());
-                continue;
-            }
-            if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
-                if let Some(ref tx) = aof_tx {
-                    responses.push(crate::command::persistence::bgrewriteaof_start_sharded(
-                        tx,
-                        shard_databases.clone(),
-                    ));
-                } else {
-                    responses.push(Frame::Error(Bytes::from_static(b"ERR AOF is not enabled")));
-                }
-                continue;
-            }
-
             // === ACL permission check (NOPERM gate) ===
             // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
             {
@@ -1248,6 +1215,39 @@ pub async fn handle_connection_sharded_monoio<
                     responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                     continue;
                 }
+            }
+
+            // --- BGSAVE: trigger per-shard cooperative snapshot ---
+            if cmd.eq_ignore_ascii_case(b"BGSAVE") {
+                let response = crate::command::persistence::bgsave_start_sharded(
+                    &snapshot_trigger_tx,
+                    num_shards,
+                );
+                responses.push(response);
+                continue;
+            }
+            // SAVE -- not supported in sharded mode
+            if cmd.eq_ignore_ascii_case(b"SAVE") {
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR SAVE not supported in sharded mode, use BGSAVE",
+                )));
+                continue;
+            }
+            // LASTSAVE -- return timestamp of last successful save
+            if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
+                responses.push(crate::command::persistence::handle_lastsave());
+                continue;
+            }
+            if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
+                if let Some(ref tx) = aof_tx {
+                    responses.push(crate::command::persistence::bgrewriteaof_start_sharded(
+                        tx,
+                        shard_databases.clone(),
+                    ));
+                } else {
+                    responses.push(Frame::Error(Bytes::from_static(b"ERR AOF is not enabled")));
+                }
+                continue;
             }
 
             // --- MULTI ---

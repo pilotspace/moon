@@ -755,6 +755,12 @@ pub fn load_from_bytes(
         path: std::path::PathBuf::from("<aof-preamble>"),
         source: e,
     })?;
+    if version[0] != RDB_VERSION {
+        return Err(RdbError::UnsupportedVersion {
+            version: version[0] as u32,
+        }
+        .into());
+    }
 
     let now_ms = current_time_ms();
     let now_secs = (now_ms / 1000) as u32;
@@ -784,6 +790,16 @@ pub fn load_from_bytes(
                     source: e,
                 })?;
                 current_db = db_idx[0] as usize;
+                if current_db >= databases.len() {
+                    return Err(RdbError::Corrupted {
+                        detail: format!(
+                            "RDB preamble references database {} but only {} configured",
+                            current_db,
+                            databases.len()
+                        ),
+                    }
+                    .into());
+                }
             }
             type_tag => match read_entry_zero_copy(&mut cursor, type_tag, &shared_buf, now_secs) {
                 Ok((key, entry)) => {

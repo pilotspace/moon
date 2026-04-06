@@ -58,8 +58,13 @@ impl Shard {
     ///
     /// Loads the per-shard RRDSHARD snapshot file first (if it exists), then replays
     /// the per-shard WAL for any commands written after the last snapshot.
+    ///
+    /// When `skip_wal` is true, per-shard WAL replay is skipped (used when
+    /// `appendonly=yes` because the global AOF is the source of truth for
+    /// write replay, and replaying per-shard WAL could cause double-replay).
+    ///
     /// Returns total keys loaded (snapshot + WAL replay).
-    pub fn restore_from_persistence(&mut self, persistence_dir: &str) -> usize {
+    pub fn restore_from_persistence(&mut self, persistence_dir: &str, skip_wal: bool) -> usize {
         use crate::persistence::snapshot::shard_snapshot_load;
         use crate::persistence::wal;
 
@@ -80,9 +85,9 @@ impl Shard {
             }
         }
 
-        // Replay per-shard WAL
+        // Replay per-shard WAL (skip when global AOF is the write source of truth)
         let wal_file = wal::wal_path(dir, self.id);
-        if wal_file.exists() {
+        if !skip_wal && wal_file.exists() {
             match wal::replay_wal(&mut self.databases, &wal_file, &DispatchReplayEngine) {
                 Ok(n) => {
                     info!("Shard {}: replayed {} WAL commands", self.id, n);

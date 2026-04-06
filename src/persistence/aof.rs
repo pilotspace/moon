@@ -122,21 +122,16 @@ pub async fn aof_writer_task(
         // Resolve the persistence base directory from aof_path's parent.
         let base_dir = aof_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-        // Load or create manifest
-        let mut manifest = match AofManifest::load(&base_dir) {
-            Some(m) => m,
-            None => {
-                // First run or migration from legacy single-file AOF.
-                // Initialize multi-part with seq 1.
-                match AofManifest::initialize(&base_dir) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("Failed to initialize AOF manifest: {}", e);
-                        // Fallback: write to legacy path
-                        return;
-                    }
-                }
+        // Load manifest — do NOT create one here if it doesn't exist.
+        // main.rs recovery runs concurrently and must finish before a manifest
+        // is created, to avoid racing against legacy single-file AOF detection.
+        // main.rs will create the manifest after recovery completes.
+        let mut manifest = loop {
+            if let Some(m) = AofManifest::load(&base_dir) {
+                break m;
             }
+            // main.rs recovery hasn't created the manifest yet — wait.
+            std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
         // Open the current incremental file for appending
@@ -323,8 +318,9 @@ pub fn replay_aof(
                 (keys, consumed)
             }
             Err(e) => {
-                tracing::error!("AOF RDB preamble load failed: {}. Falling back to RESP.", e);
-                (0, 0)
+                // Data starts with MOON magic — it IS RDB format.
+                // Falling back to RESP would parse garbage. Propagate the error.
+                return Err(e);
             }
         }
     } else {
