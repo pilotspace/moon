@@ -262,7 +262,12 @@ fn main() -> anyhow::Result<()> {
                             producers,
                             shard_cancel,
                             shard_aof_tx,
-                            Some(shard_bind_addr),
+                            // Only pass bind_addr for per-shard SO_REUSEPORT when tokio
+                            // with io_uring is active. monoio uses central listener MPSC.
+                            #[cfg(feature = "runtime-tokio")]
+                            { Some(shard_bind_addr) },
+                            #[cfg(feature = "runtime-monoio")]
+                            { let _ = &shard_bind_addr; None },
                             shard_persistence_dir,
                             shard_snap_rx,
                             shard_snap_tx,
