@@ -93,8 +93,8 @@ impl AofManifest {
         let mut seq = 0u64;
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with("seq ") {
-                if let Ok(n) = line[4..].parse::<u64>() {
+            if let Some(val) = line.strip_prefix("seq ") {
+                if let Ok(n) = val.parse::<u64>() {
                     seq = n;
                 }
             }
