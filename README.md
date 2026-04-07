@@ -82,6 +82,28 @@ Moon implements 200+ Redis commands with a thread-per-core shared-nothing archit
 | Disk Offload + AOF | 5000/5000 (100%) | N/A |
 | Disk Offload + maxmemory | 5000/5000 (100%) | N/A |
 
+### Vector Search (Real MiniLM Embeddings, 10K × 384d, k=10)
+
+Moon ships an in-process vector search engine with **TurboQuant 4-bit compression**,
+HNSW indexing, and Redis-compatible `FT.CREATE` / `FT.SEARCH` commands. Benchmarked
+against Qdrant 1.12 (FP32 HNSW) on identical hardware:
+
+| | Moon ARM64 (t2a, Ampere Altra) | Moon x86 (c3, Xeon 8481C) | Qdrant FP32 (x86) |
+|---|---:|---:|---:|
+| **Recall@10** | **0.9670** | **0.9670** | ~0.95 |
+| **Search QPS** | 843 | **1,296** | 507 |
+| **Search p50** | 1.20 ms | **0.78 ms** | 1.79 ms |
+| **Insert** | 9,950 v/s | 11,270 v/s | ~2,600 v/s |
+| **Memory/vec** | ~3.2 KB | ~3.2 KB | ~4.0 KB |
+
+- **2.56× Qdrant search QPS** on x86 with **higher recall** (+1.7%)
+- **4.3× Qdrant insert throughput** via auto-indexing on `HSET`
+- **20% less memory per vector** via TurboQuant 4-bit quantization
+- **Cross-platform deterministic** — identical recall and top-k results on ARM64 vs x86
+
+See [Vector Search Guide](docs/vector-search-guide.md) for `FT.CREATE` syntax,
+`COMPACT_THRESHOLD` tuning, and `BUILD_MODE` trade-offs.
+
 ### ARM64 (Apple M4 Pro, OrbStack Linux VM)
 
 | Metric | Moon vs Redis | Conditions |
@@ -105,6 +127,7 @@ See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK
 - **Sets** - SADD, SREM, SINTER, SUNION, SDIFF, SRANDMEMBER, SPOP, SSCAN
 - **Sorted Sets** - ZADD, ZRANGE, ZRANGEBYSCORE, ZRANK, ZINCRBY, ZPOPMIN/MAX, blocking BZPOPMIN/MAX
 - **Streams** - XADD, XREAD, XRANGE, XLEN, XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM
+- **Vector Search** - FT.CREATE, FT.SEARCH, FT.COMPACT, FT.INFO, FT.DROPINDEX with HNSW + TurboQuant 4-bit quantization. 1,296 QPS / 0.78ms p50 on real MiniLM data — beats Qdrant FP32 by 2.56x with higher recall
 
 ### Architecture
 - **Thread-per-core** shared-nothing design with per-shard event loops
