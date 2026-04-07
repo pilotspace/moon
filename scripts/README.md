@@ -50,7 +50,7 @@ full pipeline; the components can also be invoked individually.
 | `gcloud-benchmark.sh` | GCloud `e2-highmem-4` benchmark runner — Moon vs Redis vs Qdrant on a controlled instance. |
 | `run-gcloud-bench.sh` | Driver script that provisions, runs `gcloud-benchmark.sh`, collects results, tears down. |
 
-## Pre-existing canonicals (not modified by feat/disk-offload)
+## KV benchmarks (pre-existing, referenced by CI/docs)
 
 | Script | Purpose |
 |---|---|
@@ -58,14 +58,41 @@ full pipeline; the components can also be invoked individually.
 | `bench-production.sh` | Production-like benchmark with realistic pipeline depth |
 | `bench-resources.sh` | CPU / memory profile during a long run |
 | `bench-scaling.sh` | Multi-shard scaling curves |
-| `bench-server-mode.sh` | Server bootstrap helper for the bench-* family |
-| `bench-vector.sh` / `bench-vector-production.sh` / `bench-vector-vs-competitors.sh` | Vector benchmarks (pre-PR canonicals) |
-| `bench-mixed-workload.py` / `bench-mixed-1k-compact.py` | Mixed-workload generators |
-| `bench-vs-competitors.py` | KV head-to-head driver |
-| `profile.sh` / `profile-vector.sh` | perf record + flamegraph helpers |
+
+## Vector benchmarks (pre-existing canonicals)
+
+Two orthogonal entry points. `bench-server-mode.sh` is the canonical
+head-to-head driver; it orchestrates `bench-vs-competitors.py` (the engine)
+across Moon + Redis 8.x + Qdrant and emits `BENCHMARK-REPORT.md`.
+`bench-vector-production.sh` is the Criterion-level micro-benchmark suite
+(distance kernels, HNSW build/search, FWHT, recall, memory audit, e2e).
+
+| Script | Purpose |
+|---|---|
+| `bench-server-mode.sh` | 3-way server-mode head-to-head (Moon vs Redis vs Qdrant); calls the engine below |
+| `bench-vs-competitors.py` | Shared engine: `--generate-only / --bench-{moon,redis,qdrant} / --report` |
+| `bench-vector-production.sh` | Criterion micro-benchmarks — subcommands: `distance hnsw fwht recall memory e2e` |
+| `bench-mixed-workload.py` | Mixed insert + search simulation across 5 phases |
+
+## Profiling (pre-existing)
+
+| Script | Purpose |
+|---|---|
+| `profile.sh` | CPU & memory profiling suite — generates `PROFILING-REPORT.md` |
+| `profile-vector.sh` | flamegraph / samply wrapper for HNSW search hot path |
+
+## Test suites (referenced by CI)
+
+| Script | Purpose |
+|---|---|
 | `test-commands.sh` | Command-coverage smoke test |
 | `test-consistency.sh` | Redis-vs-Moon consistency suite (ground truth) |
-| `push.sh` | Helper for the GCloud workflow |
+
+## Git / workflow helpers
+
+| Script | Purpose |
+|---|---|
+| `push.sh` | Dual-remote push: `moon` (code) + `moon-docs` (.planning/ via subtree) |
 
 ## Conventions for new scripts
 
