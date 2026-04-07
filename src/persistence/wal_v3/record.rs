@@ -174,7 +174,10 @@ pub fn read_wal_v3_record(data: &[u8]) -> Option<WalRecord> {
     let payload_raw = &data[16..record_len - 4];
 
     let payload = if flags & FLAG_LZ4_COMPRESSED != 0 {
-        lz4_flex::decompress_size_prepended(payload_raw).ok()?
+        crate::persistence::compression::safe_lz4_decompress(
+            payload_raw,
+            crate::persistence::compression::MAX_LZ4_DECOMPRESSED,
+        )?
     } else {
         payload_raw.to_vec()
     };

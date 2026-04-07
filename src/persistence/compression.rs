@@ -5,6 +5,36 @@
 // Gorilla encoding targets ZSET scores (slowly changing f64 values).
 
 // ---------------------------------------------------------------------------
+// Bounded LZ4 decompression helper
+// ---------------------------------------------------------------------------
+
+/// Maximum decompressed size for any LZ4 payload encountered on disk.
+///
+/// Sized to comfortably fit a 64 KB page plus headroom. Records claiming to
+/// decode beyond this are rejected without allocation, defending against
+/// malicious or corrupted size prefixes that would otherwise OOM the process
+/// even when the surrounding CRC32C is intact.
+pub const MAX_LZ4_DECOMPRESSED: usize = 96 * 1024;
+
+/// Decompress an `lz4_flex::compress_prepend_size` payload with an upper
+/// bound on the decoded size.
+///
+/// Reads the 4-byte little-endian size prefix manually, rejects sizes that
+/// exceed `max`, then performs a single allocation of exactly the claimed
+/// size. Returns `None` for any malformed or oversized payload.
+#[inline]
+pub fn safe_lz4_decompress(input: &[u8], max: usize) -> Option<Vec<u8>> {
+    if input.len() < 4 {
+        return None;
+    }
+    let claimed = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    if claimed == 0 || claimed > max {
+        return None;
+    }
+    lz4_flex::decompress(&input[4..], claimed).ok()
+}
+
+// ---------------------------------------------------------------------------
 // Zigzag + Varint helpers
 // ---------------------------------------------------------------------------
 
@@ -538,5 +568,37 @@ mod tests {
         for (a, b) in decoded.iter().zip(input.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    #[test]
+    fn safe_lz4_decompress_roundtrips_valid_payload() {
+        let original = vec![0xABu8; 4096];
+        let compressed = lz4_flex::compress_prepend_size(&original);
+        let decoded = super::safe_lz4_decompress(&compressed, super::MAX_LZ4_DECOMPRESSED)
+            .expect("valid payload decodes");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn safe_lz4_decompress_rejects_oversized_size_prefix() {
+        // Craft a 4-byte prefix claiming a 1 GB decompressed size, then a few
+        // junk bytes for the lz4 block. The helper must reject without
+        // touching `lz4_flex::decompress`.
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(&(1u32 << 30).to_le_bytes());
+        crafted.extend_from_slice(&[0u8; 16]);
+        assert!(super::safe_lz4_decompress(&crafted, super::MAX_LZ4_DECOMPRESSED).is_none());
+    }
+
+    #[test]
+    fn safe_lz4_decompress_rejects_short_input() {
+        assert!(super::safe_lz4_decompress(&[], super::MAX_LZ4_DECOMPRESSED).is_none());
+        assert!(super::safe_lz4_decompress(&[1, 2, 3], super::MAX_LZ4_DECOMPRESSED).is_none());
+    }
+
+    #[test]
+    fn safe_lz4_decompress_rejects_zero_size_prefix() {
+        let crafted = vec![0u8; 8];
+        assert!(super::safe_lz4_decompress(&crafted, super::MAX_LZ4_DECOMPRESSED).is_none());
     }
 }

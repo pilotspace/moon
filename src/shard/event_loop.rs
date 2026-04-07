@@ -301,15 +301,12 @@ impl super::Shard {
         }
 
         #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
-        {
-            if per_shard_monoio_listener.is_none() {
-                info!("Shard {} started (monoio, conn_rx fallback)", self.id);
-            }
+        if per_shard_monoio_listener.is_none() {
+            info!("Shard {} started (monoio, conn_rx fallback)", self.id);
         }
 
         let dispatch_tx = Rc::new(RefCell::new(producers));
-        // Use pre-shared Arc<RwLock<PubSubRegistry>> for this shard.
-        // Initialize with shard's restored registry data (from persistence/snapshot).
+        // Use pre-shared Arc<RwLock<PubSubRegistry>> seeded from snapshot.
         let pubsub_arc = all_pubsub_registries[self.id].clone();
         {
             let mut reg = pubsub_arc.write();
@@ -321,7 +318,7 @@ impl super::Shard {
         let remote_sub_map_arc = all_remote_sub_maps[self.id].clone();
         let num_shards = self.num_shards;
 
-        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
+        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA.
         let lua_rc: Rc<RefCell<Option<Rc<mlua::Lua>>>> = Rc::new(RefCell::new(None));
         let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
 
@@ -334,36 +331,28 @@ impl super::Shard {
             .read()
             .map(|cfg| cfg.appendonly != "no")
             .unwrap_or(false);
-        let mut wal_writer: Option<WalWriter> = if let Some(ref dir) = persistence_dir {
-            if appendonly_enabled {
-                match WalWriter::new(shard_id, std::path::Path::new(dir)) {
-                    Ok(w) => {
-                        info!("Shard {}: WAL writer initialized", shard_id);
-                        Some(w)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
-                        None
-                    }
+        let mut wal_writer: Option<WalWriter> = match (&persistence_dir, appendonly_enabled) {
+            (Some(dir), true) => match WalWriter::new(shard_id, std::path::Path::new(dir)) {
+                Ok(w) => {
+                    info!("Shard {}: WAL writer initialized", shard_id);
+                    Some(w)
                 }
-            } else {
-                info!(
-                    "Shard {}: WAL skipped (appendonly disabled, snapshot-only persistence)",
-                    shard_id
-                );
+                Err(e) => {
+                    tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
+                    None
+                }
+            },
+            (Some(_), false) => {
+                info!("Shard {}: WAL skipped (appendonly=no)", shard_id);
                 None
             }
-        } else {
-            None
+            (None, _) => None,
         };
 
         // Disk-offload base directory (None when disk-offload is disabled).
-        let disk_offload_base: Option<std::path::PathBuf> = if server_config.disk_offload_enabled()
-        {
-            Some(server_config.effective_disk_offload_dir())
-        } else {
-            None
-        };
+        let disk_offload_base: Option<std::path::PathBuf> = server_config
+            .disk_offload_enabled()
+            .then(|| server_config.effective_disk_offload_dir());
 
         // Per-shard WAL v3 writer (created only when disk-offload is enabled).
         // Provides per-record LSN tracking and FPI support for checkpoint-based recovery.
@@ -529,9 +518,6 @@ impl super::Shard {
 
         // Shared spill file ID counter for connection handlers + event loop.
         // Rc<Cell<u64>> is safe: monoio is single-threaded per shard.
-        // Event loop syncs its local `next_file_id` TO this Cell before spawning
-        // connections, and syncs FROM this Cell at top of each timer tick (in case
-        // handlers incremented it via async spill eviction).
         let spill_sender: Option<
             flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>,
         > = spill_thread.as_ref().map(|st| st.sender());
@@ -539,10 +525,8 @@ impl super::Shard {
             std::rc::Rc::new(std::cell::Cell::new(1));
         let mut next_file_id: u64 = 1;
         let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
-        // Suppress unused warnings for tokio path (these are used in monoio handler only)
-        let _ = &spill_sender;
-        let _ = &spill_file_id;
-        let _ = &disk_offload_dir;
+        // Tokio path doesn't take these into the spawn signatures; suppress warnings.
+        let (_, _, _) = (&spill_sender, &spill_file_id, &disk_offload_dir);
 
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
@@ -563,8 +547,7 @@ impl super::Shard {
             (server_config.segment_warm_after * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
         let mut warm_check_interval = TimerImpl::interval(Duration::from_millis(warm_poll_ms));
         // Cold tier transition check: poll at min(60s, segment_cold_after) so the
-        // timer fires within one cold-age window. Default cold_after=86400 → 60s poll.
-        // Short cold_after (e.g. 15s for testing) → poll every 15s.
+        // timer fires within one cold-age window (default 60s; short for testing).
         let cold_poll_secs = if server_config.segment_cold_after > 0 {
             server_config.segment_cold_after.min(60)
         } else {
@@ -1067,40 +1050,18 @@ impl super::Shard {
                 }
                 // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
-                    // Poll spill completions from background thread
-                    if let Some(ref spill_t) = spill_thread {
-                        persistence_tick::apply_spill_completions(
-                            spill_t,
-                            &mut shard_manifest,
-                            &shard_databases,
-                            shard_id,
-                        );
-                    }
-
-                    if server_config.disk_offload_enabled()
-                        && persistence_tick::should_run_pressure_cascade(
-                            &runtime_config,
-                            &server_config,
-                            &shard_databases,
-                            shard_id,
-                        )
-                    {
-                        persistence_tick::handle_memory_pressure(
-                            &page_cache,
-                            &shard_databases,
-                            shard_id,
-                            &runtime_config,
-                            &server_config,
-                            &mut shard_manifest,
-                            &mut next_file_id,
-                            &mut wal_v3_writer,
-                            spill_thread.as_ref(),
-                        );
-                    } else {
-                        timers::run_eviction(&shard_databases, shard_id, &runtime_config);
-                    }
-                    // Sync file ID back to shared Cell for connection handlers
-                    spill_file_id.set(next_file_id);
+                    persistence_tick::run_eviction_tick(
+                        spill_thread.as_ref(),
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                        &server_config,
+                        &runtime_config,
+                        &page_cache,
+                        &mut next_file_id,
+                        &mut wal_v3_writer,
+                        &spill_file_id,
+                    );
 
                     // Reap idle io_uring connections (tokio+io_uring path).
                     // Cleans up CLOSE_WAIT connections where the multishot recv
@@ -1112,16 +1073,12 @@ impl super::Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
-                    // Drain final spill completions before shutdown
-                    if let Some(ref spill_t) = spill_thread {
-                        persistence_tick::apply_spill_completions(
-                            spill_t, &mut shard_manifest, &shard_databases, shard_id,
-                        );
-                    }
-                    if let Some(st) = spill_thread.take() {
-                        st.shutdown();
-                        info!("Shard {}: spill background thread shut down", shard_id);
-                    }
+                    persistence_tick::drain_and_shutdown_spill(
+                        &mut spill_thread,
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                    );
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
@@ -1481,40 +1438,18 @@ impl super::Shard {
                 }
                 // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
-                    // Poll spill completions from background thread
-                    if let Some(ref spill_t) = spill_thread {
-                        persistence_tick::apply_spill_completions(
-                            spill_t,
-                            &mut shard_manifest,
-                            &shard_databases,
-                            shard_id,
-                        );
-                    }
-
-                    if server_config.disk_offload_enabled()
-                        && persistence_tick::should_run_pressure_cascade(
-                            &runtime_config,
-                            &server_config,
-                            &shard_databases,
-                            shard_id,
-                        )
-                    {
-                        persistence_tick::handle_memory_pressure(
-                            &page_cache,
-                            &shard_databases,
-                            shard_id,
-                            &runtime_config,
-                            &server_config,
-                            &mut shard_manifest,
-                            &mut next_file_id,
-                            &mut wal_v3_writer,
-                            spill_thread.as_ref(),
-                        );
-                    } else {
-                        timers::run_eviction(&shard_databases, shard_id, &runtime_config);
-                    }
-                    // Sync file ID back to shared Cell for connection handlers
-                    spill_file_id.set(next_file_id);
+                    persistence_tick::run_eviction_tick(
+                        spill_thread.as_ref(),
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                        &server_config,
+                        &runtime_config,
+                        &page_cache,
+                        &mut next_file_id,
+                        &mut wal_v3_writer,
+                        &spill_file_id,
+                    );
 
                     // Reap idle io_uring connections every ~5s (50 ticks × 100ms).
                     // Cleans up CLOSE_WAIT connections where the multishot recv
@@ -1526,16 +1461,12 @@ impl super::Shard {
                 // Shutdown
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down (monoio)", self.id);
-                    // Drain final spill completions before shutdown
-                    if let Some(ref spill_t) = spill_thread {
-                        persistence_tick::apply_spill_completions(
-                            spill_t, &mut shard_manifest, &shard_databases, shard_id,
-                        );
-                    }
-                    if let Some(st) = spill_thread.take() {
-                        st.shutdown();
-                        info!("Shard {}: spill background thread shut down", shard_id);
-                    }
+                    persistence_tick::drain_and_shutdown_spill(
+                        &mut spill_thread,
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                    );
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)

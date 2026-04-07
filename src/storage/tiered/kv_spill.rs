@@ -19,6 +19,89 @@ use crate::persistence::page::{PAGE_4K, PageType};
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::Entry;
 
+/// Outcome of building a spill page set: a finalized leaf page, the overflow
+/// chain (empty unless the value didn't fit), and the total page count.
+///
+/// Both the synchronous (`spill_to_datafile`) and asynchronous
+/// (`SpillThread::write_spill_file`) paths construct identical leaf/overflow
+/// layouts; this helper is the single source of truth for that layout.
+pub struct KvSpillPages {
+    pub leaf: KvLeafPage,
+    pub overflow: Vec<crate::persistence::kv_page::KvOverflowPage>,
+    pub total_pages: u32,
+}
+
+/// Build the leaf + overflow page set for a spilled KV entry.
+///
+/// Returns `Ok(KvSpillPages)` on success. Returns `Err(io::ErrorKind::InvalidData)`
+/// if the key itself is too large to fit in a leaf page even alongside an
+/// overflow pointer (an irrecoverable layout failure for that key).
+pub fn build_kv_spill_pages(
+    key: &[u8],
+    value_bytes: &[u8],
+    value_type: ValueType,
+    flags: u8,
+    ttl_ms: Option<u64>,
+    file_id: u64,
+) -> io::Result<KvSpillPages> {
+    let mut leaf = KvLeafPage::new(0, file_id);
+
+    let (overflow, total_pages) = match leaf.insert(key, value_bytes, value_type, flags, ttl_ms) {
+        Ok(_) => (Vec::new(), 1u32),
+        Err(PageFull) => {
+            // Build the overflow chain and reinsert the key with an overflow pointer.
+            let chain = build_overflow_chain(value_bytes, file_id, 1);
+            let chain_len = chain.len() as u32;
+            let overflow_ptr = 1u32.to_le_bytes();
+            let overflow_flags = flags | entry_flags::OVERFLOW;
+            match leaf.insert(key, &overflow_ptr, value_type, overflow_flags, ttl_ms) {
+                Ok(_) => {}
+                Err(PageFull) => {
+                    warn!(
+                        key_len = key.len(),
+                        "kv_spill: key too large for leaf page even with overflow pointer"
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "key too large for leaf page",
+                    ));
+                }
+            }
+            (chain, 1 + chain_len)
+        }
+    };
+
+    leaf.finalize();
+
+    Ok(KvSpillPages {
+        leaf,
+        overflow,
+        total_pages,
+    })
+}
+
+/// Write a previously-built `KvSpillPages` to `{shard_dir}/data/heap-{file_id:06}.mpf`.
+///
+/// Returns the byte size of the written file. The caller is responsible for
+/// updating the manifest / cold index after this returns.
+pub fn write_kv_spill_pages(
+    shard_dir: &Path,
+    file_id: u64,
+    pages: &KvSpillPages,
+) -> io::Result<u64> {
+    let data_dir = shard_dir.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let file_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
+
+    if pages.overflow.is_empty() {
+        write_datafile(&file_path, &[&pages.leaf])?;
+    } else {
+        write_datafile_mixed(&file_path, &pages.leaf, &pages.overflow)?;
+    }
+
+    Ok((pages.total_pages as u64) * (PAGE_4K as u64))
+}
+
 /// Spill a single evicted KV entry to a DataFile on disk.
 ///
 /// Creates a single-page `.mpf` file at `{shard_dir}/data/heap-{file_id:06}.mpf`,
@@ -40,8 +123,8 @@ pub fn spill_to_datafile(
     manifest: &mut ShardManifest,
     cold_index: Option<&mut super::cold_index::ColdIndex>,
 ) -> io::Result<()> {
-    // Determine value type and extract bytes.
-    // For collections, serialize via kv_serde; for strings, borrow directly.
+    // Determine value type and extract bytes. For collections, serialize via
+    // kv_serde; for strings, borrow directly.
     let collection_buf: Vec<u8>;
     let val_ref = entry.as_redis_value();
     let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
@@ -73,54 +156,18 @@ pub fn spill_to_datafile(
         None
     };
 
-    // Create page and insert entry
-    let mut page = KvLeafPage::new(0, file_id);
-    let overflow_pages: Vec<crate::persistence::kv_page::KvOverflowPage>;
-    let total_pages: u32;
-
-    match page.insert(key, value_bytes, value_type, flags, ttl_ms) {
-        Ok(_) => {
-            overflow_pages = Vec::new();
-            total_pages = 1;
+    // Build leaf + overflow via the shared helper. A "key too large" failure
+    // is non-fatal here (legacy behavior) — log and skip the spill.
+    let pages = match build_kv_spill_pages(key, value_bytes, value_type, flags, ttl_ms, file_id) {
+        Ok(p) => p,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            warn!(key = %String::from_utf8_lossy(key), "kv_spill: skipping oversized key");
+            return Ok(());
         }
-        Err(PageFull) => {
-            // Build overflow chain for the full value
-            let chain = build_overflow_chain(value_bytes, file_id, 1);
-            let chain_len = chain.len() as u32;
+        Err(e) => return Err(e),
+    };
 
-            // Build overflow pointer: start_page_idx u32 LE (= 1, first page after leaf)
-            let overflow_ptr = 1u32.to_le_bytes();
-            // Insert the pointer into the leaf with OVERFLOW flag
-            let overflow_flags = flags | entry_flags::OVERFLOW;
-            match page.insert(key, &overflow_ptr, value_type, overflow_flags, ttl_ms) {
-                Ok(_) => {}
-                Err(PageFull) => {
-                    // Key itself is too large even for the overflow pointer
-                    warn!(
-                        key = %String::from_utf8_lossy(key),
-                        key_len = key.len(),
-                        "kv_spill: key too large for leaf page even with overflow pointer"
-                    );
-                    return Ok(());
-                }
-            }
-            overflow_pages = chain;
-            total_pages = 1 + chain_len;
-        }
-    }
-    page.finalize();
-
-    // Ensure data directory exists
-    let data_dir = shard_dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-
-    // Write DataFile
-    let file_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
-    if overflow_pages.is_empty() {
-        write_datafile(&file_path, &[&page])?;
-    } else {
-        write_datafile_mixed(&file_path, &page, &overflow_pages)?;
-    }
+    let byte_size = write_kv_spill_pages(shard_dir, file_id, &pages)?;
 
     // Register in manifest
     manifest.add_file(FileEntry {
@@ -129,8 +176,8 @@ pub fn spill_to_datafile(
         status: FileStatus::Active,
         tier: StorageTier::Hot,
         page_size_log2: 12, // 4KB = 2^12
-        page_count: total_pages,
-        byte_size: (total_pages as u64) * (PAGE_4K as u64),
+        page_count: pages.total_pages,
+        byte_size,
         created_lsn: 0,
         min_key_hash: 0,
         max_key_hash: 0,

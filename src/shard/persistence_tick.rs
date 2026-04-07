@@ -257,6 +257,73 @@ pub(crate) fn check_cold_transitions(
 // ---------------------------------------------------------------------------
 
 /// Poll background spill thread for completed pwrite operations.
+/// Run the eviction tick body shared between the tokio and monoio event
+/// loops.
+///
+/// Drains background spill completions, runs the memory-pressure cascade if
+/// enabled, otherwise falls back to plain `timers::run_eviction`. Finally
+/// publishes the latest `next_file_id` back to the shared `Rc<Cell>` so
+/// connection handlers spawning fresh spills do not collide on file IDs.
+///
+/// Extracted from `event_loop.rs` so the file stays under the 1500-line cap
+/// and so both runtime arms cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_eviction_tick(
+    spill_thread: Option<&crate::storage::tiered::spill_thread::SpillThread>,
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+    server_config: &std::sync::Arc<crate::config::ServerConfig>,
+    runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
+    page_cache: &Option<PageCache>,
+    next_file_id: &mut u64,
+    wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    spill_file_id: &std::rc::Rc<std::cell::Cell<u64>>,
+) {
+    if let Some(spill_t) = spill_thread {
+        apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
+    }
+
+    if server_config.disk_offload_enabled()
+        && should_run_pressure_cascade(runtime_config, server_config, shard_databases, shard_id)
+    {
+        handle_memory_pressure(
+            page_cache,
+            shard_databases,
+            shard_id,
+            runtime_config,
+            server_config,
+            shard_manifest,
+            next_file_id,
+            wal_v3_writer,
+            spill_thread,
+        );
+    } else {
+        super::timers::run_eviction(shard_databases, shard_id, runtime_config);
+    }
+
+    // Sync file ID back to the shared Cell so connection handlers see it.
+    spill_file_id.set(*next_file_id);
+}
+
+/// Drain any final spill completions and shut down the spill thread.
+///
+/// Shared between the tokio and monoio shutdown arms in `event_loop.rs`.
+pub(crate) fn drain_and_shutdown_spill(
+    spill_thread: &mut Option<crate::storage::tiered::spill_thread::SpillThread>,
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+) {
+    if let Some(spill_t) = spill_thread.as_ref() {
+        apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
+    }
+    if let Some(st) = spill_thread.take() {
+        st.shutdown();
+        tracing::info!("Shard {}: spill background thread shut down", shard_id);
+    }
+}
+
 /// For each successful completion: update manifest and ColdIndex.
 /// Called on each eviction tick from the event loop.
 pub(crate) fn apply_spill_completions(

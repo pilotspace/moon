@@ -11,17 +11,28 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Cumulative count of `SpillCompletion`s dropped because the event-loop-side
+/// completion channel was full. Each drop means the data is on disk but the
+/// in-memory `cold_index` slot was not refreshed; the next checkpoint repairs
+/// it from the manifest.
+static SPILL_COMPLETION_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the cumulative number of dropped spill completions across all
+/// shards. Exposed for INFO / metrics scraping.
+#[inline]
+pub fn spill_completion_dropped_total() -> u64 {
+    SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
+}
 
 use bytes::Bytes;
 use tracing::warn;
 
-use crate::persistence::kv_page::{
-    KvLeafPage, PageFull, ValueType, build_overflow_chain, entry_flags, write_datafile,
-    write_datafile_mixed,
-};
+use crate::persistence::kv_page::ValueType;
 use crate::persistence::manifest::{FileEntry, FileStatus, StorageTier};
-use crate::persistence::page::{PAGE_4K, PageType};
+use crate::persistence::page::PageType;
+use crate::storage::tiered::kv_spill::{build_kv_spill_pages, write_kv_spill_pages};
 
 /// Request sent from event loop to background spill thread.
 ///
@@ -66,68 +77,21 @@ pub struct SpillCompletion {
 
 /// Write a spill file to disk without touching manifest or ColdIndex.
 ///
-/// Returns `(page_count, byte_size)` on success. This is the I/O-only
-/// portion extracted from `kv_spill::spill_to_datafile`.
+/// Returns `(page_count, byte_size)` on success. Delegates page layout to
+/// `kv_spill::build_kv_spill_pages` so the on-disk format is bit-identical
+/// to the synchronous (`spill_to_datafile`) path.
 fn write_spill_file(req: &SpillRequest) -> io::Result<(u32, u64)> {
-    let mut page = KvLeafPage::new(0, req.file_id);
-    let overflow_pages: Vec<crate::persistence::kv_page::KvOverflowPage>;
-    let total_pages: u32;
-
-    match page.insert(
+    let pages = build_kv_spill_pages(
         req.key.as_ref(),
         req.value_bytes.as_ref(),
         req.value_type,
         req.flags,
         req.ttl_ms,
-    ) {
-        Ok(_) => {
-            overflow_pages = Vec::new();
-            total_pages = 1;
-        }
-        Err(PageFull) => {
-            let chain = build_overflow_chain(req.value_bytes.as_ref(), req.file_id, 1);
-            let chain_len = chain.len() as u32;
+        req.file_id,
+    )?;
 
-            let overflow_ptr = 1u32.to_le_bytes();
-            let overflow_flags = req.flags | entry_flags::OVERFLOW;
-            match page.insert(
-                req.key.as_ref(),
-                &overflow_ptr,
-                req.value_type,
-                overflow_flags,
-                req.ttl_ms,
-            ) {
-                Ok(_) => {}
-                Err(PageFull) => {
-                    warn!(
-                        key_len = req.key.len(),
-                        "spill_thread: key too large for leaf page even with overflow pointer"
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "key too large for leaf page",
-                    ));
-                }
-            }
-            overflow_pages = chain;
-            total_pages = 1 + chain_len;
-        }
-    }
-    page.finalize();
-
-    // Ensure data directory exists
-    let data_dir = req.shard_dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-
-    // Write DataFile
-    let file_path = data_dir.join(format!("heap-{:06}.mpf", req.file_id));
-    if overflow_pages.is_empty() {
-        write_datafile(&file_path, &[&page])?;
-    } else {
-        write_datafile_mixed(&file_path, &page, &overflow_pages)?;
-    }
-
-    Ok((total_pages, (total_pages as u64) * (PAGE_4K as u64)))
+    let byte_size = write_kv_spill_pages(&req.shard_dir, req.file_id, &pages)?;
+    Ok((pages.total_pages, byte_size))
 }
 
 /// Background thread that performs pwrite for evicted KV entries.
@@ -145,12 +109,18 @@ pub struct SpillThread {
 impl SpillThread {
     /// Spawn a new background spill thread for the given shard.
     ///
-    /// Creates two flume channels:
-    /// - `request`: bounded(64), event loop -> bg thread
-    /// - `completion`: unbounded, bg thread -> event loop
+    /// Creates two bounded flume channels:
+    /// - `request`: bounded(4096), event loop -> bg thread
+    /// - `completion`: bounded(8192), bg thread -> event loop
+    ///
+    /// The completion channel is bounded so a stalled event loop cannot let
+    /// in-flight `SpillCompletion`s accumulate without limit. The KV is
+    /// already on disk by the time a completion is dropped — the next
+    /// checkpoint rebuilds `cold_index` from the manifest, so dropping is
+    /// safe (though we count it for observability).
     pub fn new(shard_id: usize) -> Self {
         let (request_tx, request_rx) = flume::bounded::<SpillRequest>(4096);
-        let (completion_tx, completion_rx) = flume::unbounded::<SpillCompletion>();
+        let (completion_tx, completion_rx) = flume::bounded::<SpillCompletion>(8192);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_bg = stop_flag.clone();
 
@@ -236,9 +206,24 @@ impl SpillThread {
                 success,
             };
 
-            if completion_tx.send(completion).is_err() {
-                // Event loop dropped its receiver -- shutting down
-                break;
+            // Use try_send: a wedged event loop must not back-pressure the
+            // bg thread (which would in turn back-pressure eviction and
+            // defeat the entire async-spill design). On overflow we drop the
+            // completion and bump a counter; the data is already on disk and
+            // the next checkpoint will rebuild cold_index from the manifest.
+            match completion_tx.try_send(completion) {
+                Ok(()) => {}
+                Err(flume::TrySendError::Full(_)) => {
+                    SPILL_COMPLETION_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "spill_thread: completion channel full, dropping completion (total dropped: {})",
+                        SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
+                    );
+                }
+                Err(flume::TrySendError::Disconnected(_)) => {
+                    // Event loop dropped its receiver -- shutting down
+                    break;
+                }
             }
         }
     }
@@ -279,7 +264,8 @@ impl SpillThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::kv_page::{ValueType, read_datafile};
+    use crate::persistence::kv_page::{ValueType, entry_flags, read_datafile};
+    use crate::persistence::page::PAGE_4K;
     use crate::storage::entry::current_time_ms;
 
     #[test]

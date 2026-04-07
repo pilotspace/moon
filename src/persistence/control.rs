@@ -4,9 +4,10 @@
 //! Written atomically (single-sector write + fsync) and verified on read
 //! via CRC32C checksum.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::persistence::fsync::{fsync_directory, fsync_file};
+use crate::persistence::fsync::fsync_directory;
 use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 
 /// Control file payload size: 1 + 8 + 8 + 8 + 8 + 8 + 16 = 57 bytes.
@@ -78,7 +79,12 @@ impl ShardControlFile {
 
     /// Write the control file atomically to disk.
     ///
-    /// Produces exactly 4096 bytes (one PAGE_4K), fsyncs file and parent directory.
+    /// Produces exactly 4096 bytes (one PAGE_4K). Uses the standard
+    /// temp-file + fsync + `rename(2)` + parent-fsync sequence so that a
+    /// crash mid-write cannot leave the canonical control file in a
+    /// truncated or partial state. On Linux, `rename` over an existing file
+    /// is atomic, and the parent-directory fsync makes the new directory
+    /// entry durable.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
         let mut buf = [0u8; PAGE_4K];
 
@@ -100,9 +106,22 @@ impl ShardControlFile {
         // Compute CRC32C over payload and embed in header
         MoonPageHeader::compute_checksum(&mut buf);
 
-        // Write + fsync
-        std::fs::write(path, &buf)?;
-        fsync_file(path)?;
+        // 1. Write to a temp sibling file and fsync its data.
+        let tmp_path = control_tmp_path(path);
+        {
+            let mut tmp = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(&buf)?;
+            tmp.sync_data()?;
+        }
+
+        // 2. Atomic rename over the canonical path.
+        std::fs::rename(&tmp_path, path)?;
+
+        // 3. Fsync the parent directory so the new dirent is durable.
         if let Some(parent) = path.parent() {
             fsync_directory(parent)?;
         }
@@ -187,6 +206,14 @@ impl ShardControlFile {
     pub fn control_path(shard_dir: &Path, shard_id: usize) -> PathBuf {
         shard_dir.join(format!("shard-{shard_id}.control"))
     }
+}
+
+/// Build the temp-file sibling path used by the atomic write sequence.
+#[inline]
+fn control_tmp_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".tmp");
+    PathBuf::from(p)
 }
 
 #[cfg(test)]
@@ -314,5 +341,57 @@ mod tests {
         assert_eq!(ShardState::from_u8(0), None);
         assert_eq!(ShardState::from_u8(5), None);
         assert_eq!(ShardState::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_atomic_write_overwrites_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-7.control");
+
+        // First commit.
+        let mut ctl_a = ShardControlFile::new([0xAA; 16]);
+        ctl_a.last_checkpoint_lsn = 100;
+        ctl_a.write(&path).unwrap();
+
+        // Second commit must atomically replace the first.
+        let mut ctl_b = ShardControlFile::new([0xBB; 16]);
+        ctl_b.last_checkpoint_lsn = 200;
+        ctl_b.write(&path).unwrap();
+
+        // Tmp sibling must be gone (consumed by rename).
+        let tmp_sibling = control_tmp_path(&path);
+        assert!(
+            !tmp_sibling.exists(),
+            "tmp sibling should not exist after successful write"
+        );
+
+        let read_back = ShardControlFile::read(&path).unwrap();
+        assert_eq!(read_back.last_checkpoint_lsn, 200);
+        assert_eq!(read_back.shard_uuid, [0xBB; 16]);
+    }
+
+    #[test]
+    fn test_corrupted_control_file_recovers_via_manual_replace() {
+        // Simulate a partially-written control file: truncate to 2 KB.
+        // After the atomic-rename fix, a real crash mid-write would leave
+        // the canonical path untouched (the tmp sibling is what's torn).
+        // This test confirms that even if the canonical file IS corrupted
+        // out-of-band, ShardControlFile::read still rejects it cleanly via
+        // CRC and an admin can replace it from the tmp sibling.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.control");
+
+        let ctl = ShardControlFile::new([0x42; 16]);
+        ctl.write(&path).unwrap();
+
+        // Corrupt the canonical file.
+        let buf = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &buf[..2048]).unwrap();
+        assert!(ShardControlFile::read(&path).is_err());
+
+        // A subsequent successful write must heal the file.
+        ctl.write(&path).unwrap();
+        let read_back = ShardControlFile::read(&path).unwrap();
+        assert_eq!(read_back.shard_uuid, [0x42; 16]);
     }
 }

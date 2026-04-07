@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use rand::seq::IndexedRandom;
+use rand::RngExt;
+use smallvec::SmallVec;
 use tracing::warn;
 
 use crate::config::RuntimeConfig;
@@ -15,6 +16,75 @@ use crate::storage::entry::lfu_decay;
 use crate::storage::tiered::kv_serde;
 use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::spill_thread::SpillRequest;
+
+/// Maximum number of victim candidates we will sample in a single
+/// `find_victim_*` call. This bounds the inline storage of the SmallVec
+/// returned by `sample_random_keys` and matches a generous upper bound on
+/// the user-tunable `maxmemory-samples` (Redis default 5; we accept up to 16).
+const MAX_VICTIM_SAMPLES: usize = 16;
+
+/// Reservoir-sample up to `samples` random keys from the database without
+/// materializing the entire keyspace.
+///
+/// Algorithm: pick a random `Segment`, then reservoir-sample one slot inside
+/// it (Algorithm R with reservoir size 1). Repeat until either `samples` keys
+/// have been collected or the per-segment retry budget is exhausted (which
+/// can happen if `volatile_only` is true and most segments contain no
+/// volatile keys). The returned vector is bounded by `MAX_VICTIM_SAMPLES`.
+///
+/// Cost: each iteration touches one segment (≤ a few hundred slots), so the
+/// total work per call is `O(samples × segment_capacity)` instead of
+/// `O(total_keys)` — the previous implementation cloned every key in the
+/// database into a `Vec<CompactKey>` per eviction loop iteration, which
+/// dominated CPU cost on hot eviction.
+fn sample_random_keys(
+    db: &Database,
+    samples: usize,
+    volatile_only: bool,
+) -> SmallVec<[CompactKey; MAX_VICTIM_SAMPLES]> {
+    let table = db.data();
+    let mut out: SmallVec<[CompactKey; MAX_VICTIM_SAMPLES]> = SmallVec::new();
+
+    let seg_count = table.segment_count();
+    if seg_count == 0 || table.is_empty() {
+        return out;
+    }
+    let want = samples.min(MAX_VICTIM_SAMPLES);
+    if want == 0 {
+        return out;
+    }
+
+    let mut rng = rand::rng();
+    // Per-segment retries: bounded so a sparse volatile keyspace cannot
+    // turn this into an unbounded loop.
+    let max_attempts = want.saturating_mul(8);
+    let mut attempts = 0usize;
+
+    while out.len() < want && attempts < max_attempts {
+        attempts += 1;
+        let seg_idx = rng.random_range(0..seg_count);
+        let seg = table.segment(seg_idx);
+
+        // Reservoir-sample one occupied slot from this segment with the
+        // optional volatile filter applied. Algorithm R with k=1.
+        let mut chosen: Option<&CompactKey> = None;
+        let mut seen = 0u32;
+        for (k, v) in seg.iter_occupied() {
+            if volatile_only && !v.has_expiry() {
+                continue;
+            }
+            seen += 1;
+            if rng.random_range(0..seen) == 0 {
+                chosen = Some(k);
+            }
+        }
+        if let Some(k) = chosen {
+            out.push(k.clone());
+        }
+    }
+
+    out
+}
 
 /// Compare two LRU timestamps with u16 wraparound handling.
 /// Uses signed-distance comparison: treats the 16-bit clock as circular.
@@ -468,34 +538,17 @@ fn evict_one_with_spill(
 
 // ── Victim selection helpers ───────────────────────────
 
-/// Collect candidate keys for eviction (all keys or volatile-only).
-fn collect_candidate_keys(db: &Database, volatile_only: bool) -> Vec<CompactKey> {
-    if volatile_only {
-        db.data()
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        db.data().keys().cloned().collect()
-    }
-}
-
 /// Find the victim key with the oldest last_access from a random sample.
 fn find_victim_lru(db: &Database, samples: usize, volatile_only: bool) -> Option<CompactKey> {
-    let keys = collect_candidate_keys(db, volatile_only);
-    if keys.is_empty() {
+    let sampled = sample_random_keys(db, samples, volatile_only);
+    if sampled.is_empty() {
         return None;
     }
 
-    let mut rng = rand::rng();
-    let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
-
     let mut oldest_key: Option<CompactKey> = None;
-    let mut oldest_access = None;
+    let mut oldest_access: Option<u32> = None;
 
-    for key in sampled {
+    for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             let la = entry.last_access();
             match oldest_access {
@@ -503,8 +556,8 @@ fn find_victim_lru(db: &Database, samples: usize, volatile_only: bool) -> Option
                     oldest_key = Some(key.clone());
                     oldest_access = Some(la);
                 }
-                Some(ref oldest) => {
-                    if lru_is_older(la, *oldest) {
+                Some(oldest) => {
+                    if lru_is_older(la, oldest) {
                         oldest_key = Some(key.clone());
                         oldest_access = Some(la);
                     }
@@ -523,20 +576,16 @@ fn find_victim_lfu(
     lfu_decay_time: u64,
     volatile_only: bool,
 ) -> Option<CompactKey> {
-    let keys = collect_candidate_keys(db, volatile_only);
-    if keys.is_empty() {
+    let sampled = sample_random_keys(db, samples, volatile_only);
+    if sampled.is_empty() {
         return None;
     }
 
-    let mut rng = rand::rng();
-    let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
-
     let mut evict_key: Option<CompactKey> = None;
     let mut lowest_counter: Option<u8> = None;
-    let mut oldest_access_for_tie = None;
+    let mut oldest_access_for_tie: Option<u32> = None;
 
-    for key in sampled {
+    for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             let effective_counter =
                 lfu_decay(entry.access_counter(), entry.last_access(), lfu_decay_time);
@@ -564,36 +613,20 @@ fn find_victim_lfu(
 
 /// Find a random victim key.
 fn find_victim_random(db: &Database, volatile_only: bool) -> Option<CompactKey> {
-    let keys = collect_candidate_keys(db, volatile_only);
-    if keys.is_empty() {
-        return None;
-    }
-
-    let mut rng = rand::rng();
-    keys.choose(&mut rng).cloned()
+    sample_random_keys(db, 1, volatile_only).into_iter().next()
 }
 
 /// Find the victim key with the soonest TTL expiration from a random sample.
 fn find_victim_volatile_ttl(db: &Database, samples: usize) -> Option<CompactKey> {
-    let keys: Vec<CompactKey> = db
-        .data()
-        .iter()
-        .filter(|(_, e)| e.has_expiry())
-        .map(|(k, _)| k.clone())
-        .collect();
-
-    if keys.is_empty() {
+    let sampled = sample_random_keys(db, samples, true);
+    if sampled.is_empty() {
         return None;
     }
-
-    let mut rng = rand::rng();
-    let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
 
     let mut evict_key: Option<CompactKey> = None;
     let mut soonest_expiry: Option<u64> = None;
 
-    for key in sampled {
+    for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             if entry.has_expiry() {
                 let exp = entry.expires_at_ms(db.base_timestamp());
