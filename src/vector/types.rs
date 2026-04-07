@@ -18,19 +18,29 @@ pub enum DistanceMetric {
     InnerProduct = 2,
 }
 
-/// A single search result: (distance, vector ID).
+/// A single search result: (distance, vector ID, key_hash).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchResult {
     /// Distance or similarity score.
     pub distance: f32,
-    /// Internal vector ID.
+    /// Internal vector ID (global_id after segment remap).
     pub id: VectorId,
+    /// xxh64 hash of the original Redis HASH key. Used to look up the
+    /// original key string via `VectorIndex.key_hash_to_key` so FT.SEARCH
+    /// returns `doc:N` instead of `vec:<internal_id>`.
+    /// Default 0 means "unknown" — caller falls back to `vec:<id>` form.
+    pub key_hash: u64,
 }
 
 impl SearchResult {
     #[inline]
     pub fn new(distance: f32, id: VectorId) -> Self {
-        Self { distance, id }
+        Self { distance, id, key_hash: 0 }
+    }
+
+    #[inline]
+    pub fn with_key_hash(distance: f32, id: VectorId, key_hash: u64) -> Self {
+        Self { distance, id, key_hash }
     }
 }
 

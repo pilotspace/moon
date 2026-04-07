@@ -100,16 +100,22 @@ pub struct SearchScratch {
     pub(crate) visited: BitVec,
     /// Pre-allocated buffer for FWHT-rotated query (reused across searches).
     pub(crate) query_rotated: AlignedBuffer<f32>,
+    /// Pre-allocated ADC LUT buffer. Sized for 32 entries/coord × max padded_dim.
+    /// Reused across searches -- eliminates 32KB-65KB allocation per query.
+    pub(crate) adc_lut: Vec<f32>,
 }
 
 impl SearchScratch {
     /// Create scratch space for graphs up to `max_nodes` and queries up to `padded_dim`.
     pub fn new(max_nodes: u32, padded_dim: u32) -> Self {
+        // Allocate LUT for worst case: sub-centroid mode (32 entries/coord).
+        let lut_cap = padded_dim as usize * 32;
         Self {
             candidates: BinaryHeap::with_capacity(256),
             results: BinaryHeap::with_capacity(256),
             visited: BitVec::new(max_nodes),
             query_rotated: AlignedBuffer::new(padded_dim as usize),
+            adc_lut: Vec::with_capacity(lut_cap),
         }
     }
 
@@ -121,6 +127,7 @@ impl SearchScratch {
         self.candidates.clear();
         self.results.clear();
         self.visited.clear_all(num_nodes);
+        self.adc_lut.clear();
     }
 }
 
@@ -285,14 +292,21 @@ pub fn hnsw_search_filtered(
     // Guard use_subcent on sub_table availability to avoid panic
     let use_subcent = use_subcent && sub_table.is_some();
     let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
-    let mut adc_lut = Vec::with_capacity(padded_dim * entries_per_coord);
+
+    // Use pre-allocated scratch.adc_lut (zero alloc per query).
+    // Capacity was reserved in SearchScratch::new() for worst case (32 entries).
+    // clear() is called in scratch.clear() at the start of this function.
+    let lut_needed = padded_dim * entries_per_coord;
+    if scratch.adc_lut.capacity() < lut_needed {
+        scratch.adc_lut.reserve(lut_needed - scratch.adc_lut.capacity());
+    }
 
     if let Some(st) = sub_table.filter(|_| use_subcent) {
         for j in 0..padded_dim {
             let q = q_rotated[j];
             for e in 0..32 {
                 let d = q - st.table[e];
-                adc_lut.push(d * d);
+                scratch.adc_lut.push(d * d);
             }
         }
     } else {
@@ -300,10 +314,12 @@ pub fn hnsw_search_filtered(
             let q = q_rotated[j];
             for c in 0..16 {
                 let d = q - codebook[c];
-                adc_lut.push(d * d);
+                scratch.adc_lut.push(d * d);
             }
         }
     }
+    // Take an immutable slice reference for use in closures below.
+    let adc_lut: &[f32] = &scratch.adc_lut;
 
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;
@@ -311,33 +327,132 @@ pub fn hnsw_search_filtered(
     let _epc = entries_per_coord;
 
     // LUT-based unbounded distance with optional sub-centroid scoring.
+    // Hot path: processes `code_len` bytes (nibble-packed TQ codes) with LUT lookups.
+    // For 384d: code_len ≈ 192, 384 nibble lookups per candidate, called ~500 times per query.
     let dist_bfs = |bfs_pos: u32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
         let norm_sq = norm * norm;
-        let mut sum0 = 0.0f32;
-        let mut sum1 = 0.0f32;
 
         if use_subcent {
+            // Hot path: 90%+ of search time. Optimization strategy:
+            //   - Every 4 code bytes (8 nibbles) consume exactly 1 sign byte
+            //     (since qi = i*2, so 4 bytes × 2 nibbles = 8 sign bits = 1 sign byte)
+            //   - Process 4 code bytes per iteration with 8 independent accumulators
+            //     for CPU instruction-level parallelism (8-wide ILP)
+            //   - Unsafe pointer arithmetic to eliminate bounds checks
+            //   - Sign bits extracted by single load + unpacking via shifts
+            //
+            // SAFETY:
+            //   - code_only.len() == code_len == padded_dim / 2
+            //   - qi = i*2 < padded_dim, so qi*32 + 31 < padded_dim*32 == adc_lut.len()
+            //   - sign_off + (code_len/4) < sub_sign_bpv * num_vectors == sub_centroid_signs.len()
+            //     (caller guarantees sub_sign_bpv bytes per vector, covering code_len/4 sign bytes)
+            let lut_ptr = adc_lut.as_ptr();
+            let code_ptr = code_only.as_ptr();
+            let sign_ptr = unsafe { sub_centroid_signs.as_ptr().add(bfs_pos as usize * sub_sign_bpv) };
+            let n = code_only.len();
+            let chunks = n / 4;
+            let rem = n % 4;
+
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut s3 = 0.0f32;
+            let mut s4 = 0.0f32;
+            let mut s5 = 0.0f32;
+            let mut s6 = 0.0f32;
+            let mut s7 = 0.0f32;
+
+            for c in 0..chunks {
+                let i = c * 4;
+                unsafe {
+                    // Load 4 code bytes + 1 sign byte (8 sign bits for 8 nibbles)
+                    let b0 = *code_ptr.add(i) as usize;
+                    let b1 = *code_ptr.add(i + 1) as usize;
+                    let b2 = *code_ptr.add(i + 2) as usize;
+                    let b3 = *code_ptr.add(i + 3) as usize;
+                    let signs = *sign_ptr.add(c) as usize;
+
+                    let qi0 = i * 2;
+                    // Each nibble index = (nibble_val * 2) + sign_bit
+                    // sign_bit for nibble j comes from bit j of signs byte
+                    s0 += *lut_ptr.add(qi0 * 32 + (b0 & 0x0F) * 2 + (signs & 1));
+                    s1 += *lut_ptr.add((qi0 + 1) * 32 + (b0 >> 4) * 2 + ((signs >> 1) & 1));
+                    s2 += *lut_ptr.add((qi0 + 2) * 32 + (b1 & 0x0F) * 2 + ((signs >> 2) & 1));
+                    s3 += *lut_ptr.add((qi0 + 3) * 32 + (b1 >> 4) * 2 + ((signs >> 3) & 1));
+                    s4 += *lut_ptr.add((qi0 + 4) * 32 + (b2 & 0x0F) * 2 + ((signs >> 4) & 1));
+                    s5 += *lut_ptr.add((qi0 + 5) * 32 + (b2 >> 4) * 2 + ((signs >> 5) & 1));
+                    s6 += *lut_ptr.add((qi0 + 6) * 32 + (b3 & 0x0F) * 2 + ((signs >> 6) & 1));
+                    s7 += *lut_ptr.add((qi0 + 7) * 32 + (b3 >> 4) * 2 + ((signs >> 7) & 1));
+                }
+            }
+            // Tail (< 4 bytes): fall back to the original bit-shuffling loop
+            let tail_start = chunks * 4;
             let sign_off = bfs_pos as usize * sub_sign_bpv;
-            for (i, &byte) in code_only.iter().enumerate() {
+            for j in 0..rem {
+                let i = tail_start + j;
+                let byte = code_only[i];
                 let qi = i * 2;
                 let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
                 let s_hi =
                     ((sub_centroid_signs[sign_off + (qi + 1) / 8] >> ((qi + 1) % 8)) & 1) as usize;
-                sum0 += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
-                sum1 += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+                s0 += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
+                s1 += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
             }
+            ((s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7)) * norm_sq
         } else {
-            for (i, &byte) in code_only.iter().enumerate() {
-                let qi = i * 2;
-                sum0 += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                sum1 += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+            // 4-way unrolled with independent accumulators for ILP.
+            // Uses unsafe get_unchecked to eliminate bounds checks in the hot loop.
+            // SAFETY: qi*16 + nibble is always < padded_dim*16 = adc_lut.len(),
+            // because i < code_only.len() == code_len, and code_len = padded_dim/2.
+            // So qi = i*2 < padded_dim, and qi*16 + 15 < padded_dim*16.
+            let lut_ptr = adc_lut.as_ptr();
+            let code_ptr = code_only.as_ptr();
+            let n = code_only.len();
+            let chunks = n / 4;
+            let rem = n % 4;
+
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut s3 = 0.0f32;
+            let mut s4 = 0.0f32;
+            let mut s5 = 0.0f32;
+            let mut s6 = 0.0f32;
+            let mut s7 = 0.0f32;
+
+            for c in 0..chunks {
+                let i = c * 4;
+                unsafe {
+                    let b0 = *code_ptr.add(i) as usize;
+                    let b1 = *code_ptr.add(i + 1) as usize;
+                    let b2 = *code_ptr.add(i + 2) as usize;
+                    let b3 = *code_ptr.add(i + 3) as usize;
+                    let qi0 = i * 2;
+                    s0 += *lut_ptr.add(qi0 * 16 + (b0 & 0x0F));
+                    s1 += *lut_ptr.add((qi0 + 1) * 16 + (b0 >> 4));
+                    s2 += *lut_ptr.add((qi0 + 2) * 16 + (b1 & 0x0F));
+                    s3 += *lut_ptr.add((qi0 + 3) * 16 + (b1 >> 4));
+                    s4 += *lut_ptr.add((qi0 + 4) * 16 + (b2 & 0x0F));
+                    s5 += *lut_ptr.add((qi0 + 5) * 16 + (b2 >> 4));
+                    s6 += *lut_ptr.add((qi0 + 6) * 16 + (b3 & 0x0F));
+                    s7 += *lut_ptr.add((qi0 + 7) * 16 + (b3 >> 4));
+                }
             }
+            // Tail (< 4 bytes)
+            let tail_start = chunks * 4;
+            for j in 0..rem {
+                let i = tail_start + j;
+                let byte = code_only[i] as usize;
+                let qi = i * 2;
+                s0 += adc_lut[qi * 16 + (byte & 0x0F)];
+                s1 += adc_lut[(qi + 1) * 16 + (byte >> 4)];
+            }
+            ((s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7)) * norm_sq
         }
-        (sum0 + sum1) * norm_sq
     };
 
     // LUT-based budgeted distance with early termination.
@@ -357,24 +472,59 @@ pub fn hnsw_search_filtered(
         let remainder = code_only.len() % check_interval;
 
         if use_subcent {
-            let sign_off = bfs_pos as usize * sub_sign_bpv;
+            // HOTTEST PATH — profile showed 90%+ of search time here.
+            // Process 4 code bytes + 1 sign byte per iteration with 8 independent accumulators.
+            // check_interval (16 bytes) = 4 chunks of 4 bytes = 4 sign bytes per budget check.
+            //
+            // SAFETY: Same invariants as the unbudgeted dist_bfs sibling:
+            //   code_only.len() == padded_dim / 2, so qi*32 + 31 < padded_dim*32 == adc_lut.len()
+            //   sign_off + (code_len/4) < sub_centroid_signs.len() (caller guarantees bpv)
+            let lut_ptr = adc_lut.as_ptr();
+            let code_ptr = code_only.as_ptr();
+            let sign_ptr = unsafe { sub_centroid_signs.as_ptr().add(bfs_pos as usize * sub_sign_bpv) };
+
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut s3 = 0.0f32;
+            let mut s4 = 0.0f32;
+            let mut s5 = 0.0f32;
+            let mut s6 = 0.0f32;
+            let mut s7 = 0.0f32;
+
             for chunk in 0..chunks {
                 let base = chunk * check_interval;
-                for j in 0..check_interval {
-                    let i = base + j;
-                    let byte = code_only[i];
-                    let qi = i * 2;
-                    let s_lo = ((sub_centroid_signs[sign_off + qi / 8] >> (qi % 8)) & 1) as usize;
-                    let s_hi = ((sub_centroid_signs[sign_off + (qi + 1) / 8] >> ((qi + 1) % 8)) & 1)
-                        as usize;
-                    sum += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
-                    sum += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
+                // Inner: 4 sub-chunks of 4 bytes each (16 bytes total)
+                for sub in 0..4 {
+                    let i = base + sub * 4;
+                    unsafe {
+                        let b0 = *code_ptr.add(i) as usize;
+                        let b1 = *code_ptr.add(i + 1) as usize;
+                        let b2 = *code_ptr.add(i + 2) as usize;
+                        let b3 = *code_ptr.add(i + 3) as usize;
+                        // 4 code bytes × 2 nibbles = 8 sign bits = 1 sign byte
+                        let signs = *sign_ptr.add(i / 4) as usize;
+
+                        let qi0 = i * 2;
+                        s0 += *lut_ptr.add(qi0 * 32 + (b0 & 0x0F) * 2 + (signs & 1));
+                        s1 += *lut_ptr.add((qi0 + 1) * 32 + (b0 >> 4) * 2 + ((signs >> 1) & 1));
+                        s2 += *lut_ptr.add((qi0 + 2) * 32 + (b1 & 0x0F) * 2 + ((signs >> 2) & 1));
+                        s3 += *lut_ptr.add((qi0 + 3) * 32 + (b1 >> 4) * 2 + ((signs >> 3) & 1));
+                        s4 += *lut_ptr.add((qi0 + 4) * 32 + (b2 & 0x0F) * 2 + ((signs >> 4) & 1));
+                        s5 += *lut_ptr.add((qi0 + 5) * 32 + (b2 >> 4) * 2 + ((signs >> 5) & 1));
+                        s6 += *lut_ptr.add((qi0 + 6) * 32 + (b3 & 0x0F) * 2 + ((signs >> 6) & 1));
+                        s7 += *lut_ptr.add((qi0 + 7) * 32 + (b3 >> 4) * 2 + ((signs >> 7) & 1));
+                    }
                 }
+                // Budget check: collapse accumulators once per check_interval
+                sum = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
                 if sum > scaled_budget {
                     return f32::MAX;
                 }
             }
+            // Tail (< check_interval bytes): fall back to scalar
             let tail = chunks * check_interval;
+            let sign_off = bfs_pos as usize * sub_sign_bpv;
             for j in 0..remainder {
                 let i = tail + j;
                 let byte = code_only[i];

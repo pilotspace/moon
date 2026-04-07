@@ -107,6 +107,10 @@ impl ImmutableSegment {
     ) -> SmallVec<[SearchResult; 32]> {
         // Use sub-centroid signs during beam (32-level LUT) when available.
         // This eliminates the separate rerank pass — beam itself is high-accuracy.
+        // Note: passing ef_search for both k and ef_search is intentional.
+        // HNSW returns up to `ef_search` candidates (no early truncation to k).
+        // This preserves candidates for cross-segment merging in the caller,
+        // which does the final top-k selection after merging all segments.
         let mut candidates = if !self.sub_centroid_signs.is_empty() {
             hnsw_search_subcent(
                 &self.graph,
@@ -147,6 +151,8 @@ impl ImmutableSegment {
         scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
+        // Note: passing ef_search for both k and ef_search is intentional
+        // (see comment in search() method above).
         let mut candidates = hnsw_search_filtered(
             &self.graph,
             self.vectors_tq.as_slice(),
@@ -179,7 +185,9 @@ impl ImmutableSegment {
             let orig_id = c.id.0;
             let bfs_pos = self.graph.to_bfs(orig_id);
             if (bfs_pos as usize) < self.mvcc.len() {
-                c.id = VectorId(self.mvcc[bfs_pos as usize].global_id);
+                let hdr = &self.mvcc[bfs_pos as usize];
+                c.id = VectorId(hdr.global_id);
+                c.key_hash = hdr.key_hash;
             }
         }
     }
@@ -315,6 +323,53 @@ impl ImmutableSegment {
     /// Access MVCC headers.
     pub fn mvcc_headers(&self) -> &[MvccHeader] {
         &self.mvcc
+    }
+
+    /// Decode the TQ code at the given internal id back to an approximate f32 vector.
+    ///
+    /// Used for segment merging: existing immutable segments are decoded, then re-encoded
+    /// in a single fresh segment to consolidate many small HNSW graphs into one big graph.
+    /// This is lossy (TQ4 reconstruction error) but acceptable when the alternative is
+    /// searching N segments at N× the cost.
+    ///
+    /// Returns the decoded f32 vector (length = original dimension).
+    pub fn decode_vector(&self, internal_id: u32) -> Vec<f32> {
+        let bfs_pos = self.graph.to_bfs(internal_id) as usize;
+        let bytes_per_code = self.graph.bytes_per_code() as usize;
+        let code_len = bytes_per_code - 4;
+        let offset = bfs_pos * bytes_per_code;
+        let code_bytes = self.vectors_tq.as_slice()[offset..offset + code_len].to_vec();
+        let norm_bytes = &self.vectors_tq.as_slice()[offset + code_len..offset + bytes_per_code];
+        let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+
+        let tq_code = crate::vector::turbo_quant::encoder::TqCode {
+            codes: code_bytes,
+            norm,
+        };
+        let dim = self.collection_meta.dimension as usize;
+        let padded = self.collection_meta.padded_dimension as usize;
+        let centroids = self.collection_meta.codebook_16();
+        let sign_flips = self.collection_meta.fwht_sign_flips.as_slice();
+        let mut work_buf = vec![0.0f32; padded];
+        crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
+            &tq_code,
+            sign_flips,
+            centroids,
+            dim,
+            &mut work_buf,
+        )
+    }
+
+    /// Iterate live (non-tombstoned) entries as `(key_hash, decoded_f32)` tuples.
+    /// Skips entries marked deleted in MVCC headers.
+    pub fn iter_live_decoded(&self) -> impl Iterator<Item = (u64, Vec<f32>)> + '_ {
+        self.mvcc.iter().enumerate().filter_map(move |(idx, hdr)| {
+            if hdr.delete_lsn != 0 {
+                None
+            } else {
+                Some((hdr.key_hash, self.decode_vector(idx as u32)))
+            }
+        })
     }
 
     /// Map a BFS-reordered position to the globally unique key_hash.

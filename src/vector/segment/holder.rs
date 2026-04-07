@@ -387,8 +387,14 @@ impl SegmentHolder {
             let dim = query_f32.len();
             let pdim = padded_dimension(dim as u32) as usize;
 
+            // Allocate query rotation + LUT buffers ONCE, reuse across all IVF segments.
+            // Previously these were allocated per-segment-per-query (12KB+ × n_segments).
+            let mut q_rotated = vec![0.0f32; pdim];
+            let mut lut_buf = vec![0u8; pdim * 16];
+
             for ivf_seg in &snapshot.ivf {
-                let mut q_rotated = vec![0.0f32; pdim];
+                // Reset and re-rotate for this segment (different sign_flips per segment)
+                q_rotated.iter_mut().for_each(|v| *v = 0.0);
                 q_rotated[..dim].copy_from_slice(query_f32);
                 let qnorm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if qnorm > 0.0 {
@@ -398,8 +404,6 @@ impl SegmentHolder {
                     }
                 }
                 fwht::fwht(&mut q_rotated, ivf_seg.sign_flips());
-
-                let mut lut_buf = vec![0u8; pdim * 16];
 
                 if let Some(bm) = filter_bitmap {
                     all.extend(ivf_seg.search_filtered(

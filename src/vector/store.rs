@@ -56,6 +56,13 @@ pub struct VectorIndex {
     pub scratch: SearchScratch,
     pub collection: Arc<CollectionMetadata>,
     pub payload_index: PayloadIndex,
+    /// Maps `key_hash` (xxh64 of original Redis hash key) → original key bytes.
+    ///
+    /// Populated at insert time via `auto_index_hset`. Used by `FT.SEARCH` to
+    /// return the original Redis key (e.g., `doc:1755`) instead of the internal
+    /// `vec:<internal_id>` form. Survives compaction and segment merging because
+    /// it's keyed by the stable `key_hash`, not the volatile internal ID.
+    pub key_hash_to_key: std::collections::HashMap<u64, Bytes>,
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -86,9 +93,34 @@ impl VectorIndex {
         if mutable_len < threshold {
             return;
         }
+        self.force_compact();
+    }
+
+    /// Unconditionally compact the mutable segment into an immutable HNSW segment.
+    ///
+    /// Unlike `try_compact()`, this bypasses the `compact_threshold` check and always
+    /// compacts if the mutable segment contains at least 1 vector. Called directly by
+    /// the `FT.COMPACT` command (explicit user intent).
+    ///
+    /// **Note**: Existing immutable segments are NOT merged. Tested experimentally —
+    /// decoding TQ4 codes back to f32 then re-encoding accumulates lossy quantization
+    /// error and destroys recall (drops from 0.73 → 0.0005 with 14 segments). True
+    /// merge requires retaining f32 vectors in immutable segments (memory cost) or
+    /// implementing a quantization-aware HNSW union (complex).
+    ///
+    /// To get a single segment, use a higher `COMPACT_THRESHOLD` so the mutable
+    /// segment compacts only once at the end of bulk loading.
+    ///
+    /// Without `force_compact`, when `compact_threshold >= mutable_len`, FT.COMPACT
+    /// silently no-ops, leaving all vectors in brute-force mutable segment
+    /// (O(n) search instead of HNSW O(log n)).
+    pub fn force_compact(&mut self) {
+        let mutable_len = self.segments.load().mutable.len();
+        if mutable_len == 0 {
+            return;
+        }
 
         let frozen = self.segments.load().mutable.freeze();
-        // Use a deterministic seed based on collection ID for reproducibility
         let seed = self
             .collection
             .collection_id
@@ -96,14 +128,10 @@ impl VectorIndex {
 
         match compaction::compact(&frozen, &self.collection, seed, None) {
             Ok(immutable) => {
-                // Resize scratch to match new graph size
                 let num_nodes = immutable.graph().num_nodes();
                 let padded = self.collection.padded_dimension;
                 self.scratch = SearchScratch::new(num_nodes, padded);
 
-                // Swap: empty mutable + append new immutable to existing list.
-                // The new mutable segment's global_id_base continues from where
-                // the compacted segment left off, ensuring unique IDs across segments.
                 let old = self.segments.load();
                 let next_global = old.mutable.next_global_id();
                 let mut imm_list = old.immutable.clone();
@@ -433,6 +461,7 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
+                key_hash_to_key: std::collections::HashMap::new(),
             },
         );
 

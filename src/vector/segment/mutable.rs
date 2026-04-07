@@ -88,9 +88,10 @@ struct MutableSegmentInner {
     byte_size: usize,
 }
 
-/// Ordered wrapper for BinaryHeap: (distance, id).
+/// Ordered wrapper for BinaryHeap: (distance, id, key_hash).
+/// key_hash is carried so FT.SEARCH can return the original Redis key.
 #[derive(PartialEq)]
-struct DistF32(f32, u32);
+struct DistF32(f32, u32, u64);
 
 impl Eq for DistF32 {}
 
@@ -377,19 +378,20 @@ impl MutableSegment {
             };
 
             let global_id = inner.global_id_base + entry.internal_id;
+            let key_hash = entry.key_hash;
             if heap.len() < k {
-                heap.push(DistF32(dist, global_id));
-            } else if let Some(&DistF32(worst, _)) = heap.peek() {
+                heap.push(DistF32(dist, global_id, key_hash));
+            } else if let Some(&DistF32(worst, _, _)) = heap.peek() {
                 if dist < worst {
                     heap.pop();
-                    heap.push(DistF32(dist, global_id));
+                    heap.push(DistF32(dist, global_id, key_hash));
                 }
             }
         }
 
         heap.into_sorted_vec()
             .into_iter()
-            .map(|DistF32(d, id)| SearchResult::new(d, VectorId(id)))
+            .map(|DistF32(d, id, kh)| SearchResult::with_key_hash(d, VectorId(id), kh))
             .collect()
     }
 
@@ -482,19 +484,20 @@ impl MutableSegment {
             };
 
             let global_id = inner.global_id_base + entry.internal_id;
+            let key_hash = entry.key_hash;
             if heap.len() < k {
-                heap.push(DistF32(dist, global_id));
-            } else if let Some(&DistF32(worst, _)) = heap.peek() {
+                heap.push(DistF32(dist, global_id, key_hash));
+            } else if let Some(&DistF32(worst, _, _)) = heap.peek() {
                 if dist < worst {
                     heap.pop();
-                    heap.push(DistF32(dist, global_id));
+                    heap.push(DistF32(dist, global_id, key_hash));
                 }
             }
         }
 
         heap.into_sorted_vec()
             .into_iter()
-            .map(|DistF32(d, id)| SearchResult::new(d, VectorId(id)))
+            .map(|DistF32(d, id, kh)| SearchResult::with_key_hash(d, VectorId(id), kh))
             .collect()
     }
 
@@ -570,6 +573,29 @@ impl MutableSegment {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.read().entries.is_empty()
+    }
+
+    /// Iterate live (non-deleted) entries, calling `f(key_hash, f32_vector, norm)` for each.
+    /// Used by `force_compact` to merge multiple segments into one.
+    /// Requires the mutable segment to retain `raw_f32` (BuildMode::Light or higher).
+    pub fn iter_live<F>(&self, mut f: F)
+    where
+        F: FnMut(u64, &[f32], f32),
+    {
+        let inner = self.inner.read();
+        let dim = inner.dimension as usize;
+        if inner.raw_f32.len() < inner.entries.len() * dim {
+            // raw_f32 not retained — skip (caller must handle this case separately).
+            return;
+        }
+        for (i, entry) in inner.entries.iter().enumerate() {
+            if entry.delete_lsn != 0 {
+                continue;
+            }
+            let start = i * dim;
+            let end = start + dim;
+            f(entry.key_hash, &inner.raw_f32[start..end], entry.norm);
+        }
     }
 
     /// Mark an entry as deleted.

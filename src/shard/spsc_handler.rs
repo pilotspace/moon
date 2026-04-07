@@ -953,6 +953,12 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                             let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
                             // Key hash for the entry
                             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+                            // Record original Redis key for FT.SEARCH response.
+                            // Without this mapping, FT.SEARCH returns "vec:<internal_id>"
+                            // instead of "doc:<id>", breaking client recall measurement.
+                            idx.key_hash_to_key
+                                .entry(key_hash)
+                                .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
                             // Append to mutable segment
                             let snap = idx.segments.load();
                             let internal_id =

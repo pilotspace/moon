@@ -245,7 +245,7 @@ impl super::Shard {
         // Per-shard SO_REUSEPORT listener (Linux + monoio).
         // Each shard creates its own listener; the kernel distributes connections via SO_REUSEPORT.
         #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
-        let mut per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
+        let per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
             if let Some(ref addr) = bind_addr {
                 match conn_accept::create_reuseport_socket(addr) {
                     Ok(std_listener) => match monoio::net::TcpListener::from_std(std_listener) {
@@ -559,109 +559,116 @@ impl super::Shard {
             crate::vector::store::VectorStore::new(),
         );
 
-        // Restore vector index metadata from sidecar file (disk-offload path).
-        // This re-creates FT.CREATE indexes before any connections are accepted,
-        // then auto-indexes existing HASH keys from the restored databases.
-        if server_config.disk_offload_enabled() {
-            let shard_dir = server_config.effective_disk_offload_dir()
-                .join(format!("shard-{}", shard_id));
-            let mut vs = shard_databases.vector_store(shard_id);
-            vs.set_persist_dir(shard_dir.clone());
-            match crate::vector::index_persist::load_index_metadata(&shard_dir) {
-                Ok(metas) if !metas.is_empty() => {
-                    info!(
-                        "Shard {}: restoring {} vector index(es) from sidecar",
-                        shard_id, metas.len()
-                    );
-                    for meta in &metas {
-                        if let Err(e) = vs.create_index(meta.clone()) {
-                            tracing::warn!(
-                                "Shard {}: failed to restore index '{}': {}",
-                                shard_id,
-                                String::from_utf8_lossy(&meta.name),
-                                e
-                            );
-                        }
-                    }
-                    drop(vs); // release VectorStore lock before scanning databases
+        // Restore vector index metadata from sidecar file.
+        // Set persist_dir so FT.CREATE/FT.DROPINDEX saves metadata for future recovery.
+        // Try disk-offload dir first (higher priority), then main persistence dir.
+        {
+            let vector_persist_dir = if server_config.disk_offload_enabled() {
+                Some(server_config.effective_disk_offload_dir()
+                    .join(format!("shard-{}", shard_id)))
+            } else {
+                persistence_dir.as_ref().map(|d| {
+                    std::path::PathBuf::from(d).join(format!("shard-{}-vectors", shard_id))
+                })
+            };
 
-                    // Auto-reindex existing HASH keys that match index prefixes.
-                    let db_count = shard_databases.db_count();
-                    let mut reindexed = 0usize;
-                    for db_idx in 0..db_count {
-                        let guard = shard_databases.read_db(shard_id, db_idx);
-                        // Collect matching keys (to avoid holding both DB lock and VS lock)
-                        let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
-                        for (key, entry) in guard.data().iter() {
-                            let key_bytes = key.as_bytes();
-                            // Check if key matches any index prefix
-                            let matches_prefix = metas.iter().any(|m| {
-                                m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
-                            });
-                            if !matches_prefix {
-                                continue;
-                            }
-                            // Build HSET-style args: [key, field1, val1, field2, val2, ...]
-                            let mut args = Vec::new();
-                            args.push(crate::protocol::Frame::BulkString(
-                                bytes::Bytes::copy_from_slice(key_bytes),
-                            ));
-                            match entry.as_redis_value() {
-                                crate::storage::compact_value::RedisValueRef::Hash(map) => {
-                                    for (field, value) in map.iter() {
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::copy_from_slice(field),
-                                        ));
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::copy_from_slice(value),
-                                        ));
-                                    }
-                                }
-                                crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
-                                    // Listpack stores field/value as alternating entries
-                                    let entries: Vec<_> = lp.iter().collect();
-                                    let mut j = 0;
-                                    while j + 1 < entries.len() {
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::from(entries[j].as_bytes()),
-                                        ));
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::from(entries[j + 1].as_bytes()),
-                                        ));
-                                        j += 2;
-                                    }
-                                }
-                                _ => continue, // Not a hash — skip
-                            }
-                            if args.len() > 1 {
-                                matching.push((key_bytes.to_vec(), args));
-                            }
-                        }
-                        drop(guard); // release DB read lock
+            if let Some(ref vdir) = vector_persist_dir {
+                let _ = std::fs::create_dir_all(vdir);
+                let mut vs = shard_databases.vector_store(shard_id);
+                vs.set_persist_dir(vdir.clone());
+                drop(vs);
+            }
 
-                        // Now auto-index with VectorStore lock
-                        if !matching.is_empty() {
-                            let mut vs = shard_databases.vector_store(shard_id);
-                            for (key, args) in &matching {
-                                crate::shard::spsc_handler::auto_index_hset_public(
-                                    &mut vs, key, args,
-                                );
-                                reindexed += 1;
-                            }
-                        }
-                    }
-                    if reindexed > 0 {
-                        info!(
-                            "Shard {}: auto-reindexed {} HASH key(s) into restored vector indexes",
-                            shard_id, reindexed
+            // Try loading saved index metadata from the vector persist dir.
+            let metas = vector_persist_dir.as_ref().and_then(|vdir| {
+                match crate::vector::index_persist::load_index_metadata(vdir) {
+                    Ok(m) if !m.is_empty() => Some(m),
+                    _ => None,
+                }
+            });
+
+            if let Some(metas) = metas {
+                let mut vs = shard_databases.vector_store(shard_id);
+                info!(
+                    "Shard {}: restoring {} vector index(es) from sidecar",
+                    shard_id, metas.len()
+                );
+                for meta in &metas {
+                    if let Err(e) = vs.create_index(meta.clone()) {
+                        tracing::warn!(
+                            "Shard {}: failed to restore index '{}': {}",
+                            shard_id,
+                            String::from_utf8_lossy(&meta.name),
+                            e
                         );
                     }
                 }
-                Ok(_) => {} // No saved indexes
-                Err(e) => {
-                    tracing::warn!(
-                        "Shard {}: failed to load vector index metadata: {}",
-                        shard_id, e
+                drop(vs); // release VectorStore lock before scanning databases
+
+                // Auto-reindex existing HASH keys that match index prefixes.
+                let db_count = shard_databases.db_count();
+                let mut reindexed = 0usize;
+                for db_idx in 0..db_count {
+                    let guard = shard_databases.read_db(shard_id, db_idx);
+                    let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
+                    for (key, entry) in guard.data().iter() {
+                        let key_bytes = key.as_bytes();
+                        let matches_prefix = metas.iter().any(|m| {
+                            m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
+                        });
+                        if !matches_prefix {
+                            continue;
+                        }
+                        let mut args = Vec::new();
+                        args.push(crate::protocol::Frame::BulkString(
+                            bytes::Bytes::copy_from_slice(key_bytes),
+                        ));
+                        match entry.as_redis_value() {
+                            crate::storage::compact_value::RedisValueRef::Hash(map) => {
+                                for (field, value) in map.iter() {
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::copy_from_slice(field),
+                                    ));
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::copy_from_slice(value),
+                                    ));
+                                }
+                            }
+                            crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
+                                let entries: Vec<_> = lp.iter().collect();
+                                let mut j = 0;
+                                while j + 1 < entries.len() {
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(entries[j].as_bytes()),
+                                    ));
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(entries[j + 1].as_bytes()),
+                                    ));
+                                    j += 2;
+                                }
+                            }
+                            _ => continue,
+                        }
+                        if args.len() > 1 {
+                            matching.push((key_bytes.to_vec(), args));
+                        }
+                    }
+                    drop(guard);
+
+                    if !matching.is_empty() {
+                        let mut vs = shard_databases.vector_store(shard_id);
+                        for (key, args) in &matching {
+                            crate::shard::spsc_handler::auto_index_hset_public(
+                                &mut vs, key, args,
+                            );
+                            reindexed += 1;
+                        }
+                    }
+                }
+                if reindexed > 0 {
+                    info!(
+                        "Shard {}: auto-reindexed {} HASH key(s) into restored vector indexes",
+                        shard_id, reindexed
                     );
                 }
             }
