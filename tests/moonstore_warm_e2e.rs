@@ -60,7 +60,8 @@ fn test_warm_transition_end_to_end() {
         for i in 0..150u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
             let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable.append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable
+                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
         }
     }
 
@@ -68,8 +69,15 @@ fn test_warm_transition_end_to_end() {
     {
         let idx = store.get_index(b"idx").unwrap();
         let snap = idx.segments.load();
-        assert_eq!(snap.mutable.len(), 150, "mutable segment should have 150 vectors");
-        assert!(snap.immutable.is_empty(), "no immutable segments before compaction");
+        assert_eq!(
+            snap.mutable.len(),
+            150,
+            "mutable segment should have 150 vectors"
+        );
+        assert!(
+            snap.immutable.is_empty(),
+            "no immutable segments before compaction"
+        );
     }
 
     // 4. Compact
@@ -83,7 +91,10 @@ fn test_warm_transition_end_to_end() {
     {
         let idx = store.get_index(b"idx").unwrap();
         let snap = idx.segments.load();
-        assert!(!snap.immutable.is_empty(), "compaction should create immutable segment");
+        assert!(
+            !snap.immutable.is_empty(),
+            "compaction should create immutable segment"
+        );
         imm_count_before = snap.immutable.len();
     }
 
@@ -111,17 +122,16 @@ fn test_warm_transition_end_to_end() {
 
     // 8. Verify .mpf files on disk
     let vectors_dir = shard_dir.join("vectors");
-    assert!(vectors_dir.exists(), "vectors directory should exist after warm transition");
+    assert!(
+        vectors_dir.exists(),
+        "vectors directory should exist after warm transition"
+    );
 
     let seg_dirs: Vec<_> = std::fs::read_dir(&vectors_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .unwrap_or("")
-                    .starts_with("segment-")
+            e.path().is_dir() && e.file_name().to_str().unwrap_or("").starts_with("segment-")
         })
         .collect();
     assert!(
@@ -175,9 +185,7 @@ fn test_warm_transition_respects_age_threshold() {
     let mut manifest = ShardManifest::create(&manifest_path).unwrap();
 
     let mut store = VectorStore::new();
-    store
-        .create_index(make_test_meta("idx", 128, 100))
-        .unwrap();
+    store.create_index(make_test_meta("idx", 128, 100)).unwrap();
 
     // Insert 150 vectors and compact
     {
@@ -186,7 +194,8 @@ fn test_warm_transition_respects_age_threshold() {
         for i in 0..150u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
             let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable.append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable
+                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
         }
     }
     {
@@ -197,7 +206,10 @@ fn test_warm_transition_respects_age_threshold() {
     // Verify we have immutable segments
     let idx = store.get_index(b"idx").unwrap();
     let imm_before = idx.segments.load().immutable.len();
-    assert!(imm_before > 0, "should have immutable segments after compaction");
+    assert!(
+        imm_before > 0,
+        "should have immutable segments after compaction"
+    );
 
     // Try warm transition with very high age threshold (segments are brand new)
     let mut next_file_id = 1u64;
@@ -238,9 +250,7 @@ fn test_warm_transition_search_still_works_on_mutable() {
     let mut manifest = ShardManifest::create(&manifest_path).unwrap();
 
     let mut store = VectorStore::new();
-    store
-        .create_index(make_test_meta("idx", 128, 100))
-        .unwrap();
+    store.create_index(make_test_meta("idx", 128, 100)).unwrap();
 
     // Insert 150 vectors and compact
     {
@@ -249,7 +259,8 @@ fn test_warm_transition_search_still_works_on_mutable() {
         for i in 0..150u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
             let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable.append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable
+                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
         }
     }
     {
@@ -261,7 +272,8 @@ fn test_warm_transition_search_still_works_on_mutable() {
     {
         let idx = store.get_index(b"idx").unwrap();
         let mut next_file_id = 1u64;
-        let transitioned = idx.try_warm_transitions(&shard_dir, &mut manifest, 0, &mut next_file_id, &mut None);
+        let transitioned =
+            idx.try_warm_transitions(&shard_dir, &mut manifest, 0, &mut next_file_id, &mut None);
         assert!(transitioned > 0, "should transition at least one segment");
     }
 
@@ -272,10 +284,14 @@ fn test_warm_transition_search_still_works_on_mutable() {
         for i in 200..210u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
             let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable.append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable
+                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
         }
         // Mutable segment should have the new vectors
-        assert!(snap.mutable.len() >= 10, "mutable segment should have new vectors");
+        assert!(
+            snap.mutable.len() >= 10,
+            "mutable segment should have new vectors"
+        );
     }
 
     // Brute force search on the mutable segment should work

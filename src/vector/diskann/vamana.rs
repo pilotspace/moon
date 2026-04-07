@@ -62,9 +62,27 @@ impl VamanaGraph {
 
         // Two-pass Vamana refinement: alpha=1.0 then alpha=1.2
         let pass_order = deterministic_permutation(n, 42);
-        vamana_pass(vectors, dim, r, l, 1.0, &pass_order, entry_point, &mut adjacency);
+        vamana_pass(
+            vectors,
+            dim,
+            r,
+            l,
+            1.0,
+            &pass_order,
+            entry_point,
+            &mut adjacency,
+        );
         let pass_order2 = deterministic_permutation(n, 137);
-        vamana_pass(vectors, dim, r, l, 1.2, &pass_order2, entry_point, &mut adjacency);
+        vamana_pass(
+            vectors,
+            dim,
+            r,
+            l,
+            1.2,
+            &pass_order2,
+            entry_point,
+            &mut adjacency,
+        );
 
         Self {
             num_nodes: n as u32,
@@ -81,7 +99,11 @@ impl VamanaGraph {
     pub fn build_from_hnsw(hnsw: &HnswGraph, vectors: &[f32], dim: usize, r: u32, l: u32) -> Self {
         let n = hnsw.num_nodes() as usize;
         assert!(n > 0, "HNSW graph must have at least one node");
-        assert_eq!(vectors.len(), n * dim, "vector count must match HNSW node count");
+        assert_eq!(
+            vectors.len(),
+            n * dim,
+            "vector count must match HNSW node count"
+        );
         assert!(l >= r, "L must be >= R");
 
         // Compute centroid and medoid
@@ -118,9 +140,27 @@ impl VamanaGraph {
 
         // Two-pass Vamana refinement
         let pass_order = deterministic_permutation(n, 42);
-        vamana_pass(vectors, dim, r, l, 1.0, &pass_order, entry_point, &mut adjacency);
+        vamana_pass(
+            vectors,
+            dim,
+            r,
+            l,
+            1.0,
+            &pass_order,
+            entry_point,
+            &mut adjacency,
+        );
         let pass_order2 = deterministic_permutation(n, 137);
-        vamana_pass(vectors, dim, r, l, 1.2, &pass_order2, entry_point, &mut adjacency);
+        vamana_pass(
+            vectors,
+            dim,
+            r,
+            l,
+            1.2,
+            &pass_order2,
+            entry_point,
+            &mut adjacency,
+        );
 
         Self {
             num_nodes: n as u32,
@@ -283,13 +323,16 @@ fn vamana_pass(
     for &p in order {
         // Greedy search for p's vector from entry_point
         let query = &vectors[p as usize * dim..(p as usize + 1) * dim];
-        let mut candidates = greedy_search_internal(
-            query, vectors, dim, l as usize, entry_point, adjacency, n,
-        );
+        let mut candidates =
+            greedy_search_internal(query, vectors, dim, l as usize, entry_point, adjacency, n);
 
         // Add current neighbors to candidate set
         for &nbr in &adjacency[p as usize] {
-            let d = l2_distance(query, &vectors[nbr as usize * dim..(nbr as usize + 1) * dim], dim);
+            let d = l2_distance(
+                query,
+                &vectors[nbr as usize * dim..(nbr as usize + 1) * dim],
+                dim,
+            );
             if !candidates.iter().any(|&(_, id)| id == nbr) {
                 candidates.push((d, nbr));
             }
@@ -317,11 +360,19 @@ fn vamana_pass(
                     let mut nbr_candidates: Vec<(f32, u32)> = adjacency[nbr as usize]
                         .iter()
                         .map(|&id| {
-                            let d = l2_distance(nbr_vec, &vectors[id as usize * dim..(id as usize + 1) * dim], dim);
+                            let d = l2_distance(
+                                nbr_vec,
+                                &vectors[id as usize * dim..(id as usize + 1) * dim],
+                                dim,
+                            );
                             (d, id)
                         })
                         .collect();
-                    let d_p = l2_distance(nbr_vec, &vectors[p as usize * dim..(p as usize + 1) * dim], dim);
+                    let d_p = l2_distance(
+                        nbr_vec,
+                        &vectors[p as usize * dim..(p as usize + 1) * dim],
+                        dim,
+                    );
                     nbr_candidates.push((d_p, p));
                     adjacency[nbr as usize] = robust_prune(&nbr_candidates, vectors, dim, alpha, r);
                 }
@@ -341,7 +392,11 @@ fn greedy_search_internal(
     n: usize,
 ) -> Vec<(f32, u32)> {
     let mut visited = vec![false; n];
-    let ep_dist = l2_distance(query, &vectors[entry_point as usize * dim..(entry_point as usize + 1) * dim], dim);
+    let ep_dist = l2_distance(
+        query,
+        &vectors[entry_point as usize * dim..(entry_point as usize + 1) * dim],
+        dim,
+    );
     visited[entry_point as usize] = true;
 
     let mut candidates: Vec<(f32, u32)> = vec![(ep_dist, entry_point)];
@@ -368,7 +423,11 @@ fn greedy_search_internal(
                 continue;
             }
             visited[nbr as usize] = true;
-            let d = l2_distance(query, &vectors[nbr as usize * dim..(nbr as usize + 1) * dim], dim);
+            let d = l2_distance(
+                query,
+                &vectors[nbr as usize * dim..(nbr as usize + 1) * dim],
+                dim,
+            );
             candidates.push((d, nbr));
         }
 

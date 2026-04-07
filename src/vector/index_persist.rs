@@ -154,10 +154,7 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
 ///
 /// Called after FT.CREATE and FT.DROPINDEX. Atomically replaces the file
 /// via write-to-temp + rename.
-pub fn save_index_metadata(
-    shard_dir: &Path,
-    metas: &[&IndexMeta],
-) -> io::Result<()> {
+pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result<()> {
     let path = shard_dir.join("vector-indexes.meta");
     let tmp_path = shard_dir.join(".vector-indexes.meta.tmp");
 

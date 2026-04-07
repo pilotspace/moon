@@ -24,61 +24,61 @@ pub const PAGE_64K: usize = 65536;
 pub enum PageType {
     // ── Structural ──────────────────────────────────────
     /// Dual meta-root page (LMDB pattern).
-    ManifestRoot  = 0x01,
+    ManifestRoot = 0x01,
     /// Overflow file table entries.
     ManifestEntry = 0x02,
     /// Shard control file (single page).
-    ControlPage   = 0x03,
+    ControlPage = 0x03,
     /// Commit log bitmap (2 bits per txn).
-    ClogPage      = 0x04,
+    ClogPage = 0x04,
 
     // ── KV Data ─────────────────────────────────────────
     /// Slotted page of key-value entries (4KB).
-    KvLeaf        = 0x10,
+    KvLeaf = 0x10,
     /// Large value continuation chain (4KB).
-    KvOverflow    = 0x11,
+    KvOverflow = 0x11,
     /// Key hash → page_id lookup (4KB).
-    KvIndex       = 0x12,
+    KvIndex = 0x12,
 
     // ── Complex Type Overflow ───────────────────────────
     /// HASH field-value pairs (4KB).
-    HashBucket    = 0x18,
+    HashBucket = 0x18,
     /// LIST element sequence (4KB).
-    ListChunk     = 0x19,
+    ListChunk = 0x19,
     /// SET member page (4KB).
-    SetBucket     = 0x1A,
+    SetBucket = 0x1A,
     /// ZSET skip-list nodes (4KB).
-    ZSetSkip      = 0x1B,
+    ZSetSkip = 0x1B,
     /// STREAM ID-entry pairs (4KB).
     StreamEntries = 0x1C,
 
     // ── Vector Data ─────────────────────────────────────
     /// Quantized codes (TQ/PQ/SBQ) — 64KB pages.
-    VecCodes      = 0x20,
+    VecCodes = 0x20,
     /// Full-precision vectors (f16/f32) — 64KB pages.
-    VecFull       = 0x21,
+    VecFull = 0x21,
     /// HNSW or Vamana adjacency — 4KB pages.
-    VecGraph      = 0x22,
+    VecGraph = 0x22,
     /// MVCC visibility headers (4KB).
-    VecMvcc       = 0x23,
+    VecMvcc = 0x23,
     /// Collection/segment metadata + codebook (4KB).
-    VecMeta       = 0x24,
+    VecMeta = 0x24,
     /// Undo log for vector metadata updates (4KB).
-    VecUndo       = 0x25,
+    VecUndo = 0x25,
 
     // ── WAL (on-disk only, never in PageCache) ──────────
     /// RESP command batch.
-    WalBlock      = 0x30,
+    WalBlock = 0x30,
     /// Full-page image.
-    WalFpi        = 0x31,
+    WalFpi = 0x31,
     /// Checkpoint record.
     WalCheckpoint = 0x32,
     /// Vector operation record.
-    WalVectorOp   = 0x33,
+    WalVectorOp = 0x33,
 
     // ── Free Space ──────────────────────────────────────
     /// Free page bitmap.
-    FreeMap       = 0xF0,
+    FreeMap = 0xF0,
 }
 
 impl PageType {
@@ -285,8 +285,7 @@ impl MoonPageHeader {
     ///
     /// Panics if the page buffer is too small for header + payload.
     pub fn compute_checksum(page: &mut [u8]) {
-        let payload_bytes =
-            u32::from_le_bytes([page[20], page[21], page[22], page[23]]) as usize;
+        let payload_bytes = u32::from_le_bytes([page[20], page[21], page[22], page[23]]) as usize;
         let end = MOONPAGE_HEADER_SIZE + payload_bytes;
         assert!(
             page.len() >= end,
@@ -307,8 +306,7 @@ impl MoonPageHeader {
             return false;
         }
 
-        let payload_bytes =
-            u32::from_le_bytes([page[20], page[21], page[22], page[23]]) as usize;
+        let payload_bytes = u32::from_le_bytes([page[20], page[21], page[22], page[23]]) as usize;
         let end = MOONPAGE_HEADER_SIZE + payload_bytes;
         if page.len() < end {
             return false;

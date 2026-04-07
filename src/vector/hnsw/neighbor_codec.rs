@@ -65,7 +65,11 @@ fn decode_vbyte(data: &[u8], pos: &mut usize) -> Option<u32> {
 /// Returns the compressed byte buffer.
 pub fn encode_neighbors(neighbors: &[u32]) -> Vec<u8> {
     // Filter sentinels and sort
-    let mut sorted: Vec<u32> = neighbors.iter().copied().filter(|&v| v != SENTINEL).collect();
+    let mut sorted: Vec<u32> = neighbors
+        .iter()
+        .copied()
+        .filter(|&v| v != SENTINEL)
+        .collect();
     sorted.sort_unstable();
 
     let mut out = Vec::with_capacity(sorted.len() * 2 + 5);

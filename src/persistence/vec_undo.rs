@@ -19,7 +19,7 @@
 //!   old_data: [u8]          only changed fields (NOT the full vector)
 //! ```
 
-use crate::persistence::page::{MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE};
+use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PageType};
 
 /// Undo record operation type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,22 +147,13 @@ impl VecUndoPage {
             return None;
         }
 
-        let prev_undo_ptr = u32::from_le_bytes(
-            self.data[base..base + 4].try_into().ok()?,
-        );
-        let txn_id = u64::from_le_bytes(
-            self.data[base + 4..base + 12].try_into().ok()?,
-        );
-        let vector_id = u32::from_le_bytes(
-            self.data[base + 12..base + 16].try_into().ok()?,
-        );
-        let flags_raw = u16::from_le_bytes(
-            self.data[base + 16..base + 18].try_into().ok()?,
-        );
+        let prev_undo_ptr = u32::from_le_bytes(self.data[base..base + 4].try_into().ok()?);
+        let txn_id = u64::from_le_bytes(self.data[base + 4..base + 12].try_into().ok()?);
+        let vector_id = u32::from_le_bytes(self.data[base + 12..base + 16].try_into().ok()?);
+        let flags_raw = u16::from_le_bytes(self.data[base + 16..base + 18].try_into().ok()?);
         let flags = UndoFlags::from_u16(flags_raw)?;
-        let data_len = u16::from_le_bytes(
-            self.data[base + 18..base + 20].try_into().ok()?,
-        ) as usize;
+        let data_len =
+            u16::from_le_bytes(self.data[base + 18..base + 20].try_into().ok()?) as usize;
 
         if base + 20 + data_len > self.write_offset as usize {
             return None;

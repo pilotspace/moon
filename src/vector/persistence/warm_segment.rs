@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::persistence::fsync::fsync_file;
 use crate::persistence::page::{
-    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K, page_flags,
+    MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PAGE_64K, PageType, page_flags,
 };
 use crate::storage::tiered::SegmentHandle;
 
@@ -288,15 +288,17 @@ pub fn write_graph_mpf(path: &Path, file_id: u64, graph_data: &[u8]) -> std::io:
 /// Each page holds up to 65448 bytes of data (65536 - 64 header - 24 sub-header).
 /// The 24-byte VecFull sub-header is written with element_type=2 (F16),
 /// element_size=2.
-pub fn write_vectors_mpf(
-    path: &Path,
-    file_id: u64,
-    vectors_data: &[u8],
-) -> std::io::Result<()> {
+pub fn write_vectors_mpf(path: &Path, file_id: u64, vectors_data: &[u8]) -> std::io::Result<()> {
     let sub_fn = |buf: &mut [u8], _page_idx: usize, _data_len: usize| {
         write_vec_full_sub_header(buf, 0, 0, 0, 2, 2, 0); // F16=2, elem_size=2
     };
-    write_mpf_pages(path, file_id, PageType::VecFull, vectors_data, Some(&sub_fn))
+    write_mpf_pages(
+        path,
+        file_id,
+        PageType::VecFull,
+        vectors_data,
+        Some(&sub_fn),
+    )
 }
 
 /// Write MVCC metadata entries to a .mpf file with 4KB VecMvcc pages.
@@ -394,25 +396,19 @@ impl WarmSegmentFiles {
         };
 
         // Verify CRC32C on first page of each mandatory file
-        if !MoonPageHeader::verify_checksum(
-            &codes[..codes.len().min(PAGE_64K)],
-        ) {
+        if !MoonPageHeader::verify_checksum(&codes[..codes.len().min(PAGE_64K)]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "codes.mpf first page CRC32C verification failed",
             ));
         }
-        if !MoonPageHeader::verify_checksum(
-            &graph[..graph.len().min(PAGE_4K)],
-        ) {
+        if !MoonPageHeader::verify_checksum(&graph[..graph.len().min(PAGE_4K)]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "graph.mpf first page CRC32C verification failed",
             ));
         }
-        if !MoonPageHeader::verify_checksum(
-            &mvcc[..mvcc.len().min(PAGE_4K)],
-        ) {
+        if !MoonPageHeader::verify_checksum(&mvcc[..mvcc.len().min(PAGE_4K)]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "mvcc.mpf first page CRC32C verification failed",
@@ -473,7 +469,9 @@ mod tests {
         let mut data = Vec::with_capacity(len);
         let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
         for _ in 0..len {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             data.push((state >> 33) as u8);
         }
         data
@@ -510,7 +508,9 @@ mod tests {
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_64K]));
 
         // Verify page 1 header (remaining data = 100000 - 65440 = 34560)
-        let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_64K..PAGE_64K + MOONPAGE_HEADER_SIZE]).unwrap();
+        let hdr1 =
+            MoonPageHeader::read_from(&file_bytes[PAGE_64K..PAGE_64K + MOONPAGE_HEADER_SIZE])
+                .unwrap();
         assert_eq!(hdr1.page_type, PageType::VecCodes);
         assert_eq!(hdr1.page_id, 1);
         assert_eq!(
@@ -519,7 +519,9 @@ mod tests {
         );
 
         // Verify page 1 CRC32C
-        assert!(MoonPageHeader::verify_checksum(&file_bytes[PAGE_64K..2 * PAGE_64K]));
+        assert!(MoonPageHeader::verify_checksum(
+            &file_bytes[PAGE_64K..2 * PAGE_64K]
+        ));
     }
 
     #[test]
@@ -550,14 +552,17 @@ mod tests {
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_4K]));
 
         // Verify page 1 (remaining data = 5000 - 4016 = 984)
-        let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_4K..PAGE_4K + MOONPAGE_HEADER_SIZE]).unwrap();
+        let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_4K..PAGE_4K + MOONPAGE_HEADER_SIZE])
+            .unwrap();
         assert_eq!(hdr1.page_type, PageType::VecGraph);
         assert_eq!(hdr1.page_id, 1);
         assert_eq!(
             hdr1.payload_bytes as usize,
             VEC_GRAPH_SUB_HEADER_SIZE + (5000 - data_cap),
         );
-        assert!(MoonPageHeader::verify_checksum(&file_bytes[PAGE_4K..2 * PAGE_4K]));
+        assert!(MoonPageHeader::verify_checksum(
+            &file_bytes[PAGE_4K..2 * PAGE_4K]
+        ));
     }
 
     #[test]
@@ -573,11 +578,11 @@ mod tests {
         let entry_count = 200;
         let mut data = Vec::with_capacity(entry_count * 24);
         for i in 0..entry_count as u32 {
-            data.extend_from_slice(&i.to_le_bytes());           // internal_id: 4
-            data.extend_from_slice(&(i + 1000).to_le_bytes());  // global_id: 4
+            data.extend_from_slice(&i.to_le_bytes()); // internal_id: 4
+            data.extend_from_slice(&(i + 1000).to_le_bytes()); // global_id: 4
             data.extend_from_slice(&(i as u64 * 10).to_le_bytes()); // insert_lsn: 8
-            data.extend_from_slice(&0u32.to_le_bytes());        // delete_lsn: 4
-            data.extend_from_slice(&0u32.to_le_bytes());        // undo_ptr: 4
+            data.extend_from_slice(&0u32.to_le_bytes()); // delete_lsn: 4
+            data.extend_from_slice(&0u32.to_le_bytes()); // undo_ptr: 4
         }
         assert_eq!(data.len(), 4800);
 
@@ -594,10 +599,13 @@ mod tests {
         assert!(MoonPageHeader::verify_checksum(&file_bytes[..PAGE_4K]));
 
         // Page 1: remaining 776 bytes = 32 entries (776 / 24 = 32)
-        let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_4K..PAGE_4K + MOONPAGE_HEADER_SIZE]).unwrap();
+        let hdr1 = MoonPageHeader::read_from(&file_bytes[PAGE_4K..PAGE_4K + MOONPAGE_HEADER_SIZE])
+            .unwrap();
         assert_eq!(hdr1.page_type, PageType::VecMvcc);
         assert_eq!(hdr1.entry_count, 32); // 776 / 24 = 32
-        assert!(MoonPageHeader::verify_checksum(&file_bytes[PAGE_4K..2 * PAGE_4K]));
+        assert!(MoonPageHeader::verify_checksum(
+            &file_bytes[PAGE_4K..2 * PAGE_4K]
+        ));
     }
 
     #[test]
@@ -611,10 +619,12 @@ mod tests {
         let file_bytes = std::fs::read(&path).unwrap();
 
         // First 4 bytes should be MOONPAGE_MAGIC (no file-level header)
-        let magic = u32::from_le_bytes([
-            file_bytes[0], file_bytes[1], file_bytes[2], file_bytes[3],
-        ]);
-        assert_eq!(magic, MOONPAGE_MAGIC, "first bytes must be MoonPage magic, not a file header");
+        let magic =
+            u32::from_le_bytes([file_bytes[0], file_bytes[1], file_bytes[2], file_bytes[3]]);
+        assert_eq!(
+            magic, MOONPAGE_MAGIC,
+            "first bytes must be MoonPage magic, not a file header"
+        );
     }
 
     #[test]
@@ -682,7 +692,10 @@ mod tests {
 
         // codes_data should return data only (skip header + sub-header)
         let page0_data = ws.codes_data(0);
-        assert_eq!(page0_data.len(), PAGE_64K - MOONPAGE_HEADER_SIZE - VEC_CODES_SUB_HEADER_SIZE);
+        assert_eq!(
+            page0_data.len(),
+            PAGE_64K - MOONPAGE_HEADER_SIZE - VEC_CODES_SUB_HEADER_SIZE
+        );
         // First 1000 bytes should be our data
         assert_eq!(&page0_data[..1000], &codes[..1000]);
 
@@ -725,7 +738,10 @@ mod tests {
         let result = WarmSegmentFiles::open(&seg_dir, handle, false);
         match result {
             Err(e) => {
-                assert!(e.to_string().contains("codes.mpf"), "error should mention codes.mpf: {e}");
+                assert!(
+                    e.to_string().contains("codes.mpf"),
+                    "error should mention codes.mpf: {e}"
+                );
             }
             Ok(_) => panic!("expected CRC verification error, got Ok"),
         }
@@ -826,7 +842,8 @@ mod tests {
         let hdr = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
         // COMPRESSED flag should be set since data_len=2048 > 256 and pattern is compressible
         assert_ne!(
-            hdr.flags & page_flags::COMPRESSED, 0,
+            hdr.flags & page_flags::COMPRESSED,
+            0,
             "COMPRESSED flag should be set for compressible data > 256 bytes"
         );
         // payload_bytes should be less than uncompressed (sub_hdr + 2048)
@@ -854,7 +871,8 @@ mod tests {
 
         let hdr = MoonPageHeader::read_from(&file_bytes[..MOONPAGE_HEADER_SIZE]).unwrap();
         assert_eq!(
-            hdr.flags & page_flags::COMPRESSED, 0,
+            hdr.flags & page_flags::COMPRESSED,
+            0,
             "COMPRESSED flag should NOT be set for small payloads"
         );
         // payload_bytes = sub_hdr(16) + 100 = 116

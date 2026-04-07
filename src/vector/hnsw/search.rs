@@ -298,7 +298,9 @@ pub fn hnsw_search_filtered(
     // clear() is called in scratch.clear() at the start of this function.
     let lut_needed = padded_dim * entries_per_coord;
     if scratch.adc_lut.capacity() < lut_needed {
-        scratch.adc_lut.reserve(lut_needed - scratch.adc_lut.capacity());
+        scratch
+            .adc_lut
+            .reserve(lut_needed - scratch.adc_lut.capacity());
     }
 
     if let Some(st) = sub_table.filter(|_| use_subcent) {
@@ -352,7 +354,11 @@ pub fn hnsw_search_filtered(
             //     (caller guarantees sub_sign_bpv bytes per vector, covering code_len/4 sign bytes)
             let lut_ptr = adc_lut.as_ptr();
             let code_ptr = code_only.as_ptr();
-            let sign_ptr = unsafe { sub_centroid_signs.as_ptr().add(bfs_pos as usize * sub_sign_bpv) };
+            let sign_ptr = unsafe {
+                sub_centroid_signs
+                    .as_ptr()
+                    .add(bfs_pos as usize * sub_sign_bpv)
+            };
             let n = code_only.len();
             let chunks = n / 4;
             let rem = n % 4;
@@ -481,7 +487,11 @@ pub fn hnsw_search_filtered(
             //   sign_off + (code_len/4) < sub_centroid_signs.len() (caller guarantees bpv)
             let lut_ptr = adc_lut.as_ptr();
             let code_ptr = code_only.as_ptr();
-            let sign_ptr = unsafe { sub_centroid_signs.as_ptr().add(bfs_pos as usize * sub_sign_bpv) };
+            let sign_ptr = unsafe {
+                sub_centroid_signs
+                    .as_ptr()
+                    .add(bfs_pos as usize * sub_sign_bpv)
+            };
 
             let mut s0 = 0.0f32;
             let mut s1 = 0.0f32;

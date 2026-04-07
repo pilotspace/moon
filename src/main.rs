@@ -225,9 +225,7 @@ fn main() -> anyhow::Result<()> {
                 for db in &mut shard.databases {
                     db.cold_shard_dir = Some(shard_dir.clone());
                     if db.cold_index.is_none() {
-                        db.cold_index = Some(
-                            moon::storage::tiered::cold_index::ColdIndex::new(),
-                        );
+                        db.cold_index = Some(moon::storage::tiered::cold_index::ColdIndex::new());
                     }
                 }
             }
@@ -286,9 +284,14 @@ fn main() -> anyhow::Result<()> {
                             // Only pass bind_addr for per-shard SO_REUSEPORT when tokio
                             // with io_uring is active. monoio uses central listener MPSC.
                             #[cfg(feature = "runtime-tokio")]
-                            { Some(shard_bind_addr) },
+                            {
+                                Some(shard_bind_addr)
+                            },
                             #[cfg(feature = "runtime-monoio")]
-                            { let _ = &shard_bind_addr; None },
+                            {
+                                let _ = &shard_bind_addr;
+                                None
+                            },
                             shard_persistence_dir,
                             shard_snap_rx,
                             shard_snap_tx,

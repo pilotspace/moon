@@ -147,7 +147,15 @@ mod tests {
         let mvcc = vec![0u8; 24 * 10];
 
         let handle = transition_to_warm(
-            &shard_dir, 1, 100, &codes, &graph, None, &mvcc, &mut manifest, None,
+            &shard_dir,
+            1,
+            100,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            None,
         )
         .unwrap();
 
@@ -172,13 +180,24 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let _handle = transition_to_warm(
-            &shard_dir, 2, 200, &codes, &graph, None, &mvcc, &mut manifest, None,
+            &shard_dir,
+            2,
+            200,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            None,
         )
         .unwrap();
 
         // Staging dir should not exist (renamed to final)
         let staging = shard_dir.join("vectors/.segment-2.staging");
-        assert!(!staging.exists(), "staging directory should not remain after transition");
+        assert!(
+            !staging.exists(),
+            "staging directory should not remain after transition"
+        );
     }
 
     #[test]
@@ -195,7 +214,15 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let _handle = transition_to_warm(
-            &shard_dir, 3, 300, &codes, &graph, None, &mvcc, &mut manifest, None,
+            &shard_dir,
+            3,
+            300,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            None,
         )
         .unwrap();
 
@@ -252,7 +279,15 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let handle = transition_to_warm(
-            &shard_dir, 5, 500, &codes, &graph, None, &mvcc, &mut manifest, None,
+            &shard_dir,
+            5,
+            500,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            None,
         )
         .unwrap();
 
@@ -275,7 +310,15 @@ mod tests {
         let mvcc = vec![0u8; 24 * 10];
 
         let handle = transition_to_warm(
-            &shard_dir, 6, 600, &codes, &graph, None, &mvcc, &mut manifest, None,
+            &shard_dir,
+            6,
+            600,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            None,
         )
         .unwrap();
 
@@ -290,7 +333,10 @@ mod tests {
         let sub_hdr_size = crate::vector::persistence::warm_segment::VEC_CODES_SUB_HEADER_SIZE;
         // The payload_bytes in the header includes sub-header + data (possibly compressed)
         // Just verify the page is non-empty and has the right structure
-        assert!(cd.len() >= sub_hdr_size, "codes page should have at least sub-header");
+        assert!(
+            cd.len() >= sub_hdr_size,
+            "codes page should have at least sub-header"
+        );
         assert_eq!(ws.page_count_codes(), 1);
     }
 
@@ -310,7 +356,15 @@ mod tests {
         let mvcc = vec![0u8; 24 * 10];
 
         let handle = transition_to_warm(
-            &shard_dir, 1, 100, &codes, &graph, None, &mvcc, &mut manifest, None,
+            &shard_dir,
+            1,
+            100,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            None,
         )
         .unwrap();
 
@@ -318,18 +372,24 @@ mod tests {
 
         // deletion.bitmap must exist in segment directory
         let bitmap_path = seg_dir.join("deletion.bitmap");
-        assert!(bitmap_path.exists(), "deletion.bitmap should be created during warm transition");
+        assert!(
+            bitmap_path.exists(),
+            "deletion.bitmap should be created during warm transition"
+        );
 
         // Must deserialize to an empty RoaringBitmap
         let data = std::fs::read(&bitmap_path).unwrap();
         let bitmap = RoaringBitmap::deserialize_from(&data[..]).unwrap();
-        assert!(bitmap.is_empty(), "fresh warm segment deletion bitmap should be empty");
+        assert!(
+            bitmap.is_empty(),
+            "fresh warm segment deletion bitmap should be empty"
+        );
     }
 
     #[test]
     fn test_transition_writes_file_create_wal_record() {
         use crate::persistence::wal_v3::record::{WalRecordType, read_wal_v3_record};
-        use crate::persistence::wal_v3::segment::{WalSegment, WalWriterV3, WAL_V3_HEADER_SIZE};
+        use crate::persistence::wal_v3::segment::{WAL_V3_HEADER_SIZE, WalSegment, WalWriterV3};
 
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path().join("shard-0");
@@ -346,8 +406,15 @@ mod tests {
         let mvcc = vec![0u8; 24 * 5];
 
         let _handle = transition_to_warm(
-            &shard_dir, 10, 1000, &codes, &graph, None, &mvcc,
-            &mut manifest, Some(&mut wal),
+            &shard_dir,
+            10,
+            1000,
+            &codes,
+            &graph,
+            None,
+            &mvcc,
+            &mut manifest,
+            Some(&mut wal),
         )
         .unwrap();
 
@@ -372,8 +439,10 @@ mod tests {
                     break;
                 }
                 let record_len = u32::from_le_bytes([
-                    data[offset], data[offset + 1],
-                    data[offset + 2], data[offset + 3],
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
                 ]) as usize;
                 offset += record_len;
             } else {

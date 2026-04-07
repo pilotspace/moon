@@ -5,8 +5,8 @@
 //! handle drops and the segment is tombstoned, the directory is removed.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Tracks segment directory lifecycle. When tombstoned and all references
 /// are dropped, the segment directory is removed from disk.
@@ -115,7 +115,10 @@ mod tests {
 
         // Drop the handle -- directory should be removed
         drop(handle);
-        assert!(!seg_dir.exists(), "tombstoned segment dir should be removed on drop");
+        assert!(
+            !seg_dir.exists(),
+            "tombstoned segment dir should be removed on drop"
+        );
     }
 
     #[test]
@@ -167,7 +170,10 @@ mod tests {
 
         // Drop clone -- now it should be cleaned up
         drop(clone);
-        assert!(!seg_dir.exists(), "dir should be removed after last ref dropped");
+        assert!(
+            !seg_dir.exists(),
+            "dir should be removed after last ref dropped"
+        );
     }
 
     #[test]

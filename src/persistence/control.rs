@@ -7,9 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::persistence::fsync::{fsync_directory, fsync_file};
-use crate::persistence::page::{
-    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K,
-};
+use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 
 /// Control file payload size: 1 + 8 + 8 + 8 + 8 + 8 + 16 = 57 bytes.
 const CONTROL_PAYLOAD_SIZE: u32 = 57;
@@ -144,10 +142,7 @@ impl ShardControlFile {
         if hdr.page_type != PageType::ControlPage {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "expected Control page type, got {:?}",
-                    hdr.page_type
-                ),
+                format!("expected Control page type, got {:?}", hdr.page_type),
             ));
         }
 
@@ -168,16 +163,11 @@ impl ShardControlFile {
             )
         })?;
 
-        let last_checkpoint_lsn =
-            u64::from_le_bytes(buf[p + 1..p + 9].try_into().unwrap());
-        let last_checkpoint_epoch =
-            u64::from_le_bytes(buf[p + 9..p + 17].try_into().unwrap());
-        let wal_flush_lsn =
-            u64::from_le_bytes(buf[p + 17..p + 25].try_into().unwrap());
-        let next_txn_id =
-            u64::from_le_bytes(buf[p + 25..p + 33].try_into().unwrap());
-        let next_page_id =
-            u64::from_le_bytes(buf[p + 33..p + 41].try_into().unwrap());
+        let last_checkpoint_lsn = u64::from_le_bytes(buf[p + 1..p + 9].try_into().unwrap());
+        let last_checkpoint_epoch = u64::from_le_bytes(buf[p + 9..p + 17].try_into().unwrap());
+        let wal_flush_lsn = u64::from_le_bytes(buf[p + 17..p + 25].try_into().unwrap());
+        let next_txn_id = u64::from_le_bytes(buf[p + 25..p + 33].try_into().unwrap());
+        let next_page_id = u64::from_le_bytes(buf[p + 33..p + 41].try_into().unwrap());
 
         let mut shard_uuid = [0u8; 16];
         shard_uuid.copy_from_slice(&buf[p + 41..p + 57]);

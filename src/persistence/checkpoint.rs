@@ -143,9 +143,8 @@ impl CheckpointManager {
 
         // Compute how many ticks we have to spread the page flushes over.
         // ticks = timeout_secs * completion_fraction * 1000 (since tick is 1ms)
-        let ticks = (self.trigger.timeout_secs as f64
-            * self.trigger.completion_fraction
-            * 1000.0) as usize;
+        let ticks =
+            (self.trigger.timeout_secs as f64 * self.trigger.completion_fraction * 1000.0) as usize;
         let pages_per_tick = (dirty_count / ticks.max(1)).clamp(1, 16);
 
         self.state = CheckpointState::InProgress {
@@ -189,9 +188,7 @@ impl CheckpointManager {
                     CheckpointAction::FlushPages(pages_per_tick)
                 }
             }
-            CheckpointState::Finalizing { redo_lsn } => {
-                CheckpointAction::Finalize { redo_lsn }
-            }
+            CheckpointState::Finalizing { redo_lsn } => CheckpointAction::Finalize { redo_lsn },
         }
     }
 
@@ -405,7 +402,11 @@ mod tests {
         assert!(mgr.force_begin(100, 10));
         assert!(mgr.is_active());
         match mgr.state() {
-            CheckpointState::InProgress { redo_lsn, dirty_count, .. } => {
+            CheckpointState::InProgress {
+                redo_lsn,
+                dirty_count,
+                ..
+            } => {
                 assert_eq!(*redo_lsn, 100);
                 assert_eq!(*dirty_count, 10);
             }

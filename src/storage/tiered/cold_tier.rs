@@ -156,13 +156,7 @@ pub fn transition_to_cold(
     // Step 4: Build Vamana graph (warm-started from HNSW layer-0)
     let r = 64u32.min(n.saturating_sub(1) as u32).max(1); // max degree
     let l = 128u32.min(n as u32).max(r); // search list size >= r
-    let graph = VamanaGraph::build_from_hnsw(
-        warm_seg.graph(),
-        &vectors,
-        dim,
-        r,
-        l,
-    );
+    let graph = VamanaGraph::build_from_hnsw(warm_seg.graph(), &vectors, dim, r, l);
 
     // Step 5: Write to staging directory
     let vectors_dir = shard_dir.join("vectors");
@@ -216,12 +210,17 @@ pub fn transition_to_cold(
     if recall < 0.95 {
         tracing::warn!(
             "Cold transition recall {:.2} < 0.95 target for segment {} ({} vectors, dim={})",
-            recall, cold_file_id, n, dim,
+            recall,
+            cold_file_id,
+            n,
+            dim,
         );
     } else {
         tracing::info!(
             "Cold transition recall {:.2} for segment {} ({} vectors)",
-            recall, cold_file_id, n,
+            recall,
+            cold_file_id,
+            n,
         );
     }
 
@@ -260,12 +259,7 @@ pub fn transition_to_cold(
 /// Runs up to 50 deterministic query vectors (sampled from the dataset),
 /// computes recall@10 comparing Vamana greedy search against brute-force L2.
 /// Returns recall as a float in [0.0, 1.0].
-fn verify_recall(
-    graph: &VamanaGraph,
-    vectors: &[f32],
-    dim: usize,
-    n: usize,
-) -> f64 {
+fn verify_recall(graph: &VamanaGraph, vectors: &[f32], dim: usize, n: usize) -> f64 {
     if n < 10 {
         return 1.0; // Not enough vectors for meaningful recall test
     }
@@ -282,26 +276,24 @@ fn verify_recall(
 
         // Vamana greedy search
         let vamana_results = graph.greedy_search(query, vectors, dim, l);
-        let vamana_topk: std::collections::HashSet<u32> = vamana_results
-            .iter()
-            .take(k)
-            .map(|&(id, _)| id)
-            .collect();
+        let vamana_topk: std::collections::HashSet<u32> =
+            vamana_results.iter().take(k).map(|&(id, _)| id).collect();
 
         // Brute-force top-k
         let mut bf_dists: Vec<(f32, u32)> = (0..n as u32)
             .map(|i| {
                 let v = &vectors[i as usize * dim..(i as usize + 1) * dim];
-                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                let d: f32 = query
+                    .iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
                 (d, i)
             })
             .collect();
         bf_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let bf_topk: std::collections::HashSet<u32> = bf_dists
-            .iter()
-            .take(k)
-            .map(|&(_, id)| id)
-            .collect();
+        let bf_topk: std::collections::HashSet<u32> =
+            bf_dists.iter().take(k).map(|&(_, id)| id).collect();
 
         let hits = vamana_topk.intersection(&bf_topk).count();
         total_recall += hits as f64 / k as f64;
@@ -469,9 +461,17 @@ mod tests {
         manifest.add_file(cold_entry);
         manifest.commit().unwrap();
 
-        let warm = manifest.files().iter().find(|f| f.file_id == warm_file_id).unwrap();
+        let warm = manifest
+            .files()
+            .iter()
+            .find(|f| f.file_id == warm_file_id)
+            .unwrap();
         assert_eq!(warm.status, FileStatus::Compacting);
-        let cold = manifest.files().iter().find(|f| f.file_id == cold_file_id).unwrap();
+        let cold = manifest
+            .files()
+            .iter()
+            .find(|f| f.file_id == cold_file_id)
+            .unwrap();
         assert_eq!(cold.status, FileStatus::Building);
         assert_eq!(cold.tier, StorageTier::Cold);
 
@@ -484,9 +484,17 @@ mod tests {
         });
         manifest.commit().unwrap();
 
-        let warm = manifest.files().iter().find(|f| f.file_id == warm_file_id).unwrap();
+        let warm = manifest
+            .files()
+            .iter()
+            .find(|f| f.file_id == warm_file_id)
+            .unwrap();
         assert_eq!(warm.status, FileStatus::Tombstone);
-        let cold = manifest.files().iter().find(|f| f.file_id == cold_file_id).unwrap();
+        let cold = manifest
+            .files()
+            .iter()
+            .find(|f| f.file_id == cold_file_id)
+            .unwrap();
         assert_eq!(cold.status, FileStatus::Active);
         assert_eq!(cold.tier, StorageTier::Cold);
     }

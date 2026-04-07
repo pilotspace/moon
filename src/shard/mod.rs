@@ -99,9 +99,8 @@ impl Shard {
                             for db in &mut self.databases {
                                 db.cold_shard_dir = Some(cold_dir.clone());
                                 if db.cold_index.is_none() {
-                                    db.cold_index = Some(
-                                        crate::storage::tiered::cold_index::ColdIndex::new(),
-                                    );
+                                    db.cold_index =
+                                        Some(crate::storage::tiered::cold_index::ColdIndex::new());
                                 }
                             }
                             if let Some(recovered_ci) = result.cold_index {
@@ -118,18 +117,22 @@ impl Shard {
                         if !result.warm_segments.is_empty() {
                             info!(
                                 "Shard {}: registering {} warm segment(s)",
-                                self.id, result.warm_segments.len()
+                                self.id,
+                                result.warm_segments.len()
                             );
-                            self.vector_store.register_warm_segments(result.warm_segments);
+                            self.vector_store
+                                .register_warm_segments(result.warm_segments);
                         }
 
                         // Register cold DiskANN segments for discovery
                         if !result.cold_segments.is_empty() {
                             info!(
                                 "Shard {}: registering {} cold segment(s)",
-                                self.id, result.cold_segments.len()
+                                self.id,
+                                result.cold_segments.len()
                             );
-                            self.vector_store.register_cold_segments(result.cold_segments);
+                            self.vector_store
+                                .register_cold_segments(result.cold_segments);
                         }
                         return result.commands_replayed;
                     }
@@ -192,9 +195,14 @@ impl Shard {
         if wal_replayed == 0 {
             let aof_path = dir.join("appendonly.aof");
             if aof_path.exists() {
-                info!("Shard {}: WAL empty, falling back to appendonly.aof", self.id);
+                info!(
+                    "Shard {}: WAL empty, falling back to appendonly.aof",
+                    self.id
+                );
                 match crate::persistence::aof::replay_aof(
-                    &mut self.databases, &aof_path, &DispatchReplayEngine,
+                    &mut self.databases,
+                    &aof_path,
+                    &DispatchReplayEngine,
                 ) {
                     Ok(n) => {
                         info!("Shard {}: replayed {} AOF commands", self.id, n);

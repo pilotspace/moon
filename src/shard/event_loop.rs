@@ -14,9 +14,9 @@ use tracing::info;
 
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
-use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::control::ShardControlFile;
 use crate::persistence::page_cache::PageCache;
+use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
@@ -171,16 +171,28 @@ impl super::Shard {
                         tokio::io::Interest::READABLE,
                     ) {
                         Ok(afd) => {
-                            tracing::info!("Shard {}: io_uring eventfd registered with tokio (fd={})", self.id, dup_fd);
+                            tracing::info!(
+                                "Shard {}: io_uring eventfd registered with tokio (fd={})",
+                                self.id,
+                                dup_fd
+                            );
                             Some(afd)
                         }
                         Err(e) => {
-                            tracing::warn!("Shard {}: AsyncFd for io_uring eventfd failed: {}", self.id, e);
+                            tracing::warn!(
+                                "Shard {}: AsyncFd for io_uring eventfd failed: {}",
+                                self.id,
+                                e
+                            );
                             None
                         }
                     }
                 } else {
-                    tracing::warn!("Shard {}: dup(eventfd) failed: {}", self.id, std::io::Error::last_os_error());
+                    tracing::warn!(
+                        "Shard {}: dup(eventfd) failed: {}",
+                        self.id,
+                        std::io::Error::last_os_error()
+                    );
                     None
                 }
             } else {
@@ -346,7 +358,8 @@ impl super::Shard {
         };
 
         // Disk-offload base directory (None when disk-offload is disabled).
-        let disk_offload_base: Option<std::path::PathBuf> = if server_config.disk_offload_enabled() {
+        let disk_offload_base: Option<std::path::PathBuf> = if server_config.disk_offload_enabled()
+        {
             Some(server_config.effective_disk_offload_dir())
         } else {
             None
@@ -356,13 +369,17 @@ impl super::Shard {
         // Provides per-record LSN tracking and FPI support for checkpoint-based recovery.
         // WAL v2 remains active for non-disk-offload mode; both writers can coexist.
         let mut wal_v3_writer: Option<WalWriterV3> = if server_config.disk_offload_enabled() {
-            let shard_dir = server_config.effective_disk_offload_dir()
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
                 .join(format!("shard-{}", shard_id));
             let wal_dir = shard_dir.join("wal-v3");
             match WalWriterV3::new(shard_id, &wal_dir, server_config.wal_segment_size_bytes()) {
                 Ok(w) => {
-                    info!("Shard {}: WAL v3 writer initialized (segment_size={})",
-                        shard_id, server_config.wal_segment_size_bytes());
+                    info!(
+                        "Shard {}: WAL v3 writer initialized (segment_size={})",
+                        shard_id,
+                        server_config.wal_segment_size_bytes()
+                    );
                     Some(w)
                 }
                 Err(e) => {
@@ -389,10 +406,12 @@ impl super::Shard {
             let budget = server_config.pagecache_size_bytes(server_config.maxmemory as u64);
             let num_4k = ((budget * 3 / 4) / 4096) as usize;
             let num_64k = ((budget / 4) / 65536) as usize;
-            let num_4k = num_4k.max(64);   // minimum 64 frames
-            let num_64k = num_64k.max(8);  // minimum 8 frames
-            info!("Shard {}: PageCache initialized ({} x 4KB + {} x 64KB frames, budget={})",
-                shard_id, num_4k, num_64k, budget);
+            let num_4k = num_4k.max(64); // minimum 64 frames
+            let num_64k = num_64k.max(8); // minimum 8 frames
+            info!(
+                "Shard {}: PageCache initialized ({} x 4KB + {} x 64KB frames, budget={})",
+                shard_id, num_4k, num_64k, budget
+            );
             Some(PageCache::new(num_4k, num_64k))
         } else {
             None
@@ -400,14 +419,19 @@ impl super::Shard {
 
         // Per-shard control file (disk-offload path).
         let mut control_file: Option<ShardControlFile> = if server_config.disk_offload_enabled() {
-            let shard_dir = server_config.effective_disk_offload_dir()
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
                 .join(format!("shard-{}", shard_id));
             let ctrl_path = ShardControlFile::control_path(&shard_dir, shard_id);
             if ctrl_path.exists() {
                 match ShardControlFile::read(&ctrl_path) {
                     Ok(cf) => Some(cf),
                     Err(e) => {
-                        tracing::warn!("Shard {}: control file read failed: {}, creating new", shard_id, e);
+                        tracing::warn!(
+                            "Shard {}: control file read failed: {}, creating new",
+                            shard_id,
+                            e
+                        );
                         Some(ShardControlFile::new([0u8; 16]))
                     }
                 }
@@ -417,8 +441,10 @@ impl super::Shard {
         } else {
             None
         };
-        let control_file_path: Option<std::path::PathBuf> = if server_config.disk_offload_enabled() {
-            let shard_dir = server_config.effective_disk_offload_dir()
+        let control_file_path: Option<std::path::PathBuf> = if server_config.disk_offload_enabled()
+        {
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
                 .join(format!("shard-{}", shard_id));
             Some(ShardControlFile::control_path(&shard_dir, shard_id))
         } else {
@@ -442,10 +468,15 @@ impl super::Shard {
                     server_config.max_wal_size_bytes(),
                     server_config.checkpoint_completion,
                 );
-                info!("Shard {}: checkpoint manager initialized (timeout={}s, max_wal={})",
-                    shard_id, server_config.checkpoint_timeout,
-                    server_config.max_wal_size_bytes());
-                Some(crate::persistence::checkpoint::CheckpointManager::new(trigger))
+                info!(
+                    "Shard {}: checkpoint manager initialized (timeout={}s, max_wal={})",
+                    shard_id,
+                    server_config.checkpoint_timeout,
+                    server_config.max_wal_size_bytes()
+                );
+                Some(crate::persistence::checkpoint::CheckpointManager::new(
+                    trigger,
+                ))
             } else {
                 None
             };
@@ -455,7 +486,8 @@ impl super::Shard {
         // tier transitions (check_warm_transitions).
         let mut shard_manifest: Option<crate::persistence::manifest::ShardManifest> =
             if server_config.disk_offload_enabled() {
-                let shard_dir = server_config.effective_disk_offload_dir()
+                let shard_dir = server_config
+                    .effective_disk_offload_dir()
                     .join(format!("shard-{}", shard_id));
                 std::fs::create_dir_all(&shard_dir).ok();
                 let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
@@ -471,7 +503,11 @@ impl super::Shard {
                     match crate::persistence::manifest::ShardManifest::create(&manifest_path) {
                         Ok(m) => Some(m),
                         Err(e) => {
-                            tracing::warn!("Shard {}: shard manifest create failed: {}", shard_id, e);
+                            tracing::warn!(
+                                "Shard {}: shard manifest create failed: {}",
+                                shard_id,
+                                e
+                            );
                             None
                         }
                     }
@@ -496,9 +532,11 @@ impl super::Shard {
         // Event loop syncs its local `next_file_id` TO this Cell before spawning
         // connections, and syncs FROM this Cell at top of each timer tick (in case
         // handlers incremented it via async spill eviction).
-        let spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>> =
-            spill_thread.as_ref().map(|st| st.sender());
-        let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(1));
+        let spill_sender: Option<
+            flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>,
+        > = spill_thread.as_ref().map(|st| st.sender());
+        let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> =
+            std::rc::Rc::new(std::cell::Cell::new(1));
         let mut next_file_id: u64 = 1;
         let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
         // Suppress unused warnings for tokio path (these are used in monoio handler only)
@@ -521,13 +559,9 @@ impl super::Shard {
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
         // Warm check interval adapts to segment_warm_after for fast testing:
         // default 10s, but if warm_after < 10s, poll at warm_after frequency.
-        let warm_poll_ms = (server_config.segment_warm_after * 1000).clamp(
-            1000,
-            timers::WARM_CHECK_INTERVAL_MS,
-        );
-        let mut warm_check_interval = TimerImpl::interval(
-            Duration::from_millis(warm_poll_ms)
-        );
+        let warm_poll_ms =
+            (server_config.segment_warm_after * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
+        let mut warm_check_interval = TimerImpl::interval(Duration::from_millis(warm_poll_ms));
         // Cold tier transition check: poll at min(60s, segment_cold_after) so the
         // timer fires within one cold-age window. Default cold_after=86400 → 60s poll.
         // Short cold_after (e.g. 15s for testing) → poll every 15s.
@@ -564,8 +598,11 @@ impl super::Shard {
         // Try disk-offload dir first (higher priority), then main persistence dir.
         {
             let vector_persist_dir = if server_config.disk_offload_enabled() {
-                Some(server_config.effective_disk_offload_dir()
-                    .join(format!("shard-{}", shard_id)))
+                Some(
+                    server_config
+                        .effective_disk_offload_dir()
+                        .join(format!("shard-{}", shard_id)),
+                )
             } else {
                 persistence_dir.as_ref().map(|d| {
                     std::path::PathBuf::from(d).join(format!("shard-{}-vectors", shard_id))
@@ -591,7 +628,8 @@ impl super::Shard {
                 let mut vs = shard_databases.vector_store(shard_id);
                 info!(
                     "Shard {}: restoring {} vector index(es) from sidecar",
-                    shard_id, metas.len()
+                    shard_id,
+                    metas.len()
                 );
                 for meta in &metas {
                     if let Err(e) = vs.create_index(meta.clone()) {
@@ -613,9 +651,9 @@ impl super::Shard {
                     let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
                     for (key, entry) in guard.data().iter() {
                         let key_bytes = key.as_bytes();
-                        let matches_prefix = metas.iter().any(|m| {
-                            m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
-                        });
+                        let matches_prefix = metas
+                            .iter()
+                            .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)));
                         if !matches_prefix {
                             continue;
                         }
@@ -658,9 +696,7 @@ impl super::Shard {
                     if !matching.is_empty() {
                         let mut vs = shard_databases.vector_store(shard_id);
                         for (key, args) in &matching {
-                            crate::shard::spsc_handler::auto_index_hset_public(
-                                &mut vs, key, args,
-                            );
+                            crate::shard::spsc_handler::auto_index_hset_public(&mut vs, key, args);
                             reindexed += 1;
                         }
                     }
@@ -1109,16 +1145,37 @@ impl super::Shard {
             #[cfg(feature = "runtime-monoio")]
             while let Ok((std_tcp_stream, is_tls)) = conn_rx.try_recv() {
                 conn_accept::spawn_monoio_connection(
-                    std_tcp_stream, is_tls, &tls_config,
-                    &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                    &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                    &acl_table, &runtime_config, &server_config, &all_notifiers,
-                    &snapshot_trigger_tx, &repl_state, &cluster_state,
-                    &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                    &all_remote_sub_maps, &affinity_tracker,
-                    shard_id, num_shards, config_port,
+                    std_tcp_stream,
+                    is_tls,
+                    &tls_config,
+                    &shard_databases,
+                    &dispatch_tx,
+                    &pubsub_arc,
+                    &blocking_rc,
+                    &shutdown,
+                    &aof_tx,
+                    &tracking_rc,
+                    &lua_rc,
+                    &script_cache_rc,
+                    &acl_table,
+                    &runtime_config,
+                    &server_config,
+                    &all_notifiers,
+                    &snapshot_trigger_tx,
+                    &repl_state,
+                    &cluster_state,
+                    &cached_clock,
+                    &remote_sub_map_arc,
+                    &all_pubsub_registries,
+                    &all_remote_sub_maps,
+                    &affinity_tracker,
+                    shard_id,
+                    num_shards,
+                    config_port,
                     &pending_wakers,
-                    &spill_sender, &spill_file_id, &disk_offload_dir,
+                    &spill_sender,
+                    &spill_file_id,
+                    &disk_offload_dir,
                 );
             }
             // Wake cross-shard response tasks that registered during the previous iteration.

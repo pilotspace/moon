@@ -1,5 +1,4 @@
 pub mod bptree;
-pub mod tiered;
 pub mod compact_key;
 pub mod compact_value;
 pub mod dashtable;
@@ -10,6 +9,7 @@ pub mod eviction;
 pub mod intset;
 pub mod listpack;
 pub mod stream;
+pub mod tiered;
 
 pub use db::Database;
 pub use entry::{Entry, RedisValue};

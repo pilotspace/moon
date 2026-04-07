@@ -341,9 +341,8 @@ impl UringDriver {
         {
             let mut sq = self.ring.submission();
             unsafe {
-                sq.push(entry).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "SQ full")
-                })?;
+                sq.push(entry)
+                    .map_err(|_| std::io::Error::other("SQ full"))?;
             }
             sq.sync();
         }
@@ -564,9 +563,9 @@ impl UringDriver {
         // SAFETY: IORING_ENTER_GETEVENTS=1. min_complete=0 means nonblocking.
         // With COOP_TASKRUN, this flushes task-work (multishot accept/recv CQEs).
         match unsafe {
-            self.ring.submitter().enter::<libc::sigset_t>(
-                0, 0, 1, /* IORING_ENTER_GETEVENTS */ None,
-            )
+            self.ring
+                .submitter()
+                .enter::<libc::sigset_t>(0, 0, 1, /* IORING_ENTER_GETEVENTS */ None)
         } {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
@@ -810,7 +809,9 @@ impl UringDriver {
 impl Drop for UringDriver {
     fn drop(&mut self) {
         // SAFETY: cqe_eventfd is a valid fd created by eventfd().
-        unsafe { libc::close(self.cqe_eventfd); }
+        unsafe {
+            libc::close(self.cqe_eventfd);
+        }
     }
 }
 

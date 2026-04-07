@@ -134,7 +134,8 @@ impl SegmentHolder {
         let snapshot = self.load();
 
         // Pre-allocate merge buffer: k results per segment (mutable + immutables + warm + cold).
-        let segment_count = 1 + snapshot.immutable.len() + snapshot.warm.len() + snapshot.cold.len();
+        let segment_count =
+            1 + snapshot.immutable.len() + snapshot.warm.len() + snapshot.cold.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
         // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
@@ -184,7 +185,11 @@ impl SegmentHolder {
                 }
                 for warm_seg in &snapshot.warm {
                     all.extend(warm_seg.search_filtered(
-                        query_f32, k, ef_search, _scratch, filter_bitmap,
+                        query_f32,
+                        k,
+                        ef_search,
+                        _scratch,
+                        filter_bitmap,
                     ));
                 }
             }
@@ -206,7 +211,11 @@ impl SegmentHolder {
                 }
                 for warm_seg in &snapshot.warm {
                     all.extend(warm_seg.search_filtered(
-                        query_f32, k, ef_search, _scratch, filter_bitmap,
+                        query_f32,
+                        k,
+                        ef_search,
+                        _scratch,
+                        filter_bitmap,
                     ));
                 }
             }
@@ -237,7 +246,10 @@ impl SegmentHolder {
                 }
                 for warm_seg in &snapshot.warm {
                     let warm_results = warm_seg.search(
-                        query_f32, oversample_k, ef_search.max(oversample_k), _scratch,
+                        query_f32,
+                        oversample_k,
+                        ef_search.max(oversample_k),
+                        _scratch,
                     );
                     if let Some(bm) = filter_bitmap {
                         for r in warm_results {
@@ -370,7 +382,11 @@ impl SegmentHolder {
         for warm_seg in &snapshot.warm {
             if filter_bitmap.is_some() {
                 all.extend(warm_seg.search_filtered(
-                    query_f32, k, ef_search, _scratch, filter_bitmap,
+                    query_f32,
+                    k,
+                    ef_search,
+                    _scratch,
+                    filter_bitmap,
                 ));
             } else {
                 all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));

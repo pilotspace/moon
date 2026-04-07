@@ -9,15 +9,15 @@ use std::path::Path;
 use bytes::Bytes;
 use tracing::warn;
 
+use super::kv_serde;
 use crate::persistence::kv_page::{
-    KvLeafPage, PageFull, ValueType, entry_flags, write_datafile,
-    build_overflow_chain, write_datafile_mixed,
+    KvLeafPage, PageFull, ValueType, build_overflow_chain, entry_flags, write_datafile,
+    write_datafile_mixed,
 };
 use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
-use crate::persistence::page::{PageType, PAGE_4K};
+use crate::persistence::page::{PAGE_4K, PageType};
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::Entry;
-use super::kv_serde;
 
 /// Spill a single evicted KV entry to a DataFile on disk.
 ///
@@ -50,8 +50,12 @@ pub fn spill_to_datafile(
             let vt = match other {
                 RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => ValueType::Hash,
                 RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-                RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => ValueType::Set,
-                RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetBPTree { .. } | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+                RedisValueRef::Set(_)
+                | RedisValueRef::SetListpack(_)
+                | RedisValueRef::SetIntset(_) => ValueType::Set,
+                RedisValueRef::SortedSet { .. }
+                | RedisValueRef::SortedSetBPTree { .. }
+                | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
                 RedisValueRef::Stream(_) => ValueType::Stream,
                 RedisValueRef::String(_) => unreachable!(),
             };
@@ -150,13 +154,13 @@ pub fn spill_to_datafile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use std::collections::HashMap;
-    use std::collections::VecDeque;
     use crate::persistence::kv_page::read_datafile;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::compact_value::CompactValue;
     use crate::storage::entry::{Entry, RedisValue, current_time_ms};
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
 
     #[test]
     fn test_spill_string_roundtrip() {
@@ -236,11 +240,17 @@ mod tests {
 
         // File SHOULD now exist with overflow pages
         let file_path = shard_dir.join("data/heap-000003.mpf");
-        assert!(file_path.exists(), "oversized entry should use overflow pages");
+        assert!(
+            file_path.exists(),
+            "oversized entry should use overflow pages"
+        );
 
         // Manifest should have an entry with page_count > 1
         assert_eq!(manifest.files().len(), 1);
-        assert!(manifest.files()[0].page_count > 1, "should have overflow pages");
+        assert!(
+            manifest.files()[0].page_count > 1,
+            "should have overflow pages"
+        );
 
         // Verify the leaf page has OVERFLOW flag
         let file_data = std::fs::read(&file_path).unwrap();
@@ -248,7 +258,11 @@ mod tests {
         leaf_buf.copy_from_slice(&file_data[..PAGE_4K]);
         let leaf = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf).unwrap();
         let kv_entry = leaf.get(0).unwrap();
-        assert_ne!(kv_entry.flags & entry_flags::OVERFLOW, 0, "OVERFLOW flag should be set");
+        assert_ne!(
+            kv_entry.flags & entry_flags::OVERFLOW,
+            0,
+            "OVERFLOW flag should be set"
+        );
     }
 
     #[test]
@@ -283,8 +297,14 @@ mod tests {
         match deserialized {
             RedisValue::Hash(result_map) => {
                 assert_eq!(result_map.len(), 2);
-                assert_eq!(result_map.get(&Bytes::from_static(b"f1")).unwrap(), &Bytes::from_static(b"v1"));
-                assert_eq!(result_map.get(&Bytes::from_static(b"f2")).unwrap(), &Bytes::from_static(b"v2"));
+                assert_eq!(
+                    result_map.get(&Bytes::from_static(b"f1")).unwrap(),
+                    &Bytes::from_static(b"v1")
+                );
+                assert_eq!(
+                    result_map.get(&Bytes::from_static(b"f2")).unwrap(),
+                    &Bytes::from_static(b"v2")
+                );
             }
             _ => panic!("expected Hash"),
         }
@@ -330,8 +350,8 @@ mod tests {
 
     #[test]
     fn test_spill_overflow_string_roundtrip() {
-        use crate::storage::tiered::cold_read::cold_read_through;
         use crate::storage::tiered::cold_index::ColdIndex;
+        use crate::storage::tiered::cold_read::cold_read_through;
 
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path();
@@ -350,12 +370,23 @@ mod tests {
         }
         let entry = Entry::new_string(Bytes::from(big_value.clone()));
 
-        spill_to_datafile(shard_dir, 50, b"overflow_key", &entry, &mut manifest, Some(&mut cold_index)).unwrap();
+        spill_to_datafile(
+            shard_dir,
+            50,
+            b"overflow_key",
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
 
         // Verify file is multi-page
         let file_path = shard_dir.join("data/heap-000050.mpf");
         let file_size = std::fs::metadata(&file_path).unwrap().len();
-        assert!(file_size > PAGE_4K as u64, "file should have overflow pages");
+        assert!(
+            file_size > PAGE_4K as u64,
+            "file should have overflow pages"
+        );
 
         // Read back via cold_read_through
         let result = cold_read_through(&cold_index, shard_dir, b"overflow_key", 0);

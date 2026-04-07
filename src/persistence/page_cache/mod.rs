@@ -72,8 +72,9 @@ impl PageCache {
             .map(|_| RwLock::new(vec![0u8; PAGE_4K]))
             .collect();
 
-        let frames_64k: Vec<FrameDescriptor> =
-            (0..num_frames_64k).map(|_| FrameDescriptor::new()).collect();
+        let frames_64k: Vec<FrameDescriptor> = (0..num_frames_64k)
+            .map(|_| FrameDescriptor::new())
+            .collect();
         let buffers_64k: Vec<RwLock<Vec<u8>>> = (0..num_frames_64k)
             .map(|_| RwLock::new(vec![0u8; PAGE_64K]))
             .collect();
@@ -115,7 +116,11 @@ impl PageCache {
         // Cache hit path
         if let Some(entry) = self.page_table.get(&key) {
             let (frame_idx, large) = *entry;
-            let frames = if large { &self.frames_64k } else { &self.frames_4k };
+            let frames = if large {
+                &self.frames_64k
+            } else {
+                &self.frames_4k
+            };
             frames[frame_idx as usize].state.pin();
             frames[frame_idx as usize].state.touch();
             return Ok(PageHandle {
@@ -131,12 +136,9 @@ impl PageCache {
             (&self.frames_4k, &self.buffers_4k, &self.sweep_4k)
         };
 
-        let victim_idx = sweep.find_victim(frames).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "page cache full: all frames pinned",
-            )
-        })?;
+        let victim_idx = sweep
+            .find_victim(frames)
+            .ok_or_else(|| std::io::Error::other("page cache full: all frames pinned"))?;
 
         let victim = &frames[victim_idx];
 
@@ -164,8 +166,7 @@ impl PageCache {
         victim.state.touch();
 
         // Insert into page table
-        self.page_table
-            .insert(key, (victim_idx as u32, is_large));
+        self.page_table.insert(key, (victim_idx as u32, is_large));
 
         Ok(PageHandle {
             frame_index: victim_idx as u32,
@@ -188,10 +189,7 @@ impl PageCache {
     /// Get a write reference to the page data for a pinned handle.
     ///
     /// The caller must hold a valid pin (via `fetch_page`).
-    pub fn page_data_mut(
-        &self,
-        handle: &PageHandle,
-    ) -> parking_lot::RwLockWriteGuard<'_, Vec<u8>> {
+    pub fn page_data_mut(&self, handle: &PageHandle) -> parking_lot::RwLockWriteGuard<'_, Vec<u8>> {
         let buffers = if handle.is_large {
             &self.buffers_64k
         } else {
@@ -492,7 +490,12 @@ impl PageCache {
                 if flags & FLAG_FPI_PENDING != 0 {
                     let buf = self.buffers_4k[idx].read();
                     if let Err(e) = fpi_fn(file_id, page_offset, false, &buf) {
-                        tracing::error!("FPI write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        tracing::error!(
+                            "FPI write failed: file_id={}, offset={}: {}",
+                            file_id,
+                            page_offset,
+                            e
+                        );
                         continue;
                     }
                     drop(buf);
@@ -501,7 +504,12 @@ impl PageCache {
                 {
                     let buf = self.buffers_4k[idx].read();
                     if let Err(e) = write_fn(file_id, page_offset, false, &buf) {
-                        tracing::error!("Dirty page write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        tracing::error!(
+                            "Dirty page write failed: file_id={}, offset={}: {}",
+                            file_id,
+                            page_offset,
+                            e
+                        );
                         continue;
                     }
                 }
@@ -527,7 +535,12 @@ impl PageCache {
                 if flags & FLAG_FPI_PENDING != 0 {
                     let buf = self.buffers_64k[idx].read();
                     if let Err(e) = fpi_fn(file_id, page_offset, true, &buf) {
-                        tracing::error!("FPI write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        tracing::error!(
+                            "FPI write failed: file_id={}, offset={}: {}",
+                            file_id,
+                            page_offset,
+                            e
+                        );
                         continue;
                     }
                     drop(buf);
@@ -536,7 +549,12 @@ impl PageCache {
                 {
                     let buf = self.buffers_64k[idx].read();
                     if let Err(e) = write_fn(file_id, page_offset, true, &buf) {
-                        tracing::error!("Dirty page write failed: file_id={}, offset={}: {}", file_id, page_offset, e);
+                        tracing::error!(
+                            "Dirty page write failed: file_id={}, offset={}: {}",
+                            file_id,
+                            page_offset,
+                            e
+                        );
                         continue;
                     }
                 }
@@ -802,8 +820,7 @@ mod tests {
         }
         assert_eq!(cache.dirty_page_count(), 4);
 
-        let flushed =
-            cache.flush_dirty_pages(2, &mut |_| Ok(()), &mut |_, _, _, _| Ok(()));
+        let flushed = cache.flush_dirty_pages(2, &mut |_| Ok(()), &mut |_, _, _, _| Ok(()));
 
         assert_eq!(flushed, 2);
         assert_eq!(cache.dirty_page_count(), 2);
@@ -847,10 +864,12 @@ mod tests {
         let cache = PageCache::new(4, 2);
 
         // Fetch, dirty, and set FPI_PENDING on a page
-        let h = cache.fetch_page(1, 0, false, |buf| {
-            buf[0] = 0xCC;
-            Ok(())
-        }).unwrap();
+        let h = cache
+            .fetch_page(1, 0, false, |buf| {
+                buf[0] = 0xCC;
+                Ok(())
+            })
+            .unwrap();
         cache.unpin_page(h);
         cache.mark_dirty(1, 0, 100);
 
@@ -909,6 +928,9 @@ mod tests {
         );
 
         assert_eq!(flushed, 1);
-        assert!(!fpi_called, "FPI should not be called when FPI_PENDING is not set");
+        assert!(
+            !fpi_called,
+            "FPI should not be called when FPI_PENDING is not set"
+        );
     }
 }

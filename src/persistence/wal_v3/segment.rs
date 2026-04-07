@@ -304,7 +304,10 @@ impl WalWriterV3 {
             if !name_str.ends_with(".wal") {
                 continue;
             }
-            let seq = match name_str.strip_suffix(".wal").and_then(|s| s.parse::<u64>().ok()) {
+            let seq = match name_str
+                .strip_suffix(".wal")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
                 Some(s) => s,
                 None => continue,
             };
@@ -322,7 +325,12 @@ impl WalWriterV3 {
                 continue; // Truncated header, skip
             };
 
-            all_segments.push(SegInfo { seq, base_lsn, file_size, path });
+            all_segments.push(SegInfo {
+                seq,
+                base_lsn,
+                file_size,
+                path,
+            });
         }
 
         // Sort candidates by sequence ascending (oldest first).
@@ -376,13 +384,16 @@ impl WalWriterV3 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::record::read_wal_v3_record;
+    use super::*;
 
     #[test]
     fn test_segment_name_format() {
         assert_eq!(WalSegment::segment_name(1), "000000000001.wal");
-        assert_eq!(WalSegment::segment_name(999_999_999_999), "999999999999.wal");
+        assert_eq!(
+            WalSegment::segment_name(999_999_999_999),
+            "999999999999.wal"
+        );
         assert_eq!(WalSegment::segment_name(0), "000000000000.wal");
     }
 
@@ -428,9 +439,12 @@ mod tests {
         while offset < data.len() {
             let record = read_wal_v3_record(&data[offset..]).expect("should parse record");
             assert_eq!(record.record_type, WalRecordType::Command);
-            let record_len =
-                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
-                    as usize;
+            let record_len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
             offset += record_len;
             count += 1;
         }
@@ -523,7 +537,11 @@ mod tests {
         writer.flush_sync().unwrap();
 
         let active_seq = writer.current_segment_sequence();
-        assert!(active_seq >= 3, "should have 3+ segments, got {}", active_seq);
+        assert!(
+            active_seq >= 3,
+            "should have 3+ segments, got {}",
+            active_seq
+        );
 
         // Count total .wal files before recycling.
         let count_wals = || -> usize {
@@ -543,7 +561,10 @@ mod tests {
 
         // Active segment must still exist.
         let active_path = WalSegment::segment_path(&wal_dir, active_seq);
-        assert!(active_path.exists(), "active segment must survive recycling");
+        assert!(
+            active_path.exists(),
+            "active segment must survive recycling"
+        );
 
         // First segment should be deleted (base_lsn = 1 < 20).
         let first_path = WalSegment::segment_path(&wal_dir, 1);
@@ -574,7 +595,11 @@ mod tests {
         writer.flush_sync().unwrap();
 
         let active_seq = writer.current_segment_sequence();
-        assert!(active_seq >= 4, "should have 4+ segments, got {}", active_seq);
+        assert!(
+            active_seq >= 4,
+            "should have 4+ segments, got {}",
+            active_seq
+        );
 
         // Sum total WAL size on disk.
         let total_wal_size = || -> u64 {

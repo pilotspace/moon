@@ -58,12 +58,7 @@ pub fn replay_wal_auto(
                     if record.record_type == WalRecordType::Command {
                         // Parse RESP from payload and dispatch
                         // For now, pass raw payload as command bytes
-                        engine.replay_command(
-                            databases,
-                            &record.payload,
-                            &[],
-                            &mut selected_db,
-                        );
+                        engine.replay_command(databases, &record.payload, &[], &mut selected_db);
                     }
                     commands_replayed += 1;
                 };
@@ -99,11 +94,7 @@ pub fn replay_wal_v3_dir(
 ) -> std::io::Result<WalV3ReplayResult> {
     let mut segments: Vec<_> = std::fs::read_dir(wal_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(".wal"))
-        })
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
         .map(|e| e.path())
         .collect();
 
@@ -219,9 +210,9 @@ pub fn replay_wal_v3_file(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::record::write_wal_v3_record;
     use super::super::segment::WAL_V3_HEADER_SIZE;
+    use super::*;
 
     /// Build a minimal v3 segment header.
     fn make_v3_header(shard_id: u16) -> Vec<u8> {
@@ -256,12 +247,9 @@ mod tests {
 
         let mut cmd_count = 0usize;
         let mut fpi_count = 0usize;
-        let result = replay_wal_v3_file(
-            &seg_path,
-            0,
-            &mut |_| cmd_count += 1,
-            &mut |_| fpi_count += 1,
-        )
+        let result = replay_wal_v3_file(&seg_path, 0, &mut |_| cmd_count += 1, &mut |_| {
+            fpi_count += 1
+        })
         .unwrap();
 
         assert_eq!(result.commands_replayed, 5);
@@ -288,13 +276,8 @@ mod tests {
         std::fs::write(&seg_path, &data).unwrap();
 
         let mut fpi_count = 0usize;
-        let result = replay_wal_v3_file(
-            &seg_path,
-            0,
-            &mut |_| {},
-            &mut |_| fpi_count += 1,
-        )
-        .unwrap();
+        let result =
+            replay_wal_v3_file(&seg_path, 0, &mut |_| {}, &mut |_| fpi_count += 1).unwrap();
 
         assert_eq!(result.commands_replayed, 1);
         assert_eq!(result.fpi_applied, 1);
@@ -319,13 +302,8 @@ mod tests {
         std::fs::write(&seg_path, &data).unwrap();
 
         let mut cmd_count = 0usize;
-        let result = replay_wal_v3_file(
-            &seg_path,
-            0,
-            &mut |_| cmd_count += 1,
-            &mut |_| {},
-        )
-        .unwrap();
+        let result =
+            replay_wal_v3_file(&seg_path, 0, &mut |_| cmd_count += 1, &mut |_| {}).unwrap();
 
         // Only first 2 records should have replayed
         assert_eq!(result.commands_replayed, 2);
@@ -379,13 +357,7 @@ mod tests {
         std::fs::write(wal_dir.join("000000000002.wal"), &data2).unwrap();
 
         let mut cmd_count = 0usize;
-        let result = replay_wal_v3_dir(
-            &wal_dir,
-            0,
-            &mut |_| cmd_count += 1,
-            &mut |_| {},
-        )
-        .unwrap();
+        let result = replay_wal_v3_dir(&wal_dir, 0, &mut |_| cmd_count += 1, &mut |_| {}).unwrap();
 
         assert_eq!(result.commands_replayed, 6);
         assert_eq!(cmd_count, 6);
@@ -405,12 +377,9 @@ mod tests {
 
         let mut cmd_count = 0usize;
         let mut fpi_count = 0usize;
-        let result = replay_wal_v3_file(
-            &seg_path,
-            0,
-            &mut |_| cmd_count += 1,
-            &mut |_| fpi_count += 1,
-        )
+        let result = replay_wal_v3_file(&seg_path, 0, &mut |_| cmd_count += 1, &mut |_| {
+            fpi_count += 1
+        })
         .unwrap();
 
         // Checkpoint should NOT be dispatched to either callback
@@ -430,13 +399,7 @@ mod tests {
         let data = make_v3_header(0);
         std::fs::write(&seg_path, &data).unwrap();
 
-        let result = replay_wal_v3_file(
-            &seg_path,
-            0,
-            &mut |_| {},
-            &mut |_| {},
-        )
-        .unwrap();
+        let result = replay_wal_v3_file(&seg_path, 0, &mut |_| {}, &mut |_| {}).unwrap();
 
         assert_eq!(result.commands_replayed, 0);
         assert_eq!(result.fpi_applied, 0);
@@ -488,13 +451,8 @@ mod tests {
         std::fs::write(&seg_path, &data).unwrap();
 
         let mut cmd_count = 0usize;
-        let result = replay_wal_v3_file(
-            &seg_path,
-            0,
-            &mut |_| cmd_count += 1,
-            &mut |_| {},
-        )
-        .unwrap();
+        let result =
+            replay_wal_v3_file(&seg_path, 0, &mut |_| cmd_count += 1, &mut |_| {}).unwrap();
 
         // Vector and File records go through on_command
         assert_eq!(result.commands_replayed, 3);

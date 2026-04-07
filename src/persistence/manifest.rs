@@ -7,9 +7,7 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::persistence::page::{
-    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K,
-};
+use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 
 /// File lifecycle status within the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +190,8 @@ const ROOT_META_SIZE: usize = 64;
 
 /// Maximum inline FileEntry records per root page.
 /// (4096 - 64 header - 64 meta) / 48 = 82.
-pub const MAX_INLINE_ENTRIES: usize = (PAGE_4K - MOONPAGE_HEADER_SIZE - ROOT_META_SIZE) / FileEntry::SIZE;
+pub const MAX_INLINE_ENTRIES: usize =
+    (PAGE_4K - MOONPAGE_HEADER_SIZE - ROOT_META_SIZE) / FileEntry::SIZE;
 
 /// In-memory representation of one manifest root page.
 ///

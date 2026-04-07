@@ -73,9 +73,7 @@ impl ColdIndex {
         let data_dir = shard_dir.join("data");
 
         for entry in manifest.files() {
-            if entry.status == FileStatus::Active
-                && entry.file_type == PageType::KvLeaf as u8
-            {
+            if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
                 let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
                 if let Ok(pages) = crate::persistence::kv_page::read_datafile(&heap_path) {
                     for page in &pages {

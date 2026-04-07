@@ -8,7 +8,7 @@
 //!   - 0b10: Aborted
 //!   - 0b11: SubCommitted
 
-use crate::persistence::page::{MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE};
+use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PageType};
 
 /// Transaction status: 2 bits per transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +338,10 @@ mod tests {
         assert_eq!(pages[1].page_index(), 1);
         assert_eq!(pages[0].get_status(5), TxnStatus::Committed);
         assert_eq!(pages[0].get_status(10), TxnStatus::Aborted);
-        assert_eq!(pages[1].get_status(TXNS_PER_PAGE + 3), TxnStatus::SubCommitted);
+        assert_eq!(
+            pages[1].get_status(TXNS_PER_PAGE + 3),
+            TxnStatus::SubCommitted
+        );
     }
 
     #[test]

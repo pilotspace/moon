@@ -96,7 +96,9 @@ impl DiskAnnSegment {
                 Err(_e) => {
                     // io_uring setup failed -- close the FD and fall back.
                     // SAFETY: `fd` is a valid FD we just opened.
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                     None
                 }
             },
@@ -145,10 +147,13 @@ impl DiskAnnSegment {
         // Read first node to get entry_point and infer max_degree.
         #[cfg(unix)]
         let node0 = crate::vector::diskann::page::read_vamana_node_with_fd(&vamana_file, 0, dim)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty vamana file"))?;
+            .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "empty vamana file")
+        })?;
         #[cfg(not(unix))]
-        let node0 = read_vamana_node_at(&vamana_path, 0, dim)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty vamana file"))?;
+        let node0 = read_vamana_node_at(&vamana_path, 0, dim)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "empty vamana file")
+        })?;
         // Entry point is the medoid stored during build -- for from_files we
         // accept it as node 0 unless caller overrides. In practice the builder
         // writes entry_point metadata; for MVP we default to 0.
@@ -161,7 +166,9 @@ impl DiskAnnSegment {
                 Ok(u) => Some(u),
                 Err(_e) => {
                     // SAFETY: `fd` is a valid FD we just opened.
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                     None
                 }
             },
@@ -240,10 +247,9 @@ impl DiskAnnSegment {
         // Seed with entry point.
         let ep = self.entry_point as usize;
         if ep < n {
-            let ep_dist = self.pq.asymmetric_distance(
-                &adt,
-                &self.pq_codes[ep * m..(ep + 1) * m],
-            );
+            let ep_dist = self
+                .pq
+                .asymmetric_distance(&adt, &self.pq_codes[ep * m..(ep + 1) * m]);
             candidates.push((ep_dist, self.entry_point));
             visited[ep] = true;
         }
@@ -267,7 +273,9 @@ impl DiskAnnSegment {
             // Read Vamana page from disk to get neighbors.
             #[cfg(unix)]
             let read_result = crate::vector::diskann::page::read_vamana_node_with_fd(
-                &self.vamana_file, node, self.dim,
+                &self.vamana_file,
+                node,
+                self.dim,
             );
             #[cfg(not(unix))]
             let read_result = read_vamana_node_at(&self.vamana_path, node, self.dim);
@@ -283,20 +291,22 @@ impl DiskAnnSegment {
                     continue;
                 }
                 visited[nbr_idx] = true;
-                let d = self.pq.asymmetric_distance(
-                    &adt,
-                    &self.pq_codes[nbr_idx * m..(nbr_idx + 1) * m],
-                );
+                let d = self
+                    .pq
+                    .asymmetric_distance(&adt, &self.pq_codes[nbr_idx * m..(nbr_idx + 1) * m]);
                 candidates.push((d, nbr));
             }
 
             // Keep only best `beam_width` candidates.
-            candidates.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.sort_unstable_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
             candidates.truncate(beam_width);
         }
 
         // Return top-k.
-        candidates.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates
+            .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(k);
 
         let mut results = SmallVec::with_capacity(k);
@@ -342,10 +352,9 @@ impl DiskAnnSegment {
         // Seed with entry point.
         let ep = self.entry_point as usize;
         if ep < n {
-            let ep_dist = self.pq.asymmetric_distance(
-                &adt,
-                &self.pq_codes[ep * m..(ep + 1) * m],
-            );
+            let ep_dist = self
+                .pq
+                .asymmetric_distance(&adt, &self.pq_codes[ep * m..(ep + 1) * m]);
             candidates.push((ep_dist, self.entry_point));
             visited[ep] = true;
         }
@@ -435,9 +444,8 @@ impl DiskAnnSegment {
         }
 
         // Return top-k.
-        candidates.sort_unstable_by(|a, b| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates
+            .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(k);
 
         let mut results = SmallVec::with_capacity(k);
@@ -462,7 +470,9 @@ impl DiskAnnSegment {
             .iter()
             .map(|&idx| {
                 crate::vector::diskann::page::read_vamana_node_with_fd(
-                    &self.vamana_file, idx, self.dim,
+                    &self.vamana_file,
+                    idx,
+                    self.dim,
                 )
                 .ok()
                 .flatten()
@@ -501,6 +511,7 @@ impl DiskAnnSegment {
     /// Caller must ensure single-threaded access (per-shard invariant).
     #[cfg(target_os = "linux")]
     #[inline]
+    #[allow(clippy::mut_from_ref)] // SAFETY enforced by single-threaded per-shard invariant
     pub fn uring(&self) -> Option<&mut super::uring_search::DiskAnnUring> {
         // SAFETY: Single-threaded per-shard access (thread-per-core architecture).
         unsafe { (*self.uring.get()).as_mut() }
@@ -550,7 +561,12 @@ mod tests {
         dists.iter().take(k).map(|&(_, id)| id).collect()
     }
 
-    fn build_test_segment(n: usize, dim: usize, m: usize, r: u32) -> (DiskAnnSegment, Vec<f32>, tempfile::TempDir) {
+    fn build_test_segment(
+        n: usize,
+        dim: usize,
+        m: usize,
+        r: u32,
+    ) -> (DiskAnnSegment, Vec<f32>, tempfile::TempDir) {
         let vectors = random_vectors(n, dim, 7777);
         let graph = VamanaGraph::build(&vectors, dim, r, r.max(10));
         let pq = ProductQuantizer::train(&vectors, dim, m, 8);
@@ -598,8 +614,7 @@ mod tests {
             let query = deterministic_f32(dim, 9000 + q);
             let results = seg.search(&query, k, beam_width);
             let true_topk = brute_force_topk(&query, &vectors, dim, k);
-            let true_set: std::collections::HashSet<u32> =
-                true_topk.iter().copied().collect();
+            let true_set: std::collections::HashSet<u32> = true_topk.iter().copied().collect();
             let hits = results
                 .iter()
                 .filter(|r| true_set.contains(&r.id.0))
@@ -683,8 +698,7 @@ mod tests {
             let query = deterministic_f32(dim, 9000 + q);
             let results = seg.search_pread(&query, k, beam_width);
             let true_topk = brute_force_topk(&query, &vectors, dim, k);
-            let true_set: std::collections::HashSet<u32> =
-                true_topk.iter().copied().collect();
+            let true_set: std::collections::HashSet<u32> = true_topk.iter().copied().collect();
             let hits = results
                 .iter()
                 .filter(|r| true_set.contains(&r.id.0))
@@ -755,8 +769,7 @@ mod tests {
             let query = deterministic_f32(dim, 9000 + q);
             let results = seg.search_uring(&query, k, beam_width);
             let true_topk = brute_force_topk(&query, &vectors, dim, k);
-            let true_set: std::collections::HashSet<u32> =
-                true_topk.iter().copied().collect();
+            let true_set: std::collections::HashSet<u32> = true_topk.iter().copied().collect();
             let hits = results
                 .iter()
                 .filter(|r| true_set.contains(&r.id.0))

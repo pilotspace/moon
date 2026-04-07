@@ -12,8 +12,8 @@ use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::lfu_decay;
-use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::kv_serde;
+use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::spill_thread::SpillRequest;
 
 /// Compare two LRU timestamps with u16 wraparound handling.
@@ -205,7 +205,15 @@ pub fn try_evict_if_needed_async_spill_with_total(
             return Err(oom_error());
         }
         let before = db.estimated_memory();
-        if !evict_one_async_spill(db, config, &policy, sender, shard_dir, next_file_id, db_index) {
+        if !evict_one_async_spill(
+            db,
+            config,
+            &policy,
+            sender,
+            shard_dir,
+            next_file_id,
+            db_index,
+        ) {
             return Err(oom_error());
         }
         let after = db.estimated_memory();
@@ -330,8 +338,12 @@ fn evict_one_async_spill(
                 let vt = match other {
                     RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => ValueType::Hash,
                     RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
-                    RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => ValueType::Set,
-                    RedisValueRef::SortedSet { .. } | RedisValueRef::SortedSetBPTree { .. } | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+                    RedisValueRef::Set(_)
+                    | RedisValueRef::SetListpack(_)
+                    | RedisValueRef::SetIntset(_) => ValueType::Set,
+                    RedisValueRef::SortedSet { .. }
+                    | RedisValueRef::SortedSetBPTree { .. }
+                    | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
                     RedisValueRef::Stream(_) => ValueType::Stream,
                     RedisValueRef::String(_) => unreachable!(),
                 };
@@ -814,7 +826,10 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"spill_key"), Bytes::from_static(b"spill_val"));
+        db.set_string(
+            Bytes::from_static(b"spill_key"),
+            Bytes::from_static(b"spill_val"),
+        );
 
         let config = make_config(1, "allkeys-lru");
         let mut ctx = SpillContext {

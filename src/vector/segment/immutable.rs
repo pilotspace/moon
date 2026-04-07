@@ -568,15 +568,33 @@ mod tests {
             42,
         ));
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
-            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));
 
         let seg = ImmutableSegment::new(
-            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
-            Vec::new(), 16, Vec::new(), collection, 0, 0,
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            Vec::new(),
+            collection,
+            0,
+            0,
         );
         // created_at should be very recent
         assert!(seg.age_secs() < 2);
@@ -588,22 +606,58 @@ mod tests {
     fn test_mvcc_raw_bytes_roundtrip() {
         distance::init();
         let collection = Arc::new(CollectionMetadata::new(
-            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
-            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));
 
         let mvcc = vec![
-            MvccHeader { internal_id: 0, global_id: 10, key_hash: 0xDEAD, insert_lsn: 1, delete_lsn: 0, hint_committed: 0 },
-            MvccHeader { internal_id: 1, global_id: 11, key_hash: 0xBEEF, insert_lsn: 2, delete_lsn: 5, hint_committed: 0 },
+            MvccHeader {
+                internal_id: 0,
+                global_id: 10,
+                key_hash: 0xDEAD,
+                insert_lsn: 1,
+                delete_lsn: 0,
+                hint_committed: 0,
+            },
+            MvccHeader {
+                internal_id: 1,
+                global_id: 11,
+                key_hash: 0xBEEF,
+                insert_lsn: 2,
+                delete_lsn: 5,
+                hint_committed: 0,
+            },
         ];
         let seg = ImmutableSegment::new(
-            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
-            Vec::new(), 16, mvcc, collection, 2, 2,
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            mvcc,
+            collection,
+            2,
+            2,
         );
 
         let raw = seg.mvcc_raw_bytes();
@@ -679,22 +733,58 @@ mod tests {
     fn test_set_hint_committed() {
         distance::init();
         let collection = Arc::new(CollectionMetadata::new(
-            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
-            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));
 
         let mvcc = vec![
-            MvccHeader { internal_id: 0, global_id: 0, key_hash: 0, insert_lsn: 1, delete_lsn: 0, hint_committed: 0 },
-            MvccHeader { internal_id: 1, global_id: 1, key_hash: 0, insert_lsn: 2, delete_lsn: 0, hint_committed: 0 },
+            MvccHeader {
+                internal_id: 0,
+                global_id: 0,
+                key_hash: 0,
+                insert_lsn: 1,
+                delete_lsn: 0,
+                hint_committed: 0,
+            },
+            MvccHeader {
+                internal_id: 1,
+                global_id: 1,
+                key_hash: 0,
+                insert_lsn: 2,
+                delete_lsn: 0,
+                hint_committed: 0,
+            },
         ];
         let mut seg = ImmutableSegment::new(
-            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
-            Vec::new(), 16, mvcc, collection, 2, 2,
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            mvcc,
+            collection,
+            2,
+            2,
         );
 
         // Neither should be hint-committed initially
@@ -714,21 +804,48 @@ mod tests {
     fn test_mvcc_raw_bytes_v2_includes_hint() {
         distance::init();
         let collection = Arc::new(CollectionMetadata::new(
-            1, 128, DistanceMetric::L2, QuantizationConfig::TurboQuant4, 42,
+            1,
+            128,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
         ));
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
-            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));
 
-        let mvcc = vec![
-            MvccHeader { internal_id: 0, global_id: 10, key_hash: 0xAA, insert_lsn: 1, delete_lsn: 0, hint_committed: 1 },
-        ];
+        let mvcc = vec![MvccHeader {
+            internal_id: 0,
+            global_id: 10,
+            key_hash: 0xAA,
+            insert_lsn: 1,
+            delete_lsn: 0,
+            hint_committed: 1,
+        }];
         let seg = ImmutableSegment::new(
-            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
-            Vec::new(), 16, mvcc, collection, 1, 1,
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            mvcc,
+            collection,
+            1,
+            1,
         );
 
         let v1 = seg.mvcc_raw_bytes();
@@ -736,6 +853,6 @@ mod tests {
 
         let v2 = seg.mvcc_raw_bytes_v2();
         assert_eq!(v2.len(), 33); // v2 format includes hint byte
-        assert_eq!(v2[32], 1);    // hint_committed byte
+        assert_eq!(v2[32], 1); // hint_committed byte
     }
 }

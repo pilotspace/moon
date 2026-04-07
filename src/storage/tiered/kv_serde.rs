@@ -14,7 +14,9 @@ use crate::persistence::kv_page::ValueType;
 use crate::storage::bptree::BPTree;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::RedisValue;
-use crate::storage::stream::{Consumer, ConsumerGroup, PendingEntry, Stream as StreamData, StreamId};
+use crate::storage::stream::{
+    Consumer, ConsumerGroup, PendingEntry, Stream as StreamData, StreamId,
+};
 
 // ── Helpers (local, avoids coupling to rdb module internals) ──
 
@@ -32,7 +34,10 @@ fn read_len_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Bytes> {
     let pos = cursor.position() as usize;
     let data = cursor.get_ref();
     if pos + len > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated data"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated data",
+        ));
     }
     let result = Bytes::copy_from_slice(&data[pos..pos + len]);
     cursor.set_position((pos + len) as u64);
@@ -149,7 +154,8 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
         }
         RedisValueRef::Stream(stream) => {
             // Entry count + last_id
-            buf.write_all(&(stream.entries.len() as u64).to_le_bytes()).ok()?;
+            buf.write_all(&(stream.entries.len() as u64).to_le_bytes())
+                .ok()?;
             buf.write_all(&stream.last_id.ms.to_le_bytes()).ok()?;
             buf.write_all(&stream.last_id.seq.to_le_bytes()).ok()?;
             // Entries
@@ -163,13 +169,17 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
                 }
             }
             // Consumer groups
-            buf.write_all(&(stream.groups.len() as u32).to_le_bytes()).ok()?;
+            buf.write_all(&(stream.groups.len() as u32).to_le_bytes())
+                .ok()?;
             for (group_name, group) in &stream.groups {
                 write_len_bytes(&mut buf, group_name);
-                buf.write_all(&group.last_delivered_id.ms.to_le_bytes()).ok()?;
-                buf.write_all(&group.last_delivered_id.seq.to_le_bytes()).ok()?;
+                buf.write_all(&group.last_delivered_id.ms.to_le_bytes())
+                    .ok()?;
+                buf.write_all(&group.last_delivered_id.seq.to_le_bytes())
+                    .ok()?;
                 // PEL
-                buf.write_all(&(group.pel.len() as u32).to_le_bytes()).ok()?;
+                buf.write_all(&(group.pel.len() as u32).to_le_bytes())
+                    .ok()?;
                 for (id, pe) in &group.pel {
                     buf.write_all(&id.ms.to_le_bytes()).ok()?;
                     buf.write_all(&id.seq.to_le_bytes()).ok()?;
@@ -178,11 +188,13 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
                     buf.write_all(&pe.delivery_count.to_le_bytes()).ok()?;
                 }
                 // Consumers
-                buf.write_all(&(group.consumers.len() as u32).to_le_bytes()).ok()?;
+                buf.write_all(&(group.consumers.len() as u32).to_le_bytes())
+                    .ok()?;
                 for (cname, consumer) in &group.consumers {
                     write_len_bytes(&mut buf, cname);
                     buf.write_all(&consumer.seen_time.to_le_bytes()).ok()?;
-                    buf.write_all(&(consumer.pending.len() as u32).to_le_bytes()).ok()?;
+                    buf.write_all(&(consumer.pending.len() as u32).to_le_bytes())
+                        .ok()?;
                     for (id, _) in &consumer.pending {
                         buf.write_all(&id.ms.to_le_bytes()).ok()?;
                         buf.write_all(&id.seq.to_le_bytes()).ok()?;
@@ -247,7 +259,10 @@ pub fn deserialize_collection(data: &[u8], value_type: ValueType) -> Option<Redi
             let entry_count = read_u64_le(&mut cursor).ok()? as usize;
             let last_id_ms = read_u64_le(&mut cursor).ok()?;
             let last_id_seq = read_u64_le(&mut cursor).ok()?;
-            let last_id = StreamId { ms: last_id_ms, seq: last_id_seq };
+            let last_id = StreamId {
+                ms: last_id_ms,
+                seq: last_id_seq,
+            };
 
             let mut stream = StreamData::new();
             stream.last_id = last_id;
@@ -273,22 +288,31 @@ pub fn deserialize_collection(data: &[u8], value_type: ValueType) -> Option<Redi
                 let group_name = read_len_bytes(&mut cursor).ok()?;
                 let gld_ms = read_u64_le(&mut cursor).ok()?;
                 let gld_seq = read_u64_le(&mut cursor).ok()?;
-                let last_delivered_id = StreamId { ms: gld_ms, seq: gld_seq };
+                let last_delivered_id = StreamId {
+                    ms: gld_ms,
+                    seq: gld_seq,
+                };
 
                 let pel_count = read_u32_le(&mut cursor).ok()? as usize;
                 let mut pel = BTreeMap::new();
                 for _ in 0..pel_count {
                     let pid_ms = read_u64_le(&mut cursor).ok()?;
                     let pid_seq = read_u64_le(&mut cursor).ok()?;
-                    let pid = StreamId { ms: pid_ms, seq: pid_seq };
+                    let pid = StreamId {
+                        ms: pid_ms,
+                        seq: pid_seq,
+                    };
                     let consumer_name = read_len_bytes(&mut cursor).ok()?;
                     let delivery_time = read_u64_le(&mut cursor).ok()?;
                     let delivery_count = read_u64_le(&mut cursor).ok()?;
-                    pel.insert(pid, PendingEntry {
-                        consumer: consumer_name,
-                        delivery_time,
-                        delivery_count,
-                    });
+                    pel.insert(
+                        pid,
+                        PendingEntry {
+                            consumer: consumer_name,
+                            delivery_time,
+                            delivery_count,
+                        },
+                    );
                 }
 
                 let consumer_count = read_u32_le(&mut cursor).ok()? as usize;
@@ -301,20 +325,32 @@ pub fn deserialize_collection(data: &[u8], value_type: ValueType) -> Option<Redi
                     for _ in 0..pending_count {
                         let cid_ms = read_u64_le(&mut cursor).ok()?;
                         let cid_seq = read_u64_le(&mut cursor).ok()?;
-                        pending.insert(StreamId { ms: cid_ms, seq: cid_seq }, ());
+                        pending.insert(
+                            StreamId {
+                                ms: cid_ms,
+                                seq: cid_seq,
+                            },
+                            (),
+                        );
                     }
-                    consumers.insert(cname.clone(), Consumer {
-                        name: cname,
-                        pending,
-                        seen_time,
-                    });
+                    consumers.insert(
+                        cname.clone(),
+                        Consumer {
+                            name: cname,
+                            pending,
+                            seen_time,
+                        },
+                    );
                 }
 
-                stream.groups.insert(group_name, ConsumerGroup {
-                    last_delivered_id,
-                    pel,
-                    consumers,
-                });
+                stream.groups.insert(
+                    group_name,
+                    ConsumerGroup {
+                        last_delivered_id,
+                        pel,
+                        consumers,
+                    },
+                );
             }
 
             Some(RedisValue::Stream(Box::new(stream)))
@@ -334,14 +370,20 @@ mod tests {
         let val_ref = RedisValueRef::Hash(&map);
 
         let serialized = serialize_collection(&val_ref).expect("should serialize");
-        let deserialized = deserialize_collection(&serialized, ValueType::Hash)
-            .expect("should deserialize");
+        let deserialized =
+            deserialize_collection(&serialized, ValueType::Hash).expect("should deserialize");
 
         match deserialized {
             RedisValue::Hash(result_map) => {
                 assert_eq!(result_map.len(), 2);
-                assert_eq!(result_map.get(&Bytes::from_static(b"field1")).unwrap(), &Bytes::from_static(b"value1"));
-                assert_eq!(result_map.get(&Bytes::from_static(b"field2")).unwrap(), &Bytes::from_static(b"value2"));
+                assert_eq!(
+                    result_map.get(&Bytes::from_static(b"field1")).unwrap(),
+                    &Bytes::from_static(b"value1")
+                );
+                assert_eq!(
+                    result_map.get(&Bytes::from_static(b"field2")).unwrap(),
+                    &Bytes::from_static(b"value2")
+                );
             }
             other => panic!("expected Hash, got {:?}", other.type_name()),
         }
@@ -356,8 +398,8 @@ mod tests {
         let val_ref = RedisValueRef::List(&list);
 
         let serialized = serialize_collection(&val_ref).expect("should serialize");
-        let deserialized = deserialize_collection(&serialized, ValueType::List)
-            .expect("should deserialize");
+        let deserialized =
+            deserialize_collection(&serialized, ValueType::List).expect("should deserialize");
 
         match deserialized {
             RedisValue::List(result_list) => {
@@ -378,8 +420,8 @@ mod tests {
         let val_ref = RedisValueRef::Set(&set);
 
         let serialized = serialize_collection(&val_ref).expect("should serialize");
-        let deserialized = deserialize_collection(&serialized, ValueType::Set)
-            .expect("should deserialize");
+        let deserialized =
+            deserialize_collection(&serialized, ValueType::Set).expect("should deserialize");
 
         match deserialized {
             RedisValue::Set(result_set) => {
@@ -405,14 +447,23 @@ mod tests {
         };
 
         let serialized = serialize_collection(&val_ref).expect("should serialize");
-        let deserialized = deserialize_collection(&serialized, ValueType::ZSet)
-            .expect("should deserialize");
+        let deserialized =
+            deserialize_collection(&serialized, ValueType::ZSet).expect("should deserialize");
 
         match deserialized {
-            RedisValue::SortedSetBPTree { members: result_members, .. } => {
+            RedisValue::SortedSetBPTree {
+                members: result_members,
+                ..
+            } => {
                 assert_eq!(result_members.len(), 2);
-                assert_eq!(*result_members.get(&Bytes::from_static(b"m1")).unwrap(), 1.5);
-                assert_eq!(*result_members.get(&Bytes::from_static(b"m2")).unwrap(), 2.5);
+                assert_eq!(
+                    *result_members.get(&Bytes::from_static(b"m1")).unwrap(),
+                    1.5
+                );
+                assert_eq!(
+                    *result_members.get(&Bytes::from_static(b"m2")).unwrap(),
+                    2.5
+                );
             }
             other => panic!("expected SortedSetBPTree, got {:?}", other.type_name()),
         }
@@ -422,16 +473,17 @@ mod tests {
     fn test_stream_roundtrip() {
         let mut stream = StreamData::new();
         let id = StreamId { ms: 1000, seq: 1 };
-        stream.entries.insert(id, vec![
-            (Bytes::from_static(b"name"), Bytes::from_static(b"alice")),
-        ]);
+        stream.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"name"), Bytes::from_static(b"alice"))],
+        );
         stream.length = 1;
         stream.last_id = id;
 
         let val_ref = RedisValueRef::Stream(&stream);
         let serialized = serialize_collection(&val_ref).expect("should serialize");
-        let deserialized = deserialize_collection(&serialized, ValueType::Stream)
-            .expect("should deserialize");
+        let deserialized =
+            deserialize_collection(&serialized, ValueType::Stream).expect("should deserialize");
 
         match deserialized {
             RedisValue::Stream(result_stream) => {
@@ -482,7 +534,10 @@ mod tests {
         // Empty zset
         let members = HashMap::new();
         let scores = BTreeMap::new();
-        let val_ref = RedisValueRef::SortedSet { members: &members, scores: &scores };
+        let val_ref = RedisValueRef::SortedSet {
+            members: &members,
+            scores: &scores,
+        };
         let serialized = serialize_collection(&val_ref).unwrap();
         let deserialized = deserialize_collection(&serialized, ValueType::ZSet).unwrap();
         match deserialized {

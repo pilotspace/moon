@@ -35,12 +35,20 @@ pub struct SearchResult {
 impl SearchResult {
     #[inline]
     pub fn new(distance: f32, id: VectorId) -> Self {
-        Self { distance, id, key_hash: 0 }
+        Self {
+            distance,
+            id,
+            key_hash: 0,
+        }
     }
 
     #[inline]
     pub fn with_key_hash(distance: f32, id: VectorId, key_hash: u64) -> Self {
-        Self { distance, id, key_hash }
+        Self {
+            distance,
+            id,
+            key_hash,
+        }
     }
 }
 

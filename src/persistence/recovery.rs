@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::persistence::clog::{ClogPage, TxnStatus};
 use crate::persistence::control::{ShardControlFile, ShardState};
-use crate::persistence::kv_page::{read_datafile, ValueType};
+use crate::persistence::kv_page::{ValueType, read_datafile};
 use crate::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
 use crate::persistence::page::PageType;
 use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
@@ -113,10 +113,7 @@ pub fn recover_shard_v3_with_fallback(
         None
     };
 
-    let redo_lsn = control
-        .as_ref()
-        .map(|c| c.last_checkpoint_lsn)
-        .unwrap_or(0);
+    let redo_lsn = control.as_ref().map(|c| c.last_checkpoint_lsn).unwrap_or(0);
 
     // ── Phase 2: MANIFEST RECOVERY ────────────────────────────────────
     let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
@@ -134,11 +131,7 @@ pub fn recover_shard_v3_with_fallback(
                 // Building/Compacting entries are cleaned up on next checkpoint commit
             }
             Err(e) => {
-                tracing::warn!(
-                    "Shard {}: manifest recovery failed: {}",
-                    shard_id,
-                    e
-                );
+                tracing::warn!("Shard {}: manifest recovery failed: {}", shard_id, e);
             }
         }
     }
@@ -178,7 +171,8 @@ pub fn recover_shard_v3_with_fallback(
                     } else {
                         tracing::warn!(
                             "Shard {}: manifest references warm segment {} but directory missing",
-                            shard_id, entry.file_id
+                            shard_id,
+                            entry.file_id
                         );
                     }
                 }
@@ -200,9 +194,7 @@ pub fn recover_shard_v3_with_fallback(
         if let Ok(manifest) = ShardManifest::open(&manifest_path) {
             let data_dir = shard_dir.join("data");
             for entry in manifest.files() {
-                if entry.status == FileStatus::Active
-                    && entry.file_type == PageType::KvLeaf as u8
-                {
+                if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
                     let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
                     if heap_path.exists() {
                         match read_datafile(&heap_path) {
@@ -216,7 +208,8 @@ pub fn recover_shard_v3_with_fallback(
                                                 let value = Bytes::from(kv_entry.value);
                                                 if let Some(ttl) = kv_entry.ttl_ms {
                                                     // ttl_ms is absolute unix millis
-                                                    databases[0].set_string_with_expiry(key, value, ttl);
+                                                    databases[0]
+                                                        .set_string_with_expiry(key, value, ttl);
                                                 } else {
                                                     databases[0].set_string(key, value);
                                                 }
@@ -235,7 +228,9 @@ pub fn recover_shard_v3_with_fallback(
                             Err(e) => {
                                 tracing::warn!(
                                     "Shard {}: heap DataFile read failed for file {}: {}",
-                                    shard_id, entry.file_id, e
+                                    shard_id,
+                                    entry.file_id,
+                                    e
                                 );
                             }
                         }
@@ -249,10 +244,9 @@ pub fn recover_shard_v3_with_fallback(
     // Used by Database::get() for read-through on DashTable miss.
     if manifest_path.exists() {
         if let Ok(manifest) = ShardManifest::open(&manifest_path) {
-            let cold_idx =
-                crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest(
-                    shard_dir, &manifest,
-                );
+            let cold_idx = crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest(
+                shard_dir, &manifest,
+            );
             if cold_idx.len() > 0 {
                 info!(
                     "Shard {}: rebuilt cold index with {} entries",
@@ -298,7 +292,8 @@ pub fn recover_shard_v3_with_fallback(
                     // The payload is RESP-encoded (same format as AOF/WAL v2 blocks).
                     let mut buf = bytes::BytesMut::from(&record.payload[..]);
                     let parse_cfg = crate::protocol::ParseConfig::default();
-                    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
+                    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg)
+                    {
                         if let crate::protocol::Frame::Array(ref arr) = frame {
                             if !arr.is_empty() {
                                 let cmd_name = match &arr[0] {
@@ -341,7 +336,9 @@ pub fn recover_shard_v3_with_fallback(
             if payload.len() < 16 {
                 tracing::warn!(
                     "Shard {}: FPI record at LSN {} too short ({} bytes), skipping",
-                    shard_id, record.lsn, payload.len()
+                    shard_id,
+                    record.lsn,
+                    payload.len()
                 );
                 return;
             }
@@ -359,7 +356,9 @@ pub fn recover_shard_v3_with_fallback(
                         Err(e) => {
                             tracing::warn!(
                                 "Shard {}: FPI LZ4 decompression failed at LSN {}: {}, skipping",
-                                shard_id, record.lsn, e
+                                shard_id,
+                                record.lsn,
+                                e
                             );
                             return;
                         }
@@ -401,19 +400,28 @@ pub fn recover_shard_v3_with_fallback(
                     if let Err(e) = file.write_at(page_data, byte_offset) {
                         tracing::error!(
                             "Shard {}: FPI pwrite failed for file_id={}, offset={}: {}",
-                            shard_id, file_id, page_offset, e
+                            shard_id,
+                            file_id,
+                            page_offset,
+                            e
                         );
                         return;
                     }
                     info!(
                         "Shard {}: FPI applied at LSN {} (file_id={}, offset={}, {} bytes)",
-                        shard_id, record.lsn, file_id, page_offset, page_data.len()
+                        shard_id,
+                        record.lsn,
+                        file_id,
+                        page_offset,
+                        page_data.len()
                     );
                 }
                 Err(e) => {
                     tracing::error!(
                         "Shard {}: FPI cannot open DataFile heap-{:06}.mpf: {}",
-                        shard_id, file_id, e
+                        shard_id,
+                        file_id,
+                        e
                     );
                     return;
                 }
@@ -472,7 +480,10 @@ pub fn recover_shard_v3_with_fallback(
                         break;
                     }
                     Ok(_) => {
-                        info!("Shard {}: v2 source {:?} had 0 commands, trying next", shard_id, path);
+                        info!(
+                            "Shard {}: v2 source {:?} had 0 commands, trying next",
+                            shard_id, path
+                        );
                     }
                     Err(e) => {
                         tracing::error!("Shard {}: v2 fallback {:?} failed: {}", shard_id, path, e);
@@ -525,10 +536,7 @@ pub fn recover_shard_v3_with_fallback(
 
     // ── Phase 6: READY ────────────────────────────────────────────────
     // Update control file to Running state with recovered LSN position.
-    let shard_uuid = control
-        .as_ref()
-        .map(|c| c.shard_uuid)
-        .unwrap_or([0u8; 16]);
+    let shard_uuid = control.as_ref().map(|c| c.shard_uuid).unwrap_or([0u8; 16]);
     let mut new_control = ShardControlFile::new(shard_uuid);
     new_control.shard_state = ShardState::Running;
     new_control.last_checkpoint_lsn = redo_lsn;
@@ -537,14 +545,8 @@ pub fn recover_shard_v3_with_fallback(
         .map(|c| c.last_checkpoint_epoch)
         .unwrap_or(0);
     new_control.wal_flush_lsn = result.last_lsn;
-    new_control.next_txn_id = control
-        .as_ref()
-        .map(|c| c.next_txn_id)
-        .unwrap_or(0);
-    new_control.next_page_id = control
-        .as_ref()
-        .map(|c| c.next_page_id)
-        .unwrap_or(0);
+    new_control.next_txn_id = control.as_ref().map(|c| c.next_txn_id).unwrap_or(0);
+    new_control.next_page_id = control.as_ref().map(|c| c.next_page_id).unwrap_or(0);
     if let Err(e) = new_control.write(&control_path) {
         tracing::error!(
             "Shard {}: control file update to Running failed: {}",
@@ -623,7 +625,12 @@ mod tests {
         // Write a WAL segment with 3 command records
         let mut data = make_v3_header(0);
         for i in 1..=3u64 {
-            write_wal_v3_record(&mut data, i, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+            write_wal_v3_record(
+                &mut data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
         }
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
@@ -650,18 +657,18 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         let mut data = make_v3_header(0);
-        write_wal_v3_record(&mut data, 1, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+        write_wal_v3_record(
+            &mut data,
+            1,
+            WalRecordType::Command,
+            b"*1\r\n$4\r\nPING\r\n",
+        );
         // FPI payload: file_id(8 LE) + page_offset(8 LE) + page_data
         let mut fpi_payload = Vec::new();
         fpi_payload.extend_from_slice(&1u64.to_le_bytes()); // file_id = 1
         fpi_payload.extend_from_slice(&0u64.to_le_bytes()); // page_offset = 0
         fpi_payload.extend_from_slice(&vec![0xABu8; 128]); // page_data
-        write_wal_v3_record(
-            &mut data,
-            2,
-            WalRecordType::FullPageImage,
-            &fpi_payload,
-        );
+        write_wal_v3_record(&mut data, 2, WalRecordType::FullPageImage, &fpi_payload);
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
         let mut databases = vec![Database::new()];
@@ -689,7 +696,12 @@ mod tests {
         // WAL with LSNs 1-5
         let mut data = make_v3_header(0);
         for i in 1..=5u64 {
-            write_wal_v3_record(&mut data, i, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+            write_wal_v3_record(
+                &mut data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
         }
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
@@ -830,10 +842,19 @@ mod tests {
         let data_dir = shard_dir.join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let mut page = KvLeafPage::new(0, 7);
-        page.insert(b"key1", b"val1", ValueType::String, 0, None).unwrap();
-        page.insert(b"key2", b"val2", ValueType::String, 0, None).unwrap();
+        page.insert(b"key1", b"val1", ValueType::String, 0, None)
+            .unwrap();
+        page.insert(b"key2", b"val2", ValueType::String, 0, None)
+            .unwrap();
         // TTL is stored as absolute unix millis -- use a far-future value
-        page.insert(b"key3", b"val3", ValueType::String, 0, Some(4_000_000_000_000)).unwrap();
+        page.insert(
+            b"key3",
+            b"val3",
+            ValueType::String,
+            0,
+            Some(4_000_000_000_000),
+        )
+        .unwrap();
         page.finalize();
         write_datafile(&data_dir.join("heap-000007.mpf"), &[&page]).unwrap();
 
@@ -844,9 +865,18 @@ mod tests {
         assert_eq!(result.kv_heap_entries_loaded, 3);
 
         // Verify entries exist in database
-        assert!(databases[0].get(b"key1").is_some(), "key1 should be in database");
-        assert!(databases[0].get(b"key2").is_some(), "key2 should be in database");
-        assert!(databases[0].get(b"key3").is_some(), "key3 should be in database");
+        assert!(
+            databases[0].get(b"key1").is_some(),
+            "key1 should be in database"
+        );
+        assert!(
+            databases[0].get(b"key2").is_some(),
+            "key2 should be in database"
+        );
+        assert!(
+            databases[0].get(b"key3").is_some(),
+            "key3 should be in database"
+        );
     }
 
     #[test]

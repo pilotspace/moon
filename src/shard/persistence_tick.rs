@@ -206,7 +206,11 @@ pub(crate) fn check_warm_transitions(
     wal: &mut Option<WalWriterV3>,
 ) {
     let count = vector_store.try_warm_transitions_all(
-        shard_dir, manifest, warm_after_secs, next_file_id, wal,
+        shard_dir,
+        manifest,
+        warm_after_secs,
+        next_file_id,
+        wal,
     );
     if count > 0 {
         info!(
@@ -238,9 +242,8 @@ pub(crate) fn check_cold_transitions(
     next_file_id: &mut u64,
     shard_id: usize,
 ) {
-    let count = vector_store.try_cold_transitions_all(
-        shard_dir, manifest, cold_after_secs, next_file_id,
-    );
+    let count =
+        vector_store.try_cold_transitions_all(shard_dir, manifest, cold_after_secs, next_file_id);
     if count > 0 {
         info!(
             "Shard {}: transitioned {} segment(s) to cold tier",
@@ -407,9 +410,16 @@ pub(crate) fn handle_memory_pressure(
                     let sender = spill_t.sender();
                     for i in 0..db_count {
                         let mut guard = shard_databases.write_db(shard_id, i);
-                        let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
-                            &mut guard, &rt, &sender, &shard_dir, next_file_id, total_mem, i,
-                        );
+                        let _ =
+                            crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
+                                &mut guard,
+                                &rt,
+                                &sender,
+                                &shard_dir,
+                                next_file_id,
+                                total_mem,
+                                i,
+                            );
                     }
                     // Drop sender clone immediately to avoid shutdown deadlock
                     drop(sender);
@@ -423,13 +433,18 @@ pub(crate) fn handle_memory_pressure(
                                 manifest,
                                 next_file_id,
                             };
-                            let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
-                                &mut guard, &rt, Some(&mut ctx), total_mem,
-                            );
+                            let _ =
+                                crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                    &mut guard,
+                                    &rt,
+                                    Some(&mut ctx),
+                                    total_mem,
+                                );
                         } else {
-                            let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
-                                &mut guard, &rt, None, total_mem,
-                            );
+                            let _ =
+                                crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                    &mut guard, &rt, None, total_mem,
+                                );
                         }
                     }
                 }
@@ -477,7 +492,10 @@ pub(crate) fn force_checkpoint(
     shard_id: usize,
 ) {
     if checkpoint_mgr.is_active() {
-        tracing::warn!("Shard {}: checkpoint already active, skipping force", shard_id);
+        tracing::warn!(
+            "Shard {}: checkpoint already active, skipping force",
+            shard_id
+        );
         return;
     }
     let lsn = wal.current_lsn();
@@ -488,7 +506,14 @@ pub(crate) fn force_checkpoint(
     page_cache.clear_all_fpi_pending();
     // Drive checkpoint to completion synchronously (tick loop)
     loop {
-        if handle_checkpoint_tick(checkpoint_mgr, page_cache, wal, manifest, control, control_path) {
+        if handle_checkpoint_tick(
+            checkpoint_mgr,
+            page_cache,
+            wal,
+            manifest,
+            control,
+            control_path,
+        ) {
             break; // Finalize completed
         }
         // If Nothing returned and not active, we're done (empty checkpoint)
@@ -512,7 +537,10 @@ pub(crate) fn maybe_begin_checkpoint(
     if checkpoint_mgr.is_active() {
         return;
     }
-    if checkpoint_mgr.trigger().should_checkpoint(wal_bytes_since_checkpoint) {
+    if checkpoint_mgr
+        .trigger()
+        .should_checkpoint(wal_bytes_since_checkpoint)
+    {
         let lsn = wal.current_lsn();
         let dirty = page_cache.dirty_page_count();
         checkpoint_mgr.begin(lsn, dirty);
@@ -590,9 +618,7 @@ pub(crate) fn handle_checkpoint_tick(
                     let file_path = shard_dir
                         .join("data")
                         .join(format!("heap-{:06}.mpf", file_id));
-                    let file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&file_path)?;
+                    let file = std::fs::OpenOptions::new().write(true).open(&file_path)?;
                     file.write_at(data, byte_offset)?;
                     Ok(())
                 },
@@ -675,9 +701,8 @@ mod tests {
         let mut offset = WAL_V3_HEADER_SIZE;
         let mut fpi_count = 0usize;
         while offset + 4 <= raw_data.len() {
-            let record_len = u32::from_le_bytes(
-                raw_data[offset..offset + 4].try_into().unwrap(),
-            ) as usize;
+            let record_len =
+                u32::from_le_bytes(raw_data[offset..offset + 4].try_into().unwrap()) as usize;
             if record_len < 20 || offset + record_len > raw_data.len() {
                 break;
             }
@@ -719,7 +744,11 @@ mod tests {
         // Set FPI_PENDING on all valid frames (simulates checkpoint begin)
         page_cache.clear_all_fpi_pending();
 
-        assert_eq!(page_cache.dirty_page_count(), 2, "Should have 2 dirty pages");
+        assert_eq!(
+            page_cache.dirty_page_count(),
+            2,
+            "Should have 2 dirty pages"
+        );
 
         // Create a dummy heap file (at least 8KB so pwrite succeeds for 2 pages)
         let heap_path = data_dir.join("heap-000001.mpf");
@@ -758,7 +787,10 @@ mod tests {
                 break;
             }
             // Safety: don't loop forever
-            assert!(tick_count < 100, "Checkpoint should complete within 100 ticks");
+            assert!(
+                tick_count < 100,
+                "Checkpoint should complete within 100 ticks"
+            );
         }
 
         // Flush WAL to disk
@@ -838,7 +870,10 @@ mod tests {
             if finalized || !checkpoint_mgr.is_active() {
                 break;
             }
-            assert!(tick_count < 100, "Checkpoint should complete within 100 ticks");
+            assert!(
+                tick_count < 100,
+                "Checkpoint should complete within 100 ticks"
+            );
         }
 
         // Flush WAL to disk

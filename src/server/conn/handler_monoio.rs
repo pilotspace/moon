@@ -1550,9 +1550,16 @@ pub async fn handle_connection_sharded_monoio<
                     let mut guard = shard_databases.write_db(shard_id, selected_db);
                     let evict_result = if let Some(ref sender) = spill_sender {
                         let mut fid = spill_file_id.get();
-                        let dir = disk_offload_dir.as_deref().unwrap_or(std::path::Path::new("."));
+                        let dir = disk_offload_dir
+                            .as_deref()
+                            .unwrap_or(std::path::Path::new("."));
                         let res = try_evict_if_needed_async_spill(
-                            &mut guard, &rt, sender, dir, &mut fid, selected_db,
+                            &mut guard,
+                            &rt,
+                            sender,
+                            dir,
+                            &mut fid,
+                            selected_db,
                         );
                         spill_file_id.set(fid);
                         res

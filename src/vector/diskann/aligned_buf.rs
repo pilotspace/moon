@@ -25,8 +25,8 @@ impl AlignedBuf {
     /// Allocate one 4KB-aligned buffer.
     pub fn new() -> Self {
         // SAFETY: Layout is non-zero (4096 bytes), alignment is a power of 2 (4096).
-        let layout = Layout::from_size_align(PAGE_4K, PAGE_4K)
-            .expect("PAGE_4K layout must be valid");
+        let layout =
+            Layout::from_size_align(PAGE_4K, PAGE_4K).expect("PAGE_4K layout must be valid");
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);

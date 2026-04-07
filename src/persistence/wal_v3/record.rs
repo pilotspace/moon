@@ -102,11 +102,14 @@ pub fn write_wal_v3_record(
     let start = buf.len();
 
     // Determine compression
-    let should_compress = record_type == WalRecordType::FullPageImage
-        && payload.len() > FPI_COMPRESS_THRESHOLD;
+    let should_compress =
+        record_type == WalRecordType::FullPageImage && payload.len() > FPI_COMPRESS_THRESHOLD;
 
     let (actual_payload, flags) = if should_compress {
-        (lz4_flex::compress_prepend_size(payload), FLAG_LZ4_COMPRESSED)
+        (
+            lz4_flex::compress_prepend_size(payload),
+            FLAG_LZ4_COMPRESSED,
+        )
     } else {
         (payload.to_vec(), 0u8)
     };
@@ -239,7 +242,10 @@ mod tests {
         // Corrupt a payload byte
         buf[16] ^= 0xFF;
 
-        assert!(read_wal_v3_record(&buf).is_none(), "corrupted CRC should fail");
+        assert!(
+            read_wal_v3_record(&buf).is_none(),
+            "corrupted CRC should fail"
+        );
     }
 
     #[test]
@@ -257,7 +263,9 @@ mod tests {
         assert_eq!(WalRecordType::FileTierChange as u8, 0x42);
 
         // from_u8 roundtrips
-        for &v in &[0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x40, 0x41, 0x42] {
+        for &v in &[
+            0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x40, 0x41, 0x42,
+        ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }
         assert!(WalRecordType::from_u8(0xFF).is_none());

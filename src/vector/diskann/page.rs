@@ -4,9 +4,7 @@
 //! neighbors + CRC32C. One SSD read = one graph hop + one exact distance
 //! computation. Per design section 7.4 (Vamana mode).
 
-use crate::persistence::page::{
-    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K,
-};
+use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 use crate::vector::diskann::vamana::VamanaGraph;
 use std::io;
 use std::path::Path;
@@ -275,7 +273,10 @@ mod tests {
         // Corrupt a byte in the vector region
         page[NODE_PAYLOAD_OFFSET + 20] ^= 0xFF;
 
-        assert!(read_vamana_node(&page, dim).is_none(), "corrupted CRC should reject");
+        assert!(
+            read_vamana_node(&page, dim).is_none(),
+            "corrupted CRC should reject"
+        );
     }
 
     #[test]
@@ -294,9 +295,7 @@ mod tests {
         let dim = 32;
         let n = 10;
         let r = 8;
-        let vectors: Vec<f32> = (0..n * dim)
-            .map(|i| (i as f32) * 0.01)
-            .collect();
+        let vectors: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
 
         let graph = crate::vector::diskann::vamana::VamanaGraph::build(&vectors, dim, r, r);
 

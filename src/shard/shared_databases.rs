@@ -51,7 +51,11 @@ impl ShardDatabases {
     /// once per shard before any connections are accepted.
     /// Set the WAL append channel sender for a shard.
     /// Called once during event loop startup before connections are accepted.
-    pub fn set_wal_append_tx(&self, shard_id: usize, tx: crate::runtime::channel::MpscSender<bytes::Bytes>) {
+    pub fn set_wal_append_tx(
+        &self,
+        shard_id: usize,
+        tx: crate::runtime::channel::MpscSender<bytes::Bytes>,
+    ) {
         *self.wal_append_txs[shard_id].lock() = Some(tx);
     }
 

@@ -358,7 +358,7 @@ pub fn handle_cluster_reset(
     let mut state = cs.write().unwrap();
     let my_id = state.node_id.clone();
     // Clear slots on my node
-    state.my_node_mut().slots = Box::new([0u8; 2048]);
+    *state.my_node_mut().slots = [0u8; 2048];
     state.importing.clear();
     state.migrating.clear();
     state.epoch = 0;

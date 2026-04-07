@@ -10,13 +10,15 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
-use crate::persistence::page::{MoonPageHeader, MOONPAGE_HEADER_SIZE, PAGE_4K, PAGE_64K, page_flags};
-use crate::vector::persistence::warm_segment::{
-    VEC_CODES_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE, VEC_MVCC_SUB_HEADER_SIZE,
+use crate::persistence::page::{
+    MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PAGE_64K, page_flags,
 };
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered};
+use crate::vector::persistence::warm_segment::{
+    VEC_CODES_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE, VEC_MVCC_SUB_HEADER_SIZE,
+};
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::types::{SearchResult, VectorId};
 
@@ -175,7 +177,9 @@ impl WarmSearchSegment {
         // Lock mvcc pages in RAM -- visibility checks run on every query (design S14).
         // Failure is non-fatal: mlock may fail in containers or when RLIMIT_MEMLOCK is low.
         if let Err(e) = mvcc_mmap.lock() {
-            tracing::warn!("mlock mvcc.mpf failed for segment {segment_id}: {e} (continuing without mlock)");
+            tracing::warn!(
+                "mlock mvcc.mpf failed for segment {segment_id}: {e} (continuing without mlock)"
+            );
         }
 
         // Extract contiguous data from each file (skipping per-page sub-headers)
@@ -189,12 +193,12 @@ impl WarmSearchSegment {
         // Detect by checking: if byte 15 is 0x01, try compressed first;
         // fall back to uncompressed for legacy segments.
         let graph = if graph_payload.len() > 15 && graph_payload[15] == 0x01 {
-            HnswGraph::from_bytes_compressed(&graph_payload).or_else(|_| {
-                HnswGraph::from_bytes(&graph_payload)
-            })
+            HnswGraph::from_bytes_compressed(&graph_payload)
+                .or_else(|_| HnswGraph::from_bytes(&graph_payload))
         } else {
             HnswGraph::from_bytes(&graph_payload)
-        }.map_err(|e| {
+        }
+        .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("graph deserialization failed: {e}"),
@@ -444,7 +448,7 @@ mod tests {
     fn test_compressed_warm_segment_roundtrip() {
         use crate::persistence::page::PAGE_4K;
         use crate::vector::persistence::warm_segment::{
-            write_graph_mpf, VEC_GRAPH_SUB_HEADER_SIZE,
+            VEC_GRAPH_SUB_HEADER_SIZE, write_graph_mpf,
         };
 
         // 4KB of repeating compressible pattern (will span 2 pages at 4016 data cap)
@@ -473,7 +477,7 @@ mod tests {
     fn test_extract_payloads_handles_mixed_compressed_uncompressed() {
         use crate::persistence::page::PAGE_4K;
         use crate::vector::persistence::warm_segment::{
-            write_graph_mpf, VEC_GRAPH_SUB_HEADER_SIZE,
+            VEC_GRAPH_SUB_HEADER_SIZE, write_graph_mpf,
         };
 
         // Test 1: Large compressible data (>256 bytes) -- should be compressed

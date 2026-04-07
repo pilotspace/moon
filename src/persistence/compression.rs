@@ -412,7 +412,11 @@ mod tests {
         let decoded = delta_decode_timestamps(&encoded);
         assert_eq!(decoded, input);
         // After header (12 bytes), each dod=0 => zigzag(0)=0 => 1 byte per value
-        assert!(encoded.len() <= 12 + 3, "all-same should compress well, got {} bytes", encoded.len());
+        assert!(
+            encoded.len() <= 12 + 3,
+            "all-same should compress well, got {} bytes",
+            encoded.len()
+        );
     }
 
     #[test]
@@ -433,7 +437,11 @@ mod tests {
         assert_eq!(decoded, input);
         // 12 bytes header + varint for first delta (~3 bytes) + 98 * 1 byte (dod=0)
         // Should be well under 120 bytes for 100 values (vs 800 raw)
-        assert!(encoded.len() < 120, "monotonic timestamps should compress well, got {} bytes", encoded.len());
+        assert!(
+            encoded.len() < 120,
+            "monotonic timestamps should compress well, got {} bytes",
+            encoded.len()
+        );
     }
 
     // -- Gorilla encoding --
@@ -448,7 +456,11 @@ mod tests {
             assert_eq!(a.to_bits(), b.to_bits());
         }
         // 12 bytes header + 3 bits (padded to 1 byte) for 3 identical values
-        assert!(encoded.len() <= 13, "all-same should compress to ~13 bytes, got {}", encoded.len());
+        assert!(
+            encoded.len() <= 13,
+            "all-same should compress to ~13 bytes, got {}",
+            encoded.len()
+        );
     }
 
     #[test]
@@ -469,7 +481,11 @@ mod tests {
         let decoded = gorilla_decode_f64(&encoded);
         assert_eq!(decoded.len(), input.len());
         for (a, b) in decoded.iter().zip(input.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits(), "bit-exact mismatch for special value");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "bit-exact mismatch for special value"
+            );
         }
     }
 

@@ -66,8 +66,7 @@ fn read_cold_entry(
         if entry.value.len() < 4 {
             return None;
         }
-        let start_page_idx =
-            u32::from_le_bytes(entry.value[..4].try_into().ok()?) as usize;
+        let start_page_idx = u32::from_le_bytes(entry.value[..4].try_into().ok()?) as usize;
         read_overflow_chain(&file_data, start_page_idx)?
     } else {
         entry.value
@@ -85,13 +84,13 @@ fn read_cold_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use std::collections::HashMap;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::compact_value::CompactValue;
     use crate::storage::entry::Entry;
     use crate::storage::tiered::cold_index::ColdIndex;
     use crate::storage::tiered::kv_spill::spill_to_datafile;
+    use bytes::Bytes;
+    use std::collections::HashMap;
 
     #[test]
     fn test_cold_read_hash_entry() {
@@ -109,8 +108,14 @@ mod tests {
         entry.value = CompactValue::from_redis_value(RedisValue::Hash(map));
 
         spill_to_datafile(
-            shard_dir, 20, b"myhash", &entry, &mut manifest, Some(&mut cold_index),
-        ).unwrap();
+            shard_dir,
+            20,
+            b"myhash",
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
 
         // Read back via cold_read_through
         let result = cold_read_through(&cold_index, shard_dir, b"myhash", 0);
@@ -121,8 +126,14 @@ mod tests {
         match value {
             RedisValue::Hash(result_map) => {
                 assert_eq!(result_map.len(), 2);
-                assert_eq!(result_map.get(&Bytes::from_static(b"color")).unwrap(), &Bytes::from_static(b"red"));
-                assert_eq!(result_map.get(&Bytes::from_static(b"size")).unwrap(), &Bytes::from_static(b"large"));
+                assert_eq!(
+                    result_map.get(&Bytes::from_static(b"color")).unwrap(),
+                    &Bytes::from_static(b"red")
+                );
+                assert_eq!(
+                    result_map.get(&Bytes::from_static(b"size")).unwrap(),
+                    &Bytes::from_static(b"large")
+                );
             }
             _ => panic!("expected Hash, got {:?}", value.type_name()),
         }
@@ -148,13 +159,22 @@ mod tests {
         let entry = Entry::new_string(Bytes::from(big_value.clone()));
 
         spill_to_datafile(
-            shard_dir, 30, b"big_key", &entry, &mut manifest, Some(&mut cold_index),
-        ).unwrap();
+            shard_dir,
+            30,
+            b"big_key",
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
 
         // Verify the file has multiple pages
         let file_path = shard_dir.join("data/heap-000030.mpf");
         let file_size = std::fs::metadata(&file_path).unwrap().len();
-        assert!(file_size > PAGE_4K as u64, "should have overflow pages: file size = {file_size}");
+        assert!(
+            file_size > PAGE_4K as u64,
+            "should have overflow pages: file size = {file_size}"
+        );
 
         // Read back via cold_read_through
         let result = cold_read_through(&cold_index, shard_dir, b"big_key", 0);
@@ -164,7 +184,11 @@ mod tests {
         assert!(ttl.is_none());
         match value {
             RedisValue::String(data) => {
-                assert_eq!(data.as_ref(), big_value.as_slice(), "overflow data must match original");
+                assert_eq!(
+                    data.as_ref(),
+                    big_value.as_slice(),
+                    "overflow data must match original"
+                );
             }
             _ => panic!("expected String, got {:?}", value.type_name()),
         }

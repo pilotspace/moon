@@ -103,7 +103,6 @@ pub struct ServerConfig {
     pub tls_ciphersuites: Option<String>,
 
     // ── io_uring tuning ─────────────────────────────────────────────
-
     /// Enable io_uring SQPOLL mode with the given idle timeout in milliseconds.
     /// The kernel spins a dedicated SQ poll thread, eliminating io_uring_enter()
     /// syscalls on the submission path. Requires CAP_SYS_NICE or root; falls back
@@ -112,7 +111,6 @@ pub struct ServerConfig {
     pub uring_sqpoll_ms: Option<u32>,
 
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
-
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
     #[arg(long = "disk-offload", default_value = "disable")]
     pub disk_offload: String,
@@ -132,13 +130,11 @@ pub struct ServerConfig {
     pub segment_warm_after: u64,
 
     // ── MoonStore v2: PageCache ─────────────────────────────────────
-
     /// PageCache memory budget (e.g., "256mb", "1gb"). Default: 25% of maxmemory.
     #[arg(long = "pagecache-size")]
     pub pagecache_size: Option<String>,
 
     // ── MoonStore v2: Checkpoint ────────────────────────────────────
-
     /// Checkpoint timeout in seconds
     #[arg(long = "checkpoint-timeout", default_value_t = 300)]
     pub checkpoint_timeout: u64,
@@ -152,7 +148,6 @@ pub struct ServerConfig {
     pub max_wal_size: String,
 
     // ── MoonStore v2: WAL v3 ────────────────────────────────────────
-
     /// Enable Full Page Images for torn page defense
     #[arg(long = "wal-fpi", default_value = "enable")]
     pub wal_fpi: String,
@@ -166,13 +161,11 @@ pub struct ServerConfig {
     pub wal_segment_size: String,
 
     // ── MoonStore v2: Vector Warm Tier ──────────────────────────────
-
     /// mlock vector codes pages into RAM
     #[arg(long = "vec-codes-mlock", default_value = "enable")]
     pub vec_codes_mlock: String,
 
     // ── Cold-tier / DiskANN config stubs (not yet consumed) ─────────
-
     /// Seconds after last access before a WARM segment is promoted to COLD.
     /// Not yet consumed — reserved for the WARM->COLD transition timer.
     #[arg(long = "segment-cold-after", default_value_t = 86_400)]
@@ -224,7 +217,10 @@ impl ServerConfig {
     pub fn parse_size(s: &str) -> Option<u64> {
         let s = s.trim().to_lowercase();
         if let Some(num) = s.strip_suffix("gb") {
-            num.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
+            num.trim()
+                .parse::<u64>()
+                .ok()
+                .map(|n| n * 1024 * 1024 * 1024)
         } else if let Some(num) = s.strip_suffix("mb") {
             num.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024)
         } else if let Some(num) = s.strip_suffix("kb") {
@@ -532,13 +528,8 @@ mod tests {
         );
 
         // Uses explicit --disk-offload-dir when set
-        let config = ServerConfig::parse_from([
-            "moon",
-            "--dir",
-            "/data",
-            "--disk-offload-dir",
-            "/mnt/nvme",
-        ]);
+        let config =
+            ServerConfig::parse_from(["moon", "--dir", "/data", "--disk-offload-dir", "/mnt/nvme"]);
         assert_eq!(
             config.effective_disk_offload_dir(),
             std::path::PathBuf::from("/mnt/nvme")
@@ -548,8 +539,7 @@ mod tests {
     #[test]
     fn test_pagecache_size_bytes() {
         // Explicit size
-        let config =
-            ServerConfig::parse_from(["moon", "--pagecache-size", "1gb"]);
+        let config = ServerConfig::parse_from(["moon", "--pagecache-size", "1gb"]);
         assert_eq!(config.pagecache_size_bytes(0), 1_073_741_824);
 
         // Default: 25% of maxmemory

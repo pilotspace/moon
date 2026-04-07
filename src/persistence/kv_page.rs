@@ -12,9 +12,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::persistence::page::{
-    MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE, PAGE_4K,
-};
+use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 
 /// Minimum value size to trigger LZ4 compression (per design section 12).
 const LZ4_COMPRESS_THRESHOLD: usize = 256;
@@ -30,11 +28,11 @@ const KV_DATA_START: usize = MOONPAGE_HEADER_SIZE + KV_PAGE_HEADER_SIZE;
 
 // ── KV page header field offsets (relative to MOONPAGE_HEADER_SIZE = 64) ──
 
-const OFF_FREE_START: usize = MOONPAGE_HEADER_SIZE;      // u16 at 64
-const OFF_FREE_END: usize = MOONPAGE_HEADER_SIZE + 2;    // u16 at 66
-const _OFF_KV_FLAGS: usize = MOONPAGE_HEADER_SIZE + 4;    // u16 at 68
-const OFF_SLOT_COUNT: usize = MOONPAGE_HEADER_SIZE + 6;  // u16 at 70
-const _OFF_BASE_TS: usize = MOONPAGE_HEADER_SIZE + 8;     // u32 at 72
+const OFF_FREE_START: usize = MOONPAGE_HEADER_SIZE; // u16 at 64
+const OFF_FREE_END: usize = MOONPAGE_HEADER_SIZE + 2; // u16 at 66
+const _OFF_KV_FLAGS: usize = MOONPAGE_HEADER_SIZE + 4; // u16 at 68
+const OFF_SLOT_COUNT: usize = MOONPAGE_HEADER_SIZE + 6; // u16 at 70
+const _OFF_BASE_TS: usize = MOONPAGE_HEADER_SIZE + 8; // u32 at 72
 const _OFF_COMPACT_GEN: usize = MOONPAGE_HEADER_SIZE + 12; // u32 at 76
 
 // ── Value type discriminant ─────────────────────────────
@@ -46,10 +44,10 @@ const _OFF_COMPACT_GEN: usize = MOONPAGE_HEADER_SIZE + 12; // u32 at 76
 #[repr(u8)]
 pub enum ValueType {
     String = 0,
-    Hash   = 1,
-    List   = 2,
-    Set    = 3,
-    ZSet   = 4,
+    Hash = 1,
+    List = 2,
+    Set = 3,
+    ZSet = 4,
     Stream = 5,
 }
 
@@ -134,11 +132,9 @@ impl KvLeafPage {
 
         // Write KV page header
         let free_start = KV_DATA_START as u16; // 80
-        let free_end = PAGE_4K as u16;         // 4096
-        data[OFF_FREE_START..OFF_FREE_START + 2]
-            .copy_from_slice(&free_start.to_le_bytes());
-        data[OFF_FREE_END..OFF_FREE_END + 2]
-            .copy_from_slice(&free_end.to_le_bytes());
+        let free_end = PAGE_4K as u16; // 4096
+        data[OFF_FREE_START..OFF_FREE_START + 2].copy_from_slice(&free_start.to_le_bytes());
+        data[OFF_FREE_END..OFF_FREE_END + 2].copy_from_slice(&free_end.to_le_bytes());
         // kv_flags, slot_count, base_timestamp, compaction_gen: all zero
 
         Self { data }
@@ -190,7 +186,11 @@ impl KvLeafPage {
     /// Compute the serialized size of an entry (excluding slot).
     #[inline]
     fn entry_size(key_len: usize, value_len: usize, flags: u8) -> usize {
-        let ttl_size = if flags & entry_flags::HAS_TTL != 0 { 8 } else { 0 };
+        let ttl_size = if flags & entry_flags::HAS_TTL != 0 {
+            8
+        } else {
+            0
+        };
         2 /* key_len */ + 1 /* value_type */ + 1 /* flags */ + ttl_size + key_len + 4 /* value_len */ + value_len
     }
 
@@ -290,8 +290,7 @@ impl KvLeafPage {
         let slot_offset = fs;
         self.data[slot_offset..slot_offset + 2]
             .copy_from_slice(&(entry_offset as u16).to_le_bytes());
-        self.data[slot_offset + 2..slot_offset + 4]
-            .copy_from_slice(&(e_size as u16).to_le_bytes());
+        self.data[slot_offset + 2..slot_offset + 4].copy_from_slice(&(e_size as u16).to_le_bytes());
 
         // Update page metadata
         let new_slot_count = self.slot_count() + 1;
@@ -317,22 +316,15 @@ impl KvLeafPage {
 
         // Read slot: offset at KV_DATA_START + slot_index * SLOT_SIZE
         let slot_pos = KV_DATA_START + (slot_index as usize) * SLOT_SIZE;
-        let entry_offset = u16::from_le_bytes([
-            self.data[slot_pos],
-            self.data[slot_pos + 1],
-        ]) as usize;
-        let _entry_len = u16::from_le_bytes([
-            self.data[slot_pos + 2],
-            self.data[slot_pos + 3],
-        ]) as usize;
+        let entry_offset =
+            u16::from_le_bytes([self.data[slot_pos], self.data[slot_pos + 1]]) as usize;
+        let _entry_len =
+            u16::from_le_bytes([self.data[slot_pos + 2], self.data[slot_pos + 3]]) as usize;
 
         let mut cursor = entry_offset;
 
         // key_len: u16 LE
-        let key_len = u16::from_le_bytes([
-            self.data[cursor],
-            self.data[cursor + 1],
-        ]) as usize;
+        let key_len = u16::from_le_bytes([self.data[cursor], self.data[cursor + 1]]) as usize;
         cursor += 2;
 
         // value_type: u8
@@ -345,9 +337,7 @@ impl KvLeafPage {
 
         // optional ttl_ms
         let ttl_ms = if flags & entry_flags::HAS_TTL != 0 {
-            let ttl = u64::from_le_bytes(
-                self.data[cursor..cursor + 8].try_into().ok()?,
-            );
+            let ttl = u64::from_le_bytes(self.data[cursor..cursor + 8].try_into().ok()?);
             cursor += 8;
             Some(ttl)
         } else {
@@ -359,9 +349,7 @@ impl KvLeafPage {
         cursor += key_len;
 
         // value_len: u32 LE
-        let value_len = u32::from_le_bytes(
-            self.data[cursor..cursor + 4].try_into().ok()?,
-        ) as usize;
+        let value_len = u32::from_le_bytes(self.data[cursor..cursor + 4].try_into().ok()?) as usize;
         cursor += 4;
 
         // value bytes
@@ -512,7 +500,11 @@ pub fn build_overflow_chain(data: &[u8], file_id: u64, start_page_id: u64) -> Ve
         // prev_page: 0 for first, otherwise i (1-based index of previous overflow page)
         let prev = if i == 0 { 0 } else { i as u32 };
         // next_page: i+2 for non-last (1-based index of next overflow page), 0 for last
-        let next = if i + 1 < chunk_count { (i + 2) as u32 } else { 0 };
+        let next = if i + 1 < chunk_count {
+            (i + 2) as u32
+        } else {
+            0
+        };
         page.set_prev_next(prev, next);
         page.finalize();
         pages.push(page);
@@ -553,7 +545,11 @@ pub fn read_overflow_chain(file_data: &[u8], start_page_idx: usize) -> Option<Ve
 /// Write a KvLeaf page followed by overflow pages to a `.mpf` DataFile.
 ///
 /// The file is fsynced after writing.
-pub fn write_datafile_mixed(path: &Path, leaf: &KvLeafPage, overflow: &[KvOverflowPage]) -> io::Result<()> {
+pub fn write_datafile_mixed(
+    path: &Path,
+    leaf: &KvLeafPage,
+    overflow: &[KvOverflowPage],
+) -> io::Result<()> {
     use std::io::Write;
 
     let mut file = std::fs::File::create(path)?;
@@ -617,7 +613,8 @@ mod tests {
     #[test]
     fn test_insert_get_roundtrip_basic() {
         let mut page = KvLeafPage::new(1, 1);
-        let idx = page.insert(b"key1", b"value1", ValueType::String, 0, None)
+        let idx = page
+            .insert(b"key1", b"value1", ValueType::String, 0, None)
             .expect("insert should succeed");
         assert_eq!(idx, 0);
         assert_eq!(page.slot_count(), 1);
@@ -647,11 +644,17 @@ mod tests {
         let mut page = KvLeafPage::new(3, 1);
         // Overflow pointer: file_id(u64) + page_id(u32) = 12 bytes
         let mut overflow_val = [0u8; 12];
-        overflow_val[..8].copy_from_slice(&42u64.to_le_bytes());   // file_id
+        overflow_val[..8].copy_from_slice(&42u64.to_le_bytes()); // file_id
         overflow_val[8..12].copy_from_slice(&100u32.to_le_bytes()); // page_id
 
-        page.insert(b"big_key", &overflow_val, ValueType::Hash, entry_flags::OVERFLOW, None)
-            .expect("insert should succeed");
+        page.insert(
+            b"big_key",
+            &overflow_val,
+            ValueType::Hash,
+            entry_flags::OVERFLOW,
+            None,
+        )
+        .expect("insert should succeed");
 
         let entry = page.get(0).unwrap();
         assert_eq!(entry.flags & entry_flags::OVERFLOW, entry_flags::OVERFLOW);
@@ -665,8 +668,14 @@ mod tests {
     #[test]
     fn test_insert_tombstone() {
         let mut page = KvLeafPage::new(4, 1);
-        page.insert(b"deleted_key", b"ignored", ValueType::String, entry_flags::TOMBSTONE, None)
-            .expect("insert should succeed");
+        page.insert(
+            b"deleted_key",
+            b"ignored",
+            ValueType::String,
+            entry_flags::TOMBSTONE,
+            None,
+        )
+        .expect("insert should succeed");
 
         let entry = page.get(0).unwrap();
         assert_eq!(entry.flags & entry_flags::TOMBSTONE, entry_flags::TOMBSTONE);
@@ -729,7 +738,9 @@ mod tests {
         assert_eq!(page.slot_count(), count);
 
         for i in 0..count {
-            let entry = page.get(i).unwrap_or_else(|| panic!("get {i} should succeed"));
+            let entry = page
+                .get(i)
+                .unwrap_or_else(|| panic!("get {i} should succeed"));
             let expected_key = format!("key_{i:04}");
             let expected_val = format!("val_{i:04}");
             assert_eq!(entry.key, expected_key.as_bytes());
@@ -747,7 +758,8 @@ mod tests {
     #[test]
     fn test_finalize_checksum() {
         let mut page = KvLeafPage::new(9, 1);
-        page.insert(b"foo", b"bar", ValueType::String, 0, None).unwrap();
+        page.insert(b"foo", b"bar", ValueType::String, 0, None)
+            .unwrap();
         page.finalize();
 
         assert!(MoonPageHeader::verify_checksum(&page.data));
@@ -760,7 +772,8 @@ mod tests {
     #[test]
     fn test_from_bytes_valid() {
         let mut page = KvLeafPage::new(10, 2);
-        page.insert(b"test", b"data", ValueType::List, 0, None).unwrap();
+        page.insert(b"test", b"data", ValueType::List, 0, None)
+            .unwrap();
         page.finalize();
 
         let bytes = *page.as_bytes();
@@ -791,7 +804,8 @@ mod tests {
         p1.finalize();
 
         let mut p2 = KvLeafPage::new(1, 1);
-        p2.insert(b"k2", b"v2", ValueType::Hash, 0, Some(5000)).unwrap();
+        p2.insert(b"k2", b"v2", ValueType::Hash, 0, Some(5000))
+            .unwrap();
         p2.finalize();
 
         write_datafile(&path, &[&p1, &p2]).expect("write should succeed");
@@ -837,7 +851,8 @@ mod tests {
             ValueType::ZSet,
             entry_flags::OVERFLOW,
             Some(120_000),
-        ).unwrap();
+        )
+        .unwrap();
 
         let entry = page.get(0).unwrap();
         assert_eq!(entry.flags & entry_flags::HAS_TTL, entry_flags::HAS_TTL);
@@ -865,7 +880,10 @@ mod tests {
         assert_eq!(idx, 0);
 
         let entry = page.get(0).expect("get should succeed");
-        assert_eq!(entry.value, original, "decompressed value must match original");
+        assert_eq!(
+            entry.value, original,
+            "decompressed value must match original"
+        );
         assert_ne!(
             entry.flags & entry_flags::COMPRESSED,
             0,
@@ -874,7 +892,8 @@ mod tests {
 
         // Verify on-disk slot occupies less than the original 500B value
         let slot_pos = KV_DATA_START;
-        let entry_len = u16::from_le_bytes([page.data[slot_pos + 2], page.data[slot_pos + 3]]) as usize;
+        let entry_len =
+            u16::from_le_bytes([page.data[slot_pos + 2], page.data[slot_pos + 3]]) as usize;
         assert!(
             entry_len < KvLeafPage::entry_size(b"big_key".len(), original.len(), 0),
             "compressed entry should be smaller than uncompressed"
@@ -963,7 +982,10 @@ mod tests {
         payload.extend_from_slice(&file_id.to_le_bytes());
         payload.extend_from_slice(&page_offset.to_le_bytes());
         let compressed = lz4_flex::compress_prepend_size(&page_data);
-        assert!(compressed.len() < page_data.len(), "test data should be compressible");
+        assert!(
+            compressed.len() < page_data.len(),
+            "test data should be compressible"
+        );
         payload.push(0x01); // compressed flag
         payload.extend_from_slice(&compressed);
 

@@ -57,7 +57,8 @@ impl ProductQuantizer {
                     let mut best_k = 0u16;
                     let mut best_dist = f32::MAX;
                     for k in 0..ksub {
-                        let c = &centroids[codebook_offset + k * dsub..codebook_offset + (k + 1) * dsub];
+                        let c = &centroids
+                            [codebook_offset + k * dsub..codebook_offset + (k + 1) * dsub];
                         let d = l2_sub(sv, c, dsub);
                         if d < best_dist {
                             best_dist = d;
@@ -109,7 +110,8 @@ impl ProductQuantizer {
             let mut best_k = 0u8;
             let mut best_dist = f32::MAX;
             for k in 0..self.ksub {
-                let c = &self.centroids[codebook_offset + k * self.dsub..codebook_offset + (k + 1) * self.dsub];
+                let c = &self.centroids
+                    [codebook_offset + k * self.dsub..codebook_offset + (k + 1) * self.dsub];
                 let d = l2_sub(sv, c, self.dsub);
                 if d < best_dist {
                     best_dist = d;
@@ -128,7 +130,8 @@ impl ProductQuantizer {
         for sub in 0..self.m {
             let k = codes[sub] as usize;
             let codebook_offset = sub * self.ksub * self.dsub;
-            let c = &self.centroids[codebook_offset + k * self.dsub..codebook_offset + (k + 1) * self.dsub];
+            let c = &self.centroids
+                [codebook_offset + k * self.dsub..codebook_offset + (k + 1) * self.dsub];
             vector.extend_from_slice(c);
         }
         vector
@@ -145,7 +148,8 @@ impl ProductQuantizer {
             let qsub = &query[sub * self.dsub..(sub + 1) * self.dsub];
             let codebook_offset = sub * self.ksub * self.dsub;
             for k in 0..self.ksub {
-                let c = &self.centroids[codebook_offset + k * self.dsub..codebook_offset + (k + 1) * self.dsub];
+                let c = &self.centroids
+                    [codebook_offset + k * self.dsub..codebook_offset + (k + 1) * self.dsub];
                 table.push(l2_sub(qsub, c, self.dsub));
             }
         }

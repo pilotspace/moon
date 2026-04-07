@@ -17,11 +17,11 @@ use bytes::Bytes;
 use tracing::warn;
 
 use crate::persistence::kv_page::{
-    KvLeafPage, PageFull, ValueType, entry_flags, write_datafile,
-    build_overflow_chain, write_datafile_mixed,
+    KvLeafPage, PageFull, ValueType, build_overflow_chain, entry_flags, write_datafile,
+    write_datafile_mixed,
 };
 use crate::persistence::manifest::{FileEntry, FileStatus, StorageTier};
-use crate::persistence::page::{PageType, PAGE_4K};
+use crate::persistence::page::{PAGE_4K, PageType};
 
 /// Request sent from event loop to background spill thread.
 ///
@@ -73,7 +73,13 @@ fn write_spill_file(req: &SpillRequest) -> io::Result<(u32, u64)> {
     let overflow_pages: Vec<crate::persistence::kv_page::KvOverflowPage>;
     let total_pages: u32;
 
-    match page.insert(req.key.as_ref(), req.value_bytes.as_ref(), req.value_type, req.flags, req.ttl_ms) {
+    match page.insert(
+        req.key.as_ref(),
+        req.value_bytes.as_ref(),
+        req.value_type,
+        req.flags,
+        req.ttl_ms,
+    ) {
         Ok(_) => {
             overflow_pages = Vec::new();
             total_pages = 1;
@@ -84,7 +90,13 @@ fn write_spill_file(req: &SpillRequest) -> io::Result<(u32, u64)> {
 
             let overflow_ptr = 1u32.to_le_bytes();
             let overflow_flags = req.flags | entry_flags::OVERFLOW;
-            match page.insert(req.key.as_ref(), &overflow_ptr, req.value_type, overflow_flags, req.ttl_ms) {
+            match page.insert(
+                req.key.as_ref(),
+                &overflow_ptr,
+                req.value_type,
+                overflow_flags,
+                req.ttl_ms,
+            ) {
                 Ok(_) => {}
                 Err(PageFull) => {
                     warn!(
@@ -267,7 +279,7 @@ impl SpillThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::kv_page::{read_datafile, ValueType};
+    use crate::persistence::kv_page::{ValueType, read_datafile};
     use crate::storage::entry::current_time_ms;
 
     #[test]
@@ -298,7 +310,10 @@ mod tests {
         sender.send(req).unwrap();
 
         // Wait for completion
-        let completion = st.completion_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let completion = st
+            .completion_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         assert!(completion.success);
         assert_eq!(completion.file_id, 1);
         assert_eq!(completion.key, Bytes::from_static(b"test_key"));
@@ -342,7 +357,10 @@ mod tests {
         };
         sender.send(req).unwrap();
 
-        let completion = st.completion_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let completion = st
+            .completion_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         assert!(completion.success);
         assert_eq!(completion.file_entry.file_type, PageType::KvLeaf as u8);
 
@@ -396,7 +414,10 @@ mod tests {
         // Collect all completions in order
         let mut completions = Vec::new();
         for _ in 0..5 {
-            let c = st.completion_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let c = st
+                .completion_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             completions.push(c);
         }
 

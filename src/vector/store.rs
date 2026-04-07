@@ -247,7 +247,8 @@ impl VectorIndex {
                             // Log error; data is on disk but not searchable until restart.
                             tracing::error!(
                                 "Warm search open failed for segment {}: {} (data on disk, not searchable)",
-                                file_id, e
+                                file_id,
+                                e
                             );
                         }
                     }
@@ -337,7 +338,8 @@ impl VectorIndex {
                 Err(e) => {
                     tracing::error!(
                         "Cold transition failed for warm segment {}: {}",
-                        warm_file_id, e
+                        warm_file_id,
+                        e
                     );
                 }
             }
@@ -602,7 +604,11 @@ impl VectorStore {
         for name in names {
             if let Some(idx) = self.indexes.get(&name) {
                 total += idx.try_warm_transitions(
-                    shard_dir, manifest, warm_after_secs, next_file_id, wal,
+                    shard_dir,
+                    manifest,
+                    warm_after_secs,
+                    next_file_id,
+                    wal,
                 );
             }
         }
@@ -624,9 +630,8 @@ impl VectorStore {
         let mut total = 0;
         for name in names {
             if let Some(idx) = self.indexes.get(&name) {
-                total += idx.try_cold_transitions(
-                    shard_dir, manifest, cold_after_secs, next_file_id,
-                );
+                total +=
+                    idx.try_cold_transitions(shard_dir, manifest, cold_after_secs, next_file_id);
             }
         }
         total
@@ -668,21 +673,27 @@ impl VectorStore {
                         loaded += 1;
                         tracing::info!(
                             "Registered warm segment {} from {:?}",
-                            segment_id, segment_dir
+                            segment_id,
+                            segment_dir
                         );
                         break; // Segment belongs to one index only
                     }
                     Err(e) => {
                         tracing::debug!(
                             "Warm segment {} not compatible with index: {}",
-                            segment_id, e
+                            segment_id,
+                            e
                         );
                     }
                 }
             }
         }
         if loaded > 0 {
-            tracing::info!("Registered {}/{} warm segments on startup", loaded, warm_segments.len());
+            tracing::info!(
+                "Registered {}/{} warm segments on startup",
+                loaded,
+                warm_segments.len()
+            );
         }
     }
 
@@ -869,20 +880,40 @@ mod tests {
 
         distance::init();
         let mut store = VectorStore::new();
-        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+        store
+            .create_index(make_meta("idx", 128, &["doc:"]))
+            .unwrap();
 
         // Create a minimal immutable segment and swap it in.
         let idx = store.get_index(b"idx").unwrap();
         let collection = idx.collection.clone();
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
-            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));
         let imm = Arc::new(ImmutableSegment::new(
-            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
-            Vec::new(), 16, Vec::new(), collection, 0, 0,
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            Vec::new(),
+            collection,
+            0,
+            0,
         ));
 
         let old_snap = idx.segments.load();
@@ -904,11 +935,16 @@ mod tests {
         let shard_dir = tmp.path().join("shard-0");
         std::fs::create_dir_all(&shard_dir).unwrap();
         let manifest_path = shard_dir.join("shard-0.manifest");
-        let mut manifest = crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
+        let mut manifest =
+            crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
         let mut next_file_id = 1u64;
 
         let count = store.try_warm_transitions_all(
-            &shard_dir, &mut manifest, 0, &mut next_file_id, &mut None,
+            &shard_dir,
+            &mut manifest,
+            0,
+            &mut next_file_id,
+            &mut None,
         );
         assert_eq!(count, 1);
 
@@ -930,19 +966,39 @@ mod tests {
 
         distance::init();
         let mut store = VectorStore::new();
-        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+        store
+            .create_index(make_meta("idx", 128, &["doc:"]))
+            .unwrap();
 
         let idx = store.get_index(b"idx").unwrap();
         let collection = idx.collection.clone();
         let empty_graph = HnswGraph::new(
-            0, 16, 32, 0, 0,
-            AlignedBuffer::new(0), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 68,
+            0,
+            16,
+            32,
+            0,
+            0,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
         );
         let graph = HnswGraph::from_bytes(&empty_graph.to_bytes())
             .unwrap_or_else(|_| panic!("empty graph"));
         let imm = Arc::new(ImmutableSegment::new(
-            graph, AlignedBuffer::new(0), Vec::new(), Vec::new(), 16,
-            Vec::new(), 16, Vec::new(), collection, 0, 0,
+            graph,
+            AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            16,
+            Vec::new(),
+            16,
+            Vec::new(),
+            collection,
+            0,
+            0,
         ));
 
         let old_snap = idx.segments.load();
@@ -959,11 +1015,16 @@ mod tests {
         let shard_dir = tmp.path().join("shard-0");
         std::fs::create_dir_all(&shard_dir).unwrap();
         let manifest_path = shard_dir.join("shard-0.manifest");
-        let mut manifest = crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
+        let mut manifest =
+            crate::persistence::manifest::ShardManifest::create(&manifest_path).unwrap();
         let mut next_file_id = 1u64;
 
         let count = store.try_warm_transitions_all(
-            &shard_dir, &mut manifest, 999_999, &mut next_file_id, &mut None,
+            &shard_dir,
+            &mut manifest,
+            999_999,
+            &mut next_file_id,
+            &mut None,
         );
         assert_eq!(count, 0);
 
@@ -1013,7 +1074,9 @@ mod tests {
     #[test]
     fn test_register_cold_segments_empty() {
         let mut store = VectorStore::new();
-        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+        store
+            .create_index(make_meta("idx", 128, &["doc:"]))
+            .unwrap();
         // Should not panic with empty input
         store.register_cold_segments(Vec::new());
     }
@@ -1021,7 +1084,9 @@ mod tests {
     #[test]
     fn test_register_cold_segments_discovers() {
         let mut store = VectorStore::new();
-        store.create_index(make_meta("idx", 128, &["doc:"])).unwrap();
+        store
+            .create_index(make_meta("idx", 128, &["doc:"]))
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let seg_dir = tmp.path().join("segment-10-diskann");

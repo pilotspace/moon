@@ -11,13 +11,11 @@ use moon::persistence::checkpoint::{
     CheckpointAction, CheckpointManager, CheckpointState, CheckpointTrigger,
 };
 use moon::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
-use moon::persistence::page::{MoonPageHeader, PageType, MOONPAGE_HEADER_SIZE};
-use moon::persistence::wal_v3::record::{
-    WalRecordType, write_wal_v3_record,
-};
+use moon::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PageType};
+use moon::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
 use moon::persistence::wal_v3::replay::{replay_wal_v3_dir, replay_wal_v3_file};
 use moon::persistence::wal_v3::segment::{
-    WalSegment, WalWriterV3, DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE,
+    DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE, WalSegment, WalWriterV3,
 };
 use moon::storage::tiered::warm_tier::transition_to_warm;
 
@@ -71,7 +69,10 @@ fn test_wal_v3_write_and_recovery() {
     .unwrap();
 
     // Verify all 100 commands replayed
-    assert_eq!(result.commands_replayed, 100, "all 100 commands must be replayed");
+    assert_eq!(
+        result.commands_replayed, 100,
+        "all 100 commands must be replayed"
+    );
     assert_eq!(result.last_lsn, 100, "last LSN should be 100");
     assert_eq!(recovered_lsns.len(), 100);
 
@@ -102,7 +103,10 @@ fn test_wal_v3_write_and_recovery() {
     )
     .unwrap();
 
-    assert_eq!(partial.commands_replayed, 50, "should replay only LSNs 51-100");
+    assert_eq!(
+        partial.commands_replayed, 50,
+        "should replay only LSNs 51-100"
+    );
     assert_eq!(partial_count, 50);
     assert_eq!(partial.last_lsn, 100, "last_lsn tracks all records seen");
 }
@@ -126,8 +130,16 @@ fn test_checkpoint_creates_redo_point() {
     assert!(mgr.is_active());
 
     match mgr.state() {
-        CheckpointState::InProgress { redo_lsn, dirty_count, flushed, .. } => {
-            assert_eq!(*redo_lsn, 50, "redo_lsn should capture LSN at checkpoint start");
+        CheckpointState::InProgress {
+            redo_lsn,
+            dirty_count,
+            flushed,
+            ..
+        } => {
+            assert_eq!(
+                *redo_lsn, 50,
+                "redo_lsn should capture LSN at checkpoint start"
+            );
             assert_eq!(*dirty_count, 10);
             assert_eq!(*flushed, 0);
         }
@@ -189,29 +201,24 @@ fn test_checkpoint_creates_redo_point() {
     std::fs::write(&seg_path, &data).unwrap();
 
     let mut cmd_count = 0usize;
-    let result = replay_wal_v3_file(
-        &seg_path,
-        0,
-        &mut |_| cmd_count += 1,
-        &mut |_| {},
-    )
-    .unwrap();
+    let result = replay_wal_v3_file(&seg_path, 0, &mut |_| cmd_count += 1, &mut |_| {}).unwrap();
 
     // Checkpoint marker is NOT dispatched to callbacks
-    assert_eq!(result.commands_replayed, 6, "6 commands total (3 before + 3 after checkpoint)");
+    assert_eq!(
+        result.commands_replayed, 6,
+        "6 commands total (3 before + 3 after checkpoint)"
+    );
     assert_eq!(cmd_count, 6);
     assert_eq!(result.last_lsn, 7);
 
     // Replay with redo_lsn=4 skips records 1-4 (including checkpoint), replays 5-7
     let mut partial_count = 0usize;
-    let partial = replay_wal_v3_file(
-        &seg_path,
-        4,
-        &mut |_| partial_count += 1,
-        &mut |_| {},
-    )
-    .unwrap();
-    assert_eq!(partial.commands_replayed, 3, "only LSNs 5-7 after redo point");
+    let partial =
+        replay_wal_v3_file(&seg_path, 4, &mut |_| partial_count += 1, &mut |_| {}).unwrap();
+    assert_eq!(
+        partial.commands_replayed, 3,
+        "only LSNs 5-7 after redo point"
+    );
     assert_eq!(partial_count, 3);
 }
 
@@ -242,8 +249,8 @@ fn test_warm_tier_transition_preserves_search() {
     // Transition to warm
     let handle = transition_to_warm(
         &shard_dir,
-        1,    // segment_id
-        100,  // file_id
+        1,   // segment_id
+        100, // file_id
         &codes_data,
         &graph_data,
         None, // no raw vectors (TQ encoded)
@@ -266,14 +273,21 @@ fn test_warm_tier_transition_preserves_search() {
 
     // Verify staging directory was cleaned up (renamed to final)
     let staging = shard_dir.join("vectors/.segment-1.staging");
-    assert!(!staging.exists(), "staging dir should be removed after rename");
+    assert!(
+        !staging.exists(),
+        "staging dir should be removed after rename"
+    );
 
     // Verify manifest was updated
     assert!(
         manifest.epoch() > initial_epoch,
         "epoch should increment after commit"
     );
-    assert_eq!(manifest.files().len(), 1, "manifest should have 1 file entry");
+    assert_eq!(
+        manifest.files().len(),
+        1,
+        "manifest should have 1 file entry"
+    );
 
     let entry = &manifest.files()[0];
     assert_eq!(entry.file_id, 100);
@@ -283,7 +297,10 @@ fn test_warm_tier_transition_preserves_search() {
 
     // Verify .mpf files have valid MoonPage headers with CRC32C
     let codes_file = std::fs::read(seg_dir.join("codes.mpf")).unwrap();
-    assert!(codes_file.len() >= MOONPAGE_HEADER_SIZE, "codes.mpf too small");
+    assert!(
+        codes_file.len() >= MOONPAGE_HEADER_SIZE,
+        "codes.mpf too small"
+    );
 
     let hdr = MoonPageHeader::read_from(&codes_file)
         .expect("codes.mpf should have valid MoonPage header");
@@ -365,14 +382,9 @@ fn test_fpi_torn_page_defense() {
     let mut replayed_fpis: Vec<Vec<u8>> = Vec::new();
     let mut cmd_count = 0usize;
 
-    let result = replay_wal_v3_dir(
-        &wal_dir,
-        0,
-        &mut |_| cmd_count += 1,
-        &mut |record| {
-            replayed_fpis.push(record.payload.clone());
-        },
-    )
+    let result = replay_wal_v3_dir(&wal_dir, 0, &mut |_| cmd_count += 1, &mut |record| {
+        replayed_fpis.push(record.payload.clone());
+    })
     .unwrap();
 
     assert_eq!(result.commands_replayed, 55, "55 command records");
@@ -437,7 +449,10 @@ fn test_fpi_torn_page_defense() {
         }
         offset += record_len;
     }
-    assert_eq!(fpi_found, 5, "should find 5 FPI records in raw segment data");
+    assert_eq!(
+        fpi_found, 5,
+        "should find 5 FPI records in raw segment data"
+    );
 }
 
 // ======================================================================
@@ -495,11 +510,18 @@ fn test_disk_offload_disable_is_noop() {
 
     // Verify checkpoint manager is None when disabled
     let ckpt: Option<CheckpointManager> = if config.disk_offload_enabled() {
-        Some(CheckpointManager::new(CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9)))
+        Some(CheckpointManager::new(CheckpointTrigger::new(
+            300,
+            256 * 1024 * 1024,
+            0.9,
+        )))
     } else {
         None
     };
-    assert!(ckpt.is_none(), "CheckpointManager should be None when disabled");
+    assert!(
+        ckpt.is_none(),
+        "CheckpointManager should be None when disabled"
+    );
 
     // Verify all config knobs have sane defaults
     assert_eq!(config.segment_warm_after, 3600);
@@ -557,7 +579,12 @@ fn test_fpi_torn_page_crash_recovery() {
 
     // 4. Write a WAL segment: header + 1 Command (dummy) + 1 FullPageImage
     let mut wal_data = make_v3_header(0);
-    write_wal_v3_record(&mut wal_data, 1, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+    write_wal_v3_record(
+        &mut wal_data,
+        1,
+        WalRecordType::Command,
+        b"*1\r\n$4\r\nPING\r\n",
+    );
     write_wal_v3_record(&mut wal_data, 2, WalRecordType::FullPageImage, &fpi_payload);
     std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
 
@@ -654,7 +681,12 @@ fn test_fpi_selective_recovery_only_fpi_pages_restored() {
     fpi_payload.extend_from_slice(&page0);
 
     let mut wal_data = make_v3_header(0);
-    write_wal_v3_record(&mut wal_data, 1, WalRecordType::Command, b"*1\r\n$4\r\nPING\r\n");
+    write_wal_v3_record(
+        &mut wal_data,
+        1,
+        WalRecordType::Command,
+        b"*1\r\n$4\r\nPING\r\n",
+    );
     write_wal_v3_record(&mut wal_data, 2, WalRecordType::FullPageImage, &fpi_payload);
     std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
 
