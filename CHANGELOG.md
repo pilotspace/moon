@@ -5,7 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - Disk Offload & x86_64 Performance
+## [Unreleased] - Vector Search 4x QPS + Correctness
+
+### Vector Search Performance & Correctness (2026-04-07)
+
+**4x search QPS, 4.1x lower latency, 2.56x faster than Qdrant on real MiniLM data.**
+
+#### Performance (perf-profiled on GCloud c3-standard-8, Intel Xeon 8481C)
+- 8-wide ILP unrolled `dist_bfs_budgeted` subcent path (the real hot loop, 90% of
+  search time per perf profile). Loads 4 code bytes + 1 sign byte per iteration,
+  8 independent f32 accumulators. Confirmed via objdump: parallel `vaddss` into
+  xmm3-xmm8 (vs serial single-xmm0 chain before).
+- 4-way unrolled `dist_bfs` non-subcent path with `unsafe` pointer arithmetic
+- Pre-allocated ADC LUT in `SearchScratch` (eliminates 32-65KB heap alloc per query)
+- Hoisted IVF `q_rotated` and `lut_buf` allocation out of per-segment loop
+
+#### Correctness fixes
+- **`FT.COMPACT` silent no-op**: split `try_compact` (threshold-gated) from
+  `force_compact` (unconditional). Previously `FT.COMPACT` returned OK without
+  compacting when `compact_threshold >= mutable_len`, leaving all vectors in
+  brute-force O(n) mutable segment.
+- **`key_hash_to_key` mapping restored** (lost in earlier refactor). `FT.SEARCH`
+  now returns original Redis keys (`doc:N`) instead of `vec:<internal_id>`.
+  Carried through `SearchResult.key_hash` and populated by `remap_to_global_ids`.
+- **`FT.INFO num_docs`** now sums mutable + immutable segments (was 0 after compact)
+- **Vector index recovery** metadata loads without `--disk-offload` flag
+  (was gated behind `server_config.disk_offload_enabled()`)
+
+#### Real MiniLM benchmarks (10K vectors, 384d, x86 Xeon 8481C)
+
+| Metric | Mar 31 (M4 Pro) | Apr 7 (Xeon 8481C) | Δ |
+|--------|---:|---:|---:|
+| Recall@10 | 0.9250 | **0.9670** | +4.5% |
+| QPS | 1,126 | **1,296** | +15% |
+| p50 | 0.878 ms | **0.783 ms** | -11% |
+
+| | Moon | Qdrant 1.12 FP32 | Ratio |
+|---|---:|---:|---:|
+| QPS (10K MiniLM) | 1,296 | 507 | **2.56x** |
+| p50 | 0.783 ms | 1.79 ms | **2.29x lower** |
+| Recall@10 | 0.967 | ~0.95 | **+1.7%** |
+
+#### Infrastructure (for future segment merge work)
+- `ImmutableSegment::decode_vector` / `iter_live_decoded`
+- `MutableSegment::iter_live`
+
+#### Attempted and reverted
+Segment merge on `FT.COMPACT` via TQ4 decode → re-encode. Dropped recall from
+0.73 → 0.0005 due to accumulated quantization error across 14 segments. Proper
+fix requires retaining f32/f16 vectors alongside TQ codes in immutable segments.
+
+#### Known limitation
+TQ4 quantization at 384d with random Gaussian inputs hits ~0.73 recall floor
+(curse of dimensionality — all points nearly equidistant). Real semantic
+embeddings (clustered) achieve 0.92-0.97 recall with the same code.
+
+---
+
+## [Earlier Unreleased] - Disk Offload & x86_64 Performance
 
 Tiered storage, crash recovery, and 2x Redis on x86_64 (Intel Xeon, io_uring).
 
