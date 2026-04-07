@@ -93,8 +93,15 @@ fn main() -> anyhow::Result<()> {
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
     // Ensure persistence directory exists before spawning AOF writer.
-    // Without this, the AOF writer silently fails when --dir is a new path.
-    let _ = std::fs::create_dir_all(&config.dir);
+    // Fail fast if --dir is invalid or permission-denied: otherwise the AOF
+    // writer and recovery paths silently fall back and corrupt invariants.
+    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+        return Err(anyhow::anyhow!(
+            "failed to create persistence directory {:?}: {}",
+            config.dir,
+            e
+        ));
+    }
 
     // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
     // The AOF writer task will be spawned on the listener runtime.

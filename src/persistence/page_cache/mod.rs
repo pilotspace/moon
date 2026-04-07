@@ -356,7 +356,7 @@ impl PageCache {
     ///
     /// After this call, every valid page will require a full-page image written
     /// to WAL before its first flush in the checkpoint cycle — torn-page defense.
-    pub fn clear_all_fpi_pending(&self) {
+    pub fn arm_all_fpi_pending(&self) {
         for frame in &self.frames_4k {
             let val = frame.state.load();
             let (_, _, flags) = FrameState::unpack(val);
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_all_fpi_pending_sets_on_valid_frames() {
+    fn test_arm_all_fpi_pending_sets_on_valid_frames() {
         let cache = PageCache::new(4, 2);
 
         // Fetch 2 pages (makes them VALID)
@@ -842,7 +842,7 @@ mod tests {
         }
 
         // Checkpoint begin: set FPI on all valid frames
-        cache.clear_all_fpi_pending();
+        cache.arm_all_fpi_pending();
 
         // The 2 valid frames should have FPI_PENDING
         let mut fpi_count = 0;
@@ -874,7 +874,7 @@ mod tests {
         cache.mark_dirty(1, 0, 100);
 
         // Simulate checkpoint begin
-        cache.clear_all_fpi_pending();
+        cache.arm_all_fpi_pending();
 
         let fpi_called = Cell::new(false);
         let write_called = Cell::new(false);

@@ -503,7 +503,7 @@ pub(crate) fn force_checkpoint(
     if !checkpoint_mgr.force_begin(lsn, dirty) {
         return;
     }
-    page_cache.clear_all_fpi_pending();
+    page_cache.arm_all_fpi_pending();
     // Drive checkpoint to completion synchronously (tick loop)
     loop {
         if handle_checkpoint_tick(
@@ -544,7 +544,7 @@ pub(crate) fn maybe_begin_checkpoint(
         let lsn = wal.current_lsn();
         let dirty = page_cache.dirty_page_count();
         checkpoint_mgr.begin(lsn, dirty);
-        page_cache.clear_all_fpi_pending();
+        page_cache.arm_all_fpi_pending();
     }
 }
 
@@ -742,7 +742,7 @@ mod tests {
         }
 
         // Set FPI_PENDING on all valid frames (simulates checkpoint begin)
-        page_cache.clear_all_fpi_pending();
+        page_cache.arm_all_fpi_pending();
 
         assert_eq!(
             page_cache.dirty_page_count(),
@@ -834,7 +834,7 @@ mod tests {
             page_cache.unpin_page(handle);
             page_cache.mark_dirty(1, i as u64, (i + 1) as u64);
         }
-        // Do NOT call clear_all_fpi_pending -- no FPI_PENDING set
+        // Do NOT call arm_all_fpi_pending -- no FPI_PENDING set
 
         // Create a dummy heap file
         let heap_path = data_dir.join("heap-000001.mpf");

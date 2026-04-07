@@ -340,6 +340,10 @@ impl UringDriver {
     fn push_sqe(&mut self, entry: &io_uring::squeue::Entry) -> std::io::Result<()> {
         {
             let mut sq = self.ring.submission();
+            // SAFETY: `entry` is a borrow that outlives this call, `sq` is
+            // freshly obtained from the owned ring, and io_uring's `push`
+            // copies the SQE bytes into the kernel-shared ring at call time —
+            // it does not retain the reference past the push.
             unsafe {
                 sq.push(entry)
                     .map_err(|_| std::io::Error::other("SQ full"))?;
@@ -555,8 +559,11 @@ impl UringDriver {
         // so we must call enter() directly. With COOP_TASKRUN, GETEVENTS causes
         // the kernel to process deferred task-work and generate CQEs.
         let n = if self.pending_sqes > 0 {
+            // Only clear the counter if submit() succeeds — otherwise the SQEs
+            // are still queued and a subsequent flush must retry them.
+            let n = self.ring.submit()?;
             self.pending_sqes = 0;
-            self.ring.submit()?
+            n
         } else {
             0
         };
