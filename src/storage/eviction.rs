@@ -170,6 +170,7 @@ pub fn try_evict_if_needed_async_spill(
     sender: &flume::Sender<SpillRequest>,
     shard_dir: &Path,
     next_file_id: &mut u64,
+    db_index: usize,
 ) -> Result<(), Frame> {
     try_evict_if_needed_async_spill_with_total(
         db,
@@ -178,6 +179,7 @@ pub fn try_evict_if_needed_async_spill(
         shard_dir,
         next_file_id,
         db.estimated_memory(),
+        db_index,
     )
 }
 
@@ -189,6 +191,7 @@ pub fn try_evict_if_needed_async_spill_with_total(
     shard_dir: &Path,
     next_file_id: &mut u64,
     total_memory: usize,
+    db_index: usize,
 ) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
@@ -202,7 +205,7 @@ pub fn try_evict_if_needed_async_spill_with_total(
             return Err(oom_error());
         }
         let before = db.estimated_memory();
-        if !evict_one_async_spill(db, config, &policy, sender, shard_dir, next_file_id) {
+        if !evict_one_async_spill(db, config, &policy, sender, shard_dir, next_file_id, db_index) {
             return Err(oom_error());
         }
         let after = db.estimated_memory();
@@ -291,6 +294,7 @@ fn evict_one_async_spill(
     sender: &flume::Sender<SpillRequest>,
     shard_dir: &Path,
     next_file_id: &mut u64,
+    db_index: usize,
 ) -> bool {
     // Find victim key using same policy logic as sync path
     let victim = match policy {
@@ -350,6 +354,7 @@ fn evict_one_async_spill(
 
         let req = SpillRequest {
             key: Bytes::copy_from_slice(key.as_bytes()),
+            db_index,
             value_bytes: Bytes::copy_from_slice(value_bytes),
             value_type,
             flags,
@@ -358,12 +363,22 @@ fn evict_one_async_spill(
             shard_dir: PathBuf::from(shard_dir),
         };
 
-        // Remove from DashTable -- frees RAM immediately
+        // CRITICAL: queue the spill BEFORE freeing RAM. If try_send fails
+        // (channel full or disconnected) we MUST NOT remove the entry — that
+        // would lose data because no completion will arrive and the file will
+        // not exist. Bail out and let the next eviction tick retry.
+        if sender.try_send(req).is_err() {
+            return false;
+        }
+
+        // Now safe to free RAM. The bg thread holds the SpillRequest and will
+        // produce a SpillCompletion that updates cold_index for this db_index.
         db.remove(key.as_bytes());
 
-        // Update cold_index IMMEDIATELY so subsequent GETs can find the key.
-        // The file may not exist on disk yet (SpillThread processes async),
-        // but cold_read_through will handle the race (file appears shortly).
+        // Insert a tentative cold_index entry so subsequent GETs in this DB
+        // can resolve the key while the bg pwrite is in flight. The completion
+        // handler in persistence_tick::apply_spill_completions will overwrite
+        // this with the authoritative ColdLocation once pwrite finishes.
         if let Some(ref mut ci) = db.cold_index {
             ci.insert(
                 Bytes::copy_from_slice(key.as_bytes()),
@@ -373,9 +388,6 @@ fn evict_one_async_spill(
                 },
             );
         }
-
-        // Send to background thread (best-effort, drop if full)
-        let _ = sender.try_send(req);
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());

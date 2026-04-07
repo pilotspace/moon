@@ -285,8 +285,8 @@ pub(crate) fn apply_spill_completions(
             }
         }
 
-        // Update ColdIndex in db 0 (eviction currently operates on db 0)
-        let mut guard = shard_databases.write_db(shard_id, 0);
+        // Update ColdIndex in the originating logical DB.
+        let mut guard = shard_databases.write_db(shard_id, c.db_index);
         if let Some(ref mut ci) = guard.cold_index {
             ci.insert(
                 c.key,
@@ -408,7 +408,7 @@ pub(crate) fn handle_memory_pressure(
                     for i in 0..db_count {
                         let mut guard = shard_databases.write_db(shard_id, i);
                         let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
-                            &mut guard, &rt, &sender, &shard_dir, next_file_id, total_mem,
+                            &mut guard, &rt, &sender, &shard_dir, next_file_id, total_mem, i,
                         );
                     }
                     // Drop sender clone immediately to avoid shutdown deadlock

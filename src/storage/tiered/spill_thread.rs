@@ -10,6 +10,8 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tracing::warn;
@@ -27,6 +29,9 @@ use crate::persistence::page::{PageType, PAGE_4K};
 /// `Bytes` fields are reference-counted (cheap clone on event loop side).
 pub struct SpillRequest {
     pub key: Bytes,
+    /// Logical database index the key was evicted from. Used by completion
+    /// handler to update the correct per-DB cold_index.
+    pub db_index: usize,
     /// Already-serialized value (string bytes or kv_serde output).
     pub value_bytes: Bytes,
     /// Value type discriminant from `kv_page::ValueType`.
@@ -47,6 +52,8 @@ pub struct SpillRequest {
 pub struct SpillCompletion {
     /// The key that was spilled (for ColdIndex insertion).
     pub key: Bytes,
+    /// Logical database index this completion belongs to.
+    pub db_index: usize,
     /// File ID of the created `.mpf` file.
     pub file_id: u64,
     /// Slot index within the page (always 0 for single-entry pages).
@@ -120,6 +127,7 @@ pub struct SpillThread {
     request_tx: flume::Sender<SpillRequest>,
     completion_rx: flume::Receiver<SpillCompletion>,
     join_handle: Option<std::thread::JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl SpillThread {
@@ -131,11 +139,13 @@ impl SpillThread {
     pub fn new(shard_id: usize) -> Self {
         let (request_tx, request_rx) = flume::bounded::<SpillRequest>(4096);
         let (completion_tx, completion_rx) = flume::unbounded::<SpillCompletion>();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_bg = stop_flag.clone();
 
         let join_handle = std::thread::Builder::new()
             .name(format!("spill-{shard_id}"))
             .spawn(move || {
-                Self::run(request_rx, completion_tx);
+                Self::run(request_rx, completion_tx, stop_flag_bg);
             })
             .expect("failed to spawn spill thread");
 
@@ -143,6 +153,7 @@ impl SpillThread {
             request_tx,
             completion_rx,
             join_handle: Some(join_handle),
+            stop_flag,
         }
     }
 
@@ -150,10 +161,20 @@ impl SpillThread {
     fn run(
         request_rx: flume::Receiver<SpillRequest>,
         completion_tx: flume::Sender<SpillCompletion>,
+        stop_flag: Arc<AtomicBool>,
     ) {
-        while let Ok(req) = request_rx.recv() {
+        loop {
+            if stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+            let req = match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(r) => r,
+                Err(flume::RecvTimeoutError::Timeout) => continue,
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+            };
             let file_id = req.file_id;
             let key = req.key.clone();
+            let db_index = req.db_index;
 
             let (success, file_entry) = match write_spill_file(&req) {
                 Ok((page_count, byte_size)) => {
@@ -196,6 +217,7 @@ impl SpillThread {
 
             let completion = SpillCompletion {
                 key,
+                db_index,
                 file_id,
                 slot_idx: 0,
                 file_entry,
@@ -230,18 +252,12 @@ impl SpillThread {
 
     /// Shut down the background thread cleanly.
     ///
-    /// Drops the internal request sender and joins the thread.
-    ///
-    /// **Important:** The caller MUST drop all cloned senders (from `sender()`)
-    /// before calling this, otherwise the background thread will not exit and
-    /// `join` will block indefinitely.
+    /// Sets a stop flag and joins. Safe to call even when cloned `Sender`s are
+    /// still alive: the background thread polls the flag every 100 ms and
+    /// exits without waiting for channel close. This avoids the deadlock where
+    /// connection futures held cloned senders past shutdown.
     pub fn shutdown(mut self) {
-        // Drop the sender to signal the bg thread to stop.
-        // NOTE: if cloned senders still exist, the channel stays open.
-        let (dead_tx, _) = flume::bounded(1);
-        // Swap in a disconnected sender so the real one is dropped
-        std::mem::drop(std::mem::replace(&mut self.request_tx, dead_tx));
-
+        self.stop_flag.store(true, Ordering::Release);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
@@ -271,6 +287,7 @@ mod tests {
 
         let req = SpillRequest {
             key: Bytes::from_static(b"test_key"),
+            db_index: 0,
             value_bytes: Bytes::from_static(b"test_value"),
             value_type: ValueType::String,
             flags: 0,
@@ -315,6 +332,7 @@ mod tests {
         let future_ms = current_time_ms() + 60_000;
         let req = SpillRequest {
             key: Bytes::from_static(b"ttl_key"),
+            db_index: 0,
             value_bytes: Bytes::from_static(b"expiring_val"),
             value_type: ValueType::String,
             flags: entry_flags::HAS_TTL,
@@ -364,6 +382,7 @@ mod tests {
         for i in 0..5u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("key_{i}")),
+                db_index: 0,
                 value_bytes: Bytes::from(format!("val_{i}")),
                 value_type: ValueType::String,
                 flags: 0,
@@ -408,6 +427,7 @@ mod tests {
         for i in 0..5u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("pipeline_key_{i}")),
+                db_index: 0,
                 value_bytes: Bytes::from(format!("pipeline_value_{i}_with_some_data")),
                 value_type: ValueType::String,
                 flags: 0,
@@ -478,6 +498,7 @@ mod tests {
         for i in 0..128u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("bp_key_{i}")),
+                db_index: 0,
                 value_bytes: Bytes::from(format!("bp_val_{i}")),
                 value_type: ValueType::String,
                 flags: 0,
@@ -513,6 +534,7 @@ mod tests {
         // Now send one more -- should succeed since channel is drained
         let req = SpillRequest {
             key: Bytes::from_static(b"bp_final"),
+            db_index: 0,
             value_bytes: Bytes::from_static(b"bp_final_val"),
             value_type: ValueType::String,
             flags: 0,
@@ -536,6 +558,7 @@ mod tests {
         for i in 0..10u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("order_key_{i}")),
+                db_index: 0,
                 value_bytes: Bytes::from(format!("order_val_{i}")),
                 value_type: ValueType::String,
                 flags: 0,
@@ -583,6 +606,7 @@ mod tests {
         for i in 0..3u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("shutdown_key_{i}")),
+                db_index: 0,
                 value_bytes: Bytes::from(format!("shutdown_val_{i}")),
                 value_type: ValueType::String,
                 flags: 0,

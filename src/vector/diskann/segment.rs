@@ -372,7 +372,10 @@ impl DiskAnnSegment {
             // SAFETY: Single-threaded per-shard access. We hold exclusive logical
             // ownership of this segment on the shard thread.
             let uring = unsafe { &mut *self.uring.get() };
-            let uring = uring.as_mut().expect("search_uring called without uring");
+            let uring = match uring.as_mut() {
+                Some(u) => u,
+                None => break, // io_uring not initialized -- caller should use search_pread
+            };
             let submitted = match uring.submit_reads(&to_expand) {
                 Ok(count) => count,
                 Err(_) => {
@@ -399,8 +402,13 @@ impl DiskAnnSegment {
                 }
                 let buf = uring.read_buf(buf_idx);
                 // The buffer is exactly PAGE_4K bytes from the aligned pool.
-                let page: &[u8; PAGE_4K] = buf.try_into()
-                    .expect("aligned buf must be PAGE_4K bytes");
+                let page: &[u8; PAGE_4K] = match buf.try_into() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        uring.reclaim_buf(buf_idx);
+                        continue;
+                    }
+                };
                 if let Some(vnode) = read_vamana_node(page, self.dim) {
                     // Score each unvisited neighbor using PQ distance.
                     for &nbr in &vnode.neighbors {

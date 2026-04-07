@@ -750,8 +750,12 @@ impl UringDriver {
             .connections
             .iter()
             .filter(|(_, c)| {
+                // Reap any connection idle past max_idle_ticks regardless of
+                // recv_active. CLOSE_WAIT sockets stay with recv_active=true
+                // (multishot recv armed, never receives 0-byte CQE) and would
+                // otherwise leak forever.
                 let idle = current.saturating_sub(c.last_recv_tick);
-                idle > max_idle_ticks && !c.recv_active
+                idle > max_idle_ticks
             })
             .map(|(&id, _)| id)
             .collect();

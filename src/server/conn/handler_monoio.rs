@@ -1552,7 +1552,7 @@ pub async fn handle_connection_sharded_monoio<
                         let mut fid = spill_file_id.get();
                         let dir = disk_offload_dir.as_deref().unwrap_or(std::path::Path::new("."));
                         let res = try_evict_if_needed_async_spill(
-                            &mut guard, &rt, sender, dir, &mut fid,
+                            &mut guard, &rt, sender, dir, &mut fid, selected_db,
                         );
                         spill_file_id.set(fid);
                         res
