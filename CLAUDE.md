@@ -2,6 +2,8 @@
 
 High-performance Redis-compatible server in Rust. See [README.md](README.md) for build/run/test commands, configuration flags, architecture diagram, and command reference.
 
+Load specific skill that best fit for each user task. Like /senior-rust-engineer to do task related to rust implement.
+
 ## MSRV
 
 Rust **1.85** (edition 2024). Enforced in CI.
@@ -68,6 +70,15 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - The VM path to the repo is the same as macOS: `/Users/tindang/workspaces/tind-repo/moon`.
 - Use `source ~/.cargo/env &&` prefix in every `orb run` command.
 
+## Scripts
+
+- `scripts/bench-compare.sh` — Moon vs Redis side-by-side (all commands, pipeline 1–128, data 8B–64KB). Use `--requests 200000` for stable numbers.
+- `scripts/bench-production.sh` — 10 production scenarios (session, ratelimit, leaderboard, cache, queue, hash, connections, datasizes, memory, pipeline).
+- `scripts/bench-resources.sh` — RSS/memory bench. Starts a fresh server per row (RSS is a high-water mark; delta within one process is unreliable).
+- `scripts/test-commands.sh` — 190 tests across 13 categories (correctness vs Redis + throughput). `--skip-bench` for fast correctness-only.
+- `scripts/test-consistency.sh` — 132 data-consistency tests across 1/4/12 shard configs.
+- All scripts run inside `moon-dev` and need `redis-server` / `redis-benchmark` on PATH.
+
 ## Environment Variables
 
 - `RUST_LOG=moon=debug` — enable tracing output (uses `tracing-subscriber` with `env-filter`)
@@ -90,6 +101,11 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - **High client counts:** Testing with >1K clients may require `ulimit -n 65536`; 5K clients with pipeline can cause connection drops without it.
 - **AOF advantage grows with pipeline depth:** Per-shard WAL eliminates the global serialization bottleneck that Redis's single AOF file introduces at high pipeline depths.
 - **Use `--shards 1` for fair per-key memory comparison** against Redis.
+- **WAL sync kills write throughput ~11x** (135K → 12K ops/s). Always benchmark writes with `appendonly=no` first. The WAL writer is created whenever `persistence_dir` is set, so explicitly disable it when measuring raw write speed.
+- **Memory benchmarks need a fresh server + `redis-benchmark -r <N>`.** Without `-r`, all writes hit `__rand_key__` (1 real key). Delta measurement within one process is broken — RSS is a high-water mark, FLUSHALL does not return pages.
+- **redis-benchmark 8.x uses `\r` for progress lines.** Pipe through `tr '\r' '\n' | grep "requests per second" | tail -1 | awk '{print $2}'` before grepping RPS, or you'll parse the command name instead.
+- **`FT.COMPACT` is a silent no-op** when `mutable_len < compact_threshold`. Explicit user calls must route through `force_compact`, or set `COMPACT_THRESHOLD` ≥ expected dataset size so the one final compact happens.
+- **Vector recall on random Gaussian is misleading** at high dimensions (concentration of distances). Validate recall with real semantic embeddings (e.g. MiniLM) — Moon hits 0.96+ there vs ~0.73 on random.
 
 ## Coding Rules
 
@@ -115,6 +131,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Never hold a lock across `.await` points.
 - Replace `.read().unwrap()` / `.write().unwrap()` with `.read()` / `.write()` (parking_lot doesn't poison).
 - Per-shard locks only — no global locks on the write path.
+- **monoio cross-thread wakers:** `monoio::spawn` creates `!Send` tasks; `Waker::wake()` from another OS thread does NOT reach them. Use the `pending_wakers: Rc<RefCell<Vec<Waker>>>` relay — connection handler registers its waker, event loop drains and wakes locally after SPSC processing. For cross-thread signalling, prefer `flume::bounded(1)` over custom atomic oneshots.
 
 ### Error Handling
 - All command errors return `Frame::Error(Bytes)` — no `Result` types in dispatch paths.
@@ -144,6 +161,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Cross-shard dispatch: use `flume` channels, never `Arc<Mutex<>>` queues.
 - Protocol parsing: zero-copy where possible — use `Bytes::slice()` not `to_vec()`.
 - Response serialization: write directly to codec buffer, avoid intermediate `Vec<u8>`.
+- Profile first, optimize second. Use `perf record -F 999 -g` + `objdump` on the stripped binary and verify the assembly actually changed (e.g. serial `vaddss xmm0` chain → parallel `vaddss xmm3..8`). Easy to unroll the wrong function.
 
 ### File Size
 - No single `.rs` file should exceed 1500 lines. Split into submodules if approaching this limit.
@@ -153,6 +171,16 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Every new command needs at least one unit test and one consistency test entry.
 - Integration tests use real server instances — no mocking.
 - Benchmarks use Criterion with `black_box()` on inputs and outputs.
+
+## Vector Search (FT.*)
+
+Moon ships a native HNSW + TurboQuant vector engine exposed via a RediSearch-compatible subset (`FT.CREATE`, `FT.DROPINDEX`, `FT.INFO`, `FT.SEARCH`, `FT.COMPACT`). Source: `src/vector/` and `src/command/vector_search/`.
+
+- **Per-index knobs:** `EF_RUNTIME` (recall/QPS trade-off), `COMPACT_THRESHOLD` (when to flush mutable → immutable segment).
+- **Segment lifecycle:** auto-indexed on HSET → mutable segment (brute force) → compact → immutable segment (HNSW graph + TQ codes). Segments do not merge once immutable — lossy decode+re-encode accumulates quantization error (tested, recall collapsed 0.73 → 0.0005).
+- **Key hash map:** `key_hash_to_key: HashMap<u64, Bytes>` must be populated in `auto_index_hset` and propagated via `SearchResult.key_hash`; otherwise multi-segment search returns synthetic `vec:<id>` instead of original keys.
+- **FT.INFO `num_docs`** must sum across all segments (mutable + immutable), not just the mutable one.
+- **TQ4 at 384d loses recall** (concentration of distances + quantization noise). Use TQ8 or FP32 HNSW for ≤384d workloads; TQ4 shines at 768d+.
 
 ## GPU / CUDA Acceleration
 
