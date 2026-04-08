@@ -160,11 +160,13 @@ impl WarmSearchSegment {
         // call against an atomically-renamed sealed file. See
         // `WarmSegmentFiles` for the long-lived-mmap variant and the full
         // invariant chain it relies on.
-        let codes_file = std::fs::File::open(segment_dir.join("codes.mpf"))?;
-        // SAFETY: Sealed-after-rename file (see warm_tier::transition_to_warm),
-        // mmap dropped at end of this function. Caller's `handle` keeps the
-        // segment dir alive past the rename and across this open call.
-        let codes_mmap = unsafe { memmap2::MmapOptions::new().map(&codes_file)? };
+        // Sealed-after-rename warm-segment files; see
+        // `vector::persistence::sealed_mmap` module docs for the seal contract.
+        // The mmaps live only for the duration of `open()` — payload bytes are
+        // copied into owned `Vec<u8>` before this function returns.
+        use crate::vector::persistence::sealed_mmap::map_sealed_file;
+
+        let codes_mmap = map_sealed_file(&segment_dir.join("codes.mpf"))?;
         codes_mmap.advise(memmap2::Advice::Sequential)?;
         if mlock_codes {
             if let Err(e) = codes_mmap.lock() {
@@ -173,15 +175,11 @@ impl WarmSearchSegment {
         }
 
         // Open and mmap graph.mpf (4KB pages)
-        let graph_file = std::fs::File::open(segment_dir.join("graph.mpf"))?;
-        // SAFETY: Same invariants as codes above; mmap dropped at end of `open()`.
-        let graph_mmap = unsafe { memmap2::MmapOptions::new().map(&graph_file)? };
+        let graph_mmap = map_sealed_file(&segment_dir.join("graph.mpf"))?;
         graph_mmap.advise(memmap2::Advice::Random)?;
 
         // Open and mmap mvcc.mpf (4KB pages)
-        let mvcc_file = std::fs::File::open(segment_dir.join("mvcc.mpf"))?;
-        // SAFETY: Same invariants as codes above; mmap dropped at end of `open()`.
-        let mvcc_mmap = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
+        let mvcc_mmap = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
         mvcc_mmap.advise(memmap2::Advice::Sequential)?;
         // Lock mvcc pages in RAM -- visibility checks run on every query (design S14).
         // Failure is non-fatal: mlock may fail in containers or when RLIMIT_MEMLOCK is low.

@@ -17,8 +17,16 @@ pub struct AlignedBuf {
     layout: Layout,
 }
 
-// SAFETY: The buffer is a plain byte slab with no thread-affinity.
-// Ownership transfer across threads is safe.
+// SAFETY: `AlignedBuf` is a uniquely-owned heap allocation of `PAGE_4K` bytes
+// with no interior mutability, no thread-local state, and no references into
+// thread-specific resources (no TLS, no thread-bound handles). The contained
+// raw pointer is owned exclusively by this value — there is no aliasing — and
+// `Drop` frees it with the same layout it was allocated with. Moving the
+// buffer between threads therefore transfers full, exclusive access with no
+// data race and no dangling-reference hazard. `Sync` is intentionally NOT
+// implemented: mutation through `&AlignedBuf` is not supported, and handing
+// `&[u8]` views to multiple threads concurrently is not part of the API
+// contract (all reads go through `&self`/`&mut self` on a single owner).
 unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {

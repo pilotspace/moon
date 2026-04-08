@@ -262,7 +262,16 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
     use crate::server::connection::handle_connection_sharded_inner;
 
-    // SAFETY: caller guarantees fd is a valid connected TCP socket.
+    // SAFETY: `fd` was produced by `libc::dup()` on the source shard before
+    // being pushed through the `ShardMessage::MigrateConnection` SPSC channel
+    // (see `conn_accept.rs` migration emit site). That dup is a fresh, owned
+    // kernel file descriptor, distinct from any other open fd in the process,
+    // and ownership is transferred exactly once through the channel — the
+    // source shard drops the original stream immediately after `dup`, and on
+    // SPSC push failure the producer reconstructs an `OwnedFd` to close the
+    // dup. Here on the consumer side we take ownership by wrapping it in
+    // `TcpStream`, whose `Drop` closes the fd exactly once. No aliasing, no
+    // double-close.
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
     if let Err(e) = std_stream.set_nonblocking(true) {
         tracing::warn!(
@@ -650,7 +659,11 @@ pub(crate) fn spawn_migrated_monoio_connection(
 
     use crate::server::connection::handle_connection_sharded_monoio;
 
-    // SAFETY: caller guarantees fd is a valid connected TCP socket.
+    // SAFETY: Same ownership chain as `spawn_migrated_tokio_connection`: `fd`
+    // is a dup'd socket transferred exactly once through the migration SPSC,
+    // with the source having already dropped its original handle. Wrapping
+    // in `TcpStream` here is the sole close-owner. See the tokio sibling
+    // function for the full argument.
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
     if let Err(e) = std_stream.set_nonblocking(true) {
         tracing::warn!(

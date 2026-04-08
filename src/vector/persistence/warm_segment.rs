@@ -378,12 +378,11 @@ impl WarmSegmentFiles {
         handle: SegmentHandle,
         mlock_codes: bool,
     ) -> std::io::Result<Self> {
-        // codes.mpf
-        let codes_file = std::fs::File::open(segment_dir.join("codes.mpf"))?;
-        // SAFETY: Upholds invariants 1-4 documented on `WarmSegmentFiles`:
-        // sealed-after-rename, refcount-protected dir, drop order, exclusive
-        // process ownership of the data directory.
-        let codes = unsafe { memmap2::MmapOptions::new().map(&codes_file)? };
+        use crate::vector::persistence::sealed_mmap::map_sealed_file;
+
+        // codes.mpf — sealed warm-segment file, see `sealed_mmap` module docs
+        // and invariants 1-4 on `WarmSegmentFiles`.
+        let codes = map_sealed_file(&segment_dir.join("codes.mpf"))?;
         codes.advise(memmap2::Advice::Sequential)?;
         #[cfg(unix)]
         if mlock_codes {
@@ -391,22 +390,17 @@ impl WarmSegmentFiles {
         }
 
         // graph.mpf
-        let graph_file = std::fs::File::open(segment_dir.join("graph.mpf"))?;
-        // SAFETY: Same invariants as codes -- see `WarmSegmentFiles` doc comment.
-        let graph = unsafe { memmap2::MmapOptions::new().map(&graph_file)? };
+        let graph = map_sealed_file(&segment_dir.join("graph.mpf"))?;
         graph.advise(memmap2::Advice::Random)?;
 
         // mvcc.mpf
-        let mvcc_file = std::fs::File::open(segment_dir.join("mvcc.mpf"))?;
-        // SAFETY: Same invariants as codes -- see `WarmSegmentFiles` doc comment.
-        let mvcc = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
+        let mvcc = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
         mvcc.advise(memmap2::Advice::Sequential)?;
 
         // vectors.mpf (optional)
-        let vectors = match std::fs::File::open(segment_dir.join("vectors.mpf")) {
-            Ok(vf) => {
-                // SAFETY: Same invariants as codes -- see `WarmSegmentFiles` doc comment.
-                let v = unsafe { memmap2::MmapOptions::new().map(&vf)? };
+        let vectors_path = segment_dir.join("vectors.mpf");
+        let vectors = match map_sealed_file(&vectors_path) {
+            Ok(v) => {
                 v.advise(memmap2::Advice::Sequential)?;
                 Some(v)
             }

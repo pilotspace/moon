@@ -8,7 +8,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
 use io_uring::IoUring;
@@ -27,7 +27,9 @@ use super::aligned_buf::AlignedBufPool;
 pub struct DiskAnnUring {
     ring: IoUring,
     buf_pool: AlignedBufPool,
-    vamana_fd: RawFd,
+    /// Owned O_DIRECT file descriptor. `OwnedFd::drop` closes it automatically,
+    /// so no manual `libc::close` is needed.
+    vamana_fd: OwnedFd,
 }
 
 impl DiskAnnUring {
@@ -36,7 +38,7 @@ impl DiskAnnUring {
     /// `vamana_fd` must be an O_DIRECT-opened file descriptor (from
     /// `open_vamana_direct`). `pool_size` controls how many concurrent
     /// 4KB reads can be in flight.
-    pub fn new(vamana_fd: RawFd, pool_size: u16) -> io::Result<Self> {
+    pub fn new(vamana_fd: OwnedFd, pool_size: u16) -> io::Result<Self> {
         let ring = IoUring::builder()
             .setup_single_issuer()
             .setup_coop_taskrun()
@@ -71,7 +73,7 @@ impl DiskAnnUring {
 
             let file_offset = node_index as u64 * PAGE_4K as u64;
             let read_op = opcode::Read::new(
-                types::Fd(self.vamana_fd),
+                types::Fd(self.vamana_fd.as_raw_fd()),
                 self.buf_pool.buf_ptr(buf_idx),
                 PAGE_4K as u32,
             )
@@ -133,22 +135,16 @@ impl DiskAnnUring {
     }
 }
 
-impl Drop for DiskAnnUring {
-    fn drop(&mut self) {
-        // SAFETY: We own this FD from open_vamana_direct(). Closing it
-        // is required to avoid FD leaks. The io_uring ring does not
-        // close the FD on its own.
-        unsafe {
-            libc::close(self.vamana_fd);
-        }
-    }
-}
+// `Drop` for `DiskAnnUring` is intentionally not implemented: `OwnedFd` closes
+// the vamana fd automatically when the struct is dropped, and `IoUring` and
+// `AlignedBufPool` own their own resources. Keeping this as an implicit drop
+// removes the only remaining raw `libc::close` from this module.
 
 /// Open a Vamana graph file with O_DIRECT for bypassing the page cache.
 ///
-/// Returns the raw file descriptor. The caller owns it and must ensure
-/// it is closed (typically via `DiskAnnUring::drop`).
-pub fn open_vamana_direct(path: &Path) -> io::Result<RawFd> {
+/// Returns an [`OwnedFd`] — the caller owns it and it is closed automatically
+/// when dropped. Pass it to [`DiskAnnUring::new`] which takes ownership.
+pub fn open_vamana_direct(path: &Path) -> io::Result<OwnedFd> {
     let c_path = CString::new(
         path.to_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?,
@@ -156,10 +152,16 @@ pub fn open_vamana_direct(path: &Path) -> io::Result<RawFd> {
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
 
     // SAFETY: `c_path` is a valid null-terminated C string. O_RDONLY | O_DIRECT
-    // are valid flags for libc::open. The returned FD is owned by the caller.
+    // are valid flags for libc::open. `libc::open` returns a fresh, owned fd
+    // on success; we immediately wrap it in `OwnedFd` (which takes ownership
+    // of the close) before returning, so there is no possibility of leak or
+    // double-close along the happy path.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(fd)
+    // SAFETY: `fd` is a fresh kernel-allocated file descriptor that we have
+    // not handed to anyone else and not registered with any other owner; this
+    // is the sole transfer of ownership into `OwnedFd`.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
