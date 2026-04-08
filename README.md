@@ -169,6 +169,10 @@ Moon is pre-1.0 and **experimental**. Current focus:
 
 Production readiness is **not** a v0.1 goal. Storage formats, APIs, and config flags may change between releases.
 
+## Production Readiness
+
+Moon's v1.0 promises — SLOs, durability modes, supported platforms, and a machine-checkable GA exit-criteria checklist — live in **[docs/PRODUCTION-CONTRACT.md](docs/PRODUCTION-CONTRACT.md)**. The contract is the single source of truth every v0.1.3 hardening phase tests against.
+
 ## Credits
 
 Moon stands on the shoulders of systems research and an open-source ecosystem. Headline credits:
