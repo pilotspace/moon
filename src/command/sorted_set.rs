@@ -226,7 +226,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remaining args must be score member pairs
     let remaining = &args[i..];
-    if remaining.is_empty() || remaining.len() % 2 != 0 {
+    if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
         return err_wrong_args("ZADD");
     }
 

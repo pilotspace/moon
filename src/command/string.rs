@@ -224,7 +224,7 @@ pub fn mget(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// MSET command handler.
 pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return err_wrong_args("MSET");
     }
     for pair in args.chunks(2) {

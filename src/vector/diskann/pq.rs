@@ -25,7 +25,7 @@ impl ProductQuantizer {
     pub fn train(vectors: &[f32], dim: usize, m: usize, nbits: u8) -> Self {
         let n = vectors.len() / dim;
         assert!(n > 0, "need at least one vector");
-        assert!(dim % m == 0, "dim must be divisible by m");
+        assert!(dim.is_multiple_of(m), "dim must be divisible by m");
 
         let ksub = 1usize << nbits;
         let dsub = dim / m;

@@ -13,7 +13,7 @@ use super::helpers::{err_wrong_args, extract_bytes, ok};
 /// of fields that were newly added (not updated).
 pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
     // Need at least key + one field-value pair, and args count must be odd (key + pairs)
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return err_wrong_args("HSET");
     }
     let key = match extract_bytes(&args[0]) {
@@ -159,7 +159,7 @@ pub fn hdel(db: &mut Database, args: &[Frame]) -> Frame {
 ///
 /// Sets multiple field-value pairs. Legacy command, always returns OK.
 pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return err_wrong_args("HMSET");
     }
     let key = match extract_bytes(&args[0]) {

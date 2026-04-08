@@ -103,7 +103,7 @@ pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Parse field-value pairs (remaining args)
     let remaining = args.len() - idx;
-    if remaining == 0 || remaining % 2 != 0 {
+    if remaining == 0 || !remaining.is_multiple_of(2) {
         return err_wrong_args("XADD");
     }
 
@@ -469,7 +469,7 @@ pub fn xread(db: &mut Database, args: &[Frame]) -> Frame {
 
     // After STREAMS keyword: remaining args are keys... followed by ids...
     let remaining = args.len() - idx;
-    if remaining == 0 || remaining % 2 != 0 {
+    if remaining == 0 || !remaining.is_multiple_of(2) {
         return err_wrong_args("XREAD");
     }
 
@@ -830,7 +830,7 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Parse keys and IDs
     let remaining = args.len() - idx;
-    if remaining == 0 || remaining % 2 != 0 {
+    if remaining == 0 || !remaining.is_multiple_of(2) {
         return err_wrong_args("XREADGROUP");
     }
 
