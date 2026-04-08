@@ -143,8 +143,12 @@ echo "Moon started (pid=$MOON_PID)"
 echo ""
 echo "Inserting $N_KV keys × 1KB values (target: ${N_KV}KB > $MAXMEMORY)..."
 INSERT_START=$(date +%s%N)
-# Use redis-benchmark with pipeline for speed
-timeout 60 redis-benchmark -p $MOON_PORT -c 10 -n $N_KV -t set -d 1024 -P 64 -q 2>&1 | head -3 || true
+# Use redis-benchmark with pipeline for speed.
+# IMPORTANT: -r $N_KV is required so __rand_int__ expands to a 12-digit
+# integer in [0, N_KV). Without -r, redis-benchmark writes a SINGLE literal
+# key named "key:__rand_int__" 50K times — DBSIZE stays at 1 and the
+# spot-check below fails. The spot-check uses the same 12-digit format.
+timeout 60 redis-benchmark -p $MOON_PORT -r $N_KV -c 10 -n $N_KV -t set -d 1024 -P 64 -q 2>&1 | head -3 || true
 INSERT_END=$(date +%s%N)
 INSERT_MS=$(( (INSERT_END - INSERT_START) / 1000000 ))
 echo "Insert: ${INSERT_MS}ms"
@@ -160,7 +164,7 @@ echo "$INFO" | grep -E "used_memory|evicted|maxmemory" | tr -d '\r' || echo "  (
 echo ""
 echo "Cold read-through test: GET 10000 random keys..."
 READ_START=$(date +%s%N)
-timeout 30 redis-benchmark -p $MOON_PORT -c 10 -n 10000 -t get -r 100000 -P 16 -q 2>&1 | head -3 || true
+timeout 30 redis-benchmark -p $MOON_PORT -c 10 -n 10000 -t get -r $N_KV -P 16 -q 2>&1 | head -3 || true
 READ_END=$(date +%s%N)
 READ_MS=$(( (READ_END - READ_START) / 1000000 ))
 echo "Read: ${READ_MS}ms"
@@ -287,7 +291,8 @@ echo ""
 echo "Spot-check 10 random reads after recovery:"
 OK=0
 for i in $(seq 1 10); do
-    KEY="key:$(( RANDOM % N_KV ))"
+    # redis-benchmark zero-pads __rand_int__ to 12 digits, so we must match.
+    KEY=$(printf "key:%012d" $(( RANDOM % N_KV )))
     VAL=$(redis-cli -p $MOON_PORT GET "$KEY" 2>&1)
     if [ -n "$VAL" ] && [ "$VAL" != "(nil)" ]; then
         OK=$((OK + 1))
