@@ -10,23 +10,71 @@ use super::intset::Intset;
 use super::listpack::Listpack;
 use super::stream::Stream as StreamData;
 
-/// Return the current time as seconds since the Unix epoch, truncated to u32.
-/// Wraps around in the year 2106 -- acceptable for LRU/LFU relative comparisons.
+// ── Thread-local cached clock ───────────────────────────────────────────
+//
+// Shard event loops tick at ~1 ms and call `tl_clock_set(...)` once per tick.
+// Hot-path callers of `current_secs()` / `current_time_ms()` (e.g. every
+// `Entry::new_*` constructor) read from this thread-local Cell and avoid the
+// `clock_gettime` vDSO call entirely. A value of 0 means "never set on this
+// thread" -- fall back to the real syscall for tests and cold init paths.
+//
+// Correctness: monoio is thread-per-core, so each shard owns its thread and
+// its own thread-local. Tokio multi-thread is also safe because every call
+// site here produces timestamps whose staleness budget is >= 1 ms.
+
+thread_local! {
+    static TL_NOW_SECS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static TL_NOW_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Update the per-thread cached clock. Call from shard event-loop ticks.
 #[inline]
-pub fn current_secs() -> u32 {
+pub fn tl_clock_set(secs: u32, ms: u64) {
+    TL_NOW_SECS.with(|c| c.set(secs));
+    TL_NOW_MS.with(|c| c.set(ms));
+}
+
+#[cold]
+fn current_secs_syscall() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32
 }
 
-/// Return the current time as milliseconds since the Unix epoch.
-#[inline]
-pub fn current_time_ms() -> u64 {
+#[cold]
+fn current_time_ms_syscall() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Return the current time as seconds since the Unix epoch, truncated to u32.
+/// Reads the thread-local cache set by `tl_clock_set` -- no syscall on the
+/// hot path. Falls back to `SystemTime::now()` only when the cache is zero
+/// (tests, cold init). Wraps around in the year 2106 -- acceptable for
+/// LRU/LFU relative comparisons.
+#[inline]
+pub fn current_secs() -> u32 {
+    let cached = TL_NOW_SECS.with(|c| c.get());
+    if cached != 0 {
+        cached
+    } else {
+        current_secs_syscall()
+    }
+}
+
+/// Return the current time as milliseconds since the Unix epoch.
+/// Reads the thread-local cache set by `tl_clock_set`. See `current_secs`.
+#[inline]
+pub fn current_time_ms() -> u64 {
+    let cached = TL_NOW_MS.with(|c| c.get());
+    if cached != 0 {
+        cached
+    } else {
+        current_time_ms_syscall()
+    }
 }
 
 /// Shared cached clock updated once per shard event loop tick (1ms).
@@ -52,12 +100,20 @@ impl CachedClock {
     }
 
     /// Update the cached clock. Called once per shard tick (1ms).
+    ///
+    /// This function is the ONE place per shard that actually calls
+    /// `clock_gettime`. It refreshes both the `Arc<AtomicU64>` used by
+    /// cross-thread readers (e.g. `Database::refresh_now_from_cache`) AND
+    /// the thread-local `TL_NOW_*` cells read by `current_secs` /
+    /// `current_time_ms` on the hot path.
     #[inline]
     pub fn update(&self) {
+        let s = current_secs_syscall();
+        let m = current_time_ms_syscall();
         self.secs
-            .store(current_secs() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.ms
-            .store(current_time_ms(), std::sync::atomic::Ordering::Relaxed);
+            .store(s as u64, std::sync::atomic::Ordering::Relaxed);
+        self.ms.store(m, std::sync::atomic::Ordering::Relaxed);
+        tl_clock_set(s, m);
     }
 
     /// Read cached seconds.
