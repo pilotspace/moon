@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Dispatch Hot-Path Recovery (2026-04-08)
+
+**Pipelined SET +37%, pipelined GET +68% at p=16 after PR #43 regression recovery.**
+
+Three targeted perf fixes landed after flamegraph-driven analysis of pipelined
+SET on aarch64 (OrbStack moon-dev, 1 shard, default config, redis-benchmark
+-c 50 -n 3M -P 16 -r 100000 -d 64):
+
+| Metric                  | Broken baseline | After T0a+T0b+T0c | Δ      |
+|-------------------------|----------------:|------------------:|-------:|
+| SET p=1   (ratio Redis) | 0.99x           | **1.12x**         | +13pp  |
+| SET p=16                | 1.42M/s         | **1.94M/s**       | +37%   |
+| SET p=32                | 2.06M/s         | **2.26M/s**       | +10%   |
+| GET p=16                | 2.40M/s         | **4.04M/s**       | +68%   |
+| GET p=128 vs Redis      | 1.87x           | **1.91x**         | +4pp   |
+
+### Perf fixes
+
+- **T0a — Thread-local cached clock** (4041b0d). `Entry::new_*` constructors
+  were calling `SystemTime::now()` / `clock_gettime` on every write, showing up
+  at **10.14% of CPU** in the perf profile. Added a thread-local `Cell<u32>` /
+  `Cell<u64>` refreshed once per shard tick (~1 ms) from `CachedClock::update()`.
+  `current_secs` / `current_time_ms` now read the Cell and fall back to the
+  syscall only on tests / cold init. `__kernel_clock_gettime` dropped from
+  10.14% → **0%** of CPU.
+
+- **T0b — Hot command dispatch bypasses phf SipHasher** (4b0eec3). The command
+  metadata registry is a `phf::Map` keyed by `&'static str` using `SipHasher` —
+  cryptographic overkill for a 173-entry ASCII table. Combined `phf::Map::get`
+  + `SipHasher::write` + `hash_one` was **~6% of CPU**. Added a direct match
+  path in `command::metadata::lookup`: pack the first ≤8 bytes of the command
+  name as a `u64` with ASCII letters uppercased, match against 24 hand-picked
+  hot commands (GET/SET/DEL/TTL/MGET/MSET/INCR/DECR/HSET/HGET/HDEL/HLEN/LPOP/
+  RPOP/LLEN/PING/LPUSH/RPUSH/EXPIRE/EXISTS/INCRBY/DECRBY/SELECT/HGETALL).
+  Hot-path resolves through a pre-resolved `LazyLock<[&'static CommandMeta; 24]>`
+  — single array index, no hashing. Cold commands fall through to phf unchanged.
+  Correctness asserted by `hot_path_matches_phf_map` test: every hot entry must
+  return the same `&'static` pointer as a direct phf probe, in both upper and
+  lowercase.
+
+- **T0c — ACL unrestricted-user short-circuit** (4603511). Every command
+  executed `check_command_permission` + `check_key_permission` even for the
+  default `on nopass ~* &* +@all` user, burning **2.11% of CPU** on
+  lowercasing, `extract_command_keys`, and glob matching. Added a cached
+  `unrestricted: bool` field to `AclUser`, true iff the user is enabled, has
+  `AllAllowed` commands, only `~*` read/write key patterns, and only `*`
+  channel patterns. The three `check_*_permission` methods early-return `None`
+  on `unrestricted` before any allocation or iteration. The cache is
+  recomputed once at the end of `apply_rule` (the single mutation entry point
+  used by ACL SETUSER / LOAD / reset). Correctness covered by three new tests
+  (`default_user_is_unrestricted`, `restrictions_clear_unrestricted_flag`,
+  `unrestricted_user_passes_all_checks`).
+
+### Correctness fix (PR #43 review)
+
+- **Inline monoio fast-path restricted to GET** (613c164). The previous inline
+  dispatch in `try_inline_dispatch` handled both GET and SET directly against
+  the DashTable, bypassing replica READONLY enforcement, ACL checks, maxmemory
+  eviction, client-side tracking invalidation, keyspace notifications,
+  replication propagation, and blocking-waiter wakeups. Under any of those
+  configurations the inlined SET would silently diverge from the normal path —
+  accepted writes on replicas, ACL-denied clients writing, maxmemory overshoot,
+  stale client-side caches. Fix: inline only handles `*2\r\n$3\r\nGET` now;
+  SET and everything else fall through to the full dispatcher where all
+  side-effects run.
+
+### Cold-tier lock hygiene (PR #43 review)
+
+- **Release shard read guard before cold-tier disk read** (ff51135). The
+  cold-tier fallback in `server::conn::blocking` previously called
+  `get_cold_value()` — which does a synchronous `std::fs::read()` — while still
+  holding the per-shard read guard, blocking all concurrent operations on that
+  shard during disk I/O. Split the path: `Database::cold_lookup_location`
+  returns the `(ColdLocation, PathBuf)` under the lock, the guard is dropped,
+  and `cold_read::read_cold_entry_at` performs the disk read unlocked.
+
+### Additional PR #43 fixes
+
+- `read_overflow_chain` now bounded at 1000 iterations (cycle guard against
+  corrupted `next_page` links)
+- `recovery.rs` FPI replay replaces `.unwrap()` on `try_into()` with explicit
+  byte-array construction (coding-guidelines compliance)
+- `bench-production.sh`: fixed unsupported `-t zrangebyscore` (→ `zpopmin`),
+  MSET rps parser for `"MSET (10 keys):"` output, heredoc `$(date)` expansion,
+  and Redis RSS probe (`pgrep`/`/proc` instead of missing `lsof`)
+- `bench-cold-tier.sh`: removed stray `&` backgrounding `FT.CREATE`
+- `test-recovery-all-cases.sh`: `NoPersistence` case now PASSes at 0 keys
+- `benches/resp_parsing.rs`, `benches/get_hotpath.rs`: wrap `Vec<Frame>` in
+  `FrameVec` via `.into()` after frame.rs type change
+
+All 1872 unit tests pass under `--no-default-features --features
+runtime-tokio,jemalloc`. Follow-up work (T1 `dispatch_raw` zero-alloc entry
+point, Tier 2 storage/DashTable optimization, residual ACL SipHash elimination)
+captured as todo in `.planning/todos/pending/`.
+
+---
+
 ## [Unreleased] - Vector Search 4x QPS + Correctness
 
 ### Vector Search Performance & Correctness (2026-04-07)

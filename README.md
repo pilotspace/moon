@@ -118,6 +118,41 @@ See [Vector Search Guide](docs/vector-search-guide.md) for `FT.CREATE` syntax,
 
 See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK-PRODUCTION.md](BENCHMARK-PRODUCTION.md) for production workload patterns.
 
+### Recent Perf Recovery (2026-04-08, aarch64 dev VM)
+
+After PR #43 (disk-offload) removed an unsound inline SET fast-path that was
+bypassing replica / ACL / maxmemory / tracking / notifications / replication
+side-effects, three flamegraph-driven fixes recovered the hot path in a
+correctness-preserving way:
+
+| Metric (1 shard, c=50, p=16, aarch64 OrbStack) | Broken | After T0 | Δ   |
+|------------------------------------------------|-------:|---------:|-----|
+| SET p=1 vs Redis                               | 0.99x  | **1.12x** | +13pp |
+| SET p=16 throughput                            | 1.42M  | **1.94M** | +37% |
+| SET p=32 throughput                            | 2.06M  | **2.26M** | +10% |
+| GET p=16 throughput                            | 2.40M  | **4.04M** | +68% |
+| GET p=128 vs Redis                             | 1.87x  | **1.91x** | +4pp |
+
+- **T0a** — Thread-local cached clock eliminates `clock_gettime` from the
+  `Entry::new_*` constructor hot path (was 10.14% of CPU → 0%).
+- **T0b** — Hot command dispatch bypasses the phf `SipHasher` via a direct
+  `(len, packed u64)` match against 24 pre-resolved `&'static CommandMeta`
+  pointers (was ~6% of CPU → 0%).
+- **T0c** — ACL `check_*_permission` short-circuits on a cached
+  `unrestricted: bool` for the default `on nopass ~* &* +@all` user shape
+  (was 2.11% of CPU → 0%).
+
+See [CHANGELOG.md](CHANGELOG.md#unreleased---dispatch-hot-path-recovery-2026-04-08)
+for per-commit profiles and correctness guarantees. Follow-up work (T1
+zero-alloc `dispatch_raw` entry point, Tier 2 storage/DashTable optimization)
+tracked in `.planning/todos/pending/`.
+
+> Headline numbers in the tables above (GCP c3-standard-8 x86_64) were measured
+> before the PR #43 correctness changes and have not yet been re-run on x86.
+> The aarch64 table in this section reflects the current dispatch hot path on
+> the dev VM; x86 peak throughput is expected to follow a similar trajectory
+> once re-benchmarked.
+
 ## Features
 
 ### Data Types
