@@ -485,8 +485,8 @@ impl ShardManifest {
         // Validate payload framing: root metadata + declared entries must match
         // the authenticated payload_bytes and entry_count in the header. This
         // prevents reading unchecked trailing bytes on a corrupted root page.
-        let expected_payload = ROOT_META_SIZE
-            .checked_add((file_count as usize).checked_mul(FileEntry::SIZE)?)?;
+        let expected_payload =
+            ROOT_META_SIZE.checked_add((file_count as usize).checked_mul(FileEntry::SIZE)?)?;
         if hdr.payload_bytes as usize != expected_payload {
             return None;
         }
