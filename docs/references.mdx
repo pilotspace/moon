@@ -1,0 +1,73 @@
+---
+title: "References & credits"
+description: "Open-source projects, research papers, and specifications Moon builds on."
+keywords: ["references", "credits", "papers", "dependencies", "design"]
+---
+
+Moon stands on the shoulders of decades of systems research and a vibrant open-source ecosystem. This page lists the projects, papers, and specifications that directly shaped Moon's design, along with the core runtime dependencies and the rationale for each.
+
+## Design inspirations
+
+Moon's architecture is not invented — it's assembled from ideas that have been validated in production by others. Credit where it's due.
+
+- **[Dragonfly](https://github.com/dragonflydb/dragonfly)** — C++ shared-nothing, thread-per-core Redis alternative. Validated that the thread-per-core model is the right answer for key-value stores in 2024+. Moon follows the same top-level architecture with a Rust implementation.
+- **[ScyllaDB / Seastar](https://github.com/scylladb/seastar)** — pioneered thread-per-core shared-nothing for databases. The `CachePadded<T>` discipline, SPSC cross-shard channels, and "never share data, always share work" philosophy come from Seastar.
+- **[KeyDB](https://github.com/Snapchat/KeyDB)** — multi-threaded Redis fork. A useful counter-example: demonstrated the spinlock ceiling at ~4 threads, which is exactly what shared-nothing avoids.
+- **[Garnet (Microsoft Research)](https://github.com/microsoft/garnet)** — .NET Redis alternative with a Tsavorite log-structured store. Validated that RESP compatibility plus a modern storage engine can beat Redis on both latency and memory.
+- **[TiKV](https://github.com/tikv/tikv)** — large-scale Rust KV store. Production-proven jemalloc tuning and tracing patterns Moon adopts.
+- **[ByteDance Monoio](https://github.com/bytedance/monoio)** — the thread-per-core `io_uring` runtime Moon uses by default on Linux. Production-proven at ByteDance scale.
+
+## Research papers
+
+Algorithms Moon implements directly, with papers worth reading if you want to understand *why* the code looks the way it does.
+
+- **[Dash: Scalable Hashing on Persistent Memory (VLDB 2020)](https://www.vldb.org/pvldb/vol13/p1147-lu.pdf)** — the segmented-hash-table design that `DashTable` in `src/storage/dashtable/` is based on. Optimized for cache-line locality and concurrent lock-free reads.
+- **[Swiss Table / Abseil](https://abseil.io/about/design/swisstables)** — SIMD control-byte probing. Moon uses Swiss Table-style probing *within* each Dash segment: one SIMD load scans 16 slots' worth of metadata before touching any key data. See `src/storage/dashtable/segment.rs`.
+- **[VLL: Very Lightweight Locking for Main Memory Database Systems (VLDB 2012)](https://www.vldb.org/pvldb/vol6/p145-ren.pdf)** — multi-key transaction coordination across shards without heavy locking. Informs Moon's approach to cross-shard `MGET`/`MSET`/`MULTI` and future cluster-wide transactions.
+- **[TurboQuant: Fast 4-bit Vector Quantization](https://arxiv.org/abs/2411.04405)** — the foundation for Moon's `TQ-4bit` vector compression. See `src/vector/turbo_quant/` for the implementation and `docs/vector-search-guide.md` for how it's wired into `FT.CREATE`.
+- **[HNSW: Efficient and Robust Approximate Nearest Neighbor Search (Malkov & Yashunin, 2016)](https://arxiv.org/abs/1603.09320)** — the graph index used for `FT.SEARCH`. Moon's HNSW implementation lives in `src/vector/hnsw/`.
+- **[io_uring and Networking (Alibaba Cloud)](https://www.alibabacloud.com/blog/io_uring-vs-epoll-in-high-performance-networking_599367)** — why `io_uring` matters for request-response workloads. Background for Moon's dual-runtime design.
+- **[Coordinated Omission (Gil Tene)](https://www.scylladb.com/2021/04/22/on-coordinated-omission/)** — why closed-loop benchmarking under-reports tail latency. Moon's benchmark methodology follows open-loop principles.
+
+## Protocol & compatibility specifications
+
+Moon targets drop-in Redis compatibility. These are the specs it implements.
+
+- **[Redis Protocol Specification (RESP2/RESP3)](https://redis.io/docs/latest/develop/reference/protocol-spec/)** — the wire protocol parsed in `src/protocol/`.
+- **[Redis Commands Reference](https://redis.io/docs/latest/commands/)** — command semantics Moon preserves. Any deviation is a bug.
+- **[Redis Cluster Specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)** — 16,384 hash slots, gossip protocol, `MOVED`/`ASK` redirections, epoch-based failover.
+- **[PSYNC2 Replication Protocol](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/)** — partial resynchronization. Moon's replication in `src/replication/` implements PSYNC2 so Redis replicas can peer with Moon primaries and vice versa.
+
+## Core runtime dependencies
+
+Each dependency was chosen for a specific, load-bearing reason. Swapping any of them would require measurable justification.
+
+| Crate | Purpose | Why chosen |
+|---|---|---|
+| **[monoio](https://github.com/bytedance/monoio)** | Thread-per-core async runtime | `io_uring` on Linux, `kqueue` on macOS. Production-proven at ByteDance. Lower per-op overhead than Tokio for request-response workloads. |
+| **[tokio](https://github.com/tokio-rs/tokio)** | Fallback async runtime | Broad ecosystem, cross-platform, CI-friendly. Used as portable alternative behind a feature flag. |
+| **[tikv-jemallocator](https://github.com/tikv/jemallocator)** | Memory allocator | Reduced fragmentation for long-running servers. Production-proven by TiKV. |
+| **[rustls](https://github.com/rustls/rustls)** | TLS implementation | Pure Rust, no OpenSSL dependency, async-native. |
+| **[aws-lc-rs](https://github.com/aws/aws-lc-rs)** | Cryptographic backend | FIPS-capable, high-performance AES-GCM and ChaCha20. |
+| **[mlua](https://github.com/mlua-rs/mlua)** | Lua 5.4 VM | Redis `EVAL`/`EVALSHA` compatibility via safe Rust bindings. |
+| **[memchr](https://github.com/BurntSushi/memchr)** | SIMD byte search | [~6.5× faster](https://github.com/BurntSushi/memchr#benchmarks) CRLF scanning than `std`. SSE2, AVX2, NEON dispatched at runtime. |
+| **[bumpalo](https://github.com/fitzgen/bumpalo)** | Bump allocation arenas | ~2 ns allocation, O(1) bulk deallocation per request. Used for per-request scratch buffers. |
+| **[bytes](https://github.com/tokio-rs/bytes)** | Zero-copy buffers | `Bytes::freeze()` for shared response data without copying; reference-counted slices for pipeline batches. |
+| **[xxhash-rust](https://github.com/DoumanAsh/xxhash-rust)** | Non-cryptographic hashing | Fast key hashing for DashTable segment routing. |
+| **[crossbeam-utils](https://github.com/crossbeam-rs/crossbeam)** | Concurrency primitives | `CachePadded<T>` for false-sharing prevention on hot atomics. |
+| **[ringbuf](https://github.com/agerasev/ringbuf)** | SPSC ring buffer | Lock-free cross-shard message passing. |
+| **[phf](https://github.com/rust-phf/rust-phf)** | Perfect hash map | Static command metadata registry; constant-time lookup for cold commands (hot commands use a direct match — see [dispatch hot-path recovery](/benchmarks#dispatch-hot-path-recovery)). |
+| **[ordered-float](https://github.com/reem/rust-ordered-float)** | Total-ordered floats | Sorted-set score keys. |
+| **[parking_lot](https://github.com/Amanieu/parking_lot)** | Non-poisoning locks | Faster, poisoning-free `RwLock`/`Mutex` for per-shard state. |
+
+## Benchmarking methodology
+
+Moon's benchmark numbers follow industry-standard practices. These are the references worth understanding before interpreting any results.
+
+- **[Redis vs Dragonfly Performance (Redis blog)](https://redis.io/blog/diving-into-dragonfly/)** — fair comparison methodology: same cores, cluster vs single-process, honest caveats.
+- **[memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark)** — industry-standard Redis benchmarking tool. Moon's benchmark scripts use `redis-benchmark` for parity with published Redis numbers, and `memtier_benchmark` for latency distribution analysis.
+- **[Coordinated Omission (Gil Tene)](https://www.scylladb.com/2021/04/22/on-coordinated-omission/)** — why closed-loop benchmarking lies about tail latency, and how to measure honestly.
+
+## License & attribution
+
+Moon is Apache 2.0 licensed. Each dependency carries its own license — see `Cargo.lock` and `cargo tree --format "{p} {l}"` for the full list. If you ship Moon in a product, comply with the combined license set. The maintainers recommend running `cargo about generate` to produce a `THIRD-PARTY.md` for your distribution.

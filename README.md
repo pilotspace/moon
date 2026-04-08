@@ -169,6 +169,20 @@ Moon is pre-1.0 and **experimental**. Current focus:
 
 Production readiness is **not** a v0.1 goal. Storage formats, APIs, and config flags may change between releases.
 
+## Credits
+
+Moon stands on the shoulders of systems research and an open-source ecosystem. Headline credits:
+
+- **[Dragonfly](https://github.com/dragonflydb/dragonfly)**, **[ScyllaDB/Seastar](https://github.com/scylladb/seastar)**, **[Garnet](https://github.com/microsoft/garnet)** — thread-per-core shared-nothing architecture.
+- **[Dash (VLDB 2020)](https://www.vldb.org/pvldb/vol13/p1147-lu.pdf)** — segmented hash table design behind `DashTable`.
+- **[Swiss Table / Abseil](https://abseil.io/about/design/swisstables)** — SIMD control-byte probing within each segment.
+- **[TurboQuant (arXiv 2411.04405)](https://arxiv.org/abs/2411.04405)** + **[HNSW (arXiv 1603.09320)](https://arxiv.org/abs/1603.09320)** — vector quantization and graph index for `FT.SEARCH`.
+- **[Monoio (ByteDance)](https://github.com/bytedance/monoio)** — thread-per-core `io_uring` runtime.
+- **[rustls](https://github.com/rustls/rustls)**, **[aws-lc-rs](https://github.com/aws/aws-lc-rs)**, **[mlua](https://github.com/mlua-rs/mlua)**, **[jemalloc (TiKV)](https://github.com/tikv/jemallocator)**, **[memchr](https://github.com/BurntSushi/memchr)**, **[bumpalo](https://github.com/fitzgen/bumpalo)**, **[bytes](https://github.com/tokio-rs/bytes)** — core runtime dependencies.
+- **[Redis Protocol Spec (RESP2/RESP3)](https://redis.io/docs/latest/develop/reference/protocol-spec/)** + **[Redis Cluster Spec](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)** — the wire protocol and cluster semantics Moon implements.
+
+Full list with per-dependency rationale, research paper summaries, and benchmarking methodology: **[docs/references.mdx](docs/references.mdx)**.
+
 ## License
 
 [Apache License 2.0](LICENSE)
