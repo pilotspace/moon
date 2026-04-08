@@ -151,10 +151,19 @@ impl WarmSearchSegment {
         handle: SegmentHandle,
         mlock_codes: bool,
     ) -> std::io::Result<Self> {
-        // Open and mmap codes.mpf (64KB pages)
+        // Open and mmap codes.mpf (64KB pages).
+        //
+        // The mmaps below live only for the duration of `open()` -- payload
+        // bytes are extracted into owned `Vec<u8>` (`codes_data`, `global_ids`)
+        // before this function returns, and the mmaps are dropped at scope
+        // exit. So the mmap-validity window is bounded by a single function
+        // call against an atomically-renamed sealed file. See
+        // `WarmSegmentFiles` for the long-lived-mmap variant and the full
+        // invariant chain it relies on.
         let codes_file = std::fs::File::open(segment_dir.join("codes.mpf"))?;
-        // SAFETY: File is a sealed immutable warm segment. SegmentHandle refcount
-        // prevents directory deletion while mapped. No concurrent writers exist.
+        // SAFETY: Sealed-after-rename file (see warm_tier::transition_to_warm),
+        // mmap dropped at end of this function. Caller's `handle` keeps the
+        // segment dir alive past the rename and across this open call.
         let codes_mmap = unsafe { memmap2::MmapOptions::new().map(&codes_file)? };
         codes_mmap.advise(memmap2::Advice::Sequential)?;
         if mlock_codes {
@@ -165,13 +174,13 @@ impl WarmSearchSegment {
 
         // Open and mmap graph.mpf (4KB pages)
         let graph_file = std::fs::File::open(segment_dir.join("graph.mpf"))?;
-        // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+        // SAFETY: Same invariants as codes above; mmap dropped at end of `open()`.
         let graph_mmap = unsafe { memmap2::MmapOptions::new().map(&graph_file)? };
         graph_mmap.advise(memmap2::Advice::Random)?;
 
         // Open and mmap mvcc.mpf (4KB pages)
         let mvcc_file = std::fs::File::open(segment_dir.join("mvcc.mpf"))?;
-        // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+        // SAFETY: Same invariants as codes above; mmap dropped at end of `open()`.
         let mvcc_mmap = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
         mvcc_mmap.advise(memmap2::Advice::Sequential)?;
         // Lock mvcc pages in RAM -- visibility checks run on every query (design S14).

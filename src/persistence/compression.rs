@@ -16,6 +16,12 @@
 /// even when the surrounding CRC32C is intact.
 pub const MAX_LZ4_DECOMPRESSED: usize = 96 * 1024;
 
+/// Hard upper bound on element counts decoded from any compressed stream
+/// (delta varint, Gorilla XOR, etc.). Caps adversarial headers that would
+/// otherwise size allocations to the entire input length. 16 Mi values is
+/// 4–5 orders of magnitude above any realistic per-page count.
+pub const MAX_DECOMPRESS_ELEMS: usize = 16 << 20;
+
 /// Decompress an `lz4_flex::compress_prepend_size` payload with an upper
 /// bound on the decoded size.
 ///
@@ -147,7 +153,16 @@ pub fn delta_decode_timestamps(data: &[u8]) -> Vec<u64> {
         data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
-    let mut result = Vec::with_capacity(count);
+    // Cap count against remaining bytes (each delta is at least 1 varint byte) to
+    // prevent huge allocations on corrupt headers. +1 accounts for the first value
+    // already in the buffer. Also enforce MAX_DECOMPRESS_ELEMS as a hard ceiling
+    // independent of input length.
+    let remaining = data.len() - 12;
+    let safe_count = count.min(remaining + 1).min(MAX_DECOMPRESS_ELEMS);
+    let mut result = Vec::new();
+    if result.try_reserve(safe_count).is_err() {
+        return Vec::new();
+    }
     result.push(first);
 
     if count == 1 {
@@ -331,7 +346,15 @@ pub fn gorilla_decode_f64(data: &[u8]) -> Vec<f64> {
         data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
-    let mut result = Vec::with_capacity(count);
+    // Cap count against remaining bit budget: each non-identical value needs at
+    // least 1 control bit, so remaining_bits + 1 is an upper bound on valid count.
+    // Also enforce MAX_DECOMPRESS_ELEMS as a hard ceiling.
+    let remaining_bits = (data.len() - 12) * 8;
+    let safe_count = count.min(remaining_bits + 1).min(MAX_DECOMPRESS_ELEMS);
+    let mut result = Vec::new();
+    if result.try_reserve(safe_count).is_err() {
+        return Vec::new();
+    }
     result.push(f64::from_bits(first_bits));
 
     if count == 1 {
@@ -357,6 +380,11 @@ pub fn gorilla_decode_f64(data: &[u8]) -> Vec<f64> {
             };
             // Stored as meaningful_bits - 1, so add 1 back
             let meaningful = (meaningful_raw as u8) + 1;
+            // Reject control bits that encode an impossible (leading,meaningful)
+            // pair instead of underflowing the trailing computation.
+            if (leading as u16) + (meaningful as u16) > 64 {
+                return Vec::new();
+            }
             let Some(meaningful_val) = reader.read_bits(meaningful) else {
                 break;
             };

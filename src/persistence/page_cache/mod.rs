@@ -458,11 +458,21 @@ impl PageCache {
 
     /// FPI-aware variant of `flush_dirty_pages`.
     ///
-    /// Before writing a dirty page, checks if FPI_PENDING is set. If so,
-    /// calls `fpi_fn` with the full page data to write a full-page image to
-    /// WAL (torn-page defense), then clears the FPI_PENDING flag.
+    /// For each dirty page:
+    ///   1. If FPI_PENDING: append full-page image via `fpi_fn`.
+    ///   2. Flush WAL durable up to `page_lsn` (covers both the data record
+    ///      AND the FPI record appended in step 1).
+    ///   3. Write the data page via `write_fn`.
+    ///   4. Only after `write_fn` succeeds: clear FPI_PENDING and DIRTY.
     ///
-    /// `fpi_fn` signature matches `write_fn`: (file_id, page_offset, is_large, data).
+    /// Crash-safety invariants:
+    /// - The buffer read-lock is held across FPI snapshot, WAL flush, and data
+    ///   write — concurrent writers cannot mutate the buffer between the FPI
+    ///   snapshot and the data page write, so the FPI on disk always matches
+    ///   the data page on disk.
+    /// - FPI_PENDING is cleared only after the data write succeeds. If WAL
+    ///   flush or data write fails the flag remains set, so the next flush
+    ///   attempt re-emits the FPI and torn-page protection is preserved.
     pub fn flush_dirty_pages_with_fpi(
         &self,
         max_pages: usize,
@@ -471,98 +481,97 @@ impl PageCache {
         write_fn: &mut impl FnMut(u64, u64, bool, &[u8]) -> std::io::Result<()>,
     ) -> usize {
         let mut flushed = 0;
-        // Scan 4KB frames
-        for (idx, frame) in self.frames_4k.iter().enumerate() {
-            if flushed >= max_pages {
-                break;
-            }
-            let val = frame.state.load();
-            let (_, _, flags) = FrameState::unpack(val);
-            if flags & FLAG_DIRTY != 0 && flags & frame::FLAG_VALID != 0 {
-                let file_id = frame.file_id.load(Ordering::Acquire);
-                let page_offset = frame.page_offset.load(Ordering::Acquire);
-                let page_lsn = frame.page_lsn.load(Ordering::Acquire);
-                if let Err(e) = wal_flush_fn(page_lsn) {
-                    tracing::error!("WAL flush for dirty page failed: {}", e);
-                    continue;
-                }
-                // FPI: write full-page image before page data if pending
-                if flags & FLAG_FPI_PENDING != 0 {
-                    let buf = self.buffers_4k[idx].read();
-                    if let Err(e) = fpi_fn(file_id, page_offset, false, &buf) {
-                        tracing::error!(
-                            "FPI write failed: file_id={}, offset={}: {}",
-                            file_id,
-                            page_offset,
-                            e
-                        );
-                        continue;
-                    }
-                    drop(buf);
-                    frame.state.clear_fpi_pending();
-                }
-                {
-                    let buf = self.buffers_4k[idx].read();
-                    if let Err(e) = write_fn(file_id, page_offset, false, &buf) {
-                        tracing::error!(
-                            "Dirty page write failed: file_id={}, offset={}: {}",
-                            file_id,
-                            page_offset,
-                            e
-                        );
-                        continue;
-                    }
-                }
-                frame.state.clear_dirty();
-                flushed += 1;
-            }
-        }
-        // Scan 64KB frames
-        for (idx, frame) in self.frames_64k.iter().enumerate() {
-            if flushed >= max_pages {
-                break;
-            }
-            let val = frame.state.load();
-            let (_, _, flags) = FrameState::unpack(val);
-            if flags & FLAG_DIRTY != 0 && flags & frame::FLAG_VALID != 0 {
-                let file_id = frame.file_id.load(Ordering::Acquire);
-                let page_offset = frame.page_offset.load(Ordering::Acquire);
-                let page_lsn = frame.page_lsn.load(Ordering::Acquire);
-                if let Err(e) = wal_flush_fn(page_lsn) {
-                    tracing::error!("WAL flush for dirty page failed: {}", e);
-                    continue;
-                }
-                if flags & FLAG_FPI_PENDING != 0 {
-                    let buf = self.buffers_64k[idx].read();
-                    if let Err(e) = fpi_fn(file_id, page_offset, true, &buf) {
-                        tracing::error!(
-                            "FPI write failed: file_id={}, offset={}: {}",
-                            file_id,
-                            page_offset,
-                            e
-                        );
-                        continue;
-                    }
-                    drop(buf);
-                    frame.state.clear_fpi_pending();
-                }
-                {
-                    let buf = self.buffers_64k[idx].read();
-                    if let Err(e) = write_fn(file_id, page_offset, true, &buf) {
-                        tracing::error!(
-                            "Dirty page write failed: file_id={}, offset={}: {}",
-                            file_id,
-                            page_offset,
-                            e
-                        );
-                        continue;
-                    }
-                }
-                frame.state.clear_dirty();
-                flushed += 1;
-            }
-        }
+        flush_pool_with_fpi(
+            &self.frames_4k,
+            &self.buffers_4k,
+            false,
+            max_pages,
+            &mut flushed,
+            wal_flush_fn,
+            fpi_fn,
+            write_fn,
+        );
+        flush_pool_with_fpi(
+            &self.frames_64k,
+            &self.buffers_64k,
+            true,
+            max_pages,
+            &mut flushed,
+            wal_flush_fn,
+            fpi_fn,
+            write_fn,
+        );
         flushed
+    }
+}
+
+/// Shared dirty-page flush loop for one frame pool (4K or 64K).
+///
+/// See `PageCache::flush_dirty_pages_with_fpi` for the crash-safety contract.
+/// Held under a read-lock from FPI snapshot through data write so the FPI
+/// image and the data page on disk are bytewise identical.
+#[allow(clippy::too_many_arguments)]
+fn flush_pool_with_fpi(
+    frames: &[FrameDescriptor],
+    buffers: &[RwLock<Vec<u8>>],
+    is_large: bool,
+    max_pages: usize,
+    flushed: &mut usize,
+    wal_flush_fn: &mut impl FnMut(u64) -> std::io::Result<()>,
+    fpi_fn: &mut impl FnMut(u64, u64, bool, &[u8]) -> std::io::Result<()>,
+    write_fn: &mut impl FnMut(u64, u64, bool, &[u8]) -> std::io::Result<()>,
+) {
+    for (idx, frame) in frames.iter().enumerate() {
+        if *flushed >= max_pages {
+            break;
+        }
+        let val = frame.state.load();
+        let (_, _, flags) = FrameState::unpack(val);
+        if flags & FLAG_DIRTY == 0 || flags & frame::FLAG_VALID == 0 {
+            continue;
+        }
+        let file_id = frame.file_id.load(Ordering::Acquire);
+        let page_offset = frame.page_offset.load(Ordering::Acquire);
+        let page_lsn = frame.page_lsn.load(Ordering::Acquire);
+        let needs_fpi = flags & FLAG_FPI_PENDING != 0;
+
+        // Hold read-lock across the entire FPI -> WAL flush -> data write
+        // sequence so the FPI snapshot and the data page on disk match.
+        let buf = buffers[idx].read();
+        if needs_fpi {
+            if let Err(e) = fpi_fn(file_id, page_offset, is_large, &buf) {
+                tracing::error!(
+                    "FPI write failed: file_id={}, offset={}: {}",
+                    file_id,
+                    page_offset,
+                    e
+                );
+                continue;
+            }
+        }
+        if let Err(e) = wal_flush_fn(page_lsn) {
+            tracing::error!("WAL flush for dirty page failed: {}", e);
+            continue;
+        }
+        if let Err(e) = write_fn(file_id, page_offset, is_large, &buf) {
+            tracing::error!(
+                "Dirty page write failed: file_id={}, offset={}: {}",
+                file_id,
+                page_offset,
+                e
+            );
+            continue;
+        }
+        drop(buf);
+
+        // Only clear FPI_PENDING after the data page is durably written. If
+        // any earlier step failed we `continue`d above, leaving FPI_PENDING
+        // set so the next flush attempt re-emits the FPI.
+        if needs_fpi {
+            frame.state.clear_fpi_pending();
+        }
+        frame.state.clear_dirty();
+        *flushed += 1;
     }
 }
 

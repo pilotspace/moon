@@ -330,8 +330,25 @@ pub fn write_undo_mpf(path: &Path, file_id: u64) -> std::io::Result<()> {
 
 /// Memory-mapped warm segment files for zero-copy access.
 ///
-/// Each file is a sequence of MoonPage-format pages. The `SegmentHandle`
-/// prevents the segment directory from being deleted while mmaps are active.
+/// # Safety invariants for the mmap fields
+///
+/// All four mmap fields rely on the following chain to be sound:
+///
+/// 1. **Sealed-after-rename**: warm segments are written into a `.staging`
+///    directory (`warm_tier::transition_to_warm`) and atomically renamed to
+///    their final path. After the rename, no code path opens the .mpf files
+///    for writing — they are read-only for the rest of the process lifetime.
+/// 2. **Refcount-protected directory**: `_handle` is an `Arc<SegmentLifetime>`
+///    clone. `SegmentLifetime::drop` calls `remove_dir_all` only when the
+///    refcount hits zero AND the segment is tombstoned. As long as this
+///    `WarmSegmentFiles` is alive, the directory cannot be unlinked.
+/// 3. **Drop order**: fields are listed mmaps-first, `_handle` last. Rust
+///    drops fields in declaration order, so the mmaps are munmapped *before*
+///    the handle's refcount decrement that could trigger directory removal.
+///    DO NOT reorder the fields.
+/// 4. **No cross-process sharing**: a second `moon` instance opening the same
+///    data directory would violate (1). This is a deployment misconfiguration,
+///    not a code bug — moon assumes exclusive ownership of its data dir.
 pub struct WarmSegmentFiles {
     /// Memory-mapped codes.mpf (VecCodes, 64KB pages).
     pub codes: memmap2::Mmap,
@@ -341,7 +358,8 @@ pub struct WarmSegmentFiles {
     pub vectors: Option<memmap2::Mmap>,
     /// Memory-mapped mvcc.mpf (VecMvcc, 4KB pages).
     pub mvcc: memmap2::Mmap,
-    /// Segment handle prevents deletion while mapped.
+    /// Segment handle prevents directory deletion while mapped. MUST be the
+    /// last field so it drops after the mmaps (see invariant 3 above).
     _handle: SegmentHandle,
 }
 
@@ -362,8 +380,9 @@ impl WarmSegmentFiles {
     ) -> std::io::Result<Self> {
         // codes.mpf
         let codes_file = std::fs::File::open(segment_dir.join("codes.mpf"))?;
-        // SAFETY: File is a sealed immutable segment. SegmentHandle refcount
-        // prevents directory deletion while mapped. No concurrent writers exist.
+        // SAFETY: Upholds invariants 1-4 documented on `WarmSegmentFiles`:
+        // sealed-after-rename, refcount-protected dir, drop order, exclusive
+        // process ownership of the data directory.
         let codes = unsafe { memmap2::MmapOptions::new().map(&codes_file)? };
         codes.advise(memmap2::Advice::Sequential)?;
         #[cfg(unix)]
@@ -373,20 +392,20 @@ impl WarmSegmentFiles {
 
         // graph.mpf
         let graph_file = std::fs::File::open(segment_dir.join("graph.mpf"))?;
-        // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+        // SAFETY: Same invariants as codes -- see `WarmSegmentFiles` doc comment.
         let graph = unsafe { memmap2::MmapOptions::new().map(&graph_file)? };
         graph.advise(memmap2::Advice::Random)?;
 
         // mvcc.mpf
         let mvcc_file = std::fs::File::open(segment_dir.join("mvcc.mpf"))?;
-        // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+        // SAFETY: Same invariants as codes -- see `WarmSegmentFiles` doc comment.
         let mvcc = unsafe { memmap2::MmapOptions::new().map(&mvcc_file)? };
         mvcc.advise(memmap2::Advice::Sequential)?;
 
         // vectors.mpf (optional)
         let vectors = match std::fs::File::open(segment_dir.join("vectors.mpf")) {
             Ok(vf) => {
-                // SAFETY: Same invariants as codes -- sealed, immutable, refcount-protected.
+                // SAFETY: Same invariants as codes -- see `WarmSegmentFiles` doc comment.
                 let v = unsafe { memmap2::MmapOptions::new().map(&vf)? };
                 v.advise(memmap2::Advice::Sequential)?;
                 Some(v)

@@ -93,7 +93,9 @@ impl AlignedBufPool {
         Some((idx, buf.as_mut_slice()))
     }
 
-    /// Return a buffer to the pool.
+    /// Return a buffer to the pool. Out-of-bounds indices are silently
+    /// ignored in release builds (asserted in debug) so a malformed CQE
+    /// `user_data` cannot panic the shard thread.
     #[inline]
     pub fn reclaim(&mut self, idx: u16) {
         debug_assert!(
@@ -101,6 +103,9 @@ impl AlignedBufPool {
             "reclaim index {idx} out of bounds (pool size {})",
             self.buffers.len(),
         );
+        if (idx as usize) >= self.buffers.len() {
+            return;
+        }
         self.free_list.push(idx);
     }
 

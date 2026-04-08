@@ -98,6 +98,8 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - Every `unsafe` block MUST have a `// SAFETY:` comment explaining the invariant.
 - Prefer safe abstractions. If unsafe is needed, isolate it in a dedicated module.
 - When modifying existing unsafe code, verify all SAFETY comments remain accurate.
+- Full policy, review checklist, approved patterns, and forbidden constructs:
+  see [`UNSAFE_POLICY.md`](UNSAFE_POLICY.md).
 
 ### Allocations on Hot Paths
 - No `Box::new()`, `Vec::new()`, `String::new()`, `Arc::new()`, `clone()`, `format!()`, or `to_string()` in:

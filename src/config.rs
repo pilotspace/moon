@@ -220,11 +220,17 @@ impl ServerConfig {
             num.trim()
                 .parse::<u64>()
                 .ok()
-                .map(|n| n * 1024 * 1024 * 1024)
+                .and_then(|n| n.checked_mul(1024 * 1024 * 1024))
         } else if let Some(num) = s.strip_suffix("mb") {
-            num.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024)
+            num.trim()
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| n.checked_mul(1024 * 1024))
         } else if let Some(num) = s.strip_suffix("kb") {
-            num.trim().parse::<u64>().ok().map(|n| n * 1024)
+            num.trim()
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| n.checked_mul(1024))
         } else {
             s.parse::<u64>().ok()
         }

@@ -182,11 +182,17 @@ impl ShardControlFile {
             )
         })?;
 
-        let last_checkpoint_lsn = u64::from_le_bytes(buf[p + 1..p + 9].try_into().unwrap());
-        let last_checkpoint_epoch = u64::from_le_bytes(buf[p + 9..p + 17].try_into().unwrap());
-        let wal_flush_lsn = u64::from_le_bytes(buf[p + 17..p + 25].try_into().unwrap());
-        let next_txn_id = u64::from_le_bytes(buf[p + 25..p + 33].try_into().unwrap());
-        let next_page_id = u64::from_le_bytes(buf[p + 33..p + 41].try_into().unwrap());
+        let read_u64 = |slice: &[u8]| -> std::io::Result<u64> {
+            let arr: [u8; 8] = slice.try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "control payload truncated")
+            })?;
+            Ok(u64::from_le_bytes(arr))
+        };
+        let last_checkpoint_lsn = read_u64(&buf[p + 1..p + 9])?;
+        let last_checkpoint_epoch = read_u64(&buf[p + 9..p + 17])?;
+        let wal_flush_lsn = read_u64(&buf[p + 17..p + 25])?;
+        let next_txn_id = read_u64(&buf[p + 25..p + 33])?;
+        let next_page_id = read_u64(&buf[p + 33..p + 41])?;
 
         let mut shard_uuid = [0u8; 16];
         shard_uuid.copy_from_slice(&buf[p + 41..p + 57]);

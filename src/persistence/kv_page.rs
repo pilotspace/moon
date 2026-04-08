@@ -380,12 +380,21 @@ impl KvLeafPage {
         &self.data
     }
 
-    /// Construct a page from raw bytes, validating the header.
+    /// Construct a page from raw bytes, validating the header and CRC32C
+    /// checksum.
     ///
-    /// Returns `None` if magic or page_type is invalid.
+    /// Returns `None` if magic, page_type, or checksum is invalid.
+    ///
+    /// Intended for the disk-load path only (page cache miss / cold read /
+    /// spill recovery). Callers must NOT invoke this on every access to a
+    /// cached page — `verify_checksum` is O(PAGE_4K) and would regress hot
+    /// reads. All current callers (`kv_spill`, `cold_read`) load from disk.
     pub fn from_bytes(data: [u8; PAGE_4K]) -> Option<Self> {
         let hdr = MoonPageHeader::read_from(&data)?;
         if hdr.page_type != PageType::KvLeaf {
+            return None;
+        }
+        if !MoonPageHeader::verify_checksum(&data) {
             return None;
         }
         Some(Self { data })
@@ -465,12 +474,19 @@ impl KvOverflowPage {
         &self.data
     }
 
-    /// Construct from raw bytes, validating the header.
+    /// Construct from raw bytes, validating the header and CRC32C checksum.
     ///
-    /// Returns `None` if magic or page_type is invalid.
+    /// Returns `None` if magic, page_type, or checksum is invalid.
+    ///
+    /// Disk-load path only — see `KvLeafPage::from_bytes` for the same
+    /// invariant. `verify_checksum` is O(PAGE_4K) and must not run on cached
+    /// pages.
     pub fn from_bytes(data: [u8; PAGE_4K]) -> Option<Self> {
         let hdr = MoonPageHeader::read_from(&data)?;
         if hdr.page_type != PageType::KvOverflow {
+            return None;
+        }
+        if !MoonPageHeader::verify_checksum(&data) {
             return None;
         }
         Some(Self { data })

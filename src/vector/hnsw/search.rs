@@ -328,6 +328,20 @@ pub fn hnsw_search_filtered(
     let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 bytes are norm)
     let _epc = entries_per_coord;
 
+    // Invariants relied on by the unsafe ADC LUT inner loops below. These are
+    // free in release builds and catch refactor bugs that would otherwise
+    // produce out-of-bounds reads on the LUT or sign array.
+    debug_assert_eq!(
+        code_len,
+        padded_dim / 2,
+        "code_len must equal padded_dim/2 for nibble-packed codes",
+    );
+    debug_assert_eq!(
+        adc_lut.len(),
+        padded_dim * entries_per_coord,
+        "adc_lut size mismatch — unsafe loop will read OOB",
+    );
+
     // LUT-based unbounded distance with optional sub-centroid scoring.
     // Hot path: processes `code_len` bytes (nibble-packed TQ codes) with LUT lookups.
     // For 384d: code_len ≈ 192, 384 nibble lookups per candidate, called ~500 times per query.

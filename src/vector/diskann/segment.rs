@@ -39,12 +39,13 @@ pub struct DiskAnnSegment {
     /// Dedicated io_uring ring for batch O_DIRECT reads (Linux only).
     /// `None` when O_DIRECT is unsupported (tmpfs, non-ext4/xfs) or on non-Linux.
     ///
-    /// Wrapped in `UnsafeCell` because `search()` takes `&self` (the segment
-    /// is behind `Arc` in the segment holder), but io_uring submission requires
-    /// `&mut`. This is safe because `DiskAnnSegment` is per-shard and accessed
-    /// from a single thread only (thread-per-core architecture).
+    /// Wrapped in `parking_lot::Mutex` so the type is genuinely `Send + Sync`
+    /// without resorting to `unsafe impl`. The submit/complete cycle is the
+    /// per-segment bottleneck (microseconds of disk I/O), so the lock cost is
+    /// in the noise. This also makes the code correct under both monoio
+    /// (thread-per-core) and tokio (multi-thread) runtimes.
     #[cfg(target_os = "linux")]
-    uring: std::cell::UnsafeCell<Option<super::uring_search::DiskAnnUring>>,
+    uring: parking_lot::Mutex<Option<super::uring_search::DiskAnnUring>>,
     /// Vector dimensionality.
     dim: usize,
     /// Number of vectors in this segment.
@@ -57,13 +58,8 @@ pub struct DiskAnnSegment {
     file_id: u64,
 }
 
-// SAFETY: `DiskAnnSegment` is per-shard and accessed from a single thread
-// (thread-per-core architecture). The `UnsafeCell<Option<DiskAnnUring>>` is
-// only mutated during `search_uring()` which runs on the owning shard thread.
-#[cfg(target_os = "linux")]
-unsafe impl Send for DiskAnnSegment {}
-#[cfg(target_os = "linux")]
-unsafe impl Sync for DiskAnnSegment {}
+// `DiskAnnSegment` is `Send + Sync` automatically: every field is either
+// owned data or `parking_lot::Mutex`. No `unsafe impl` needed.
 
 impl DiskAnnSegment {
     /// Create a new DiskAnnSegment from pre-built components.
@@ -115,7 +111,7 @@ impl DiskAnnSegment {
             #[cfg(unix)]
             vamana_file,
             #[cfg(target_os = "linux")]
-            uring: std::cell::UnsafeCell::new(uring),
+            uring: parking_lot::Mutex::new(uring),
             dim,
             num_vectors,
             entry_point,
@@ -182,7 +178,7 @@ impl DiskAnnSegment {
             #[cfg(unix)]
             vamana_file,
             #[cfg(target_os = "linux")]
-            uring: std::cell::UnsafeCell::new(uring),
+            uring: parking_lot::Mutex::new(uring),
             dim,
             num_vectors: num_vectors as u32,
             entry_point: 0,
@@ -207,10 +203,7 @@ impl DiskAnnSegment {
     ) -> SmallVec<[SearchResult; 32]> {
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: Single-threaded per-shard access. The UnsafeCell is only
-            // read here to check presence; mutation happens in search_uring.
-            let has_uring = unsafe { (*self.uring.get()).is_some() };
-            if has_uring {
+            if self.uring.lock().is_some() {
                 return self.search_uring(query, k, beam_width);
             }
         }
@@ -378,10 +371,10 @@ impl DiskAnnSegment {
             }
 
             // BATCH READ: submit all node reads via io_uring (BATCH-SQE-SUBMIT).
-            // SAFETY: Single-threaded per-shard access. We hold exclusive logical
-            // ownership of this segment on the shard thread.
-            let uring = unsafe { &mut *self.uring.get() };
-            let uring = match uring.as_mut() {
+            // The ring is owned by this segment; the lock is per-segment and
+            // serializes concurrent searches against the same ring.
+            let mut guard = self.uring.lock();
+            let uring = match guard.as_mut() {
                 Some(u) => u,
                 None => break, // io_uring not initialized -- caller should use search_pread
             };
@@ -498,23 +491,14 @@ impl DiskAnnSegment {
         self.file_id
     }
 
-    /// Access the io_uring ring for batch beam search (Linux only).
+    /// Whether the io_uring ring was successfully initialized for this segment.
     ///
-    /// Returns `None` if O_DIRECT was not available (e.g., tmpfs) or
-    /// io_uring setup failed. The pread fallback is always available.
-    /// Access the io_uring ring for batch beam search (Linux only).
-    ///
-    /// Returns `None` if O_DIRECT was not available (e.g., tmpfs) or
-    /// io_uring setup failed. The pread fallback is always available.
-    ///
-    /// # Safety
-    /// Caller must ensure single-threaded access (per-shard invariant).
+    /// Returns `false` if O_DIRECT was not available (e.g., tmpfs) or io_uring
+    /// setup failed. The pread fallback is always available regardless.
     #[cfg(target_os = "linux")]
     #[inline]
-    #[allow(clippy::mut_from_ref)] // SAFETY enforced by single-threaded per-shard invariant
-    pub fn uring(&self) -> Option<&mut super::uring_search::DiskAnnUring> {
-        // SAFETY: Single-threaded per-shard access (thread-per-core architecture).
-        unsafe { (*self.uring.get()).as_mut() }
+    pub fn has_uring(&self) -> bool {
+        self.uring.lock().is_some()
     }
 }
 
@@ -756,7 +740,7 @@ mod tests {
         );
 
         // If uring is None (tmpfs / O_DIRECT unsupported), skip gracefully.
-        if seg.uring().is_none() {
+        if !seg.has_uring() {
             eprintln!("SKIP: io_uring not available (O_DIRECT unsupported on this FS)");
             let _ = std::fs::remove_dir_all(&dir);
             return;
