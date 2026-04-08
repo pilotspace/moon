@@ -982,7 +982,19 @@ pub fn get_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 b"WRONGTYPE Operation against a key holding the wrong kind of value",
             )),
         },
-        None => Frame::Null,
+        None => {
+            // Cold storage fallback: key may have been evicted to NVMe
+            if let Some(value) = db.get_cold_value(key, now_ms) {
+                match value {
+                    crate::storage::entry::RedisValue::String(v) => Frame::BulkString(v),
+                    _ => Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )),
+                }
+            } else {
+                Frame::Null
+            }
+        }
     }
 }
 

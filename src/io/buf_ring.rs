@@ -76,12 +76,9 @@ impl BufRingManager {
         .user_data(0); // special: buffer registration
 
         unsafe {
-            ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "SQ full during buffer registration",
-                )
-            })?;
+            ring.submission()
+                .push(&entry)
+                .map_err(|_| std::io::Error::other("SQ full during buffer registration"))?;
         }
 
         ring.submit_and_wait(1)?;
@@ -132,9 +129,9 @@ impl BufRingManager {
         .user_data(0);
 
         unsafe {
-            ring.submission_shared().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full during buffer return")
-            })?;
+            ring.submission_shared()
+                .push(&entry)
+                .map_err(|_| std::io::Error::other("SQ full during buffer return"))?;
         }
 
         Ok(())

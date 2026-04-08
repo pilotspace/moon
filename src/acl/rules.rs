@@ -14,6 +14,15 @@ pub fn verify_password(provided: &str, stored_hash: &str) -> bool {
 }
 
 pub fn apply_rule(user: &mut AclUser, rule: &str) {
+    apply_rule_inner(user, rule);
+    // Any mutation that could affect the unrestricted fast-path flag
+    // must refresh the cached bool. Doing this once at the end of
+    // apply_rule covers every field (enabled, allowed_commands,
+    // key_patterns, channel_patterns) and every call site.
+    user.refresh_unrestricted_cache();
+}
+
+fn apply_rule_inner(user: &mut AclUser, rule: &str) {
     match rule {
         "on" => user.enabled = true,
         "off" => user.enabled = false,

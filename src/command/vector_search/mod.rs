@@ -288,7 +288,10 @@ pub fn ft_compact(store: &mut VectorStore, args: &[Frame]) -> Frame {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
-    idx.try_compact();
+    // FT.COMPACT is explicit user intent: compact unconditionally, ignoring threshold.
+    // Without this, when compact_threshold >= mutable_len, FT.COMPACT silently no-ops,
+    // leaving all vectors in brute-force mutable segment (O(n) search instead of HNSW O(log n)).
+    idx.force_compact();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -312,7 +315,12 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
 
     // Return flat array: [key, value, key, value, ...]
     let snap = idx.segments.load();
-    let num_docs = snap.mutable.len();
+    // Sum live counts across mutable + immutable segments.
+    // Previously this only counted the mutable segment, showing num_docs=0 after FT.COMPACT.
+    let mut num_docs = snap.mutable.len();
+    for imm in snap.immutable.iter() {
+        num_docs += imm.live_count() as usize;
+    }
 
     // Use itoa for numeric formatting — no format!() on hot path.
     let ef_rt_bytes: Bytes = if idx.meta.hnsw_ef_runtime > 0 {
@@ -505,7 +513,7 @@ pub fn search_local_filtered(
         filter_bitmap.as_ref(),
         &mvcc_ctx,
     );
-    build_search_response(&results)
+    build_search_response(&results, &idx.key_hash_to_key)
 }
 
 /// Parse "*=>[KNN <k> @<field> $<param>]" query string.
@@ -571,8 +579,15 @@ fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
 }
 
 /// Build FT.SEARCH response array.
-/// Format: [num_results, "vec:0", ["__vec_score", "0.5"], "vec:1", ["__vec_score", "0.8"], ...]
-fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
+/// Format: [num_results, "doc:0", ["__vec_score", "0.5"], "doc:1", ["__vec_score", "0.8"], ...]
+///
+/// Looks up the original Redis key via `key_hash_to_key` map (populated at insert time
+/// in `auto_index_hset`). Falls back to `vec:<internal_id>` only if the mapping is missing
+/// (e.g., legacy data restored from a snapshot without the key map).
+fn build_search_response(
+    results: &SmallVec<[SearchResult; 32]>,
+    key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+) -> Frame {
     let total = results.len() as i64;
     // NOTE: Vec/format! usage here is acceptable -- this is response building at end
     // of command path, not hot-path dispatch.
@@ -580,13 +595,27 @@ fn build_search_response(results: &SmallVec<[SearchResult; 32]>) -> Frame {
     items.push(Frame::Integer(total));
 
     for r in results {
-        // Document ID as "vec:<internal_id>"
-        let mut doc_id_buf = itoa::Buffer::new();
-        let id_str = doc_id_buf.format(r.id.0);
-        let mut doc_id = Vec::with_capacity(4 + id_str.len());
-        doc_id.extend_from_slice(b"vec:");
-        doc_id.extend_from_slice(id_str.as_bytes());
-        items.push(Frame::BulkString(Bytes::from(doc_id)));
+        // Try to resolve original Redis key from key_hash; fallback to vec:<id>
+        let doc_id = if r.key_hash != 0 {
+            if let Some(orig_key) = key_hash_to_key.get(&r.key_hash) {
+                orig_key.clone()
+            } else {
+                let mut buf = itoa::Buffer::new();
+                let id_str = buf.format(r.id.0);
+                let mut v = Vec::with_capacity(4 + id_str.len());
+                v.extend_from_slice(b"vec:");
+                v.extend_from_slice(id_str.as_bytes());
+                Bytes::from(v)
+            }
+        } else {
+            let mut buf = itoa::Buffer::new();
+            let id_str = buf.format(r.id.0);
+            let mut v = Vec::with_capacity(4 + id_str.len());
+            v.extend_from_slice(b"vec:");
+            v.extend_from_slice(id_str.as_bytes());
+            Bytes::from(v)
+        };
+        items.push(Frame::BulkString(doc_id));
 
         // Score as nested array — use write! to pre-allocated buffer
         let mut score_buf = String::with_capacity(16);

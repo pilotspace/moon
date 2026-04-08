@@ -277,6 +277,10 @@ pub struct Database {
     /// Set once at database creation time and never changed, ensuring
     /// TTL deltas remain stable across the database lifetime.
     base_timestamp: u32,
+    /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
+    pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
+    /// Shard directory for cold reads (None when disk-offload disabled).
+    pub cold_shard_dir: Option<std::path::PathBuf>,
 }
 
 impl Database {
@@ -288,6 +292,8 @@ impl Database {
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
+            cold_index: None,
+            cold_shard_dir: None,
         }
     }
 
@@ -358,8 +364,33 @@ impl Database {
                 .saturating_sub(entry_overhead(key, &removed));
             return None;
         }
-        // Return immutable ref (same slot, fast re-probe)
-        self.data.get(key)
+        // Hot path: DashTable lookup
+        if self.data.get(key).is_some() {
+            return self.data.get(key);
+        }
+        // Cold fallback: read from disk DataFile via cold_read helper.
+        // Extract owned result first to drop immutable borrows before mutation.
+        let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
+            self.cold_index.as_ref().and_then(|ci| {
+                crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)
+            })
+        });
+        if let Some((redis_value, ttl_ms)) = cold_result {
+            let key_bytes = Bytes::copy_from_slice(key);
+            // Build an entry from the RedisValue (works for strings and collections)
+            let mut entry = Entry::new_string(Bytes::new()); // placeholder
+            entry.value =
+                crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
+            if let Some(ttl) = ttl_ms {
+                entry.set_expires_at_ms(self.base_timestamp, ttl);
+            }
+            self.set(key_bytes, entry);
+            if let Some(ref mut ci) = self.cold_index {
+                ci.remove(key);
+            }
+            return self.data.get(key);
+        }
+        None
     }
 
     /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.
@@ -995,6 +1026,44 @@ impl Database {
             return None;
         }
         Some(entry)
+    }
+
+    /// Read-only cold storage lookup for evicted keys.
+    ///
+    /// When `get_if_alive` returns None, call this to check if the key was
+    /// spilled to disk by the eviction path. Returns the value as owned Bytes
+    /// (read from disk file). Does NOT promote the entry back to RAM.
+    ///
+    /// WARNING: this method performs synchronous disk I/O. Callers on the
+    /// hot path must release any shard read/write guard *before* invoking it.
+    /// Use [`Self::cold_lookup_location`] under the guard, then drop the guard,
+    /// then call [`crate::storage::tiered::cold_read::read_cold_entry_at`].
+    pub fn get_cold_value(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Option<crate::storage::entry::RedisValue> {
+        let shard_dir = self.cold_shard_dir.as_ref()?;
+        let ci = self.cold_index.as_ref()?;
+        let (value, _ttl) =
+            crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)?;
+        Some(value)
+    }
+
+    /// Cheap, in-memory cold-index lookup. Returns the disk location plus a
+    /// cloned shard dir path so the caller can drop the shard guard before
+    /// performing the disk read.
+    pub fn cold_lookup_location(
+        &self,
+        key: &[u8],
+    ) -> Option<(
+        crate::storage::tiered::cold_index::ColdLocation,
+        std::path::PathBuf,
+    )> {
+        let shard_dir = self.cold_shard_dir.as_ref()?;
+        let ci = self.cold_index.as_ref()?;
+        let location = ci.lookup(key)?;
+        Some((location, shard_dir.clone()))
     }
 
     /// Read-only existence check: returns false if expired.

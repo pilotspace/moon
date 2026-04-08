@@ -228,6 +228,7 @@ fn recall_1k_768d_ef128() {
 }
 
 #[test]
+#[ignore = "slow: 10K x 768d recall benchmark — run with --ignored"]
 fn recall_10k_768d_ef128() {
     distance::init();
     let recall = measure_recall(10_000, 768, 50, 128, 10);
@@ -236,6 +237,7 @@ fn recall_10k_768d_ef128() {
 }
 
 #[test]
+#[ignore = "slow: 10K x 768d ef=256 recall benchmark — run with --ignored"]
 fn recall_10k_768d_ef256() {
     distance::init();
     let recall = measure_recall(10_000, 768, 50, 256, 10);
@@ -248,6 +250,7 @@ fn recall_10k_768d_ef256() {
 /// This validates VEC-FIX-01: recall@10 >= 0.95 at 10K/128d ef=200 against
 /// true L2 ground truth. The f32 path is what ImmutableSegment.search uses.
 #[test]
+#[ignore = "slow: 10K x 128d f32 HNSW recall benchmark — run with --ignored"]
 fn recall_f32_hnsw_10k_128d_ef200() {
     use moon::vector::hnsw::search_sq::hnsw_search_f32;
 

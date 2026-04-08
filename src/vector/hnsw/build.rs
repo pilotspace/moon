@@ -761,7 +761,7 @@ mod tests {
                 s = s.wrapping_mul(1664525).wrapping_add(1013904223);
                 let u1 = (s as f32) / (u32::MAX as f32);
                 s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-                let u2 = (s as f32) / (u32::MAX as f32);
+                let _u2 = (s as f32) / (u32::MAX as f32);
                 // Approximate normal: use simple linear transform of uniform
                 let normal = (u1 - 0.5) * 2.0 * 0.1; // stddev ~ 0.1
                 v.push(center[d] + normal);

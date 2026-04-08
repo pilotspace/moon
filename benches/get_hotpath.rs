@@ -24,10 +24,13 @@ fn bench_get_hotpath(c: &mut Criterion) {
     let missing_key = Bytes::from("key:missing_nope");
 
     // Build a GET command frame
-    let get_frame = Frame::Array(vec![
-        Frame::BulkString(Bytes::from_static(b"GET")),
-        Frame::BulkString(lookup_key.clone()),
-    ]);
+    let get_frame = Frame::Array(
+        vec![
+            Frame::BulkString(Bytes::from_static(b"GET")),
+            Frame::BulkString(lookup_key.clone()),
+        ]
+        .into(),
+    );
 
     // Pre-serialize the GET command into wire format
     let mut wire = bytes::BytesMut::with_capacity(64);
@@ -162,13 +165,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
         })
     });
 
-    // ─── Stage 10: is_write_command check ───
-    c.bench_function("10_is_write_command_get", |b| {
-        b.iter(|| {
-            let result = moon::persistence::aof::is_write_command(black_box(b"GET"));
-            black_box(result);
-        })
-    });
+    // ─── Stage 10: is_write_command check (removed; function deleted) ───
 
     // ─── Stage 11: xxhash key routing ───
     c.bench_function("11_xxhash_key_route", |b| {

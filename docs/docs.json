@@ -52,7 +52,7 @@
           },
           {
             "group": "Reference",
-            "pages": ["configuration", "benchmarks"]
+            "pages": ["configuration", "benchmarks", "references"]
           }
         ]
       }

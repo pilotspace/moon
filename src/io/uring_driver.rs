@@ -40,12 +40,14 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 struct ConnState {
     /// Fixed FD index in the registered table.
     fixed_fd_idx: u32,
-    /// Raw file descriptor (kept for future diagnostic/close use).
+    /// Raw file descriptor (kept for diagnostic use; graceful shutdown retrieves from fd_table).
     _raw_fd: RawFd,
     /// Accumulation buffer for partial RESP frames spanning multiple recvs.
     read_buf: BytesMut,
     /// Whether this connection has an active multishot recv.
     recv_active: bool,
+    /// Monotonic tick counter at last recv activity (for idle reaping).
+    last_recv_tick: u64,
 }
 
 /// Default number of pre-registered send buffers per shard.
@@ -64,6 +66,12 @@ pub struct UringConfig {
     pub buf_ring: BufRingConfig,
     /// Number of pre-registered send buffers. Default: 256 (= 2MB per shard).
     pub send_buf_pool_size: u16,
+    /// Enable SQPOLL mode with the given idle timeout in milliseconds.
+    ///
+    /// When set, the kernel spins a dedicated SQ poll thread that submits SQEs
+    /// without requiring `io_uring_enter()` syscalls, reducing submission latency.
+    /// Requires `CAP_SYS_NICE` or root; falls back gracefully on EPERM.
+    pub sqpoll_idle_ms: Option<u32>,
 }
 
 impl Default for UringConfig {
@@ -73,6 +81,7 @@ impl Default for UringConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             buf_ring: BufRingConfig::default(),
             send_buf_pool_size: DEFAULT_SEND_BUF_POOL_SIZE,
+            sqpoll_idle_ms: None,
         }
     }
 }
@@ -188,9 +197,12 @@ impl SendBufPool {
 
 /// Per-shard io_uring driver.
 ///
-/// Owns one io_uring instance with `SINGLE_ISSUER` + `DEFER_TASKRUN` + `COOP_TASKRUN`.
+/// Owns one io_uring instance with `SINGLE_ISSUER` + `COOP_TASKRUN`.
 /// Manages connection lifecycle via multishot accept/recv, registered FDs,
 /// provided buffer ring, and batched SQE submission.
+///
+/// An eventfd is registered with the io_uring instance so that the tokio
+/// event loop can be woken up instantly when CQEs arrive (no polling needed).
 ///
 /// # Thread Safety
 ///
@@ -206,6 +218,11 @@ pub struct UringDriver {
     config: UringConfig,
     /// Number of SQEs queued in current batch (not yet submitted).
     pending_sqes: usize,
+    /// Monotonic tick counter (incremented each drain_completions call).
+    tick: u64,
+    /// Eventfd registered with io_uring for CQE notifications.
+    /// When CQEs arrive, the kernel writes to this fd, waking tokio's epoll.
+    cqe_eventfd: RawFd,
 }
 
 impl UringDriver {
@@ -214,15 +231,56 @@ impl UringDriver {
     /// MUST be called from the shard thread that will own this driver
     /// (`SINGLE_ISSUER` flag requires single-thread access).
     pub fn new(config: UringConfig) -> std::io::Result<Self> {
-        let ring = IoUring::builder()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
-            .setup_coop_taskrun()
-            .build(config.ring_size)?;
+        let ring = if let Some(ms) = config.sqpoll_idle_ms {
+            // SQPOLL: kernel thread polls SQ, avoiding io_uring_enter() per submit.
+            // Note: SQPOLL is incompatible with DEFER_TASKRUN (kernel thread != issuer),
+            // so we only set SINGLE_ISSUER + COOP_TASKRUN + SQPOLL here.
+            match IoUring::builder()
+                .setup_single_issuer()
+                .setup_coop_taskrun()
+                .setup_sqpoll(ms)
+                .build(config.ring_size)
+            {
+                Ok(ring) => {
+                    tracing::info!("io_uring SQPOLL enabled (idle {}ms)", ms);
+                    ring
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                    // EPERM: insufficient privileges for SQPOLL. Fall back to
+                    // standard mode without SQPOLL (requires CAP_SYS_NICE or root).
+                    tracing::warn!(
+                        "io_uring SQPOLL failed (EPERM, need CAP_SYS_NICE), falling back to standard mode"
+                    );
+                    IoUring::builder()
+                        .setup_single_issuer()
+                        .setup_coop_taskrun()
+                        .build(config.ring_size)?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // SINGLE_ISSUER + COOP_TASKRUN: kernel processes task-work during
+            // io_uring_enter() rather than via signals (which tokio masks).
+            // Without COOP_TASKRUN, default mode uses TIF_NOTIFY_SIGNAL which
+            // is masked by tokio's runtime — CQEs are never generated.
+            //
+            // DEFER_TASKRUN is NOT used because it requires GETEVENTS flag on
+            // every enter(), which the io-uring crate skips when want=0.
+            IoUring::builder()
+                .setup_single_issuer()
+                .setup_coop_taskrun()
+                .build(config.ring_size)?
+        };
 
         let fd_table = FdTable::new(config.max_connections);
         let buf_ring = BufRingManager::new(config.buf_ring.clone());
         let send_buf_pool = SendBufPool::new(config.send_buf_pool_size, DEFAULT_SEND_BUF_SIZE);
+
+        // SAFETY: EFD_NONBLOCK | EFD_CLOEXEC are valid flags for eventfd.
+        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if efd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
 
         Ok(Self {
             ring,
@@ -233,6 +291,8 @@ impl UringDriver {
             next_conn_id: 0,
             config,
             pending_sqes: 0,
+            tick: 0,
+            cqe_eventfd: efd,
         })
     }
 
@@ -252,12 +312,47 @@ impl UringDriver {
             }
         }
 
+        // Register eventfd for CQE notifications. The kernel writes to this fd
+        // when completions arrive, allowing tokio's epoll to wake up instantly
+        // instead of waiting for the next timer tick.
+        self.ring.submitter().register_eventfd(self.cqe_eventfd)?;
+
         Ok(())
+    }
+
+    /// Returns the raw fd of the CQE notification eventfd.
+    ///
+    /// The event loop should wrap this in `tokio::io::unix::AsyncFd` and
+    /// poll it in the `select!` macro to get instant CQE wakeups.
+    pub fn cqe_eventfd(&self) -> RawFd {
+        self.cqe_eventfd
     }
 
     // -----------------------------------------------------------------------
     // SQE submission methods
     // -----------------------------------------------------------------------
+
+    /// Push an SQE to the submission queue and sync the tail pointer.
+    ///
+    /// The io-uring crate's `SubmissionQueue::push()` writes to a local tail
+    /// but does NOT flush it to the kernel-shared tail pointer. Without calling
+    /// `sync()`, `submit()` sees `sq_len() == 0` and skips the syscall.
+    fn push_sqe(&mut self, entry: &io_uring::squeue::Entry) -> std::io::Result<()> {
+        {
+            let mut sq = self.ring.submission();
+            // SAFETY: `entry` is a borrow that outlives this call, `sq` is
+            // freshly obtained from the owned ring, and io_uring's `push`
+            // copies the SQE bytes into the kernel-shared ring at call time —
+            // it does not retain the reference past the push.
+            unsafe {
+                sq.push(entry)
+                    .map_err(|_| std::io::Error::other("SQ full"))?;
+            }
+            sq.sync();
+        }
+        self.pending_sqes += 1;
+        Ok(())
+    }
 
     /// Submit multishot accept on a listener socket fd.
     ///
@@ -267,13 +362,7 @@ impl UringDriver {
         let entry = opcode::AcceptMulti::new(types::Fd(listener_fd))
             .build()
             .user_data(encode_user_data(EVENT_ACCEPT, 0, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit accept")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -308,6 +397,7 @@ impl UringDriver {
                 _raw_fd: raw_fd,
                 read_buf: BytesMut::with_capacity(0), // allocated on-demand for partial frames
                 recv_active: false,
+                last_recv_tick: 0,
             },
         );
 
@@ -323,13 +413,7 @@ impl UringDriver {
             .build()
             .user_data(encode_user_data(EVENT_RECV, conn_id, 0))
             .flags(Flags::BUFFER_SELECT);
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit recv")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
 
         if let Some(conn) = self.connections.get_mut(&conn_id) {
             conn.recv_active = true;
@@ -356,13 +440,7 @@ impl UringDriver {
         let entry = opcode::Writev::new(types::Fixed(conn.fixed_fd_idx), iovecs, iovec_count)
             .build()
             .user_data(encode_user_data(EVENT_SEND, conn_id, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit writev")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -375,13 +453,7 @@ impl UringDriver {
         let entry = opcode::Send::new(types::Fixed(conn.fixed_fd_idx), data, len)
             .build()
             .user_data(encode_user_data(EVENT_SEND, conn_id, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit send")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -408,16 +480,7 @@ impl UringDriver {
         let entry = opcode::WriteFixed::new(types::Fixed(conn.fixed_fd_idx), ptr, len, buf_idx)
             .build()
             .user_data(encode_user_data(EVENT_SEND, conn_id, buf_idx as u32));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "SQ full: cannot submit send_fixed",
-                )
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -451,13 +514,7 @@ impl UringDriver {
         let entry = opcode::Timeout::new(&ts as *const _)
             .build()
             .user_data(encode_user_data(EVENT_TIMEOUT, 0, 0));
-
-        unsafe {
-            self.ring.submission().push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "SQ full: cannot submit timeout")
-            })?;
-        }
-        self.pending_sqes += 1;
+        self.push_sqe(&entry)?;
         Ok(())
     }
 
@@ -484,12 +541,44 @@ impl UringDriver {
     ///
     /// Used in the hybrid Tokio+io_uring path where the shard event loop
     /// polls io_uring completions on a timer rather than blocking.
+    /// Drain the CQE eventfd counter (must be called after being woken by eventfd).
+    /// Returns true if the eventfd had a non-zero value (CQEs were signaled).
+    pub fn drain_eventfd(&self) -> bool {
+        let mut buf = [0u8; 8];
+        // SAFETY: cqe_eventfd is a valid eventfd with EFD_NONBLOCK.
+        let n = unsafe { libc::read(self.cqe_eventfd, buf.as_mut_ptr().cast(), 8) };
+        n == 8
+    }
+
     pub fn submit_and_wait_nonblocking(&mut self) -> std::io::Result<usize> {
-        if self.pending_sqes == 0 {
-            return Ok(0);
+        // Two-step approach for COOP_TASKRUN:
+        // 1. Submit pending SQEs (syncs SQ ring tail)
+        // 2. Call enter(GETEVENTS) to trigger cooperative task-work processing
+        //
+        // The io-uring crate's submit_and_wait(0) skips GETEVENTS when want=0,
+        // so we must call enter() directly. With COOP_TASKRUN, GETEVENTS causes
+        // the kernel to process deferred task-work and generate CQEs.
+        let n = if self.pending_sqes > 0 {
+            // Only clear the counter if submit() succeeds — otherwise the SQEs
+            // are still queued and a subsequent flush must retry them.
+            let n = self.ring.submit()?;
+            self.pending_sqes = 0;
+            n
+        } else {
+            0
+        };
+        // SAFETY: IORING_ENTER_GETEVENTS=1. min_complete=0 means nonblocking.
+        // With COOP_TASKRUN, this flushes task-work (multishot accept/recv CQEs).
+        match unsafe {
+            self.ring
+                .submitter()
+                .enter::<libc::sigset_t>(0, 0, 1, /* IORING_ENTER_GETEVENTS */ None)
+        } {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => return Err(e),
         }
-        let n = self.ring.submit()?;
-        self.pending_sqes = 0;
         Ok(n)
     }
 
@@ -499,6 +588,8 @@ impl UringDriver {
     /// Buffer lifecycle: recv data is copied from the provided buffer before
     /// the buffer is returned to the ring (per pitfall 1 in research).
     pub fn drain_completions(&mut self) -> Vec<IoEvent> {
+        self.tick += 1;
+        let current_tick = self.tick;
         let mut events = Vec::new();
 
         // Collect CQEs first to release the mutable borrow on self.ring,
@@ -542,9 +633,19 @@ impl UringDriver {
                         // Return buffer immediately since data is copied
                         let _ = self.buf_ring.return_buf(&self.ring, buf_id);
 
+                        // Stamp connection activity for idle reaping
+                        if let Some(conn) = self.connections.get_mut(&conn_id) {
+                            conn.last_recv_tick = current_tick;
+                        }
+
                         events.push(IoEvent::Recv { conn_id, data });
 
-                        // Check if multishot recv was cancelled (MORE flag absent)
+                        // Check if multishot recv ended (MORE flag absent).
+                        // MORE=0 can mean: buffer ring exhaustion, kernel cancellation,
+                        // OR client FIN. We cannot distinguish these reliably at CQE
+                        // time when result>0 (there IS data). Rearm recv — if the
+                        // client truly closed, the rearmed recv will produce result=0
+                        // which triggers Disconnect via the branch below.
                         if !cqueue::more(flags) {
                             if let Some(conn) = self.connections.get_mut(&conn_id) {
                                 conn.recv_active = false;
@@ -552,7 +653,7 @@ impl UringDriver {
                             events.push(IoEvent::RecvNeedsRearm { conn_id });
                         }
                     } else if result == 0 {
-                        // Connection closed by peer
+                        // Connection closed by peer (explicit 0-byte recv)
                         events.push(IoEvent::Disconnect { conn_id });
                     } else {
                         // Error on recv
@@ -606,6 +707,71 @@ impl UringDriver {
         Ok(())
     }
 
+    /// Gracefully close a connection: shutdown(SHUT_WR) to send FIN, then close.
+    ///
+    /// Called when recv returns 0 (client half-close). The shutdown(SHUT_WR)
+    /// sends a TCP FIN to the peer, which redis-benchmark 8.x needs to
+    /// detect completion. Without this, close() on a fd with pending state
+    /// may send RST instead.
+    pub fn shutdown_and_close_connection(&mut self, conn_id: u32) -> std::io::Result<()> {
+        if let Some(conn) = self.connections.remove(&conn_id) {
+            let raw_fd = self
+                .fd_table
+                .remove_and_register(conn.fixed_fd_idx, &self.ring)?;
+
+            // Send FIN to peer via shutdown(SHUT_WR).
+            // Ignore ENOTCONN -- peer may have already fully closed.
+            // SAFETY: raw_fd is a valid open socket fd obtained from fd_table.remove_and_register.
+            unsafe {
+                let ret = libc::shutdown(raw_fd, libc::SHUT_WR);
+                if ret < 0 {
+                    let errno = *libc::__errno_location();
+                    if errno != libc::ENOTCONN {
+                        tracing::debug!(
+                            "shutdown(SHUT_WR) for conn {} fd {}: {}",
+                            conn_id,
+                            raw_fd,
+                            std::io::Error::from_raw_os_error(errno)
+                        );
+                    }
+                }
+            }
+
+            // SAFETY: raw_fd is a valid open fd; we have exclusive ownership after removing from fd_table.
+            unsafe {
+                libc::close(raw_fd);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reap connections idle for more than `max_idle_ticks` drain_completions cycles.
+    ///
+    /// Returns conn_ids that were reaped. Called periodically from the event loop
+    /// (e.g. every 5 seconds) to clean up CLOSE_WAIT connections where the client
+    /// closed but the multishot recv didn't produce a 0-byte CQE.
+    pub fn reap_idle_connections(&mut self, max_idle_ticks: u64) -> Vec<u32> {
+        let current = self.tick;
+        let idle_ids: Vec<u32> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| {
+                // Reap any connection idle past max_idle_ticks regardless of
+                // recv_active. CLOSE_WAIT sockets stay with recv_active=true
+                // (multishot recv armed, never receives 0-byte CQE) and would
+                // otherwise leak forever.
+                let idle = current.saturating_sub(c.last_recv_tick);
+                idle > max_idle_ticks
+            })
+            .map(|(&id, _)| id)
+            .collect();
+
+        for &conn_id in &idle_ids {
+            let _ = self.shutdown_and_close_connection(conn_id);
+        }
+        idle_ids
+    }
+
     /// Get mutable reference to a connection's read buffer (for partial frame accumulation).
     pub fn conn_read_buf(&mut self, conn_id: u32) -> Option<&mut BytesMut> {
         self.connections.get_mut(&conn_id).map(|c| &mut c.read_buf)
@@ -644,6 +810,15 @@ impl UringDriver {
     /// Reference to the buffer ring manager.
     pub fn buf_ring(&self) -> &BufRingManager {
         &self.buf_ring
+    }
+}
+
+impl Drop for UringDriver {
+    fn drop(&mut self) {
+        // SAFETY: cqe_eventfd is a valid fd created by eventfd().
+        unsafe {
+            libc::close(self.cqe_eventfd);
+        }
     }
 }
 

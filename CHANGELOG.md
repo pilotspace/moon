@@ -5,6 +5,214 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Dispatch Hot-Path Recovery (2026-04-08)
+
+**Pipelined SET +37%, pipelined GET +68% at p=16 after PR #43 regression recovery.**
+
+Three targeted perf fixes landed after flamegraph-driven analysis of pipelined
+SET on aarch64 (OrbStack moon-dev, 1 shard, default config, redis-benchmark
+-c 50 -n 3M -P 16 -r 100000 -d 64):
+
+| Metric                  | Broken baseline | After T0a+T0b+T0c | Δ      |
+|-------------------------|----------------:|------------------:|-------:|
+| SET p=1   (ratio Redis) | 0.99x           | **1.12x**         | +13pp  |
+| SET p=16                | 1.42M/s         | **1.94M/s**       | +37%   |
+| SET p=32                | 2.06M/s         | **2.26M/s**       | +10%   |
+| GET p=16                | 2.40M/s         | **4.04M/s**       | +68%   |
+| GET p=128 vs Redis      | 1.87x           | **1.91x**         | +4pp   |
+
+### Perf fixes
+
+- **T0a — Thread-local cached clock** (4041b0d). `Entry::new_*` constructors
+  were calling `SystemTime::now()` / `clock_gettime` on every write, showing up
+  at **10.14% of CPU** in the perf profile. Added a thread-local `Cell<u32>` /
+  `Cell<u64>` refreshed once per shard tick (~1 ms) from `CachedClock::update()`.
+  `current_secs` / `current_time_ms` now read the Cell and fall back to the
+  syscall only on tests / cold init. `__kernel_clock_gettime` dropped from
+  10.14% → **0%** of CPU.
+
+- **T0b — Hot command dispatch bypasses phf SipHasher** (4b0eec3). The command
+  metadata registry is a `phf::Map` keyed by `&'static str` using `SipHasher` —
+  cryptographic overkill for a 173-entry ASCII table. Combined `phf::Map::get`
+  + `SipHasher::write` + `hash_one` was **~6% of CPU**. Added a direct match
+  path in `command::metadata::lookup`: pack the first ≤8 bytes of the command
+  name as a `u64` with ASCII letters uppercased, match against 24 hand-picked
+  hot commands (GET/SET/DEL/TTL/MGET/MSET/INCR/DECR/HSET/HGET/HDEL/HLEN/LPOP/
+  RPOP/LLEN/PING/LPUSH/RPUSH/EXPIRE/EXISTS/INCRBY/DECRBY/SELECT/HGETALL).
+  Hot-path resolves through a pre-resolved `LazyLock<[&'static CommandMeta; 24]>`
+  — single array index, no hashing. Cold commands fall through to phf unchanged.
+  Correctness asserted by `hot_path_matches_phf_map` test: every hot entry must
+  return the same `&'static` pointer as a direct phf probe, in both upper and
+  lowercase.
+
+- **T0c — ACL unrestricted-user short-circuit** (4603511). Every command
+  executed `check_command_permission` + `check_key_permission` even for the
+  default `on nopass ~* &* +@all` user, burning **2.11% of CPU** on
+  lowercasing, `extract_command_keys`, and glob matching. Added a cached
+  `unrestricted: bool` field to `AclUser`, true iff the user is enabled, has
+  `AllAllowed` commands, only `~*` read/write key patterns, and only `*`
+  channel patterns. The three `check_*_permission` methods early-return `None`
+  on `unrestricted` before any allocation or iteration. The cache is
+  recomputed once at the end of `apply_rule` (the single mutation entry point
+  used by ACL SETUSER / LOAD / reset). Correctness covered by three new tests
+  (`default_user_is_unrestricted`, `restrictions_clear_unrestricted_flag`,
+  `unrestricted_user_passes_all_checks`).
+
+### Correctness fix (PR #43 review)
+
+- **Inline monoio fast-path restricted to GET** (613c164). The previous inline
+  dispatch in `try_inline_dispatch` handled both GET and SET directly against
+  the DashTable, bypassing replica READONLY enforcement, ACL checks, maxmemory
+  eviction, client-side tracking invalidation, keyspace notifications,
+  replication propagation, and blocking-waiter wakeups. Under any of those
+  configurations the inlined SET would silently diverge from the normal path —
+  accepted writes on replicas, ACL-denied clients writing, maxmemory overshoot,
+  stale client-side caches. Fix: inline only handles `*2\r\n$3\r\nGET` now;
+  SET and everything else fall through to the full dispatcher where all
+  side-effects run.
+
+### Cold-tier lock hygiene (PR #43 review)
+
+- **Release shard read guard before cold-tier disk read** (ff51135). The
+  cold-tier fallback in `server::conn::blocking` previously called
+  `get_cold_value()` — which does a synchronous `std::fs::read()` — while still
+  holding the per-shard read guard, blocking all concurrent operations on that
+  shard during disk I/O. Split the path: `Database::cold_lookup_location`
+  returns the `(ColdLocation, PathBuf)` under the lock, the guard is dropped,
+  and `cold_read::read_cold_entry_at` performs the disk read unlocked.
+
+### Additional PR #43 fixes
+
+- `read_overflow_chain` now bounded at 1000 iterations (cycle guard against
+  corrupted `next_page` links)
+- `recovery.rs` FPI replay replaces `.unwrap()` on `try_into()` with explicit
+  byte-array construction (coding-guidelines compliance)
+- `bench-production.sh`: fixed unsupported `-t zrangebyscore` (→ `zpopmin`),
+  MSET rps parser for `"MSET (10 keys):"` output, heredoc `$(date)` expansion,
+  and Redis RSS probe (`pgrep`/`/proc` instead of missing `lsof`)
+- `bench-cold-tier.sh`: removed stray `&` backgrounding `FT.CREATE`
+- `test-recovery-all-cases.sh`: `NoPersistence` case now PASSes at 0 keys
+- `benches/resp_parsing.rs`, `benches/get_hotpath.rs`: wrap `Vec<Frame>` in
+  `FrameVec` via `.into()` after frame.rs type change
+
+All 1872 unit tests pass under `--no-default-features --features
+runtime-tokio,jemalloc`. Follow-up work (T1 `dispatch_raw` zero-alloc entry
+point, Tier 2 storage/DashTable optimization, residual ACL SipHash elimination)
+captured as todo in `.planning/todos/pending/`.
+
+---
+
+## [Unreleased] - Vector Search 4x QPS + Correctness
+
+### Vector Search Performance & Correctness (2026-04-07)
+
+**4x search QPS, 4.1x lower latency, 2.56x faster than Qdrant on real MiniLM data.**
+
+#### Performance (perf-profiled on GCloud c3-standard-8, Intel Xeon 8481C)
+- 8-wide ILP unrolled `dist_bfs_budgeted` subcent path (the real hot loop, 90% of
+  search time per perf profile). Loads 4 code bytes + 1 sign byte per iteration,
+  8 independent f32 accumulators. Confirmed via objdump: parallel `vaddss` into
+  xmm3-xmm8 (vs serial single-xmm0 chain before).
+- 4-way unrolled `dist_bfs` non-subcent path with `unsafe` pointer arithmetic
+- Pre-allocated ADC LUT in `SearchScratch` (eliminates 32-65KB heap alloc per query)
+- Hoisted IVF `q_rotated` and `lut_buf` allocation out of per-segment loop
+
+#### Correctness fixes
+- **`FT.COMPACT` silent no-op**: split `try_compact` (threshold-gated) from
+  `force_compact` (unconditional). Previously `FT.COMPACT` returned OK without
+  compacting when `compact_threshold >= mutable_len`, leaving all vectors in
+  brute-force O(n) mutable segment.
+- **`key_hash_to_key` mapping restored** (lost in earlier refactor). `FT.SEARCH`
+  now returns original Redis keys (`doc:N`) instead of `vec:<internal_id>`.
+  Carried through `SearchResult.key_hash` and populated by `remap_to_global_ids`.
+- **`FT.INFO num_docs`** now sums mutable + immutable segments (was 0 after compact)
+- **Vector index recovery** metadata loads without `--disk-offload` flag
+  (was gated behind `server_config.disk_offload_enabled()`)
+
+#### Real MiniLM benchmarks (10K vectors, 384d, x86 Xeon 8481C)
+
+| Metric | Mar 31 (M4 Pro) | Apr 7 (Xeon 8481C) | Δ |
+|--------|---:|---:|---:|
+| Recall@10 | 0.9250 | **0.9670** | +4.5% |
+| QPS | 1,126 | **1,296** | +15% |
+| p50 | 0.878 ms | **0.783 ms** | -11% |
+
+| | Moon | Qdrant 1.12 FP32 | Ratio |
+|---|---:|---:|---:|
+| QPS (10K MiniLM) | 1,296 | 507 | **2.56x** |
+| p50 | 0.783 ms | 1.79 ms | **2.29x lower** |
+| Recall@10 | 0.967 | ~0.95 | **+1.7%** |
+
+#### Infrastructure (for future segment merge work)
+- `ImmutableSegment::decode_vector` / `iter_live_decoded`
+- `MutableSegment::iter_live`
+
+#### Attempted and reverted
+Segment merge on `FT.COMPACT` via TQ4 decode → re-encode. Dropped recall from
+0.73 → 0.0005 due to accumulated quantization error across 14 segments. Proper
+fix requires retaining f32/f16 vectors alongside TQ codes in immutable segments.
+
+#### Known limitation
+TQ4 quantization at 384d with random Gaussian inputs hits ~0.73 recall floor
+(curse of dimensionality — all points nearly equidistant). Real semantic
+embeddings (clustered) achieve 0.92-0.97 recall with the same code.
+
+---
+
+## [Earlier Unreleased] - Disk Offload & x86_64 Performance
+
+Tiered storage, crash recovery, and 2x Redis on x86_64 (Intel Xeon, io_uring).
+
+### Added
+
+#### Disk Offload (Tiered Storage)
+- `--disk-offload enable` — evicted keys under maxmemory are spilled to NVMe instead of being deleted
+- Async SpillThread: background pwrite via dedicated `std::thread` per shard (no event loop blocking)
+- Cold read-through: GET transparently reads spilled keys from NVMe DataFiles
+- ColdIndex: in-memory key→file mapping, updated immediately on eviction for consistent reads
+- SpillThread channel capacity: 4096 bounded flume channel for burst absorption
+- `--disk-offload-dir`, `--disk-offload-threshold` configuration flags
+
+#### Crash Recovery
+- V3 recovery falls back to appendonly.aof when WAL v3 has 0 commands
+- V2 recovery falls back to appendonly.aof when shard WAL has 0 commands
+- Automatic `--dir` creation before AOF writer starts (fixes silent write failure)
+- Cold index rebuilt from manifest during v3 recovery
+- Verified: 100% recovery (5000/5000 keys) across 7 persistence configurations after SIGKILL
+
+#### Inline GET Optimization
+- `read_db` + `get_if_alive` replaces `write_db` + triple-lookup `get()` — single DashTable probe
+- Removed unnecessary write lock for timestamp refresh before inline dispatch
+- Multi-shard inline dispatch: local keys bypass Frame construction via `key_to_shard()` check
+- Cold storage fallback in `get_readonly` and inline GET dispatch paths
+
+### Changed
+
+- Connection handler eviction uses `try_evict_if_needed_async_spill` when disk offload enabled
+- `spawn_monoio_connection` passes spill sender, file ID counter, and offload dir to handlers
+- Event loop syncs `next_file_id` between `Rc<Cell<u64>>` (handlers) and local variable (timer tick)
+- Inline dispatch `try_inline_dispatch` takes `now_ms` and `num_shards` parameters
+
+### Fixed
+
+- **Data loss under maxmemory**: evicted keys were silently deleted instead of spilled to disk (6 bugs)
+- **Crash recovery = 0 keys**: appendonly.aof never tried as fallback source
+- **AOF writer silent failure**: `--dir` directory not created before AOF writer task started
+- **Cold read miss**: `get_if_alive` (read path) didn't check cold storage; `get_readonly` returned NULL for spilled keys
+- **ColdIndex never initialized**: `cold_index` and `cold_shard_dir` were None on all databases at startup
+
+### Performance (GCP c3-standard-8, Intel Xeon 8481C, CPU-pinned)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| c=1 p=1 GET vs Redis | 0.35x (47K) | **1.0x (47K)** — parity |
+| c=10 p=64 GET | 2.29M | **4.71M** (2.06x Redis) |
+| c=50 p=64 GET | 2.36M | **4.81M** (2.04x Redis) |
+| Disk offload GET overhead | N/A | **<1%** vs no-persist |
+| Recovery (SIGKILL) | 0/5000 | **5000/5000** (100%) |
+
+---
+
 ## [0.1.2] - 2026-03-29
 
 Multi-shard scaling milestone. Eliminated negative scaling, achieving 5M GET/s and 2.5M SET/s at 4 shards — both exceeding Redis 8.6.1.

@@ -46,6 +46,23 @@ async fn start_server() -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        disk_offload: "disable".to_string(),
+        disk_offload_dir: None,
+        disk_offload_threshold: 0.85,
+        segment_warm_after: 3600,
+        pagecache_size: None,
+        checkpoint_timeout: 300,
+        checkpoint_completion: 0.9,
+        max_wal_size: "256mb".to_string(),
+        wal_fpi: "enable".to_string(),
+        wal_compression: "lz4".to_string(),
+        wal_segment_size: "16mb".to_string(),
+        vec_codes_mlock: "enable".to_string(),
+        segment_cold_after: 86400,
+        segment_cold_min_qps: 0.1,
+        vec_diskann_beam_width: 8,
+        vec_diskann_cache_levels: 3,
+        uring_sqpoll_ms: None,
     };
 
     tokio::spawn(async move {

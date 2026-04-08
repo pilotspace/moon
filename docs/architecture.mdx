@@ -99,6 +99,56 @@ Monoio's thread-per-core model avoids work-stealing overhead. On Linux, io_uring
 | Zero-copy argument slicing | Eliminates parse buffer copies | RESP parser |
 | Direct GET serialization | Bypasses Frame allocation | Response path |
 
+## Vector search engine
+
+Moon ships an in-process vector search engine accessed via Redis-compatible
+`FT.CREATE` / `FT.SEARCH` commands. It uses **TurboQuant 4-bit quantization**
+to compress f32 vectors to ~4 bits per dimension while preserving rank-order
+similarity.
+
+### Tiered segment architecture
+
+| Segment | Backing | Search algorithm | Use case |
+|---------|---------|------------------|----------|
+| **Mutable** | RAM, append-only | Brute-force TQ-ADC | Active inserts |
+| **Immutable** | RAM, frozen | HNSW + TQ-ADC | Hot data, post-compact |
+| **Warm** | mmap'd .mpf files | HNSW + TQ-ADC | Aged-out data |
+| **Cold** | DiskANN | Vamana + PQ | Massive datasets |
+
+`HSET key field <f32_blob>` automatically encodes + indexes vectors. When the
+mutable segment hits `COMPACT_THRESHOLD`, the next `FT.SEARCH` triggers
+asynchronous compaction into a frozen HNSW immutable segment. Explicit
+`FT.COMPACT` forces unconditional compaction (e.g., end of bulk load).
+
+### TurboQuant 4-bit ADC
+
+The search hot path uses **Asymmetric Distance Computation** (ADC) with a
+per-query lookup table:
+
+1. Query vector is FWHT-rotated and normalized once per query
+2. A 16-entry LUT (or 32-entry with sub-centroid signs) is built per coordinate
+3. HNSW beam search computes per-candidate distance via 192 nibble-indexed
+   LUT lookups (for 384d) instead of 384 f32 multiply-adds
+4. Distance kernel is **8-way ILP unrolled** with `unsafe` pointer arithmetic
+   and 8 independent f32 accumulators (verified via objdump: 8 parallel
+   `vaddss` into xmm3-xmm8 on x86)
+
+The LUT is pre-allocated in `SearchScratch` (zero alloc per query). Sub-centroid
+sign bits provide 2× quantization resolution at zero memory cost in the search
+path.
+
+### Performance vs Qdrant (10K MiniLM, 384d, real semantic embeddings)
+
+| | Moon ARM64 | Moon x86 | Qdrant FP32 x86 |
+|---|---:|---:|---:|
+| Recall@10 | 0.967 | 0.967 | ~0.95 |
+| Search QPS | 843 | **1,296** | 507 |
+| Search p50 | 1.20 ms | **0.78 ms** | 1.79 ms |
+| Insert | 9,950 v/s | 11,270 v/s | ~2,600 v/s |
+
+Moon beats Qdrant on QPS (2.56×), latency (2.3× lower), recall (+1.7%),
+insert throughput (4.3×), and memory (~20% less per vector via TQ4).
+
 ## Design inspirations
 
 - [Dragonfly](https://github.com/dragonflydb/dragonfly) — shared-nothing thread-per-core architecture (C++)

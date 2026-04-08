@@ -14,8 +14,11 @@ use tracing::info;
 
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
+use crate::persistence::control::ShardControlFile;
+use crate::persistence::page_cache::PageCache;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
+use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
@@ -77,6 +80,12 @@ impl super::Shard {
     ) {
         let _shard_id = self.id;
 
+        // Publish disk-offload status for INFO moonstore (set once per shard, idempotent).
+        crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED.store(
+            server_config.disk_offload_enabled(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
@@ -84,7 +93,10 @@ impl super::Shard {
                 info!("Shard {} io_uring disabled via MOON_NO_URING", self.id);
                 None
             } else {
-                match UringDriver::new(UringConfig::default()) {
+                match UringDriver::new(UringConfig {
+                    sqpoll_idle_ms: server_config.uring_sqpoll_ms,
+                    ..UringConfig::default()
+                }) {
                     Ok(mut d) => match d.init() {
                         Ok(()) => {
                             info!("Shard {} started (io_uring mode)", self.id);
@@ -118,6 +130,8 @@ impl super::Shard {
                                 e
                             );
                         } else {
+                            // Flush the accept SQE to the kernel immediately.
+                            let _ = d.submit_and_wait_nonblocking();
                             info!(
                                 "Shard {}: multishot accept armed on fd {}",
                                 self.id, listener_fd
@@ -135,6 +149,56 @@ impl super::Shard {
                 }
             }
         }
+
+        // Wrap io_uring's CQE eventfd in tokio AsyncFd for select! integration.
+        // When io_uring has completions, the kernel signals this eventfd, which
+        // wakes tokio's epoll and fires the select! branch — instant CQE processing
+        // with zero polling overhead.
+        //
+        // We dup() the eventfd so AsyncFd can take ownership without conflicting
+        // with io_uring's registered eventfd (which must stay open).
+        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+        let uring_cqe_fd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> = {
+            if let Some(ref d) = uring_state {
+                use std::os::fd::{FromRawFd, OwnedFd};
+                // SAFETY: dup() creates a new fd referencing the same eventfd.
+                // OwnedFd takes ownership and will close the dup'd fd on drop.
+                let dup_fd = unsafe { libc::dup(d.cqe_eventfd()) };
+                if dup_fd >= 0 {
+                    let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                    match tokio::io::unix::AsyncFd::with_interest(
+                        owned,
+                        tokio::io::Interest::READABLE,
+                    ) {
+                        Ok(afd) => {
+                            tracing::info!(
+                                "Shard {}: io_uring eventfd registered with tokio (fd={})",
+                                self.id,
+                                dup_fd
+                            );
+                            Some(afd)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: AsyncFd for io_uring eventfd failed: {}",
+                                self.id,
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Shard {}: dup(eventfd) failed: {}",
+                        self.id,
+                        std::io::Error::last_os_error()
+                    );
+                    None
+                }
+            } else {
+                None
+            }
+        };
 
         // Track per-connection parse state for io_uring path (Linux + tokio only).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -237,15 +301,12 @@ impl super::Shard {
         }
 
         #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
-        {
-            if per_shard_monoio_listener.is_none() {
-                info!("Shard {} started (monoio, conn_rx fallback)", self.id);
-            }
+        if per_shard_monoio_listener.is_none() {
+            info!("Shard {} started (monoio, conn_rx fallback)", self.id);
         }
 
         let dispatch_tx = Rc::new(RefCell::new(producers));
-        // Use pre-shared Arc<RwLock<PubSubRegistry>> for this shard.
-        // Initialize with shard's restored registry data (from persistence/snapshot).
+        // Use pre-shared Arc<RwLock<PubSubRegistry>> seeded from snapshot.
         let pubsub_arc = all_pubsub_registries[self.id].clone();
         {
             let mut reg = pubsub_arc.write();
@@ -257,7 +318,7 @@ impl super::Shard {
         let remote_sub_map_arc = all_remote_sub_maps[self.id].clone();
         let num_shards = self.num_shards;
 
-        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA to save ~1.5MB/shard.
+        // Lazy per-shard Lua VM: deferred until first EVAL/EVALSHA.
         let lua_rc: Rc<RefCell<Option<Rc<mlua::Lua>>>> = Rc::new(RefCell::new(None));
         let script_cache_rc = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
 
@@ -270,28 +331,202 @@ impl super::Shard {
             .read()
             .map(|cfg| cfg.appendonly != "no")
             .unwrap_or(false);
-        let mut wal_writer: Option<WalWriter> = if let Some(ref dir) = persistence_dir {
-            if appendonly_enabled {
-                match WalWriter::new(shard_id, std::path::Path::new(dir)) {
-                    Ok(w) => {
-                        info!("Shard {}: WAL writer initialized", shard_id);
-                        Some(w)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
-                        None
-                    }
+        let mut wal_writer: Option<WalWriter> = match (&persistence_dir, appendonly_enabled) {
+            (Some(dir), true) => match WalWriter::new(shard_id, std::path::Path::new(dir)) {
+                Ok(w) => {
+                    info!("Shard {}: WAL writer initialized", shard_id);
+                    Some(w)
                 }
-            } else {
-                info!(
-                    "Shard {}: WAL skipped (appendonly disabled, snapshot-only persistence)",
-                    shard_id
-                );
+                Err(e) => {
+                    tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
+                    None
+                }
+            },
+            (Some(_), false) => {
+                info!("Shard {}: WAL skipped (appendonly=no)", shard_id);
                 None
+            }
+            (None, _) => None,
+        };
+
+        // Disk-offload base directory (None when disk-offload is disabled).
+        let disk_offload_base: Option<std::path::PathBuf> = server_config
+            .disk_offload_enabled()
+            .then(|| server_config.effective_disk_offload_dir());
+
+        // Per-shard WAL v3 writer (created only when disk-offload is enabled).
+        // Provides per-record LSN tracking and FPI support for checkpoint-based recovery.
+        // WAL v2 remains active for non-disk-offload mode; both writers can coexist.
+        let mut wal_v3_writer: Option<WalWriterV3> = if server_config.disk_offload_enabled() {
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            let wal_dir = shard_dir.join("wal-v3");
+            match WalWriterV3::new(shard_id, &wal_dir, server_config.wal_segment_size_bytes()) {
+                Ok(w) => {
+                    info!(
+                        "Shard {}: WAL v3 writer initialized (segment_size={})",
+                        shard_id,
+                        server_config.wal_segment_size_bytes()
+                    );
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::warn!("Shard {}: WAL v3 init failed: {}", shard_id, e);
+                    None
+                }
             }
         } else {
             None
         };
+
+        // Per-shard WAL append channel for local writes.
+        // Connection handlers send serialized write commands here; we drain on the 1ms tick.
+        let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<bytes::Bytes>(4096);
+        if appendonly_enabled || server_config.disk_offload_enabled() {
+            shard_databases.set_wal_append_tx(shard_id, wal_append_tx);
+        }
+
+        // Per-shard PageCache (None when disk-offload is disabled).
+        // Manages 4KB + 64KB page frames with clock-sweep eviction.
+        let page_cache: Option<PageCache> = if server_config.disk_offload_enabled() {
+            // Default: pagecache_size_bytes returns configured size or maxmemory/4.
+            // Split: 75% for 4KB frames, 25% for 64KB frames.
+            let budget = server_config.pagecache_size_bytes(server_config.maxmemory as u64);
+            let num_4k = ((budget * 3 / 4) / 4096) as usize;
+            let num_64k = ((budget / 4) / 65536) as usize;
+            let num_4k = num_4k.max(64); // minimum 64 frames
+            let num_64k = num_64k.max(8); // minimum 8 frames
+            info!(
+                "Shard {}: PageCache initialized ({} x 4KB + {} x 64KB frames, budget={})",
+                shard_id, num_4k, num_64k, budget
+            );
+            Some(PageCache::new(num_4k, num_64k))
+        } else {
+            None
+        };
+
+        // Per-shard control file (disk-offload path).
+        let mut control_file: Option<ShardControlFile> = if server_config.disk_offload_enabled() {
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            let ctrl_path = ShardControlFile::control_path(&shard_dir, shard_id);
+            if ctrl_path.exists() {
+                match ShardControlFile::read(&ctrl_path) {
+                    Ok(cf) => Some(cf),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Shard {}: control file read failed: {}, creating new",
+                            shard_id,
+                            e
+                        );
+                        Some(ShardControlFile::new([0u8; 16]))
+                    }
+                }
+            } else {
+                Some(ShardControlFile::new([0u8; 16]))
+            }
+        } else {
+            None
+        };
+        let control_file_path: Option<std::path::PathBuf> = if server_config.disk_offload_enabled()
+        {
+            let shard_dir = server_config
+                .effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id));
+            Some(ShardControlFile::control_path(&shard_dir, shard_id))
+        } else {
+            None
+        };
+
+        // Track WAL bytes since last checkpoint for trigger logic.
+        let mut wal_bytes_since_checkpoint: u64 = 0;
+
+        // Flag: BGSAVE snapshot completed, request a forced checkpoint on next tick.
+        let mut bgsave_checkpoint_requested = false;
+
+        // Per-shard checkpoint manager (None when disk-offload is disabled).
+        // When enabled, drives the fuzzy checkpoint protocol: begin(redo_lsn) ->
+        // advance_tick(flush pages) -> finalize(WAL record + manifest + control).
+        // Wired to PageCache, WalWriterV3, ShardManifest, and ShardControlFile below.
+        let mut checkpoint_manager: Option<crate::persistence::checkpoint::CheckpointManager> =
+            if server_config.disk_offload_enabled() {
+                let trigger = crate::persistence::checkpoint::CheckpointTrigger::new(
+                    server_config.checkpoint_timeout,
+                    server_config.max_wal_size_bytes(),
+                    server_config.checkpoint_completion,
+                );
+                info!(
+                    "Shard {}: checkpoint manager initialized (timeout={}s, max_wal={})",
+                    shard_id,
+                    server_config.checkpoint_timeout,
+                    server_config.max_wal_size_bytes()
+                );
+                Some(crate::persistence::checkpoint::CheckpointManager::new(
+                    trigger,
+                ))
+            } else {
+                None
+            };
+
+        // Per-shard manifest for tracking segment files and checkpoint state.
+        // Used by both checkpoint protocol (handle_checkpoint_tick) and warm
+        // tier transitions (check_warm_transitions).
+        let mut shard_manifest: Option<crate::persistence::manifest::ShardManifest> =
+            if server_config.disk_offload_enabled() {
+                let shard_dir = server_config
+                    .effective_disk_offload_dir()
+                    .join(format!("shard-{}", shard_id));
+                std::fs::create_dir_all(&shard_dir).ok();
+                let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
+                if manifest_path.exists() {
+                    match crate::persistence::manifest::ShardManifest::open(&manifest_path) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!("Shard {}: shard manifest open failed: {}", shard_id, e);
+                            None
+                        }
+                    }
+                } else {
+                    match crate::persistence::manifest::ShardManifest::create(&manifest_path) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: shard manifest create failed: {}",
+                                shard_id,
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+        // Per-shard background spill thread for async eviction pwrite.
+        // When disk-offload is enabled, evicted KV entries are written to disk
+        // on a background std::thread instead of blocking the event loop.
+        let mut spill_thread: Option<crate::storage::tiered::spill_thread::SpillThread> =
+            if server_config.disk_offload_enabled() {
+                let st = crate::storage::tiered::spill_thread::SpillThread::new(shard_id);
+                info!("Shard {}: spill background thread initialized", shard_id);
+                Some(st)
+            } else {
+                None
+            };
+
+        // Shared spill file ID counter for connection handlers + event loop.
+        // Rc<Cell<u64>> is safe: monoio is single-threaded per shard.
+        let spill_sender: Option<
+            flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>,
+        > = spill_thread.as_ref().map(|st| st.sender());
+        let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> =
+            std::rc::Rc::new(std::cell::Cell::new(1));
+        let mut next_file_id: u64 = 1;
+        let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
+        // Tokio path doesn't take these into the spawn signatures; suppress warnings.
+        let (_, _, _) = (&spill_sender, &spill_file_id, &disk_offload_dir);
 
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
@@ -306,6 +541,19 @@ impl super::Shard {
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
         let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
+        // Warm check interval adapts to segment_warm_after for fast testing:
+        // default 10s, but if warm_after < 10s, poll at warm_after frequency.
+        let warm_poll_ms =
+            (server_config.segment_warm_after * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
+        let mut warm_check_interval = TimerImpl::interval(Duration::from_millis(warm_poll_ms));
+        // Cold tier transition check: poll at min(60s, segment_cold_after) so the
+        // timer fires within one cold-age window (default 60s; short for testing).
+        let cold_poll_secs = if server_config.segment_cold_after > 0 {
+            server_config.segment_cold_after.min(60)
+        } else {
+            60
+        };
+        let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
         let spsc_notify_local = spsc_notify;
 
         // Per-shard cached clock: updated once per 1ms tick.
@@ -328,6 +576,123 @@ impl super::Shard {
             crate::vector::store::VectorStore::new(),
         );
 
+        // Restore vector index metadata from sidecar file.
+        // Set persist_dir so FT.CREATE/FT.DROPINDEX saves metadata for future recovery.
+        // Try disk-offload dir first (higher priority), then main persistence dir.
+        {
+            let vector_persist_dir = if server_config.disk_offload_enabled() {
+                Some(
+                    server_config
+                        .effective_disk_offload_dir()
+                        .join(format!("shard-{}", shard_id)),
+                )
+            } else {
+                persistence_dir.as_ref().map(|d| {
+                    std::path::PathBuf::from(d).join(format!("shard-{}-vectors", shard_id))
+                })
+            };
+
+            if let Some(ref vdir) = vector_persist_dir {
+                let _ = std::fs::create_dir_all(vdir);
+                let mut vs = shard_databases.vector_store(shard_id);
+                vs.set_persist_dir(vdir.clone());
+                drop(vs);
+            }
+
+            // Try loading saved index metadata from the vector persist dir.
+            let metas = vector_persist_dir.as_ref().and_then(|vdir| {
+                match crate::vector::index_persist::load_index_metadata(vdir) {
+                    Ok(m) if !m.is_empty() => Some(m),
+                    _ => None,
+                }
+            });
+
+            if let Some(metas) = metas {
+                let mut vs = shard_databases.vector_store(shard_id);
+                info!(
+                    "Shard {}: restoring {} vector index(es) from sidecar",
+                    shard_id,
+                    metas.len()
+                );
+                for meta in &metas {
+                    if let Err(e) = vs.create_index(meta.clone()) {
+                        tracing::warn!(
+                            "Shard {}: failed to restore index '{}': {}",
+                            shard_id,
+                            String::from_utf8_lossy(&meta.name),
+                            e
+                        );
+                    }
+                }
+                drop(vs); // release VectorStore lock before scanning databases
+
+                // Auto-reindex existing HASH keys that match index prefixes.
+                let db_count = shard_databases.db_count();
+                let mut reindexed = 0usize;
+                for db_idx in 0..db_count {
+                    let guard = shard_databases.read_db(shard_id, db_idx);
+                    let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
+                    for (key, entry) in guard.data().iter() {
+                        let key_bytes = key.as_bytes();
+                        let matches_prefix = metas
+                            .iter()
+                            .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)));
+                        if !matches_prefix {
+                            continue;
+                        }
+                        let mut args = Vec::new();
+                        args.push(crate::protocol::Frame::BulkString(
+                            bytes::Bytes::copy_from_slice(key_bytes),
+                        ));
+                        match entry.as_redis_value() {
+                            crate::storage::compact_value::RedisValueRef::Hash(map) => {
+                                for (field, value) in map.iter() {
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::copy_from_slice(field),
+                                    ));
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::copy_from_slice(value),
+                                    ));
+                                }
+                            }
+                            crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
+                                let entries: Vec<_> = lp.iter().collect();
+                                let mut j = 0;
+                                while j + 1 < entries.len() {
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(entries[j].as_bytes()),
+                                    ));
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(entries[j + 1].as_bytes()),
+                                    ));
+                                    j += 2;
+                                }
+                            }
+                            _ => continue,
+                        }
+                        if args.len() > 1 {
+                            matching.push((key_bytes.to_vec(), args));
+                        }
+                    }
+                    drop(guard);
+
+                    if !matching.is_empty() {
+                        let mut vs = shard_databases.vector_store(shard_id);
+                        for (key, args) in &matching {
+                            crate::shard::spsc_handler::auto_index_hset_public(&mut vs, key, args);
+                            reindexed += 1;
+                        }
+                    }
+                }
+                if reindexed > 0 {
+                    info!(
+                        "Shard {}: auto-reindexed {} HASH key(s) into restored vector indexes",
+                        shard_id, reindexed
+                    );
+                }
+            }
+        }
+
         // Pending wakers for monoio cross-shard write dispatch.
         // monoio's !Send single-threaded executor doesn't see cross-thread Waker::wake()
         // from flume oneshot channels. Connection tasks register their waker here; the
@@ -338,6 +703,37 @@ impl super::Shard {
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
+                // io_uring CQE notification: eventfd becomes readable when completions arrive.
+                // This wakes tokio's epoll instantly — no polling, no timer latency.
+                // Processes ALL pending completions in a drain loop (accept → recv → send chain).
+                _ = async {
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref afd) = uring_cqe_fd {
+                        if let Ok(mut guard) = afd.readable().await {
+                            guard.clear_ready();
+                            return;
+                        }
+                    }
+                    std::future::pending::<()>().await
+                } => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut driver) = uring_state {
+                        driver.drain_eventfd();
+                        loop {
+                            let _ = driver.submit_and_wait_nonblocking();
+                            let events = driver.drain_completions();
+                            if events.is_empty() {
+                                break;
+                            }
+                            for event in events {
+                                uring_handler::handle_uring_event(
+                                    event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
+                                    &mut inflight_sends, uring_listener_fd, &cached_clock,
+                                );
+                            }
+                        }
+                    }
+                }
                 // Per-shard SO_REUSEPORT accept (Linux only, non-uring tokio path)
                 result = async {
                     #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
@@ -379,7 +775,11 @@ impl super::Shard {
                                                 use std::os::unix::io::IntoRawFd;
                                                 let raw_fd = std_stream.into_raw_fd();
                                                 match driver.register_connection(raw_fd) {
-                                                    Ok(Some(_conn_id)) => {}
+                                                    Ok(Some(_conn_id)) => {
+                                                        // Immediately submit the recv SQE so the
+                                                        // client doesn't wait for the next timer tick.
+                                                        let _ = driver.submit_and_wait_nonblocking();
+                                                    }
                                                     Ok(None) => {}
                                                     Err(e) => {
                                                         tracing::warn!("Shard {}: register_connection error: {}", shard_id, e);
@@ -419,13 +819,13 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -457,6 +857,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
@@ -464,18 +865,20 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.tick() => {
                     cached_clock.update();
+                    // Sync file ID from shared Cell (handlers may have incremented it)
+                    next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -507,13 +910,15 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir,
+                        disk_offload_base.as_deref(), shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
@@ -533,13 +938,56 @@ impl super::Shard {
                                     &mut snapshot_state, &mut snapshot_reply_tx,
                                     &mut wal_writer, shard_id,
                                 );
+                                bgsave_checkpoint_requested = true;
                             }
                         }
                     }
 
-                    persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                    // Drain local-write WAL channel (connection handler inline writes)
+                    while let Ok(data) = wal_append_rx.try_recv() {
+                        if let Some(ref mut wal) = wal_writer {
+                            wal.append(&data);
+                        }
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            wal.append(
+                                crate::persistence::wal_v3::record::WalRecordType::Command,
+                                &data,
+                            );
+                        }
+                    }
 
-                    // On Linux: poll io_uring for completions (non-blocking)
+                    persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                    persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                    // appendfsync=always: fsync WAL v3 after every SPSC drain batch
+                    if server_config.appendfsync == "always" {
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            if let Err(e) = wal.flush_sync() {
+                                tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Checkpoint protocol tick (disk-offload only)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
+                        if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
+                            let lsn = wal_v3.current_lsn();
+                            let dirty = page_cache_inst.dirty_page_count();
+                            ckpt_mgr.force_begin(lsn, dirty);
+                            bgsave_checkpoint_requested = false;
+                        }
+                        persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
+                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
+                            wal_bytes_since_checkpoint = 0;
+                        }
+                    }
+
+                    // Also poll io_uring in the timer tick as a fallback.
+                    // The eventfd select! branch should handle most CQEs instantly,
+                    // but this catches any that slip through.
                     #[cfg(target_os = "linux")]
                     if let Some(ref mut driver) = uring_state {
                         let _ = driver.submit_and_wait_nonblocking();
@@ -555,6 +1003,42 @@ impl super::Shard {
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {
                     timers::sync_wal(&mut wal_writer);
+                    timers::sync_wal_v3(&mut wal_v3_writer);
+                }
+                // Warm tier transition check (10s interval, disk-offload only)
+                _ = warm_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() {
+                        if let Some(ref mut manifest) = shard_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_warm_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_warm_after,
+                                &mut next_file_id,
+                                shard_id,
+                                &mut wal_v3_writer,
+                            );
+                        }
+                    }
+                }
+                // Cold tier transition check (60s, disk-offload only)
+                _ = cold_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
+                        if let Some(ref mut manifest) = shard_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_cold_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_cold_after,
+                                &mut next_file_id,
+                                shard_id,
+                            );
+                        }
+                    }
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.tick() => {
@@ -564,20 +1048,100 @@ impl super::Shard {
                 _ = expiry_interval.tick() => {
                     timers::run_active_expiry(&shard_databases, shard_id);
                 }
-                // Background eviction timer
+                // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
+                    persistence_tick::run_eviction_tick(
+                        spill_thread.as_ref(),
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                        &server_config,
+                        &runtime_config,
+                        &page_cache,
+                        &mut next_file_id,
+                        &mut wal_v3_writer,
+                        &spill_file_id,
+                    );
+
+                    // Reap idle io_uring connections (tokio+io_uring path).
+                    // Cleans up CLOSE_WAIT connections where the multishot recv
+                    // ended without producing a 0-byte CQE (client FIN + MORE=0).
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref mut driver) = uring_state {
+                        let _reaped = driver.reap_idle_connections(5000);
+                    }
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    persistence_tick::drain_and_shutdown_spill(
+                        &mut spill_thread,
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                    );
+                    // Trigger final checkpoint before shutdown (design S9)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
+                    }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
+                    }
+                    if let Some(ref mut wal_v3) = wal_v3_writer {
+                        let _ = wal_v3.flush_sync();
                     }
                     break;
                 }
             }
 
-            // Monoio runtime: full event loop mirroring the tokio path.
+            // Non-blocking drain: process all pending connections before entering select!.
+            // monoio::select! drops and recreates conn_rx.recv_async() every iteration
+            // (when timer tick fires), leaving queued connections unprocessed for ~1ms.
+            // try_recv() is zero-cost when empty (atomic load + early return).
+            #[cfg(feature = "runtime-monoio")]
+            while let Ok((std_tcp_stream, is_tls)) = conn_rx.try_recv() {
+                conn_accept::spawn_monoio_connection(
+                    std_tcp_stream,
+                    is_tls,
+                    &tls_config,
+                    &shard_databases,
+                    &dispatch_tx,
+                    &pubsub_arc,
+                    &blocking_rc,
+                    &shutdown,
+                    &aof_tx,
+                    &tracking_rc,
+                    &lua_rc,
+                    &script_cache_rc,
+                    &acl_table,
+                    &runtime_config,
+                    &server_config,
+                    &all_notifiers,
+                    &snapshot_trigger_tx,
+                    &repl_state,
+                    &cluster_state,
+                    &cached_clock,
+                    &remote_sub_map_arc,
+                    &all_pubsub_registries,
+                    &all_remote_sub_maps,
+                    &affinity_tracker,
+                    shard_id,
+                    num_shards,
+                    config_port,
+                    &pending_wakers,
+                    &spill_sender,
+                    &spill_file_id,
+                    &disk_offload_dir,
+                );
+            }
+            // Wake cross-shard response tasks that registered during the previous iteration.
+            #[cfg(feature = "runtime-monoio")]
+            for waker in pending_wakers.borrow_mut().drain(..) {
+                waker.wake();
+            }
+
+            // Monoio runtime: full event loop.
             #[cfg(feature = "runtime-monoio")]
             monoio::select! {
                 // Per-shard SO_REUSEPORT accept (Linux only, monoio path)
@@ -607,6 +1171,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(e) => {
@@ -629,6 +1194,7 @@ impl super::Shard {
                                 &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(_) => {
@@ -644,7 +1210,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -655,7 +1221,7 @@ impl super::Shard {
                     }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -687,6 +1253,7 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
@@ -695,12 +1262,14 @@ impl super::Shard {
                 _ = periodic_interval.tick() => {
                     tracing::trace!("Shard {}: periodic tick", shard_id);
                     cached_clock.update();
+                    // Sync file ID from shared Cell (handlers may have incremented it)
+                    next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -710,7 +1279,7 @@ impl super::Shard {
                     }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, shard_id,
+                        &shard_databases, disk_offload_base.as_deref(), shard_id,
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -742,13 +1311,15 @@ impl super::Shard {
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                     }
 
                     persistence_tick::check_auto_save_trigger(
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &shard_databases, &persistence_dir, shard_id,
+                        &mut snapshot_state, &shard_databases, &persistence_dir,
+                        disk_offload_base.as_deref(), shard_id,
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
@@ -770,15 +1341,92 @@ impl super::Shard {
                                     &mut wal_writer, shard_id,
                                 );
                                 crate::command::persistence::bgsave_shard_done(true);
+                                bgsave_checkpoint_requested = true;
                             }
                         }
                     }
 
+                    // Drain local-write WAL channel (connection handler inline writes)
+                    while let Ok(data) = wal_append_rx.try_recv() {
+                        if let Some(ref mut wal) = wal_writer {
+                            wal.append(&data);
+                        }
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            wal.append(
+                                crate::persistence::wal_v3::record::WalRecordType::Command,
+                                &data,
+                            );
+                        }
+                    }
+
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                    persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                    // appendfsync=always: fsync WAL v3 after every SPSC drain batch
+                    if server_config.appendfsync == "always" {
+                        if let Some(ref mut wal) = wal_v3_writer {
+                            if let Err(e) = wal.flush_sync() {
+                                tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Checkpoint protocol tick (disk-offload only)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
+                        if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
+                            let lsn = wal_v3.current_lsn();
+                            let dirty = page_cache_inst.dirty_page_count();
+                            ckpt_mgr.force_begin(lsn, dirty);
+                            bgsave_checkpoint_requested = false;
+                        }
+                        persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
+                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
+                            wal_bytes_since_checkpoint = 0;
+                        }
+                    }
                 }
                 // WAL fsync on 1-second interval
                 _ = wal_sync_interval.tick() => {
                     timers::sync_wal(&mut wal_writer);
+                    timers::sync_wal_v3(&mut wal_v3_writer);
+                }
+                // Warm tier transition check (10s interval, disk-offload only)
+                _ = warm_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() {
+                        if let Some(ref mut manifest) = shard_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_warm_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_warm_after,
+                                &mut next_file_id,
+                                shard_id,
+                                &mut wal_v3_writer,
+                            );
+                        }
+                    }
+                }
+                // Cold tier transition check (60s, disk-offload only)
+                _ = cold_check_interval.tick() => {
+                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
+                        if let Some(ref mut manifest) = shard_manifest {
+                            let shard_dir = server_config.effective_disk_offload_dir()
+                                .join(format!("shard-{}", shard_id));
+                            persistence_tick::check_cold_transitions(
+                                &*shard_databases.vector_store(shard_id),
+                                &shard_dir,
+                                manifest,
+                                server_config.segment_cold_after,
+                                &mut next_file_id,
+                                shard_id,
+                            );
+                        }
+                    }
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.tick() => {
@@ -788,15 +1436,48 @@ impl super::Shard {
                 _ = expiry_interval.tick() => {
                     timers::run_active_expiry(&shard_databases, shard_id);
                 }
-                // Background eviction timer
+                // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.tick() => {
-                    timers::run_eviction(&shard_databases, shard_id, &runtime_config);
+                    persistence_tick::run_eviction_tick(
+                        spill_thread.as_ref(),
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                        &server_config,
+                        &runtime_config,
+                        &page_cache,
+                        &mut next_file_id,
+                        &mut wal_v3_writer,
+                        &spill_file_id,
+                    );
+
+                    // Reap idle io_uring connections every ~5s (50 ticks × 100ms).
+                    // Cleans up CLOSE_WAIT connections where the multishot recv
+                    // ended without producing a 0-byte CQE (client FIN + MORE=0).
+                    // Note: idle connection reaping for CLOSE_WAIT cleanup is handled
+                    // by the UringDriver in the tokio+io_uring path. The monoio path
+                    // relies on monoio's internal connection lifecycle management.
                 }
                 // Shutdown
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down (monoio)", self.id);
+                    persistence_tick::drain_and_shutdown_spill(
+                        &mut spill_thread,
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                    );
+                    // Trigger final checkpoint before shutdown (design S9)
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
+                    }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
+                    }
+                    if let Some(ref mut wal_v3) = wal_v3_writer {
+                        let _ = wal_v3.flush_sync();
                     }
                     break;
                 }

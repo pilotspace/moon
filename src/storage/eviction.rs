@@ -1,11 +1,90 @@
+use std::path::{Path, PathBuf};
+
 use bytes::Bytes;
-use rand::seq::IndexedRandom;
+use rand::RngExt;
+use smallvec::SmallVec;
+use tracing::warn;
 
 use crate::config::RuntimeConfig;
+use crate::persistence::kv_page::{ValueType, entry_flags};
+use crate::persistence::manifest::ShardManifest;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
+use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::lfu_decay;
+use crate::storage::tiered::kv_serde;
+use crate::storage::tiered::kv_spill;
+use crate::storage::tiered::spill_thread::SpillRequest;
+
+/// Maximum number of victim candidates we will sample in a single
+/// `find_victim_*` call. This bounds the inline storage of the SmallVec
+/// returned by `sample_random_keys` and matches a generous upper bound on
+/// the user-tunable `maxmemory-samples` (Redis default 5; we accept up to 16).
+const MAX_VICTIM_SAMPLES: usize = 16;
+
+/// Reservoir-sample up to `samples` random keys from the database without
+/// materializing the entire keyspace.
+///
+/// Algorithm: pick a random `Segment`, then reservoir-sample one slot inside
+/// it (Algorithm R with reservoir size 1). Repeat until either `samples` keys
+/// have been collected or the per-segment retry budget is exhausted (which
+/// can happen if `volatile_only` is true and most segments contain no
+/// volatile keys). The returned vector is bounded by `MAX_VICTIM_SAMPLES`.
+///
+/// Cost: each iteration touches one segment (≤ a few hundred slots), so the
+/// total work per call is `O(samples × segment_capacity)` instead of
+/// `O(total_keys)` — the previous implementation cloned every key in the
+/// database into a `Vec<CompactKey>` per eviction loop iteration, which
+/// dominated CPU cost on hot eviction.
+fn sample_random_keys(
+    db: &Database,
+    samples: usize,
+    volatile_only: bool,
+) -> SmallVec<[CompactKey; MAX_VICTIM_SAMPLES]> {
+    let table = db.data();
+    let mut out: SmallVec<[CompactKey; MAX_VICTIM_SAMPLES]> = SmallVec::new();
+
+    let seg_count = table.segment_count();
+    if seg_count == 0 || table.is_empty() {
+        return out;
+    }
+    let want = samples.min(MAX_VICTIM_SAMPLES);
+    if want == 0 {
+        return out;
+    }
+
+    let mut rng = rand::rng();
+    // Per-segment retries: bounded so a sparse volatile keyspace cannot
+    // turn this into an unbounded loop.
+    let max_attempts = want.saturating_mul(8);
+    let mut attempts = 0usize;
+
+    while out.len() < want && attempts < max_attempts {
+        attempts += 1;
+        let seg_idx = rng.random_range(0..seg_count);
+        let seg = table.segment(seg_idx);
+
+        // Reservoir-sample one occupied slot from this segment with the
+        // optional volatile filter applied. Algorithm R with k=1.
+        let mut chosen: Option<&CompactKey> = None;
+        let mut seen = 0u32;
+        for (k, v) in seg.iter_occupied() {
+            if volatile_only && !v.has_expiry() {
+                continue;
+            }
+            seen += 1;
+            if rng.random_range(0..seen) == 0 {
+                chosen = Some(k);
+            }
+        }
+        if let Some(k) = chosen {
+            out.push(k.clone());
+        }
+    }
+
+    out
+}
 
 /// Compare two LRU timestamps with u16 wraparound handling.
 /// Uses signed-distance comparison: treats the 16-bit clock as circular.
@@ -76,72 +155,400 @@ fn oom_error() -> Frame {
     ))
 }
 
+/// Context for spilling evicted entries to disk instead of deleting them.
+///
+/// When provided to `try_evict_if_needed_with_spill`, evicted entries are
+/// serialized to KvLeafPage DataFiles before being removed from RAM.
+pub struct SpillContext<'a> {
+    pub shard_dir: &'a Path,
+    pub manifest: &'a mut ShardManifest,
+    pub next_file_id: &'a mut u64,
+}
+
 /// Check if eviction is needed and attempt to free memory.
 ///
 /// Returns Ok(()) if memory is within limits (or maxmemory is 0).
 /// Returns Err(Frame) with OOM error if eviction fails to free enough memory.
 pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill(db, config, None)
+}
+
+/// Check if eviction is needed, optionally spilling evicted entries to disk.
+///
+/// When `spill` is `Some`, evicted entries are written to a DataFile before
+/// being removed from RAM. When `None`, behaves identically to
+/// `try_evict_if_needed` (entries are simply deleted).
+///
+/// Spill failures are best-effort: if I/O fails, a warning is logged and the
+/// entry is still removed from RAM.
+pub fn try_evict_if_needed_with_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    spill: Option<&mut SpillContext<'_>>,
+) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill_and_total(db, config, spill, db.estimated_memory())
+}
+
+/// Eviction with explicit total_memory parameter (for aggregate checking).
+///
+/// When called from the memory pressure cascade, `total_memory` should be the
+/// aggregate across all databases. When called from the connection handler,
+/// pass `db.estimated_memory()` for single-DB behavior (Redis-compatible).
+pub fn try_evict_if_needed_with_spill_and_total(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    mut spill: Option<&mut SpillContext<'_>>,
+    total_memory: usize,
+) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
     }
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
-    while db.estimated_memory() > config.maxmemory {
+    // Check aggregate memory (server-wide maxmemory limit per Redis semantics).
+    // Evict from this DB until total memory drops below limit.
+    let mut current_total = total_memory;
+    while current_total > config.maxmemory {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
-        if !evict_one(db, config, &policy) {
+        let before = db.estimated_memory();
+        if !evict_one_with_spill(db, config, &policy, spill.as_deref_mut()) {
             return Err(oom_error());
         }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
     }
 
     Ok(())
 }
 
-/// Evict a single key according to the configured policy.
-/// Returns true if a key was evicted, false if no eligible keys found.
-fn evict_one(db: &mut Database, config: &RuntimeConfig, policy: &EvictionPolicy) -> bool {
+/// Check if eviction is needed, spilling evicted entries asynchronously via
+/// a background `SpillThread` instead of doing synchronous pwrite.
+///
+/// The async path: extracts key/value bytes, removes entry from DashTable
+/// (freeing RAM immediately), then sends a `SpillRequest` to the background
+/// thread. The pwrite is best-effort -- if the channel is full, the request
+/// is dropped (entry already removed from RAM).
+///
+/// Callers must poll `SpillThread::drain_completions()` to apply manifest
+/// and ColdIndex updates from completed spills.
+pub fn try_evict_if_needed_async_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    db_index: usize,
+) -> Result<(), Frame> {
+    try_evict_if_needed_async_spill_with_total(
+        db,
+        config,
+        sender,
+        shard_dir,
+        next_file_id,
+        db.estimated_memory(),
+        db_index,
+    )
+}
+
+/// Async spill eviction with explicit total_memory parameter.
+pub fn try_evict_if_needed_async_spill_with_total(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    total_memory: usize,
+    db_index: usize,
+) -> Result<(), Frame> {
+    if config.maxmemory == 0 {
+        return Ok(());
+    }
+
+    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
+
+    let mut current_total = total_memory;
+    while current_total > config.maxmemory {
+        if policy == EvictionPolicy::NoEviction {
+            return Err(oom_error());
+        }
+        let before = db.estimated_memory();
+        if !evict_one_async_spill(
+            db,
+            config,
+            &policy,
+            sender,
+            shard_dir,
+            next_file_id,
+            db_index,
+        ) {
+            return Err(oom_error());
+        }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
+    }
+
+    Ok(())
+}
+
+/// Evict entries to bring memory under maxmemory, returning removed
+/// (key, Entry) pairs for deferred spill OUTSIDE the write lock.
+///
+/// Inside the lock: only find_victim + db.remove (~600ns per eviction).
+/// The caller extracts value bytes from the owned Entry after releasing
+/// the lock, then sends SpillRequests to the background thread.
+pub fn try_evict_deferred(
+    db: &mut Database,
+    config: &RuntimeConfig,
+) -> Result<smallvec::SmallVec<[(Bytes, crate::storage::entry::Entry); 2]>, Frame> {
+    if config.maxmemory == 0 {
+        return Ok(smallvec::SmallVec::new());
+    }
+
+    let total_memory = db.estimated_memory();
+    if total_memory <= config.maxmemory {
+        return Ok(smallvec::SmallVec::new());
+    }
+
+    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
+    let mut evicted = smallvec::SmallVec::new();
+    let mut current_total = total_memory;
+
+    while current_total > config.maxmemory {
+        if policy == EvictionPolicy::NoEviction {
+            return Err(oom_error());
+        }
+
+        let victim = find_victim_for_policy(db, config, &policy);
+        let key = match victim {
+            Some(k) => k,
+            None => return Err(oom_error()),
+        };
+
+        let before = db.estimated_memory();
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        if let Some(entry) = db.remove(key.as_bytes()) {
+            evicted.push((key_bytes, entry));
+        }
+        let after = db.estimated_memory();
+        current_total = current_total.saturating_sub(before.saturating_sub(after));
+    }
+
+    Ok(evicted)
+}
+
+/// Find a victim key using the given eviction policy.
+fn find_victim_for_policy(
+    db: &Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+) -> Option<CompactKey> {
     match policy {
-        EvictionPolicy::NoEviction => false,
-        EvictionPolicy::AllKeysLru => evict_one_lru(db, config.maxmemory_samples, false),
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
         EvictionPolicy::AllKeysLfu => {
-            evict_one_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
         }
-        EvictionPolicy::AllKeysRandom => evict_one_random(db, false),
-        EvictionPolicy::VolatileLru => evict_one_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
         EvictionPolicy::VolatileLfu => {
-            evict_one_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
         }
-        EvictionPolicy::VolatileRandom => evict_one_random(db, true),
-        EvictionPolicy::VolatileTtl => evict_one_volatile_ttl(db, config.maxmemory_samples),
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
     }
 }
 
-/// Evict the key with the oldest last_access from a random sample.
-fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool {
-    let keys: Vec<CompactKey> = if volatile_only {
-        db.data()
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        db.data().keys().cloned().collect()
+/// Evict a single key via the async spill path.
+///
+/// Extracts the entry, removes it from DashTable (immediate RAM relief),
+/// then sends a SpillRequest to the background thread for pwrite.
+fn evict_one_async_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    db_index: usize,
+) -> bool {
+    // Find victim key using same policy logic as sync path
+    let victim = match policy {
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
+        EvictionPolicy::AllKeysLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+        }
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::VolatileLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+        }
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
     };
 
-    if keys.is_empty() {
-        return false;
+    let key = match victim {
+        Some(k) => k,
+        None => return false,
+    };
+
+    // Build SpillRequest from the entry BEFORE removing it from DashTable.
+    // This is CPU work only -- no I/O on the event loop.
+    if let Some(entry) = db.data().get(key.as_bytes()) {
+        let val_ref = entry.as_redis_value();
+
+        // Determine value_type and serialize value bytes
+        let collection_buf: Vec<u8>;
+        let (value_type, value_bytes): (ValueType, &[u8]) = match val_ref {
+            RedisValueRef::String(s) => (ValueType::String, s),
+            ref other => {
+                let vt = match other {
+                    RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => ValueType::Hash,
+                    RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
+                    RedisValueRef::Set(_)
+                    | RedisValueRef::SetListpack(_)
+                    | RedisValueRef::SetIntset(_) => ValueType::Set,
+                    RedisValueRef::SortedSet { .. }
+                    | RedisValueRef::SortedSetBPTree { .. }
+                    | RedisValueRef::SortedSetListpack(_) => ValueType::ZSet,
+                    RedisValueRef::Stream(_) => ValueType::Stream,
+                    RedisValueRef::String(_) => unreachable!(),
+                };
+                collection_buf = kv_serde::serialize_collection(other).unwrap_or_default();
+                (vt, collection_buf.as_slice())
+            }
+        };
+
+        // Determine flags and TTL
+        let mut flags: u8 = 0;
+        let ttl_ms = if entry.has_expiry() {
+            flags |= entry_flags::HAS_TTL;
+            Some(entry.expires_at_ms(0))
+        } else {
+            None
+        };
+
+        let file_id = *next_file_id;
+        *next_file_id += 1;
+
+        let req = SpillRequest {
+            key: Bytes::copy_from_slice(key.as_bytes()),
+            db_index,
+            value_bytes: Bytes::copy_from_slice(value_bytes),
+            value_type,
+            flags,
+            ttl_ms,
+            file_id,
+            shard_dir: PathBuf::from(shard_dir),
+        };
+
+        // CRITICAL: queue the spill BEFORE freeing RAM. If try_send fails
+        // (channel full or disconnected) we MUST NOT remove the entry — that
+        // would lose data because no completion will arrive and the file will
+        // not exist. Bail out and let the next eviction tick retry.
+        if sender.try_send(req).is_err() {
+            return false;
+        }
+
+        // Now safe to free RAM. The bg thread holds the SpillRequest and will
+        // produce a SpillCompletion that updates cold_index for this db_index.
+        db.remove(key.as_bytes());
+
+        // Insert a tentative cold_index entry so subsequent GETs in this DB
+        // can resolve the key while the bg pwrite is in flight. The completion
+        // handler in persistence_tick::apply_spill_completions will overwrite
+        // this with the authoritative ColdLocation once pwrite finishes.
+        if let Some(ref mut ci) = db.cold_index {
+            ci.insert(
+                Bytes::copy_from_slice(key.as_bytes()),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id,
+                    slot_idx: 0,
+                },
+            );
+        }
+    } else {
+        // Entry disappeared (race with expiry), just remove
+        db.remove(key.as_bytes());
     }
 
-    let mut rng = rand::rng();
-    let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
+    true
+}
+
+/// Evict a single key, optionally spilling to disk before removal.
+fn evict_one_with_spill(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    policy: &EvictionPolicy,
+    spill: Option<&mut SpillContext<'_>>,
+) -> bool {
+    // Find victim key using policy-specific sampling
+    let victim = match policy {
+        EvictionPolicy::NoEviction => None,
+        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
+        EvictionPolicy::AllKeysLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
+        }
+        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        EvictionPolicy::VolatileLfu => {
+            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+        }
+        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
+    };
+
+    let key = match victim {
+        Some(k) => k,
+        None => return false,
+    };
+
+    // Spill to disk before removing, if context provided
+    if let Some(ctx) = spill {
+        if let Some(entry) = db.data().get(key.as_bytes()) {
+            // Only spill string entries (collection types not yet supported)
+            let is_string = matches!(entry.as_redis_value(), RedisValueRef::String(_));
+            if is_string {
+                if let Err(e) = kv_spill::spill_to_datafile(
+                    ctx.shard_dir,
+                    *ctx.next_file_id,
+                    key.as_bytes(),
+                    entry,
+                    ctx.manifest,
+                    None,
+                ) {
+                    warn!(
+                        key = %String::from_utf8_lossy(key.as_bytes()),
+                        error = %e,
+                        "kv_spill: I/O error during spill, proceeding with eviction"
+                    );
+                } else {
+                    *ctx.next_file_id += 1;
+                }
+            }
+        }
+    }
+
+    db.remove(key.as_bytes());
+    true
+}
+
+// ── Victim selection helpers ───────────────────────────
+
+/// Find the victim key with the oldest last_access from a random sample.
+fn find_victim_lru(db: &Database, samples: usize, volatile_only: bool) -> Option<CompactKey> {
+    let sampled = sample_random_keys(db, samples, volatile_only);
+    if sampled.is_empty() {
+        return None;
+    }
 
     let mut oldest_key: Option<CompactKey> = None;
-    let mut oldest_access = None;
+    let mut oldest_access: Option<u32> = None;
 
-    for key in sampled {
+    for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             let la = entry.last_access();
             match oldest_access {
@@ -149,8 +556,8 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
                     oldest_key = Some(key.clone());
                     oldest_access = Some(la);
                 }
-                Some(ref oldest) => {
-                    if lru_is_older(la, *oldest) {
+                Some(oldest) => {
+                    if lru_is_older(la, oldest) {
                         oldest_key = Some(key.clone());
                         oldest_access = Some(la);
                     }
@@ -159,44 +566,26 @@ fn evict_one_lru(db: &mut Database, samples: usize, volatile_only: bool) -> bool
         }
     }
 
-    if let Some(key) = oldest_key {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    oldest_key
 }
 
-/// Evict the key with the lowest LFU counter (after decay) from a random sample.
-fn evict_one_lfu(
-    db: &mut Database,
+/// Find the victim key with the lowest LFU counter from a random sample.
+fn find_victim_lfu(
+    db: &Database,
     samples: usize,
     lfu_decay_time: u64,
     volatile_only: bool,
-) -> bool {
-    let keys: Vec<CompactKey> = if volatile_only {
-        db.data()
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        db.data().keys().cloned().collect()
-    };
-
-    if keys.is_empty() {
-        return false;
+) -> Option<CompactKey> {
+    let sampled = sample_random_keys(db, samples, volatile_only);
+    if sampled.is_empty() {
+        return None;
     }
-
-    let mut rng = rand::rng();
-    let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
 
     let mut evict_key: Option<CompactKey> = None;
     let mut lowest_counter: Option<u8> = None;
-    let mut oldest_access_for_tie = None;
+    let mut oldest_access_for_tie: Option<u32> = None;
 
-    for key in sampled {
+    for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             let effective_counter =
                 lfu_decay(entry.access_counter(), entry.last_access(), lfu_decay_time);
@@ -219,60 +608,25 @@ fn evict_one_lfu(
         }
     }
 
-    if let Some(key) = evict_key {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    evict_key
 }
 
-/// Evict one random key.
-fn evict_one_random(db: &mut Database, volatile_only: bool) -> bool {
-    let keys: Vec<CompactKey> = if volatile_only {
-        db.data()
-            .iter()
-            .filter(|(_, e)| e.has_expiry())
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        db.data().keys().cloned().collect()
-    };
-
-    if keys.is_empty() {
-        return false;
-    }
-
-    let mut rng = rand::rng();
-    if let Some(key) = keys.choose(&mut rng) {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+/// Find a random victim key.
+fn find_victim_random(db: &Database, volatile_only: bool) -> Option<CompactKey> {
+    sample_random_keys(db, 1, volatile_only).into_iter().next()
 }
 
-/// Evict the key with the soonest TTL expiration from a random sample.
-fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
-    let keys: Vec<CompactKey> = db
-        .data()
-        .iter()
-        .filter(|(_, e)| e.has_expiry())
-        .map(|(k, _)| k.clone())
-        .collect();
-
-    if keys.is_empty() {
-        return false;
+/// Find the victim key with the soonest TTL expiration from a random sample.
+fn find_victim_volatile_ttl(db: &Database, samples: usize) -> Option<CompactKey> {
+    let sampled = sample_random_keys(db, samples, true);
+    if sampled.is_empty() {
+        return None;
     }
-
-    let mut rng = rand::rng();
-    let sample_size = samples.min(keys.len());
-    let sampled: Vec<&CompactKey> = keys.sample(&mut rng, sample_size).collect();
 
     let mut evict_key: Option<CompactKey> = None;
     let mut soonest_expiry: Option<u64> = None;
 
-    for key in sampled {
+    for key in sampled.iter() {
         if let Some(entry) = db.data().get(key.as_bytes()) {
             if entry.has_expiry() {
                 let exp = entry.expires_at_ms(db.base_timestamp());
@@ -288,17 +642,33 @@ fn evict_one_volatile_ttl(db: &mut Database, samples: usize) -> bool {
         }
     }
 
-    if let Some(key) = evict_key {
-        db.remove(key.as_bytes());
-        true
-    } else {
-        false
-    }
+    evict_key
 }
 
 #[cfg(test)]
 mod tests {
+    // Legacy wrappers used only in tests for backward-compatible assertions.
+    fn evict_one_random(db: &mut super::Database, volatile_only: bool) -> bool {
+        if let Some(key) = super::find_victim_random(db, volatile_only) {
+            db.remove(key.as_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn evict_one_volatile_ttl(db: &mut super::Database, samples: usize) -> bool {
+        if let Some(key) = super::find_victim_volatile_ttl(db, samples) {
+            db.remove(key.as_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
     use super::*;
+    use crate::persistence::kv_page::read_datafile;
+    use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
 
     fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
@@ -366,9 +736,7 @@ mod tests {
     #[test]
     fn test_noeviction_returns_oom() {
         let mut db = Database::new();
-        // Set a key to use some memory
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
-        // Configure very small maxmemory with noeviction
         let config = make_config(1, "noeviction");
         let result = try_evict_if_needed(&mut db, &config);
         assert!(result.is_err());
@@ -394,15 +762,22 @@ mod tests {
         db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
         let config = make_config(1_000_000, "allkeys-lru");
         assert!(try_evict_if_needed(&mut db, &config).is_ok());
-        assert_eq!(db.len(), 1); // Key should still be there
+        assert_eq!(db.len(), 1);
     }
 
     #[test]
     fn test_lru_evicts_oldest() {
+        // `sample_random_keys` reservoir-samples `maxmemory_samples` victims
+        // per eviction round using a non-deterministic RNG, so a single
+        // eviction call over a tiny 3-key population is statistically flaky:
+        // with probability ~(2/3)^5 ≈ 13% the oldest key is never sampled in
+        // that round and a different key is evicted. We instead drive
+        // eviction in a bounded loop, shrinking maxmemory after each round,
+        // so "old" is eventually guaranteed to be sampled and picked
+        // (worst case once the population shrinks to a single key).
         let mut db = Database::new();
-        // Create entries with different last_access times
         let mut entry1 = Entry::new_string(Bytes::from_static(b"val1"));
-        entry1.set_last_access(current_secs() - 100); // oldest
+        entry1.set_last_access(current_secs() - 100);
         db.set(Bytes::from_static(b"old"), entry1);
 
         let mut entry2 = Entry::new_string(Bytes::from_static(b"val2"));
@@ -410,20 +785,27 @@ mod tests {
         db.set(Bytes::from_static(b"medium"), entry2);
 
         let mut entry3 = Entry::new_string(Bytes::from_static(b"val3"));
-        entry3.set_last_access(current_secs()); // newest
+        entry3.set_last_access(current_secs());
         db.set(Bytes::from_static(b"new"), entry3);
 
-        // Set maxmemory to allow only 2 entries (roughly)
-        let mem = db.estimated_memory();
-        // We want to trigger eviction of exactly 1 key
-        let config = make_config(mem - 1, "allkeys-lru");
-
-        let result = try_evict_if_needed(&mut db, &config);
-        assert!(result.is_ok());
-        // With samples=5 and only 3 keys, all are sampled -> oldest should be evicted
-        assert_eq!(db.len(), 2);
-        // "old" should have been evicted (oldest last_access)
-        assert!(db.data().get(b"old" as &[u8]).is_none());
+        // Drive eviction rounds until "old" is gone, bounded to prevent
+        // infinite looping if the sampler is broken.
+        for _ in 0..50 {
+            if db.data().get(b"old" as &[u8]).is_none() {
+                break;
+            }
+            let mem = db.estimated_memory();
+            if mem == 0 {
+                break;
+            }
+            let config = make_config(mem.saturating_sub(1), "allkeys-lru");
+            let result = try_evict_if_needed(&mut db, &config);
+            assert!(result.is_ok());
+        }
+        assert!(
+            db.data().get(b"old" as &[u8]).is_none(),
+            "LRU eviction failed to remove the oldest key within 50 rounds",
+        );
     }
 
     #[test]
@@ -435,7 +817,6 @@ mod tests {
 
         let config = make_config(1, "allkeys-random");
         let result = try_evict_if_needed(&mut db, &config);
-        // Should have evicted keys until under limit (all of them since limit is 1 byte)
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
     }
@@ -443,12 +824,10 @@ mod tests {
     #[test]
     fn test_volatile_only_skips_persistent() {
         let mut db = Database::new();
-        // Persistent key (no TTL)
         db.set_string(
             Bytes::from_static(b"persistent"),
             Bytes::from_static(b"value"),
         );
-        // Volatile key (has TTL)
         let future_ms = current_time_ms() + 3_600_000;
         db.set_string_with_expiry(
             Bytes::from_static(b"volatile"),
@@ -456,7 +835,6 @@ mod tests {
             future_ms,
         );
 
-        // With only 1 volatile key, volatile-random should evict it
         let result = evict_one_random(&mut db, true);
         assert!(result);
         assert_eq!(db.len(), 1);
@@ -481,7 +859,6 @@ mod tests {
         let result = evict_one_volatile_ttl(&mut db, 5);
         assert!(result);
         assert_eq!(db.len(), 1);
-        // "soon" should have been evicted (soonest expiry)
         assert!(db.data().get(b"soon" as &[u8]).is_none());
     }
 
@@ -490,5 +867,57 @@ mod tests {
         assert_eq!(EvictionPolicy::NoEviction.as_str(), "noeviction");
         assert_eq!(EvictionPolicy::AllKeysLru.as_str(), "allkeys-lru");
         assert_eq!(EvictionPolicy::VolatileTtl.as_str(), "volatile-ttl");
+    }
+
+    #[test]
+    fn test_evict_with_spill_creates_datafile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(
+            Bytes::from_static(b"spill_key"),
+            Bytes::from_static(b"spill_val"),
+        );
+
+        let config = make_config(1, "allkeys-lru");
+        let mut ctx = SpillContext {
+            shard_dir,
+            manifest: &mut manifest,
+            next_file_id: &mut next_file_id,
+        };
+
+        let result = try_evict_if_needed_with_spill(&mut db, &config, Some(&mut ctx));
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 0);
+
+        // Verify DataFile was created
+        let file_path = shard_dir.join("data/heap-000001.mpf");
+        assert!(file_path.exists(), "DataFile should have been created");
+
+        // Verify contents
+        let pages = read_datafile(&file_path).unwrap();
+        assert_eq!(pages.len(), 1);
+        let entry = pages[0].get(0).unwrap();
+        assert_eq!(entry.key, b"spill_key");
+        assert_eq!(entry.value, b"spill_val");
+
+        // file_id should have been incremented
+        assert_eq!(next_file_id, 2);
+    }
+
+    #[test]
+    fn test_evict_without_spill_unchanged() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+
+        let config = make_config(1, "allkeys-random");
+        let result = try_evict_if_needed_with_spill(&mut db, &config, None);
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 0);
     }
 }

@@ -9,6 +9,7 @@ pub mod eviction;
 pub mod intset;
 pub mod listpack;
 pub mod stream;
+pub mod tiered;
 
 pub use db::Database;
 pub use entry::{Entry, RedisValue};

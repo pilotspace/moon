@@ -6,6 +6,68 @@ High-performance Redis-compatible server in Rust. See [README.md](README.md) for
 
 Rust **1.85** (edition 2024). Enforced in CI.
 
+## Target Platform
+
+**Linux only** (aarch64 primary, x86_64 secondary). macOS support is deferred to a future milestone.
+
+All development, testing, and benchmarking MUST target Linux. On macOS hosts, use OrbStack (see below).
+
+## OrbStack Development Environment
+
+Moon requires Linux for io_uring, O_DIRECT, and production benchmarks. On macOS, use the `moon-dev` OrbStack machine.
+
+### Machine: `moon-dev`
+
+- **OS:** Ubuntu 24.04 (kernel 6.17+, full io_uring support)
+- **Arch:** aarch64 (matches Apple Silicon host)
+- **Rust:** 1.85.0 (MSRV-pinned)
+- **Tools:** build-essential, pkg-config, libssl-dev, redis-server
+
+OrbStack auto-mounts macOS `/Users/` into the VM — edit on macOS, compile on Linux. No rsync or Docker volumes needed.
+
+### Commands
+
+```bash
+# Build (release)
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && cargo build --release'
+
+# Test (all)
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && cargo test --release'
+
+# Test (tokio runtime, CI parity)
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && cargo test --no-default-features --features runtime-tokio,jemalloc'
+
+# Clippy
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && cargo clippy -- -D warnings'
+
+# Run server
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && ./target/release/moon --port 6399 --shards 4'
+
+# Benchmark (redis-benchmark from macOS can reach moon-dev via OrbStack networking)
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && cargo bench'
+
+# Interactive shell
+orb run -m moon-dev bash
+```
+
+### Recreating the Machine
+
+If the machine is lost or corrupted:
+```bash
+orb delete moon-dev
+orb create ubuntu moon-dev
+orb run -m moon-dev bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0'
+orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev redis-server'
+```
+
+### OrbStack Rules for Claude Code
+
+- **Always build/test via `orb run -m moon-dev`** — never `cargo build` directly on macOS for final verification.
+- `cargo check` on macOS is acceptable for fast iteration (syntax/type errors only).
+- All benchmark numbers MUST come from the Linux VM.
+- The VM path to the repo is the same as macOS: `/Users/tindang/workspaces/tind-repo/moon`.
+- Use `source ~/.cargo/env &&` prefix in every `orb run` command.
+
 ## Environment Variables
 
 - `RUST_LOG=moon=debug` — enable tracing output (uses `tracing-subscriber` with `env-filter`)
@@ -36,6 +98,8 @@ Rust **1.85** (edition 2024). Enforced in CI.
 - Every `unsafe` block MUST have a `// SAFETY:` comment explaining the invariant.
 - Prefer safe abstractions. If unsafe is needed, isolate it in a dedicated module.
 - When modifying existing unsafe code, verify all SAFETY comments remain accurate.
+- Full policy, review checklist, approved patterns, and forbidden constructs:
+  see [`UNSAFE_POLICY.md`](UNSAFE_POLICY.md).
 
 ### Allocations on Hot Paths
 - No `Box::new()`, `Vec::new()`, `String::new()`, `Arc::new()`, `clone()`, `format!()`, or `to_string()` in:
@@ -60,7 +124,7 @@ Rust **1.85** (edition 2024). Enforced in CI.
 ### Feature Gates
 - All runtime-specific code must compile under both `runtime-tokio` and `runtime-monoio`.
 - Verify with: `cargo check --no-default-features --features runtime-tokio,jemalloc`
-- Platform-specific code (io_uring, kqueue) must have `#[cfg(target_os = "...")]` guards.
+- Linux-only code (io_uring, O_DIRECT, `libc::` calls) must have `#[cfg(target_os = "linux")]` guards with a stub/fallback for non-Linux (compile guard is sufficient — runtime fallback not required until macOS milestone).
 - New features use additive feature flags — never break the default feature set.
 
 ### New Commands
@@ -135,3 +199,10 @@ Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness 
 - MSRV check — `cargo build` with Rust 1.85 toolchain
 - CodeQL (Rust) — weekly + on push/PR
 - Claude Code Review — runs on PRs
+
+### Local CI Parity (via OrbStack)
+
+Before pushing, run the full CI matrix locally:
+```bash
+orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Users/tindang/workspaces/tind-repo/moon && cargo fmt --check && cargo clippy -- -D warnings && cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings && cargo test --release && cargo test --no-default-features --features runtime-tokio,jemalloc'
+```

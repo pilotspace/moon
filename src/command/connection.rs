@@ -180,14 +180,25 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     ));
     sections.push_str("\r\n");
 
+    sections.push_str("# MoonStore\r\n");
+    use std::fmt::Write as _;
+    let _ = write!(
+        sections,
+        "disk_offload_enabled:{}\r\n",
+        crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed) as u8
+    );
+    sections.push_str("\r\n");
+
     sections.push_str("# Keyspace\r\n");
     let key_count = db.len();
     let expires_count = db.expires_count();
     if key_count > 0 {
-        sections.push_str(&format!(
+        let _ = write!(
+            sections,
             "db0:keys={},expires={},avg_ttl=0\r\n",
             key_count, expires_count
-        ));
+        );
     }
 
     Frame::BulkString(Bytes::from(sections))

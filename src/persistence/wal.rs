@@ -126,10 +126,7 @@ impl WalWriter {
             self.header_written = true;
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "WAL file handle is closed",
-            ))
+            Err(std::io::Error::other("WAL file handle is closed"))
         }
     }
 
@@ -253,10 +250,7 @@ impl WalWriter {
             self.buf.clear(); // clear but keep allocation
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "WAL file handle is closed",
-            ))
+            Err(std::io::Error::other("WAL file handle is closed"))
         }
     }
 
@@ -267,10 +261,7 @@ impl WalWriter {
             self.last_fsync = Instant::now();
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "WAL file handle is closed",
-            ))
+            Err(std::io::Error::other("WAL file handle is closed"))
         }
     }
 
@@ -291,6 +282,9 @@ impl WalWriter {
         let old_path = self.file_path.with_extension("wal.old");
         if self.file_path.exists() {
             std::fs::rename(&self.file_path, &old_path)?;
+            if let Some(parent) = self.file_path.parent() {
+                crate::persistence::fsync::fsync_directory(parent)?;
+            }
         }
 
         // Open a fresh WAL file

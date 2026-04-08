@@ -92,6 +92,17 @@ fn main() -> anyhow::Result<()> {
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
+    // Ensure persistence directory exists before spawning AOF writer.
+    // Fail fast if --dir is invalid or permission-denied: otherwise the AOF
+    // writer and recovery paths silently fall back and corrupt invariants.
+    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+        return Err(anyhow::anyhow!(
+            "failed to create persistence directory {:?}: {}",
+            config.dir,
+            e
+        ));
+    }
+
     // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
     // The AOF writer task will be spawned on the listener runtime.
     let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {
@@ -203,12 +214,27 @@ fn main() -> anyhow::Result<()> {
 
     // Create and restore all shards on main thread, then extract databases
     // into centralized ShardDatabases for cross-shard direct read access.
+    let disk_offload_base = if config.disk_offload_enabled() {
+        Some(config.effective_disk_offload_dir())
+    } else {
+        None
+    };
     let mut shards: Vec<Shard> = (0..num_shards)
         .map(|id| {
             let mut shard =
                 Shard::new(id, num_shards, config.databases, config.to_runtime_config());
             if let Some(ref dir) = persistence_dir {
-                shard.restore_from_persistence(dir);
+                shard.restore_from_persistence(dir, disk_offload_base.as_deref());
+            }
+            // Initialize cold_index + cold_shard_dir for disk offload
+            if let Some(ref offload_base) = disk_offload_base {
+                let shard_dir = offload_base.join(format!("shard-{}", id));
+                for db in &mut shard.databases {
+                    db.cold_shard_dir = Some(shard_dir.clone());
+                    if db.cold_index.is_none() {
+                        db.cold_index = Some(moon::storage::tiered::cold_index::ColdIndex::new());
+                    }
+                }
             }
             shard
         })
@@ -262,7 +288,17 @@ fn main() -> anyhow::Result<()> {
                             producers,
                             shard_cancel,
                             shard_aof_tx,
-                            Some(shard_bind_addr),
+                            // Only pass bind_addr for per-shard SO_REUSEPORT when tokio
+                            // with io_uring is active. monoio uses central listener MPSC.
+                            #[cfg(feature = "runtime-tokio")]
+                            {
+                                Some(shard_bind_addr)
+                            },
+                            #[cfg(feature = "runtime-monoio")]
+                            {
+                                let _ = &shard_bind_addr;
+                                None
+                            },
                             shard_persistence_dir,
                             shard_snap_rx,
                             shard_snap_tx,
@@ -416,7 +452,10 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        let per_shard_accept = cfg!(target_os = "linux");
+        // monoio: disable per-shard accept. The listener thread handles all accepts
+        // and dispatches via MPSC (conn_txs). Per-shard SO_REUSEPORT accept with monoio
+        // has an io_uring cancel/resubmit race in monoio::select! that drops connections.
+        let per_shard_accept = false;
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
             if let Err(e) = server::listener::run_sharded(
                 config,

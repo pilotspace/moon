@@ -17,6 +17,7 @@ memchr = "2.8"
 smallvec = { version = "1.15", features = ["union"] }
 thiserror = "2.0"
 mimalloc = { version = "0.1", default-features = false }
+crc32c = "0.6"
 crossbeam-utils = "0.8"
 flume = "0.12"
 atomic-waker = "1"
@@ -53,6 +54,9 @@ roaring = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
+memmap2 = "0.9"
+lz4_flex = "0.13"
+dashmap = "6"
 
 tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
@@ -90,6 +94,10 @@ lto = "fat"           # Full cross-crate LTO for maximum inlining
 codegen-units = 1     # Single codegen unit for global optimization
 opt-level = 3         # Full optimization
 strip = true          # Strip symbols
+
+[[bin]]
+name = "moon-bench"
+path = "src/bin/moon-bench.rs"
 
 [[bench]]
 name = "resp_parsing"
