@@ -166,7 +166,25 @@ fn parse_single_frame_zc(
         }
         b'~' => {
             let count = read_decimal_zc(buf, pos)?;
+            if count == -1 {
+                return Ok(Frame::Null);
+            }
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid set count: {}", count),
+                    offset: *pos,
+                });
+            }
             let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "set length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
+                    offset: *pos,
+                });
+            }
             let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame_zc(buf, pos, config, depth + 1)?);
@@ -231,7 +249,26 @@ fn parse_single_frame_zc(
             Ok(Frame::BigNumber(line))
         }
         b'>' => {
-            let count = read_decimal_zc(buf, pos)? as usize;
+            let count = read_decimal_zc(buf, pos)?;
+            if count == -1 {
+                return Ok(Frame::Null);
+            }
+            if count < 0 {
+                return Err(ParseError::Invalid {
+                    message: format!("invalid push count: {}", count),
+                    offset: *pos,
+                });
+            }
+            let count = count as usize;
+            if count > config.max_array_length {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "push length {} exceeds maximum {}",
+                        count, config.max_array_length
+                    ),
+                    offset: *pos,
+                });
+            }
             let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_single_frame_zc(buf, pos, config, depth + 1)?);
@@ -318,9 +355,13 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             // Map
             let crlf = find_crlf(buf, *pos).unwrap();
             let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap() as usize;
+            let count = atoi::atoi::<i64>(line).unwrap();
             *pos = crlf + 2;
-            let mut entries = Vec::with_capacity(count);
+            if count == -1 {
+                return Frame::Null;
+            }
+            let count = count as usize;
+            let mut entries = Vec::with_capacity(count.min(config.max_array_length));
             for _ in 0..count {
                 let key = parse_frame_zerocopy(buf, pos, config, depth + 1);
                 let val = parse_frame_zerocopy(buf, pos, config, depth + 1);
@@ -332,9 +373,13 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             // Set
             let crlf = find_crlf(buf, *pos).unwrap();
             let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap() as usize;
+            let count = atoi::atoi::<i64>(line).unwrap();
             *pos = crlf + 2;
-            let mut items = FrameVec::with_capacity(count);
+            if count == -1 {
+                return Frame::Null;
+            }
+            let count = count as usize;
+            let mut items = FrameVec::with_capacity(count.min(config.max_array_length));
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
@@ -388,9 +433,13 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             // Push
             let crlf = find_crlf(buf, *pos).unwrap();
             let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap() as usize;
+            let count = atoi::atoi::<i64>(line).unwrap();
             *pos = crlf + 2;
-            let mut items = FrameVec::with_capacity(count);
+            if count == -1 {
+                return Frame::Null;
+            }
+            let count = count as usize;
+            let mut items = FrameVec::with_capacity(count.min(config.max_array_length));
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
@@ -1328,6 +1377,54 @@ mod tests {
     fn test_parse_resp3_boolean_invalid() {
         // #foo is not a valid boolean, should error (not route to inline)
         let result = parse_bytes(b"#foo\r\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fuzz_crash_resp3_set_negative_count() {
+        // Regression test from cargo-fuzz crash artifact.
+        // ~-1 followed by garbage bytes — must not panic or crash.
+        let data: &[u8] = &[
+            126, 45, 49, 255, 58, 10, 49, 1, 0, 141, 13, 10, 36, 45, 49, 255, 58, 10, 48, 13,
+            49, 48, 141, 13, 10, 36, 45, 49, 255, 58, 48, 13, 13, 10,
+        ];
+        let config = ParseConfig {
+            max_bulk_string_size: 64 * 1024,
+            max_array_depth: 4,
+            max_array_length: 256,
+        };
+        let mut buf = BytesMut::from(data);
+        // Must not panic — any combination of Ok/Err is acceptable
+        for _ in 0..16 {
+            if buf.is_empty() {
+                break;
+            }
+            match parse(&mut buf, &config) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[test]
+    fn test_resp3_null_set() {
+        // ~-1\r\n is a null RESP3 set
+        let result = parse_bytes(b"~-1\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Null);
+    }
+
+    #[test]
+    fn test_resp3_null_push() {
+        // >-1\r\n is a null RESP3 push
+        let result = parse_bytes(b">-1\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Null);
+    }
+
+    #[test]
+    fn test_resp3_negative_set_count() {
+        // ~-2\r\n is invalid (not null, not valid count)
+        let result = parse_bytes(b"~-2\r\n");
         assert!(result.is_err());
     }
 }

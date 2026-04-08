@@ -1,0 +1,60 @@
+[package]
+name = "moon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.moon]
+path = ".."
+default-features = false
+features = ["runtime-tokio", "jemalloc"]
+
+[dependencies.tempfile]
+version = "3"
+
+# --- Fuzz targets ---
+
+[[bin]]
+name = "resp_parse"
+path = "fuzz_targets/resp_parse.rs"
+doc = false
+
+[[bin]]
+name = "resp_parse_differential"
+path = "fuzz_targets/resp_parse_differential.rs"
+doc = false
+
+[[bin]]
+name = "inline_parse"
+path = "fuzz_targets/inline_parse.rs"
+doc = false
+
+[[bin]]
+name = "wal_v3_record"
+path = "fuzz_targets/wal_v3_record.rs"
+doc = false
+
+[[bin]]
+name = "rdb_load"
+path = "fuzz_targets/rdb_load.rs"
+doc = false
+
+[[bin]]
+name = "gossip_deser"
+path = "fuzz_targets/gossip_deser.rs"
+doc = false
+
+[[bin]]
+name = "acl_rule"
+path = "fuzz_targets/acl_rule.rs"
+doc = false
+
+[workspace]
+members = ["."]

@@ -87,6 +87,7 @@ libc = "0.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 redis = { version = "1.1", features = ["tokio-comp"] }
 tempfile = "3"
+loom = "0.7"
 
 [profile.release]
 debug = false         # No debug symbols for smaller/faster binary
