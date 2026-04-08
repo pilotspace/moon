@@ -2,7 +2,7 @@
 name = "moon"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94"
 description = "A high-performance Redis-compatible server written in Rust"
 license = "Apache-2.0"
 repository = "https://github.com/pilotspace/moon"
