@@ -318,7 +318,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                 }
             }
             type_tag => {
-                match read_entry_zero_copy(&mut cursor, type_tag, &shared_buf, now_secs) {
+                match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
                     Ok((key, entry)) => {
                         if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
                             continue;
@@ -520,11 +520,17 @@ fn skip_bytes_field(data: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
-/// Zero-copy variant of read_entry: uses shared Bytes buffer and cached timestamps.
+/// Variant of read_entry using cached timestamps to avoid per-entry syscalls.
+///
+/// Earlier revisions threaded a `shared_buf: &Bytes` through this path for
+/// zero-copy slicing via `read_bytes_zero_copy`, but that helper was never
+/// wired up — `read_bytes` currently always heap-allocates. The parameter
+/// and the caller-side `Bytes::copy_from_slice(data)` that fed it have been
+/// removed; restoring true zero-copy should add it back as part of a single
+/// landed change, not as vestigial plumbing.
 fn read_entry_zero_copy(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
-    _shared_buf: &Bytes,
     cached_secs: u32,
 ) -> Result<(Bytes, Entry), MoonError> {
     let key = read_bytes(cursor)?;
@@ -803,7 +809,6 @@ pub fn load_from_bytes(
 
     let now_ms = current_time_ms();
     let now_secs = (now_ms / 1000) as u32;
-    let shared_buf = Bytes::copy_from_slice(data);
     let mut total_keys = 0usize;
     let mut current_db: usize = 0;
 
@@ -840,7 +845,7 @@ pub fn load_from_bytes(
                     .into());
                 }
             }
-            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, &shared_buf, now_secs) {
+            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
                 Ok((key, entry)) => {
                     if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
                         continue;
@@ -1349,28 +1354,6 @@ pub(crate) fn read_bytes_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, Moon
     let slice = &cursor.get_ref()[pos..pos + len];
     cursor.set_position((pos + len) as u64);
     Ok(slice.to_vec())
-}
-
-/// Zero-copy read: returns a `Bytes` slice of the shared buffer (no heap alloc).
-#[allow(dead_code)]
-pub(crate) fn read_bytes_zero_copy(
-    cursor: &mut Cursor<&[u8]>,
-    shared_buf: &Bytes,
-) -> Result<Bytes, MoonError> {
-    let len = read_u32(cursor)? as usize;
-    let pos = cursor.position() as usize;
-    let remaining = cursor.get_ref().len() - pos;
-    if len > remaining {
-        return Err(RdbError::Corrupted {
-            detail: format!(
-                "read_bytes_zero_copy: length {} exceeds remaining {}",
-                len, remaining
-            ),
-        }
-        .into());
-    }
-    cursor.set_position((pos + len) as u64);
-    Ok(shared_buf.slice(pos..pos + len))
 }
 
 pub(crate) fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, MoonError> {
