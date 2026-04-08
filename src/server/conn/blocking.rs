@@ -807,14 +807,18 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
-    // --- Detect *2\r\n (GET) or *3\r\n (SET) ---
-    let (is_get, is_set) = if buf[1] == b'2' && buf[2] == b'\r' && buf[3] == b'\n' {
-        (true, false)
-    } else if buf[1] == b'3' && buf[2] == b'\r' && buf[3] == b'\n' {
-        (false, true)
-    } else {
+    // --- Detect *2\r\n (GET) ONLY ---
+    //
+    // The inline fast-path is intentionally restricted to read-only,
+    // side-effect-free commands. Write commands (SET, etc.) must go through
+    // the normal dispatcher so that replica READONLY enforcement, ACL checks,
+    // maxmemory eviction, client-side tracking invalidation, keyspace
+    // notifications, replication propagation, and blocking-waiter wakeups
+    // all run. See PR #43 review: inlining SET here bypasses all of those.
+    let is_get = buf[1] == b'2' && buf[2] == b'\r' && buf[3] == b'\n';
+    if !is_get {
         return 0;
-    };
+    }
 
     // After "*N\r\n" expect "$3\r\n" for 3-letter command name
     // Position 4: must be '$', pos 5: '3', pos 6-7: \r\n
@@ -829,10 +833,7 @@ pub(crate) fn try_inline_dispatch(
         buf[10].to_ascii_uppercase(),
     ];
 
-    if is_get && cmd_upper != [b'G', b'E', b'T'] {
-        return 0;
-    }
-    if is_set && cmd_upper != [b'S', b'E', b'T'] {
+    if cmd_upper != [b'G', b'E', b'T'] {
         return 0;
     }
 
@@ -882,120 +883,64 @@ pub(crate) fn try_inline_dispatch(
         }
     }
 
-    if is_get {
-        // GET: done parsing -- total consumed = key_end + 2
-        let consumed = key_end + 2;
-        let key_bytes = &buf[key_start..key_end];
+    // GET: done parsing -- total consumed = key_end + 2
+    let _ = aof_tx; // AOF unused on the read-only inline path
+    let consumed = key_end + 2;
+    let key_bytes = &buf[key_start..key_end];
 
-        // Read path: shared lock + single DashTable lookup via get_if_alive
-        let guard = shard_databases.read_db(shard_id, selected_db);
-        match guard.get_if_alive(key_bytes, now_ms) {
-            Some(entry) => {
-                match entry.value.as_bytes() {
-                    Some(val) => {
-                        // $<len>\r\n<val>\r\n
-                        write_buf.extend_from_slice(b"$");
-                        let mut itoa_buf = itoa::Buffer::new();
-                        write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
-                        write_buf.extend_from_slice(b"\r\n");
-                        write_buf.extend_from_slice(val);
-                        write_buf.extend_from_slice(b"\r\n");
-                    }
-                    None => {
-                        // Wrong type
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
-                    }
+    // Read path: shared lock + single DashTable lookup via get_if_alive
+    let guard = shard_databases.read_db(shard_id, selected_db);
+    match guard.get_if_alive(key_bytes, now_ms) {
+        Some(entry) => {
+            match entry.value.as_bytes() {
+                Some(val) => {
+                    // $<len>\r\n<val>\r\n
+                    write_buf.extend_from_slice(b"$");
+                    let mut itoa_buf = itoa::Buffer::new();
+                    write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    write_buf.extend_from_slice(val);
+                    write_buf.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    // Wrong type
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
                 }
             }
-            None => {
-                // Cold storage fallback: key may have been evicted to NVMe.
-                // CRITICAL: do the in-memory index lookup under the guard,
-                // then DROP the guard before doing the synchronous disk read,
-                // so concurrent ops on this shard are not blocked on I/O.
-                let cold_loc = guard.cold_lookup_location(key_bytes);
-                drop(guard);
-                let cold = cold_loc.and_then(|(loc, shard_dir)| {
-                    crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
-                });
-                if let Some((value, _ttl)) = cold {
-                    if let crate::storage::entry::RedisValue::String(v) = value {
-                        write_buf.extend_from_slice(b"$");
-                        let mut itoa_buf2 = itoa::Buffer::new();
-                        write_buf.extend_from_slice(itoa_buf2.format(v.len()).as_bytes());
-                        write_buf.extend_from_slice(b"\r\n");
-                        write_buf.extend_from_slice(&v);
-                        write_buf.extend_from_slice(b"\r\n");
-                    } else {
-                        write_buf.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
-                    }
+        }
+        None => {
+            // Cold storage fallback: key may have been evicted to NVMe.
+            // CRITICAL: do the in-memory index lookup under the guard,
+            // then DROP the guard before doing the synchronous disk read,
+            // so concurrent ops on this shard are not blocked on I/O.
+            let cold_loc = guard.cold_lookup_location(key_bytes);
+            drop(guard);
+            let cold = cold_loc.and_then(|(loc, shard_dir)| {
+                crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
+            });
+            if let Some((value, _ttl)) = cold {
+                if let crate::storage::entry::RedisValue::String(v) = value {
+                    write_buf.extend_from_slice(b"$");
+                    let mut itoa_buf2 = itoa::Buffer::new();
+                    write_buf.extend_from_slice(itoa_buf2.format(v.len()).as_bytes());
+                    write_buf.extend_from_slice(b"\r\n");
+                    write_buf.extend_from_slice(&v);
+                    write_buf.extend_from_slice(b"\r\n");
                 } else {
-                    write_buf.extend_from_slice(b"$-1\r\n");
+                    write_buf.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
                 }
-                let _ = read_buf.split_to(consumed);
-                return 1;
+            } else {
+                write_buf.extend_from_slice(b"$-1\r\n");
             }
+            let _ = read_buf.split_to(consumed);
+            return 1;
         }
-        drop(guard);
-        let _ = read_buf.split_to(consumed);
-        return 1;
     }
-
-    // --- SET: parse value argument ---
-    let mut vpos = key_end + 2; // after key's trailing \r\n
-    if vpos >= len || buf[vpos] != b'$' {
-        return 0;
-    }
-    vpos += 1; // skip '$'
-
-    let mut val_len: usize = 0;
-    while vpos < len && buf[vpos] != b'\r' {
-        let d = buf[vpos];
-        if d < b'0' || d > b'9' {
-            return 0;
-        }
-        val_len = val_len * 10 + (d - b'0') as usize;
-        vpos += 1;
-    }
-    if vpos + 1 >= len || buf[vpos] != b'\r' || buf[vpos + 1] != b'\n' {
-        return 0;
-    }
-    vpos += 2; // skip \r\n
-
-    let val_start = vpos;
-    let val_end = val_start + val_len;
-    if val_end + 2 > len {
-        return 0; // partial value
-    }
-    if buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
-        return 0;
-    }
-
-    let consumed = val_end + 2;
-
-    // Create owned copies of key and value before advancing read_buf
-    let key_owned = Bytes::copy_from_slice(&buf[key_start..key_end]);
-    let val_owned = Bytes::copy_from_slice(&buf[val_start..val_end]);
-
-    // AOF: capture the raw RESP bytes before we advance the buffer
-    if let Some(tx) = aof_tx {
-        let aof_bytes = Bytes::copy_from_slice(&buf[..consumed]);
-        let _ = tx.try_send(crate::persistence::aof::AofMessage::Append(aof_bytes));
-    }
-
-    // Insert into database
-    {
-        let entry = crate::storage::entry::Entry::new_string(val_owned);
-        let mut guard = shard_databases.write_db(shard_id, selected_db);
-        guard.set(key_owned, entry);
-    }
-
-    // +OK\r\n
-    write_buf.extend_from_slice(b"+OK\r\n");
-
+    drop(guard);
     let _ = read_buf.split_to(consumed);
     1
 }
