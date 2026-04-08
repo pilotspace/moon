@@ -3,551 +3,171 @@
 </p>
 
 <p align="center">
-  <strong>A high-performance, Redis-compatible in-memory data store written in Rust from scratch.</strong>
+  <strong>A Redis-compatible in-memory data store, written from scratch in Rust.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/version-v0.1.0-blue" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/status-experimental-orange" alt="Status"></a>
+  <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
   <img src="https://img.shields.io/badge/rust-edition%202024-orange" alt="Rust">
   <img src="https://img.shields.io/badge/redis--compatible-RESP2%2FRESP3-red" alt="Protocol">
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> &bull;
-  <a href="#features">Features</a> &bull;
-  <a href="#architecture">Architecture</a> &bull;
-  <a href="#configuration">Configuration</a> &bull;
-  <a href="#command-reference">Commands</a> &bull;
-  <a href="#benchmarking">Benchmarks</a> &bull;
+  <a href="#quick-start">Quick start</a> &bull;
+  <a href="#why-moon">Why Moon</a> &bull;
+  <a href="#benchmarks">Benchmarks</a> &bull;
+  <a href="docs/index.mdx">Docs</a> &bull;
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 ---
 
-> **Warning**
-> This project is **experimental** and under active development. It is NOT recommended for production use. APIs, storage formats, and configuration options may change without notice between releases. Use at your own risk. If you encounter issues, please [open an issue](https://github.com/pilotspace/moon/issues).
+> **⚠ Experimental.** Moon is under active development and **not** recommended for production. Storage formats, APIs, and config flags may change between releases. Please [open an issue](https://github.com/pilotspace/moon/issues) if something breaks.
 
 ---
 
-Moon implements 200+ Redis commands with a thread-per-core shared-nothing architecture, dual-runtime support (Tokio + Monoio), SIMD-accelerated parsing, forkless persistence, tiered disk offload, and memory-optimized data structures. It consistently outperforms Redis 8.x by **2x** on throughput (4.8M GET/s vs 2.4M) while using **27-35% less memory** for real-world value sizes and providing **100% crash recovery** across all persistence tiers.
+Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. It runs on a thread-per-core, shared-nothing architecture with optional `io_uring` I/O, per-shard WAL, tiered disk offload, and an in-process vector search engine. Any Redis client connects out of the box.
 
-## Moon vs Redis Architecture
+## Why Moon
+
+- **Thread-per-core, zero shared state.** Each shard owns its own event loop, DashTable, WAL writer, and Pub/Sub registry. No global locks; cross-shard dispatch is a lock-free SPSC channel.
+- **Dual runtime.** Monoio (`io_uring` on Linux, `kqueue` on macOS) for peak throughput; Tokio for portability and CI. Same binary, feature-gated.
+- **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no fork(), no COW memory spike. AOF is a per-shard WAL with batched fsync; the advantage over Redis grows with pipeline depth.
+- **Tiered disk offload.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through. 100% crash recovery across all tiers.
+- **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
+- **In-process vector search.** `FT.CREATE` / `FT.SEARCH` with HNSW + TurboQuant 4-bit quantization. **2.56× Qdrant QPS** at higher recall on real MiniLM embeddings.
 
 <p align="center">
   <img src="assets/architecture-comparison.png" alt="Moon vs Redis Architecture" width="100%">
 </p>
 
-## Benchmark Achievements
+## Benchmarks
 
-<p align="center">
-  <img src="assets/benchmark-chart.png" alt="Benchmark Results" width="100%">
-</p>
+Measured vs Redis 8.6.1, co-located client and server, pipeline depth tuned per row. Full methodology and reproduction steps in [BENCHMARK.md](BENCHMARK.md) and [docs/benchmarks.mdx](docs/benchmarks.mdx).
 
-### Multi-Shard Scaling & Production Value
+### Peak throughput (GCP c3-standard-8, x86_64, monoio io_uring)
 
-<p align="center">
-  <img src="assets/shard-scaling-chart.png" alt="Shard Scaling & Production Value" width="100%">
-</p>
+| Workload                         |   Moon | Redis |  Ratio |
+|----------------------------------|-------:|------:|:------:|
+| Peak GET (c=50, p=64)            | 4.81M  | 2.36M | **2.04×** |
+| Peak SET (c=50, p=64)            | 3.60M  | 1.79M | **2.01×** |
+| GET with AOF everysec            | 4.57M  | 2.24M | **2.04×** |
+| GET with Disk Offload            | 4.81M  | 2.36M | **2.04×** |
+| Single-conn GET (c=1, p=64)      | 2.08M  | 1.30M | **1.60×** |
+| p99 latency (c=10, p=64)         | 0.079 ms | 0.263 ms | **3.3× lower** |
+| Memory, values ≥ 1 KB            | —      | —     | **27–35% less** |
+| Crash recovery (SIGKILL, 5K keys)| 100%   | 100%  | parity |
 
-### x86_64 (GCP c3-standard-8, Intel Xeon 8481C, CPU-pinned, monoio io_uring)
+### Vector search (10K × 384d MiniLM, k=10)
 
-| Metric | Moon | Redis | Ratio |
-|--------|-----:|------:|:-----:|
-| Peak GET (c=50 p=64) | **4.81M ops/s** | 2.36M | **2.04x** |
-| Peak SET (c=50 p=64) | **3.60M ops/s** | 1.79M | **2.01x** |
-| GET with AOF | **4.57M ops/s** | 2.24M | **2.04x** |
-| GET with Disk Offload | **4.81M ops/s** | 2.36M | **2.04x** |
-| Single-conn GET (c=1 p=64) | **2.08M ops/s** | 1.30M | **1.60x** |
-| Single-conn latency (c=1 p=1) | **0.020ms** | 0.020ms | **parity** |
-| p99 latency (c=10 p=64) | **0.079ms** | 0.263ms | **3.3x lower** |
-| Crash recovery (5K keys) | **100%** | 100% | **parity** |
-| Memory (1KB+ values) | | | **27-35% less** |
+|                    |   Moon x86 | Qdrant FP32 |
+|--------------------|-----------:|------------:|
+| Recall@10          | **0.9670** | ~0.9500     |
+| Search QPS         | **1,296**  | 507         |
+| Search p50         | **0.78 ms**| 1.79 ms     |
+| Insert rate        | **11.3K/s**| ~2.6K/s     |
+| Memory per vector  | **~3.2 KB**| ~4.0 KB     |
 
-### 3-Tier Throughput (GET ops/s, c=10 p=64)
+> **Caveat.** The x86_64 numbers above were measured before the PR #43 correctness changes were landed. A correctness-preserving dispatch hot-path recovery is in place on aarch64 — see the [dispatch recovery entry in CHANGELOG.md](CHANGELOG.md#unreleased---dispatch-hot-path-recovery-2026-04-08) for per-commit profiles. x86_64 peak numbers will be re-measured on the next release.
 
-| Tier | Moon | Redis | Ratio |
-|------|-----:|------:|:-----:|
-| In-Memory (no persist) | **4.71M** | 2.29M | **2.06x** |
-| AOF everysec | **4.57M** | 2.24M | **2.04x** |
-| Disk Offload + AOF | **4.71M** | 2.29M | **2.06x** |
-
-### Crash Recovery (SIGKILL, 5000 keys)
-
-| Configuration | Moon | Redis |
-|---------------|:----:|:-----:|
-| AOF everysec | 5000/5000 (100%) | 5000/5000 (100%) |
-| AOF always | 5000/5000 (100%) | 5000/5000 (100%) |
-| Disk Offload + AOF | 5000/5000 (100%) | N/A |
-| Disk Offload + maxmemory | 5000/5000 (100%) | N/A |
-
-### Vector Search (Real MiniLM Embeddings, 10K × 384d, k=10)
-
-Moon ships an in-process vector search engine with **TurboQuant 4-bit compression**,
-HNSW indexing, and Redis-compatible `FT.CREATE` / `FT.SEARCH` commands. Benchmarked
-against Qdrant 1.12 (FP32 HNSW) on identical hardware:
-
-| | Moon ARM64 (t2a, Ampere Altra) | Moon x86 (c3, Xeon 8481C) | Qdrant FP32 (x86) |
-|---|---:|---:|---:|
-| **Recall@10** | **0.9670** | **0.9670** | ~0.95 |
-| **Search QPS** | 843 | **1,296** | 507 |
-| **Search p50** | 1.20 ms | **0.78 ms** | 1.79 ms |
-| **Insert** | 9,950 v/s | 11,270 v/s | ~2,600 v/s |
-| **Memory/vec** | ~3.2 KB | ~3.2 KB | ~4.0 KB |
-
-- **2.56× Qdrant search QPS** on x86 with **higher recall** (+1.7%)
-- **4.3× Qdrant insert throughput** via auto-indexing on `HSET`
-- **20% less memory per vector** via TurboQuant 4-bit quantization
-- **Cross-platform deterministic** — identical recall and top-k results on ARM64 vs x86
-
-See [Vector Search Guide](docs/vector-search-guide.md) for `FT.CREATE` syntax,
-`COMPACT_THRESHOLD` tuning, and `BUILD_MODE` trade-offs.
-
-### ARM64 (Apple M4 Pro, OrbStack Linux VM)
-
-| Metric | Moon vs Redis | Conditions |
-|--------|:------------:|------------|
-| Peak GET throughput | **3.79M ops/sec** | 4 shards, pipeline=64 |
-| Peak SET with AOF | **2.78M ops/sec** | AOF everysec, pipeline=64 |
-| Throughput (pipeline=64) | **3.17x faster** | 1 shard, SET |
-| Throughput (8 shards) | **1.84-1.99x faster** | GET/SET, pipeline=16 |
-| With AOF persistence | **2.75x faster** | Per-shard WAL vs global fsync |
-| p50 latency (8 shards) | **8-10x lower** | 0.031ms vs 0.26ms |
-| CPU efficiency (p=64) | **45x better** | 1.9% vs 43.9% CPU |
-
-See [BENCHMARK.md](BENCHMARK.md) for full methodology and results, or [BENCHMARK-PRODUCTION.md](BENCHMARK-PRODUCTION.md) for production workload patterns.
-
-### Recent Perf Recovery (2026-04-08, aarch64 dev VM)
-
-After PR #43 (disk-offload) removed an unsound inline SET fast-path that was
-bypassing replica / ACL / maxmemory / tracking / notifications / replication
-side-effects, three flamegraph-driven fixes recovered the hot path in a
-correctness-preserving way:
-
-| Metric (1 shard, c=50, p=16, aarch64 OrbStack) | Broken | After T0 | Δ   |
-|------------------------------------------------|-------:|---------:|-----|
-| SET p=1 vs Redis                               | 0.99x  | **1.12x** | +13pp |
-| SET p=16 throughput                            | 1.42M  | **1.94M** | +37% |
-| SET p=32 throughput                            | 2.06M  | **2.26M** | +10% |
-| GET p=16 throughput                            | 2.40M  | **4.04M** | +68% |
-| GET p=128 vs Redis                             | 1.87x  | **1.91x** | +4pp |
-
-- **T0a** — Thread-local cached clock eliminates `clock_gettime` from the
-  `Entry::new_*` constructor hot path (was 10.14% of CPU → 0%).
-- **T0b** — Hot command dispatch bypasses the phf `SipHasher` via a direct
-  `(len, packed u64)` match against 24 pre-resolved `&'static CommandMeta`
-  pointers (was ~6% of CPU → 0%).
-- **T0c** — ACL `check_*_permission` short-circuits on a cached
-  `unrestricted: bool` for the default `on nopass ~* &* +@all` user shape
-  (was 2.11% of CPU → 0%).
-
-See [CHANGELOG.md](CHANGELOG.md#unreleased---dispatch-hot-path-recovery-2026-04-08)
-for per-commit profiles and correctness guarantees. Follow-up work (T1
-zero-alloc `dispatch_raw` entry point, Tier 2 storage/DashTable optimization)
-tracked in `.planning/todos/pending/`.
-
-> Headline numbers in the tables above (GCP c3-standard-8 x86_64) were measured
-> before the PR #43 correctness changes and have not yet been re-run on x86.
-> The aarch64 table in this section reflects the current dispatch hot path on
-> the dev VM; x86 peak throughput is expected to follow a similar trajectory
-> once re-benchmarked.
-
-## Features
-
-### Data Types
-- **Strings** - GET, SET, MGET, MSET, INCR/DECR, APPEND, GETRANGE, SETRANGE, GETEX, GETDEL, and more
-- **Lists** - LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINSERT, LPOS, blocking BLPOP/BRPOP/BLMOVE
-- **Hashes** - HSET, HGET, HGETALL, HINCRBY, HSCAN, and all hash operations
-- **Sets** - SADD, SREM, SINTER, SUNION, SDIFF, SRANDMEMBER, SPOP, SSCAN
-- **Sorted Sets** - ZADD, ZRANGE, ZRANGEBYSCORE, ZRANK, ZINCRBY, ZPOPMIN/MAX, blocking BZPOPMIN/MAX
-- **Streams** - XADD, XREAD, XRANGE, XLEN, XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM
-- **Vector Search** - FT.CREATE, FT.SEARCH, FT.COMPACT, FT.INFO, FT.DROPINDEX with HNSW + TurboQuant 4-bit quantization. 1,296 QPS / 0.78ms p50 on real MiniLM data — beats Qdrant FP32 by 2.56x with higher recall
-
-### Architecture
-- **Thread-per-core** shared-nothing design with per-shard event loops
-- **Dual runtime** - Tokio (all platforms) + Monoio (Linux io_uring / macOS kqueue)
-- **DashTable** - Segmented hash table with Swiss Table SIMD probing
-- **SIMD parsing** - memchr-accelerated CRLF scanning, atoi fast integer parsing
-- **Lock-free channels** - Custom oneshot channels replacing tokio::oneshot (12% CPU reduction)
-
-### Persistence
-- **RDB snapshots** - Forkless compartmentalized snapshots (no COW memory spike)
-- **AOF** - Per-shard WAL with batched fsync, configurable everysec/always/no
-- **WAL v2** - Checksums, block framing, corruption isolation
-- **Disk Offload** - Tiered storage (RAM -> NVMe) with async spill, cold read-through, and crash recovery. Keys evicted under maxmemory are spilled to NVMe instead of being deleted. `--disk-offload enable`
-
-### Networking & Protocol
-- **RESP2/RESP3** - Full protocol support with HELLO negotiation
-- **TLS 1.3** - Via [rustls](https://github.com/rustls/rustls) + [aws-lc-rs](https://github.com/aws/aws-lc-rs), dual-port (plaintext + TLS), mTLS support
-- **Pipelining** - Adaptive batch dispatch with response freezing
-- **Client-side caching** - Invalidation hints via RESP3 Push frames
-
-### Clustering & Replication
-- **Replication** - PSYNC2-compatible, per-shard WAL streaming, partial resync
-- **Cluster mode** - 16,384 hash slots, gossip protocol, MOVED/ASK redirections, live slot migration
-- **Failover** - Majority consensus election, automatic promotion
-
-### Scripting & Security
-- **Lua scripting** - Embedded Lua 5.4 via [mlua](https://github.com/mlua-rs/mlua), EVAL/EVALSHA, sandboxed with Redis API bindings
-- **ACL system** - Per-user permissions, command/key/channel restrictions
-- **Protected mode** - Rejects non-loopback connections when no password is set
-
-### Memory Optimization
-- **CompactKey** - 23-byte inline SSO, eliminates heap allocation for short keys
-- **HeapString** - No Arc overhead for non-shared values
-- **CompactValue** - 16-byte SSO struct with embedded TTL delta
-- **B+ tree sorted sets** - Cache-friendly replacement for BTreeMap
-- **Arena allocation** - Per-request [bumpalo](https://github.com/fitzgen/bumpalo) arenas, per-connection reuse
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) stable toolchain (edition 2024)
-- cmake (required by aws-lc-rs for TLS)
+- `cmake` (required by `aws-lc-rs` for TLS)
 
-### Install from source
+### Build and run
 
 ```bash
 git clone https://github.com/pilotspace/moon.git
 cd moon
 cargo build --release
-```
 
-### Run
-
-```bash
-# Default: binds to 127.0.0.1:6379, auto-detects CPU count for shards
+# Defaults: bind 127.0.0.1:6379, shard count = CPU count
 ./target/release/moon
 
-# With specific options
-./target/release/moon --port 6380 --shards 4 --requirepass mysecret
+# Or with production flags
+./target/release/moon \
+  --port 6379 \
+  --shards 8 \
+  --appendonly yes --appendfsync everysec \
+  --maxmemory 8g --maxmemory-policy allkeys-lfu
 ```
 
-### Connect
-
-Any Redis client works out of the box:
+### Connect with any Redis client
 
 ```bash
 redis-cli -p 6379
-127.0.0.1:6379> PING
-PONG
 127.0.0.1:6379> SET hello world
 OK
 127.0.0.1:6379> GET hello
 "world"
-127.0.0.1:6379> HSET user:1 name "Alice" age 30
+127.0.0.1:6379> HSET user:1 name Alice age 30
 (integer) 2
-127.0.0.1:6379> HGETALL user:1
-1) "name"
-2) "Alice"
-3) "age"
-4) "30"
+127.0.0.1:6379> FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA emb VECTOR HNSW 6 DIM 384 TYPE FLOAT32 DISTANCE_METRIC COSINE
+OK
 ```
 
 ### Docker
 
-Moon ships a multi-stage Dockerfile with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) dependency caching and a [distroless](https://github.com/GoogleContainerTools/distroless) runtime (~41MB final image).
+Multi-stage build with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) caching and a [distroless](https://github.com/GoogleContainerTools/distroless) runtime (~41 MB final image):
 
 ```bash
-# Build (default: monoio runtime + jemalloc)
 docker build -t moon .
-
-# Build with tokio runtime
-docker build --build-arg FEATURES=runtime-tokio,jemalloc -t moon .
-
-# Multi-platform build (amd64 + arm64)
-docker buildx build --platform linux/amd64,linux/arm64 -t moon .
-
-# Run
-docker run -d -p 6379:6379 moon
-
-# Run with persistence
 docker run -d -p 6379:6379 -v moon-data:/data moon \
-  moon --bind 0.0.0.0 --appendonly yes --appendfsync everysec
-
-# Run with TLS
-docker run -d -p 6379:6379 -p 6443:6443 -v /path/to/certs:/data moon \
-  moon --bind 0.0.0.0 --tls-port 6443 \
-  --tls-cert-file /data/cert.pem --tls-key-file /data/key.pem
+  moon --bind 0.0.0.0 --appendonly yes
 ```
 
-Or use Docker Compose:
+See [docs/quickstart.mdx](docs/quickstart.mdx) for alternative build configs, TLS setup, and Docker Compose.
+
+## Features at a glance
+
+| Category | Highlights |
+|---|---|
+| **Data types** | Strings, lists, hashes, sets, sorted sets, streams, HyperLogLog, bitmaps, vectors |
+| **Persistence** | Forkless RDB, per-shard AOF (`always`/`everysec`/`no`), WAL v2 framing, tiered disk offload |
+| **Networking** | RESP2/RESP3, HELLO negotiation, TLS 1.3 (rustls + aws-lc-rs), mTLS, pipelining, client-side caching |
+| **Clustering** | 16,384 hash slots, gossip, MOVED/ASK, live slot migration, PSYNC2 replication, majority-vote failover |
+| **Scripting & security** | Lua 5.4 (EVAL/EVALSHA), ACL users/keys/channels/commands, protected mode |
+| **Vector search** | `FT.CREATE`/`FT.SEARCH`, HNSW + TurboQuant 4-bit, auto-indexing on `HSET` |
+| **Observability** | `INFO`, `SLOWLOG`, `COMMAND DOCS`, `OBJECT`, `DEBUG`, structured `tracing` logs |
+
+Full command list: [docs/commands.mdx](docs/commands.mdx). Configuration flags: [docs/configuration.mdx](docs/configuration.mdx). Architecture deep-dive: [docs/architecture.mdx](docs/architecture.mdx).
+
+## Development
 
 ```bash
-docker compose up -d       # Start
-docker compose logs -f     # Follow logs
-docker compose down        # Stop
-```
-
-## Configuration
-
-All options are available as command-line flags. See `--help` for the full list.
-
-### Server
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--bind` | `127.0.0.1` | Bind address |
-| `--port` / `-p` | `6379` | Port to listen on |
-| `--shards` | `0` (auto) | Number of shards (0 = CPU count) |
-| `--databases` | `16` | Number of databases |
-| `--requirepass` | *(none)* | Require password authentication |
-| `--protected-mode` | `yes` | Reject non-loopback when no password set |
-
-### Persistence
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--appendonly` | `no` | Enable AOF persistence (`yes`/`no`) |
-| `--appendfsync` | `everysec` | AOF fsync policy (`always`/`everysec`/`no`) |
-| `--appendfilename` | `appendonly.aof` | AOF filename |
-| `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
-| `--dir` | `.` | Directory for persistence files |
-| `--dbfilename` | `dump.rdb` | RDB snapshot filename |
-
-### Memory & Eviction
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--maxmemory` | `0` | Max memory in bytes (0 = unlimited) |
-| `--maxmemory-policy` | `noeviction` | Eviction policy |
-| `--maxmemory-samples` | `5` | Keys to sample for eviction |
-
-**Eviction policies:** `noeviction`, `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random`, `volatile-ttl`
-
-### TLS
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--tls-port` | `0` (disabled) | TLS listener port |
-| `--tls-cert-file` | *(none)* | PEM certificate file |
-| `--tls-key-file` | *(none)* | PEM private key file |
-| `--tls-ca-cert-file` | *(none)* | CA cert for mTLS client auth |
-| `--tls-ciphersuites` | *(default)* | TLS 1.3 cipher suites |
-
-### Cluster
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--cluster-enabled` | `false` | Enable cluster mode |
-| `--cluster-node-timeout` | `15000` | Node timeout in ms |
-
-### ACL
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--aclfile` | *(none)* | Path to ACL file (Redis-compatible format) |
-| `--acllog-max-len` | `128` | Max ACL log entries |
-
-### Example: Production Configuration
-
-```bash
-./target/release/moon \
-  --bind 0.0.0.0 \
-  --port 6379 \
-  --tls-port 6380 \
-  --tls-cert-file /etc/moon/server.crt \
-  --tls-key-file /etc/moon/server.key \
-  --shards 8 \
-  --requirepass "$REDIS_PASSWORD" \
-  --appendonly yes \
-  --appendfsync everysec \
-  --dir /var/lib/moon \
-  --maxmemory 8589934592 \
-  --maxmemory-policy allkeys-lfu \
-  --aclfile /etc/moon/users.acl
-```
-
-## Architecture
-
-```
-                    Client Connections
-                           |
-                    TCP / TLS Listener
-                           |
-                  ┌────────┴────────┐
-                  │  Shard Router    │  (hash(key) % N)
-                  └────────┬────────┘
-           ┌───────┬───────┼───────┬───────┐
-        Shard 0  Shard 1  ...   Shard N-1
-           │       │               │
-      ┌────┴────┐  │          ┌────┴────┐
-      │DashTable│  │          │DashTable│  Swiss Table SIMD
-      │  (data) │  │          │  (data) │
-      └────┬────┘  │          └────┬────┘
-           │       │               │
-        Per-Shard WAL          Per-Shard WAL   (batched fsync)
-```
-
-Each shard runs on its own thread with:
-- Independent event loop (Tokio `current_thread` or Monoio `LocalExecutor`)
-- Own DashTable with segmented hash table and SIMD probing
-- Own WAL writer for persistence (no global lock)
-- Own PubSub registry with cross-shard fan-out via SPSC channels
-- Own Lua VM instance for script execution
-
-**Key design choices:**
-- **No shared mutable state** between shards — all cross-shard communication via message passing
-- **Forkless snapshots** — iterate DashTable segments asynchronously, no COW memory spike
-- **CompactKey SSO** — keys up to 23 bytes stored inline (no heap allocation)
-- **Lock-free oneshot** — custom channels replace tokio::oneshot for 12% CPU reduction
-- **CachedClock** — thread-local timestamp cache avoids syscall per operation
-
-## Benchmarking
-
-```bash
-# Quick throughput comparison vs Redis
-./scripts/bench-production.sh
-
-# Memory and CPU efficiency benchmark
-./scripts/bench-resources.sh
-
-# Cargo micro-benchmarks
-RUSTFLAGS="-C target-cpu=native" cargo bench
-
-# Run data consistency tests (132 tests across 1/4/12 shard configs)
-./scripts/test-consistency.sh
-```
-
-See [BENCHMARK.md](BENCHMARK.md) for detailed methodology and [BENCHMARK-RESOURCES.md](BENCHMARK-RESOURCES.md) for memory/CPU profiling data.
-
-## Testing
-
-```bash
-# Unit tests (1,067 tests)
+# Unit tests (1,872 tests)
 cargo test --lib
 
-# With logging
-RUST_LOG=moon=debug cargo test --lib
+# Full CI matrix (Linux, via OrbStack on macOS)
+cargo fmt --check && cargo clippy -- -D warnings && cargo test --release
 
-# Data consistency tests (132 tests vs Redis as ground truth)
+# Data-consistency tests vs Redis as ground truth (132 tests, 1/4/12 shards)
 ./scripts/test-consistency.sh
+
+# Throughput comparison vs Redis
+./scripts/bench-production.sh
+
+# Flamegraph a hot path
+cargo flamegraph --bin moon -- --port 6399 --shards 1
 ```
 
-## Command Reference
+Contribution guide and coding rules (unsafe policy, hot-path allocation rules, lock discipline) are in [CLAUDE.md](CLAUDE.md) and [UNSAFE_POLICY.md](UNSAFE_POLICY.md).
 
-<details>
-<summary><strong>200+ supported commands</strong> (click to expand)</summary>
+## Roadmap
 
-### Connection (7)
-PING, ECHO, QUIT, SELECT, COMMAND, INFO, AUTH
+Moon is pre-1.0 and **experimental**. Current focus:
 
-### Strings (21)
-GET, SET, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT, APPEND, STRLEN, GETRANGE, SETRANGE, SUBSTR, SETNX, SETEX, PSETEX, GETSET, GETDEL, GETEX
+- Correctness parity with Redis 8.x across the full command surface
+- Tiered disk offload (RAM → NVMe) with crash recovery
+- In-process vector search (HNSW + TurboQuant) with `FT.*` API compatibility
+- Thread-per-core dispatch hot-path optimization (see [CHANGELOG.md](CHANGELOG.md))
 
-### Keys (15)
-DEL, EXISTS, EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, TYPE, UNLINK, SCAN, KEYS, RENAME, RENAMENX
-
-### Hashes (14)
-HSET, HGET, HDEL, HMSET, HMGET, HGETALL, HEXISTS, HLEN, HKEYS, HVALS, HINCRBY, HINCRBYFLOAT, HSETNX, HSCAN
-
-### Lists (16)
-LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LINSERT, LREM, LTRIM, LPOS, LMOVE, BLPOP, BRPOP, BLMOVE
-
-### Sets (15)
-SADD, SREM, SMEMBERS, SCARD, SISMEMBER, SMISMEMBER, SINTER, SUNION, SDIFF, SINTERSTORE, SUNIONSTORE, SDIFFSTORE, SRANDMEMBER, SPOP, SSCAN
-
-### Sorted Sets (21)
-ZADD, ZREM, ZSCORE, ZCARD, ZINCRBY, ZRANK, ZREVRANK, ZPOPMIN, ZPOPMAX, ZSCAN, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZCOUNT, ZLEXCOUNT, ZUNIONSTORE, ZINTERSTORE, BZPOPMIN, BZPOPMAX
-
-### Streams (14)
-XADD, XLEN, XRANGE, XREVRANGE, XREAD, XTRIM, XDEL, XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO
-
-### Pub/Sub (5)
-SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
-
-### Transactions (5)
-MULTI, EXEC, DISCARD, WATCH, UNWATCH
-
-### Scripting (5)
-EVAL, EVALSHA, SCRIPT LOAD, SCRIPT EXISTS, SCRIPT FLUSH
-
-### Persistence (2)
-BGSAVE, BGREWRITEAOF
-
-### Replication (5)
-REPLICAOF, SLAVEOF, REPLCONF, PSYNC, WAIT
-
-### Cluster (9)
-CLUSTER INFO, CLUSTER NODES, CLUSTER SLOTS, CLUSTER MEET, CLUSTER ADDSLOTS, CLUSTER DELSLOTS, CLUSTER SETSLOT, CLUSTER FAILOVER, CLUSTER MYID
-
-### ACL (8)
-ACL SETUSER, ACL GETUSER, ACL DELUSER, ACL LIST, ACL WHOAMI, ACL LOG, ACL SAVE, ACL LOAD
-
-### Server (12)
-CONFIG GET, CONFIG SET, DBSIZE, FLUSHDB, FLUSHALL, HELLO, CLIENT, OBJECT, DEBUG, SLOWLOG, WAIT, COMMAND DOCS
-
-</details>
-
-## Project Structure
-
-```
-src/
-  main.rs              # Entry point, CLI args, server bootstrap
-  config.rs            # Runtime configuration
-  tls.rs               # TLS acceptor (rustls + aws-lc-rs)
-  lib.rs               # Library root, module declarations
-  protocol/            # RESP2/RESP3 parser, serializer, codec
-  server/              # TCP listener, connection handler, shard router
-  storage/             # DashTable, CompactKey, CompactValue, expiration, eviction
-  command/             # Command implementations (string, hash, list, set, etc.)
-  persistence/         # RDB snapshots, AOF writer, WAL v2
-  shard/               # Per-shard event loop, message dispatch
-  cluster/             # Hash slots, gossip protocol, failover, migration
-  replication/         # PSYNC2, backlog, replica streaming
-  scripting/           # Lua VM, script cache, Redis API bridge
-  acl/                 # ACL user permissions, rule parser
-  pubsub/              # Pub/Sub registry, pattern matching
-  blocking/            # Blocking command wakeup (BLPOP, BRPOP, etc.)
-  tracking/            # Client-side caching invalidation
-  runtime/             # Runtime abstraction (Tokio/Monoio traits)
-  io/                  # io_uring driver, buffer management
-```
-
-## References
-
-### Design Inspirations
-
-- [Dragonfly](https://github.com/dragonflydb/dragonfly) — shared-nothing thread-per-core Redis alternative (C++); validated the architecture Moon follows
-- [Dash: Scalable Hashing on Persistent Memory (VLDB 2020)](https://www.vldb.org/pvldb/vol13/p1147-lu.pdf) — segmented hash table design that DashTable is based on
-- [Swiss Table / Abseil](https://abseil.io/about/design/swisstables) — SIMD control-byte probing used within DashTable segments
-- [VLL: Very Lightweight Locking (VLDB 2012)](https://www.vldb.org/pvldb/vol6/p145-ren.pdf) — multi-key coordination across shards without heavy locks
-- [ScyllaDB / Seastar](https://github.com/scylladb/seastar) — pioneered thread-per-core shared-nothing for databases
-- [KeyDB](https://github.com/Snapchat/KeyDB) — multi-threaded Redis fork; demonstrated spinlock ceiling at ~4 threads
-- [Garnet (Microsoft Research)](https://github.com/microsoft/garnet) — .NET Redis alternative with Tsavorite log-structured store
-
-### Protocol & Compatibility
-
-- [Redis Protocol Specification (RESP2/RESP3)](https://redis.io/docs/latest/develop/reference/protocol-spec/) — wire protocol Moon implements
-- [Redis Commands Reference](https://redis.io/docs/latest/commands/) — command semantics Moon follows
-- [Redis Cluster Specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) — 16,384 hash slots, gossip, failover protocol
-- [PSYNC2 Replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/) — partial resync protocol Moon implements
-
-### Core Dependencies
-
-| Crate | Purpose | Why chosen |
-|-------|---------|-----------|
-| [monoio](https://github.com/bytedance/monoio) | Thread-per-core async runtime | io_uring on Linux, kqueue on macOS; [ByteDance production-proven](https://github.com/bytedance/monoio#production-users) |
-| [tokio](https://github.com/tokio-rs/tokio) | Fallback async runtime | Broad ecosystem, cross-platform; used as portable alternative |
-| [tikv-jemallocator](https://github.com/tikv/jemallocator) | Memory allocator | Reduced fragmentation for long-running servers; [TiKV production-proven](https://github.com/tikv/tikv) |
-| [rustls](https://github.com/rustls/rustls) | TLS implementation | Pure Rust, no OpenSSL dependency, async-native |
-| [aws-lc-rs](https://github.com/aws/aws-lc-rs) | Cryptographic backend | FIPS-capable, high-performance AES-GCM and ChaCha20 |
-| [mlua](https://github.com/mlua-rs/mlua) | Lua 5.4 VM | Redis EVAL/EVALSHA compatibility with safe Rust bindings |
-| [memchr](https://github.com/BurntSushi/memchr) | SIMD byte search | [6.5x faster](https://github.com/BurntSushi/memchr#benchmarks) CRLF scanning than std; SSE2/AVX2/NEON |
-| [bumpalo](https://github.com/fitzgen/bumpalo) | Bump allocation arenas | ~2ns allocation; O(1) bulk deallocation per request |
-| [bytes](https://github.com/tokio-rs/bytes) | Zero-copy buffers | `Bytes::freeze()` for shared response data without copying |
-| [xxhash-rust](https://github.com/DoumanAsh/xxhash-rust) | Non-cryptographic hashing | Fast key hashing for DashTable segment routing |
-| [crossbeam-utils](https://github.com/crossbeam-rs/crossbeam) | Concurrency primitives | `CachePadded<T>` for false-sharing prevention |
-| [ringbuf](https://github.com/agerasev/ringbuf) | SPSC ring buffer | Lock-free cross-shard message passing |
-
-### Research & Benchmarking Methodology
-
-- [Redis vs Dragonfly Performance (Redis blog)](https://redis.io/blog/diving-into-dragonfly/) — fair comparison methodology: same cores, cluster vs single-process
-- [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) — industry-standard Redis benchmarking tool
-- [io_uring and Networking (Alibaba Cloud)](https://www.alibabacloud.com/blog/io_uring-vs-epoll-in-high-performance-networking_599367) — io_uring advantages for request-response workloads
-- [Coordinated Omission (Gil Tene)](https://www.scylladb.com/2021/04/22/on-coordinated-omission/) — why open-loop benchmarking matters for tail latency
+Production readiness is **not** a v0.1 goal. Storage formats, APIs, and config flags may change between releases.
 
 ## License
 
