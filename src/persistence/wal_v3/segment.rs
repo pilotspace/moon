@@ -338,13 +338,18 @@ impl WalWriterV3 {
 
         // Delete eligible candidates, respecting min_wal_bytes floor.
         let mut recycled = 0usize;
-        for seg in &all_segments {
+        for i in 0..all_segments.len() {
+            let seg = &all_segments[i];
             // Never delete the active segment.
             if seg.seq >= self.current_sequence {
                 continue;
             }
-            // Only recycle segments whose records are fully before redo_lsn.
-            if seg.base_lsn == 0 || seg.base_lsn >= redo_lsn {
+            // Determine segment end by peeking the next segment's base_lsn.
+            // A segment is only safe to recycle when its last record lies
+            // strictly before redo_lsn — i.e. the next segment's base_lsn
+            // (which equals this segment's end LSN) is <= redo_lsn.
+            let next_base = all_segments.get(i + 1).map(|s| s.base_lsn).unwrap_or(0);
+            if next_base == 0 || next_base > redo_lsn {
                 continue;
             }
             // Check min_wal_bytes floor: stop if removing this segment would
