@@ -194,10 +194,11 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     let key_count = db.len();
     let expires_count = db.expires_count();
     if key_count > 0 {
-        sections.push_str(&format!(
+        let _ = write!(
+            sections,
             "db0:keys={},expires={},avg_ttl=0\r\n",
             key_count, expires_count
-        ));
+        );
     }
 
     Frame::BulkString(Bytes::from(sections))
