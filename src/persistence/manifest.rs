@@ -481,6 +481,18 @@ impl ShardManifest {
         let wal_flush_lsn = u64::from_le_bytes(page[p + 16..p + 24].try_into().ok()?);
         let file_count = u32::from_le_bytes(page[p + 24..p + 28].try_into().ok()?);
         let entry_page_count = u32::from_le_bytes(page[p + 28..p + 32].try_into().ok()?);
+
+        // Validate payload framing: root metadata + declared entries must match
+        // the authenticated payload_bytes and entry_count in the header. This
+        // prevents reading unchecked trailing bytes on a corrupted root page.
+        let expected_payload = ROOT_META_SIZE
+            .checked_add((file_count as usize).checked_mul(FileEntry::SIZE)?)?;
+        if hdr.payload_bytes as usize != expected_payload {
+            return None;
+        }
+        if hdr.entry_count != file_count {
+            return None;
+        }
         let snapshot_lsn = u64::from_le_bytes(page[p + 32..p + 40].try_into().ok()?);
         let created_at = u64::from_le_bytes(page[p + 40..p + 48].try_into().ok()?);
         let mut shard_uuid = [0u8; 16];
