@@ -461,8 +461,8 @@ fn test_fpi_torn_page_defense() {
 
 #[test]
 fn test_disk_offload_disable_is_noop() {
-    // Verify default config has disk-offload disabled
-    let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+    // Verify --disk-offload disable opts out of MoonStore v2 (default is enable).
+    let config = ServerConfig::parse_from(["moon", "--disk-offload", "disable"]);
     assert!(!config.disk_offload_enabled());
     assert_eq!(config.disk_offload, "disable");
 
