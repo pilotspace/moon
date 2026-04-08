@@ -9,6 +9,9 @@
     clippy::type_complexity,
     clippy::too_many_arguments,
     clippy::redundant_closure,
+    // comparison_chain: pervasive in version/LSN/page-id ordering paths; rewriting
+    // to match { Ordering::Less => .., Equal => .., Greater => .. } adds noise
+    // without correctness or perf benefit. Style-only lint, same rationale as above.
     clippy::comparison_chain,
     clippy::explicit_auto_deref,
     clippy::manual_map,

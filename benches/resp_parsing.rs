@@ -60,11 +60,14 @@ fn bench_parse_inline(c: &mut Criterion) {
 }
 
 fn bench_serialize_array(c: &mut Criterion) {
-    let frame = Frame::Array(vec![
-        Frame::BulkString(Bytes::from_static(b"SET")),
-        Frame::BulkString(Bytes::from_static(b"foo")),
-        Frame::BulkString(Bytes::from_static(b"bar")),
-    ]);
+    let frame = Frame::Array(
+        vec![
+            Frame::BulkString(Bytes::from_static(b"SET")),
+            Frame::BulkString(Bytes::from_static(b"foo")),
+            Frame::BulkString(Bytes::from_static(b"bar")),
+        ]
+        .into(),
+    );
     c.bench_function("serialize_array_3elem", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
@@ -76,11 +79,14 @@ fn bench_serialize_array(c: &mut Criterion) {
 
 fn bench_roundtrip(c: &mut Criterion) {
     let config = ParseConfig::default();
-    let frame = Frame::Array(vec![
-        Frame::BulkString(Bytes::from_static(b"SET")),
-        Frame::BulkString(Bytes::from_static(b"mykey")),
-        Frame::BulkString(Bytes::from_static(b"myvalue")),
-    ]);
+    let frame = Frame::Array(
+        vec![
+            Frame::BulkString(Bytes::from_static(b"SET")),
+            Frame::BulkString(Bytes::from_static(b"mykey")),
+            Frame::BulkString(Bytes::from_static(b"myvalue")),
+        ]
+        .into(),
+    );
     c.bench_function("roundtrip_array_3elem", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);

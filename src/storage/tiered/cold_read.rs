@@ -32,6 +32,14 @@ pub fn cold_read_through(
 ///
 /// Returns the deserialized RedisValue and optional TTL (absolute ms).
 /// Returns None if the entry is expired, file is missing, or data is corrupt.
+pub fn read_cold_entry_at(
+    shard_dir: &Path,
+    location: ColdLocation,
+    now_ms: u64,
+) -> Option<(RedisValue, Option<u64>)> {
+    read_cold_entry(shard_dir, location, now_ms)
+}
+
 fn read_cold_entry(
     shard_dir: &Path,
     location: ColdLocation,

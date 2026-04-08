@@ -186,8 +186,8 @@ echo ""
 
 # Create vector index
 redis-cli -p $MOON_PORT FT.CREATE bench_vec ON HASH PREFIX 1 vec: \
-    SCHEMA emb VECTOR HNSW 6 DIM $DIM DISTANCE_METRIC COSINE TYPE FLOAT32 &
-sleep 2
+    SCHEMA emb VECTOR HNSW 6 DIM $DIM DISTANCE_METRIC COSINE TYPE FLOAT32
+sleep 1
 
 # Insert vectors via python
 echo "Inserting $N_VEC vectors (${DIM}d)..."

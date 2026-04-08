@@ -51,13 +51,17 @@ cleanup() {
 trap cleanup EXIT
 
 parse_rps() {
-    # Redis-benchmark 8.x uses \r for progress, final line has "requests per second"
-    # Convert \r to \n first, then extract the numeric RPS value
-    tr '\r' '\n' | grep "requests per second" | tail -1 | awk '{print $2}' | sed 's/,//g'
+    # Redis-benchmark 8.x uses \r for progress, final line has "requests per second".
+    # Handles both "SET: 12345 requests per second" and "MSET (10 keys): 12345 ..."
+    # by stripping everything up to the last ": " before the number.
+    tr '\r' '\n' \
+        | grep "requests per second" \
+        | tail -1 \
+        | sed -n 's/.*: *\([0-9][0-9.]*\) *requests per second.*/\1/p'
 }
 
 parse_p50() {
-    tr '\r' '\n' | grep "requests per second" | tail -1 | sed 's/.*p50=\([0-9.]*\).*/\1/'
+    tr '\r' '\n' | grep "requests per second" | tail -1 | sed -n 's/.*p50=\([0-9.]*\).*/\1/p'
 }
 
 run_redis_bench() {
@@ -85,10 +89,23 @@ get_rss_kb() {
     if [[ "$port" == "$PORT_RUST" ]]; then
         pid="$RUST_PID"
     else
-        pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
+        # Redis is daemonized — no stored PID. Find it portably.
+        pid=$(pgrep -f "redis-server.*${port}" 2>/dev/null | head -1)
+        if [[ -z "$pid" ]] && command -v lsof >/dev/null 2>&1; then
+            pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
+        fi
+        if [[ -z "$pid" ]] && command -v ss >/dev/null 2>&1; then
+            pid=$(ss -tlnpH 2>/dev/null | awk -v p=":$port" '$4 ~ p { print $0 }' \
+                | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+        fi
     fi
     [[ -z "$pid" ]] && echo "0" && return
-    ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo "0"
+    # Prefer /proc on Linux for deterministic numeric output
+    if [[ -r "/proc/$pid/status" ]]; then
+        awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || echo "0"
+    else
+        ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo "0"
+    fi
 }
 
 format_number() {
@@ -236,9 +253,10 @@ scenario_leaderboard() {
     local zadd16_redis=$(echo "$out_redis" | parse_rps)
     local zadd16_rust=$(echo "$out_rust" | parse_rps)
 
-    # ZRANGEBYSCORE (top-N queries) — redis-benchmark supports this
-    out_redis=$(run_redis_bench $PORT_REDIS -c 50 -n $REQUESTS -t zrangebyscore)
-    out_rust=$(run_redis_bench $PORT_RUST -c 50 -n $REQUESTS -t zrangebyscore)
+    # ZPOPMIN (top-of-leaderboard pop) — redis-benchmark built-in.
+    # NOTE: redis-benchmark has no -t zrangebyscore; previously produced bogus 0s.
+    out_redis=$(run_redis_bench $PORT_REDIS -c 50 -n $((REQUESTS / 5)) -t zpopmin)
+    out_rust=$(run_redis_bench $PORT_RUST -c 50 -n $((REQUESTS / 5)) -t zpopmin)
     local zrange_redis=$(echo "$out_redis" | parse_rps)
     local zrange_rust=$(echo "$out_rust" | parse_rps)
     local zrange_p50_redis=$(echo "$out_redis" | parse_p50)
@@ -250,9 +268,9 @@ scenario_leaderboard() {
         "$(format_number "${zadd_redis%%.*}")" "$(format_number "${zadd_rust%%.*}")" "$(ratio "${zadd_rust%%.*}" "${zadd_redis%%.*}")"
     printf "| ZADD (batch ingest, p=16) | %s | %s | %s |\n" \
         "$(format_number "${zadd16_redis%%.*}")" "$(format_number "${zadd16_rust%%.*}")" "$(ratio "${zadd16_rust%%.*}" "${zadd16_redis%%.*}")"
-    printf "| ZRANGEBYSCORE (top-N, p=1) | %s | %s | %s |\n" \
+    printf "| ZPOPMIN (top-of-board, p=1) | %s | %s | %s |\n" \
         "$(format_number "${zrange_redis%%.*}")" "$(format_number "${zrange_rust%%.*}")" "$(ratio "${zrange_rust%%.*}" "${zrange_redis%%.*}")"
-    printf "| ZRANGEBYSCORE p50 latency | %sms | %sms | |\n" "$zrange_p50_redis" "$zrange_p50_rust"
+    printf "| ZPOPMIN p50 latency | %sms | %sms | |\n" "$zrange_p50_redis" "$zrange_p50_rust"
     echo ""
 }
 

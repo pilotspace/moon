@@ -1033,6 +1033,11 @@ impl Database {
     /// When `get_if_alive` returns None, call this to check if the key was
     /// spilled to disk by the eviction path. Returns the value as owned Bytes
     /// (read from disk file). Does NOT promote the entry back to RAM.
+    ///
+    /// WARNING: this method performs synchronous disk I/O. Callers on the
+    /// hot path must release any shard read/write guard *before* invoking it.
+    /// Use [`Self::cold_lookup_location`] under the guard, then drop the guard,
+    /// then call [`crate::storage::tiered::cold_read::read_cold_entry_at`].
     pub fn get_cold_value(
         &self,
         key: &[u8],
@@ -1043,6 +1048,22 @@ impl Database {
         let (value, _ttl) =
             crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)?;
         Some(value)
+    }
+
+    /// Cheap, in-memory cold-index lookup. Returns the disk location plus a
+    /// cloned shard dir path so the caller can drop the shard guard before
+    /// performing the disk read.
+    pub fn cold_lookup_location(
+        &self,
+        key: &[u8],
+    ) -> Option<(
+        crate::storage::tiered::cold_index::ColdLocation,
+        std::path::PathBuf,
+    )> {
+        let shard_dir = self.cold_shard_dir.as_ref()?;
+        let ci = self.cold_index.as_ref()?;
+        let location = ci.lookup(key)?;
+        Some((location, shard_dir.clone()))
     }
 
     /// Read-only existence check: returns false if expired.

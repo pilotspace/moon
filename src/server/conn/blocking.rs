@@ -910,8 +910,16 @@ pub(crate) fn try_inline_dispatch(
                 }
             }
             None => {
-                // Cold storage fallback: key may have been evicted to NVMe
-                if let Some(value) = guard.get_cold_value(key_bytes, now_ms) {
+                // Cold storage fallback: key may have been evicted to NVMe.
+                // CRITICAL: do the in-memory index lookup under the guard,
+                // then DROP the guard before doing the synchronous disk read,
+                // so concurrent ops on this shard are not blocked on I/O.
+                let cold_loc = guard.cold_lookup_location(key_bytes);
+                drop(guard);
+                let cold = cold_loc.and_then(|(loc, shard_dir)| {
+                    crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
+                });
+                if let Some((value, _ttl)) = cold {
                     if let crate::storage::entry::RedisValue::String(v) = value {
                         write_buf.extend_from_slice(b"$");
                         let mut itoa_buf2 = itoa::Buffer::new();
@@ -927,6 +935,8 @@ pub(crate) fn try_inline_dispatch(
                 } else {
                     write_buf.extend_from_slice(b"$-1\r\n");
                 }
+                let _ = read_buf.split_to(consumed);
+                return 1;
             }
         }
         drop(guard);

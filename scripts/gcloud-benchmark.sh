@@ -390,7 +390,7 @@ generate_report() {
     echo "  GENERATING BENCHMARK REPORT"
     echo "=========================================="
 
-    cat > "$RESULTS_DIR/REPORT.md" <<'HEADER'
+    cat > "$RESULTS_DIR/REPORT.md" <<HEADER
 # Moon Benchmark Report
 ## Instance: GCP e2-highmem-4 (4 vCPU, 32GB RAM, AMD EPYC 7B12)
 ## Date: $(date -u +"%Y-%m-%d %H:%M UTC")

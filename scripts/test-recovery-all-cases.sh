@@ -14,7 +14,7 @@ cleanup() {
 
 # Generic test: insert N keys, crash, recover, verify
 run_test() {
-    local name="$1" nkeys="$2" moon_args="$3"
+    local name="$1" nkeys="$2" moon_args="$3" expected="${4:-$nkeys}"
     echo ""
     echo "============================================"
     echo "  TEST: $name ($nkeys keys)"
@@ -67,13 +67,28 @@ correct = sum(1 for i in range(N) if r.get(f'k:{i}') == f'val-{i}')
 print(f'  Recovered: {post}/{N} accessible, {correct}/{N} correct')
 PYEOF
 
-    local post=$(python3 -c "
+    local post
+    post=$(python3 -c "
 import redis
 r = redis.Redis(host='127.0.0.1', port=16379, decode_responses=True)
 print(sum(1 for i in range($nkeys) if r.get(f'k:{i}') is not None))
 ")
 
-    if [ "$post" -ge "$nkeys" ] 2>/dev/null; then
+    if [ "$expected" = "0" ]; then
+        if [ "$post" = "0" ]; then
+            echo "  PASS: $post/$nkeys recovered (expected 0)"
+            RESULTS="$RESULTS\n$name: PASS (0/$nkeys, expected)"
+            PASS=$((PASS + 1))
+        else
+            echo "  FAIL: $post/$nkeys recovered (expected 0)"
+            RESULTS="$RESULTS\n$name: FAIL ($post/$nkeys, expected 0)"
+            FAIL=$((FAIL + 1))
+        fi
+        cleanup
+        return
+    fi
+
+    if [ "$post" -ge "$expected" ] 2>/dev/null; then
         echo "  PASS: $post/$nkeys recovered"
         RESULTS="$RESULTS\n$name: PASS ($post/$nkeys)"
         PASS=$((PASS + 1))
@@ -125,7 +140,7 @@ run_test "DiskOffload+AOF-5000keys" 5000 \
 
 # ─── Case 6: No persistence (should recover 0 — expected) ───
 run_test "NoPersistence" 100 \
-    "--dir /tmp/rc-data"
+    "--dir /tmp/rc-data" 0
 
 echo ""
 echo "============================================"

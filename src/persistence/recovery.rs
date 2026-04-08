@@ -342,8 +342,22 @@ pub fn recover_shard_v3_with_fallback(
                 );
                 return;
             }
-            let file_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-            let page_offset = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            // Bounds already checked by `payload.len() < 16` guard above; use
+            // explicit byte arrays to avoid `.unwrap()` per coding guidelines.
+            let file_id = u64::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+                payload[7],
+            ]);
+            let page_offset = u64::from_le_bytes([
+                payload[8],
+                payload[9],
+                payload[10],
+                payload[11],
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+            ]);
 
             // Check compression flag at offset 16 (added in Phase 84).
             // Pre-Phase-84 FPI records start page_data at offset 16 (first byte is

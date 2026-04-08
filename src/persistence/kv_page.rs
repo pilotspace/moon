@@ -535,10 +535,19 @@ pub fn build_overflow_chain(data: &[u8], file_id: u64, start_page_id: u64) -> Ve
 /// 1-based page index of the first overflow page (page 0 is the KvLeaf).
 /// Reads sequential overflow pages until `next_page == 0`.
 pub fn read_overflow_chain(file_data: &[u8], start_page_idx: usize) -> Option<Vec<u8>> {
+    // Bounded traversal: defends against corrupted next_page links forming
+    // cycles or excessively long chains. Matches VecUndoPage::chain_records.
+    const MAX_OVERFLOW_PAGES: usize = 1000;
+
     let mut result = Vec::new();
     let mut page_idx = start_page_idx;
+    let mut iterations = 0usize;
 
     loop {
+        if iterations >= MAX_OVERFLOW_PAGES {
+            return None;
+        }
+        iterations += 1;
         let offset = page_idx * PAGE_4K;
         if offset + PAGE_4K > file_data.len() {
             return None; // truncated file
