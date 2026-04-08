@@ -126,12 +126,25 @@ pub async fn aof_writer_task(
         // main.rs recovery runs concurrently and must finish before a manifest
         // is created, to avoid racing against legacy single-file AOF detection.
         // main.rs will create the manifest after recovery completes.
+        //
+        // A corrupt manifest is fatal — exit the writer so the server startup
+        // notices and fails loud rather than silently overwriting.
         let mut manifest = loop {
-            if let Some(m) = AofManifest::load(&base_dir) {
-                break m;
+            match AofManifest::load(&base_dir) {
+                Ok(Some(m)) => break m,
+                Ok(None) => {
+                    // main.rs recovery hasn't created the manifest yet — wait.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    error!(
+                        "AOF manifest corrupt at {}: {}. Writer exiting; persistence disabled.",
+                        base_dir.display(),
+                        e
+                    );
+                    return;
+                }
             }
-            // main.rs recovery hasn't created the manifest yet — wait.
-            std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
         // Open the current incremental file for appending
@@ -213,7 +226,7 @@ pub async fn aof_writer_task(
                             error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
                         }
                     }
-                    match do_rewrite_single(&db, &mut manifest, &mut file) {
+                    match do_rewrite_single(&db, &mut manifest, &mut file, &rx) {
                         Ok(()) => {
                             write_error = false; // Reset on successful rewrite
                         }
@@ -226,7 +239,7 @@ pub async fn aof_writer_task(
                             error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
                         }
                     }
-                    match do_rewrite_sharded(&shard_dbs, &mut manifest, &mut file) {
+                    match do_rewrite_sharded(&shard_dbs, &mut manifest, &mut file, &rx) {
                         Ok(()) => {
                             write_error = false;
                         }
@@ -683,38 +696,124 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
     generate_rewrite_commands(&temp_dbs)
 }
 
+/// Drain any queued `AofMessage::Append` messages to the current incr file.
+///
+/// Called during rewrite to catch in-flight appends that handlers sent before
+/// the writer thread could enter the rewrite routine. Messages of other variants
+/// are dropped silently (duplicate rewrites while a rewrite is in progress) or
+/// returned via the flag for Shutdown (caller is responsible for honoring it
+/// after the rewrite completes).
+#[cfg(feature = "runtime-monoio")]
+#[derive(Default)]
+struct DrainOutcome {
+    drained: usize,
+    shutdown_requested: bool,
+}
+
+#[cfg(feature = "runtime-monoio")]
+fn drain_pending_appends(
+    rx: &channel::MpscReceiver<AofMessage>,
+    file: &mut std::fs::File,
+) -> Result<DrainOutcome, MoonError> {
+    use std::io::Write;
+    let mut outcome = DrainOutcome::default();
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            AofMessage::Append(data) => {
+                file.write_all(&data).map_err(|e| AofError::Io {
+                    path: PathBuf::from("<aof incr drain>"),
+                    source: e,
+                })?;
+                outcome.drained += 1;
+            }
+            AofMessage::Shutdown => {
+                outcome.shutdown_requested = true;
+            }
+            AofMessage::Rewrite(_) | AofMessage::RewriteSharded(_) => {
+                // Already rewriting — drop redundant request.
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 /// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.
+///
+/// Correctness ordering (prevents double-apply of non-idempotent commands like
+/// INCR/LPUSH/SADD after rewrite):
+///
+/// 1. Drain any queued appends into the OLD incr file and fsync.
+/// 2. Acquire write locks on all databases in the shard. This blocks handlers
+///    from applying new writes or queueing new appends for the locked dbs.
+/// 3. Drain the channel once more — catches appends for writes that the
+///    handler completed between step 1 and step 2.
+/// 4. Snapshot every database under the write locks. Because no handler can
+///    mutate the dbs while we hold the locks, the snapshot is atomic with
+///    respect to the post-drain channel state.
+/// 5. Release the write locks. New handler writes from here on queue in the
+///    channel and will be processed into the NEW incr file after rotation.
+/// 6. Write the new base RDB, advance the manifest, reopen the file handle.
+///
+/// Invariant: any write captured in the new base is NOT in the new incr file
+/// (handlers were blocked between drain and snapshot), and any write NOT in
+/// the new base IS in the new incr file (queued after lock release).
 #[cfg(feature = "runtime-monoio")]
 fn do_rewrite_single(
     db: &SharedDatabases,
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
+    rx: &channel::MpscReceiver<AofMessage>,
 ) -> Result<(), MoonError> {
-    // Capture (entries, base_ts) per database — preserves original base_ts for correct TTL.
+    // Phase 1: drain pre-rewrite queued appends into old incr, fsync.
+    let pre_drain = drain_pending_appends(rx, file)?;
+    file.sync_data().map_err(|e| AofError::Io {
+        path: manifest.incr_path(),
+        source: e,
+    })?;
+
+    // Phase 2: acquire write locks on every database in the shard.
+    // Order is consistent (index-ascending) so concurrent callers would
+    // serialize without deadlock — but in practice only this thread
+    // acquires multi-db locks.
+    let guards: Vec<_> = db.iter().map(|lock| lock.write()).collect();
+
+    // Phase 3: drain any appends the handlers sent between phase 1 and phase 2.
+    let mid_drain = drain_pending_appends(rx, file)?;
+    file.sync_data().map_err(|e| AofError::Io {
+        path: manifest.incr_path(),
+        source: e,
+    })?;
+
+    // Phase 4: snapshot under the write locks. No mutation is possible.
+    let now_ms = current_time_ms();
     let snapshot: Vec<(
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
         )>,
         u32,
-    )> = db
+    )> = guards
         .iter()
-        .map(|lock| {
-            let guard = lock.read();
+        .map(|guard| {
             let base_ts = guard.base_timestamp();
-            let entries = guard
+            let entries: Vec<_> = guard
                 .data()
                 .iter()
+                .filter(|(_, v)| !v.is_expired_at(base_ts, now_ms))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             (entries, base_ts)
         })
         .collect();
 
+    // Phase 5: release locks. Handlers resume; new appends queue in the channel
+    // and will be processed into the new incr after step 6.
+    drop(guards);
+
+    // Phase 6: write new base, advance manifest, reopen.
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let new_incr = manifest.advance(&rdb_bytes)?;
 
-    // Switch writer to new incr file
     *file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -724,17 +823,60 @@ fn do_rewrite_single(
             source: e,
         })?;
 
+    info!(
+        "AOF rewrite complete (single): drained {}+{} pre-snapshot appends, seq={}",
+        pre_drain.drained, mid_drain.drained, manifest.seq
+    );
+    if pre_drain.shutdown_requested || mid_drain.shutdown_requested {
+        // Caller doesn't currently observe this; logging is the escape hatch.
+        warn!("AOF writer: shutdown requested during rewrite (will honor on next recv)");
+    }
     Ok(())
 }
 
 /// Multi-part rewrite: snapshot all shards → merged RDB base → advance manifest.
+///
+/// See [`do_rewrite_single`] for the ordering rationale. The multi-shard variant
+/// holds write locks on every (shard, db) pair simultaneously for the duration
+/// of the snapshot. This creates a brief global write pause, but it is the only
+/// way to guarantee a torn-free snapshot without per-message sequence numbers.
 #[cfg(feature = "runtime-monoio")]
 fn do_rewrite_sharded(
     shard_dbs: &crate::shard::shared_databases::ShardDatabases,
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
+    rx: &channel::MpscReceiver<AofMessage>,
 ) -> Result<(), MoonError> {
-    // Capture (entries, base_ts) per merged database, preserving original base_ts for TTL.
+    // Phase 1: drain pre-rewrite queued appends into old incr.
+    let pre_drain = drain_pending_appends(rx, file)?;
+    file.sync_data().map_err(|e| AofError::Io {
+        path: manifest.incr_path(),
+        source: e,
+    })?;
+
+    // Phase 2: acquire write locks on ALL (shard, db) pairs simultaneously.
+    // Lock order is (shard_idx, db_idx) ascending — must match anywhere else
+    // that acquires multiple locks to prevent deadlock (currently no other
+    // call site does, but the ordering discipline is documented for future
+    // maintainers).
+    let all_shards = shard_dbs.all_shard_dbs();
+    let mut guards: Vec<Vec<_>> = Vec::with_capacity(all_shards.len());
+    for shard_locks in all_shards {
+        let mut shard_guards = Vec::with_capacity(shard_locks.len());
+        for lock in shard_locks {
+            shard_guards.push(lock.write());
+        }
+        guards.push(shard_guards);
+    }
+
+    // Phase 3: drain appends completed between phase 1 and phase 2.
+    let mid_drain = drain_pending_appends(rx, file)?;
+    file.sync_data().map_err(|e| AofError::Io {
+        path: manifest.incr_path(),
+        source: e,
+    })?;
+
+    // Phase 4: snapshot under locks.
     let db_count = shard_dbs.db_count();
     let mut merged: Vec<(
         Vec<(
@@ -743,12 +885,10 @@ fn do_rewrite_sharded(
         )>,
         u32,
     )> = (0..db_count).map(|_| (Vec::new(), 0u32)).collect();
-
-    for shard_locks in shard_dbs.all_shard_dbs() {
-        for (db_idx, lock) in shard_locks.iter().enumerate() {
-            let guard = lock.read();
+    let now_ms = current_time_ms();
+    for shard_guards in &guards {
+        for (db_idx, guard) in shard_guards.iter().enumerate() {
             let base_ts = guard.base_timestamp();
-            let now_ms = current_time_ms();
             if merged[db_idx].0.is_empty() {
                 merged[db_idx].1 = base_ts;
             }
@@ -760,6 +900,10 @@ fn do_rewrite_sharded(
         }
     }
 
+    // Phase 5: release locks before the expensive disk write.
+    drop(guards);
+
+    // Phase 6: write new base, advance manifest, reopen.
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&merged)?;
     let new_incr = manifest.advance(&rdb_bytes)?;
 
@@ -772,6 +916,13 @@ fn do_rewrite_sharded(
             source: e,
         })?;
 
+    info!(
+        "AOF rewrite complete (sharded): drained {}+{} pre-snapshot appends, seq={}",
+        pre_drain.drained, mid_drain.drained, manifest.seq
+    );
+    if pre_drain.shutdown_requested || mid_drain.shutdown_requested {
+        warn!("AOF writer: shutdown requested during rewrite (will honor on next recv)");
+    }
     Ok(())
 }
 

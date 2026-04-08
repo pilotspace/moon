@@ -453,8 +453,20 @@ impl Database {
     }
 
     /// Pre-size the internal hash table for an expected key count.
-    /// Eliminates segment splits during bulk load.
+    ///
+    /// WARNING: This REPLACES the internal hash table with a fresh one sized for
+    /// `additional` entries. It MUST be called on an empty `Database` (typically
+    /// immediately after `Database::new()` during RDB/AOF bulk load). Calling it
+    /// on a populated database silently discards all entries.
+    ///
+    /// Named `reserve` rather than `reset_with_capacity` to match the plan
+    /// nomenclature, but the debug assertion guards the misuse case.
     pub fn reserve(&mut self, additional: usize) {
+        debug_assert!(
+            self.data.is_empty(),
+            "Database::reserve() must only be called on an empty database (bulk-load pre-sizing); called with {} existing entries",
+            self.data.len()
+        );
         if additional > self.data.len() {
             let new_table = DashTable::with_capacity(additional);
             self.data = new_table;

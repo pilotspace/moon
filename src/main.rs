@@ -243,36 +243,45 @@ fn main() -> anyhow::Result<()> {
     // Multi-part AOF replay layered on top of v2/v3 recovery.
     // Priority: if appendonlydir/ manifest exists → load multi-part (skip legacy v2 fallback).
     // Otherwise v2 already handled legacy appendonly.aof during restore_from_persistence.
+    //
+    // A corrupt manifest is FATAL: overwriting it silently destroys the reference
+    // to the real base RDB and loses all persisted data.
     if config.appendonly == "yes" {
         if let Some(ref dir) = persistence_dir {
+            use anyhow::Context;
             use moon::persistence::aof_manifest::AofManifest;
             use moon::persistence::replay::DispatchReplayEngine;
             let base_dir = std::path::PathBuf::from(dir);
-            if let Some(manifest) = AofManifest::load(&base_dir) {
+            let manifest_opt = AofManifest::load(&base_dir).with_context(|| {
+                format!(
+                    "AOF manifest at {}/appendonlydir/ is corrupt; refusing to start to avoid data loss. Inspect manually before deleting.",
+                    base_dir.display()
+                )
+            })?;
+            if let Some(ref manifest) = manifest_opt {
                 if num_shards == 1 {
-                    match moon::persistence::aof_manifest::replay_multi_part(
+                    let loaded = moon::persistence::aof_manifest::replay_multi_part(
                         &mut shards[0].databases,
-                        &manifest,
+                        manifest,
                         &DispatchReplayEngine,
-                    ) {
-                        Ok(n) => info!(
-                            "AOF multi-part loaded (seq {}): {} entries",
-                            manifest.seq, n
-                        ),
-                        Err(e) => tracing::error!("Multi-part AOF load failed: {}", e),
-                    }
+                    )
+                    .with_context(|| "multi-part AOF replay failed")?;
+                    info!(
+                        "AOF multi-part loaded (seq {}): {} entries",
+                        manifest.seq, loaded
+                    );
                 } else {
                     tracing::warn!(
                         "Multi-part AOF skipped in multi-shard mode (not yet supported)"
                     );
                 }
-            }
-            // Initialize manifest for writer thread (safe — recovery is complete).
-            // On fresh/legacy upgrade, writer is blocked waiting for this file.
-            if AofManifest::load(&base_dir).is_none() {
-                if let Err(e) = AofManifest::initialize(&base_dir) {
-                    tracing::error!("Failed to initialize AOF manifest: {}", e);
-                }
+            } else {
+                // No manifest present — first boot after upgrade from legacy
+                // single-file AOF (v2 recovery already loaded it above) or
+                // fresh install. Initialize now so the writer thread can
+                // unblock and BGREWRITEAOF can advance from seq 1.
+                AofManifest::initialize(&base_dir)
+                    .with_context(|| "failed to initialize AOF manifest")?;
             }
         }
     }
