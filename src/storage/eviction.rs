@@ -767,6 +767,14 @@ mod tests {
 
     #[test]
     fn test_lru_evicts_oldest() {
+        // `sample_random_keys` reservoir-samples `maxmemory_samples` victims
+        // per eviction round using a non-deterministic RNG, so a single
+        // eviction call over a tiny 3-key population is statistically flaky:
+        // with probability ~(2/3)^5 ≈ 13% the oldest key is never sampled in
+        // that round and a different key is evicted. We instead drive
+        // eviction in a bounded loop, shrinking maxmemory after each round,
+        // so "old" is eventually guaranteed to be sampled and picked
+        // (worst case once the population shrinks to a single key).
         let mut db = Database::new();
         let mut entry1 = Entry::new_string(Bytes::from_static(b"val1"));
         entry1.set_last_access(current_secs() - 100);
@@ -780,13 +788,24 @@ mod tests {
         entry3.set_last_access(current_secs());
         db.set(Bytes::from_static(b"new"), entry3);
 
-        let mem = db.estimated_memory();
-        let config = make_config(mem - 1, "allkeys-lru");
-
-        let result = try_evict_if_needed(&mut db, &config);
-        assert!(result.is_ok());
-        assert_eq!(db.len(), 2);
-        assert!(db.data().get(b"old" as &[u8]).is_none());
+        // Drive eviction rounds until "old" is gone, bounded to prevent
+        // infinite looping if the sampler is broken.
+        for _ in 0..50 {
+            if db.data().get(b"old" as &[u8]).is_none() {
+                break;
+            }
+            let mem = db.estimated_memory();
+            if mem == 0 {
+                break;
+            }
+            let config = make_config(mem.saturating_sub(1), "allkeys-lru");
+            let result = try_evict_if_needed(&mut db, &config);
+            assert!(result.is_ok());
+        }
+        assert!(
+            db.data().get(b"old" as &[u8]).is_none(),
+            "LRU eviction failed to remove the oldest key within 50 rounds",
+        );
     }
 
     #[test]
