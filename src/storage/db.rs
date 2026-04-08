@@ -434,6 +434,17 @@ impl Database {
         self.data.insert(CompactKey::from(key), entry);
     }
 
+    /// Clear all entries and reset memory accounting.
+    ///
+    /// Used during multi-part AOF recovery to wipe any state populated by
+    /// earlier recovery phases (per-shard WAL replay, legacy appendonly.aof)
+    /// before loading the authoritative base RDB + incr log. Without this,
+    /// non-idempotent commands from pre-existing state would be double-applied.
+    pub fn clear(&mut self) {
+        self.data = DashTable::new();
+        self.used_memory = 0;
+    }
+
     /// Bulk-load insert: skip duplicate check, version tracking, and per-key memory accounting.
     ///
     /// Used exclusively during RDB/AOF restore where keys are guaranteed unique and

@@ -63,12 +63,50 @@ impl AofManifest {
     }
 
     /// Create the `appendonlydir/` and write the initial manifest.
+    ///
+    /// Prefer [`Self::initialize_with_base`] when the in-memory databases
+    /// already contain state (e.g. first upgrade from legacy single-file AOF
+    /// or per-shard WAL) — otherwise subsequent boots cannot reconstruct that
+    /// state because there is no base RDB for `replay_multi_part` to load.
     pub fn initialize(dir: &Path) -> std::io::Result<Self> {
         let manifest = Self {
             dir: dir.to_path_buf(),
             seq: 1,
         };
         std::fs::create_dir_all(manifest.aof_dir())?;
+        manifest.write_manifest()?;
+        Ok(manifest)
+    }
+
+    /// Create the `appendonlydir/` and write an initial manifest with a base RDB
+    /// capturing the current in-memory state.
+    ///
+    /// Used on first upgrade from legacy persistence formats: after
+    /// `restore_from_persistence` has loaded state from the per-shard WAL or
+    /// `appendonly.aof`, this call materializes that state as the seq 1 base
+    /// RDB. Without a base, on the next boot the multi-part replay path would
+    /// clear the databases and then fail (missing base with non-empty incr)
+    /// or silently restart from empty state.
+    pub fn initialize_with_base(dir: &Path, rdb_bytes: &[u8]) -> std::io::Result<Self> {
+        let manifest = Self {
+            dir: dir.to_path_buf(),
+            seq: 1,
+        };
+        std::fs::create_dir_all(manifest.aof_dir())?;
+
+        // Write base RDB atomically: tmp file + fsync + rename.
+        let base_path = manifest.base_path();
+        let tmp_path = base_path.with_extension("rdb.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(rdb_bytes)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp_path, &base_path)?;
+
+        // Create empty incr file so the writer has something to append to.
+        std::fs::File::create(manifest.incr_path())?;
+
         manifest.write_manifest()?;
         Ok(manifest)
     }
@@ -196,13 +234,28 @@ impl AofManifest {
             source: e,
         })?;
 
-        // 1. Write new base RDB (atomic: tmp + rename)
+        // 1. Write new base RDB (atomic: tmp + fsync + rename).
+        //    Must fsync the data BEFORE renaming — a rename without prior fsync
+        //    can publish a file whose contents aren't durable, so a crash leaves
+        //    the manifest pointing at an empty/partial base RDB.
         let new_base = self.base_path_seq(new_seq);
         let tmp_base = new_base.with_extension("rdb.tmp");
-        std::fs::write(&tmp_base, rdb_bytes).map_err(|e| crate::error::AofError::Io {
-            path: tmp_base.clone(),
-            source: e,
-        })?;
+        {
+            let mut f =
+                std::fs::File::create(&tmp_base).map_err(|e| crate::error::AofError::Io {
+                    path: tmp_base.clone(),
+                    source: e,
+                })?;
+            f.write_all(rdb_bytes)
+                .map_err(|e| crate::error::AofError::Io {
+                    path: tmp_base.clone(),
+                    source: e,
+                })?;
+            f.sync_data().map_err(|e| crate::error::AofError::Io {
+                path: tmp_base.clone(),
+                source: e,
+            })?;
+        }
         std::fs::rename(&tmp_base, &new_base).map_err(|e| {
             crate::error::AofError::RewriteFailed {
                 detail: format!("rename base: {}", e),
@@ -279,7 +332,29 @@ pub fn replay_multi_part(
             }
         }
     } else {
-        warn!("AOF base RDB not found: {}", base_path.display());
+        // Missing base is tolerable only when the incr log is also empty
+        // (fresh manifest from initialize(), or first boot after legacy
+        // upgrade). If there's incremental content but no base, replaying
+        // deltas (DEL, EXPIRE, HINCRBY, …) on an empty database produces
+        // incorrect state — fail loudly rather than silently corrupt.
+        let incr_path = manifest.incr_path();
+        let incr_len = std::fs::metadata(&incr_path).map(|m| m.len()).unwrap_or(0);
+        if incr_len > 0 {
+            return Err(crate::error::MoonError::from(
+                crate::error::AofError::RewriteFailed {
+                    detail: format!(
+                        "AOF base RDB missing at {} but incr {} is {} bytes; refusing to replay incr against empty state",
+                        base_path.display(),
+                        incr_path.display(),
+                        incr_len,
+                    ),
+                },
+            ));
+        }
+        warn!(
+            "AOF base RDB not found: {} (incr empty, treating as fresh init)",
+            base_path.display()
+        );
     }
 
     // Replay incremental RESP
