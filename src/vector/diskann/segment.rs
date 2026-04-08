@@ -90,11 +90,9 @@ impl DiskAnnSegment {
             Ok(fd) => match super::uring_search::DiskAnnUring::new(fd, 32) {
                 Ok(u) => Some(u),
                 Err(_e) => {
-                    // io_uring setup failed -- close the FD and fall back.
-                    // SAFETY: `fd` is a valid FD we just opened.
-                    unsafe {
-                        libc::close(fd);
-                    }
+                    // io_uring setup failed — `fd` was moved into `new` and
+                    // is dropped (closed) automatically by `OwnedFd::drop`
+                    // on the error return path. Fall back to pread.
                     None
                 }
             },
@@ -161,10 +159,8 @@ impl DiskAnnSegment {
             Ok(fd) => match super::uring_search::DiskAnnUring::new(fd, 32) {
                 Ok(u) => Some(u),
                 Err(_e) => {
-                    // SAFETY: `fd` is a valid FD we just opened.
-                    unsafe {
-                        libc::close(fd);
-                    }
+                    // `fd` was moved into `new` and is closed automatically
+                    // by `OwnedFd::drop` on the error return path.
                     None
                 }
             },
