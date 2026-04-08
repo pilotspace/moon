@@ -112,7 +112,7 @@ pub struct ServerConfig {
 
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
-    #[arg(long = "disk-offload", default_value = "disable")]
+    #[arg(long = "disk-offload", default_value = "enable")]
     pub disk_offload: String,
 
     /// Directory for disk offload files (default: same as --dir)
@@ -452,8 +452,8 @@ mod tests {
     #[test]
     fn test_disk_offload_defaults() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert!(!config.disk_offload_enabled());
-        assert_eq!(config.disk_offload, "disable");
+        assert!(config.disk_offload_enabled());
+        assert_eq!(config.disk_offload, "enable");
         assert_eq!(config.disk_offload_dir, None);
         assert!((config.disk_offload_threshold - 0.85).abs() < f64::EPSILON);
         assert_eq!(config.segment_warm_after, 3600);
