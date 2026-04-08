@@ -61,6 +61,8 @@ pub enum AofMessage {
     Append(Bytes),
     /// Trigger a full AOF rewrite (compaction) using current database state.
     Rewrite(SharedDatabases),
+    /// Trigger AOF rewrite in sharded mode (all shards' databases).
+    RewriteSharded(Arc<crate::shard::shared_databases::ShardDatabases>),
     /// Shut down the AOF writer task gracefully.
     Shutdown,
 }
@@ -107,38 +109,129 @@ pub async fn aof_writer_task(
     #[cfg(feature = "runtime-tokio")]
     interval.tick().await; // consume first tick
 
-    // Monoio fallback: AOF writer uses sync I/O in a simple recv loop.
+    // Monoio path: multi-part AOF (base RDB + incremental RESP) with sync I/O.
+    //
+    // On startup, if appendonlydir/ exists with a manifest, open the current
+    // incr file for appending. Otherwise start fresh with seq 1.
+    // On BGREWRITEAOF: snapshot → write new base RDB → create new incr → advance manifest.
     #[cfg(feature = "runtime-monoio")]
     {
+        use crate::persistence::aof_manifest::AofManifest;
         use std::io::Write;
+
+        // Resolve the persistence base directory from aof_path's parent.
+        let base_dir = aof_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+        // Load manifest — do NOT create one here if it doesn't exist.
+        // main.rs recovery runs concurrently and must finish before a manifest
+        // is created, to avoid racing against legacy single-file AOF detection.
+        // main.rs will create the manifest after recovery completes.
+        let mut manifest = loop {
+            if let Some(m) = AofManifest::load(&base_dir) {
+                break m;
+            }
+            // main.rs recovery hasn't created the manifest yet — wait.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // Open the current incremental file for appending
+        let incr_path = manifest.incr_path();
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&aof_path)
+            .open(&incr_path)
         {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to open AOF file {}: {}", aof_path.display(), e);
+                error!(
+                    "Failed to open AOF incr file {}: {}",
+                    incr_path.display(),
+                    e
+                );
                 return;
             }
         };
+        info!(
+            "AOF writer: seq {}, incr={}",
+            manifest.seq,
+            incr_path.display()
+        );
+
+        let mut last_fsync = Instant::now();
+
+        let mut write_error = false;
+
         loop {
-            // Use blocking recv since monoio doesn't support tokio::select!
             match rx.recv() {
                 Ok(AofMessage::Append(data)) => {
-                    let _ = file.write_all(&data);
-                    if fsync == FsyncPolicy::Always {
-                        let _ = file.flush();
-                        let _ = std::io::Write::flush(&mut file);
+                    if write_error {
+                        continue; // Drop appends after persistent I/O failure
+                    }
+                    if let Err(e) = file.write_all(&data) {
+                        error!(
+                            "AOF write failed (seq {}): {}. Persistence degraded.",
+                            manifest.seq, e
+                        );
+                        write_error = true;
+                        continue;
+                    }
+                    match fsync {
+                        FsyncPolicy::Always => {
+                            if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                error!("AOF sync failed (seq {}, always): {}", manifest.seq, e);
+                                write_error = true;
+                            }
+                        }
+                        FsyncPolicy::EverySec => {
+                            if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
+                                if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                    error!(
+                                        "AOF sync failed (seq {}, everysec): {}",
+                                        manifest.seq, e
+                                    );
+                                    // Non-fatal for everysec: retry next interval
+                                } else {
+                                    last_fsync = Instant::now();
+                                }
+                            }
+                        }
+                        FsyncPolicy::No => {}
                     }
                 }
                 Ok(AofMessage::Shutdown) | Err(_) => {
-                    let _ = file.flush();
-                    info!("AOF writer shutting down (monoio)");
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF final sync failed (seq {}): {}", manifest.seq, e);
+                        }
+                    }
+                    info!("AOF writer shutting down (monoio, seq {})", manifest.seq);
                     break;
                 }
-                Ok(AofMessage::Rewrite(_db)) => {
-                    // AOF rewrite under monoio: not yet implemented
+                Ok(AofMessage::Rewrite(db)) => {
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
+                        }
+                    }
+                    match do_rewrite_single(&db, &mut manifest, &mut file) {
+                        Ok(()) => {
+                            write_error = false; // Reset on successful rewrite
+                        }
+                        Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
+                    }
+                }
+                Ok(AofMessage::RewriteSharded(shard_dbs)) => {
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
+                        }
+                    }
+                    match do_rewrite_sharded(&shard_dbs, &mut manifest, &mut file) {
+                        Ok(()) => {
+                            write_error = false;
+                        }
+                        Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
+                    }
                 }
             }
         }
@@ -190,6 +283,19 @@ pub async fn aof_writer_task(
                             }
                         }
                     }
+                    Ok(AofMessage::RewriteSharded(shard_dbs)) => {
+                        let _ = writer.flush().await;
+                        let _ = writer.get_ref().sync_data().await;
+                        if let Err(e) = rewrite_aof_sharded_sync(&shard_dbs, &aof_path) {
+                            error!("AOF rewrite (sharded) failed: {}", e);
+                        }
+                        let reopen_result: Result<tokio::fs::File, _> = tokio::fs::OpenOptions::new()
+                            .create(true).append(true).open(&aof_path).await;
+                        match reopen_result {
+                            Ok(f) => writer = tokio::io::BufWriter::new(f),
+                            Err(e) => { error!("Failed to reopen AOF after rewrite: {}", e); return; }
+                        }
+                    }
                     Ok(AofMessage::Shutdown) | Err(_) => {
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
@@ -233,8 +339,35 @@ pub fn replay_aof(
         return Ok(0);
     }
 
-    let total_len = data.len();
-    let mut buf = BytesMut::from(&data[..]);
+    // Detect RDB preamble: if the file starts with "MOON" magic, load the binary
+    // RDB section first, then replay any RESP commands appended after it.
+    let (rdb_keys, resp_start) = if data.starts_with(b"MOON") {
+        match crate::persistence::rdb::load_from_bytes(databases, &data) {
+            Ok((keys, consumed)) => {
+                info!(
+                    "AOF RDB preamble loaded: {} keys ({} bytes)",
+                    keys, consumed
+                );
+                (keys, consumed)
+            }
+            Err(e) => {
+                // Data starts with MOON magic — it IS RDB format.
+                // Falling back to RESP would parse garbage. Propagate the error.
+                return Err(e);
+            }
+        }
+    } else {
+        (0, 0)
+    };
+
+    // If the entire file was RDB (no RESP tail), we're done
+    if resp_start >= data.len() {
+        return Ok(rdb_keys);
+    }
+
+    let resp_data = &data[resp_start..];
+    let total_len = resp_data.len();
+    let mut buf = BytesMut::from(resp_data);
     let config = ParseConfig::default();
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
@@ -314,12 +447,13 @@ pub fn replay_aof(
         );
     }
 
-    Ok(count)
+    Ok(rdb_keys + count)
 }
 
 /// Generate synthetic RESP commands from the current database state for AOF rewriting.
 ///
 /// Produces commands for all 5 data types plus PEXPIRE for keys with TTL.
+#[allow(dead_code)] // Retained for RESP-only AOF rewrite fallback and testing
 pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
     let mut buf = BytesMut::new();
     let now_ms = current_time_ms();
@@ -518,12 +652,11 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
     buf
 }
 
-/// Rewrite the AOF file with synthetic commands from current database state.
+/// Snapshot databases and generate compacted AOF commands.
 ///
-/// Writes to a temporary file first, then atomically renames for crash safety.
-#[cfg(feature = "runtime-tokio")]
-pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
-    // Clone database state: lock each db individually with read lock
+/// Shared by both the async (tokio) and sync (monoio) rewrite paths.
+#[allow(dead_code)]
+fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
     let snapshot: Vec<(Vec<(CompactKey, Entry)>, u32)> = db
         .iter()
         .map(|lock| {
@@ -538,7 +671,6 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), Moo
         })
         .collect();
 
-    // Reconstruct temporary Database objects for generate_rewrite_commands
     let mut temp_dbs: Vec<Database> = Vec::with_capacity(snapshot.len());
     for (entries, _base_ts) in &snapshot {
         let mut db = Database::new();
@@ -548,11 +680,130 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), Moo
         temp_dbs.push(db);
     }
 
-    let commands = generate_rewrite_commands(&temp_dbs);
+    generate_rewrite_commands(&temp_dbs)
+}
 
-    // Write to temp file, then atomic rename
+/// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.
+#[cfg(feature = "runtime-monoio")]
+fn do_rewrite_single(
+    db: &SharedDatabases,
+    manifest: &mut crate::persistence::aof_manifest::AofManifest,
+    file: &mut std::fs::File,
+) -> Result<(), MoonError> {
+    // Capture (entries, base_ts) per database — preserves original base_ts for correct TTL.
+    let snapshot: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = db
+        .iter()
+        .map(|lock| {
+            let guard = lock.read();
+            let base_ts = guard.base_timestamp();
+            let entries = guard
+                .data()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (entries, base_ts)
+        })
+        .collect();
+
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
+    let new_incr = manifest.advance(&rdb_bytes)?;
+
+    // Switch writer to new incr file
+    *file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&new_incr)
+        .map_err(|e| AofError::Io {
+            path: new_incr,
+            source: e,
+        })?;
+
+    Ok(())
+}
+
+/// Multi-part rewrite: snapshot all shards → merged RDB base → advance manifest.
+#[cfg(feature = "runtime-monoio")]
+fn do_rewrite_sharded(
+    shard_dbs: &crate::shard::shared_databases::ShardDatabases,
+    manifest: &mut crate::persistence::aof_manifest::AofManifest,
+    file: &mut std::fs::File,
+) -> Result<(), MoonError> {
+    // Capture (entries, base_ts) per merged database, preserving original base_ts for TTL.
+    let db_count = shard_dbs.db_count();
+    let mut merged: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = (0..db_count).map(|_| (Vec::new(), 0u32)).collect();
+
+    for shard_locks in shard_dbs.all_shard_dbs() {
+        for (db_idx, lock) in shard_locks.iter().enumerate() {
+            let guard = lock.read();
+            let base_ts = guard.base_timestamp();
+            let now_ms = current_time_ms();
+            if merged[db_idx].0.is_empty() {
+                merged[db_idx].1 = base_ts;
+            }
+            for (key, entry) in guard.data().iter() {
+                if !entry.is_expired_at(base_ts, now_ms) {
+                    merged[db_idx].0.push((key.clone(), entry.clone()));
+                }
+            }
+        }
+    }
+
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&merged)?;
+    let new_incr = manifest.advance(&rdb_bytes)?;
+
+    *file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&new_incr)
+        .map_err(|e| AofError::Io {
+            path: new_incr,
+            source: e,
+        })?;
+
+    Ok(())
+}
+
+/// Rewrite the AOF file with RDB preamble (binary base + empty RESP incremental).
+///
+/// Uses the same strategy as Redis 7+ `aof-use-rdb-preamble yes`:
+/// the rewritten AOF starts with a full RDB snapshot (compact binary),
+/// and new writes are appended as RESP after it. On startup, the loader
+/// detects the RDB magic and reads the binary preamble, then switches
+/// to RESP parsing for any incremental commands appended after.
+#[allow(dead_code)] // Retained for legacy single-file and tokio path
+fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
+    // Snapshot under read locks, build temp Database objects for RDB serialization
+    let snapshot: Vec<Database> = db
+        .iter()
+        .map(|lock| {
+            let guard = lock.read();
+            let mut temp = Database::new();
+            let now_ms = current_time_ms();
+            for (k, v) in guard.data().iter() {
+                if !v.is_expired_at(guard.base_timestamp(), now_ms) {
+                    temp.set(k.to_bytes(), v.clone());
+                }
+            }
+            temp
+        })
+        .collect();
+
+    let rdb_bytes = crate::persistence::rdb::save_to_bytes(&snapshot)?;
+
     let tmp_path = aof_path.with_extension("aof.tmp");
-    std::fs::write(&tmp_path, &commands).map_err(|e| AofError::Io {
+    std::fs::write(&tmp_path, &rdb_bytes).map_err(|e| AofError::Io {
         path: tmp_path.clone(),
         source: e,
     })?;
@@ -565,8 +816,75 @@ pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), Moo
         ),
     })?;
 
-    info!("AOF rewrite complete: {} bytes", commands.len());
+    info!(
+        "AOF rewrite complete (RDB preamble): {} bytes",
+        rdb_bytes.len()
+    );
     Ok(())
+}
+
+/// Rewrite the AOF in sharded mode with RDB preamble.
+///
+/// Merges all shards' databases into a single RDB snapshot, writes it as
+/// the AOF base file. New incremental writes are appended as RESP after.
+#[allow(dead_code)]
+fn rewrite_aof_sharded_sync(
+    shard_dbs: &crate::shard::shared_databases::ShardDatabases,
+    aof_path: &Path,
+) -> Result<(), MoonError> {
+    let db_count = shard_dbs.db_count();
+    let now_ms = current_time_ms();
+    let mut merged_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
+
+    for shard_locks in shard_dbs.all_shard_dbs() {
+        for (db_idx, lock) in shard_locks.iter().enumerate() {
+            let guard = lock.read();
+            for (key, entry) in guard.data().iter() {
+                if !entry.is_expired_at(guard.base_timestamp(), now_ms) {
+                    merged_dbs[db_idx].set(key.to_bytes(), entry.clone());
+                }
+            }
+        }
+    }
+
+    let rdb_bytes = crate::persistence::rdb::save_to_bytes(&merged_dbs)?;
+
+    let tmp_path = aof_path.with_extension("aof.tmp");
+    std::fs::write(&tmp_path, &rdb_bytes).map_err(|e| AofError::Io {
+        path: tmp_path.clone(),
+        source: e,
+    })?;
+    std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
+        detail: format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            aof_path.display(),
+            e
+        ),
+    })?;
+
+    info!(
+        "AOF rewrite (sharded, RDB preamble) complete: {} bytes",
+        rdb_bytes.len()
+    );
+    Ok(())
+}
+
+/// Reopen AOF file in append mode after atomic rewrite replaced it.
+#[allow(dead_code)]
+fn reopen_aof_sync(aof_path: &Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(aof_path)
+}
+
+/// Rewrite the AOF file (tokio async wrapper).
+///
+/// Delegates to `rewrite_aof_sync` — the actual I/O is synchronous (temp write + rename).
+#[cfg(feature = "runtime-tokio")]
+pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
+    rewrite_aof_sync(&db, aof_path)
 }
 
 #[cfg(test)]

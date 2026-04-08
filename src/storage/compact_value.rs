@@ -42,7 +42,7 @@ const HEAP_TAG_MASK: usize = 0x7;
 
 /// Thin wrapper for heap-allocated strings.
 /// At 24 bytes (Vec<u8>), this is smaller than RedisValue::String(Bytes) (~40 bytes)
-/// and avoids the enum discriminant overhead.
+/// and avoids the enum discriminant + refcount overhead.
 struct HeapString(Vec<u8>);
 
 /// Borrowed view of a CompactValue, for zero-copy read access.
@@ -139,16 +139,13 @@ impl CompactValue {
     /// `RedisValue` enum wrapper (~40B savings per heap string).
     /// Collections are still stored as `Box<RedisValue>`.
     pub fn from_redis_value(value: RedisValue) -> Self {
-        match &value {
-            RedisValue::String(s) if s.len() <= SSO_MAX_LEN => {
-                return Self::inline_string(s);
-            }
-            _ => {}
-        }
-
-        // String heap path: store as Box<[u8]> directly (no RedisValue wrapper)
-        if let RedisValue::String(s) = &value {
-            return Self::heap_string(s);
+        // String fast path: inline SSO or zero-copy owned Bytes
+        if let RedisValue::String(s) = value {
+            return if s.len() <= SSO_MAX_LEN {
+                Self::inline_string(&s)
+            } else {
+                Self::heap_string_owned(s)
+            };
         }
 
         // Collection heap path: store as Box<RedisValue>
@@ -183,10 +180,29 @@ impl CompactValue {
         }
     }
 
-    /// Create a heap-allocated string CompactValue from byte data.
-    /// Stores as `Box<HeapString>` — eliminates RedisValue enum wrapper.
-    /// HeapString is 24 bytes (Vec<u8>) vs RedisValue::String(Bytes) at ~40 bytes.
+    /// Create a heap-allocated string CompactValue from a byte slice (copies data).
     pub fn heap_string(data: &[u8]) -> Self {
+        Self::heap_string_vec(data.to_vec())
+    }
+
+    /// Create from owned Bytes (converts to Vec<u8> via Bytes::into for zero-copy
+    /// when Bytes has unique ownership, or copies when shared).
+    pub fn heap_string_owned(data: Bytes) -> Self {
+        // Bytes::into::<Vec<u8>> is zero-copy when refcount == 1, copies otherwise
+        Self::heap_string_vec(data.into())
+    }
+
+    /// Create from an owned Vec<u8> directly — no copy, no refcount.
+    /// This is the fastest path: one Box allocation for the HeapString wrapper.
+    /// Public for RDB loader fast path.
+    pub fn heap_string_vec_direct(data: Vec<u8>) -> Self {
+        if data.len() <= SSO_MAX_LEN {
+            return Self::inline_string(&data);
+        }
+        Self::heap_string_vec(data)
+    }
+
+    fn heap_string_vec(data: Vec<u8>) -> Self {
         debug_assert!(data.len() > SSO_MAX_LEN);
         let str_len = data.len();
 
@@ -194,7 +210,7 @@ impl CompactValue {
         let copy_len = str_len.min(4);
         prefix[..copy_len].copy_from_slice(&data[..copy_len]);
 
-        let hs = Box::new(HeapString(data.to_vec()));
+        let hs = Box::new(HeapString(data));
         let raw_ptr = Box::into_raw(hs) as usize;
         debug_assert!(
             raw_ptr & HEAP_TAG_MASK == 0,
@@ -322,6 +338,7 @@ impl CompactValue {
 
     /// Get a mutable reference to the heap string bytes.
     /// Returns None for non-string types and inline values.
+    /// Note: returns `Option<&mut Vec<u8>>` for the underlying byte buffer.
     pub fn as_bytes_mut(&mut self) -> Option<&mut Vec<u8>> {
         if self.is_inline() {
             None

@@ -240,6 +240,43 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // Multi-part AOF replay layered on top of v2/v3 recovery.
+    // Priority: if appendonlydir/ manifest exists → load multi-part (skip legacy v2 fallback).
+    // Otherwise v2 already handled legacy appendonly.aof during restore_from_persistence.
+    if config.appendonly == "yes" {
+        if let Some(ref dir) = persistence_dir {
+            use moon::persistence::aof_manifest::AofManifest;
+            use moon::persistence::replay::DispatchReplayEngine;
+            let base_dir = std::path::PathBuf::from(dir);
+            if let Some(manifest) = AofManifest::load(&base_dir) {
+                if num_shards == 1 {
+                    match moon::persistence::aof_manifest::replay_multi_part(
+                        &mut shards[0].databases,
+                        &manifest,
+                        &DispatchReplayEngine,
+                    ) {
+                        Ok(n) => info!(
+                            "AOF multi-part loaded (seq {}): {} entries",
+                            manifest.seq, n
+                        ),
+                        Err(e) => tracing::error!("Multi-part AOF load failed: {}", e),
+                    }
+                } else {
+                    tracing::warn!(
+                        "Multi-part AOF skipped in multi-shard mode (not yet supported)"
+                    );
+                }
+            }
+            // Initialize manifest for writer thread (safe — recovery is complete).
+            // On fresh/legacy upgrade, writer is blocked waiting for this file.
+            if AofManifest::load(&base_dir).is_none() {
+                if let Err(e) = AofManifest::initialize(&base_dir) {
+                    tracing::error!("Failed to initialize AOF manifest: {}", e);
+                }
+            }
+        }
+    }
+
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
         .iter_mut()

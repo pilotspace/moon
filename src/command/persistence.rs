@@ -212,6 +212,21 @@ pub fn bgrewriteaof_start(aof_tx: &channel::MpscSender<AofMessage>, db: SharedDa
     }
 }
 
+/// Start BGREWRITEAOF in sharded mode using ShardDatabases.
+pub fn bgrewriteaof_start_sharded(
+    aof_tx: &channel::MpscSender<AofMessage>,
+    shard_databases: std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+) -> Frame {
+    match aof_tx.try_send(AofMessage::RewriteSharded(shard_databases)) {
+        Ok(()) => Frame::SimpleString(Bytes::from_static(
+            b"Background append only file rewriting started",
+        )),
+        Err(_) => Frame::Error(Bytes::from_static(
+            b"ERR Background AOF rewrite failed to start",
+        )),
+    }
+}
+
 /// SAVE command: synchronous save to disk. Blocks until complete.
 ///
 /// Clones all entries under read locks (same as BGSAVE), then serializes

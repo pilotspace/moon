@@ -1,4 +1,5 @@
 pub mod aof;
+pub mod aof_manifest;
 pub mod auto_save;
 pub mod checkpoint;
 pub mod clog;
