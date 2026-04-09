@@ -114,6 +114,9 @@ pub use set_write::sinterstore;
 pub use set_write::spop;
 pub use set_write::srem;
 pub use set_write::sunionstore;
+pub use set_write::smove;
+pub use set_read::sintercard;
+pub use set_read::sintercard_readonly;
 
 // ===========================================================================
 // Tests

@@ -1,9 +1,11 @@
 pub mod bridge;
 pub mod cache;
+pub mod functions;
 pub mod sandbox;
 pub mod types;
 
 pub use cache::ScriptCache;
+pub use functions::FunctionRegistry;
 
 use bytes::Bytes;
 use mlua::prelude::*;

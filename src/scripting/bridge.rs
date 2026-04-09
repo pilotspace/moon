@@ -22,6 +22,8 @@ thread_local! {
     static CURRENT_DB_COUNT: Cell<usize> = const { Cell::new(1) };
     /// Whether this script execution has performed any write commands.
     static SCRIPT_HAD_WRITE: Cell<bool> = const { Cell::new(false) };
+    /// Whether this script is running in read-only mode (FCALL_RO).
+    static SCRIPT_READ_ONLY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Set the thread-local database pointer before script execution.
@@ -35,6 +37,17 @@ pub fn set_script_db(db: &mut crate::storage::Database, db_idx: usize, db_count:
 /// Clear the thread-local database pointer after script execution.
 pub fn clear_script_db() {
     CURRENT_DB.with(|c| c.set(std::ptr::null_mut()));
+    SCRIPT_READ_ONLY.with(|c| c.set(false));
+}
+
+/// Set the read-only flag for the current script execution (FCALL_RO).
+pub fn set_script_read_only(read_only: bool) {
+    SCRIPT_READ_ONLY.with(|c| c.set(read_only));
+}
+
+/// Check whether the current script execution is in read-only mode.
+pub fn is_script_read_only() -> bool {
+    SCRIPT_READ_ONLY.with(|c| c.get())
 }
 
 /// Check whether the current script execution has performed any write commands.
@@ -84,8 +97,18 @@ pub fn make_redis_call_fn(lua: &Lua, propagate_errors: bool) -> mlua::Result<Lua
             let mut db_idx = CURRENT_DB_IDX.with(|c| c.get());
             let db_count = CURRENT_DB_COUNT.with(|c| c.get());
 
-            // Track writes for SCRIPT KILL safety check
-            if crate::command::metadata::is_write(&cmd_bytes) {
+            // Reject non-readonly commands in read-only mode (FCALL_RO / EVAL_RO)
+            // Use positive allowlist (READONLY flag) instead of negative blocklist (!WRITE)
+            // to also block PUBLISH and other side-effecting commands.
+            let cmd_is_readonly = crate::command::metadata::is_read(&cmd_bytes);
+            let cmd_is_write = crate::command::metadata::is_write(&cmd_bytes);
+            if SCRIPT_READ_ONLY.with(|c| c.get()) && !cmd_is_readonly {
+                return Err(mlua::Error::RuntimeError(
+                    "Write commands are not allowed from read-only scripts".to_string(),
+                ));
+            }
+            if cmd_is_write {
+                // Track writes for SCRIPT KILL safety check
                 SCRIPT_HAD_WRITE.with(|c| c.set(true));
             }
 

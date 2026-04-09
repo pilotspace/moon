@@ -56,6 +56,30 @@ pub(crate) fn convert_blocking_to_nonblocking(cmd: &[u8], args: &[Frame]) -> Fra
         for arg in args.iter().take(args.len().saturating_sub(1)) {
             new_args.push(arg.clone());
         }
+    } else if cmd.eq_ignore_ascii_case(b"BLMPOP") {
+        // BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT n]
+        // -> LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT n] (skip timeout = args[0])
+        new_args.push(Frame::BulkString(Bytes::from_static(b"LMPOP")));
+        for arg in args.iter().skip(1) {
+            new_args.push(arg.clone());
+        }
+    } else if cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        // BRPOPLPUSH src dst timeout -> RPOPLPUSH src dst (skip timeout = args[2])
+        // Actually, convert to LMOVE src dst RIGHT LEFT
+        new_args.push(Frame::BulkString(Bytes::from_static(b"LMOVE")));
+        // src, dst
+        for arg in args.iter().take(2) {
+            new_args.push(arg.clone());
+        }
+        new_args.push(Frame::BulkString(Bytes::from_static(b"RIGHT")));
+        new_args.push(Frame::BulkString(Bytes::from_static(b"LEFT")));
+    } else if cmd.eq_ignore_ascii_case(b"BZMPOP") {
+        // BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT n]
+        // -> ZMPOP numkeys key [key ...] MIN|MAX [COUNT n] (skip timeout = args[0])
+        new_args.push(Frame::BulkString(Bytes::from_static(b"ZMPOP")));
+        for arg in args.iter().skip(1) {
+            new_args.push(arg.clone());
+        }
     }
     Frame::Array(new_args.into())
 }
@@ -551,20 +575,25 @@ pub(crate) async fn handle_blocking_command_monoio(
     frame
 }
 
-/// Parse timeout from the last argument of a blocking command.
+/// Parse timeout from a blocking command.
+/// For most commands, timeout is the last argument.
+/// For BLMPOP, timeout is the first argument.
 /// Returns seconds as f64. 0 = block forever.
 pub(crate) fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, Frame> {
     if args.is_empty() {
-        return Err(Frame::Error(Bytes::from(format!(
-            "ERR wrong number of arguments for '{}' command",
-            String::from_utf8_lossy(cmd).to_lowercase()
-        ))));
-    }
-    // args confirmed non-empty above — last() is guaranteed
-    let Some(timeout_frame) = args.last() else {
         return Err(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments",
+            b"ERR wrong number of arguments for blocking command",
         )));
+    }
+    // BLMPOP/BZMPOP: timeout is the FIRST argument; others: last argument
+    let timeout_frame = if cmd.eq_ignore_ascii_case(b"BLMPOP")
+        || cmd.eq_ignore_ascii_case(b"BZMPOP")
+    {
+        &args[0]
+    } else {
+        // args confirmed non-empty above
+        #[allow(clippy::unwrap_used)] // args.is_empty() checked at entry
+        args.last().unwrap()
     };
     let timeout_bytes = match timeout_frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => b,
@@ -699,6 +728,141 @@ pub(crate) fn parse_blocking_args(
             )));
         }
         Ok((keys, Box::new(|| crate::blocking::BlockedCommand::BZPopMax)))
+    } else if cmd.eq_ignore_ascii_case(b"BLMPOP") {
+        // BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT n]
+        // args[0] = timeout (already parsed), args[1] = numkeys, args[2..2+numkeys] = keys,
+        // args[2+numkeys] = direction, optionally args[2+numkeys+1..] = COUNT n
+        if args.len() < 4 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'blmpop' command",
+            )));
+        }
+        let numkeys_bytes = extract_bytes(&args[1])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+        let numkeys: usize = std::str::from_utf8(&numkeys_bytes)
+            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer")))?
+            .parse()
+            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer or is out of range")))?;
+        if numkeys == 0 || args.len() < 2 + numkeys + 1 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR numkeys is not an integer or is out of range",
+            )));
+        }
+        let keys: Vec<Bytes> = args[2..2 + numkeys]
+            .iter()
+            .filter_map(|f| extract_bytes(f))
+            .collect();
+        if keys.len() != numkeys {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        }
+        let dir_bytes = extract_bytes(&args[2 + numkeys])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+        let dir = if dir_bytes.eq_ignore_ascii_case(b"LEFT") {
+            crate::blocking::Direction::Left
+        } else if dir_bytes.eq_ignore_ascii_case(b"RIGHT") {
+            crate::blocking::Direction::Right
+        } else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        };
+        // Parse optional COUNT n
+        let mut count: u32 = 1;
+        let remaining = &args[3 + numkeys..];
+        if remaining.len() >= 2 {
+            let kw = extract_bytes(&remaining[0]);
+            if let Some(kw) = kw {
+                if kw.eq_ignore_ascii_case(b"COUNT") {
+                    let count_bytes = extract_bytes(&remaining[1])
+                        .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+                    count = std::str::from_utf8(&count_bytes)
+                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer")))?
+                        .parse()
+                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer or is out of range")))?;
+                    if count == 0 {
+                        return Err(Frame::Error(Bytes::from_static(
+                            b"ERR count is not an integer or is out of range",
+                        )));
+                    }
+                }
+            }
+        }
+        Ok((keys, Box::new(move || crate::blocking::BlockedCommand::BLMPop { dir, count })))
+    } else if cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        // BRPOPLPUSH source destination timeout
+        if args.len() != 3 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'brpoplpush' command",
+            )));
+        }
+        let source = extract_bytes(&args[0])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR invalid source key")))?;
+        let destination = extract_bytes(&args[1])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR invalid destination key")))?;
+        Ok((
+            vec![source],
+            Box::new(move || crate::blocking::BlockedCommand::BLMove {
+                destination: destination.clone(),
+                wherefrom: crate::blocking::Direction::Right,
+                whereto: crate::blocking::Direction::Left,
+            }),
+        ))
+    } else if cmd.eq_ignore_ascii_case(b"BZMPOP") {
+        // BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT n]
+        // args[0] = timeout (already parsed), args[1] = numkeys, args[2..2+numkeys] = keys,
+        // args[2+numkeys] = MIN|MAX, optionally args[2+numkeys+1..] = COUNT n
+        if args.len() < 4 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'bzmpop' command",
+            )));
+        }
+        let numkeys_bytes = extract_bytes(&args[1])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+        let numkeys: usize = std::str::from_utf8(&numkeys_bytes)
+            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer")))?
+            .parse()
+            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer or is out of range")))?;
+        if numkeys == 0 || args.len() < 2 + numkeys + 1 {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR numkeys is not an integer or is out of range",
+            )));
+        }
+        let keys: Vec<Bytes> = args[2..2 + numkeys]
+            .iter()
+            .filter_map(|f| extract_bytes(f))
+            .collect();
+        if keys.len() != numkeys {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        }
+        let side_bytes = extract_bytes(&args[2 + numkeys])
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+        let is_min = if side_bytes.eq_ignore_ascii_case(b"MIN") {
+            true
+        } else if side_bytes.eq_ignore_ascii_case(b"MAX") {
+            false
+        } else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        };
+        // Parse optional COUNT n
+        let mut count: u32 = 1;
+        let remaining = &args[3 + numkeys..];
+        if remaining.len() >= 2 {
+            let kw = extract_bytes(&remaining[0]);
+            if let Some(kw) = kw {
+                if kw.eq_ignore_ascii_case(b"COUNT") {
+                    let count_bytes = extract_bytes(&remaining[1])
+                        .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
+                    count = std::str::from_utf8(&count_bytes)
+                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer")))?
+                        .parse()
+                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer or is out of range")))?;
+                    if count == 0 {
+                        return Err(Frame::Error(Bytes::from_static(
+                            b"ERR count is not an integer or is out of range",
+                        )));
+                    }
+                }
+            }
+        }
+        Ok((keys, Box::new(move || crate::blocking::BlockedCommand::BZMPop { min: is_min, count })))
     } else {
         Err(Frame::Error(Bytes::from_static(
             b"ERR unknown blocking command",
@@ -767,6 +931,126 @@ pub(crate) fn try_immediate_pop(
             Direction::Right => db.list_push_back(&dest, val.clone()),
         }
         Some(Frame::BulkString(val))
+    } else if cmd.eq_ignore_ascii_case(b"BLMPOP") {
+        // BLMPOP: immediate pop up to COUNT elements
+        // args: [timeout, numkeys, key [key ...], LEFT|RIGHT, [COUNT n]]
+        let numkeys_bytes = extract_bytes(&args[1])?;
+        let numkeys: usize = std::str::from_utf8(&numkeys_bytes).ok()?.parse().ok()?;
+        if numkeys == 0 || args.len() < 2 + numkeys + 1 {
+            return None;
+        }
+        let dir_bytes = extract_bytes(&args[2 + numkeys])?;
+        let dir = if dir_bytes.eq_ignore_ascii_case(b"LEFT") {
+            crate::blocking::Direction::Left
+        } else {
+            crate::blocking::Direction::Right
+        };
+        // Parse COUNT
+        let mut count: u32 = 1;
+        let remaining = &args[3 + numkeys..];
+        if remaining.len() >= 2 {
+            if let Some(kw) = extract_bytes(&remaining[0]) {
+                if kw.eq_ignore_ascii_case(b"COUNT") {
+                    if let Some(cb) = extract_bytes(&remaining[1]) {
+                        if let Some(c) = std::str::from_utf8(&cb).ok().and_then(|s| s.parse::<u32>().ok()) {
+                            if c > 0 {
+                                count = c;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Check if list has elements
+        let list_len = match db.get_list(key) {
+            Ok(Some(l)) => l.len(),
+            _ => 0,
+        };
+        if list_len == 0 {
+            return None;
+        }
+        let n = std::cmp::min(count as usize, list_len);
+        let mut elems = smallvec::SmallVec::<[Frame; 16]>::new();
+        for _ in 0..n {
+            let val = match dir {
+                crate::blocking::Direction::Left => db.list_pop_front(key),
+                crate::blocking::Direction::Right => db.list_pop_back(key),
+            };
+            match val {
+                Some(v) => elems.push(Frame::BulkString(v)),
+                None => break,
+            }
+        }
+        if elems.is_empty() {
+            None
+        } else {
+            let elem_vec: Vec<Frame> = elems.into_vec();
+            Some(Frame::Array(framevec![
+                Frame::BulkString(key.clone()),
+                Frame::Array(elem_vec.into()),
+            ]))
+        }
+    } else if cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") {
+        // BRPOPLPUSH: immediate RPOP from source, LPUSH to destination
+        // args: [source, destination, timeout]
+        let dest = extract_bytes(&args[1])?;
+        let val = db.list_pop_back(key)?;
+        db.list_push_front(&dest, val.clone());
+        Some(Frame::BulkString(val))
+    } else if cmd.eq_ignore_ascii_case(b"BZMPOP") {
+        // BZMPOP: immediate pop from sorted set
+        // args: [timeout, numkeys, key [key ...], MIN|MAX, [COUNT n]]
+        let numkeys_bytes = extract_bytes(&args[1])?;
+        let numkeys: usize = std::str::from_utf8(&numkeys_bytes).ok()?.parse().ok()?;
+        if numkeys == 0 || args.len() < 2 + numkeys + 1 {
+            return None;
+        }
+        let side_bytes = extract_bytes(&args[2 + numkeys])?;
+        let is_min = side_bytes.eq_ignore_ascii_case(b"MIN");
+        // Parse COUNT
+        let mut count: u32 = 1;
+        let remaining = &args[3 + numkeys..];
+        if remaining.len() >= 2 {
+            if let Some(kw) = extract_bytes(&remaining[0]) {
+                if kw.eq_ignore_ascii_case(b"COUNT") {
+                    if let Some(cb) = extract_bytes(&remaining[1]) {
+                        if let Some(c) = std::str::from_utf8(&cb).ok().and_then(|s| s.parse::<u32>().ok()) {
+                            if c > 0 {
+                                count = c;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Check if sorted set has elements (use zset_pop to check)
+        let n = count as usize;
+        let mut elems = smallvec::SmallVec::<[Frame; 16]>::new();
+        for _ in 0..n {
+            let popped = if is_min {
+                db.zset_pop_min(key)
+            } else {
+                db.zset_pop_max(key)
+            };
+            match popped {
+                Some((member, score)) => {
+                    elems.push(Frame::Array(framevec![
+                        Frame::BulkString(member),
+                        Frame::BulkString(Bytes::from(format_blocking_score(score))),
+                    ]));
+                }
+                None => break,
+            }
+        }
+        if elems.is_empty() {
+            None
+        } else {
+            let elem_vec: Vec<Frame> = elems.into_vec();
+            Some(Frame::Array(framevec![
+                Frame::BulkString(key.clone()),
+                Frame::Array(elem_vec.into()),
+            ]))
+        }
     } else {
         None
     }

@@ -172,6 +172,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "HEXISTS" => CommandMeta { name: "HEXISTS", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HINCRBY" => CommandMeta { name: "HINCRBY", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HINCRBYFLOAT" => CommandMeta { name: "HINCRBYFLOAT", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HRANDFIELD" => CommandMeta { name: "HRANDFIELD", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
 
     // ---- List commands ----
     "LPUSH" => CommandMeta { name: "LPUSH", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
@@ -187,6 +188,21 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "LINSERT" => CommandMeta { name: "LINSERT", arity: 5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LTRIM" => CommandMeta { name: "LTRIM", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LMOVE" => CommandMeta { name: "LMOVE", arity: 5, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: LST },
+    "LPUSHX" => CommandMeta { name: "LPUSHX", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "RPUSHX" => CommandMeta { name: "RPUSHX", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "LMPOP" => CommandMeta { name: "LMPOP", arity: -4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: LST },
+
+    // ---- Blocking list commands ----
+    "BLPOP" => CommandMeta { name: "BLPOP", arity: -3, flags: W, first_key: 1, last_key: -2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
+    "BRPOP" => CommandMeta { name: "BRPOP", arity: -3, flags: W, first_key: 1, last_key: -2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
+    "BLMOVE" => CommandMeta { name: "BLMOVE", arity: 6, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
+    "BLMPOP" => CommandMeta { name: "BLMPOP", arity: -5, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
+    "BRPOPLPUSH" => CommandMeta { name: "BRPOPLPUSH", arity: 4, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
+
+    // ---- Blocking sorted-set commands ----
+    "BZPOPMIN" => CommandMeta { name: "BZPOPMIN", arity: -3, flags: W, first_key: 1, last_key: -2, step: 1, acl_categories: AclCategories(AclCategories::SORTEDSET.0 | AclCategories::SLOW.0) },
+    "BZPOPMAX" => CommandMeta { name: "BZPOPMAX", arity: -3, flags: W, first_key: 1, last_key: -2, step: 1, acl_categories: AclCategories(AclCategories::SORTEDSET.0 | AclCategories::SLOW.0) },
+    "BZMPOP" => CommandMeta { name: "BZMPOP", arity: -5, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: AclCategories(AclCategories::SORTEDSET.0 | AclCategories::SLOW.0) },
 
     // ---- Set commands ----
     "SADD" => CommandMeta { name: "SADD", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
@@ -204,6 +220,8 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "SDIFFSTORE" => CommandMeta { name: "SDIFFSTORE", arity: -3, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
     "SINTERSTORE" => CommandMeta { name: "SINTERSTORE", arity: -3, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
     "SUNIONSTORE" => CommandMeta { name: "SUNIONSTORE", arity: -3, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SMOVE" => CommandMeta { name: "SMOVE", arity: 4, flags: WF, first_key: 1, last_key: 2, step: 1, acl_categories: SET_CAT },
+    "SINTERCARD" => CommandMeta { name: "SINTERCARD", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SET_CAT },
 
     // ---- Sorted-set commands ----
     "ZADD" => CommandMeta { name: "ZADD", arity: -4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
@@ -224,6 +242,14 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "ZINTERSTORE" => CommandMeta { name: "ZINTERSTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZRANGEBYSCORE" => CommandMeta { name: "ZRANGEBYSCORE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZREVRANGEBYSCORE" => CommandMeta { name: "ZREVRANGEBYSCORE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZRANGESTORE" => CommandMeta { name: "ZRANGESTORE", arity: -5, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: ZST },
+    "ZDIFF" => CommandMeta { name: "ZDIFF", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZUNION" => CommandMeta { name: "ZUNION", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZINTER" => CommandMeta { name: "ZINTER", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZINTERCARD" => CommandMeta { name: "ZINTERCARD", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZMSCORE" => CommandMeta { name: "ZMSCORE", arity: -3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZRANDMEMBER" => CommandMeta { name: "ZRANDMEMBER", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZMPOP" => CommandMeta { name: "ZMPOP", arity: -4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
 
     // ---- Stream commands ----
     "XADD" => CommandMeta { name: "XADD", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
@@ -273,6 +299,11 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "BITOP" => CommandMeta { name: "BITOP", arity: -4, flags: W, first_key: 2, last_key: -1, step: 1, acl_categories: STR },
     "BITFIELD" => CommandMeta { name: "BITFIELD", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "BITPOS" => CommandMeta { name: "BITPOS", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+
+    // ---- HyperLogLog commands ----
+    "PFADD" => CommandMeta { name: "PFADD", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "PFCOUNT" => CommandMeta { name: "PFCOUNT", arity: -2, flags: R, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
+    "PFMERGE" => CommandMeta { name: "PFMERGE", arity: -2, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
 
     // ---- Geo commands ----
     "GEOADD" => CommandMeta { name: "GEOADD", arity: -5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
@@ -329,6 +360,9 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "EVAL" => CommandMeta { name: "EVAL", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "EVALSHA" => CommandMeta { name: "EVALSHA", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "SCRIPT" => CommandMeta { name: "SCRIPT", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    "FUNCTION" => CommandMeta { name: "FUNCTION", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    "FCALL" => CommandMeta { name: "FCALL", arity: -3, flags: W, first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
+    "FCALL_RO" => CommandMeta { name: "FCALL_RO", arity: -3, flags: R, first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
 
     // ---- Transaction commands ----
     "MULTI" => CommandMeta { name: "MULTI", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
@@ -667,9 +701,13 @@ mod tests {
             b"LREM",
             b"LTRIM",
             b"LMOVE",
+            b"LPUSHX",
+            b"RPUSHX",
+            b"LMPOP",
             b"SADD",
             b"SREM",
             b"SPOP",
+            b"SMOVE",
             b"SINTERSTORE",
             b"SUNIONSTORE",
             b"SDIFFSTORE",
@@ -680,6 +718,8 @@ mod tests {
             b"ZPOPMAX",
             b"ZUNIONSTORE",
             b"ZINTERSTORE",
+            b"ZRANGESTORE",
+            b"ZMPOP",
             b"SELECT",
         ];
         for cmd in aof_write_cmds {
@@ -728,6 +768,8 @@ mod tests {
             b"ZLEXCOUNT",
             b"ZRANGEBYSCORE",
             b"ZREVRANGEBYSCORE",
+            b"SINTERCARD",
+            b"HRANDFIELD",
             b"XLEN",
             b"XREAD",
             b"XINFO",
@@ -824,6 +866,8 @@ mod tests {
             b"SUNIONSTORE",
             b"ZUNIONSTORE",
             b"ZINTERSTORE",
+            b"ZRANGESTORE",
+            b"ZMPOP",
             b"HINCRBYFLOAT",
             b"LSET",
             b"LREM",

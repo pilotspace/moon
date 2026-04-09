@@ -549,3 +549,169 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Frame::Array(results.into()),
     ])
 }
+
+// ---------------------------------------------------------------------------
+// HRANDFIELD key [count [WITHVALUES]]
+// ---------------------------------------------------------------------------
+
+/// HRANDFIELD key [count [WITHVALUES]]
+pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
+    use rand::seq::IndexedRandom;
+    if args.is_empty() || args.len() > 3 {
+        return err_wrong_args("HRANDFIELD");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HRANDFIELD"),
+    };
+    let map = match db.get_hash(key) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
+        }
+        Err(e) => return e,
+    };
+    if map.is_empty() {
+        return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
+    }
+    let fields: Vec<(&Bytes, &Bytes)> = map.iter().collect();
+    let mut rng = rand::rng();
+    if args.len() == 1 {
+        if let Some((field, _)) = fields.choose(&mut rng) {
+            return Frame::BulkString((*field).clone());
+        }
+        return Frame::Null;
+    }
+    let count_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("HRANDFIELD"),
+    };
+    let count: i64 = match std::str::from_utf8(count_bytes).ok().and_then(|s| s.parse().ok()) {
+        Some(c) => c,
+        None => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+    };
+    let with_values = if args.len() == 3 {
+        let opt = match extract_bytes(&args[2]) {
+            Some(b) => b,
+            None => return err_wrong_args("HRANDFIELD"),
+        };
+        if opt.eq_ignore_ascii_case(b"WITHVALUES") { true }
+        else { return Frame::Error(Bytes::from_static(b"ERR syntax error")); }
+    } else { false };
+    if count == 0 { return Frame::Array(framevec![]); }
+    if count > 0 {
+        let n = std::cmp::min(count as usize, fields.len());
+        let indices: Vec<usize> = (0..fields.len()).collect();
+        let chosen: Vec<usize> = indices.as_slice().sample(&mut rng, n).copied().collect();
+        if with_values {
+            let mut result = Vec::with_capacity(n * 2);
+            for &idx in &chosen {
+                result.push(Frame::BulkString(fields[idx].0.clone()));
+                result.push(Frame::BulkString(fields[idx].1.clone()));
+            }
+            Frame::Array(result.into())
+        } else {
+            let result: Vec<Frame> = chosen.iter().map(|&idx| Frame::BulkString(fields[idx].0.clone())).collect();
+            Frame::Array(result.into())
+        }
+    } else {
+        let n = count.unsigned_abs() as usize;
+        if with_values {
+            let mut result = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                if let Some((field, value)) = fields.choose(&mut rng) {
+                    result.push(Frame::BulkString((*field).clone()));
+                    result.push(Frame::BulkString((*value).clone()));
+                }
+            }
+            Frame::Array(result.into())
+        } else {
+            let mut result = Vec::with_capacity(n);
+            for _ in 0..n {
+                if let Some((field, _)) = fields.choose(&mut rng) {
+                    result.push(Frame::BulkString((*field).clone()));
+                }
+            }
+            Frame::Array(result.into())
+        }
+    }
+}
+
+/// HRANDFIELD readonly path
+pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    use rand::seq::IndexedRandom;
+    if args.is_empty() || args.len() > 3 {
+        return err_wrong_args("HRANDFIELD");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HRANDFIELD"),
+    };
+    let href = match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
+        }
+        Err(e) => return e,
+    };
+    let entries = href.entries();
+    if entries.is_empty() {
+        return if args.len() == 1 { Frame::Null } else { Frame::Array(framevec![]) };
+    }
+    let mut rng = rand::rng();
+    if args.len() == 1 {
+        let (field, _) = entries.choose(&mut rng).unwrap();
+        return Frame::BulkString(field.clone());
+    }
+    let count_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("HRANDFIELD"),
+    };
+    let count: i64 = match std::str::from_utf8(count_bytes).ok().and_then(|s| s.parse().ok()) {
+        Some(c) => c,
+        None => return Frame::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+    };
+    let with_values = if args.len() == 3 {
+        let opt = match extract_bytes(&args[2]) {
+            Some(b) => b,
+            None => return err_wrong_args("HRANDFIELD"),
+        };
+        if opt.eq_ignore_ascii_case(b"WITHVALUES") { true }
+        else { return Frame::Error(Bytes::from_static(b"ERR syntax error")); }
+    } else { false };
+    if count == 0 { return Frame::Array(framevec![]); }
+    if count > 0 {
+        let n = std::cmp::min(count as usize, entries.len());
+        let indices: Vec<usize> = (0..entries.len()).collect();
+        let chosen: Vec<usize> = indices.as_slice().sample(&mut rng, n).copied().collect();
+        if with_values {
+            let mut result = Vec::with_capacity(n * 2);
+            for &idx in &chosen {
+                result.push(Frame::BulkString(entries[idx].0.clone()));
+                result.push(Frame::BulkString(entries[idx].1.clone()));
+            }
+            Frame::Array(result.into())
+        } else {
+            let result: Vec<Frame> = chosen.iter().map(|&idx| Frame::BulkString(entries[idx].0.clone())).collect();
+            Frame::Array(result.into())
+        }
+    } else {
+        let n = count.unsigned_abs() as usize;
+        if with_values {
+            let mut result = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                let (field, value) = entries.choose(&mut rng).unwrap();
+                result.push(Frame::BulkString(field.clone()));
+                result.push(Frame::BulkString(value.clone()));
+            }
+            Frame::Array(result.into())
+        } else {
+            let mut result = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (field, _) = entries.choose(&mut rng).unwrap();
+                result.push(Frame::BulkString(field.clone()));
+            }
+            Frame::Array(result.into())
+        }
+    }
+}

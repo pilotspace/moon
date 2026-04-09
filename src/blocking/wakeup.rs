@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use crate::blocking::{BlockedCommand, BlockingRegistry, Direction};
+use crate::command::sorted_set::format_score_bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
@@ -63,6 +64,29 @@ pub fn try_wake_list_waiter(
                     Frame::BulkString(v)
                 })
             }
+            BlockedCommand::BLMPop { dir, count } => {
+                let mut elems = smallvec::SmallVec::<[Frame; 16]>::new();
+                let n = *count as usize;
+                for _ in 0..n {
+                    let val = match dir {
+                        Direction::Left => db.list_pop_front(key),
+                        Direction::Right => db.list_pop_back(key),
+                    };
+                    match val {
+                        Some(v) => elems.push(Frame::BulkString(v)),
+                        None => break,
+                    }
+                }
+                if elems.is_empty() {
+                    None
+                } else {
+                    let elem_vec: Vec<Frame> = elems.into_vec();
+                    Some(Frame::Array(framevec![
+                        Frame::BulkString(key.clone()),
+                        Frame::Array(elem_vec.into()),
+                    ]))
+                }
+            }
             _ => None, // BZPopMin/BZPopMax don't watch list keys
         };
 
@@ -98,24 +122,51 @@ pub fn try_wake_zset_waiter(
 
         let result = match &waiter.cmd {
             BlockedCommand::BZPopMin => {
-                // Pop min, return [key, member, score]
                 db.zset_pop_min(key).map(|(member, score)| {
                     Frame::Array(framevec![
                         Frame::BulkString(key.clone()),
                         Frame::BulkString(member),
-                        Frame::BulkString(Bytes::from(format_score(score))),
+                        Frame::BulkString(format_score_bytes(score)),
                     ])
                 })
             }
             BlockedCommand::BZPopMax => {
-                // Pop max, return [key, member, score]
                 db.zset_pop_max(key).map(|(member, score)| {
                     Frame::Array(framevec![
                         Frame::BulkString(key.clone()),
                         Frame::BulkString(member),
-                        Frame::BulkString(Bytes::from(format_score(score))),
+                        Frame::BulkString(format_score_bytes(score)),
                     ])
                 })
+            }
+            BlockedCommand::BZMPop { min, count } => {
+                let n = *count as usize;
+                let mut elems = smallvec::SmallVec::<[Frame; 16]>::new();
+                for _ in 0..n {
+                    let popped = if *min {
+                        db.zset_pop_min(key)
+                    } else {
+                        db.zset_pop_max(key)
+                    };
+                    match popped {
+                        Some((member, score)) => {
+                            elems.push(Frame::Array(framevec![
+                                Frame::BulkString(member),
+                                Frame::BulkString(format_score_bytes(score)),
+                            ]));
+                        }
+                        None => break,
+                    }
+                }
+                if elems.is_empty() {
+                    None
+                } else {
+                    let elem_vec: Vec<Frame> = elems.into_vec();
+                    Some(Frame::Array(framevec![
+                        Frame::BulkString(key.clone()),
+                        Frame::Array(elem_vec.into()),
+                    ]))
+                }
             }
             _ => None, // List commands don't watch zset keys
         };
@@ -233,11 +284,3 @@ pub fn try_wake_stream_waiter(
     false
 }
 
-/// Format a float score the same way Redis does (integer if whole, otherwise full precision).
-fn format_score(score: f64) -> String {
-    if score == score.floor() && score.abs() < i64::MAX as f64 {
-        format!("{}", score as i64)
-    } else {
-        format!("{}", score)
-    }
-}

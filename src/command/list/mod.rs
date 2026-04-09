@@ -50,6 +50,9 @@ pub use list_write::lset;
 pub use list_write::ltrim;
 pub use list_write::rpop;
 pub use list_write::rpush;
+pub use list_write::lpushx;
+pub use list_write::rpushx;
+pub use list_write::lmpop;
 
 // ===========================================================================
 // Tests
