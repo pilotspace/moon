@@ -61,6 +61,13 @@ pub fn init_metrics(admin_port: u16, bind: &str) -> Option<std::sync::Arc<Atomic
 
 // ── Command metrics ─────────────────────────────────────────────────────
 
+/// Returns true if the Prometheus metrics exporter is active.
+/// Use this to gate expensive timing operations on the hot path.
+#[inline]
+pub fn is_metrics_enabled() -> bool {
+    METRICS_INITIALIZED.load(Ordering::Relaxed)
+}
+
 /// Record a command execution.
 #[inline]
 pub fn record_command(cmd: &str, latency_us: u64) {
@@ -68,9 +75,10 @@ pub fn record_command(cmd: &str, latency_us: u64) {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    counter!("moon_commands_total", "cmd" => cmd.to_ascii_lowercase()).increment(1);
-    histogram!("moon_command_duration_microseconds", "cmd" => cmd.to_ascii_lowercase())
-        .record(latency_us as f64);
+    // Single lowercase allocation reused for both counter and histogram labels.
+    let label = cmd.to_ascii_lowercase();
+    counter!("moon_commands_total", "cmd" => label.clone()).increment(1);
+    histogram!("moon_command_duration_microseconds", "cmd" => label).record(latency_us as f64);
 }
 
 /// Record a command error.

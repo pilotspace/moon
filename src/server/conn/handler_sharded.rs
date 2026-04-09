@@ -224,8 +224,11 @@ pub async fn handle_connection_sharded(
                 // Stream consumed by into_std attempt, connection lost either way
             }
         }
+    } else {
+        // Only decrement connected_clients when the connection is actually closing,
+        // not when migrating to another shard (the connection stays alive).
+        crate::admin::metrics_setup::record_connection_closed();
     }
-    crate::admin::metrics_setup::record_connection_closed();
 }
 
 /// Generic inner handler for sharded connections (Tokio runtime).
@@ -1406,8 +1409,8 @@ pub async fn handle_connection_sharded_inner<
                                 crate::admin::metrics_setup::global_slowlog().maybe_record(
                                     elapsed_us,
                                     args.as_slice(),
-                                    b"",
-                                    b"",
+                                    peer_addr.as_bytes(),
+                                    client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                 );
                             }
                             let response = match result {
@@ -1484,8 +1487,8 @@ pub async fn handle_connection_sharded_inner<
                                 crate::admin::metrics_setup::global_slowlog().maybe_record(
                                     elapsed_us,
                                     args.as_slice(),
-                                    b"",
-                                    b"",
+                                    peer_addr.as_bytes(),
+                                    client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                 );
                             }
                             drop(guard);

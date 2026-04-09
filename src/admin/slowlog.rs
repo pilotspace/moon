@@ -72,7 +72,7 @@ impl Slowlog {
         client_name: &[u8],
     ) {
         let threshold = self.threshold_us.load(Ordering::Relaxed);
-        if threshold == 0 || duration_us < threshold {
+        if duration_us < threshold {
             return;
         }
 
@@ -108,6 +108,9 @@ impl Slowlog {
         };
 
         let max_len = self.max_len.load(Ordering::Relaxed) as usize;
+        if max_len == 0 {
+            return; // max_len=0 means slowlog disabled (Redis convention)
+        }
         let mut entries = self.entries.lock();
         if entries.len() >= max_len {
             entries.pop_back();
@@ -169,9 +172,35 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
         b"GET" => {
             let count = if args.len() > 1 {
                 match &args[1] {
-                    Frame::BulkString(b) => atoi::atoi::<usize>(b),
-                    Frame::Integer(n) => Some(*n as usize),
-                    _ => None,
+                    Frame::BulkString(b) => {
+                        // Parse as i64 first to detect negatives
+                        match atoi::atoi::<i64>(b) {
+                            Some(n) if n < 0 => {
+                                return Frame::Error(Bytes::from_static(
+                                    b"ERR count must be a non-negative integer",
+                                ));
+                            }
+                            Some(n) => Some(n as usize),
+                            None => {
+                                return Frame::Error(Bytes::from_static(
+                                    b"ERR value is not an integer or out of range",
+                                ));
+                            }
+                        }
+                    }
+                    Frame::Integer(n) => {
+                        if *n < 0 {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR count must be a non-negative integer",
+                            ));
+                        }
+                        Some(*n as usize)
+                    }
+                    _ => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR value is not an integer or out of range",
+                        ));
+                    }
                 }
             } else {
                 None
@@ -265,5 +294,43 @@ mod tests {
             Frame::Array(_) => {} // expected
             _ => panic!("Expected array response from SLOWLOG HELP"),
         }
+    }
+
+    #[test]
+    fn test_threshold_zero_logs_everything() {
+        // threshold=0 means "log every command" (Redis convention)
+        let sl = Slowlog::new(10, 0);
+        sl.maybe_record(0, &[], b"127.0.0.1:1234", b"");
+        assert_eq!(sl.len(), 1);
+    }
+
+    #[test]
+    fn test_max_len_zero_disables() {
+        // max_len=0 means "disabled" (Redis convention)
+        let sl = Slowlog::new(0, 0);
+        sl.maybe_record(100, &[], b"", b"");
+        assert_eq!(sl.len(), 0);
+    }
+
+    #[test]
+    fn test_get_negative_count_error() {
+        let sl = Slowlog::new(10, 1);
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"GET")),
+            Frame::BulkString(Bytes::from_static(b"-5")),
+        ];
+        let result = handle_slowlog(&sl, &args);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_get_non_numeric_error() {
+        let sl = Slowlog::new(10, 1);
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"GET")),
+            Frame::BulkString(Bytes::from_static(b"abc")),
+        ];
+        let result = handle_slowlog(&sl, &args);
+        assert!(matches!(result, Frame::Error(_)));
     }
 }

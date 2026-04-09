@@ -42,9 +42,16 @@ pub fn dispatch(
     selected_db: &mut usize,
     db_count: usize,
 ) -> DispatchResult {
-    let start = std::time::Instant::now();
+    let metrics_on = metrics_setup::is_metrics_enabled();
+    let start = if metrics_on {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let result = dispatch_inner(db, cmd, args, selected_db, db_count);
-    let elapsed_us = start.elapsed().as_micros() as u64;
+    // Always bump the atomic counter (cheap), but only compute elapsed when
+    // the Prometheus exporter is active — avoids Instant::now() syscall overhead.
+    let elapsed_us = start.map_or(0, |s| s.elapsed().as_micros() as u64);
     let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
     metrics_setup::record_command(cmd_str, elapsed_us);
     if matches!(&result, DispatchResult::Response(Frame::Error(_))) {
@@ -501,6 +508,15 @@ fn dispatch_inner(
                 return resp(key::persist(db, args));
             }
         }
+        (7, b's') => {
+            // SLOWLOG
+            if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
+                return resp(crate::admin::slowlog::handle_slowlog(
+                    crate::admin::metrics_setup::global_slowlog(),
+                    args,
+                ));
+            }
+        }
         (7, b'z') => {
             // ZINCRBY ZPOPMIN ZPOPMAX
             if cmd.eq_ignore_ascii_case(b"ZINCRBY") {
@@ -695,6 +711,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
         | (7, b'h')  // HGETALL, HEXISTS
+        | (7, b's')  // SLOWLOG
         | (8, b'g')  // GETRANGE
         | (8, b's')  // SMEMBERS
         | (8, b'z')  // ZREVRANK
@@ -715,20 +732,23 @@ pub fn dispatch_read(
     _selected_db: &mut usize,
     _db_count: usize,
 ) -> DispatchResult {
-    let start = std::time::Instant::now();
+    let metrics_on = metrics_setup::is_metrics_enabled();
+    let start = if metrics_on {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let result = dispatch_read_inner(db, cmd, args, now_ms);
-    let elapsed_us = start.elapsed().as_micros() as u64;
+    let elapsed_us = start.map_or(0, |s| s.elapsed().as_micros() as u64);
     let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
     metrics_setup::record_command(cmd_str, elapsed_us);
+    if matches!(&result, DispatchResult::Response(Frame::Error(_))) {
+        metrics_setup::record_command_error(cmd_str);
+    }
     result
 }
 
-fn dispatch_read_inner(
-    db: &Database,
-    cmd: &[u8],
-    args: &[Frame],
-    now_ms: u64,
-) -> DispatchResult {
+fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
         return DispatchResult::Response(err_unknown(cmd));
@@ -910,6 +930,15 @@ fn dispatch_read_inner(
             }
             if cmd.eq_ignore_ascii_case(b"HEXISTS") {
                 return resp(hash::hexists_readonly(db, args, now_ms));
+            }
+        }
+        (7, b's') => {
+            // SLOWLOG
+            if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
+                return resp(crate::admin::slowlog::handle_slowlog(
+                    crate::admin::metrics_setup::global_slowlog(),
+                    args,
+                ));
             }
         }
         (8, b'g') => {
