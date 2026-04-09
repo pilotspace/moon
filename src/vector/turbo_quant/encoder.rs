@@ -49,7 +49,10 @@ pub fn padded_dimension(dim: u32) -> u32 {
 /// Layout: `byte[i] = (indices[2*i+1] << 4) | indices[2*i]`
 #[inline]
 pub fn nibble_pack(indices: &[u8]) -> Vec<u8> {
-    debug_assert!(indices.len() % 2 == 0, "nibble_pack requires even length");
+    debug_assert!(
+        indices.len().is_multiple_of(2),
+        "nibble_pack requires even length"
+    );
     indices
         .chunks_exact(2)
         .map(|pair| pair[0] | (pair[1] << 4))
@@ -334,7 +337,7 @@ pub fn mse_distortion(original: &[f32], reconstructed: &[f32]) -> f32 {
 #[inline]
 pub fn pack_1bit(indices: &[u8]) -> Vec<u8> {
     debug_assert!(
-        indices.len() % 8 == 0,
+        indices.len().is_multiple_of(8),
         "pack_1bit requires length multiple of 8"
     );
     let mut out = Vec::with_capacity(indices.len() / 8);
@@ -369,7 +372,7 @@ pub fn unpack_1bit(packed: &[u8], count: usize) -> Vec<u8> {
 #[inline]
 pub fn pack_2bit(indices: &[u8]) -> Vec<u8> {
     debug_assert!(
-        indices.len() % 4 == 0,
+        indices.len().is_multiple_of(4),
         "pack_2bit requires length multiple of 4"
     );
     let mut out = Vec::with_capacity(indices.len() / 4);
@@ -409,7 +412,7 @@ pub fn unpack_2bit(packed: &[u8], count: usize) -> Vec<u8> {
 #[inline]
 pub fn pack_3bit(indices: &[u8]) -> Vec<u8> {
     debug_assert!(
-        indices.len() % 8 == 0,
+        indices.len().is_multiple_of(8),
         "pack_3bit requires length multiple of 8"
     );
     let mut out = Vec::with_capacity(indices.len() * 3 / 8);

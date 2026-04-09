@@ -66,6 +66,9 @@ impl ResponseSlot {
     /// Single-producer only (target shard thread).
     pub(crate) fn fill(&self, response: Vec<Frame>) {
         // Write data before state transition (will be visible via Release ordering)
+        // SAFETY: Single-producer guarantee (only target shard calls fill). State is
+        // EMPTY, so no consumer is reading the UnsafeCell. Data write completes before
+        // the Release store to state, providing happens-before with consumer's Acquire load.
         unsafe {
             *self.data.get() = Some(response);
         }
@@ -89,6 +92,10 @@ impl ResponseSlot {
         let state = self.state.load(Ordering::Acquire);
         if state == FILLED {
             // Data is ready. Take it out and reset to EMPTY.
+            // Atomic state == FILLED guarantees fill() wrote Some(data); see fill().
+            #[allow(clippy::unwrap_used)]
+            // SAFETY: Acquire load confirmed FILLED, happens-after producer's Release store,
+            // so UnsafeCell data write is visible. Single consumer ensures no concurrent read.
             let data = unsafe { (*self.data.get()).take().unwrap() };
             self.state.store(EMPTY, Ordering::Release);
             return Poll::Ready(data);
@@ -101,6 +108,9 @@ impl ResponseSlot {
         // Handles the race where producer fills between our first load and waker store.
         let state = self.state.load(Ordering::Acquire);
         if state == FILLED {
+            // SAFETY: Same reasoning as fast path above — Acquire load confirmed FILLED,
+            // ensuring the producer's data write is visible. Single consumer, no aliasing.
+            #[allow(clippy::unwrap_used)] // fill() always writes Some before FILLED transition
             let data = unsafe { (*self.data.get()).take().unwrap() };
             self.state.store(EMPTY, Ordering::Release);
             return Poll::Ready(data);
@@ -115,6 +125,8 @@ impl ResponseSlot {
     #[allow(dead_code)] // Used in tests and available for future error recovery paths
     pub(crate) fn reset(&self) {
         self.state.store(EMPTY, Ordering::Release);
+        // SAFETY: reset() is called only by the connection owner (single consumer)
+        // after storing EMPTY, so no producer is concurrently writing to the UnsafeCell.
         unsafe {
             *self.data.get() = None;
         }

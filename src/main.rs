@@ -246,105 +246,94 @@ fn main() -> anyhow::Result<()> {
     //
     // A corrupt manifest is FATAL: overwriting it silently destroys the reference
     // to the real base RDB and loses all persisted data.
-    if config.appendonly == "yes" {
-        if let Some(ref dir) = persistence_dir {
-            use anyhow::Context;
-            use moon::persistence::aof_manifest::AofManifest;
-            use moon::persistence::replay::DispatchReplayEngine;
-            let base_dir = std::path::PathBuf::from(dir);
-            let manifest_opt = AofManifest::load(&base_dir).with_context(|| {
+    if config.appendonly == "yes"
+        && let Some(ref dir) = persistence_dir
+    {
+        use anyhow::Context;
+        use moon::persistence::aof_manifest::AofManifest;
+        use moon::persistence::replay::DispatchReplayEngine;
+        let base_dir = std::path::PathBuf::from(dir);
+        let manifest_opt = AofManifest::load(&base_dir).with_context(|| {
                 format!(
                     "AOF manifest at {}/appendonlydir/ is corrupt; refusing to start to avoid data loss. Inspect manually before deleting.",
                     base_dir.display()
                 )
             })?;
-            if let Some(ref manifest) = manifest_opt {
-                if num_shards == 1 {
-                    // Multi-part AOF is authoritative. Wipe any state that earlier
-                    // recovery phases (per-shard WAL replay, legacy appendonly.aof
-                    // fallback inside restore_from_persistence) may have loaded —
-                    // otherwise non-idempotent commands from the incr log would
-                    // double-apply on top of that pre-existing state.
-                    for db in shards[0].databases.iter_mut() {
-                        db.clear();
-                    }
-                    let loaded = moon::persistence::aof_manifest::replay_multi_part(
-                        &mut shards[0].databases,
-                        manifest,
-                        &DispatchReplayEngine,
-                    )
-                    .with_context(|| "multi-part AOF replay failed")?;
-                    info!(
-                        "AOF multi-part loaded (seq {}): {} entries",
-                        manifest.seq, loaded
-                    );
+        if let Some(ref manifest) = manifest_opt {
+            if num_shards == 1 {
+                // Multi-part AOF is authoritative. Wipe any state that earlier
+                // recovery phases (per-shard WAL replay, legacy appendonly.aof
+                // fallback inside restore_from_persistence) may have loaded —
+                // otherwise non-idempotent commands from the incr log would
+                // double-apply on top of that pre-existing state.
+                for db in shards[0].databases.iter_mut() {
+                    db.clear();
+                }
+                let loaded = moon::persistence::aof_manifest::replay_multi_part(
+                    &mut shards[0].databases,
+                    manifest,
+                    &DispatchReplayEngine,
+                )
+                .with_context(|| "multi-part AOF replay failed")?;
+                info!(
+                    "AOF multi-part loaded (seq {}): {} entries",
+                    manifest.seq, loaded
+                );
 
-                    // Retire legacy appendonly.aof so future boots don't double-
-                    // replay it via restore_from_persistence's fallback path.
-                    // Rename (not delete) so an operator can recover if something
-                    // went wrong.
-                    let legacy = base_dir.join("appendonly.aof");
-                    if legacy.exists() {
-                        let retired = base_dir.join("appendonly.aof.legacy");
-                        if let Err(e) = std::fs::rename(&legacy, &retired) {
-                            tracing::warn!(
-                                "Failed to retire legacy AOF {}: {}",
-                                legacy.display(),
-                                e
-                            );
-                        } else {
-                            info!(
-                                "Retired legacy AOF {} → {}",
-                                legacy.display(),
-                                retired.display()
-                            );
-                        }
+                // Retire legacy appendonly.aof so future boots don't double-
+                // replay it via restore_from_persistence's fallback path.
+                // Rename (not delete) so an operator can recover if something
+                // went wrong.
+                let legacy = base_dir.join("appendonly.aof");
+                if legacy.exists() {
+                    let retired = base_dir.join("appendonly.aof.legacy");
+                    if let Err(e) = std::fs::rename(&legacy, &retired) {
+                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
+                    } else {
+                        info!(
+                            "Retired legacy AOF {} → {}",
+                            legacy.display(),
+                            retired.display()
+                        );
                     }
-                } else {
-                    tracing::warn!(
-                        "Multi-part AOF skipped in multi-shard mode (not yet supported)"
-                    );
                 }
             } else {
-                // No manifest present — first boot after upgrade from legacy
-                // single-file AOF (v2 recovery already loaded it above) or
-                // fresh install.
-                //
-                // If restore_from_persistence loaded any state (from WAL or
-                // legacy appendonly.aof), we MUST capture it as the seq 1
-                // base RDB. Otherwise on the next boot the multi-part replay
-                // path would clear the databases and lose the legacy state.
-                // Only shard 0 is relevant in single-shard mode (the only
-                // mode the multi-part path currently supports).
-                let has_state =
-                    num_shards == 1 && shards[0].databases.iter().any(|db| db.len() > 0);
-                if has_state {
-                    let rdb_bytes = moon::persistence::rdb::save_to_bytes(&shards[0].databases)
-                        .with_context(|| "failed to serialize legacy state for AOF base")?;
-                    AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
-                        .with_context(|| "failed to initialize AOF manifest with base")?;
-                    info!(
-                        "First-upgrade: captured legacy state as AOF base seq 1 ({} bytes)",
-                        rdb_bytes.len()
-                    );
-                    // Retire legacy appendonly.aof — its contents are now in
-                    // the base RDB, and leaving it would cause v2 recovery on
-                    // the next boot to double-replay it.
-                    let legacy = base_dir.join("appendonly.aof");
-                    if legacy.exists() {
-                        let retired = base_dir.join("appendonly.aof.legacy");
-                        if let Err(e) = std::fs::rename(&legacy, &retired) {
-                            tracing::warn!(
-                                "Failed to retire legacy AOF {}: {}",
-                                legacy.display(),
-                                e
-                            );
-                        }
+                tracing::warn!("Multi-part AOF skipped in multi-shard mode (not yet supported)");
+            }
+        } else {
+            // No manifest present — first boot after upgrade from legacy
+            // single-file AOF (v2 recovery already loaded it above) or
+            // fresh install.
+            //
+            // If restore_from_persistence loaded any state (from WAL or
+            // legacy appendonly.aof), we MUST capture it as the seq 1
+            // base RDB. Otherwise on the next boot the multi-part replay
+            // path would clear the databases and lose the legacy state.
+            // Only shard 0 is relevant in single-shard mode (the only
+            // mode the multi-part path currently supports).
+            let has_state = num_shards == 1 && shards[0].databases.iter().any(|db| db.len() > 0);
+            if has_state {
+                let rdb_bytes = moon::persistence::rdb::save_to_bytes(&shards[0].databases)
+                    .with_context(|| "failed to serialize legacy state for AOF base")?;
+                AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
+                    .with_context(|| "failed to initialize AOF manifest with base")?;
+                info!(
+                    "First-upgrade: captured legacy state as AOF base seq 1 ({} bytes)",
+                    rdb_bytes.len()
+                );
+                // Retire legacy appendonly.aof — its contents are now in
+                // the base RDB, and leaving it would cause v2 recovery on
+                // the next boot to double-replay it.
+                let legacy = base_dir.join("appendonly.aof");
+                if legacy.exists() {
+                    let retired = base_dir.join("appendonly.aof.legacy");
+                    if let Err(e) = std::fs::rename(&legacy, &retired) {
+                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
                     }
-                } else {
-                    AofManifest::initialize(&base_dir)
-                        .with_context(|| "failed to initialize AOF manifest")?;
                 }
+            } else {
+                AofManifest::initialize(&base_dir)
+                    .with_context(|| "failed to initialize AOF manifest")?;
             }
         }
     }

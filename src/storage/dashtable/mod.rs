@@ -42,10 +42,13 @@ pub fn hash_key(key: &[u8]) -> u64 {
 #[inline(always)]
 fn prefetch_segment<K, V>(segment: &Segment<K, V>) {
     let ptr = segment as *const Segment<K, V> as *const u8;
+    // SAFETY: ptr points to a valid, aligned Segment obtained from the slab.
+    // Prefetch is a performance hint; it does not dereference the pointer.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
     }
+    // SAFETY: Same as above — ptr is a valid Segment address used as a prefetch hint.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
@@ -147,9 +150,14 @@ impl<K, V> SegmentSlab<K, V> {
         let slabs_ptr = self.slabs.as_mut_ptr();
         self.index_map
             .iter()
-            .map(|&(si, sli)| unsafe {
-                let slab = &mut *slabs_ptr.add(si as usize);
-                &mut *slab.as_mut_ptr().add(sli as usize)
+            .map(|&(si, sli)| {
+                // SAFETY: Each index_map entry refers to a unique (slab_idx, slot_idx) pair,
+                // so no two mutable references alias. Raw pointer arithmetic is used to work
+                // around the borrow checker; both slab and slot indices are in bounds.
+                unsafe {
+                    let slab = &mut *slabs_ptr.add(si as usize);
+                    &mut *slab.as_mut_ptr().add(sli as usize)
+                }
             })
             .collect()
     }

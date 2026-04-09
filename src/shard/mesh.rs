@@ -118,6 +118,7 @@ impl ChannelMesh {
     /// Take the connection receiver for a specific shard (call once during setup).
     ///
     /// Panics if called more than once for the same shard.
+    #[allow(clippy::expect_used)] // Intentional: double-take is a caller bug, panic is correct
     pub fn take_conn_rx(
         &mut self,
         shard_id: usize,

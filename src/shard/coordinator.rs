@@ -256,7 +256,7 @@ async fn coordinate_mset(
     cached_clock: &CachedClock,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'mset' command",
         ));

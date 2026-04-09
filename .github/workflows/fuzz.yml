@@ -1,0 +1,89 @@
+name: Fuzz
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-pr:
+    if: github.event_name == 'pull_request'
+    name: Fuzz PR
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - resp_parse
+          - resp_parse_differential
+          - wal_v3_record
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Override rust-toolchain.toml for nightly
+        run: rm -f rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz-nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Download nightly corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz/corpus/
+        continue-on-error: true
+      - name: Run fuzzer (5m, multi-process)
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=300 -max_len=65536 -fork=2 -ignore_crashes=0
+        env:
+          MOON_NO_URING: "1"
+          TARGET: ${{ matrix.target }}
+
+  fuzz-nightly:
+    if: github.event_name == 'schedule'
+    name: Fuzz nightly
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - resp_parse
+          - resp_parse_differential
+          - inline_parse
+          - wal_v3_record
+          - gossip_deser
+          - acl_rule
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Override rust-toolchain.toml for nightly
+        run: rm -f rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz-nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Download previous corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz/corpus/
+        continue-on-error: true
+      - name: Run fuzzer (6h, multi-process)
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=21600 -max_len=65536 -fork=2 -ignore_crashes=0
+        env:
+          MOON_NO_URING: "1"
+          TARGET: ${{ matrix.target }}
+      - name: Archive corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz/corpus/
+          retention-days: 30

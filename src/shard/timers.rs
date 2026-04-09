@@ -28,6 +28,7 @@ pub(crate) fn run_eviction(
     shard_id: usize,
     runtime_config: &Arc<RwLock<RuntimeConfig>>,
 ) {
+    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
     let rt = runtime_config.read().unwrap();
     if rt.maxmemory > 0 {
         let db_count = shard_databases.db_count();

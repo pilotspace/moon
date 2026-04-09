@@ -142,7 +142,7 @@ pub fn transition_to_cold(
     // m = dim / 8 subspaces (8 dims per subspace), 8 bits per code (256 centroids)
     let m = (dim / 8).max(1);
     // Ensure dim is divisible by m
-    let m = if dim % m != 0 { dim } else { m };
+    let m = if !dim.is_multiple_of(m) { dim } else { m };
     let pq = ProductQuantizer::train(&vectors, dim, m, 8);
 
     // Step 3: Encode all vectors into PQ codes

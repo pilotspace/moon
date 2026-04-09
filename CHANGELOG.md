@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - Dispatch Hot-Path Recovery (2026-04-08)
+## [Unreleased]
+
+### Added — Production Contract (Phase 87, 2026-04-08)
+
+- **`docs/PRODUCTION-CONTRACT.md`** — Moon's v1.0 promises: per-command-class SLOs (provisional until Phase 97), supported platform matrix (Linux aarch64 primary, Linux x86_64 secondary contingent on `PERF-04`, macOS dev-only via OrbStack), durability mode semantics per `appendfsync` × failure-class, availability & replication guarantees, security guarantees, explicit out-of-scope list, and a machine-checkable GA Exit Criteria checklist that every v0.1.3 phase ticks off. This is the contract every downstream hardening phase (88–100) tests against.
+- **`docs/runbooks/`** — stub directory for operator runbooks authored in Phase 99 (`REL-05`).
+
+### Changed — Toolchain Upgrade (Phase 88, 2026-04-08)
+
+- **MSRV bumped from Rust 1.85 to 1.94.0.** `rust-toolchain.toml` committed so fresh clones auto-install the pinned version; CI workflows (`ci.yml`, `codeql.yml`, `release.yml`) and OrbStack `moon-dev` VM provisioning in `CLAUDE.md` updated. No language/runtime behavior change; downstream phases benefit from new clippy lints and std/compiler improvements. Contributors must run `rustup update` on next pull.
+
+## [Earlier Unreleased] - Dispatch Hot-Path Recovery (2026-04-08)
 
 **Pipelined SET +37%, pipelined GET +68% at p=16 after PR #43 regression recovery.**
 

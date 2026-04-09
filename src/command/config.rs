@@ -66,7 +66,7 @@ pub fn config_get(
 
 /// Handle CONFIG SET for runtime-mutable parameters.
 pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
-    if args.len() < 2 || args.len() % 2 != 0 {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'config|set' command",
         ));

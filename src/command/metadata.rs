@@ -425,6 +425,7 @@ fn pack_upper_u64(cmd: &[u8]) -> u64 {
 /// `hot_path_matches_phf_map` unit test).
 ///
 /// Indices are assigned by `hot_index_for(len, packed)` below.
+#[allow(clippy::unwrap_used, clippy::expect_used)] // LazyLock init: panicking here is correct — missing PHF entry is a build bug
 static HOT_META: std::sync::LazyLock<[&'static CommandMeta; HOT_COUNT]> =
     std::sync::LazyLock::new(|| {
         fn get(name: &str) -> &'static CommandMeta {

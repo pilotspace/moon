@@ -364,6 +364,8 @@ mod tests {
             );
 
             let expected_dot = scalar::dot_f32(&a, &b);
+            // SAFETY: AVX-512 feature is enabled via target_feature on the caller;
+            // slices a and b have equal length.
             let got_dot = unsafe { dot_f32(&a, &b) };
             let rel = (got_dot - expected_dot).abs() / expected_dot.abs().max(1e-10);
             assert!(

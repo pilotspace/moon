@@ -423,6 +423,7 @@ pub async fn run_sharded(
 
     // Ctrl+C handler -- ctrlc crate sets handler on OS thread, signals our token
     let shutdown_signal = shutdown.clone();
+    #[allow(clippy::expect_used)] // Startup: no recovery possible without signal handler
     ctrlc::set_handler(move || {
         info!("Shutdown signal received");
         shutdown_signal.cancel();
@@ -485,6 +486,8 @@ pub async fn run_sharded(
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
                                 let fd = stream.into_raw_fd();
+                                // SAFETY: fd is a valid socket from monoio TcpStream::into_raw_fd(),
+                                // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
                             let tx = &conn_txs[target_shard];
@@ -512,6 +515,8 @@ pub async fn run_sharded(
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
                                 let fd = stream.into_raw_fd();
+                                // SAFETY: fd is a valid socket from monoio TLS stream::into_raw_fd(),
+                                // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
                             let tx = &conn_txs[tls_next_shard];
@@ -569,6 +574,8 @@ pub async fn run_sharded(
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
                                 let fd = stream.into_raw_fd();
+                                // SAFETY: fd is a valid socket from monoio TcpStream::into_raw_fd(),
+                                // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
                             let tx = &conn_txs[target_shard];

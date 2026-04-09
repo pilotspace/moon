@@ -4,6 +4,7 @@
 
 pub mod build;
 pub mod graph;
+pub mod graph_serde;
 pub mod neighbor_codec;
 pub mod search;
 pub mod search_sq;

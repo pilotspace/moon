@@ -307,6 +307,8 @@ impl UringDriver {
         // This pins pages once at init so WRITE_FIXED skips get_user_pages() per I/O.
         let iovecs = self.send_buf_pool.build_iovecs();
         if !iovecs.is_empty() {
+            // SAFETY: iovecs reference pre-allocated send buffers owned by send_buf_pool,
+            // which outlives the ring. register_buffers pins pages for WRITE_FIXED I/O.
             unsafe {
                 self.ring.submitter().register_buffers(&iovecs)?;
             }
@@ -340,10 +342,10 @@ impl UringDriver {
     fn push_sqe(&mut self, entry: &io_uring::squeue::Entry) -> std::io::Result<()> {
         {
             let mut sq = self.ring.submission();
-            // SAFETY: `entry` is a borrow that outlives this call, `sq` is
-            // freshly obtained from the owned ring, and io_uring's `push`
-            // copies the SQE bytes into the kernel-shared ring at call time —
-            // it does not retain the reference past the push.
+            // `entry` is a borrow that outlives this call, `sq` is freshly obtained
+            // from the owned ring, and io_uring's `push` copies the SQE bytes into
+            // the kernel-shared ring at call time — it does not retain the reference.
+            // SAFETY: SQE copied at push time; no dangling pointer after this scope.
             unsafe {
                 sq.push(entry)
                     .map_err(|_| std::io::Error::other("SQ full"))?;
@@ -383,6 +385,8 @@ impl UringDriver {
                     "FD table full ({} connections), rejecting new connection",
                     self.config.max_connections
                 );
+                // SAFETY: raw_fd is a valid, open socket fd from accept. We own it exclusively
+                // since fd_table.insert_and_register failed, so no other code holds a reference.
                 unsafe {
                     libc::close(raw_fd);
                 }
@@ -700,6 +704,8 @@ impl UringDriver {
             let raw_fd = self
                 .fd_table
                 .remove_and_register(conn.fixed_fd_idx, &self.ring)?;
+            // SAFETY: raw_fd is a valid socket fd returned from fd_table.remove_and_register,
+            // which unregistered it from io_uring. We are the sole owner; close is safe.
             unsafe {
                 libc::close(raw_fd);
             }
