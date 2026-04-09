@@ -53,7 +53,9 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 let mut needs_upgrade = false;
                 for arg in &args[1..] {
                     if let Some(member) = extract_bytes(arg) {
-                        let Some(val) = try_parse_i64(member) else { continue };
+                        let Some(val) = try_parse_i64(member) else {
+                            continue;
+                        };
                         if intset.insert(val) {
                             added += 1;
                         }

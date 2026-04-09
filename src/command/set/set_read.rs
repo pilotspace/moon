@@ -301,7 +301,9 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         let n = count.unsigned_abs() as usize;
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
-            let Some(chosen) = members.choose(&mut rng) else { break };
+            let Some(chosen) = members.choose(&mut rng) else {
+                break;
+            };
             result.push(Frame::BulkString((*chosen).clone()));
         }
         Frame::Array(result.into())
@@ -659,7 +661,9 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         let n = count.unsigned_abs() as usize;
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
-            let Some(chosen) = members.choose(&mut rng) else { break };
+            let Some(chosen) = members.choose(&mut rng) else {
+                break;
+            };
             result.push(Frame::BulkString((*chosen).clone()));
         }
         Frame::Array(result.into())

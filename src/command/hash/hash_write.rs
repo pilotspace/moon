@@ -249,7 +249,10 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let new_value = current + increment;
     let mut ibuf = itoa::Buffer::new();
-    map.insert(field, Bytes::copy_from_slice(ibuf.format(new_value).as_bytes()));
+    map.insert(
+        field,
+        Bytes::copy_from_slice(ibuf.format(new_value).as_bytes()),
+    );
     Frame::Integer(new_value)
 }
 
