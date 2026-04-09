@@ -149,6 +149,9 @@ fn parse_single_frame_zc(
         }
         b'%' => {
             let count = read_decimal_zc(buf, pos)?;
+            if count == -1 {
+                return Ok(Frame::Null);
+            }
             if count < 0 {
                 return Err(ParseError::Invalid {
                     message: "invalid map count".into(),
@@ -664,6 +667,9 @@ fn validate_frame(
         b'%' => {
             // Map: count pairs
             let count = read_decimal(buf, pos)?;
+            if count == -1 {
+                return Ok(()); // Null map
+            }
             if count < 0 {
                 return Err(ParseError::Invalid {
                     message: format!("invalid map length: {}", count),
@@ -1423,9 +1429,23 @@ mod tests {
     }
 
     #[test]
+    fn test_resp3_null_map() {
+        // %-1\r\n is a null RESP3 map
+        let result = parse_bytes(b"%-1\r\n").unwrap().unwrap();
+        assert_eq!(result, Frame::Null);
+    }
+
+    #[test]
     fn test_resp3_negative_set_count() {
         // ~-2\r\n is invalid (not null, not valid count)
         let result = parse_bytes(b"~-2\r\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resp3_negative_map_count() {
+        // %-2\r\n is invalid
+        let result = parse_bytes(b"%-2\r\n");
         assert!(result.is_err());
     }
 }

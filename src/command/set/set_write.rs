@@ -53,7 +53,7 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 let mut needs_upgrade = false;
                 for arg in &args[1..] {
                     if let Some(member) = extract_bytes(arg) {
-                        let val = try_parse_i64(member).unwrap();
+                        let Some(val) = try_parse_i64(member) else { continue };
                         if intset.insert(val) {
                             added += 1;
                         }
@@ -181,8 +181,12 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
 
     if args.len() == 1 {
         // Single random member
-        let chosen = members.choose(&mut rng).unwrap().clone();
-        let set = db.get_or_create_set(&key).unwrap();
+        let Some(chosen) = members.choose(&mut rng).cloned() else {
+            return Frame::Null;
+        };
+        let Ok(set) = db.get_or_create_set(&key) else {
+            return Frame::Null;
+        };
         set.remove(&chosen);
         if set.is_empty() {
             db.remove(&key);

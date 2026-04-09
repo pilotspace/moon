@@ -254,7 +254,7 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     fields.sort_by(|a, b| a.0.cmp(b.0));
 
     let total = fields.len();
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(count * 2);
     let mut pos = cursor;
     let mut checked = 0;
 
@@ -277,7 +277,8 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     let next_cursor = if pos >= total {
         Bytes::from_static(b"0")
     } else {
-        Bytes::from(pos.to_string())
+        let mut ibuf = itoa::Buffer::new();
+        Bytes::copy_from_slice(ibuf.format(pos).as_bytes())
     };
 
     Frame::Array(framevec![
@@ -540,7 +541,8 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let next_cursor = if pos >= total {
         Bytes::from_static(b"0")
     } else {
-        Bytes::from(pos.to_string())
+        let mut ibuf = itoa::Buffer::new();
+        Bytes::copy_from_slice(ibuf.format(pos).as_bytes())
     };
     Frame::Array(framevec![
         Frame::BulkString(next_cursor),

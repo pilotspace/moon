@@ -269,7 +269,9 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
 
     if args.len() == 1 {
         // Single random member
-        let chosen = members.choose(&mut rng).unwrap();
+        let Some(chosen) = members.choose(&mut rng) else {
+            return Frame::Null;
+        };
         return Frame::BulkString((*chosen).clone());
     }
 
@@ -299,7 +301,7 @@ pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
         let n = count.unsigned_abs() as usize;
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
-            let chosen = members.choose(&mut rng).unwrap();
+            let Some(chosen) = members.choose(&mut rng) else { break };
             result.push(Frame::BulkString((*chosen).clone()));
         }
         Frame::Array(result.into())
@@ -630,7 +632,9 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     let members: Vec<&Bytes> = set_members.iter().collect();
     let mut rng = rand::rng();
     if args.len() == 1 {
-        let chosen = members.choose(&mut rng).unwrap();
+        let Some(chosen) = members.choose(&mut rng) else {
+            return Frame::Null;
+        };
         return Frame::BulkString((*chosen).clone());
     }
     let count = match parse_int(&args[1]) {
@@ -655,7 +659,7 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         let n = count.unsigned_abs() as usize;
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
-            let chosen = members.choose(&mut rng).unwrap();
+            let Some(chosen) = members.choose(&mut rng) else { break };
             result.push(Frame::BulkString((*chosen).clone()));
         }
         Frame::Array(result.into())
