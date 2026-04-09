@@ -246,8 +246,7 @@ fn main() -> anyhow::Result<()> {
     //
     // A corrupt manifest is FATAL: overwriting it silently destroys the reference
     // to the real base RDB and loses all persisted data.
-    if config.appendonly == "yes" {
-        if let Some(ref dir) = persistence_dir {
+    if config.appendonly == "yes" && let Some(ref dir) = persistence_dir {
             use anyhow::Context;
             use moon::persistence::aof_manifest::AofManifest;
             use moon::persistence::replay::DispatchReplayEngine;
@@ -346,7 +345,6 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| "failed to initialize AOF manifest")?;
                 }
             }
-        }
     }
 
     // Extract databases from all shards and wrap in ShardDatabases
