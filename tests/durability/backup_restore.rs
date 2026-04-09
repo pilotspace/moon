@@ -5,16 +5,18 @@
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
-    use std::thread;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
 
     fn send_command(addr: &str, cmd: &str) -> String {
         let mut stream = TcpStream::connect(addr).expect("connect");
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        stream.write_all(format!("{}\r\n", cmd).as_bytes()).expect("write");
+        stream
+            .write_all(format!("{}\r\n", cmd).as_bytes())
+            .expect("write");
         stream.flush().ok();
         let reader = BufReader::new(&stream);
         let mut resp = String::new();
@@ -42,9 +44,12 @@ mod tests {
         // Start primary server
         let mut primary = Command::new("./target/release/moon")
             .args([
-                "--port", "16500",
-                "--shards", "1",
-                "--dir", dir1.path().to_str().unwrap(),
+                "--port",
+                "16500",
+                "--shards",
+                "1",
+                "--dir",
+                dir1.path().to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -55,7 +60,10 @@ mod tests {
 
         // Write data
         for i in 0..100 {
-            send_command("127.0.0.1:16500", &format!("SET backup_key_{} value_{}", i, i));
+            send_command(
+                "127.0.0.1:16500",
+                &format!("SET backup_key_{} value_{}", i, i),
+            );
         }
 
         let before = send_command("127.0.0.1:16500", "DBSIZE");
@@ -78,9 +86,12 @@ mod tests {
         // Start restore server from copied RDB
         let mut restore = Command::new("./target/release/moon")
             .args([
-                "--port", "16501",
-                "--shards", "1",
-                "--dir", dir2.path().to_str().unwrap(),
+                "--port",
+                "16501",
+                "--shards",
+                "1",
+                "--dir",
+                dir2.path().to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

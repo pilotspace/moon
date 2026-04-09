@@ -18,11 +18,11 @@
 //!
 //! Each cell: start server → write N keys → kill at phase → restart → verify.
 
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use std::thread;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 /// Helper: start a Moon server process with given config.
 fn start_moon(args: &[&str]) -> std::process::Child {
@@ -37,9 +37,7 @@ fn start_moon(args: &[&str]) -> std::process::Child {
 /// Helper: send a RESP command via raw TCP.
 fn send_resp_command(addr: &str, cmd: &str) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect failed");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     // Build RESP inline command
     let msg = format!("{}\r\n", cmd);
@@ -168,7 +166,10 @@ fn crash_test(
         _ => {
             // Other modes: just verify server started and recovered
             if after < 0 {
-                return Err(format!("{}: server did not recover (DBSIZE returned -1)", mode));
+                return Err(format!(
+                    "{}: server did not recover (DBSIZE returned -1)",
+                    mode
+                ));
             }
         }
     }
@@ -195,9 +196,12 @@ mod tests {
             16400,
             1000,
             &[
-                "--appendonly", "yes",
-                "--appendfsync", "always",
-                "--dir", dir.path().to_str().unwrap(),
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "always",
+                "--dir",
+                dir.path().to_str().unwrap(),
             ],
         );
         assert!(result.is_ok(), "{}", result.unwrap_err());
@@ -212,9 +216,12 @@ mod tests {
             16401,
             1000,
             &[
-                "--appendonly", "yes",
-                "--appendfsync", "everysec",
-                "--dir", dir.path().to_str().unwrap(),
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "everysec",
+                "--dir",
+                dir.path().to_str().unwrap(),
             ],
         );
         assert!(result.is_ok(), "{}", result.unwrap_err());
@@ -224,12 +231,7 @@ mod tests {
     #[ignore]
     fn crash_no_persistence() {
         let dir = tempfile::tempdir().unwrap();
-        let result = crash_test(
-            "none",
-            16402,
-            100,
-            &["--dir", dir.path().to_str().unwrap()],
-        );
+        let result = crash_test("none", 16402, 100, &["--dir", dir.path().to_str().unwrap()]);
         // No persistence — data loss is expected. Just verify server recovers.
         assert!(result.is_ok(), "{}", result.unwrap_err());
     }

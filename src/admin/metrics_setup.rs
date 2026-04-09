@@ -30,7 +30,11 @@ pub fn init_metrics(admin_port: u16, bind: &str) {
     {
         match builder
             .with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-                tracing::warn!("Invalid admin bind address '{}', using 0.0.0.0:{}", addr, admin_port);
+                tracing::warn!(
+                    "Invalid admin bind address '{}', using 0.0.0.0:{}",
+                    addr,
+                    admin_port
+                );
                 std::net::SocketAddr::from(([0, 0, 0, 0], admin_port))
             }))
             .install()

@@ -154,9 +154,7 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
         b"GET" => {
             let count = if args.len() > 1 {
                 match &args[1] {
-                    Frame::BulkString(b) => {
-                        atoi::atoi::<usize>(b)
-                    }
+                    Frame::BulkString(b) => atoi::atoi::<usize>(b),
                     Frame::Integer(n) => Some(*n as usize),
                     _ => None,
                 }

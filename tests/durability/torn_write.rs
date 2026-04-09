@@ -98,6 +98,9 @@ mod tests {
     #[test]
     fn test_too_short_data() {
         let result = moon::persistence::wal_v3::record::read_wal_v3_record(&[0u8; 10]);
-        assert!(result.is_none(), "Data shorter than header should return None");
+        assert!(
+            result.is_none(),
+            "Data shorter than header should return None"
+        );
     }
 }
