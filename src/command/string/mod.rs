@@ -45,11 +45,11 @@ pub(crate) fn format_float(val: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::framevec;
     use crate::protocol::Frame;
     use crate::storage::Database;
     use crate::storage::entry::{Entry, current_time_ms};
+    use bytes::Bytes;
 
     use super::super::helpers::ok;
 

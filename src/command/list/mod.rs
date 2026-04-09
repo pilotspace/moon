@@ -58,9 +58,9 @@ pub use list_write::rpush;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::framevec;
     use crate::storage::Database;
+    use bytes::Bytes;
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))

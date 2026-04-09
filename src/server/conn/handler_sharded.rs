@@ -182,7 +182,8 @@ pub async fn handle_connection_sharded(
                         let mut pending = Some(returned_msg);
                         for _ in 0..8 {
                             tokio::task::yield_now().await;
-                            #[allow(clippy::unwrap_used)] // pending is always re-filled on retry via Err(returned_msg)
+                            #[allow(clippy::unwrap_used)]
+                            // pending is always re-filled on retry via Err(returned_msg)
                             let msg = pending.take().unwrap();
                             let push_result = {
                                 let mut producers = dispatch_tx.borrow_mut();

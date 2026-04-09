@@ -4,8 +4,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-use crate::command::helpers::{err_wrong_args, extract_bytes};
 use super::{parse_i64, resolve_index};
+use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
 // LLEN key

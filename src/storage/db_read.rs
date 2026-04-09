@@ -3,8 +3,8 @@ use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use super::bptree::BPTree;
-use super::listpack::Listpack;
 use super::intset::Intset;
+use super::listpack::Listpack;
 
 // ---------------------------------------------------------------------------
 // Read-only Ref enums for immutable access to compact and full encodings

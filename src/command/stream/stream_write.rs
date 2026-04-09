@@ -7,8 +7,8 @@ use crate::protocol::Frame;
 use crate::storage::db::Database;
 use crate::storage::stream::StreamId;
 
-use crate::command::helpers::{err_wrong_args, extract_bytes};
 use super::format_entry;
+use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 /// XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold] id field value [field value ...]
 pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {

@@ -11,8 +11,8 @@
 mod non_loom {
     //! When not running under loom, we use std atomics and test the
     //! same logic with regular threads to validate the test structure.
-    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     const EMPTY: u8 = 0;
     const FILLED: u8 = 1;
@@ -121,9 +121,9 @@ mod non_loom {
 
 #[cfg(loom)]
 mod loom_tests {
-    use loom::sync::atomic::{AtomicU8, Ordering};
-    use loom::sync::Arc;
     use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU8, Ordering};
     use loom::thread;
 
     const EMPTY: u8 = 0;

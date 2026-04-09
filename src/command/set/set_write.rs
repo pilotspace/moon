@@ -7,8 +7,8 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::entry::Entry;
 
-use crate::command::helpers::{err_wrong_args, extract_bytes};
 use super::{collect_sets, parse_int};
+use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
 // SADD key member [member ...]

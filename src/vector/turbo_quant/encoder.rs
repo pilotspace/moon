@@ -49,7 +49,10 @@ pub fn padded_dimension(dim: u32) -> u32 {
 /// Layout: `byte[i] = (indices[2*i+1] << 4) | indices[2*i]`
 #[inline]
 pub fn nibble_pack(indices: &[u8]) -> Vec<u8> {
-    debug_assert!(indices.len().is_multiple_of(2), "nibble_pack requires even length");
+    debug_assert!(
+        indices.len().is_multiple_of(2),
+        "nibble_pack requires even length"
+    );
     indices
         .chunks_exact(2)
         .map(|pair| pair[0] | (pair[1] << 4))

@@ -1012,7 +1012,6 @@ impl BPTree {
 
         self.recompute_child_count(parent_id, left_idx);
     }
-
 }
 
 enum InsertResult {
@@ -1023,7 +1022,6 @@ enum InsertResult {
         is_new: bool,
     },
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

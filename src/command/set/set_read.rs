@@ -6,8 +6,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-use crate::command::helpers::{err_wrong_args, extract_bytes};
 use super::{collect_sets, glob_match, parse_int};
+use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
 // SMEMBERS key

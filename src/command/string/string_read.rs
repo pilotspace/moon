@@ -4,8 +4,8 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::entry::current_time_ms;
 
-use crate::command::helpers::{err_wrong_args, extract_bytes};
 use super::{parse_i64, parse_positive_i64};
+use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 /// GET command handler.
 pub fn get(db: &mut Database, args: &[Frame]) -> Frame {

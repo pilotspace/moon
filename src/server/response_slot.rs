@@ -92,11 +92,10 @@ impl ResponseSlot {
         let state = self.state.load(Ordering::Acquire);
         if state == FILLED {
             // Data is ready. Take it out and reset to EMPTY.
-            // SAFETY: Acquire load confirmed FILLED, which happens-after the producer's
-            // Release store, so the UnsafeCell data write is visible. Single consumer
-            // (connection owner) ensures no concurrent read.
             // Atomic state == FILLED guarantees fill() wrote Some(data); see fill().
             #[allow(clippy::unwrap_used)]
+            // SAFETY: Acquire load confirmed FILLED, happens-after producer's Release store,
+            // so UnsafeCell data write is visible. Single consumer ensures no concurrent read.
             let data = unsafe { (*self.data.get()).take().unwrap() };
             self.state.store(EMPTY, Ordering::Release);
             return Poll::Ready(data);

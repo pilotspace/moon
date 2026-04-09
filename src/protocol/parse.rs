@@ -1386,8 +1386,8 @@ mod tests {
         // Regression test from cargo-fuzz crash artifact.
         // ~-1 followed by garbage bytes — must not panic or crash.
         let data: &[u8] = &[
-            126, 45, 49, 255, 58, 10, 49, 1, 0, 141, 13, 10, 36, 45, 49, 255, 58, 10, 48, 13,
-            49, 48, 141, 13, 10, 36, 45, 49, 255, 58, 48, 13, 13, 10,
+            126, 45, 49, 255, 58, 10, 49, 1, 0, 141, 13, 10, 36, 45, 49, 255, 58, 10, 48, 13, 49,
+            48, 141, 13, 10, 36, 45, 49, 255, 58, 48, 13, 13, 10,
         ];
         let config = ParseConfig {
             max_bulk_string_size: 64 * 1024,
