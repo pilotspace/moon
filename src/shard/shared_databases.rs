@@ -138,6 +138,13 @@ impl ShardDatabases {
         self.num_shards
     }
 
+    /// Return a reference to all databases across all shards (for AOF rewrite).
+    /// Callers iterate shards × dbs and acquire read locks individually.
+    #[inline]
+    pub fn all_shard_dbs(&self) -> &[Vec<RwLock<Database>>] {
+        &self.shards
+    }
+
     /// Number of databases per shard (typically 16).
     #[inline]
     pub fn db_count(&self) -> usize {

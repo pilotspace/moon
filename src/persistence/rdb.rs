@@ -47,7 +47,11 @@ const EOF_MARKER: u8 = 0xFF;
 /// Uses atomic write (write to .tmp, then rename) for crash safety.
 /// Expired keys are skipped. Empty databases are skipped.
 /// Footer contains CRC32 checksum of all preceding bytes.
-pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
+/// Serialize all databases to RDB format in memory.
+///
+/// Returns the complete RDB byte stream (header + entries + footer + CRC32).
+/// Used by both `save()` (file) and AOF RDB-preamble rewrite.
+pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
     let mut buf = Vec::new();
 
     // Header
@@ -60,7 +64,6 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
     for (db_idx, db) in databases.iter().enumerate() {
         let base_ts = db.base_timestamp();
         let data = db.data();
-        // Collect non-expired entries
         let live: Vec<_> = data
             .iter()
             .filter(|(_, entry)| !entry.is_expired_at(base_ts, now_ms))
@@ -85,6 +88,12 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
     hasher.update(&buf);
     let checksum = hasher.finalize();
     buf.write_all(&checksum.to_le_bytes())?;
+
+    Ok(buf)
+}
+
+pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
+    let buf = save_to_bytes(databases)?;
 
     // Atomic write: write to tmp, then rename
     let tmp_path = path.with_extension("rdb.tmp");
@@ -154,6 +163,46 @@ pub fn save_from_snapshot(
     Ok(())
 }
 
+/// Serialize snapshot data (with correct base_ts per database) to RDB bytes in memory.
+///
+/// Unlike `save_to_bytes(&[Database])` which reads base_ts from each Database,
+/// this takes explicit (entries, base_ts) tuples — critical for AOF rewrite where
+/// entries are cloned into temporary storage and the original base_ts must be preserved.
+pub fn save_snapshot_to_bytes(
+    snapshot: &[(Vec<(CompactKey, Entry)>, u32)],
+) -> Result<Vec<u8>, MoonError> {
+    let mut buf = Vec::new();
+
+    buf.write_all(RDB_MAGIC)?;
+    buf.write_all(&[RDB_VERSION])?;
+
+    let now_ms = current_time_ms();
+
+    for (db_idx, (entries, base_ts)) in snapshot.iter().enumerate() {
+        let live: Vec<_> = entries
+            .iter()
+            .filter(|(_, e)| !e.is_expired_at(*base_ts, now_ms))
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+
+        buf.write_all(&[DB_SELECTOR])?;
+        buf.write_all(&[db_idx as u8])?;
+
+        for (key, entry) in live {
+            write_entry(&mut buf, key.as_bytes(), entry, *base_ts)?;
+        }
+    }
+
+    buf.write_all(&[EOF_MARKER])?;
+    let mut hasher = Hasher::new();
+    hasher.update(&buf);
+    buf.write_all(&hasher.finalize().to_le_bytes())?;
+
+    Ok(buf)
+}
+
 /// Load an RDB file and populate databases. Returns total keys loaded.
 ///
 /// On any error (missing file, corrupt data, bad checksum), returns Err.
@@ -175,25 +224,28 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
         .into());
     }
 
+    // Wrap in Bytes for zero-copy slicing (shared refcount, no copy)
+    let shared_buf = Bytes::from(data);
+
     // Verify CRC32: all bytes except last 4 vs last 4 bytes
-    let (payload, checksum_bytes) = data.split_at(data.len() - 4);
+    let payload_len = shared_buf.len() - 4;
     let stored_checksum = u32::from_le_bytes([
-        checksum_bytes[0],
-        checksum_bytes[1],
-        checksum_bytes[2],
-        checksum_bytes[3],
+        shared_buf[payload_len],
+        shared_buf[payload_len + 1],
+        shared_buf[payload_len + 2],
+        shared_buf[payload_len + 3],
     ]);
     let mut hasher = Hasher::new();
-    hasher.update(payload);
+    hasher.update(&shared_buf[..payload_len]);
     let computed_checksum = hasher.finalize();
     if stored_checksum != computed_checksum {
         return Err(RdbError::ChecksumMismatch.into());
     }
 
-    let mut cursor = Cursor::new(payload);
+    let mut cursor = Cursor::new(&shared_buf[..payload_len] as &[u8]);
 
     // Verify magic
-    let mut magic = [0u8; 4]; // "MOON" is 4 bytes
+    let mut magic = [0u8; 4];
     cursor.read_exact(&mut magic).map_err(|e| RdbError::Io {
         path: path.to_path_buf(),
         source: e,
@@ -218,18 +270,33 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
         .into());
     }
 
+    // Cache timestamps once (Fix #4: avoid syscall per entry)
     let now_ms = current_time_ms();
+    let now_secs = (now_ms / 1000) as u32;
+
+    // Load into temporary databases so old keys not present in the RDB
+    // snapshot are discarded. An RDB file is a full point-in-time snapshot
+    // and must replace state, not merge into it. Loading into temps also
+    // provides atomicity: on failure, the live databases are untouched.
+    let db_count = databases.len();
+    let mut temp_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
+
+    // First pass: count entries per database for pre-sizing
+    let entry_counts = count_entries_per_db(&cursor, db_count);
+    for (db_idx, &count) in entry_counts.iter().enumerate() {
+        if count > 0 && db_idx < db_count {
+            temp_dbs[db_idx].reserve(count);
+        }
+    }
 
     let mut total_keys = 0usize;
-    let mut skipped_entries = 0usize;
     let mut current_db: usize = 0;
 
     loop {
         let mut tag = [0u8; 1];
         if cursor.read_exact(&mut tag).is_err() {
-            // Truncated tail: no more data to read, treat as implicit EOF
             tracing::warn!(
-                "RDB load: truncated tail after {} keys (no EOF marker), treating as end of file",
+                "RDB load: truncated tail after {} keys (no EOF marker)",
                 total_keys
             );
             break;
@@ -244,63 +311,599 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                     source: e,
                 })?;
                 current_db = db_idx[0] as usize;
-                if current_db >= databases.len() {
+                if current_db >= db_count {
                     return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB references database {} but only {} configured",
-                            current_db,
-                            databases.len()
+                            current_db, db_count
                         ),
                     }
                     .into());
                 }
             }
-            type_tag => {
-                // Mid-stream corruption recovery: log+skip on entry parse failure
-                match read_entry(&mut cursor, type_tag) {
-                    Ok((key, entry)) => {
-                        // Skip entries whose TTL is already in the past
-                        if entry.has_expiry() && entry.is_expired_at(current_secs(), now_ms) {
-                            continue;
-                        }
-                        if current_db < databases.len() {
-                            databases[current_db].set(key, entry);
-                            total_keys += 1;
-                        }
+            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
+                Ok((key, entry)) => {
+                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        continue;
                     }
-                    Err(e) => {
-                        let offset = cursor.position();
-                        tracing::warn!(
-                            "RDB load: skipping corrupted entry at offset {}: {}",
-                            offset,
-                            e
-                        );
-                        skipped_entries += 1;
-                        // Cannot reliably skip to next entry in a variable-length
-                        // format without framing, so break out of the loop.
-                        // Entries loaded so far are valid (checksum passed).
-                        tracing::warn!(
-                            "RDB load: stopping mid-stream recovery after {} skipped entries; \
-                             {} keys loaded successfully",
-                            skipped_entries,
+                    if current_db < db_count {
+                        temp_dbs[current_db].insert_for_load(key, entry);
+                        total_keys += 1;
+                    }
+                }
+                Err(e) => {
+                    // Do NOT swap partially-loaded temp_dbs into live databases.
+                    // A corrupted-but-checksummed RDB must not commit partial state.
+                    return Err(RdbError::Corrupted {
+                        detail: format!(
+                            "RDB load: corrupted entry at offset {}: {}. {} keys loaded before failure.",
+                            cursor.position(),
+                            e,
                             total_keys
-                        );
-                        break;
+                        ),
+                    }
+                    .into());
+                }
+            },
+        }
+    }
+
+    // Recalculate memory on temp databases, then swap into live ones.
+    // Only reached if all entries parsed successfully — no partial state.
+    for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
+        temp.recalculate_memory();
+        *live = temp;
+    }
+
+    Ok(total_keys)
+}
+
+/// Fast first-pass: count entries per database without parsing values.
+/// Scans type tags and skips over entry payloads to count keys per db_idx.
+fn count_entries_per_db(cursor: &Cursor<&[u8]>, db_count: usize) -> Vec<usize> {
+    let mut counts = vec![0usize; db_count];
+    let data = cursor.get_ref();
+    let mut pos = cursor.position() as usize;
+    let mut current_db = 0usize;
+
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+
+        match tag {
+            EOF_MARKER => break,
+            DB_SELECTOR => {
+                if pos < data.len() {
+                    current_db = data[pos] as usize;
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            TYPE_STRING | TYPE_HASH | TYPE_LIST | TYPE_SET | TYPE_SORTED_SET | TYPE_STREAM => {
+                if current_db < db_count {
+                    counts[current_db] += 1;
+                }
+                // Skip over the entry payload without parsing
+                if let Some(new_pos) = skip_entry(data, pos, tag) {
+                    pos = new_pos;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    counts
+}
+
+/// Skip over an RDB entry's bytes without allocating or parsing values.
+/// Returns the new position after the entry, or None if data is truncated.
+fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
+    // Skip key
+    pos = skip_bytes_field(data, pos)?;
+    // Skip TTL (8 bytes)
+    pos = pos.checked_add(8)?;
+    if pos > data.len() {
+        return None;
+    }
+
+    match type_tag {
+        TYPE_STRING => {
+            pos = skip_bytes_field(data, pos)?;
+        }
+        TYPE_HASH => {
+            let count = read_u32_raw(data, pos)?;
+            pos += 4;
+            for _ in 0..count {
+                pos = skip_bytes_field(data, pos)?; // field
+                pos = skip_bytes_field(data, pos)?; // value
+            }
+        }
+        TYPE_LIST | TYPE_SET => {
+            let count = read_u32_raw(data, pos)?;
+            pos += 4;
+            for _ in 0..count {
+                pos = skip_bytes_field(data, pos)?;
+            }
+        }
+        TYPE_SORTED_SET => {
+            let count = read_u32_raw(data, pos)?;
+            pos += 4;
+            for _ in 0..count {
+                pos = skip_bytes_field(data, pos)?; // member
+                pos = pos.checked_add(8)?; // f64 score
+                if pos > data.len() {
+                    return None;
+                }
+            }
+        }
+        TYPE_STREAM => {
+            // entry_count(8) + last_id(16)
+            pos = pos.checked_add(24)?;
+            if pos > data.len() {
+                return None;
+            }
+            let entry_count =
+                u64::from_le_bytes(data[pos - 24..pos - 16].try_into().ok()?) as usize;
+            for _ in 0..entry_count {
+                pos = pos.checked_add(16)?; // StreamId (ms + seq)
+                if pos > data.len() {
+                    return None;
+                }
+                let field_count = read_u32_raw(data, pos)?;
+                pos += 4;
+                for _ in 0..field_count {
+                    pos = skip_bytes_field(data, pos)?;
+                    pos = skip_bytes_field(data, pos)?;
+                }
+            }
+            // Consumer groups
+            let group_count = read_u32_raw(data, pos)?;
+            pos += 4;
+            for _ in 0..group_count {
+                pos = skip_bytes_field(data, pos)?; // group name
+                pos = pos.checked_add(16)?; // last_delivered_id
+                if pos > data.len() {
+                    return None;
+                }
+                let pel_count = read_u32_raw(data, pos)?;
+                pos += 4;
+                for _ in 0..pel_count {
+                    pos = pos.checked_add(16)?; // StreamId
+                    if pos > data.len() {
+                        return None;
+                    }
+                    pos = skip_bytes_field(data, pos)?; // consumer name
+                    pos = pos.checked_add(16)?; // delivery_time + delivery_count
+                    if pos > data.len() {
+                        return None;
+                    }
+                }
+                let consumer_count = read_u32_raw(data, pos)?;
+                pos += 4;
+                for _ in 0..consumer_count {
+                    pos = skip_bytes_field(data, pos)?; // consumer name
+                    pos = pos.checked_add(8)?; // seen_time
+                    if pos > data.len() {
+                        return None;
+                    }
+                    let pending_count = read_u32_raw(data, pos)?;
+                    pos += 4;
+                    for _ in 0..pending_count {
+                        pos = pos.checked_add(16)?; // StreamId
+                        if pos > data.len() {
+                            return None;
+                        }
                     }
                 }
             }
         }
+        _ => return None,
     }
 
-    if skipped_entries > 0 {
-        tracing::warn!(
-            "RDB load completed with {} entries skipped due to corruption, {} keys loaded",
-            skipped_entries,
-            total_keys
-        );
+    Some(pos)
+}
+
+/// Read u32 LE from raw bytes without cursor overhead.
+#[inline]
+fn read_u32_raw(data: &[u8], pos: usize) -> Option<usize> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize)
+}
+
+/// Skip a length-prefixed bytes field (4-byte LE length + payload).
+#[inline]
+fn skip_bytes_field(data: &[u8], pos: usize) -> Option<usize> {
+    let len = read_u32_raw(data, pos)?;
+    let new_pos = pos.checked_add(4)?.checked_add(len)?;
+    if new_pos > data.len() {
+        None
+    } else {
+        Some(new_pos)
+    }
+}
+
+/// Variant of read_entry using cached timestamps to avoid per-entry syscalls.
+///
+/// Earlier revisions threaded a `shared_buf: &Bytes` through this path for
+/// zero-copy slicing via `read_bytes_zero_copy`, but that helper was never
+/// wired up — `read_bytes` currently always heap-allocates. The parameter
+/// and the caller-side `Bytes::copy_from_slice(data)` that fed it have been
+/// removed; restoring true zero-copy should add it back as part of a single
+/// landed change, not as vestigial plumbing.
+fn read_entry_zero_copy(
+    cursor: &mut Cursor<&[u8]>,
+    type_tag: u8,
+    cached_secs: u32,
+) -> Result<(Bytes, Entry), MoonError> {
+    let key = read_bytes(cursor)?;
+
+    let mut ttl_buf = [0u8; 8];
+    cursor.read_exact(&mut ttl_buf)?;
+    let ttl_ms = i64::from_le_bytes(ttl_buf);
+    let expires_at_ms = if ttl_ms > 0 { ttl_ms as u64 } else { 0 };
+
+    let value = match type_tag {
+        TYPE_STRING => {
+            // Fast path: build CompactValue directly from Vec, skipping RedisValue intermediate.
+            // This avoids: Vec → Bytes → RedisValue::String → from_redis_value → heap_string_vec
+            // and instead does: Vec → CompactValue directly (one Box alloc, zero copy).
+            let vec = read_bytes_vec(cursor)?;
+            let cv = if vec.len() <= 12 {
+                crate::storage::compact_value::CompactValue::from_redis_value(RedisValue::String(
+                    Bytes::from(vec),
+                ))
+            } else {
+                crate::storage::compact_value::CompactValue::heap_string_vec_direct(vec)
+            };
+            let mut entry = Entry::new_string(Bytes::new());
+            entry.value = cv;
+            if expires_at_ms > 0 {
+                entry.set_expires_at_ms(cached_secs, expires_at_ms);
+            }
+            entry.set_last_access(cached_secs);
+            entry.set_access_counter(5);
+            return Ok((key, entry));
+        }
+        TYPE_HASH => {
+            let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 8, "hash")?;
+            let mut map = HashMap::with_capacity(count);
+            for _ in 0..count {
+                let field = read_bytes(cursor)?;
+                let val = read_bytes(cursor)?;
+                map.insert(field, val);
+            }
+            RedisValue::Hash(map)
+        }
+        TYPE_LIST => {
+            let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 4, "list")?;
+            let mut list = VecDeque::with_capacity(count);
+            for _ in 0..count {
+                list.push_back(read_bytes(cursor)?);
+            }
+            RedisValue::List(list)
+        }
+        TYPE_SET => {
+            let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 4, "set")?;
+            let mut set = HashSet::with_capacity(count);
+            for _ in 0..count {
+                set.insert(read_bytes(cursor)?);
+            }
+            RedisValue::Set(set)
+        }
+        TYPE_SORTED_SET => {
+            let count = read_u32(cursor)? as usize;
+            validate_count(cursor, count, 12, "sorted_set")?;
+            let mut members = HashMap::with_capacity(count);
+            let mut tree = BPTree::new();
+            for _ in 0..count {
+                let member = read_bytes(cursor)?;
+                let mut score_buf = [0u8; 8];
+                cursor.read_exact(&mut score_buf)?;
+                let score = f64::from_le_bytes(score_buf);
+                members.insert(member.clone(), score);
+                tree.insert(OrderedFloat(score), member);
+            }
+            RedisValue::SortedSetBPTree { tree, members }
+        }
+        TYPE_STREAM => {
+            // Stream parsing: reuse read_bytes (not zero-copy for this rare type)
+            let mut entry_count_buf = [0u8; 8];
+            cursor.read_exact(&mut entry_count_buf)?;
+            let entry_count = u64::from_le_bytes(entry_count_buf) as usize;
+            let mut last_id_ms_buf = [0u8; 8];
+            let mut last_id_seq_buf = [0u8; 8];
+            cursor.read_exact(&mut last_id_ms_buf)?;
+            cursor.read_exact(&mut last_id_seq_buf)?;
+            let last_id = StreamId {
+                ms: u64::from_le_bytes(last_id_ms_buf),
+                seq: u64::from_le_bytes(last_id_seq_buf),
+            };
+            let mut stream = StreamData::new();
+            stream.last_id = last_id;
+            validate_count(cursor, entry_count, 20, "stream_entries")?;
+            for _ in 0..entry_count {
+                let mut ms_buf = [0u8; 8];
+                let mut seq_buf = [0u8; 8];
+                cursor.read_exact(&mut ms_buf)?;
+                cursor.read_exact(&mut seq_buf)?;
+                let id = StreamId {
+                    ms: u64::from_le_bytes(ms_buf),
+                    seq: u64::from_le_bytes(seq_buf),
+                };
+                let field_count = read_u32(cursor)? as usize;
+                validate_count(cursor, field_count, 8, "stream_fields")?;
+                let mut fields = Vec::with_capacity(field_count);
+                for _ in 0..field_count {
+                    fields.push((read_bytes(cursor)?, read_bytes(cursor)?));
+                }
+                stream.entries.insert(id, fields);
+                stream.length += 1;
+            }
+            let group_count = read_u32(cursor)? as usize;
+            for _ in 0..group_count {
+                let group_name = read_bytes(cursor)?;
+                let mut gld_ms = [0u8; 8];
+                let mut gld_seq = [0u8; 8];
+                cursor.read_exact(&mut gld_ms)?;
+                cursor.read_exact(&mut gld_seq)?;
+                let last_delivered_id = StreamId {
+                    ms: u64::from_le_bytes(gld_ms),
+                    seq: u64::from_le_bytes(gld_seq),
+                };
+                let pel_count = read_u32(cursor)? as usize;
+                let mut pel = BTreeMap::new();
+                for _ in 0..pel_count {
+                    let mut pid_ms = [0u8; 8];
+                    let mut pid_seq = [0u8; 8];
+                    cursor.read_exact(&mut pid_ms)?;
+                    cursor.read_exact(&mut pid_seq)?;
+                    let pid = StreamId {
+                        ms: u64::from_le_bytes(pid_ms),
+                        seq: u64::from_le_bytes(pid_seq),
+                    };
+                    let consumer_name = read_bytes(cursor)?;
+                    let mut dt_buf = [0u8; 8];
+                    let mut dc_buf = [0u8; 8];
+                    cursor.read_exact(&mut dt_buf)?;
+                    cursor.read_exact(&mut dc_buf)?;
+                    pel.insert(
+                        pid,
+                        crate::storage::stream::PendingEntry {
+                            consumer: consumer_name,
+                            delivery_time: u64::from_le_bytes(dt_buf),
+                            delivery_count: u64::from_le_bytes(dc_buf),
+                        },
+                    );
+                }
+                let consumer_count = read_u32(cursor)? as usize;
+                let mut consumers = HashMap::new();
+                for _ in 0..consumer_count {
+                    let cname = read_bytes(cursor)?;
+                    let mut st_buf = [0u8; 8];
+                    cursor.read_exact(&mut st_buf)?;
+                    let seen_time = u64::from_le_bytes(st_buf);
+                    let pending_count = read_u32(cursor)? as usize;
+                    let mut pending = BTreeMap::new();
+                    for _ in 0..pending_count {
+                        let mut cid_ms = [0u8; 8];
+                        let mut cid_seq = [0u8; 8];
+                        cursor.read_exact(&mut cid_ms)?;
+                        cursor.read_exact(&mut cid_seq)?;
+                        pending.insert(
+                            StreamId {
+                                ms: u64::from_le_bytes(cid_ms),
+                                seq: u64::from_le_bytes(cid_seq),
+                            },
+                            (),
+                        );
+                    }
+                    consumers.insert(
+                        cname.clone(),
+                        crate::storage::stream::Consumer {
+                            name: cname,
+                            pending,
+                            seen_time,
+                        },
+                    );
+                }
+                stream.groups.insert(
+                    group_name,
+                    crate::storage::stream::ConsumerGroup {
+                        last_delivered_id,
+                        pel,
+                        consumers,
+                    },
+                );
+            }
+            RedisValue::Stream(Box::new(stream))
+        }
+        _ => return Err(RdbError::UnsupportedType { type_tag }.into()),
+    };
+
+    let mut entry = Entry::new_string(Bytes::new());
+    entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
+    if expires_at_ms > 0 {
+        entry.set_expires_at_ms(cached_secs, expires_at_ms);
+    }
+    entry.set_last_access(cached_secs);
+    entry.set_access_counter(5);
+
+    Ok((key, entry))
+}
+
+/// Load an RDB snapshot from a byte slice (for AOF RDB-preamble format).
+///
+/// Returns `(keys_loaded, bytes_consumed)`. The caller can use `bytes_consumed`
+/// to find the start of any RESP commands appended after the RDB preamble.
+pub fn load_from_bytes(
+    databases: &mut [Database],
+    data: &[u8],
+) -> Result<(usize, usize), MoonError> {
+    if data.len() < RDB_MAGIC.len() + 1 + 1 + 4 {
+        return Err(RdbError::Corrupted {
+            detail: "RDB preamble too small".into(),
+        }
+        .into());
     }
 
-    Ok(total_keys)
+    // Find EOF_MARKER to determine RDB section length.
+    // The RDB section is: header + entries + EOF_MARKER(1) + CRC32(4).
+    // We scan for EOF_MARKER (0xFF) — the first one after the header that's
+    // immediately followed by a valid CRC32 of the preceding bytes.
+    //
+    // Single-pass: maintain a running CRC hasher updated byte-by-byte.
+    // When we hit a candidate EOF_MARKER at position i (i >= 5), clone
+    // the hasher (which includes data[0..i]), finalize with the EOF byte,
+    // and compare against the stored CRC at data[i+1..i+5]. This avoids
+    // re-hashing the entire prefix for each candidate (O(n) vs O(n²)).
+    let mut rdb_end = None;
+    let mut running_hasher = Hasher::new();
+    // Feed bytes 0..5 (header) into the running hasher
+    if data.len() > 5 {
+        running_hasher.update(&data[..5]);
+    }
+    for i in 5..data.len().saturating_sub(4) {
+        if data[i] == EOF_MARKER {
+            // Clone running hasher (covers data[0..i]), then finalize with EOF byte
+            let mut candidate = running_hasher.clone();
+            candidate.update(&[EOF_MARKER]);
+            if let Some(checksum_bytes) = data.get(i + 1..i + 5) {
+                let stored = u32::from_le_bytes([
+                    checksum_bytes[0],
+                    checksum_bytes[1],
+                    checksum_bytes[2],
+                    checksum_bytes[3],
+                ]);
+                if candidate.finalize() == stored {
+                    rdb_end = Some(i + 5); // past CRC32
+                    break;
+                }
+            }
+        }
+        // Feed this byte into the running hasher for the next iteration
+        running_hasher.update(&data[i..i + 1]);
+    }
+
+    let rdb_len = rdb_end.ok_or_else(|| {
+        MoonError::from(RdbError::Corrupted {
+            detail: "RDB preamble: no valid EOF+CRC found".into(),
+        })
+    })?;
+
+    // Load using the same logic as `load`, but from the byte slice
+    let payload = &data[..rdb_len - 4]; // exclude CRC32
+    let mut cursor = Cursor::new(payload);
+
+    // Skip magic + version
+    let mut magic = [0u8; 4];
+    cursor.read_exact(&mut magic).map_err(|e| RdbError::Io {
+        path: std::path::PathBuf::from("<aof-preamble>"),
+        source: e,
+    })?;
+    if &magic != RDB_MAGIC {
+        return Err(RdbError::Corrupted {
+            detail: "invalid RDB magic in AOF preamble".into(),
+        }
+        .into());
+    }
+    let mut version = [0u8; 1];
+    cursor.read_exact(&mut version).map_err(|e| RdbError::Io {
+        path: std::path::PathBuf::from("<aof-preamble>"),
+        source: e,
+    })?;
+    if version[0] != RDB_VERSION {
+        return Err(RdbError::UnsupportedVersion {
+            version: version[0] as u32,
+        }
+        .into());
+    }
+
+    let now_ms = current_time_ms();
+    let now_secs = (now_ms / 1000) as u32;
+    let mut total_keys = 0usize;
+    let mut current_db: usize = 0;
+
+    // Load into temporary databases so that:
+    // (a) If the load fails partway, original state is untouched.
+    // (b) Old keys not present in the RDB snapshot don't survive — an RDB
+    //     preamble is a full point-in-time snapshot and must replace state,
+    //     not merge into it.
+    let db_count = databases.len();
+    let mut temp_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
+
+    // Pre-size DashTables on the temporary databases
+    let entry_counts = count_entries_per_db(&cursor, db_count);
+    for (db_idx, &count) in entry_counts.iter().enumerate() {
+        if count > 0 && db_idx < db_count {
+            temp_dbs[db_idx].reserve(count);
+        }
+    }
+
+    loop {
+        let mut tag = [0u8; 1];
+        if cursor.read_exact(&mut tag).is_err() {
+            break;
+        }
+        match tag[0] {
+            EOF_MARKER => break,
+            DB_SELECTOR => {
+                let mut db_idx = [0u8; 1];
+                cursor.read_exact(&mut db_idx).map_err(|e| RdbError::Io {
+                    path: std::path::PathBuf::from("<aof-preamble>"),
+                    source: e,
+                })?;
+                current_db = db_idx[0] as usize;
+                if current_db >= db_count {
+                    return Err(RdbError::Corrupted {
+                        detail: format!(
+                            "RDB preamble references database {} but only {} configured",
+                            current_db, db_count
+                        ),
+                    }
+                    .into());
+                }
+            }
+            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
+                Ok((key, entry)) => {
+                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        continue;
+                    }
+                    if current_db < db_count {
+                        temp_dbs[current_db].insert_for_load(key, entry);
+                        total_keys += 1;
+                    }
+                }
+                Err(e) => {
+                    return Err(RdbError::Corrupted {
+                        detail: format!(
+                            "RDB preamble: corrupted entry at offset {}: {}. {} keys loaded before failure.",
+                            cursor.position(),
+                            e,
+                            total_keys
+                        ),
+                    }
+                    .into());
+                }
+            },
+        }
+    }
+
+    // Recalculate memory on temp databases, then swap into the live ones.
+    // Only reached if all entries parsed successfully — no partial state.
+    for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
+        temp.recalculate_memory();
+        *live = temp;
+    }
+
+    Ok((total_keys, rdb_len))
 }
 
 /// Distribute keys from loaded databases to the correct per-shard databases.
@@ -756,7 +1359,8 @@ fn validate_count(
 
 pub(crate) fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Bytes, MoonError> {
     let len = read_u32(cursor)? as usize;
-    let remaining = cursor.get_ref().len() - cursor.position() as usize;
+    let pos = cursor.position() as usize;
+    let remaining = cursor.get_ref().len() - pos;
     if len > remaining {
         return Err(RdbError::Corrupted {
             detail: format!(
@@ -766,9 +1370,29 @@ pub(crate) fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Bytes, MoonError>
         }
         .into());
     }
-    let mut data = vec![0u8; len];
-    cursor.read_exact(&mut data)?;
-    Ok(Bytes::from(data))
+    let slice = &cursor.get_ref()[pos..pos + len];
+    cursor.set_position((pos + len) as u64);
+    Ok(Bytes::copy_from_slice(slice))
+}
+
+/// Read bytes as owned Vec<u8> — avoids Bytes intermediate for RDB load path.
+/// Single allocation directly to the right size, no refcount overhead.
+pub(crate) fn read_bytes_vec(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, MoonError> {
+    let len = read_u32(cursor)? as usize;
+    let pos = cursor.position() as usize;
+    let remaining = cursor.get_ref().len() - pos;
+    if len > remaining {
+        return Err(RdbError::Corrupted {
+            detail: format!(
+                "read_bytes_vec: length {} exceeds remaining {}",
+                len, remaining
+            ),
+        }
+        .into());
+    }
+    let slice = &cursor.get_ref()[pos..pos + len];
+    cursor.set_position((pos + len) as u64);
+    Ok(slice.to_vec())
 }
 
 pub(crate) fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, MoonError> {

@@ -434,6 +434,56 @@ impl Database {
         self.data.insert(CompactKey::from(key), entry);
     }
 
+    /// Clear all entries and reset memory accounting.
+    ///
+    /// Used during multi-part AOF recovery to wipe any state populated by
+    /// earlier recovery phases (per-shard WAL replay, legacy appendonly.aof)
+    /// before loading the authoritative base RDB + incr log. Without this,
+    /// non-idempotent commands from pre-existing state would be double-applied.
+    pub fn clear(&mut self) {
+        self.data = DashTable::new();
+        self.used_memory = 0;
+    }
+
+    /// Bulk-load insert: skip duplicate check, version tracking, and per-key memory accounting.
+    ///
+    /// Used exclusively during RDB/AOF restore where keys are guaranteed unique and
+    /// we recalculate `used_memory` once after the entire load completes.
+    #[inline]
+    pub fn insert_for_load(&mut self, key: Bytes, entry: Entry) {
+        self.data.insert(CompactKey::from(key), entry);
+    }
+
+    /// Recalculate `used_memory` by scanning all entries. Call once after bulk load.
+    pub fn recalculate_memory(&mut self) {
+        let mut total = 0usize;
+        for (key, entry) in self.data.iter() {
+            total += entry_overhead(key.as_bytes(), entry);
+        }
+        self.used_memory = total;
+    }
+
+    /// Pre-size the internal hash table for an expected key count.
+    ///
+    /// WARNING: This REPLACES the internal hash table with a fresh one sized for
+    /// `additional` entries. It MUST be called on an empty `Database` (typically
+    /// immediately after `Database::new()` during RDB/AOF bulk load). Calling it
+    /// on a populated database silently discards all entries.
+    ///
+    /// Named `reserve` rather than `reset_with_capacity` to match the plan
+    /// nomenclature, but the debug assertion guards the misuse case.
+    pub fn reserve(&mut self, additional: usize) {
+        debug_assert!(
+            self.data.is_empty(),
+            "Database::reserve() must only be called on an empty database (bulk-load pre-sizing); called with {} existing entries",
+            self.data.len()
+        );
+        if additional > self.data.len() {
+            let new_table = DashTable::with_capacity(additional);
+            self.data = new_table;
+        }
+    }
+
     /// Remove a key and return its entry. No expiry check needed (DEL removes regardless).
     pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
         if let Some(entry) = self.data.remove(key) {

@@ -1214,6 +1214,13 @@ pub async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- MULTI queue mode ---
+                    if in_multi {
+                        command_queue.push(frame);
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                        continue;
+                    }
+
                     // --- BGSAVE ---
                     if cmd.eq_ignore_ascii_case(b"BGSAVE") {
                         responses.push(crate::command::persistence::bgsave_start_sharded(&snapshot_trigger_tx, num_shards));
@@ -1227,11 +1234,17 @@ pub async fn handle_connection_sharded_inner<
                         responses.push(crate::command::persistence::handle_lastsave());
                         continue;
                     }
-
-                    // --- MULTI queue mode ---
-                    if in_multi {
-                        command_queue.push(frame);
-                        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                    if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
+                        if let Some(ref tx) = aof_tx {
+                            responses.push(crate::command::persistence::bgrewriteaof_start_sharded(
+                                tx,
+                                shard_databases.clone(),
+                            ));
+                        } else {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR AOF is not enabled",
+                            )));
+                        }
                         continue;
                     }
 
