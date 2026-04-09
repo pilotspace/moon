@@ -1,0 +1,39 @@
+name: Performance Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'benches/**'
+
+jobs:
+  bench-regression:
+    name: Criterion Regression Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build benchmarks
+        run: cargo build --release --benches --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Run critical benchmarks
+        run: |
+          cargo bench --no-default-features --features runtime-tokio,jemalloc \
+            --bench get_hotpath \
+            --bench dispatch_baseline \
+            --bench resp_parsing \
+            -- --output-format bencher 2>&1 | tee bench_results.txt
+        env:
+          MOON_NO_URING: "1"
+      - name: Archive benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_results.txt
+          retention-days: 90
