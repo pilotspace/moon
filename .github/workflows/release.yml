@@ -81,6 +81,12 @@ jobs:
           # This is intentional — a superset SBOM is conservative and covers all variants.
           cargo cyclonedx --format json --output-file artifacts/moon-sbom.json
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum moon-linux-tokio moon-linux-monoio moon-macos-tokio moon-sbom.json > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
@@ -104,4 +110,5 @@ jobs:
             artifacts/moon-linux-monoio \
             artifacts/moon-macos-tokio \
             artifacts/moon-sbom.json \
+            artifacts/SHA256SUMS.txt \
             artifacts/moon-*.sig

@@ -56,6 +56,29 @@ jobs:
       - name: Audit unwrap/expect ratchet
         run: bash scripts/audit-unwrap.sh
 
+  changelog:
+    name: CHANGELOG check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check CHANGELOG.md touched or skip-changelog label present
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
+            echo "skip-changelog label found — skipping check"
+            exit 0
+          fi
+          if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
+            echo "CHANGELOG.md updated"
+          else
+            echo "::error::CHANGELOG.md not updated under [Unreleased]. Add a changelog entry or apply the 'skip-changelog' label."
+            exit 1
+          fi
+
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
