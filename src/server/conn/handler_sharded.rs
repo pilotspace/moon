@@ -109,6 +109,7 @@ pub async fn handle_connection_sharded(
     >,
     pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) {
+    crate::admin::metrics_setup::record_connection_opened();
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -223,6 +224,7 @@ pub async fn handle_connection_sharded(
             }
         }
     }
+    crate::admin::metrics_setup::record_connection_closed();
 }
 
 /// Generic inner handler for sharded connections (Tokio runtime).

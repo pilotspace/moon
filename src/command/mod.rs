@@ -18,6 +18,7 @@ pub mod vector_search;
 
 use bytes::Bytes;
 
+use crate::admin::metrics_setup;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
@@ -35,6 +36,24 @@ pub enum DispatchResult {
 /// to 1-5 candidates, then do final `eq_ignore_ascii_case` check. This gives O(1)
 /// dispatch vs the previous O(N) linear if-chain (~15ns vs ~60-150ns).
 pub fn dispatch(
+    db: &mut Database,
+    cmd: &[u8],
+    args: &[Frame],
+    selected_db: &mut usize,
+    db_count: usize,
+) -> DispatchResult {
+    let start = std::time::Instant::now();
+    let result = dispatch_inner(db, cmd, args, selected_db, db_count);
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
+    metrics_setup::record_command(cmd_str, elapsed_us);
+    if matches!(&result, DispatchResult::Response(Frame::Error(_))) {
+        metrics_setup::record_command_error(cmd_str);
+    }
+    result
+}
+
+fn dispatch_inner(
     db: &mut Database,
     cmd: &[u8],
     args: &[Frame],
@@ -695,6 +714,20 @@ pub fn dispatch_read(
     now_ms: u64,
     _selected_db: &mut usize,
     _db_count: usize,
+) -> DispatchResult {
+    let start = std::time::Instant::now();
+    let result = dispatch_read_inner(db, cmd, args, now_ms);
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
+    metrics_setup::record_command(cmd_str, elapsed_us);
+    result
+}
+
+fn dispatch_read_inner(
+    db: &Database,
+    cmd: &[u8],
+    args: &[Frame],
+    now_ms: u64,
 ) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
