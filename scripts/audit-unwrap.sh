@@ -23,10 +23,16 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
         # Skip files that are test-only modules (e.g., tests.rs included via #[cfg(test)] mod tests;)
         basename=$(basename "$file")
         if [ "$basename" = "tests.rs" ]; then
-            # Check if the parent mod.rs includes this via #[cfg(test)]
+            # Check if the parent mod.rs has a cfg(test) attribute adjacent to mod tests
+            # Handles both simple #[cfg(test)] and compound #[cfg(all(test, ...))]
             dir=$(dirname "$file")
             parent_mod="$dir/mod.rs"
-            if [ -f "$parent_mod" ] && grep -q '#\[cfg.*test.*\]' "$parent_mod" 2>/dev/null && grep -q 'mod tests' "$parent_mod" 2>/dev/null; then
+            if [ -f "$parent_mod" ] && awk '
+                /^[[:space:]]*#\[cfg\(.*test.*\)\]/ { cfg_test = 1; next }
+                cfg_test && /^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests/ { found = 1; exit }
+                { cfg_test = 0 }
+                END { exit(found ? 0 : 1) }
+            ' "$parent_mod"; then
                 continue
             fi
         fi

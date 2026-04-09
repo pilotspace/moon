@@ -51,27 +51,36 @@ fn send_cmd(addr: &str, cmd: &str) -> String {
         .expect("write");
     stream.flush().ok();
 
-    let reader = BufReader::new(&stream);
+    let mut reader = BufReader::new(&stream);
     let mut resp = String::new();
-    for line in reader.lines() {
-        match line {
-            Ok(l) => {
-                resp.push_str(&l);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches("\r\n").trim_end_matches('\n');
+                resp.push_str(trimmed);
                 resp.push('\n');
-                if l.starts_with('+') || l.starts_with('-') || l.starts_with(':') {
+                if trimmed.starts_with('+') || trimmed.starts_with('-') || trimmed.starts_with(':')
+                {
                     break;
                 }
-                // Bulk string: read the $N header then the data line
-                if l.starts_with('$') {
-                    let len: i64 = l[1..].trim().parse().unwrap_or(-1);
+                // Bulk string: $N header — read N bytes + CRLF
+                if trimmed.starts_with('$') {
+                    let len: i64 = trimmed[1..].trim().parse().unwrap_or(-1);
                     if len < 0 {
-                        break;
+                        break; // $-1 = nil
                     }
-                    // read the actual data line
-                    continue;
+                    let mut buf = vec![0u8; (len as usize) + 2]; // +2 for \r\n
+                    if std::io::Read::read_exact(&mut reader, &mut buf).is_ok() {
+                        let data = String::from_utf8_lossy(&buf[..len as usize]);
+                        resp.push_str(&data);
+                        resp.push('\n');
+                    }
+                    break;
                 }
             }
-            Err(_) => break,
         }
     }
     resp
@@ -121,9 +130,14 @@ fn verify_linearizability(addr: &str) -> Result<(), String> {
             };
 
             if let Some(pv) = prev_val {
-                if val < pv {
+                // Keys are written in ascending k order within each seq cycle.
+                // After a crash, valid state is: lower keys at seq=N, higher keys
+                // at seq=N-1 or nil. So values must be non-increasing across
+                // ascending key index. A HIGHER value at a later key index means
+                // a future write committed without the earlier one — a violation.
+                if val > pv {
                     return Err(format!(
-                        "Linearizability violation: thread {}, key {}: value {} < previous {}",
+                        "Linearizability violation: thread {}, key {}: value {} > previous {}",
                         tid, k, val, pv
                     ));
                 }

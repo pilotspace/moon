@@ -704,7 +704,6 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
         | (7, b'h')  // HGETALL, HEXISTS
-        | (7, b's')  // SLOWLOG
         | (8, b'g')  // GETRANGE
         | (8, b's')  // SMEMBERS
         | (8, b'z')  // ZREVRANK
@@ -911,15 +910,6 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
             if cmd.eq_ignore_ascii_case(b"HEXISTS") {
                 return resp(hash::hexists_readonly(db, args, now_ms));
-            }
-        }
-        (7, b's') => {
-            // SLOWLOG
-            if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
-                return resp(crate::admin::slowlog::handle_slowlog(
-                    crate::admin::metrics_setup::global_slowlog(),
-                    args,
-                ));
             }
         }
         (8, b'g') => {

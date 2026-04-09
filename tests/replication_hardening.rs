@@ -73,8 +73,11 @@ fn send_cmd(addr: &str, cmd: &str) -> String {
 }
 
 fn dbsize(addr: &str) -> i64 {
-    send_cmd(addr, "DBSIZE")
-        .trim()
+    let resp = send_cmd(addr, "DBSIZE");
+    if resp.is_empty() {
+        panic!("dbsize: failed to connect to {addr}");
+    }
+    resp.trim()
         .trim_start_matches(':')
         .trim()
         .parse()

@@ -85,6 +85,7 @@ fn get_dbsize(addr: &str) -> i64 {
 ///
 /// This is the test framework. Individual test functions parameterize
 /// the persistence mode and write phase.
+#[cfg(unix)]
 fn crash_test(
     mode: &str,
     port: u16,
