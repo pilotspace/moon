@@ -13,7 +13,8 @@ use std::path::PathBuf;
 
 /// Create a temp directory for persistence files.
 fn temp_persistence_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("moon-upgrade-test-{}-{}", name, std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("moon-upgrade-test-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -62,7 +63,8 @@ fn upgrade_preserves_aof_data() {
 
     // Phase 3: Verify RESP framing is parseable.
     // Count the number of RESP array markers — we expect 2 commands.
-    let command_count = contents.matches("\r\n*").count() + if contents.starts_with('*') { 1 } else { 0 };
+    let command_count =
+        contents.matches("\r\n*").count() + if contents.starts_with('*') { 1 } else { 0 };
     // We wrote SELECT + SET = at least 2 array-start markers
     assert!(
         command_count >= 2,

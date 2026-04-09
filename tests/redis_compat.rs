@@ -120,10 +120,7 @@ fn string_append_strlen() {
     assert_eq!(len, 11);
     let v: String = c.get("str:app").unwrap();
     assert_eq!(v, "hello world");
-    let slen: i64 = redis::cmd("STRLEN")
-        .arg("str:app")
-        .query(&mut c)
-        .unwrap();
+    let slen: i64 = redis::cmd("STRLEN").arg("str:app").query(&mut c).unwrap();
     assert_eq!(slen, 11);
 }
 
@@ -349,10 +346,7 @@ fn key_keys_pattern() {
     let _: () = c.set("kp:gamma", "3").unwrap();
     let _: () = c.set("other:x", "4").unwrap();
 
-    let mut matched: Vec<String> = redis::cmd("KEYS")
-        .arg("kp:*")
-        .query(&mut c)
-        .unwrap();
+    let mut matched: Vec<String> = redis::cmd("KEYS").arg("kp:*").query(&mut c).unwrap();
     matched.sort();
     assert_eq!(matched, vec!["kp:alpha", "kp:beta", "kp:gamma"]);
 }
@@ -376,10 +370,7 @@ fn transaction_multi_exec() {
         .arg("200")
         .query(&mut c)
         .unwrap();
-    let _: redis::Value = redis::cmd("INCR")
-        .arg("tx:a")
-        .query(&mut c)
-        .unwrap();
+    let _: redis::Value = redis::cmd("INCR").arg("tx:a").query(&mut c).unwrap();
     let results: Vec<redis::Value> = redis::cmd("EXEC").query(&mut c).unwrap();
     // EXEC returns array of results: [OK, OK, 101]
     assert_eq!(results.len(), 3);
@@ -423,7 +414,10 @@ fn pubsub_subscribe_publish() {
 
     // Publish from another connection
     let receivers: i64 = pub_conn.publish("test-channel", "hello-pubsub").unwrap();
-    assert!(receivers >= 1, "expected at least 1 subscriber, got {receivers}");
+    assert!(
+        receivers >= 1,
+        "expected at least 1 subscriber, got {receivers}"
+    );
 
     // Receive the message
     let msg = pubsub.get_message().unwrap();

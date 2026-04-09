@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **MSRV bumped from Rust 1.85 to 1.94.0.** `rust-toolchain.toml` committed so fresh clones auto-install the pinned version; CI workflows (`ci.yml`, `codeql.yml`, `release.yml`) and OrbStack `moon-dev` VM provisioning in `CLAUDE.md` updated. No language/runtime behavior change; downstream phases benefit from new clippy lints and std/compiler improvements. Contributors must run `rustup update` on next pull.
 
+### Added — Production Readiness Phases 92-105 (2026-04-09)
+
+- **Observability:** Prometheus `/metrics` on `--admin-port`, SLOWLOG GET/LEN/RESET/HELP, HEALTHZ + READYZ commands, `/healthz` + `/readyz` HTTP endpoints, INFO extended with Server/Clients/Memory/Stats/CPU sections, `--check-config` flag, per-command latency histograms + connection metrics wired into dispatch
+- **Durability proof:** Crash-injection test matrix, torn-write WAL v3 tests (CRC32C validated), Jepsen-lite linearizability harness, backup/restore workflow test
+- **Replication hardening:** PSYNC partial resync, full resync, network partition, kill-restart, replica promotion tests
+- **Client compatibility:** CI matrix (redis-py, go-redis, jedis, ioredis, node-redis, redis-rs, hiredis), 24 Redis compat tests, vector client smoke script, `docs/redis-compat.md`
+- **Performance gates:** Criterion regression CI with baseline caching, RSS-per-key memory gate script
+- **Security hardening:** `deny.toml` (cargo-deny), `SECURITY.md`, `docs/THREAT-MODEL.md`, `docs/security/lua-sandbox.md`, TLS cipher suite freeze
+- **Release engineering:** `docs/versioning.md`, 6 operator runbooks, CHANGELOG CI gate, user docs (getting-started, configuration, monitoring), release pipeline SHA256 checksums + SBOM + cosign
+
 ## [Earlier Unreleased] - Dispatch Hot-Path Recovery (2026-04-08)
 
 **Pipelined SET +37%, pipelined GET +68% at p=16 after PR #43 regression recovery.**
