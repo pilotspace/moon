@@ -1598,7 +1598,20 @@ pub async fn handle_connection_sharded_monoio<
                     }
                     drop(rt);
 
+                    let dispatch_start = std::time::Instant::now();
                     let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                    let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                        crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                    }
+                    if let Frame::Array(ref args) = frame {
+                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                            elapsed_us,
+                            args.as_slice(),
+                            peer_addr.as_bytes(),
+                            client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                        );
+                    }
 
                     let response = match result {
                         DispatchResult::Response(f) => f,
@@ -1680,8 +1693,21 @@ pub async fn handle_connection_sharded_monoio<
                     // READ PATH: shared lock — no contention with other shards' reads
                     let guard = shard_databases.read_db(shard_id, selected_db);
                     let now_ms = cached_clock.ms();
+                    let dispatch_start = std::time::Instant::now();
                     let result =
                         dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                    let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                        crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                    }
+                    if let Frame::Array(ref args) = frame {
+                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                            elapsed_us,
+                            args.as_slice(),
+                            peer_addr.as_bytes(),
+                            client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                        );
+                    }
                     drop(guard);
 
                     let response = match result {

@@ -205,6 +205,21 @@ pub fn record_pubsub_slow_drop() {
     counter!("moon_pubsub_slow_subscriber_drops_total").increment(1);
 }
 
+// ── Replication metrics ─────────────────────────────────────────────
+
+/// Record replication lag (byte offset and time-based).
+///
+/// Called periodically when replication is active. When no replicas are
+/// connected, the gauges remain at their last-set values (or zero).
+#[inline]
+pub fn record_replication_lag(bytes: u64, ms: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_replication_lag_bytes").set(bytes as f64);
+    gauge!("moon_replication_lag_ms").set(ms as f64);
+}
+
 // ── Memory metrics ──────────────────────────────────────────────────────
 
 /// Update RSS gauge (called periodically by shard timer).
