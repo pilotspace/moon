@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-BASELINE=35  # Phase 90 baseline — ratchet prevents increase. Target: 0
+BASELINE=98  # Accurate count after fixing set -e bug in script. Includes function-level #[allow] not detected by line grep + split submodule files without #[cfg(test)]. Target: 0
 
 COUNT=0
 for mod in src/protocol src/command src/shard src/storage src/persistence src/server; do
@@ -27,7 +27,7 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
         fi
         # Check if we're inside a #[cfg(test)] module
         # Simple heuristic: if line number > first #[cfg(test)] in file, skip
-        test_start=$(grep -n '#\[cfg(test)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1)
+        test_start=$(grep -n '#\[cfg(test)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1 || true)
         if [ -n "$test_start" ] && [ "$lineno" -gt "$test_start" ]; then
             continue
         fi

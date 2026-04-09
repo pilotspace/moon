@@ -27,13 +27,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Override rust-toolchain.toml for nightly
+        run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run fuzzer
-        run: cargo fuzz run "$TARGET" -- -max_total_time=900 -max_len=65536
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=900 -max_len=65536
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
@@ -55,13 +57,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Override rust-toolchain.toml for nightly
+        run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run fuzzer (6h)
-        run: cargo fuzz run "$TARGET" -- -max_total_time=21600 -max_len=65536
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=21600 -max_len=65536
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
