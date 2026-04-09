@@ -39,7 +39,13 @@ async fn blpop_timeout_returns_nil() {
     // Use redis-cli subprocess for true blocking semantics
     let start = std::time::Instant::now();
     let output = tokio::process::Command::new("redis-cli")
-        .args(["-p", &MOON_PORT.to_string(), "BLPOP", "empty_key_blpop", "1"])
+        .args([
+            "-p",
+            &MOON_PORT.to_string(),
+            "BLPOP",
+            "empty_key_blpop",
+            "1",
+        ])
         .output()
         .await
         .unwrap();
@@ -202,13 +208,7 @@ async fn connection_drop_cleans_registry() {
 
     // Start a blocking client via redis-cli, then kill it
     let mut child = tokio::process::Command::new("redis-cli")
-        .args([
-            "-p",
-            &MOON_PORT.to_string(),
-            "BLPOP",
-            "drop_test_key",
-            "30",
-        ])
+        .args(["-p", &MOON_PORT.to_string(), "BLPOP", "drop_test_key", "30"])
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
@@ -225,13 +225,7 @@ async fn connection_drop_cleans_registry() {
 
     // Verify a new blocking client works normally (short timeout via redis-cli)
     let output = tokio::process::Command::new("redis-cli")
-        .args([
-            "-p",
-            &MOON_PORT.to_string(),
-            "BLPOP",
-            "drop_test_key",
-            "1",
-        ])
+        .args(["-p", &MOON_PORT.to_string(), "BLPOP", "drop_test_key", "1"])
         .output()
         .await
         .unwrap();

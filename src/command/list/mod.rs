@@ -43,16 +43,16 @@ pub use list_read::lrange_readonly;
 // ---------------------------------------------------------------------------
 pub use list_write::linsert;
 pub use list_write::lmove;
+pub use list_write::lmpop;
 pub use list_write::lpop;
 pub use list_write::lpush;
+pub use list_write::lpushx;
 pub use list_write::lrem;
 pub use list_write::lset;
 pub use list_write::ltrim;
 pub use list_write::rpop;
 pub use list_write::rpush;
-pub use list_write::lpushx;
 pub use list_write::rpushx;
-pub use list_write::lmpop;
 
 // ===========================================================================
 // Tests

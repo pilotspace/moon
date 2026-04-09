@@ -13,10 +13,7 @@ use crate::storage::Database;
 ///
 /// Supported: LOAD, LIST, DELETE, FLUSH.
 /// Deferred: DUMP, RESTORE, STATS (return documented error).
-pub fn handle_function(
-    registry: &mut FunctionRegistry,
-    args: &[Frame],
-) -> Frame {
+pub fn handle_function(registry: &mut FunctionRegistry, args: &[Frame]) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'function' command",
@@ -62,10 +59,7 @@ pub fn handle_function(
 }
 
 /// FUNCTION LOAD [REPLACE] <body>
-fn handle_function_load(
-    registry: &mut FunctionRegistry,
-    args: &[Frame],
-) -> Frame {
+fn handle_function_load(registry: &mut FunctionRegistry, args: &[Frame]) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'function|load' command",
@@ -115,10 +109,7 @@ fn handle_function_load(
 }
 
 /// FUNCTION LIST [LIBRARYNAME pattern] [WITHCODE]
-fn handle_function_list(
-    registry: &FunctionRegistry,
-    args: &[Frame],
-) -> Frame {
+fn handle_function_list(registry: &FunctionRegistry, args: &[Frame]) -> Frame {
     let mut _pattern: Option<&[u8]> = None;
     let mut with_code = false;
 
@@ -169,9 +160,7 @@ fn handle_function_list(
                 fentry.push(Frame::BulkString(f.name.clone()));
                 if let Some(desc) = &f.description {
                     fentry.push(Frame::BulkString(Bytes::from_static(b"description")));
-                    fentry.push(Frame::BulkString(Bytes::copy_from_slice(
-                        desc.as_bytes(),
-                    )));
+                    fentry.push(Frame::BulkString(Bytes::copy_from_slice(desc.as_bytes())));
                 }
                 Frame::Array(fentry.into())
             })
@@ -192,10 +181,7 @@ fn handle_function_list(
 }
 
 /// FUNCTION DELETE <libname>
-fn handle_function_delete(
-    registry: &mut FunctionRegistry,
-    args: &[Frame],
-) -> Frame {
+fn handle_function_delete(registry: &mut FunctionRegistry, args: &[Frame]) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'function|delete' command",
@@ -229,7 +215,16 @@ pub fn handle_fcall(
     selected_db: usize,
     db_count: usize,
 ) -> Frame {
-    handle_fcall_inner(registry, args, db, shard_id, num_shards, selected_db, db_count, false)
+    handle_fcall_inner(
+        registry,
+        args,
+        db,
+        shard_id,
+        num_shards,
+        selected_db,
+        db_count,
+        false,
+    )
 }
 
 /// Handle FCALL_RO: same as FCALL but sets read-only mode.
@@ -242,7 +237,16 @@ pub fn handle_fcall_ro(
     selected_db: usize,
     db_count: usize,
 ) -> Frame {
-    handle_fcall_inner(registry, args, db, shard_id, num_shards, selected_db, db_count, true)
+    handle_fcall_inner(
+        registry,
+        args,
+        db,
+        shard_id,
+        num_shards,
+        selected_db,
+        db_count,
+        true,
+    )
 }
 
 /// Inner FCALL implementation shared by FCALL and FCALL_RO.
@@ -305,18 +309,14 @@ fn handle_fcall_inner(
         match f {
             Frame::BulkString(b) => keys.push(b.clone()),
             _ => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR Invalid argument type for key",
-                ));
+                return Frame::Error(Bytes::from_static(b"ERR Invalid argument type for key"));
             }
         }
     }
 
     // Validate cross-shard keys
     if num_shards > 1 {
-        if let Some(err) =
-            crate::scripting::validate_keys_same_shard(&keys, shard_id, num_shards)
-        {
+        if let Some(err) = crate::scripting::validate_keys_same_shard(&keys, shard_id, num_shards) {
             return err;
         }
     }
@@ -326,9 +326,7 @@ fn handle_fcall_inner(
         match f {
             Frame::BulkString(b) => argv.push(b.clone()),
             _ => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR Invalid argument type for arg",
-                ));
+                return Frame::Error(Bytes::from_static(b"ERR Invalid argument type for arg"));
             }
         }
     }

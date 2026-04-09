@@ -586,15 +586,14 @@ pub(crate) fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, 
         )));
     }
     // BLMPOP/BZMPOP: timeout is the FIRST argument; others: last argument
-    let timeout_frame = if cmd.eq_ignore_ascii_case(b"BLMPOP")
-        || cmd.eq_ignore_ascii_case(b"BZMPOP")
-    {
-        &args[0]
-    } else {
-        // args confirmed non-empty above
-        #[allow(clippy::unwrap_used)] // args.is_empty() checked at entry
-        args.last().unwrap()
-    };
+    let timeout_frame =
+        if cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BZMPOP") {
+            &args[0]
+        } else {
+            // args confirmed non-empty above
+            #[allow(clippy::unwrap_used)] // args.is_empty() checked at entry
+            args.last().unwrap()
+        };
     let timeout_bytes = match timeout_frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => b,
         _ => {
@@ -742,7 +741,11 @@ pub(crate) fn parse_blocking_args(
         let numkeys: usize = std::str::from_utf8(&numkeys_bytes)
             .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer")))?
             .parse()
-            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer or is out of range")))?;
+            .map_err(|_| {
+                Frame::Error(Bytes::from_static(
+                    b"ERR numkeys is not an integer or is out of range",
+                ))
+            })?;
         if numkeys == 0 || args.len() < 2 + numkeys + 1 {
             return Err(Frame::Error(Bytes::from_static(
                 b"ERR numkeys is not an integer or is out of range",
@@ -774,9 +777,15 @@ pub(crate) fn parse_blocking_args(
                     let count_bytes = extract_bytes(&remaining[1])
                         .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
                     count = std::str::from_utf8(&count_bytes)
-                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer")))?
+                        .map_err(|_| {
+                            Frame::Error(Bytes::from_static(b"ERR count is not an integer"))
+                        })?
                         .parse()
-                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer or is out of range")))?;
+                        .map_err(|_| {
+                            Frame::Error(Bytes::from_static(
+                                b"ERR count is not an integer or is out of range",
+                            ))
+                        })?;
                     if count == 0 {
                         return Err(Frame::Error(Bytes::from_static(
                             b"ERR count is not an integer or is out of range",
@@ -785,7 +794,10 @@ pub(crate) fn parse_blocking_args(
                 }
             }
         }
-        Ok((keys, Box::new(move || crate::blocking::BlockedCommand::BLMPop { dir, count })))
+        Ok((
+            keys,
+            Box::new(move || crate::blocking::BlockedCommand::BLMPop { dir, count }),
+        ))
     } else if cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") {
         // BRPOPLPUSH source destination timeout
         if args.len() != 3 {
@@ -819,7 +831,11 @@ pub(crate) fn parse_blocking_args(
         let numkeys: usize = std::str::from_utf8(&numkeys_bytes)
             .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer")))?
             .parse()
-            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR numkeys is not an integer or is out of range")))?;
+            .map_err(|_| {
+                Frame::Error(Bytes::from_static(
+                    b"ERR numkeys is not an integer or is out of range",
+                ))
+            })?;
         if numkeys == 0 || args.len() < 2 + numkeys + 1 {
             return Err(Frame::Error(Bytes::from_static(
                 b"ERR numkeys is not an integer or is out of range",
@@ -851,9 +867,15 @@ pub(crate) fn parse_blocking_args(
                     let count_bytes = extract_bytes(&remaining[1])
                         .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR syntax error")))?;
                     count = std::str::from_utf8(&count_bytes)
-                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer")))?
+                        .map_err(|_| {
+                            Frame::Error(Bytes::from_static(b"ERR count is not an integer"))
+                        })?
                         .parse()
-                        .map_err(|_| Frame::Error(Bytes::from_static(b"ERR count is not an integer or is out of range")))?;
+                        .map_err(|_| {
+                            Frame::Error(Bytes::from_static(
+                                b"ERR count is not an integer or is out of range",
+                            ))
+                        })?;
                     if count == 0 {
                         return Err(Frame::Error(Bytes::from_static(
                             b"ERR count is not an integer or is out of range",
@@ -862,7 +884,10 @@ pub(crate) fn parse_blocking_args(
                 }
             }
         }
-        Ok((keys, Box::new(move || crate::blocking::BlockedCommand::BZMPop { min: is_min, count })))
+        Ok((
+            keys,
+            Box::new(move || crate::blocking::BlockedCommand::BZMPop { min: is_min, count }),
+        ))
     } else {
         Err(Frame::Error(Bytes::from_static(
             b"ERR unknown blocking command",
@@ -952,7 +977,10 @@ pub(crate) fn try_immediate_pop(
             if let Some(kw) = extract_bytes(&remaining[0]) {
                 if kw.eq_ignore_ascii_case(b"COUNT") {
                     if let Some(cb) = extract_bytes(&remaining[1]) {
-                        if let Some(c) = std::str::from_utf8(&cb).ok().and_then(|s| s.parse::<u32>().ok()) {
+                        if let Some(c) = std::str::from_utf8(&cb)
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok())
+                        {
                             if c > 0 {
                                 count = c;
                             }
@@ -1014,7 +1042,10 @@ pub(crate) fn try_immediate_pop(
             if let Some(kw) = extract_bytes(&remaining[0]) {
                 if kw.eq_ignore_ascii_case(b"COUNT") {
                     if let Some(cb) = extract_bytes(&remaining[1]) {
-                        if let Some(c) = std::str::from_utf8(&cb).ok().and_then(|s| s.parse::<u32>().ok()) {
+                        if let Some(c) = std::str::from_utf8(&cb)
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok())
+                        {
                             if c > 0 {
                                 count = c;
                             }

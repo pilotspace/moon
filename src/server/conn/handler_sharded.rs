@@ -303,7 +303,9 @@ pub async fn handle_connection_sharded_inner<
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Functions API registry (per-shard, lazy init)
-    let func_registry = std::rc::Rc::new(std::cell::RefCell::new(crate::scripting::FunctionRegistry::new()));
+    let func_registry = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::scripting::FunctionRegistry::new(),
+    ));
 
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
@@ -723,43 +725,6 @@ pub async fn handle_connection_sharded_inner<
                         continue;
                     }
 
-                    // --- Functions API: FUNCTION subcommands ---
-                    if cmd.eq_ignore_ascii_case(b"FUNCTION") {
-                        let response = crate::command::functions::handle_function(
-                            &mut func_registry.borrow_mut(), cmd_args,
-                        );
-                        responses.push(response);
-                        continue;
-                    }
-
-                    // --- Functions API: FCALL ---
-                    if cmd.eq_ignore_ascii_case(b"FCALL") {
-                        let response = {
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            let db_count = shard_databases.db_count();
-                            crate::command::functions::handle_fcall(
-                                &func_registry.borrow(), cmd_args, &mut guard,
-                                shard_id, num_shards, selected_db, db_count,
-                            )
-                        };
-                        responses.push(response);
-                        continue;
-                    }
-
-                    // --- Functions API: FCALL_RO ---
-                    if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
-                        let response = {
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            let db_count = shard_databases.db_count();
-                            crate::command::functions::handle_fcall_ro(
-                                &func_registry.borrow(), cmd_args, &mut guard,
-                                shard_id, num_shards, selected_db, db_count,
-                            )
-                        };
-                        responses.push(response);
-                        continue;
-                    }
-
                     // --- Cluster slot routing (pre-dispatch) ---
                     if crate::cluster::cluster_enabled() {
                         if let Some(ref cs) = cluster_state {
@@ -862,6 +827,44 @@ pub async fn handle_connection_sharded_inner<
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
+                    }
+
+                    // --- Functions API: FUNCTION subcommands ---
+                    // Placed AFTER ACL check so unprivileged users cannot manage functions.
+                    if cmd.eq_ignore_ascii_case(b"FUNCTION") {
+                        let response = crate::command::functions::handle_function(
+                            &mut func_registry.borrow_mut(), cmd_args,
+                        );
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- Functions API: FCALL ---
+                    if cmd.eq_ignore_ascii_case(b"FCALL") {
+                        let response = {
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let db_count = shard_databases.db_count();
+                            crate::command::functions::handle_fcall(
+                                &func_registry.borrow(), cmd_args, &mut guard,
+                                shard_id, num_shards, selected_db, db_count,
+                            )
+                        };
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- Functions API: FCALL_RO ---
+                    if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+                        let response = {
+                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let db_count = shard_databases.db_count();
+                            crate::command::functions::handle_fcall_ro(
+                                &func_registry.borrow(), cmd_args, &mut guard,
+                                shard_id, num_shards, selected_db, db_count,
+                            )
+                        };
+                        responses.push(response);
+                        continue;
                     }
 
                     // --- CONFIG ---

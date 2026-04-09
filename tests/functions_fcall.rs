@@ -13,8 +13,7 @@ const MOON_PORT: u16 = 16479;
 
 /// Get a multiplexed connection.
 async fn get_conn() -> redis::aio::MultiplexedConnection {
-    let client =
-        redis::Client::open(format!("redis://127.0.0.1:{}/", MOON_PORT)).unwrap();
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}/", MOON_PORT)).unwrap();
     client.get_multiplexed_async_connection().await.unwrap()
 }
 
@@ -32,8 +31,7 @@ async fn raw_cmd(
 
 /// Clean up any function state before each test.
 async fn flush_functions(con: &mut redis::aio::MultiplexedConnection) {
-    let _: redis::RedisResult<redis::Value> =
-        raw_cmd(con, &["FUNCTION", "FLUSH"]).await;
+    let _: redis::RedisResult<redis::Value> = raw_cmd(con, &["FUNCTION", "FLUSH"]).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,8 +66,7 @@ async fn function_load_missing_header_errors() {
     assert!(result.is_err());
     let err_str = format!("{}", result.unwrap_err());
     assert!(
-        err_str.contains("Missing library metadata")
-            || err_str.contains("Missing library"),
+        err_str.contains("Missing library metadata") || err_str.contains("Missing library"),
         "Unexpected error: {err_str}"
     );
 }
@@ -79,10 +76,13 @@ async fn function_load_duplicate_without_replace_errors() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
-    let body = "#!lua name=duplib\nredis.register_function('dup_hello', function() return 'world' end)";
+    let body =
+        "#!lua name=duplib\nredis.register_function('dup_hello', function() return 'world' end)";
 
     // First load succeeds
-    let _ = raw_cmd(&mut con, &["FUNCTION", "LOAD", body]).await.unwrap();
+    let _ = raw_cmd(&mut con, &["FUNCTION", "LOAD", body])
+        .await
+        .unwrap();
 
     // Second load without REPLACE fails
     let result = raw_cmd(&mut con, &["FUNCTION", "LOAD", body]).await;
@@ -99,8 +99,10 @@ async fn function_load_replace_succeeds() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
-    let body1 = "#!lua name=replib\nredis.register_function('rep_hello', function() return 'world' end)";
-    let body2 = "#!lua name=replib\nredis.register_function('rep_hello', function() return 'replaced' end)";
+    let body1 =
+        "#!lua name=replib\nredis.register_function('rep_hello', function() return 'world' end)";
+    let body2 =
+        "#!lua name=replib\nredis.register_function('rep_hello', function() return 'replaced' end)";
 
     let _ = raw_cmd(&mut con, &["FUNCTION", "LOAD", body1])
         .await
@@ -124,7 +126,8 @@ async fn function_list_returns_libraries() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
-    let body = "#!lua name=listlib\nredis.register_function('list_hello', function() return 'world' end)";
+    let body =
+        "#!lua name=listlib\nredis.register_function('list_hello', function() return 'world' end)";
     let _ = raw_cmd(&mut con, &["FUNCTION", "LOAD", body])
         .await
         .unwrap();
@@ -143,7 +146,8 @@ async fn function_delete_removes() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
-    let body = "#!lua name=dellib\nredis.register_function('del_hello', function() return 'world' end)";
+    let body =
+        "#!lua name=dellib\nredis.register_function('del_hello', function() return 'world' end)";
     let _ = raw_cmd(&mut con, &["FUNCTION", "LOAD", body])
         .await
         .unwrap();
@@ -179,8 +183,7 @@ async fn fcall_ro_rejects_writes() {
     assert!(result.is_err());
     let err_str = format!("{}", result.unwrap_err());
     assert!(
-        err_str.contains("Write commands are not allowed")
-            || err_str.contains("read-only"),
+        err_str.contains("Write commands are not allowed") || err_str.contains("read-only"),
         "Expected write rejection error, got: {err_str}"
     );
 }
@@ -199,8 +202,7 @@ async fn function_dump_restore_stats_deferred() {
     );
 
     // FUNCTION RESTORE
-    let result =
-        raw_cmd(&mut con, &["FUNCTION", "RESTORE", "payload"]).await;
+    let result = raw_cmd(&mut con, &["FUNCTION", "RESTORE", "payload"]).await;
     assert!(result.is_err());
     let err_str = format!("{}", result.unwrap_err());
     assert!(

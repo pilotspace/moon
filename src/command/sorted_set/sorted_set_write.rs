@@ -6,7 +6,10 @@ use crate::storage::Database;
 
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
-use super::{format_score, format_score_bytes, zadd_member, zrem_member, AggregateOp, zrange_by_rank, zrange_by_score, zrange_by_lex};
+use super::{
+    AggregateOp, format_score, format_score_bytes, zadd_member, zrange_by_lex, zrange_by_rank,
+    zrange_by_score, zrem_member,
+};
 
 // ---------------------------------------------------------------------------
 // Write commands (mutate the database)
@@ -598,9 +601,27 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
     let entries: Vec<(Bytes, f64)> = match db.get_sorted_set(src) {
         Ok(Some((members, scores))) => {
             let frame = if by_score {
-                zrange_by_score(members, scores, &min_arg, &max_arg, rev, true, limit_offset, limit_count)
+                zrange_by_score(
+                    members,
+                    scores,
+                    &min_arg,
+                    &max_arg,
+                    rev,
+                    true,
+                    limit_offset,
+                    limit_count,
+                )
             } else if by_lex {
-                zrange_by_lex(scores, &min_arg, &max_arg, rev, true, members, limit_offset, limit_count)
+                zrange_by_lex(
+                    scores,
+                    &min_arg,
+                    &max_arg,
+                    rev,
+                    true,
+                    members,
+                    limit_offset,
+                    limit_count,
+                )
             } else {
                 zrange_by_rank(scores, &min_arg, &max_arg, rev, true)
             };
@@ -610,8 +631,11 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
                     let mut result = Vec::with_capacity(arr.len() / 2);
                     let mut idx = 0;
                     while idx + 1 < arr.len() {
-                        if let (Frame::BulkString(m), Frame::BulkString(s)) = (&arr[idx], &arr[idx + 1]) {
-                            if let Ok(score) = std::str::from_utf8(s).unwrap_or("0").parse::<f64>() {
+                        if let (Frame::BulkString(m), Frame::BulkString(s)) =
+                            (&arr[idx], &arr[idx + 1])
+                        {
+                            if let Ok(score) = std::str::from_utf8(s).unwrap_or("0").parse::<f64>()
+                            {
                                 result.push((m.clone(), score));
                             }
                         }

@@ -3,7 +3,7 @@
 //! Tests MurmurHash64A known-answer values, cardinality estimation accuracy,
 //! merge correctness, and HYLL header format.
 
-use moon::storage::hll::{murmurhash64a, Hll, HLL_HASH_SEED};
+use moon::storage::hll::{HLL_HASH_SEED, Hll, murmurhash64a};
 
 #[test]
 fn murmur_empty_string_kat() {

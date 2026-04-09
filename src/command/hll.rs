@@ -13,8 +13,7 @@ use crate::storage::hll::Hll;
 use super::helpers::{err_wrong_args, extract_bytes, ok};
 
 /// Redis-exact WRONGTYPE error for non-HLL string values.
-const WRONGTYPE_HLL: &[u8] =
-    b"WRONGTYPE Key is not a valid HyperLogLog string value.";
+const WRONGTYPE_HLL: &[u8] = b"WRONGTYPE Key is not a valid HyperLogLog string value.";
 
 /// Load an existing HLL from the database (mutable access).
 fn load_hll(db: &mut Database, key: &[u8]) -> Result<Option<Hll>, Frame> {

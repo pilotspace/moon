@@ -11,8 +11,8 @@ use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 use std::collections::HashMap;
 
 use super::{
-    format_score, format_score_bytes, glob_match, lex_in_range, parse_lex_bound, parse_score_bound,
-    zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries, AggregateOp,
+    AggregateOp, format_score, format_score_bytes, glob_match, lex_in_range, parse_lex_bound,
+    parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------

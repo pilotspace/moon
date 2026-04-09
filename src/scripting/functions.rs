@@ -239,8 +239,7 @@ impl FunctionRegistry {
 
             // Call the registered function
             let func_name_str = lib.lua.create_string(func_name)?;
-            let func_tbl: mlua::Table =
-                lib.lua.globals().get("__moon_functions")?;
+            let func_tbl: mlua::Table = lib.lua.globals().get("__moon_functions")?;
             let registered: mlua::Function = func_tbl.get(func_name_str)?;
             let val: LuaValue = registered.call(())?;
             crate::scripting::types::lua_value_to_frame(&lib.lua, &val)
@@ -252,9 +251,7 @@ impl FunctionRegistry {
 
         match result {
             Ok(frame) => frame,
-            Err(mlua::Error::RuntimeError(msg))
-                if msg.contains("ERR Lua script timeout") =>
-            {
+            Err(mlua::Error::RuntimeError(msg)) if msg.contains("ERR Lua script timeout") => {
                 Frame::Error(Bytes::from_static(b"BUSY Lua script timeout exceeded"))
             }
             Err(mlua::Error::RuntimeError(msg))
@@ -301,8 +298,7 @@ impl FunctionRegistry {
 
                 if args.is_empty() {
                     return Err(mlua::Error::RuntimeError(
-                        "ERR redis.register_function requires at least one argument"
-                            .to_string(),
+                        "ERR redis.register_function requires at least one argument".to_string(),
                     ));
                 }
 
@@ -326,31 +322,24 @@ impl FunctionRegistry {
                             }
                         };
                         let name_bytes = s.as_bytes();
-                        (
-                            Bytes::copy_from_slice(&name_bytes),
-                            func,
-                            None,
-                            0u8,
-                        )
+                        (Bytes::copy_from_slice(&name_bytes), func, None, 0u8)
                     }
                     LuaValue::Table(t) => {
                         // Table form
-                        let name_s: mlua::String =
-                            t.get("function_name").map_err(|_| {
-                                mlua::Error::RuntimeError(
-                                    "ERR redis.register_function: table must \
+                        let name_s: mlua::String = t.get("function_name").map_err(|_| {
+                            mlua::Error::RuntimeError(
+                                "ERR redis.register_function: table must \
                                      have function_name"
-                                        .to_string(),
-                                )
-                            })?;
-                        let callback: mlua::Function =
-                            t.get("callback").map_err(|_| {
-                                mlua::Error::RuntimeError(
-                                    "ERR redis.register_function: table must \
+                                    .to_string(),
+                            )
+                        })?;
+                        let callback: mlua::Function = t.get("callback").map_err(|_| {
+                            mlua::Error::RuntimeError(
+                                "ERR redis.register_function: table must \
                                      have callback"
-                                        .to_string(),
-                                )
-                            })?;
+                                    .to_string(),
+                            )
+                        })?;
                         let desc: Option<String> = t.get("description").ok();
                         let mut flags: u8 = 0;
                         if let Ok(f) = t.get::<mlua::Table>("flags") {
@@ -370,12 +359,7 @@ impl FunctionRegistry {
                             }
                         }
                         let nb = name_s.as_bytes();
-                        (
-                            Bytes::copy_from_slice(&nb),
-                            callback,
-                            desc,
-                            flags,
-                        )
+                        (Bytes::copy_from_slice(&nb), callback, desc, flags)
                     }
                     _ => {
                         return Err(mlua::Error::RuntimeError(
@@ -390,13 +374,8 @@ impl FunctionRegistry {
                 let ftbl: mlua::Table = lua
                     .globals()
                     .get("__moon_functions")
-                    .map_err(|_| {
-                        mlua::Error::RuntimeError("internal error".to_string())
-                    })?;
-                ftbl.set(
-                    lua.create_string(name.as_ref())?,
-                    callback,
-                )?;
+                    .map_err(|_| mlua::Error::RuntimeError("internal error".to_string()))?;
+                ftbl.set(lua.create_string(name.as_ref())?, callback)?;
 
                 // Store metadata
                 funcs_clone.borrow_mut().insert(
@@ -470,8 +449,7 @@ pub fn parse_shebang(body: &[u8]) -> Result<(Bytes, &[u8]), LoadError> {
     let header = &first_line[2..];
 
     // Parse engine and key=value pairs
-    let header_str =
-        std::str::from_utf8(header).map_err(|_| LoadError::MissingShebang)?;
+    let header_str = std::str::from_utf8(header).map_err(|_| LoadError::MissingShebang)?;
 
     let mut parts = header_str.split_whitespace();
     let engine = parts.next().ok_or(LoadError::MissingShebang)?;
@@ -539,7 +517,8 @@ mod tests {
     #[test]
     fn test_load_and_lookup() {
         let mut reg = FunctionRegistry::new();
-        let body = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         let name = reg.load(body, false).unwrap();
         assert_eq!(name, Bytes::from_static(b"mylib"));
 
@@ -551,7 +530,8 @@ mod tests {
     #[test]
     fn test_load_duplicate_without_replace() {
         let mut reg = FunctionRegistry::new();
-        let body = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
         assert!(matches!(
             reg.load(body, false),
@@ -562,8 +542,10 @@ mod tests {
     #[test]
     fn test_load_replace() {
         let mut reg = FunctionRegistry::new();
-        let body1 = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
-        let body2 = b"#!lua name=mylib\nredis.register_function('hello', function() return 'replaced' end)";
+        let body1 =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body2 =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'replaced' end)";
         reg.load(body1, false).unwrap();
         reg.load(body2, true).unwrap();
         assert!(reg.lookup(b"hello").is_some());
@@ -572,7 +554,8 @@ mod tests {
     #[test]
     fn test_delete() {
         let mut reg = FunctionRegistry::new();
-        let body = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
         assert!(reg.delete(b"mylib"));
         assert!(reg.lookup(b"hello").is_none());
@@ -581,7 +564,8 @@ mod tests {
     #[test]
     fn test_flush() {
         let mut reg = FunctionRegistry::new();
-        let body = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
         reg.flush();
         assert!(reg.list().is_empty());
@@ -590,7 +574,8 @@ mod tests {
     #[test]
     fn test_list() {
         let mut reg = FunctionRegistry::new();
-        let body = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
         let libs = reg.list();
         assert_eq!(libs.len(), 1);
@@ -610,23 +595,20 @@ mod tests {
     #[test]
     fn test_call_function() {
         let mut reg = FunctionRegistry::new();
-        let body = b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
+        let body =
+            b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
 
         let mut db = Database::new();
-        let result =
-            reg.call_function(b"hello", vec![], vec![], &mut db, 0, 1, false);
-        assert!(
-            matches!(result, Frame::BulkString(ref b) if *b == Bytes::from_static(b"world"))
-        );
+        let result = reg.call_function(b"hello", vec![], vec![], &mut db, 0, 1, false);
+        assert!(matches!(result, Frame::BulkString(ref b) if *b == Bytes::from_static(b"world")));
     }
 
     #[test]
     fn test_call_function_not_found() {
         let reg = FunctionRegistry::new();
         let mut db = Database::new();
-        let result =
-            reg.call_function(b"nonexistent", vec![], vec![], &mut db, 0, 1, false);
+        let result = reg.call_function(b"nonexistent", vec![], vec![], &mut db, 0, 1, false);
         assert!(matches!(result, Frame::Error(_)));
     }
 }

@@ -121,24 +121,20 @@ pub fn try_wake_zset_waiter(
         let wait_id = waiter.wait_id;
 
         let result = match &waiter.cmd {
-            BlockedCommand::BZPopMin => {
-                db.zset_pop_min(key).map(|(member, score)| {
-                    Frame::Array(framevec![
-                        Frame::BulkString(key.clone()),
-                        Frame::BulkString(member),
-                        Frame::BulkString(format_score_bytes(score)),
-                    ])
-                })
-            }
-            BlockedCommand::BZPopMax => {
-                db.zset_pop_max(key).map(|(member, score)| {
-                    Frame::Array(framevec![
-                        Frame::BulkString(key.clone()),
-                        Frame::BulkString(member),
-                        Frame::BulkString(format_score_bytes(score)),
-                    ])
-                })
-            }
+            BlockedCommand::BZPopMin => db.zset_pop_min(key).map(|(member, score)| {
+                Frame::Array(framevec![
+                    Frame::BulkString(key.clone()),
+                    Frame::BulkString(member),
+                    Frame::BulkString(format_score_bytes(score)),
+                ])
+            }),
+            BlockedCommand::BZPopMax => db.zset_pop_max(key).map(|(member, score)| {
+                Frame::Array(framevec![
+                    Frame::BulkString(key.clone()),
+                    Frame::BulkString(member),
+                    Frame::BulkString(format_score_bytes(score)),
+                ])
+            }),
             BlockedCommand::BZMPop { min, count } => {
                 let n = *count as usize;
                 let mut elems = smallvec::SmallVec::<[Frame; 16]>::new();
@@ -283,4 +279,3 @@ pub fn try_wake_stream_waiter(
     }
     false
 }
-

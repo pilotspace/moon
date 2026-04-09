@@ -6,7 +6,7 @@
 //! Storage: `RedisValue::String(Bytes)` — the raw HYLL wire bytes.
 //! Redis `TYPE` reports "string" for HLL keys; GET/SET/DUMP/RESTORE work.
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 // ---------------------------------------------------------------------------
 // Constants (match Redis hyperloglog.c exactly)
@@ -19,8 +19,7 @@ const HLL_P_MASK: u64 = (HLL_REGISTERS as u64) - 1;
 pub const HLL_BITS: u32 = 6;
 pub const HLL_REGISTER_MAX: u8 = (1 << HLL_BITS) - 1; // 63
 pub const HLL_HDR_SIZE: usize = 16;
-pub const HLL_DENSE_SIZE: usize =
-    HLL_HDR_SIZE + ((HLL_REGISTERS * HLL_BITS as usize + 7) / 8); // 12304
+pub const HLL_DENSE_SIZE: usize = HLL_HDR_SIZE + ((HLL_REGISTERS * HLL_BITS as usize + 7) / 8); // 12304
 pub const HLL_DENSE: u8 = 0;
 pub const HLL_SPARSE: u8 = 1;
 const HLL_MAX_ENCODING: u8 = 1;
@@ -50,11 +49,8 @@ pub fn murmurhash64a(key: &[u8], seed: u64) -> u64 {
     // Process 8-byte chunks
     let chunks = len / 8;
     for i in 0..chunks {
-        let mut k = u64::from_le_bytes(
-            key[i * 8..i * 8 + 8]
-                .try_into()
-                .expect("slice length is 8"),
-        );
+        let mut k =
+            u64::from_le_bytes(key[i * 8..i * 8 + 8].try_into().expect("slice length is 8"));
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
@@ -203,9 +199,9 @@ fn hll_count(reghisto: &[u32; 64]) -> u64 {
 /// Decoded sparse opcode.
 #[derive(Debug, Clone, Copy)]
 enum SparseOp {
-    Zero(u16),       // run of zeros, length 1..64
-    XZero(u16),      // run of zeros, length 1..16384
-    Val(u8, u16),    // run of val (1..32), length 1..4
+    Zero(u16),    // run of zeros, length 1..64
+    XZero(u16),   // run of zeros, length 1..16384
+    Val(u8, u16), // run of val (1..32), length 1..4
 }
 
 impl SparseOp {
@@ -567,8 +563,7 @@ impl Hll {
         }
 
         // Check if resulting sparse payload would exceed max size
-        let new_payload_len =
-            payload_len - found_consumed + replacement.len();
+        let new_payload_len = payload_len - found_consumed + replacement.len();
         if new_payload_len > HLL_SPARSE_MAX_BYTES {
             self.promote_to_dense();
             return self.add_dense(index, count);
