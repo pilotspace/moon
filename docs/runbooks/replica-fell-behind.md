@@ -41,9 +41,9 @@ redis-cli -p 6380 REPLICAOF <master_host> <master_port>
 ### Step 4: If full resync is too slow
 
 ```bash
-# Option A: Increase replication backlog
-# Moon does not support runtime CONFIG SET for repl-backlog-size.
-# Restart the primary with a larger backlog via CLI argument:
+# Option A: Increase replication backlog (future)
+# Moon does not yet support repl-backlog-size configuration.
+# When implemented, restart the primary with a larger backlog:
 #   moon --port 6379 --shards 4 --repl-backlog-size 64mb
 
 # Option B: Rebuild replica from scratch

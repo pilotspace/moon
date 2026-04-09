@@ -79,9 +79,36 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --check-config: validate and exit without starting.
-    // Runs AFTER TLS cert validation, protected mode check, and persistence dir check
+    // Runs AFTER TLS cert/key validation, protected mode check, and persistence dir check
     // so that real configuration errors are caught before reporting success.
+    // Remaining initialization (metrics, shards, AOF) is runtime-only and not validated here.
     if config.check_config {
+        // Validate shard count is reasonable
+        if config.shards == 0 {
+            return Err(anyhow::anyhow!("--shards must be >= 1"));
+        }
+        // Validate admin port doesn't conflict with main port
+        if config.admin_port > 0 && config.admin_port == config.port {
+            return Err(anyhow::anyhow!(
+                "--admin-port ({}) must differ from --port ({})",
+                config.admin_port,
+                config.port
+            ));
+        }
+        if config.admin_port > 0 && config.tls_port > 0 && config.admin_port == config.tls_port {
+            return Err(anyhow::anyhow!(
+                "--admin-port ({}) must differ from --tls-port ({})",
+                config.admin_port,
+                config.tls_port
+            ));
+        }
+        if config.tls_port > 0 && config.tls_port == config.port {
+            return Err(anyhow::anyhow!(
+                "--tls-port ({}) must differ from --port ({})",
+                config.tls_port,
+                config.port
+            ));
+        }
         info!("Configuration is valid.");
         return Ok(());
     }

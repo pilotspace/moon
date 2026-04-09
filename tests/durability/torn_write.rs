@@ -60,14 +60,14 @@ mod tests {
             }
         }
 
-        // Records 1 and 2 should be recoverable, record 3 is truncated
-        assert!(
-            records.len() >= 2,
-            "Expected at least 2 records recovered, got {}",
-            records.len()
+        // Records 1 and 2 should be recoverable; record 3 is truncated and must be rejected.
+        // Exact match ensures replay stops at the torn record boundary.
+        assert_eq!(
+            records,
+            vec![1, 2],
+            "Expected exactly [1, 2] recovered, got {:?}",
+            records
         );
-        assert_eq!(records[0], 1);
-        assert_eq!(records[1], 2);
     }
 
     #[test]

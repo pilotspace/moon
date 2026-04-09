@@ -103,7 +103,21 @@ mod tests {
             .spawn()
             .expect("start restore");
 
-        thread::sleep(Duration::from_secs(2));
+        // Poll until the restore server is ready (accepts connections) instead of fixed sleep.
+        let mut restore_ready = false;
+        for _ in 0..40 {
+            if TcpStream::connect("127.0.0.1:16501").is_ok() {
+                // Server is accepting connections; give it a moment to finish loading.
+                thread::sleep(Duration::from_millis(200));
+                restore_ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            restore_ready,
+            "restore server did not become ready within timeout"
+        );
 
         let after = send_command("127.0.0.1:16501", "DBSIZE");
 

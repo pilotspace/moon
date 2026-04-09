@@ -1413,7 +1413,11 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
-                            if !matches!(response, Frame::Error(_)) {
+                            if matches!(response, Frame::Error(_)) {
+                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                }
+                            } else {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
                                 if needs_wake {
@@ -1492,6 +1496,11 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
+                            if matches!(response, Frame::Error(_)) {
+                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                }
+                            }
                             if tracking_state.enabled && !tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
@@ -1520,6 +1529,11 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
+                            if matches!(response, Frame::Error(_)) {
+                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                }
+                            }
                             // Client tracking for cross-shard reads
                             if tracking_state.enabled && !tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {

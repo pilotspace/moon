@@ -2,6 +2,9 @@
 //!
 //! Tests REPLICAOF, REPLCONF, INFO replication, READONLY enforcement,
 //! and REPLICAOF NO ONE promotion -- using real TCP connections.
+//!
+//! Requires `runtime-tokio` feature (uses tokio::net::TcpListener + listener::run_with_shutdown).
+#![cfg(feature = "runtime-tokio")]
 
 use moon::runtime::cancel::CancellationToken;
 use tokio::net::TcpListener;
@@ -63,6 +66,10 @@ async fn start_server() -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     tokio::spawn(async move {

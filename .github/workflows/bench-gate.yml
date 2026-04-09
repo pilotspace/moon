@@ -124,6 +124,7 @@ jobs:
       - name: No baseline available (first run)
         if: steps.baseline.outputs.cache-hit != 'true' && github.event_name == 'pull_request'
         run: |
+          echo "::warning::No performance baseline cached from main branch yet. Regression check skipped. Baseline will be saved on next main branch push."
           echo "NOTE: No baseline cached from main branch yet."
           echo "Benchmark results recorded but regression check skipped."
           echo "Baseline will be saved on next main branch push."

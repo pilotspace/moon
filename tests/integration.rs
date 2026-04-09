@@ -2,6 +2,9 @@
 //!
 //! Each test spawns a real TCP server on an OS-assigned port, connects with the
 //! `redis` crate client, exercises commands over real TCP, and shuts down cleanly.
+//!
+//! Requires `runtime-tokio` feature (uses tokio APIs directly).
+#![cfg(feature = "runtime-tokio")]
 
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
@@ -65,6 +68,10 @@ async fn start_server() -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     tokio::spawn(async move {
@@ -130,6 +137,10 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     tokio::spawn(async move {
@@ -1267,6 +1278,10 @@ async fn start_server_with_persistence(
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     tokio::spawn(async move {
@@ -2116,6 +2131,10 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     tokio::spawn(async move {
@@ -2492,6 +2511,10 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     let cancel = token.clone();
@@ -2564,7 +2587,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
                         moon::acl::AclTable::load_or_default(&shard_config),
                     ));
-                    let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
+                    let rt_cfg = std::sync::Arc::new(parking_lot::RwLock::new(
                         shard_config.to_runtime_config(),
                     ));
                     rt.block_on(local.run_until(shard.run(
@@ -3637,6 +3660,10 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     std::thread::spawn(move || {
@@ -3716,7 +3743,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
                     let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
                         moon::acl::AclTable::load_or_default(&shard_config),
                     ));
-                    let rt_cfg = std::sync::Arc::new(std::sync::RwLock::new(
+                    let rt_cfg = std::sync::Arc::new(parking_lot::RwLock::new(
                         shard_config.to_runtime_config(),
                     ));
                     rt.block_on(local.run_until(shard.run(
@@ -4264,6 +4291,10 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        admin_port: 0,
+        slowlog_log_slower_than: 10000,
+        slowlog_max_len: 128,
+        check_config: false,
     };
 
     tokio::spawn(async move {

@@ -27,7 +27,8 @@ downtime.
 redis-cli -h replica-host -p 6399 INFO replication
 ```
 
-Confirm `master_link_status:up` and `master_last_io_seconds_ago` is small (< 2).
+Confirm `master_link_status:up`, `master_last_io_seconds_ago` is small (< 2), and
+replication offset lag is near zero before proceeding:
 
 ### 2. Drain the replica
 
@@ -151,7 +152,7 @@ If the upgraded node fails to start or sync:
 3. Start with the old binary
 4. Re-add to load balancer
 
-Data loss risk is minimized when the replica is fully caught up before promotion. With asynchronous replication, any writes accepted by the old primary after the last acknowledged offset may be lost. The procedure above mitigates this by draining traffic before stopping each node.
+Data loss risk is minimized — but not eliminated — when the replica is fully caught up before promotion. With asynchronous replication, any writes accepted by the old primary after the last acknowledged offset may be lost. The procedure above mitigates this by draining traffic and verifying replication offset convergence before stopping each node. For zero-loss guarantees, use `WAIT <numreplicas> <timeout>` on critical writes (when implemented).
 
 ## Notes
 

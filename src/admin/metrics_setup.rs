@@ -84,6 +84,9 @@ pub fn is_metrics_enabled() -> bool {
 /// Prevents unbounded label cardinality (DoS vector): only ASCII-alpha
 /// commands up to 20 chars (longest Redis command) are accepted. Everything
 /// else maps to the static `"unknown"` label.
+///
+/// Zero-allocation: uses a stack buffer for case-insensitive matching
+/// instead of `to_ascii_lowercase()` which allocates on every call.
 #[inline]
 fn sanitize_cmd_label(cmd: &str) -> &'static str {
     if cmd.len() > 20 || cmd.is_empty() {
@@ -92,9 +95,17 @@ fn sanitize_cmd_label(cmd: &str) -> &'static str {
     if !cmd.bytes().all(|b| b.is_ascii_alphabetic() || b == b'.') {
         return "unknown";
     }
+    // Stack-allocated lowercase: avoids heap allocation on the hot path.
+    let mut buf = [0u8; 20];
+    let bytes = cmd.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    // SAFETY: we validated all bytes are ASCII alphabetic or '.', so UTF-8 is guaranteed.
+    let lowered = std::str::from_utf8(&buf[..cmd.len()]).unwrap_or("unknown");
     // Map to a static string to avoid per-call allocation.
     // The match covers all commands Moon dispatches; anything else is "unknown".
-    match cmd.to_ascii_lowercase().as_str() {
+    match lowered {
         // String
         "get" => "get",
         "set" => "set",
