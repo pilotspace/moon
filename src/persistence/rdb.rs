@@ -332,19 +332,24 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "RDB load: corrupted entry at offset {}: {}. {} keys loaded.",
-                        cursor.position(),
-                        e,
-                        total_keys
-                    );
-                    break;
+                    // Do NOT swap partially-loaded temp_dbs into live databases.
+                    // A corrupted-but-checksummed RDB must not commit partial state.
+                    return Err(RdbError::Corrupted {
+                        detail: format!(
+                            "RDB load: corrupted entry at offset {}: {}. {} keys loaded before failure.",
+                            cursor.position(),
+                            e,
+                            total_keys
+                        ),
+                    }
+                    .into());
                 }
             },
         }
     }
 
     // Recalculate memory on temp databases, then swap into live ones.
+    // Only reached if all entries parsed successfully — no partial state.
     for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
         temp.recalculate_memory();
         *live = temp;
@@ -753,11 +758,23 @@ pub fn load_from_bytes(
     // The RDB section is: header + entries + EOF_MARKER(1) + CRC32(4).
     // We scan for EOF_MARKER (0xFF) — the first one after the header that's
     // immediately followed by a valid CRC32 of the preceding bytes.
+    //
+    // Single-pass: maintain a running CRC hasher updated byte-by-byte.
+    // When we hit a candidate EOF_MARKER at position i (i >= 5), clone
+    // the hasher (which includes data[0..i]), finalize with the EOF byte,
+    // and compare against the stored CRC at data[i+1..i+5]. This avoids
+    // re-hashing the entire prefix for each candidate (O(n) vs O(n²)).
     let mut rdb_end = None;
-    // Start scanning after header (MOON + version = 5 bytes)
+    let mut running_hasher = Hasher::new();
+    // Feed bytes 0..5 (header) into the running hasher
+    if data.len() > 5 {
+        running_hasher.update(&data[..5]);
+    }
     for i in 5..data.len().saturating_sub(4) {
         if data[i] == EOF_MARKER {
-            let payload = &data[..=i]; // everything up to and including EOF_MARKER
+            // Clone running hasher (covers data[0..i]), then finalize with EOF byte
+            let mut candidate = running_hasher.clone();
+            candidate.update(&[EOF_MARKER]);
             if let Some(checksum_bytes) = data.get(i + 1..i + 5) {
                 let stored = u32::from_le_bytes([
                     checksum_bytes[0],
@@ -765,14 +782,14 @@ pub fn load_from_bytes(
                     checksum_bytes[2],
                     checksum_bytes[3],
                 ]);
-                let mut hasher = Hasher::new();
-                hasher.update(payload);
-                if hasher.finalize() == stored {
+                if candidate.finalize() == stored {
                     rdb_end = Some(i + 5); // past CRC32
                     break;
                 }
             }
         }
+        // Feed this byte into the running hasher for the next iteration
+        running_hasher.update(&data[i..i + 1]);
     }
 
     let rdb_len = rdb_end.ok_or_else(|| {
@@ -864,14 +881,23 @@ pub fn load_from_bytes(
                         total_keys += 1;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    return Err(RdbError::Corrupted {
+                        detail: format!(
+                            "RDB preamble: corrupted entry at offset {}: {}. {} keys loaded before failure.",
+                            cursor.position(),
+                            e,
+                            total_keys
+                        ),
+                    }
+                    .into());
+                }
             },
         }
     }
 
     // Recalculate memory on temp databases, then swap into the live ones.
-    // This replaces the entire in-memory state for each database — old keys
-    // that were not in the RDB snapshot are discarded.
+    // Only reached if all entries parsed successfully — no partial state.
     for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
         temp.recalculate_memory();
         *live = temp;

@@ -129,7 +129,25 @@ pub async fn aof_writer_task(
         //
         // A corrupt manifest is fatal — exit the writer so the server startup
         // notices and fails loud rather than silently overwriting.
+        //
+        // Bounded wait: check the cancellation token each iteration and enforce
+        // a hard timeout so the writer doesn't spin forever if main.rs fails to
+        // create the manifest (e.g. disk full, permission error).
+        let manifest_wait_start = Instant::now();
+        const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
         let mut manifest = loop {
+            if cancel.is_cancelled() {
+                info!("AOF writer: cancelled while waiting for manifest");
+                return;
+            }
+            if manifest_wait_start.elapsed() > MANIFEST_TIMEOUT {
+                error!(
+                    "AOF writer: manifest not found at {} after {:?}. Writer exiting; check recovery logs.",
+                    base_dir.display(),
+                    MANIFEST_TIMEOUT,
+                );
+                return;
+            }
             match AofManifest::load(&base_dir) {
                 Ok(Some(m)) => break m,
                 Ok(None) => {

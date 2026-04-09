@@ -130,12 +130,18 @@ impl AofManifest {
         let content = std::fs::read_to_string(&manifest_path)?;
 
         let mut seq = 0u64;
+        let mut has_base_record = false;
+        let mut has_incr_record = false;
         for line in content.lines() {
             let line = line.trim();
             if let Some(val) = line.strip_prefix("seq ") {
                 if let Ok(n) = val.parse::<u64>() {
                     seq = n;
                 }
+            } else if line.starts_with("base ") {
+                has_base_record = true;
+            } else if line.starts_with("incr ") {
+                has_incr_record = true;
             }
         }
 
@@ -149,6 +155,23 @@ impl AofManifest {
             ));
         }
 
+        // A valid manifest must have all three records (seq, base, incr).
+        // A truncated manifest with only "seq N" but no base/incr lines could
+        // trigger orphan cleanup that deletes the real base RDB referenced by
+        // the previous valid manifest. Require all records before proceeding.
+        if !has_base_record || !has_incr_record {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "AOF manifest at {} is truncated: seq={} base={} incr={}",
+                    manifest_path.display(),
+                    seq,
+                    has_base_record,
+                    has_incr_record,
+                ),
+            ));
+        }
+
         let manifest = Self {
             dir: dir.to_path_buf(),
             seq,
@@ -158,6 +181,9 @@ impl AofManifest {
         // rewrites. A crash between advance() steps 1-3 leaves a new base RDB on
         // disk that the active manifest never references. Without this sweep,
         // repeated crashes during rewrite can fill the disk with zombie files.
+        //
+        // Safe to call here: we verified the manifest has all three records
+        // (seq, base, incr), so cleanup_orphans won't delete the active files.
         manifest.cleanup_orphans();
 
         Ok(Some(manifest))
