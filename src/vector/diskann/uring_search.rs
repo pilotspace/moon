@@ -151,11 +151,9 @@ pub fn open_vamana_direct(path: &Path) -> io::Result<OwnedFd> {
     )
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
 
-    // SAFETY: `c_path` is a valid null-terminated C string. O_RDONLY | O_DIRECT
-    // are valid flags for libc::open. `libc::open` returns a fresh, owned fd
-    // on success; we immediately wrap it in `OwnedFd` (which takes ownership
-    // of the close) before returning, so there is no possibility of leak or
-    // double-close along the happy path.
+    // `c_path` is a valid null-terminated C string, O_RDONLY|O_DIRECT are valid flags.
+    // libc::open returns a fresh fd; we wrap it in OwnedFd before returning.
+    // SAFETY: c_path is a valid CString; open returns a fresh fd with no leak risk.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
     if fd < 0 {
         return Err(io::Error::last_os_error());

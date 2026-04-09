@@ -97,10 +97,10 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
                 let seg = &mut self.segments[self.seg_idx];
                 if Segment::<K, V>::is_full_ctrl_pub(seg.ctrl_byte(slot)) {
                     self.remaining -= 1;
-                    // SAFETY: ctrl byte is FULL, so key and value are initialized.
-                    // We extend the lifetime from the segment borrow to 'a because
-                    // each slot is yielded exactly once and the iterator holds
+                    // Each slot is yielded exactly once and the iterator holds
                     // exclusive access to the segment.
+                    // SAFETY: ctrl byte is FULL, so key and value are initialized.
+                    // Lifetime extended to 'a — no aliasing, single-pass iteration.
                     unsafe {
                         let k = &*(seg.key_ref(slot) as *const K);
                         let v = &mut *(seg.value_mut(slot) as *mut V);

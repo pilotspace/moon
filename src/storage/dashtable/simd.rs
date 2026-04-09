@@ -165,6 +165,7 @@ mod tests {
         g.0[5] = 0x42;
         g.0[15] = 0x42;
 
+        // SAFETY: SSE2 is baseline on x86_64; Group is 16-byte aligned.
         #[cfg(target_arch = "x86_64")]
         let mask = unsafe { g.match_h2(0x42) };
         #[cfg(not(target_arch = "x86_64"))]
@@ -178,6 +179,7 @@ mod tests {
     fn test_group_match_h2_no_match() {
         let g = Group::new_empty();
 
+        // SAFETY: SSE2 is baseline on x86_64; Group is 16-byte aligned.
         #[cfg(target_arch = "x86_64")]
         let mask = unsafe { g.match_h2(0x42) };
         #[cfg(not(target_arch = "x86_64"))]
@@ -217,6 +219,7 @@ mod tests {
         g.0[2] = 0x7F; // FULL (max H2)
         // Rest are EMPTY (0xFF)
 
+        // SAFETY: SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
         #[cfg(target_arch = "x86_64")]
         let mask = unsafe { g.match_empty_or_deleted() };
         #[cfg(not(target_arch = "x86_64"))]

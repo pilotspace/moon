@@ -75,6 +75,8 @@ impl BufRingManager {
         .build()
         .user_data(0); // special: buffer registration
 
+        // SAFETY: entry is a valid ProvideBuffers SQE referencing our owned storage buffer.
+        // The submission queue is exclusively accessed through this &mut IoUring reference.
         unsafe {
             ring.submission()
                 .push(&entry)
@@ -128,6 +130,9 @@ impl BufRingManager {
         .build()
         .user_data(0);
 
+        // SAFETY: entry is a valid ProvideBuffers SQE for a single buffer we own.
+        // submission_shared() is used to avoid conflicting with completion iteration;
+        // caller guarantees no other concurrent mutable submission queue access.
         unsafe {
             ring.submission_shared()
                 .push(&entry)

@@ -67,9 +67,8 @@ pub fn map_sealed_file(path: &Path) -> io::Result<Mmap> {
 /// Violating this is undefined behavior.
 #[inline]
 pub fn map_sealed(file: &File) -> io::Result<Mmap> {
-    // SAFETY: the file is a sealed warm-segment file per the module-level
-    // contract: after its producing rename completed, no moon code writes to
-    // or truncates it while any mmap may be live. Concurrent external mutation
-    // is outside our threat model (same as every other mmap in the codebase).
+    // The file is a sealed warm-segment: after its producing rename completed,
+    // no moon code writes to or truncates it while any mmap may be live.
+    // SAFETY: File is sealed (read-only); no concurrent mutation within our process.
     unsafe { memmap2::MmapOptions::new().map(file) }
 }

@@ -202,10 +202,9 @@ pub async fn handle_connection_sharded(
                             }
                         }
                         if let Some(ShardMessage::MigrateConnection { fd, .. }) = pending {
-                            // SAFETY: fd is a valid, uniquely-owned file descriptor obtained
-                            // from TcpStream::into_raw_fd() above. No other code holds a
-                            // reference to this fd. OwnedFd closes it on drop.
                             use std::os::unix::io::FromRawFd;
+                            // SAFETY: fd is a valid, uniquely-owned file descriptor obtained
+                            // from TcpStream::into_raw_fd() above. OwnedFd closes it on drop.
                             drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
                         }
                         tracing::warn!(

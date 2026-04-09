@@ -168,6 +168,8 @@ impl Clone for CompactKey {
             CompactKey { data: self.data }
         } else {
             // Deep-copy: allocate new Box<[u8]> with the heap data.
+            // SAFETY: !is_inline() verified above, so the heap pointer was created from
+            // Box::into_raw and is still valid (not freed until Drop).
             let src = unsafe { self.heap_slice() };
             Self::from(src)
         }

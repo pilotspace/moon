@@ -361,13 +361,11 @@ pub fn hnsw_search_filtered(
             //   - Unsafe pointer arithmetic to eliminate bounds checks
             //   - Sign bits extracted by single load + unpacking via shifts
             //
-            // SAFETY:
-            //   - code_only.len() == code_len == padded_dim / 2
-            //   - qi = i*2 < padded_dim, so qi*32 + 31 < padded_dim*32 == adc_lut.len()
-            //   - sign_off + (code_len/4) < sub_sign_bpv * num_vectors == sub_centroid_signs.len()
-            //     (caller guarantees sub_sign_bpv bytes per vector, covering code_len/4 sign bytes)
+            // Bounds: code_only.len() == padded_dim/2, qi*32+31 < adc_lut.len(),
+            // sign_off + code_len/4 < sub_centroid_signs.len() (caller guarantees bpv).
             let lut_ptr = adc_lut.as_ptr();
             let code_ptr = code_only.as_ptr();
+            // SAFETY: bfs_pos * sub_sign_bpv is within sub_centroid_signs bounds (per above).
             let sign_ptr = unsafe {
                 sub_centroid_signs
                     .as_ptr()
@@ -388,6 +386,8 @@ pub fn hnsw_search_filtered(
 
             for c in 0..chunks {
                 let i = c * 4;
+                // SAFETY: Bounds verified in the SAFETY block above: i+3 < code_len,
+                // c < chunks (sign bytes), and LUT indices qi0*32+31 < adc_lut.len().
                 unsafe {
                     // Load 4 code bytes + 1 sign byte (8 sign bits for 8 nibbles)
                     let b0 = *code_ptr.add(i) as usize;
@@ -446,6 +446,7 @@ pub fn hnsw_search_filtered(
 
             for c in 0..chunks {
                 let i = c * 4;
+                // SAFETY: Bounds verified above: i+3 < code_len, qi0*16+15 < adc_lut.len().
                 unsafe {
                     let b0 = *code_ptr.add(i) as usize;
                     let b1 = *code_ptr.add(i + 1) as usize;
@@ -496,11 +497,11 @@ pub fn hnsw_search_filtered(
             // Process 4 code bytes + 1 sign byte per iteration with 8 independent accumulators.
             // check_interval (16 bytes) = 4 chunks of 4 bytes = 4 sign bytes per budget check.
             //
-            // SAFETY: Same invariants as the unbudgeted dist_bfs sibling:
-            //   code_only.len() == padded_dim / 2, so qi*32 + 31 < padded_dim*32 == adc_lut.len()
-            //   sign_off + (code_len/4) < sub_centroid_signs.len() (caller guarantees bpv)
+            // Same bounds as unbudgeted dist_bfs: qi*32+31 < adc_lut.len(),
+            // sign_off + code_len/4 < sub_centroid_signs.len().
             let lut_ptr = adc_lut.as_ptr();
             let code_ptr = code_only.as_ptr();
+            // SAFETY: bfs_pos * sub_sign_bpv is within sub_centroid_signs bounds (per above).
             let sign_ptr = unsafe {
                 sub_centroid_signs
                     .as_ptr()
@@ -521,6 +522,8 @@ pub fn hnsw_search_filtered(
                 // Inner: 4 sub-chunks of 4 bytes each (16 bytes total)
                 for sub in 0..4 {
                     let i = base + sub * 4;
+                    // SAFETY: Bounds verified in SAFETY block above: i+3 < code_len,
+                    // LUT and sign indices are within allocation bounds.
                     unsafe {
                         let b0 = *code_ptr.add(i) as usize;
                         let b1 = *code_ptr.add(i + 1) as usize;

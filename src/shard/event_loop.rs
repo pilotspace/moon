@@ -165,6 +165,8 @@ impl super::Shard {
                 // OwnedFd takes ownership and will close the dup'd fd on drop.
                 let dup_fd = unsafe { libc::dup(d.cqe_eventfd()) };
                 if dup_fd >= 0 {
+                    // SAFETY: dup_fd is a valid, fresh fd from dup() above (>= 0 check).
+                    // OwnedFd takes sole ownership and will close it on drop.
                     let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
                     match tokio::io::unix::AsyncFd::with_interest(
                         owned,
@@ -1159,6 +1161,8 @@ impl super::Shard {
                             let std_stream = {
                                 use std::os::unix::io::{IntoRawFd, FromRawFd};
                                 let fd = stream.into_raw_fd();
+                                // SAFETY: fd is a valid socket from monoio TcpStream::into_raw_fd(),
+                                // which relinquished ownership. We take sole ownership here.
                                 unsafe { std::net::TcpStream::from_raw_fd(fd) }
                             };
                             conn_accept::spawn_monoio_connection(
@@ -1487,6 +1491,8 @@ impl super::Shard {
         // Close per-shard SO_REUSEPORT listener fd if created (Linux + tokio only).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         if let Some(lfd) = uring_listener_fd {
+            // SAFETY: lfd is a valid SO_REUSEPORT listener fd created by this shard.
+            // The event loop is shutting down, so no io_uring SQEs reference this fd.
             unsafe {
                 libc::close(lfd);
             }

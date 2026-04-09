@@ -202,6 +202,7 @@ impl<K, V> Segment<K, V> {
     /// Caller must ensure the slot is FULL (control byte in 0x00..0x7F).
     #[inline]
     pub unsafe fn key_ref(&self, slot: usize) -> &K {
+        // SAFETY: Caller guarantees slot is FULL (initialized). See fn-level safety doc.
         unsafe { self.keys[slot].assume_init_ref() }
     }
 
@@ -211,6 +212,7 @@ impl<K, V> Segment<K, V> {
     /// Caller must ensure the slot is FULL (control byte in 0x00..0x7F).
     #[inline]
     pub unsafe fn value_ref(&self, slot: usize) -> &V {
+        // SAFETY: Caller guarantees slot is FULL (initialized). See fn-level safety doc.
         unsafe { self.values[slot].assume_init_ref() }
     }
 
@@ -220,6 +222,7 @@ impl<K, V> Segment<K, V> {
     /// Caller must ensure the slot is FULL (control byte in 0x00..0x7F).
     #[inline]
     pub unsafe fn value_mut(&mut self, slot: usize) -> &mut V {
+        // SAFETY: Caller guarantees slot is FULL (initialized). See fn-level safety doc.
         unsafe { self.values[slot].assume_init_mut() }
     }
 
@@ -243,6 +246,8 @@ impl<K, V> Segment<K, V> {
         let group_a = bucket_a / 16;
         let base_a = group_a * 16;
 
+        // SAFETY: group_a < NUM_GROUPS (bucket_a < REGULAR_SLOTS, 16 per group).
+        // SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
         #[cfg(target_arch = "x86_64")]
         let mask_a = unsafe { self.ctrl[group_a].match_h2(h2) };
         #[cfg(not(target_arch = "x86_64"))]
@@ -252,6 +257,8 @@ impl<K, V> Segment<K, V> {
         if let Some(first_pos) = mask_a.lowest_set_bit() {
             let prefetch_slot = base_a + first_pos;
             if prefetch_slot < TOTAL_SLOTS {
+                // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
+                // Prefetch is a hint — no memory safety requirement on the data being initialized.
                 unsafe {
                     prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
                 }
@@ -274,6 +281,8 @@ impl<K, V> Segment<K, V> {
         if group_b != group_a {
             let base_b = group_b * 16;
 
+            // SAFETY: group_b < NUM_GROUPS (bucket_b < REGULAR_SLOTS).
+            // SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
             #[cfg(target_arch = "x86_64")]
             let mask_b = unsafe { self.ctrl[group_b].match_h2(h2) };
             #[cfg(not(target_arch = "x86_64"))]
@@ -283,6 +292,8 @@ impl<K, V> Segment<K, V> {
             if let Some(first_pos) = mask_b.lowest_set_bit() {
                 let prefetch_slot = base_b + first_pos;
                 if prefetch_slot < TOTAL_SLOTS {
+                    // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
+                    // Prefetch is a hint — no memory safety requirement on the data being initialized.
                     unsafe {
                         prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
                     }
@@ -292,6 +303,7 @@ impl<K, V> Segment<K, V> {
             for pos in mask_b {
                 let slot = base_b + pos;
                 if slot < TOTAL_SLOTS {
+                    // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                     let k = unsafe { self.keys[slot].assume_init_ref() };
                     if k.borrow() == key {
                         return Some(slot);
@@ -304,6 +316,7 @@ impl<K, V> Segment<K, V> {
         for slot in REGULAR_SLOTS..TOTAL_SLOTS {
             let ctrl = self.ctrl_byte(slot);
             if ctrl == h2 {
+                // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                 let k = unsafe { self.keys[slot].assume_init_ref() };
                 if k.borrow() == key {
                     return Some(slot);
@@ -322,11 +335,8 @@ impl<K, V> Segment<K, V> {
             }
             let base = g * 16;
 
-            // SAFETY: `g` is bounded by NUM_GROUPS (iterated via 0..NUM_GROUPS),
-            // so `self.ctrl[g]` is a valid Group. `match_h2` uses SSE2 intrinsics
-            // on x86_64 to compare the h2 byte against all 16 control bytes in the
-            // group, returning a bitmask of matching slots. The Group is always
-            // properly aligned and fully initialized at segment creation.
+            // `g` is bounded by NUM_GROUPS, so `self.ctrl[g]` is a valid Group.
+            // SAFETY: Group is 16-byte aligned and initialized; SSE2 is baseline on x86_64.
             #[cfg(target_arch = "x86_64")]
             let mask = unsafe { self.ctrl[g].match_h2(h2) };
             #[cfg(not(target_arch = "x86_64"))]
@@ -374,6 +384,7 @@ impl<K, V> Segment<K, V> {
         Q: Eq,
     {
         let slot = self.find_slot_mut(h2, key, bucket_a, bucket_b)?;
+        // SAFETY: find_slot_mut only returns slots with FULL ctrl bytes, so the value is initialized.
         Some(unsafe { self.values[slot].assume_init_mut() })
     }
 
@@ -405,6 +416,7 @@ impl<K, V> Segment<K, V> {
         Q: Eq,
     {
         let slot = self.find(h2, key, bucket_a, bucket_b)?;
+        // SAFETY: find only returns slots with FULL ctrl bytes, so key and value are initialized.
         unsafe {
             Some((
                 self.keys[slot].assume_init_ref(),
@@ -432,6 +444,7 @@ impl<K, V> Segment<K, V> {
         // Check if key already exists (using K: Borrow<K> identity)
         if let Some(slot) = self.find(h2, &key, bucket_a, bucket_b) {
             // Replace value in-place
+            // SAFETY: find guarantees the slot is FULL (initialized), so reading the old value is valid.
             let old = unsafe { self.values[slot].assume_init_read() };
             self.values[slot] = MaybeUninit::new(value);
             // Drop the old key that was passed in (it's the same key)
@@ -487,6 +500,8 @@ impl<K, V> Segment<K, V> {
     fn find_free_slot_in_group(&self, group_idx: usize) -> Option<usize> {
         let base = group_idx * 16;
 
+        // SAFETY: group_idx is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
+        // The Group is 16-byte aligned and fully initialized at segment creation.
         #[cfg(target_arch = "x86_64")]
         let mask = unsafe { self.ctrl[group_idx].match_empty_or_deleted() };
         #[cfg(not(target_arch = "x86_64"))]
@@ -558,8 +573,11 @@ impl<K, V> Segment<K, V> {
         let mut entries: Vec<(K, V, u64)> = Vec::with_capacity(self.count as usize);
         for slot in 0..TOTAL_SLOTS {
             if Self::is_full_ctrl(self.ctrl_byte(slot)) {
+                // SAFETY: ctrl byte is FULL, so key and value are initialized. We immediately
+                // mark the slot EMPTY after reading, preventing double-read or double-drop.
                 let k = unsafe { ptr::read(self.keys[slot].as_ptr()) };
                 let hash = hasher(&k);
+                // SAFETY: Same as above — slot is FULL, so value is initialized.
                 let v = unsafe { ptr::read(self.values[slot].as_ptr()) };
                 entries.push((k, v, hash));
                 // Mark slot as EMPTY (we've moved the data out)
@@ -650,6 +668,7 @@ impl<K, V> Drop for Segment<K, V> {
         // if and only if its control byte is a valid H2 (0x00..0x7F).
         for slot in 0..TOTAL_SLOTS {
             if Self::is_full_ctrl(self.ctrl_byte(slot)) {
+                // SAFETY: ctrl byte is FULL, so key and value at this slot are initialized.
                 unsafe {
                     self.keys[slot].assume_init_drop();
                     self.values[slot].assume_init_drop();

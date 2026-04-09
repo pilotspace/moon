@@ -270,10 +270,14 @@ impl CompactValue {
             RedisValueRef::String(&self.payload[..len])
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
             // String path: HeapString (no RedisValue wrapper)
+            // SAFETY: Tag is HEAP_TAG_STRING, so the pointer was created from Box::into_raw(Box<HeapString>)
+            // and has not been freed. We hold &self so no mutable alias exists.
             let hs = unsafe { &*self.heap_string_ptr() };
             RedisValueRef::String(&hs.0)
         } else {
             // Collection path: Box<RedisValue>
+            // SAFETY: Tag is a collection type, so the pointer was created from Box::into_raw(Box<RedisValue>)
+            // and has not been freed. We hold &self so no mutable alias exists.
             let rv = unsafe { &*self.heap_collection_ptr() };
             match rv {
                 RedisValue::Hash(map) => RedisValueRef::Hash(map),
@@ -302,6 +306,7 @@ impl CompactValue {
             let len = self.inline_len();
             Some(&self.payload[..len])
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
             Some(&hs.0)
         } else {
@@ -318,6 +323,7 @@ impl CompactValue {
             let len = self.inline_len();
             Some(Bytes::copy_from_slice(&self.payload[..len]))
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
             Some(Bytes::copy_from_slice(&hs.0))
         } else {
@@ -343,6 +349,8 @@ impl CompactValue {
         if self.is_inline() {
             None
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid.
+            // We have &mut self so no other reference exists.
             let hs = unsafe { &mut *self.heap_string_ptr() };
             Some(&mut hs.0)
         } else {
@@ -363,11 +371,15 @@ impl CompactValue {
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
             let ptr = self.heap_string_ptr();
             std::mem::forget(self);
+            // SAFETY: ptr was created from Box::into_raw(Box<HeapString>). We called forget(self)
+            // to prevent double-free, so Box::from_raw reclaims the unique allocation.
             let hs = unsafe { *Box::from_raw(ptr) };
             RedisValue::String(Bytes::from(hs.0))
         } else {
             let ptr = self.heap_collection_ptr();
             std::mem::forget(self);
+            // SAFETY: ptr was created from Box::into_raw(Box<RedisValue>). We called forget(self)
+            // to prevent double-free, so Box::from_raw reclaims the unique allocation.
             let boxed = unsafe { Box::from_raw(ptr) };
             *boxed
         }
@@ -379,9 +391,11 @@ impl CompactValue {
             let len = self.inline_len();
             RedisValue::String(Bytes::copy_from_slice(&self.payload[..len]))
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
             RedisValue::String(Bytes::from(hs.0.clone()))
         } else {
+            // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
             rv.clone()
         }
@@ -418,10 +432,12 @@ impl CompactValue {
         if self.is_inline() {
             self.inline_len()
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
             // HeapString overhead: Box(8) + Vec header(24) + data
             32 + hs.0.len()
         } else {
+            // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
             rv.estimate_memory()
         }
@@ -454,9 +470,11 @@ impl Clone for CompactValue {
                 payload: self.payload,
             }
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
+            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
             Self::heap_string(&hs.0)
         } else {
+            // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
             Self::from_redis_value(rv.clone())
         }
