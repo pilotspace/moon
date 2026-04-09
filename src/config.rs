@@ -14,6 +14,22 @@ pub struct ServerConfig {
     #[arg(long, short, default_value_t = 6379)]
     pub port: u16,
 
+    /// Admin/metrics HTTP port (0 = disabled). Serves /metrics, /healthz, /readyz.
+    #[arg(long, default_value_t = 0)]
+    pub admin_port: u16,
+
+    /// Slowlog threshold in microseconds (commands slower than this are logged)
+    #[arg(long = "slowlog-log-slower-than", default_value_t = 10000)]
+    pub slowlog_log_slower_than: u64,
+
+    /// Maximum entries in the slowlog
+    #[arg(long = "slowlog-max-len", default_value_t = 128)]
+    pub slowlog_max_len: usize,
+
+    /// Validate configuration and exit without starting the server
+    #[arg(long = "check-config")]
+    pub check_config: bool,
+
     /// Number of databases
     #[arg(long, default_value_t = 16)]
     pub databases: usize,

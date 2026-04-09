@@ -34,6 +34,15 @@ fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::parse();
 
+    // --check-config: validate and exit without starting
+    if config.check_config {
+        info!("Configuration is valid.");
+        return Ok(());
+    }
+
+    // Initialize Prometheus metrics exporter (if admin_port > 0)
+    moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
+
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
         tracing::warn!(
