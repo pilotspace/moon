@@ -46,7 +46,9 @@ pub fn handle_acl(
         "WHOAMI" => Frame::BulkString(Bytes::copy_from_slice(current_user.as_bytes())),
 
         "LIST" => {
-            let table = acl_table.read().unwrap();
+            let Ok(table) = acl_table.read() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+            };
             let lines: Vec<Frame> = table
                 .list_users()
                 .iter()
@@ -67,7 +69,9 @@ pub fn handle_acl(
                     ));
                 }
             };
-            let table = acl_table.read().unwrap();
+            let Ok(table) = acl_table.read() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+            };
             match table.get_user(&username) {
                 None => Frame::Null,
                 Some(user) => {
@@ -152,7 +156,9 @@ pub fn handle_acl(
                 }
             };
             let rules: Vec<&str> = args[1..].iter().filter_map(|f| extract_str(f)).collect();
-            let mut table = acl_table.write().unwrap();
+            let Ok(mut table) = acl_table.write() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+            };
             table.apply_setuser(&username, &rules);
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
@@ -164,7 +170,9 @@ pub fn handle_acl(
                 ));
             }
             let mut count = 0i64;
-            let mut table = acl_table.write().unwrap();
+            let Ok(mut table) = acl_table.write() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+            };
             for arg in args {
                 if let Some(name) = extract_str(arg) {
                     if name == "default" {
@@ -267,13 +275,19 @@ pub fn handle_acl(
         }
 
         "SAVE" => {
-            let aclfile = runtime_config.read().unwrap().aclfile.clone();
+            let Ok(cfg) = runtime_config.read() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal config error"));
+            };
+            let aclfile = cfg.aclfile.clone();
+            drop(cfg);
             match aclfile {
                 None => Frame::Error(Bytes::from_static(
                     b"ERR ACL file not configured. Use --aclfile or CONFIG SET aclfile",
                 )),
                 Some(path) => {
-                    let table = acl_table.read().unwrap();
+                    let Ok(table) = acl_table.read() else {
+                        return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+                    };
                     // Blocking save -- acceptable for admin command
                     let content: String = table
                         .list_users()
@@ -293,7 +307,11 @@ pub fn handle_acl(
         }
 
         "LOAD" => {
-            let aclfile = runtime_config.read().unwrap().aclfile.clone();
+            let Ok(cfg) = runtime_config.read() else {
+                return Frame::Error(Bytes::from_static(b"ERR internal config error"));
+            };
+            let aclfile = cfg.aclfile.clone();
+            drop(cfg);
             match aclfile {
                 None => Frame::Error(Bytes::from_static(b"ERR ACL file not configured")),
                 Some(path) => match std::fs::read_to_string(&path) {
@@ -305,7 +323,10 @@ pub fn handle_acl(
                                 new_table.set_user(user.username.clone(), user);
                             }
                         }
-                        *acl_table.write().unwrap() = new_table;
+                        let Ok(mut table) = acl_table.write() else {
+                            return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
+                        };
+                        *table = new_table;
                         Frame::SimpleString(Bytes::from_static(b"OK"))
                     }
                 },

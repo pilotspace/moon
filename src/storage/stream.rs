@@ -326,7 +326,9 @@ impl Stream {
 
     /// Ensure a consumer exists in a group, auto-creating if needed.
     fn ensure_consumer(group: &mut ConsumerGroup, consumer_name: &Bytes) {
-        if !group.consumers.contains_key(consumer_name) {
+        if let Some(consumer) = group.consumers.get_mut(consumer_name) {
+            consumer.seen_time = current_time_ms();
+        } else {
             group.consumers.insert(
                 consumer_name.clone(),
                 Consumer {
@@ -335,8 +337,6 @@ impl Stream {
                     seen_time: current_time_ms(),
                 },
             );
-        } else {
-            group.consumers.get_mut(consumer_name).unwrap().seen_time = current_time_ms();
         }
     }
 
@@ -474,8 +474,13 @@ impl Stream {
             return Ok(Vec::new()); // empty signals zero pending
         }
 
-        let min_id = *group.pel.keys().next().unwrap();
-        let max_id = *group.pel.keys().next_back().unwrap();
+        // pel confirmed non-empty above — first/last keys are guaranteed to exist
+        let Some(&min_id) = group.pel.keys().next() else {
+            return Ok(Vec::new());
+        };
+        let Some(&max_id) = group.pel.keys().next_back() else {
+            return Ok(Vec::new());
+        };
 
         // Count per consumer
         let mut consumer_counts: HashMap<Bytes, u64> = HashMap::new();

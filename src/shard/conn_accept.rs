@@ -119,6 +119,7 @@ pub(crate) fn spawn_tokio_connection(
     let rs = repl_state.clone();
     let cs = cluster_state.clone();
     let cp = config_port;
+    #[allow(clippy::expect_used, clippy::unwrap_used)] // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
     let lua = {
         let mut lua_opt = lua_rc.borrow_mut();
         if lua_opt.is_none() {
@@ -298,6 +299,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let rs = repl_state.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
+            #[allow(clippy::expect_used, clippy::unwrap_used)] // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
@@ -422,6 +424,7 @@ pub(crate) fn spawn_monoio_connection(
             let do_dir = disk_offload_dir.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
+            #[allow(clippy::expect_used, clippy::unwrap_used)] // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
@@ -687,6 +690,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let rs = repl_state.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
+            #[allow(clippy::expect_used, clippy::unwrap_used)] // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {

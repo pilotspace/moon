@@ -124,6 +124,7 @@ impl SpillThread {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_bg = stop_flag.clone();
 
+        #[allow(clippy::expect_used)] // Startup: spill thread is critical infrastructure — spawn failure is fatal
         let join_handle = std::thread::Builder::new()
             .name(format!("spill-{shard_id}"))
             .spawn(move || {

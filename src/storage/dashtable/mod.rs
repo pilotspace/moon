@@ -97,8 +97,10 @@ impl<K, V> SegmentSlab<K, V> {
     /// Add a segment, returning its flat index.
     fn push(&mut self, segment: Segment<K, V>) -> usize {
         // Check if current last slab has room
-        let needs_new_slab = self.slabs.is_empty()
-            || self.slabs.last().unwrap().len() >= self.slabs.last().unwrap().capacity();
+        let needs_new_slab = self
+            .slabs
+            .last()
+            .map_or(true, |last| last.len() >= last.capacity());
 
         if needs_new_slab {
             let cap = self.next_slab_capacity;

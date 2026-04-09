@@ -119,6 +119,7 @@ impl ChannelMesh {
     ///
     /// Panics if called more than once for the same shard.
     #[allow(clippy::expect_used)] // Intentional: double-take is a caller bug, panic is correct
+    #[allow(clippy::expect_used)] // Startup: called once per shard during init — double-take is a logic bug
     pub fn take_conn_rx(
         &mut self,
         shard_id: usize,

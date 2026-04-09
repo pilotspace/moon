@@ -45,10 +45,14 @@ pub(crate) fn handle_config(
     let sub_args = &args[1..];
 
     if subcmd.eq_ignore_ascii_case(b"GET") {
-        let rt = runtime_config.read().unwrap();
+        let Ok(rt) = runtime_config.read() else {
+            return Frame::Error(Bytes::from_static(b"ERR internal config error"));
+        };
         config_cmd::config_get(&rt, server_config, sub_args)
     } else if subcmd.eq_ignore_ascii_case(b"SET") {
-        let mut rt = runtime_config.write().unwrap();
+        let Ok(mut rt) = runtime_config.write() else {
+            return Frame::Error(Bytes::from_static(b"ERR internal config error"));
+        };
         config_cmd::config_set(&mut rt, sub_args)
     } else {
         Frame::Error(Bytes::from(format!(

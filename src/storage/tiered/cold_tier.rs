@@ -291,7 +291,7 @@ fn verify_recall(graph: &VamanaGraph, vectors: &[f32], dim: usize, n: usize) -> 
                 (d, i)
             })
             .collect();
-        bf_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        bf_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let bf_topk: std::collections::HashSet<u32> =
             bf_dists.iter().take(k).map(|&(_, id)| id).collect();
 
