@@ -274,13 +274,18 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
     let now_ms = current_time_ms();
     let now_secs = (now_ms / 1000) as u32;
 
-    // First pass: count entries per database for pre-sizing (Fix #2)
-    let entry_counts = count_entries_per_db(&cursor, databases.len());
+    // Load into temporary databases so old keys not present in the RDB
+    // snapshot are discarded. An RDB file is a full point-in-time snapshot
+    // and must replace state, not merge into it. Loading into temps also
+    // provides atomicity: on failure, the live databases are untouched.
+    let db_count = databases.len();
+    let mut temp_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
 
-    // Pre-size DashTables to avoid segment splits during load (Fix #2)
+    // First pass: count entries per database for pre-sizing
+    let entry_counts = count_entries_per_db(&cursor, db_count);
     for (db_idx, &count) in entry_counts.iter().enumerate() {
-        if count > 0 && db_idx < databases.len() {
-            databases[db_idx].reserve(count);
+        if count > 0 && db_idx < db_count {
+            temp_dbs[db_idx].reserve(count);
         }
     }
 
@@ -306,46 +311,43 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                     source: e,
                 })?;
                 current_db = db_idx[0] as usize;
-                if current_db >= databases.len() {
+                if current_db >= db_count {
                     return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB references database {} but only {} configured",
-                            current_db,
-                            databases.len()
+                            current_db, db_count
                         ),
                     }
                     .into());
                 }
             }
-            type_tag => {
-                match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
-                    Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
-                            continue;
-                        }
-                        if current_db < databases.len() {
-                            // Fix #3: skip duplicate check + memory accounting
-                            databases[current_db].insert_for_load(key, entry);
-                            total_keys += 1;
-                        }
+            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
+                Ok((key, entry)) => {
+                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "RDB load: corrupted entry at offset {}: {}. {} keys loaded.",
-                            cursor.position(),
-                            e,
-                            total_keys
-                        );
-                        break;
+                    if current_db < db_count {
+                        temp_dbs[current_db].insert_for_load(key, entry);
+                        total_keys += 1;
                     }
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        "RDB load: corrupted entry at offset {}: {}. {} keys loaded.",
+                        cursor.position(),
+                        e,
+                        total_keys
+                    );
+                    break;
+                }
+            },
         }
     }
 
-    // Fix #3: single-pass memory recalculation after all inserts
-    for db in databases.iter_mut() {
-        db.recalculate_memory();
+    // Recalculate memory on temp databases, then swap into live ones.
+    for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
+        temp.recalculate_memory();
+        *live = temp;
     }
 
     Ok(total_keys)
@@ -812,11 +814,19 @@ pub fn load_from_bytes(
     let mut total_keys = 0usize;
     let mut current_db: usize = 0;
 
-    // Pre-size DashTables
-    let entry_counts = count_entries_per_db(&cursor, databases.len());
+    // Load into temporary databases so that:
+    // (a) If the load fails partway, original state is untouched.
+    // (b) Old keys not present in the RDB snapshot don't survive — an RDB
+    //     preamble is a full point-in-time snapshot and must replace state,
+    //     not merge into it.
+    let db_count = databases.len();
+    let mut temp_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
+
+    // Pre-size DashTables on the temporary databases
+    let entry_counts = count_entries_per_db(&cursor, db_count);
     for (db_idx, &count) in entry_counts.iter().enumerate() {
-        if count > 0 && db_idx < databases.len() {
-            databases[db_idx].reserve(count);
+        if count > 0 && db_idx < db_count {
+            temp_dbs[db_idx].reserve(count);
         }
     }
 
@@ -834,12 +844,11 @@ pub fn load_from_bytes(
                     source: e,
                 })?;
                 current_db = db_idx[0] as usize;
-                if current_db >= databases.len() {
+                if current_db >= db_count {
                     return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB preamble references database {} but only {} configured",
-                            current_db,
-                            databases.len()
+                            current_db, db_count
                         ),
                     }
                     .into());
@@ -850,8 +859,8 @@ pub fn load_from_bytes(
                     if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
                         continue;
                     }
-                    if current_db < databases.len() {
-                        databases[current_db].insert_for_load(key, entry);
+                    if current_db < db_count {
+                        temp_dbs[current_db].insert_for_load(key, entry);
                         total_keys += 1;
                     }
                 }
@@ -860,8 +869,12 @@ pub fn load_from_bytes(
         }
     }
 
-    for db in databases.iter_mut() {
-        db.recalculate_memory();
+    // Recalculate memory on temp databases, then swap into the live ones.
+    // This replaces the entire in-memory state for each database — old keys
+    // that were not in the RDB snapshot are discarded.
+    for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
+        temp.recalculate_memory();
+        *live = temp;
     }
 
     Ok((total_keys, rdb_len))
