@@ -391,6 +391,7 @@ fn main() -> anyhow::Result<()> {
     let shard_databases = ShardDatabases::new(all_dbs);
 
     // All shards recovered — mark server as ready for /readyz.
+    moon::admin::metrics_setup::set_server_ready();
     if let Some(ref flag) = readiness_flag {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("All shards ready — /readyz returning 200");
