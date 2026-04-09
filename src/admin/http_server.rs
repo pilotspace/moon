@@ -5,8 +5,8 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -27,7 +27,7 @@ fn response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from_static(body.as_bytes())))
-        .unwrap()
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"Internal Server Error"))))
 }
 
 /// Route incoming requests to the appropriate handler.
@@ -52,12 +52,11 @@ async fn handle_request(
             let rendered = state.prometheus_handle.render();
             Response::builder()
                 .status(StatusCode::OK)
-                .header(
-                    "content-type",
-                    "text/plain; version=0.0.4; charset=utf-8",
-                )
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
                 .body(Full::new(Bytes::from(rendered)))
-                .unwrap()
+                .unwrap_or_else(|_| {
+                    Response::new(Full::new(Bytes::from_static(b"Internal Server Error")))
+                })
         }
 
         _ => response(StatusCode::NOT_FOUND, "Not Found"),
@@ -79,13 +78,19 @@ pub fn spawn_admin_server(
         ready,
     });
 
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("admin-http".to_string())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build admin-http runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to build admin-http runtime: {}", e);
+                    return;
+                }
+            };
 
             rt.block_on(async move {
                 let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -126,7 +131,9 @@ pub fn spawn_admin_server(
                 }
             });
         })
-        .expect("failed to spawn admin-http thread");
+    {
+        tracing::error!("Failed to spawn admin-http thread: {}", e);
+    }
 }
 
 #[cfg(test)]

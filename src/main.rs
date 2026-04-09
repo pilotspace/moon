@@ -34,21 +34,6 @@ fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::parse();
 
-    // --check-config: validate and exit without starting
-    if config.check_config {
-        info!("Configuration is valid.");
-        return Ok(());
-    }
-
-    // Initialize Prometheus metrics exporter (if admin_port > 0)
-    let readiness_flag = moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
-
-    // Initialize global slowlog with user-configured thresholds
-    moon::admin::metrics_setup::init_global_slowlog(
-        config.slowlog_max_len,
-        config.slowlog_log_slower_than,
-    );
-
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
         tracing::warn!(
@@ -84,6 +69,32 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Validate persistence directory is accessible
+    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+        return Err(anyhow::anyhow!(
+            "failed to create persistence directory {:?}: {}",
+            config.dir,
+            e
+        ));
+    }
+
+    // --check-config: validate and exit without starting.
+    // Runs AFTER TLS cert validation, protected mode check, and persistence dir check
+    // so that real configuration errors are caught before reporting success.
+    if config.check_config {
+        info!("Configuration is valid.");
+        return Ok(());
+    }
+
+    // Initialize Prometheus metrics exporter (if admin_port > 0)
+    let readiness_flag = moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
+
+    // Initialize global slowlog with user-configured thresholds
+    moon::admin::metrics_setup::init_global_slowlog(
+        config.slowlog_max_len,
+        config.slowlog_log_slower_than,
+    );
+
     // Initialize vector distance dispatch table (must happen before any search).
     moon::vector::distance::init();
 
@@ -106,17 +117,6 @@ fn main() -> anyhow::Result<()> {
 
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
-
-    // Ensure persistence directory exists before spawning AOF writer.
-    // Fail fast if --dir is invalid or permission-denied: otherwise the AOF
-    // writer and recovery paths silently fall back and corrupt invariants.
-    if let Err(e) = std::fs::create_dir_all(&config.dir) {
-        return Err(anyhow::anyhow!(
-            "failed to create persistence directory {:?}: {}",
-            config.dir,
-            e
-        ));
-    }
 
     // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
     // The AOF writer task will be spawned on the listener runtime.

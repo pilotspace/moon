@@ -231,6 +231,19 @@ fn parse_single_frame_zc(
             Ok(Frame::Boolean(val == b't'))
         }
         b'_' => {
+            // RESP3 Null: `_\r\n` — verify CRLF immediately follows type byte
+            if *pos + 1 >= buf.len() {
+                return Err(ParseError::Incomplete);
+            }
+            if buf[*pos] != b'\r' || buf[*pos + 1] != b'\n' {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "RESP3 null has trailing data before CRLF at offset {}",
+                        *pos
+                    ),
+                    offset: *pos,
+                });
+            }
             *pos += 2;
             Ok(Frame::Null)
         }
@@ -427,12 +440,20 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
         }
         b'#' => {
             let crlf = crlf_or_null!(buf, pos);
+            // Defensive: exactly one byte (t or f) before CRLF
+            if crlf != *pos + 1 {
+                return Frame::Null;
+            }
             let val = buf[*pos];
             *pos = crlf + 2;
             Frame::Boolean(val == b't')
         }
         b'_' => {
             let crlf = crlf_or_null!(buf, pos);
+            // Defensive: CRLF must be immediately at *pos (no junk)
+            if crlf != *pos {
+                return Frame::Null;
+            }
             *pos = crlf + 2;
             Frame::Null
         }
@@ -601,8 +622,17 @@ fn validate_frame(
             Ok(())
         }
         b'_' => {
-            // Null: just CRLF
+            // Null: CRLF must be immediately at *pos (no intervening bytes)
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            if crlf != *pos {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "RESP3 null has trailing data before CRLF at offset {}",
+                        *pos
+                    ),
+                    offset: *pos,
+                });
+            }
             *pos = crlf + 2;
             Ok(())
         }
@@ -837,8 +867,17 @@ fn parse_single_frame(
         }
         // === RESP3 types ===
         b'_' => {
-            // RESP3 Null: `_\r\n`
+            // RESP3 Null: `_\r\n` — CRLF must be immediately at *pos
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
+            if crlf != *pos {
+                return Err(ParseError::Invalid {
+                    message: format!(
+                        "RESP3 null has trailing data before CRLF at offset {}",
+                        *pos
+                    ),
+                    offset: *pos,
+                });
+            }
             *pos = crlf + 2;
             Ok(Frame::Null)
         }
@@ -1290,6 +1329,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_resp3_null_rejects_junk() {
+        // `_junk\r\n` must be rejected, not parsed as Null
+        let result = parse_bytes(b"_junk\r\n");
+        assert!(
+            result.is_err(),
+            "expected error for _junk\\r\\n but got {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_parse_resp3_boolean_true() {
         let result = parse_bytes(b"#t\r\n").unwrap().unwrap();
         assert_eq!(result, Frame::Boolean(true));
@@ -1482,13 +1532,10 @@ mod tests {
     fn test_crash_artifact_bare_lf_in_frame_count() {
         // Crash artifact: bare \n (0x0a) in array count causes validate/zerocopy divergence
         let data: &[u8] = &[
-            0x2a, 0x33, 0x0d, 0x0a, 0x2a, 0x35, 0x0a, 0x0d,
-            0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d, 0x0a, 0x5f,
-            0x5f, 0x5f, 0x0a, 0x3a, 0x2a, 0x30, 0x0a, 0x0d,
-            0x0a, 0x5f, 0xfe, 0xff, 0xe9, 0x0d, 0x0a, 0x5f,
-            0x5f, 0x5f, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff,
-            0x0d, 0x0a, 0x5f, 0x5f, 0x5f, 0x0a, 0x2a, 0x31,
-            0x0a, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d,
+            0x2a, 0x33, 0x0d, 0x0a, 0x2a, 0x35, 0x0a, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d,
+            0x0a, 0x5f, 0x5f, 0x5f, 0x0a, 0x3a, 0x2a, 0x30, 0x0a, 0x0d, 0x0a, 0x5f, 0xfe, 0xff,
+            0xe9, 0x0d, 0x0a, 0x5f, 0x5f, 0x5f, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d, 0x0a,
+            0x5f, 0x5f, 0x5f, 0x0a, 0x2a, 0x31, 0x0a, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d,
             0x0a, 0x5f, 0x5f, 0x0a, 0x0d, 0x0a,
         ];
         // Must not panic — should return Ok or Err, never crash

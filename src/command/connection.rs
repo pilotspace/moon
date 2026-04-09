@@ -213,6 +213,7 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     // # Replication
+    // NOTE: placeholder values — wire to actual ReplicationState when available
     sections.push_str("# Replication\r\n");
     sections.push_str("role:master\r\n");
     sections.push_str("connected_slaves:0\r\n");
