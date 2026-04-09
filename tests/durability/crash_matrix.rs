@@ -235,4 +235,36 @@ mod tests {
         // No persistence — data loss is expected. Just verify server recovers.
         assert!(result.is_ok(), "{}", result.unwrap_err());
     }
+
+    /// G14: SIGKILL during disk-offload spill.
+    ///
+    /// Triggers cold-tier spill with a very low threshold, then crashes.
+    /// After restart, server must recover and report a non-negative DBSIZE.
+    #[test]
+    #[ignore]
+    fn crash_disk_offload_during_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+
+        let result = crash_test(
+            "disk-offload",
+            16403,
+            500,
+            &[
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "always",
+                "--dir",
+                dir_str,
+                "--disk-offload",
+                "enable",
+                "--disk-offload-threshold",
+                "0.1",
+            ],
+        );
+        // Disk offload with AOF-always: data should survive.
+        // At minimum, server must recover (DBSIZE >= 0).
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
 }

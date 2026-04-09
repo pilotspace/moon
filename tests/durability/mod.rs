@@ -6,4 +6,5 @@
 
 pub mod backup_restore;
 pub mod crash_matrix;
+pub mod jepsen_lite;
 pub mod torn_write;
