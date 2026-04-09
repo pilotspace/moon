@@ -115,6 +115,21 @@ pub fn command(args: &[Frame]) -> Frame {
     Frame::Array(framevec![])
 }
 
+/// HEALTHZ command — liveness check. Always returns +OK if the server is running.
+pub fn healthz() -> Frame {
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// READYZ command — readiness check. Returns +OK when the server is fully
+/// initialized (shards accepting, persistence loaded), -ERR otherwise.
+pub fn readyz() -> Frame {
+    if crate::admin::metrics_setup::is_server_ready() {
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR server not ready"))
+    }
+}
+
 /// INFO command handler.
 ///
 /// Returns a BulkString with minimal INFO sections.

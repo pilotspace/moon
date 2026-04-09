@@ -409,7 +409,10 @@ fn dispatch_inner(
             }
         }
         (6, b'r') => {
-            // RENAME
+            // READYZ RENAME
+            if cmd.eq_ignore_ascii_case(b"READYZ") {
+                return resp(connection::readyz());
+            }
             if cmd.eq_ignore_ascii_case(b"RENAME") {
                 return resp(key::rename(db, args));
             }
@@ -482,7 +485,10 @@ fn dispatch_inner(
             }
         }
         (7, b'h') => {
-            // HGETALL HEXISTS HINCRBY
+            // HEALTHZ HGETALL HEXISTS HINCRBY
+            if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
+                return resp(connection::healthz());
+            }
             if cmd.eq_ignore_ascii_case(b"HGETALL") {
                 return resp(hash::hgetall(db, args));
             }

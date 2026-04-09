@@ -8,6 +8,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use metrics::{counter, gauge, histogram};
 
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static SERVER_READY: AtomicBool = AtomicBool::new(false);
+
+/// Mark the server as ready (called once after all shards are accepting).
+pub fn set_server_ready() {
+    SERVER_READY.store(true, Ordering::Release);
+}
+
+/// Check if the server is ready (for READYZ health check).
+pub fn is_server_ready() -> bool {
+    SERVER_READY.load(Ordering::Acquire)
+}
 
 // ── Lightweight atomic counters for INFO ────────────────────────────────
 // These counters work even when the Prometheus exporter is disabled
