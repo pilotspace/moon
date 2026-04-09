@@ -3,49 +3,59 @@
 //! Uses the `metrics` facade crate so metric recording is a single atomic
 //! operation on the hot path (counter increment or histogram observation).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use metrics::{counter, gauge, histogram};
 
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Initialize the Prometheus metrics exporter.
+// ── Lightweight atomic counters for INFO ────────────────────────────────
+// These counters work even when the Prometheus exporter is disabled
+// (admin_port=0), so INFO always returns meaningful stats.
+static TOTAL_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the Prometheus metrics exporter and admin HTTP server.
 ///
-/// Must be called once before any metrics recording. Spawns a background
-/// HTTP listener on `addr` that serves `/metrics` in Prometheus text format.
+/// Must be called once before any metrics recording. Spawns a custom admin
+/// HTTP server on `addr` that serves `/metrics`, `/healthz`, and `/readyz`.
 ///
-/// Also responds to `/healthz` (liveness) and `/readyz` (readiness).
-pub fn init_metrics(admin_port: u16, bind: &str) {
+/// Returns an `Arc<AtomicBool>` readiness flag. Set it to `true` once all
+/// shards have finished persistence recovery to make `/readyz` return 200.
+pub fn init_metrics(admin_port: u16, bind: &str) -> Option<std::sync::Arc<AtomicBool>> {
     if admin_port == 0 {
-        return;
+        return None;
     }
 
-    let addr = format!("{}:{}", bind, admin_port);
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let addr_str = format!("{}:{}", bind, admin_port);
+    let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|_| {
+        tracing::warn!(
+            "Invalid admin bind address '{}', using 0.0.0.0:{}",
+            addr_str,
+            admin_port
+        );
+        std::net::SocketAddr::from(([0, 0, 0, 0], admin_port))
+    });
 
-    // Install as the global recorder — panics if called twice
+    // Build recorder without starting the built-in HTTP listener
     if METRICS_INITIALIZED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        match builder
-            .with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    "Invalid admin bind address '{}', using 0.0.0.0:{}",
-                    addr,
-                    admin_port
-                );
-                std::net::SocketAddr::from(([0, 0, 0, 0], admin_port))
-            }))
-            .install()
-        {
-            Ok(()) => {
-                tracing::info!("Admin metrics server listening on {}", addr);
-            }
-            Err(e) => {
-                tracing::error!("Failed to start metrics exporter: {}", e);
-            }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let prometheus_handle = recorder.handle();
+
+        // Install as the global metrics recorder
+        if let Err(e) = metrics::set_global_recorder(recorder) {
+            tracing::error!("Failed to set global metrics recorder: {}", e);
+            return None;
         }
+
+        let ready = std::sync::Arc::new(AtomicBool::new(false));
+        crate::admin::http_server::spawn_admin_server(addr, prometheus_handle, ready.clone());
+        Some(ready)
+    } else {
+        None
     }
 }
 
@@ -54,6 +64,7 @@ pub fn init_metrics(admin_port: u16, bind: &str) {
 /// Record a command execution.
 #[inline]
 pub fn record_command(cmd: &str, latency_us: u64) {
+    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -76,6 +87,7 @@ pub fn record_command_error(cmd: &str) {
 /// Record a new client connection.
 #[inline]
 pub fn record_connection_opened() {
+    TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -183,4 +195,73 @@ pub fn update_rss_bytes(rss: u64) {
         return;
     }
     gauge!("moon_rss_bytes").set(rss as f64);
+}
+
+// ── INFO helpers ────────────────────────────────────────────────────────
+
+/// Total commands processed since server start (for INFO Stats).
+#[inline]
+pub fn total_commands_processed() -> u64 {
+    TOTAL_COMMANDS.load(Ordering::Relaxed)
+}
+
+/// Total connections received since server start (for INFO Stats).
+#[inline]
+pub fn total_connections_received() -> u64 {
+    TOTAL_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+/// Read process CPU usage via `getrusage(RUSAGE_SELF)`.
+///
+/// Returns `(used_cpu_sys, used_cpu_user)` in seconds (f64).
+/// On non-Linux platforms returns `(0.0, 0.0)`.
+#[cfg(target_os = "linux")]
+pub fn get_cpu_usage() -> (f64, f64) {
+    use std::mem::MaybeUninit;
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` writes a valid `rusage` struct to the pointer on
+    // success (returns 0). RUSAGE_SELF is always valid. We only read the
+    // struct after confirming success.
+    let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if ret == 0 {
+        // SAFETY: getrusage returned 0, so the struct is fully initialized.
+        let ru = unsafe { usage.assume_init() };
+        let sys = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1_000_000.0;
+        let user = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1_000_000.0;
+        (sys, user)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_cpu_usage() -> (f64, f64) {
+    (0.0, 0.0)
+}
+
+// ── Global SLOWLOG ─────────────────────────────────────────────────────
+
+/// Global slowlog instance accessible from any handler thread.
+///
+/// Initialized lazily with default thresholds. `init_global_slowlog` should
+/// be called from main to apply user-configured values.
+static GLOBAL_SLOWLOG: once_cell::sync::Lazy<crate::admin::slowlog::Slowlog> =
+    once_cell::sync::Lazy::new(|| crate::admin::slowlog::Slowlog::new(128, 10_000));
+
+/// Initialize the global slowlog with user-configured values.
+///
+/// Must be called before any command processing. If called after commands
+/// have already been recorded, the old entries are lost (new instance).
+/// In practice this is called once from main() before shards start.
+pub fn init_global_slowlog(max_len: usize, threshold_us: u64) {
+    // Force initialization of the Lazy with default, then reconfigure.
+    // Since Slowlog fields are behind a Mutex, we just reset.
+    let sl = global_slowlog();
+    sl.reconfigure(max_len, threshold_us);
+}
+
+/// Get a reference to the global slowlog.
+#[inline]
+pub fn global_slowlog() -> &'static crate::admin::slowlog::Slowlog {
+    &GLOBAL_SLOWLOG
 }

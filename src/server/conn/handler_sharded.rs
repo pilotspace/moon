@@ -76,6 +76,7 @@ use super::{
 ///
 /// Connection-level commands (AUTH, SUBSCRIBE, MULTI/EXEC) are handled at the
 /// connection level same as the non-sharded handler.
+#[tracing::instrument(skip_all, level = "debug")]
 pub async fn handle_connection_sharded(
     stream: TcpStream,
     shard_databases: Arc<ShardDatabases>,
@@ -829,6 +830,13 @@ pub async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- SLOWLOG ---
+                    if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
+                        let sl = crate::admin::metrics_setup::global_slowlog();
+                        responses.push(crate::admin::slowlog::handle_slowlog(sl, cmd_args));
+                        continue;
+                    }
+
                     // --- REPLICAOF / SLAVEOF ---
                     if cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"SLAVEOF") {
                         use crate::command::connection::{replicaof, ReplicaofAction};
@@ -1388,7 +1396,20 @@ pub async fn handle_connection_sharded_inner<
 
                             let db_count = shard_databases.db_count();
                             guard.refresh_now_from_cache(&cached_clock);
+                            let dispatch_start = std::time::Instant::now();
                             let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                            let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                            if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                            }
+                            if let Frame::Array(ref args) = frame {
+                                crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                    elapsed_us,
+                                    args.as_slice(),
+                                    b"",
+                                    b"",
+                                );
+                            }
                             let response = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
@@ -1453,7 +1474,20 @@ pub async fn handle_connection_sharded_inner<
                             let guard = shard_databases.read_db(shard_id, selected_db);
                             let now_ms = cached_clock.ms();
                             let db_count = shard_databases.db_count();
+                            let dispatch_start = std::time::Instant::now();
                             let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                            if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                            }
+                            if let Frame::Array(ref args) = frame {
+                                crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                    elapsed_us,
+                                    args.as_slice(),
+                                    b"",
+                                    b"",
+                                );
+                            }
                             drop(guard);
                             let response = match result {
                                 DispatchResult::Response(f) => f,

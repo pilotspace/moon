@@ -3,5 +3,6 @@
 //! Serves `/metrics` (Prometheus), `/healthz` (liveness), `/readyz` (readiness)
 //! on a separate port from the RESP data port.
 
+pub mod http_server;
 pub mod metrics_setup;
 pub mod slowlog;

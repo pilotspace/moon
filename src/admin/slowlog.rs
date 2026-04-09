@@ -32,11 +32,15 @@ pub struct SlowlogEntry {
     pub client_name: Bytes,
 }
 
-/// Per-shard slowlog buffer.
+/// Global slowlog buffer.
+///
+/// `max_len` and `threshold_us` are stored as atomics so the global
+/// instance (created via `once_cell::sync::Lazy`) can be reconfigured
+/// from `main()` before shard threads start.
 pub struct Slowlog {
     entries: Mutex<VecDeque<SlowlogEntry>>,
-    max_len: usize,
-    threshold_us: u64,
+    max_len: AtomicU64,
+    threshold_us: AtomicU64,
 }
 
 impl Slowlog {
@@ -44,9 +48,18 @@ impl Slowlog {
     pub fn new(max_len: usize, threshold_us: u64) -> Self {
         Self {
             entries: Mutex::new(VecDeque::with_capacity(max_len.min(1024))),
-            max_len,
-            threshold_us,
+            max_len: AtomicU64::new(max_len as u64),
+            threshold_us: AtomicU64::new(threshold_us),
         }
+    }
+
+    /// Reconfigure max length and threshold.
+    ///
+    /// Clears existing entries since the threshold may have changed.
+    pub fn reconfigure(&self, max_len: usize, threshold_us: u64) {
+        self.max_len.store(max_len as u64, Ordering::Release);
+        self.threshold_us.store(threshold_us, Ordering::Release);
+        self.entries.lock().clear();
     }
 
     /// Record a command if it exceeds the slowlog threshold.
@@ -58,7 +71,8 @@ impl Slowlog {
         client_addr: &[u8],
         client_name: &[u8],
     ) {
-        if self.threshold_us == 0 || duration_us < self.threshold_us {
+        let threshold = self.threshold_us.load(Ordering::Relaxed);
+        if threshold == 0 || duration_us < threshold {
             return;
         }
 
@@ -93,8 +107,9 @@ impl Slowlog {
             client_name: Bytes::copy_from_slice(client_name),
         };
 
+        let max_len = self.max_len.load(Ordering::Relaxed) as usize;
         let mut entries = self.entries.lock();
-        if entries.len() >= self.max_len {
+        if entries.len() >= max_len {
             entries.pop_back();
         }
         entries.push_front(entry);

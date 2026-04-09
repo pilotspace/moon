@@ -41,7 +41,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Initialize Prometheus metrics exporter (if admin_port > 0)
-    moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
+    let readiness_flag = moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
+
+    // Initialize global slowlog with user-configured thresholds
+    moon::admin::metrics_setup::init_global_slowlog(
+        config.slowlog_max_len,
+        config.slowlog_log_slower_than,
+    );
 
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
@@ -353,6 +359,12 @@ fn main() -> anyhow::Result<()> {
         .map(|s| std::mem::take(&mut s.databases))
         .collect();
     let shard_databases = ShardDatabases::new(all_dbs);
+
+    // All shards recovered — mark server as ready for /readyz.
+    if let Some(ref flag) = readiness_flag {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("All shards ready — /readyz returning 200");
+    }
 
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);

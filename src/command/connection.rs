@@ -190,6 +190,34 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     );
     sections.push_str("\r\n");
 
+    // # Stats
+    sections.push_str("# Stats\r\n");
+    let _ = write!(
+        sections,
+        "total_commands_processed:{}\r\n\
+         total_connections_received:{}\r\n",
+        crate::admin::metrics_setup::total_commands_processed(),
+        crate::admin::metrics_setup::total_connections_received(),
+    );
+    sections.push_str("\r\n");
+
+    // # CPU
+    sections.push_str("# CPU\r\n");
+    let (cpu_sys, cpu_user) = crate::admin::metrics_setup::get_cpu_usage();
+    let _ = write!(
+        sections,
+        "used_cpu_sys:{:.6}\r\n\
+         used_cpu_user:{:.6}\r\n",
+        cpu_sys, cpu_user,
+    );
+    sections.push_str("\r\n");
+
+    // # Replication
+    sections.push_str("# Replication\r\n");
+    sections.push_str("role:master\r\n");
+    sections.push_str("connected_slaves:0\r\n");
+    sections.push_str("\r\n");
+
     sections.push_str("# Keyspace\r\n");
     let key_count = db.len();
     let expires_count = db.expires_count();
@@ -267,7 +295,14 @@ pub fn auth_acl(
                     );
                 }
             };
-            match acl_table.read().unwrap().authenticate("default", &password) {
+            // Fail closed: if the ACL lock is poisoned, deny authentication
+            let Ok(table) = acl_table.read() else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
+                    None,
+                );
+            };
+            match table.authenticate("default", &password) {
                 Some(username) => (
                     Frame::SimpleString(Bytes::from_static(b"OK")),
                     Some(username),
@@ -299,7 +334,14 @@ pub fn auth_acl(
                     );
                 }
             };
-            match acl_table.read().unwrap().authenticate(&username, &password) {
+            // Fail closed: if the ACL lock is poisoned, deny authentication
+            let Ok(table) = acl_table.read() else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
+                    None,
+                );
+            };
+            match table.authenticate(&username, &password) {
                 Some(uname) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(uname)),
                 None => (
                     Frame::Error(Bytes::from_static(
@@ -393,7 +435,16 @@ pub fn hello_acl(
                         );
                     }
                 };
-                match acl_table.read().unwrap().authenticate(&username, &password) {
+                // Fail closed: if the ACL lock is poisoned, deny authentication
+                let Ok(table) = acl_table.read() else {
+                    return (
+                        Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
+                        current_proto,
+                        None,
+                        None,
+                    );
+                };
+                match table.authenticate(&username, &password) {
                     Some(uname) => {
                         *authenticated = true;
                         auth_user = Some(uname);
