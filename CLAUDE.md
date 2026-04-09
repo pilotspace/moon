@@ -135,8 +135,10 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 
 ### Error Handling
 - All command errors return `Frame::Error(Bytes)` — no `Result` types in dispatch paths.
-- No `unwrap()` or `expect()` in library code outside tests. Use pattern matching or `if let`.
+- No `unwrap()` or `expect()` in library code outside tests. Use pattern matching, `if let`, or `let-else`.
 - `anyhow` is only for `main.rs` and test code. Library code uses `thiserror` or `Frame::Error`.
+- **Parser defensiveness:** `parse_frame_zerocopy` returns `Frame::Null` on ANY parse failure instead of panicking. Never add `.unwrap()` to protocol parsing code — malformed client input must never crash the server.
+- If an unwrap is truly safe (post-insert get, atomic-invariant), add `#[allow(clippy::unwrap_used)]` with a one-line justification comment on the preceding line.
 
 ### Feature Gates
 - All runtime-specific code must compile under both `runtime-tokio` and `runtime-monoio`.
@@ -166,11 +168,20 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 ### File Size
 - No single `.rs` file should exceed 1500 lines. Split into submodules if approaching this limit.
 - Command implementations for a single Redis command group can be larger, but split read/write operations into separate files when exceeding 1000 lines.
+- **Split convention:** command files become directory modules (`src/command/hash/` with `mod.rs`, `hash_read.rs`, `hash_write.rs`). The `mod.rs` re-exports via `pub use hash_read::*; pub use hash_write::*;` and holds shared helpers + tests.
 
 ### Testing
 - Every new command needs at least one unit test and one consistency test entry.
 - Integration tests use real server instances — no mocking.
 - Benchmarks use Criterion with `black_box()` on inputs and outputs.
+- **Fuzzing:** 7 `cargo-fuzz` targets in `fuzz/fuzz_targets/`. Any new parser, decoder, or deserialization function MUST have a fuzz target. CI runs 15 min/target on PRs and 6h nightly.
+- **Loom:** model tests in `tests/loom_response_slot.rs` for lock-free data structures. Any new atomic state machine MUST have a loom model.
+
+### Module Structure
+- Modules with subfiles use Rust directory-module convention: `src/command/hash/` → `mod.rs` + `hash_read.rs` + `hash_write.rs`.
+- Re-exports in `mod.rs` maintain the same public API paths (`hash::hget` resolves via `pub use hash_read::*`).
+- Submodule files use `crate::` imports (NOT `super::super::`).
+- Test code stays in `mod.rs`, not in split subfiles.
 
 ## Vector Search (FT.*)
 
@@ -225,6 +236,8 @@ Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness 
 - `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings` — zero warnings policy (tokio + jemalloc)
 - `cargo fmt --check` — enforced formatting
 - MSRV check — `cargo build` with Rust 1.94 toolchain
+- **Safety audit** — `scripts/audit-unsafe.sh` (100% SAFETY comment coverage on unsafe blocks) + `scripts/audit-unwrap.sh` (unwrap ratchet prevents new unannotated unwraps)
+- **Fuzz** — `cargo-fuzz` 15 min/target on PR, 6h nightly (`resp_parse`, `resp_parse_differential`, `inline_parse`, `wal_v3_record`, `gossip_deser`, `acl_rule`). Uses nightly compiler; `rust-toolchain.toml` is removed in CI for this job.
 - CodeQL (Rust) — weekly + on push/PR
 - Claude Code Review — runs on PRs
 
