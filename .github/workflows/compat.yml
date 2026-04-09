@@ -90,7 +90,8 @@ jobs:
           go-version: '1.22'
       - name: Run go-redis smoke test
         run: |
-          cat > /tmp/compat_smoke.go << 'GOEOF'
+          GOTEST_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/go-compat-XXXXXX")
+          cat > "$GOTEST_DIR/main.go" << 'GOEOF'
           package main
           import (
             "context"
@@ -110,7 +111,7 @@ jobs:
             fmt.Println("go-redis: ALL TESTS PASSED")
           }
           GOEOF
-          cd /tmp && go mod init compat && go get github.com/redis/go-redis/v9 && go run compat_smoke.go
+          cd "$GOTEST_DIR" && go mod init compat && go mod tidy && go run main.go
 
   ioredis:
     name: ioredis (Node.js)
