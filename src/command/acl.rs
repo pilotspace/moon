@@ -365,7 +365,7 @@ mod tests {
         Arc::new(RwLock::new(table))
     }
 
-    fn make_runtime_config() -> Arc<RwLock<RuntimeConfig>> {
+    fn make_runtime_config() -> Arc<parking_lot::RwLock<RuntimeConfig>> {
         Arc::new(parking_lot::RwLock::new(RuntimeConfig::default()))
     }
 
