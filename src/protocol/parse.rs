@@ -298,74 +298,105 @@ fn read_decimal_zc(buf: &Bytes, pos: &mut usize) -> Result<i64, ParseError> {
 }
 
 /// Zero-copy frame extraction from a frozen `Bytes` buffer.
-/// Called AFTER validation succeeds, so all bounds are guaranteed safe.
+/// Called AFTER validation succeeds, so all CRLF/atoi lookups should succeed.
 /// Uses `bytes.slice(start..end)` for zero-copy sub-slicing (Arc refcount bump only).
-#[allow(clippy::unwrap_used)] // Post-validation: pass 1 guarantees all CRLF/atoi succeed; divergence caught by cargo-fuzz
+///
+/// Defensive: returns `Frame::Null` on any parse failure rather than panicking,
+/// because validation/zerocopy position divergence bugs exist (found by fuzzing).
 fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, depth: usize) -> Frame {
+    if *pos >= buf.len() {
+        return Frame::Null;
+    }
     let type_byte = buf[*pos];
     *pos += 1;
 
+    // Helper: find CRLF or bail to Frame::Null
+    macro_rules! crlf_or_null {
+        ($buf:expr, $pos:expr) => {
+            match find_crlf($buf, *$pos) {
+                Some(p) => p,
+                None => return Frame::Null,
+            }
+        };
+    }
+
+    // Helper: parse integer or bail to Frame::Null
+    macro_rules! atoi_or_null {
+        ($line:expr) => {
+            match atoi::atoi::<i64>($line) {
+                Some(n) => n,
+                None => return Frame::Null,
+            }
+        };
+    }
+
+    // Helper: parse count for collection types (array/set/push/map)
+    macro_rules! parse_count {
+        ($buf:expr, $pos:expr) => {{
+            let crlf = crlf_or_null!($buf, $pos);
+            let line = &$buf[*$pos..crlf];
+            let count = atoi_or_null!(line);
+            *$pos = crlf + 2;
+            if count == -1 {
+                return Frame::Null;
+            }
+            if count < 0 {
+                return Frame::Null;
+            }
+            (count as usize).min(config.max_array_length)
+        }};
+    }
+
     match type_byte {
         b'+' => {
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = buf.slice(*pos..crlf);
             *pos = crlf + 2;
             Frame::SimpleString(line)
         }
         b'-' => {
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = buf.slice(*pos..crlf);
             *pos = crlf + 2;
             Frame::Error(line)
         }
         b':' => {
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = &buf[*pos..crlf];
-            let n = atoi::atoi::<i64>(line).unwrap();
+            let n = atoi_or_null!(line);
             *pos = crlf + 2;
             Frame::Integer(n)
         }
         b'$' => {
-            // Read length
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = &buf[*pos..crlf];
-            let len_val = atoi::atoi::<i64>(line).unwrap();
+            let len_val = atoi_or_null!(line);
             *pos = crlf + 2;
             if len_val == -1 {
                 return Frame::Null;
             }
+            if len_val < 0 {
+                return Frame::Null;
+            }
             let len = len_val as usize;
-            // Zero-copy: slice the Bytes (Arc refcount bump, no memcpy)
+            if *pos + len + 2 > buf.len() {
+                return Frame::Null;
+            }
             let data = buf.slice(*pos..*pos + len);
             *pos += len + 2;
             Frame::BulkString(data)
         }
         b'*' => {
-            let crlf = find_crlf(buf, *pos).unwrap();
-            let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap();
-            *pos = crlf + 2;
-            if count == -1 {
-                return Frame::Null;
-            }
-            let count = count as usize;
-            let mut items = FrameVec::with_capacity(count.min(config.max_array_length));
+            let count = parse_count!(buf, pos);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
             Frame::Array(items)
         }
         b'%' => {
-            // Map
-            let crlf = find_crlf(buf, *pos).unwrap();
-            let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap();
-            *pos = crlf + 2;
-            if count == -1 {
-                return Frame::Null;
-            }
-            let count = count as usize;
-            let mut entries = Vec::with_capacity(count.min(config.max_array_length));
+            let count = parse_count!(buf, pos);
+            let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 let key = parse_frame_zerocopy(buf, pos, config, depth + 1);
                 let val = parse_frame_zerocopy(buf, pos, config, depth + 1);
@@ -374,52 +405,51 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             Frame::Map(entries)
         }
         b'~' => {
-            // Set
-            let crlf = find_crlf(buf, *pos).unwrap();
-            let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap();
-            *pos = crlf + 2;
-            if count == -1 {
-                return Frame::Null;
-            }
-            let count = count as usize;
-            let mut items = FrameVec::with_capacity(count.min(config.max_array_length));
+            let count = parse_count!(buf, pos);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
             Frame::Set(items)
         }
         b',' => {
-            // Double
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = &buf[*pos..crlf];
-            let s = std::str::from_utf8(line).unwrap();
-            let f = if s == "inf" {
-                f64::INFINITY
-            } else if s == "-inf" {
-                f64::NEG_INFINITY
-            } else {
-                s.parse::<f64>().unwrap()
+            let f = match std::str::from_utf8(line) {
+                Ok("inf") => f64::INFINITY,
+                Ok("-inf") => f64::NEG_INFINITY,
+                Ok(s) => s.parse::<f64>().unwrap_or(0.0),
+                Err(_) => 0.0,
             };
             *pos = crlf + 2;
             Frame::Double(f)
         }
         b'#' => {
-            // Boolean
+            if *pos + 3 > buf.len() {
+                return Frame::Null;
+            }
             let val = buf[*pos];
             *pos += 3; // t/f + \r\n
             Frame::Boolean(val == b't')
         }
         b'_' => {
+            if *pos + 2 > buf.len() {
+                return Frame::Null;
+            }
             *pos += 2; // \r\n
             Frame::Null
         }
         b'=' => {
-            // Verbatim string
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = &buf[*pos..crlf];
-            let len = atoi::atoi::<i64>(line).unwrap() as usize;
+            let len = match atoi::atoi::<i64>(line) {
+                Some(n) if n >= 4 => n as usize,
+                _ => return Frame::Null,
+            };
             *pos = crlf + 2;
+            if *pos + len + 2 > buf.len() || buf[*pos + 3] != b':' {
+                return Frame::Null;
+            }
             let payload = &buf[*pos..*pos + len];
             let encoding = Bytes::copy_from_slice(&payload[..3]);
             let data = buf.slice(*pos + 4..*pos + len);
@@ -427,23 +457,14 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             Frame::VerbatimString { encoding, data }
         }
         b'(' => {
-            // Big number
-            let crlf = find_crlf(buf, *pos).unwrap();
+            let crlf = crlf_or_null!(buf, pos);
             let line = buf.slice(*pos..crlf);
             *pos = crlf + 2;
             Frame::BigNumber(line)
         }
         b'>' => {
-            // Push
-            let crlf = find_crlf(buf, *pos).unwrap();
-            let line = &buf[*pos..crlf];
-            let count = atoi::atoi::<i64>(line).unwrap();
-            *pos = crlf + 2;
-            if count == -1 {
-                return Frame::Null;
-            }
-            let count = count as usize;
-            let mut items = FrameVec::with_capacity(count.min(config.max_array_length));
+            let count = parse_count!(buf, pos);
+            let mut items = FrameVec::with_capacity(count);
             for _ in 0..count {
                 items.push(parse_frame_zerocopy(buf, pos, config, depth + 1));
             }
