@@ -250,9 +250,16 @@ mod tests {
         let addr = "127.0.0.1:16404";
 
         let mut server = start_moon(&[
-            "--port", "16404", "--shards", "1",
-            "--appendonly", "yes", "--appendfsync", "always",
-            "--dir", dir_str,
+            "--port",
+            "16404",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
         ]);
         thread::sleep(Duration::from_millis(500));
 
@@ -270,9 +277,16 @@ mod tests {
 
         // Restart and verify
         let mut server2 = start_moon(&[
-            "--port", "16404", "--shards", "1",
-            "--appendonly", "yes", "--appendfsync", "always",
-            "--dir", dir_str,
+            "--port",
+            "16404",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
         ]);
         thread::sleep(Duration::from_secs(2));
 
@@ -298,9 +312,16 @@ mod tests {
         let addr = "127.0.0.1:16405";
 
         let mut server = start_moon(&[
-            "--port", "16405", "--shards", "1",
-            "--appendonly", "yes", "--appendfsync", "always",
-            "--dir", dir_str,
+            "--port",
+            "16405",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
         ]);
         thread::sleep(Duration::from_millis(500));
 
@@ -317,9 +338,16 @@ mod tests {
 
         // Restart and verify
         let mut server2 = start_moon(&[
-            "--port", "16405", "--shards", "1",
-            "--appendonly", "yes", "--appendfsync", "always",
-            "--dir", dir_str,
+            "--port",
+            "16405",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
         ]);
         thread::sleep(Duration::from_secs(2));
 

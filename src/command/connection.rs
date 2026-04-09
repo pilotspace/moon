@@ -261,8 +261,7 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
 
     // # Replication
     sections.push_str("# Replication\r\n");
-    let (role, slaves, offset, repl_id) =
-        crate::admin::metrics_setup::get_replication_info();
+    let (role, slaves, offset, repl_id) = crate::admin::metrics_setup::get_replication_info();
     let _ = write!(
         sections,
         "role:{role}\r\n\
