@@ -27,6 +27,13 @@ jobs:
             features: runtime-monoio,jemalloc
             binary: moon-linux-monoio
 
+          - name: linux-aarch64-tokio
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            features: runtime-tokio,jemalloc
+            binary: moon-linux-aarch64-tokio
+            cross: true
+
           - name: macos-tokio
             os: macos-latest
             target: aarch64-apple-darwin
@@ -42,9 +49,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install cross (aarch64)
+        if: matrix.cross
+        run: cargo install cross --locked
+
       - name: Build
         run: |
-          cargo build --release --no-default-features --features ${{ matrix.features }} --target ${{ matrix.target }}
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --no-default-features --features ${{ matrix.features }} --target ${{ matrix.target }}
+          else
+            cargo build --release --no-default-features --features ${{ matrix.features }} --target ${{ matrix.target }}
+          fi
           cp target/${{ matrix.target }}/release/moon ${{ matrix.binary }}
 
       - name: Upload artifact
@@ -87,7 +102,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum moon-linux-tokio moon-linux-monoio moon-macos-tokio moon-sbom.json moon-sbom-tokio.json moon-sbom-monoio.json > SHA256SUMS.txt
+          sha256sum moon-linux-tokio moon-linux-monoio moon-linux-aarch64-tokio moon-macos-tokio moon-sbom.json moon-sbom-tokio.json moon-sbom-monoio.json > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Install cosign
@@ -111,6 +126,7 @@ jobs:
             --generate-notes \
             artifacts/moon-linux-tokio \
             artifacts/moon-linux-monoio \
+            artifacts/moon-linux-aarch64-tokio \
             artifacts/moon-macos-tokio \
             artifacts/moon-sbom.json \
             artifacts/moon-sbom-tokio.json \
