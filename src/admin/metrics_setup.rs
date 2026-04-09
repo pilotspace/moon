@@ -555,6 +555,7 @@ pub fn set_global_repl_state(
 }
 
 /// Get replication info for INFO command: (role, connected_slaves, master_repl_offset, repl_id).
+/// Also updates the Prometheus replication lag gauge as a side-effect.
 pub fn get_replication_info() -> (&'static str, usize, u64, String) {
     if let Some(state) = GLOBAL_REPL_STATE.get() {
         if let Ok(guard) = state.read() {
@@ -565,6 +566,23 @@ pub fn get_replication_info() -> (&'static str, usize, u64, String) {
             let slaves = guard.replicas.len();
             let offset = guard.master_repl_offset.load(Ordering::Relaxed);
             let repl_id = guard.repl_id.clone();
+            // Update Prometheus lag gauge: max lag across all replicas.
+            if !guard.replicas.is_empty() {
+                let max_lag_bytes = guard
+                    .replicas
+                    .iter()
+                    .map(|r| {
+                        let ack: u64 = r
+                            .ack_offsets
+                            .iter()
+                            .map(|a| a.load(Ordering::Relaxed))
+                            .sum();
+                        offset.saturating_sub(ack)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                record_replication_lag(max_lag_bytes, 0);
+            }
             return (role, slaves, offset, repl_id);
         }
     }
