@@ -111,3 +111,240 @@ jobs:
           }
           GOEOF
           cd /tmp && go mod init compat && go get github.com/redis/go-redis/v9 && go run compat_test.go
+
+  ioredis:
+    name: ioredis (Node.js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (tokio)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Start Moon
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+        env:
+          MOON_NO_URING: "1"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install ioredis
+        run: npm install ioredis
+      - name: Run compatibility tests
+        run: |
+          node -e "
+          const Redis = require('ioredis');
+          (async () => {
+            const r = new Redis({ host: '127.0.0.1', port: 6399, lazyConnect: true });
+            await r.connect();
+            // SET / GET
+            await r.set('node_key', 'node_value');
+            const v = await r.get('node_key');
+            if (v !== 'node_value') throw new Error('GET failed');
+            // HSET / HGET
+            await r.hset('node_hash', 'f1', 'v1');
+            const hv = await r.hget('node_hash', 'f1');
+            if (hv !== 'v1') throw new Error('HGET failed');
+            // Pipeline
+            const pipe = r.pipeline();
+            pipe.set('np1', 'pv1');
+            pipe.set('np2', 'pv2');
+            pipe.get('np1');
+            pipe.get('np2');
+            const results = await pipe.exec();
+            if (results[2][1] !== 'pv1') throw new Error('pipeline GET failed');
+            if (results[3][1] !== 'pv2') throw new Error('pipeline GET failed');
+            console.log('ioredis: ALL TESTS PASSED');
+            await r.quit();
+          })();
+          "
+
+  redis-rs:
+    name: redis-rs (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (tokio)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Start Moon
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+        env:
+          MOON_NO_URING: "1"
+      - name: Run redis-rs smoke test
+        run: |
+          TMPDIR=$(mktemp -d)
+          cat > "$TMPDIR/Cargo.toml" << 'RSEOF'
+          [package]
+          name = "moon-compat-redis-rs"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          redis = "0.27"
+          RSEOF
+          mkdir -p "$TMPDIR/src"
+          cat > "$TMPDIR/src/main.rs" << 'RSEOF'
+          use redis::Commands;
+          fn main() {
+              let client = redis::Client::open("redis://127.0.0.1:6399/").unwrap();
+              let mut con = client.get_connection().unwrap();
+              // SET / GET
+              let _: () = con.set("rs_key", "rs_value").unwrap();
+              let v: String = con.get("rs_key").unwrap();
+              assert_eq!(v, "rs_value");
+              // HSET / HGET
+              let _: () = con.hset("rs_hash", "f1", "v1").unwrap();
+              let hv: String = con.hget("rs_hash", "f1").unwrap();
+              assert_eq!(hv, "v1");
+              // Pipeline
+              let (r1, r2): (String, String) = redis::pipe()
+                  .cmd("SET").arg("rp1").arg("pv1").ignore()
+                  .cmd("SET").arg("rp2").arg("pv2").ignore()
+                  .cmd("GET").arg("rp1")
+                  .cmd("GET").arg("rp2")
+                  .query(&mut con).unwrap();
+              assert_eq!(r1, "pv1");
+              assert_eq!(r2, "pv2");
+              println!("redis-rs: ALL TESTS PASSED");
+          }
+          RSEOF
+          cd "$TMPDIR" && cargo run --release
+
+  hiredis:
+    name: hiredis (C)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (tokio)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Start Moon
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+        env:
+          MOON_NO_URING: "1"
+      - name: Install hiredis
+        run: sudo apt-get install -y libhiredis-dev
+      - name: Run hiredis smoke test
+        run: |
+          cat > /tmp/compat_test.c << 'CEOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <hiredis/hiredis.h>
+          int main() {
+              redisContext *c = redisConnect("127.0.0.1", 6399);
+              if (c == NULL || c->err) { fprintf(stderr, "connect failed\n"); return 1; }
+              redisReply *r;
+              /* SET / GET */
+              r = redisCommand(c, "SET c_key c_value");
+              freeReplyObject(r);
+              r = redisCommand(c, "GET c_key");
+              if (strcmp(r->str, "c_value") != 0) { fprintf(stderr, "GET failed\n"); return 1; }
+              freeReplyObject(r);
+              /* HSET / HGET */
+              r = redisCommand(c, "HSET c_hash f1 v1");
+              freeReplyObject(r);
+              r = redisCommand(c, "HGET c_hash f1");
+              if (strcmp(r->str, "v1") != 0) { fprintf(stderr, "HGET failed\n"); return 1; }
+              freeReplyObject(r);
+              /* Pipeline */
+              redisAppendCommand(c, "SET cp1 pv1");
+              redisAppendCommand(c, "SET cp2 pv2");
+              redisAppendCommand(c, "GET cp1");
+              redisAppendCommand(c, "GET cp2");
+              redisGetReply(c, (void**)&r); freeReplyObject(r);
+              redisGetReply(c, (void**)&r); freeReplyObject(r);
+              redisGetReply(c, (void**)&r);
+              if (strcmp(r->str, "pv1") != 0) { fprintf(stderr, "pipeline GET1 failed\n"); return 1; }
+              freeReplyObject(r);
+              redisGetReply(c, (void**)&r);
+              if (strcmp(r->str, "pv2") != 0) { fprintf(stderr, "pipeline GET2 failed\n"); return 1; }
+              freeReplyObject(r);
+              printf("hiredis: ALL TESTS PASSED\n");
+              redisFree(c);
+              return 0;
+          }
+          CEOF
+          gcc -o /tmp/compat_test /tmp/compat_test.c -lhiredis
+          /tmp/compat_test
+
+  jedis:
+    name: jedis (Java)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (tokio)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Start Moon
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+        env:
+          MOON_NO_URING: "1"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Run jedis smoke test
+        env:
+          JEDIS_VERSION: "5.2.0"
+          SLF4J_VERSION: "2.0.16"
+          POOL_VERSION: "2.12.0"
+          GSON_VERSION: "2.11.0"
+        run: |
+          mkdir -p /tmp/jedis-test
+          curl -sL "https://repo1.maven.org/maven2/redis/clients/jedis/${JEDIS_VERSION}/jedis-${JEDIS_VERSION}.jar" -o /tmp/jedis-test/jedis.jar
+          curl -sL "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/${SLF4J_VERSION}/slf4j-api-${SLF4J_VERSION}.jar" -o /tmp/jedis-test/slf4j-api.jar
+          curl -sL "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/${SLF4J_VERSION}/slf4j-simple-${SLF4J_VERSION}.jar" -o /tmp/jedis-test/slf4j-simple.jar
+          curl -sL "https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/${POOL_VERSION}/commons-pool2-${POOL_VERSION}.jar" -o /tmp/jedis-test/commons-pool2.jar
+          curl -sL "https://repo1.maven.org/maven2/com/google/gson/gson/${GSON_VERSION}/gson-${GSON_VERSION}.jar" -o /tmp/jedis-test/gson.jar
+          cat > /tmp/jedis-test/CompatTest.java << 'JEOF'
+          import redis.clients.jedis.Jedis;
+          import redis.clients.jedis.Pipeline;
+          import java.util.List;
+
+          public class CompatTest {
+              public static void main(String[] args) {
+                  try (Jedis jedis = new Jedis("127.0.0.1", 6399)) {
+                      // SET / GET
+                      jedis.set("java_key", "java_value");
+                      String v = jedis.get("java_key");
+                      assert "java_value".equals(v) : "GET failed";
+                      // HSET / HGET
+                      jedis.hset("java_hash", "f1", "v1");
+                      String hv = jedis.hget("java_hash", "f1");
+                      assert "v1".equals(hv) : "HGET failed";
+                      // Pipeline
+                      Pipeline p = jedis.pipelined();
+                      p.set("jp1", "pv1");
+                      p.set("jp2", "pv2");
+                      p.get("jp1");
+                      p.get("jp2");
+                      List<Object> results = p.syncAndReturnAll();
+                      assert "pv1".equals(results.get(2)) : "pipeline GET1 failed";
+                      assert "pv2".equals(results.get(3)) : "pipeline GET2 failed";
+                      System.out.println("jedis: ALL TESTS PASSED");
+                  }
+              }
+          }
+          JEOF
+          cd /tmp/jedis-test && javac -cp "jedis.jar:commons-pool2.jar:slf4j-api.jar:gson.jar" CompatTest.java
+          cd /tmp/jedis-test && java -ea -cp ".:jedis.jar:commons-pool2.jar:slf4j-api.jar:slf4j-simple.jar:gson.jar" CompatTest

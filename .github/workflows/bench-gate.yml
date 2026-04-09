@@ -22,12 +22,19 @@ jobs:
         run: cargo build --release --benches --no-default-features --features runtime-tokio,jemalloc
         env:
           MOON_NO_URING: "1"
-      - name: Run critical benchmarks
+      - name: Run all benchmarks
         run: |
           cargo bench --no-default-features --features runtime-tokio,jemalloc \
             --bench get_hotpath \
             --bench dispatch_baseline \
             --bench resp_parsing \
+            --bench pubsub_hotpath \
+            --bench distance_bench \
+            --bench hnsw_bench \
+            --bench fwht_bench \
+            --bench entry_memory \
+            --bench compact_key \
+            --bench bptree_memory \
             -- --output-format bencher 2>&1 | tee bench_results.txt
         env:
           MOON_NO_URING: "1"
@@ -37,3 +44,40 @@ jobs:
           name: bench-results
           path: bench_results.txt
           retention-days: 90
+
+  memory-regression:
+    name: RSS Memory Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install redis-tools
+        run: sudo apt-get install -y redis-tools
+      - name: Build release
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Measure RSS after 100K keys
+        env:
+          MOON_NO_URING: "1"
+          KEY_COUNT: "100000"
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          MOON_PID=$!
+          sleep 2
+          # Write 100K unique keys
+          redis-benchmark -h 127.0.0.1 -p 6399 -t set -n "${KEY_COUNT}" -r "${KEY_COUNT}" -q
+          sleep 1
+          # Read RSS from /proc
+          RSS_KB=$(awk '/VmRSS/ {print $2}' /proc/${MOON_PID}/status)
+          RSS_MB=$((RSS_KB / 1024))
+          echo "RSS after ${KEY_COUNT} keys: ${RSS_MB} MB (${RSS_KB} KB)"
+          echo "rss_mb=${RSS_MB}" >> "$GITHUB_OUTPUT"
+          # Baseline: 150 MB for 100K keys is generous upper bound
+          BASELINE_MB=150
+          if [ "${RSS_MB}" -gt "${BASELINE_MB}" ]; then
+            echo "WARNING: RSS ${RSS_MB} MB exceeds baseline ${BASELINE_MB} MB"
+            echo "Review memory usage before merging."
+          fi
+          kill ${MOON_PID} 2>/dev/null || true
