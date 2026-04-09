@@ -28,8 +28,8 @@ use std::time::Duration;
 fn start_moon(args: &[&str]) -> std::process::Child {
     Command::new("./target/release/moon")
         .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to start moon server")
 }
@@ -119,9 +119,10 @@ fn crash_test(
     }
 
     // 4. SIGKILL the server (simulates crash)
-    unsafe {
-        libc::kill(server.id() as i32, libc::SIGKILL);
-    }
+    // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
+    // SIGKILL is always valid. We check the return code for robustness.
+    let ret = unsafe { libc::kill(server.id() as i32, libc::SIGKILL) };
+    assert_eq!(ret, 0, "libc::kill failed");
     let _ = server.wait();
 
     // 5. Restart with same config
@@ -180,6 +181,7 @@ fn crash_test(
 // ── Test functions (one per matrix cell) ────────────────────────────
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

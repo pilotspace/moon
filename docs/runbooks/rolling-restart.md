@@ -11,7 +11,7 @@ downtime.
 
 ## Topology
 
-```
+```text
 [Client] --> [LB / Sentinel]
                 |
           +-----+------+
@@ -64,11 +64,24 @@ moon --port 6399 --shards 4 --replicaof primary-host 6399 &
 ### 6. Wait for sync to complete
 
 ```bash
-# Poll until replica reports sync complete
+# Poll until replica reports sync complete and replication lag is acceptable
 while true; do
-  STATUS=$(redis-cli -h replica-host -p 6399 INFO replication | grep master_link_status)
+  INFO=$(redis-cli -h replica-host -p 6399 INFO replication)
+  STATUS=$(echo "$INFO" | grep master_link_status)
   echo "$STATUS"
-  echo "$STATUS" | grep -q "up" && break
+  # Check link is up
+  echo "$STATUS" | grep -q "up" || { sleep 1; continue; }
+  # Check replication offset lag is within acceptable delta (< 1000 bytes)
+  MASTER_OFFSET=$(echo "$INFO" | grep master_repl_offset | tr -d '\r' | cut -d: -f2)
+  SLAVE_OFFSET=$(echo "$INFO" | grep slave_repl_offset | tr -d '\r' | cut -d: -f2)
+  if [ -n "$MASTER_OFFSET" ] && [ -n "$SLAVE_OFFSET" ]; then
+    LAG=$((MASTER_OFFSET - SLAVE_OFFSET))
+    echo "Replication lag: $LAG bytes"
+    [ "$LAG" -lt 1000 ] && break
+  else
+    # Offset fields not available — fall back to link status only
+    break
+  fi
   sleep 1
 done
 ```
@@ -138,7 +151,7 @@ If the upgraded node fails to start or sync:
 3. Start with the old binary
 4. Re-add to load balancer
 
-No data loss occurs because the other node was never stopped.
+Data loss risk is minimized when the replica is fully caught up before promotion. With asynchronous replication, any writes accepted by the old primary after the last acknowledged offset may be lost. The procedure above mitigates this by draining traffic before stopping each node.
 
 ## Notes
 

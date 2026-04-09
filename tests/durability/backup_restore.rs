@@ -68,16 +68,25 @@ mod tests {
 
         let before = send_command("127.0.0.1:16500", "DBSIZE");
 
-        // Trigger BGSAVE
+        // Trigger BGSAVE and poll for dump.rdb existence
         send_command("127.0.0.1:16500", "BGSAVE");
-        thread::sleep(Duration::from_secs(2));
+        let rdb_src = dir1.path().join("dump.rdb");
+        let poll_deadline =
+            std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < poll_deadline {
+            if rdb_src.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            rdb_src.exists(),
+            "dump.rdb was not created within timeout"
+        );
 
         // Copy RDB to restore dir
-        let rdb_src = dir1.path().join("dump.rdb");
         let rdb_dst = dir2.path().join("dump.rdb");
-        if rdb_src.exists() {
-            std::fs::copy(&rdb_src, &rdb_dst).expect("copy RDB");
-        }
+        std::fs::copy(&rdb_src, &rdb_dst).expect("copy RDB");
 
         // Stop primary
         send_command("127.0.0.1:16500", "SHUTDOWN NOSAVE");

@@ -48,7 +48,7 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
         # Check preceding 30 lines for #[allow — covers function-level annotations
         start=$((lineno - 30))
         if [ "$start" -lt 1 ]; then start=1; fi
-        if sed -n "${start},${lineno}p" "$file" 2>/dev/null | grep -q '#\[allow'; then
+        if sed -n "${start},${lineno}p" "$file" 2>/dev/null | grep -q '#\[allow.*clippy::unwrap_used\|#\[allow.*clippy::expect_used'; then
             continue
         fi
 

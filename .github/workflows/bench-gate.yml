@@ -38,6 +38,23 @@ jobs:
             -- --output-format bencher 2>&1 | tee bench_results.txt
         env:
           MOON_NO_URING: "1"
+      - name: Check for benchmark failures
+        run: |
+          if [ ! -s bench_results.txt ]; then
+            echo "ERROR: Benchmark output is empty — benchmarks may have failed to run."
+            exit 1
+          fi
+          # Fail if Criterion reported any errors
+          if grep -qi 'error\|panicked\|FAILED' bench_results.txt; then
+            echo "ERROR: Benchmark run contained errors:"
+            grep -i 'error\|panicked\|FAILED' bench_results.txt
+            exit 1
+          fi
+          echo "Benchmarks completed successfully."
+          # NOTE: To gate on regressions, use Criterion's --save-baseline / --baseline
+          # flags to compare against a known-good run. For example:
+          #   cargo bench ... -- --save-baseline main   (on main branch)
+          #   cargo bench ... -- --baseline main         (on PR branch, exits non-zero on regression)
       - name: Archive benchmark results
         uses: actions/upload-artifact@v4
         with:

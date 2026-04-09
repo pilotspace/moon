@@ -35,8 +35,8 @@ fn start_moon(port: u16, dir: &str) -> std::process::Child {
             "--dir",
             dir,
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to start moon server")
 }
@@ -135,6 +135,7 @@ fn verify_linearizability(addr: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
@@ -168,9 +169,10 @@ mod tests {
             }
 
             // SIGKILL the server
-            unsafe {
-                libc::kill(server.id() as i32, libc::SIGKILL);
-            }
+            // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
+            // SIGKILL is always valid. We check the return code for robustness.
+            let ret = unsafe { libc::kill(server.id() as i32, libc::SIGKILL) };
+            assert_eq!(ret, 0, "libc::kill failed");
             let _ = server.wait();
 
             // Restart and verify

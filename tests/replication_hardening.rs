@@ -37,18 +37,36 @@ fn send_cmd(addr: &str, cmd: &str) -> String {
         .expect("write");
     stream.flush().ok();
 
-    let reader = BufReader::new(&stream);
+    let mut reader = BufReader::new(&stream);
     let mut resp = String::new();
-    for line in reader.lines() {
-        match line {
-            Ok(l) => {
-                resp.push_str(&l);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches("\r\n").trim_end_matches('\n');
+                resp.push_str(trimmed);
                 resp.push('\n');
-                if l.starts_with('+') || l.starts_with('-') || l.starts_with(':') {
+                if trimmed.starts_with('+') || trimmed.starts_with('-') || trimmed.starts_with(':')
+                {
+                    break;
+                }
+                // Bulk string: $N header — read N bytes + CRLF
+                if trimmed.starts_with('$') {
+                    let len: i64 = trimmed[1..].trim().parse().unwrap_or(-1);
+                    if len < 0 {
+                        break; // $-1 = nil
+                    }
+                    let mut buf = vec![0u8; (len as usize) + 2]; // +2 for \r\n
+                    if std::io::Read::read_exact(&mut reader, &mut buf).is_ok() {
+                        let data = String::from_utf8_lossy(&buf[..len as usize]);
+                        resp.push_str(&data);
+                        resp.push('\n');
+                    }
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
     resp
@@ -70,6 +88,7 @@ fn write_keys(addr: &str, prefix: &str, n: usize) {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
@@ -103,7 +122,10 @@ mod tests {
         );
 
         // Kill replica
-        unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
+        // SIGKILL is always valid. We check the return code for robustness.
+        let ret = unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0, "libc::kill failed");
         let _ = replica.wait();
 
         // Write more data while replica is down (within backlog)
@@ -149,7 +171,10 @@ mod tests {
         thread::sleep(Duration::from_secs(3));
 
         // Kill replica with SIGKILL
-        unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
+        // SIGKILL is always valid. We check the return code for robustness.
+        let ret = unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0, "libc::kill failed");
         let _ = replica.wait();
 
         // Write more data
@@ -250,7 +275,10 @@ mod tests {
         );
 
         // Disconnect replica
-        unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        // SAFETY: `child.id()` returns a valid PID for a process we just spawned.
+        // SIGKILL is always valid. We check the return code for robustness.
+        let ret = unsafe { libc::kill(replica.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0, "libc::kill failed");
         let _ = replica.wait();
 
         // Write enough to overflow the 1KB backlog

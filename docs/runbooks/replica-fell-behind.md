@@ -42,7 +42,9 @@ redis-cli -p 6380 REPLICAOF <master_host> <master_port>
 
 ```bash
 # Option A: Increase replication backlog
-redis-cli -p 6379 CONFIG SET repl-backlog-size 64mb
+# Moon does not support runtime CONFIG SET for repl-backlog-size.
+# Restart the primary with a larger backlog via CLI argument:
+#   moon --port 6379 --shards 4 --repl-backlog-size 64mb
 
 # Option B: Rebuild replica from scratch
 redis-cli -p 6379 BGSAVE

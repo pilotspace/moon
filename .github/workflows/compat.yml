@@ -90,7 +90,7 @@ jobs:
           go-version: '1.22'
       - name: Run go-redis smoke test
         run: |
-          cat > /tmp/compat_test.go << 'GOEOF'
+          cat > /tmp/compat_smoke.go << 'GOEOF'
           package main
           import (
             "context"
@@ -110,7 +110,7 @@ jobs:
             fmt.Println("go-redis: ALL TESTS PASSED")
           }
           GOEOF
-          cd /tmp && go mod init compat && go get github.com/redis/go-redis/v9 && go run compat_test.go
+          cd /tmp && go mod init compat && go get github.com/redis/go-redis/v9 && go run compat_smoke.go
 
   ioredis:
     name: ioredis (Node.js)

@@ -75,7 +75,11 @@ jobs:
         run: cargo install cargo-cyclonedx --locked
 
       - name: Generate SBOM
-        run: cargo cyclonedx --format json --output-file artifacts/moon-sbom.json
+        run: |
+          # SBOM is generated with default features (superset of all dependency graphs).
+          # Individual matrix binaries may use a subset of these dependencies.
+          # This is intentional — a superset SBOM is conservative and covers all variants.
+          cargo cyclonedx --format json --output-file artifacts/moon-sbom.json
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
