@@ -74,6 +74,7 @@ pub enum MonoioHandlerResult {
 /// read since monoio's IoBufMut is implemented for Vec<u8>, then copy into BytesMut
 /// for codec parsing.
 #[cfg(feature = "runtime-monoio")]
+#[tracing::instrument(skip_all, level = "debug")]
 pub async fn handle_connection_sharded_monoio<
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent,
 >(

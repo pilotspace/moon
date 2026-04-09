@@ -195,6 +195,9 @@ fn main() -> anyhow::Result<()> {
         moon::replication::state::ReplicationState::new(num_shards, repl_id, repl_id2),
     ));
 
+    // Register repl_state globally for INFO command queries.
+    moon::admin::metrics_setup::set_global_repl_state(repl_state.clone());
+
     // Cluster mode initialization
     let cluster_state: Option<std::sync::Arc<std::sync::RwLock<moon::cluster::ClusterState>>> =
         if config.cluster_enabled {

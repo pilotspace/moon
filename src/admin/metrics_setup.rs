@@ -25,6 +25,7 @@ pub fn is_server_ready() -> bool {
 // (admin_port=0), so INFO always returns meaningful stats.
 static TOTAL_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter and admin HTTP server.
 ///
@@ -340,6 +341,7 @@ pub fn record_command_error(cmd: &str) {
 #[inline]
 pub fn record_connection_opened() {
     TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -350,10 +352,17 @@ pub fn record_connection_opened() {
 /// Record a client disconnection.
 #[inline]
 pub fn record_connection_closed() {
+    CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
     gauge!("moon_connected_clients").decrement(1.0);
+}
+
+/// Current number of connected clients (for INFO command).
+#[inline]
+pub fn connected_clients() -> u64 {
+    CONNECTED_CLIENTS.load(Ordering::Relaxed)
 }
 
 // ── Keyspace metrics ────────────────────────────────────────────────────
@@ -464,6 +473,32 @@ pub fn update_rss_bytes(rss: u64) {
     gauge!("moon_rss_bytes").set(rss as f64);
 }
 
+// ── Memory helpers ──────────────────────────────────────────────────────
+
+/// Read process RSS from /proc/self/status (Linux only).
+/// Returns bytes, or 0 on failure / non-Linux.
+#[cfg(target_os = "linux")]
+pub fn get_rss_bytes() -> u64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let trimmed = rest.trim();
+                if let Some(kb_str) = trimmed.strip_suffix(" kB") {
+                    if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_rss_bytes() -> u64 {
+    0
+}
+
 // ── INFO helpers ────────────────────────────────────────────────────────
 
 /// Total commands processed since server start (for INFO Stats).
@@ -504,6 +539,36 @@ pub fn get_cpu_usage() -> (f64, f64) {
 #[cfg(not(target_os = "linux"))]
 pub fn get_cpu_usage() -> (f64, f64) {
     (0.0, 0.0)
+}
+
+// ── Global replication state (for INFO) ────────────────────────────────
+
+static GLOBAL_REPL_STATE: once_cell::sync::OnceCell<
+    std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+> = once_cell::sync::OnceCell::new();
+
+/// Register the global replication state for INFO queries.
+pub fn set_global_repl_state(
+    state: std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+) {
+    let _ = GLOBAL_REPL_STATE.set(state);
+}
+
+/// Get replication info for INFO command: (role, connected_slaves, master_repl_offset, repl_id).
+pub fn get_replication_info() -> (&'static str, usize, u64, String) {
+    if let Some(state) = GLOBAL_REPL_STATE.get() {
+        if let Ok(guard) = state.read() {
+            let role = match &guard.role {
+                crate::replication::state::ReplicationRole::Master => "master",
+                crate::replication::state::ReplicationRole::Replica { .. } => "slave",
+            };
+            let slaves = guard.replicas.len();
+            let offset = guard.master_repl_offset.load(Ordering::Relaxed);
+            let repl_id = guard.repl_id.clone();
+            return (role, slaves, offset, repl_id);
+        }
+    }
+    ("master", 0, 0, "0".repeat(40))
 }
 
 // ── Global SLOWLOG ─────────────────────────────────────────────────────

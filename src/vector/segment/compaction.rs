@@ -445,6 +445,7 @@ fn add_neighbor_to_flat(
 ///
 /// Returns `Err(CompactionError::RecallTooLow)` if recall < 0.95.
 /// Returns `Err(CompactionError::EmptySegment)` if all entries are deleted.
+#[tracing::instrument(skip_all, level = "debug")]
 pub fn compact(
     frozen: &FrozenSegment,
     collection: &Arc<CollectionMetadata>,
