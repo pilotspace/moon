@@ -18,7 +18,6 @@ pub mod vector_search;
 
 use bytes::Bytes;
 
-use crate::admin::metrics_setup;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
@@ -42,22 +41,10 @@ pub fn dispatch(
     selected_db: &mut usize,
     db_count: usize,
 ) -> DispatchResult {
-    let metrics_on = metrics_setup::is_metrics_enabled();
-    let start = if metrics_on {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let result = dispatch_inner(db, cmd, args, selected_db, db_count);
-    // Always bump the atomic counter (cheap), but only compute elapsed when
-    // the Prometheus exporter is active — avoids Instant::now() syscall overhead.
-    let elapsed_us = start.map_or(0, |s| s.elapsed().as_micros() as u64);
-    let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
-    metrics_setup::record_command(cmd_str, elapsed_us);
-    if matches!(&result, DispatchResult::Response(Frame::Error(_))) {
-        metrics_setup::record_command_error(cmd_str);
-    }
-    result
+    // Metrics recording is owned by the handler layer (handler_single,
+    // handler_sharded, handler_monoio) which has the full timing context
+    // needed for slowlog. Recording here would double-count.
+    dispatch_inner(db, cmd, args, selected_db, db_count)
 }
 
 fn dispatch_inner(
@@ -738,20 +725,8 @@ pub fn dispatch_read(
     _selected_db: &mut usize,
     _db_count: usize,
 ) -> DispatchResult {
-    let metrics_on = metrics_setup::is_metrics_enabled();
-    let start = if metrics_on {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let result = dispatch_read_inner(db, cmd, args, now_ms);
-    let elapsed_us = start.map_or(0, |s| s.elapsed().as_micros() as u64);
-    let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
-    metrics_setup::record_command(cmd_str, elapsed_us);
-    if matches!(&result, DispatchResult::Response(Frame::Error(_))) {
-        metrics_setup::record_command_error(cmd_str);
-    }
-    result
+    // Metrics recording is owned by the handler layer — not here.
+    dispatch_read_inner(db, cmd, args, now_ms)
 }
 
 fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -> DispatchResult {

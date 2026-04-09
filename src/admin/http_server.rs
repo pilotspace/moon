@@ -114,7 +114,7 @@ pub fn spawn_admin_server(
                     let state = state.clone();
                     let io = hyper_util::rt::TokioIo::new(stream);
 
-                    tokio::task::spawn_local(async move {
+                    tokio::spawn(async move {
                         if let Err(e) = hyper::server::conn::http1::Builder::new()
                             .serve_connection(
                                 io,
