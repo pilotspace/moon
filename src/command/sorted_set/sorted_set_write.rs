@@ -125,9 +125,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
             if is_new {
                 added += 1;
                 changed += 1;
-            } else if existing_score
-                .is_some_and(|es| (es - score).abs() > f64::EPSILON)
-            {
+            } else if existing_score.is_some_and(|es| (es - score).abs() > f64::EPSILON) {
                 changed += 1;
             }
         }

@@ -71,18 +71,14 @@ mod tests {
         // Trigger BGSAVE and poll for dump.rdb existence
         send_command("127.0.0.1:16500", "BGSAVE");
         let rdb_src = dir1.path().join("dump.rdb");
-        let poll_deadline =
-            std::time::Instant::now() + Duration::from_secs(10);
+        let poll_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < poll_deadline {
             if rdb_src.exists() {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        assert!(
-            rdb_src.exists(),
-            "dump.rdb was not created within timeout"
-        );
+        assert!(rdb_src.exists(), "dump.rdb was not created within timeout");
 
         // Copy RDB to restore dir
         let rdb_dst = dir2.path().join("dump.rdb");

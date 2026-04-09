@@ -10,8 +10,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -180,12 +180,7 @@ mod tests {
             thread::sleep(Duration::from_secs(2));
 
             let result = verify_linearizability(ADDR);
-            assert!(
-                result.is_ok(),
-                "Cycle {}: {}",
-                cycle,
-                result.unwrap_err()
-            );
+            assert!(result.is_ok(), "Cycle {}: {}", cycle, result.unwrap_err());
 
             // Shutdown cleanly before next cycle
             let _ = send_cmd(ADDR, "SHUTDOWN NOSAVE");

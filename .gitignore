@@ -78,3 +78,5 @@ moon_*.log
 ssh
 .qdrant-initialized
 libnull.rlib
+fuzz
+shard-*/
