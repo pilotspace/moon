@@ -1,4 +1,5 @@
 #![allow(unused_imports, dead_code)]
+use atoi::FromRadix10SignedChecked;
 use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -83,7 +84,7 @@ fn parse_single_frame_zc(
         b':' => {
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
-            let n = atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+            let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
                 message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
                 offset: *pos,
             })?;
@@ -289,7 +290,7 @@ fn parse_single_frame_zc(
 fn read_decimal_zc(buf: &Bytes, pos: &mut usize) -> Result<i64, ParseError> {
     let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
     let line = &buf[*pos..crlf];
-    let n = atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+    let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
         message: format!("invalid decimal: {:?}", String::from_utf8_lossy(line)),
         offset: *pos,
     })?;
@@ -320,10 +321,10 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
         };
     }
 
-    // Helper: parse integer or bail to Frame::Null
+    // Helper: strict integer parse or bail to Frame::Null
     macro_rules! atoi_or_null {
         ($line:expr) => {
-            match atoi::atoi::<i64>($line) {
+            match strict_atoi($line) {
                 Some(n) => n,
                 None => return Frame::Null,
             }
@@ -425,24 +426,20 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
             Frame::Double(f)
         }
         b'#' => {
-            if *pos + 3 > buf.len() {
-                return Frame::Null;
-            }
+            let crlf = crlf_or_null!(buf, pos);
             let val = buf[*pos];
-            *pos += 3; // t/f + \r\n
+            *pos = crlf + 2;
             Frame::Boolean(val == b't')
         }
         b'_' => {
-            if *pos + 2 > buf.len() {
-                return Frame::Null;
-            }
-            *pos += 2; // \r\n
+            let crlf = crlf_or_null!(buf, pos);
+            *pos = crlf + 2;
             Frame::Null
         }
         b'=' => {
             let crlf = crlf_or_null!(buf, pos);
             let line = &buf[*pos..crlf];
-            let len = match atoi::atoi::<i64>(line) {
+            let len = match strict_atoi(line) {
                 Some(n) if n >= 4 => n as usize,
                 _ => return Frame::Null,
             };
@@ -500,13 +497,24 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
     }
 }
 
+/// Strict decimal parse: all bytes in the slice must be consumed by the integer.
+/// Rejects inputs like `b"5\n"` where `atoi::atoi` would silently ignore trailing bytes.
+#[inline]
+fn strict_atoi(line: &[u8]) -> Option<i64> {
+    let (val, used) = i64::from_radix_10_signed_checked(line);
+    match val {
+        Some(n) if used == line.len() => Some(n),
+        _ => None,
+    }
+}
+
 /// Read a CRLF-terminated decimal integer from buf at position pos.
 /// Advances pos past the CRLF.
 #[inline]
 fn read_decimal(buf: &[u8], pos: &mut usize) -> Result<i64, ParseError> {
     let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
     let line = &buf[*pos..crlf];
-    let n = atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+    let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
         message: format!("invalid decimal: {:?}", String::from_utf8_lossy(line)),
         offset: *pos,
     })?;
@@ -546,10 +554,10 @@ fn validate_frame(
             Ok(())
         }
         b':' => {
-            // Integer: validate parseable
+            // Integer: validate parseable (strict — all bytes must be digits)
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
-            atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+            strict_atoi(line).ok_or_else(|| ParseError::Invalid {
                 message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
                 offset: *pos,
             })?;
@@ -761,7 +769,7 @@ fn parse_single_frame(
         b':' => {
             let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
             let line = &buf[*pos..crlf];
-            let n = atoi::atoi::<i64>(line).ok_or_else(|| ParseError::Invalid {
+            let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
                 message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
                 offset: *pos,
             })?;
@@ -1468,5 +1476,36 @@ mod tests {
         // %-2\r\n is invalid
         let result = parse_bytes(b"%-2\r\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_crash_artifact_bare_lf_in_frame_count() {
+        // Crash artifact: bare \n (0x0a) in array count causes validate/zerocopy divergence
+        let data: &[u8] = &[
+            0x2a, 0x33, 0x0d, 0x0a, 0x2a, 0x35, 0x0a, 0x0d,
+            0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d, 0x0a, 0x5f,
+            0x5f, 0x5f, 0x0a, 0x3a, 0x2a, 0x30, 0x0a, 0x0d,
+            0x0a, 0x5f, 0xfe, 0xff, 0xe9, 0x0d, 0x0a, 0x5f,
+            0x5f, 0x5f, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff,
+            0x0d, 0x0a, 0x5f, 0x5f, 0x5f, 0x0a, 0x2a, 0x31,
+            0x0a, 0x0d, 0x0a, 0x5f, 0xfe, 0xff, 0xff, 0x0d,
+            0x0a, 0x5f, 0x5f, 0x0a, 0x0d, 0x0a,
+        ];
+        // Must not panic — should return Ok or Err, never crash
+        let mut buf = BytesMut::from(data);
+        let config = ParseConfig {
+            max_bulk_string_size: 64 * 1024,
+            max_array_depth: 4,
+            max_array_length: 256,
+        };
+        for _ in 0..16 {
+            if buf.is_empty() {
+                break;
+            }
+            match parse(&mut buf, &config) {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
     }
 }
