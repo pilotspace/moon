@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ringbuf::HeapCons;
@@ -65,11 +65,11 @@ impl super::Shard {
         persistence_dir: Option<String>,
         snapshot_trigger_rx: channel::WatchReceiver<u64>,
         snapshot_trigger_tx: channel::WatchSender<u64>,
-        repl_state_ext: Option<Arc<RwLock<ReplicationState>>>,
+        repl_state_ext: Option<Arc<std::sync::RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<std::sync::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
-        acl_table: Arc<RwLock<crate::acl::AclTable>>,
-        runtime_config: Arc<RwLock<RuntimeConfig>>,
+        acl_table: Arc<std::sync::RwLock<crate::acl::AclTable>>,
+        runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
         server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,
         all_notifiers: Vec<Arc<channel::Notify>>,
@@ -329,10 +329,7 @@ impl super::Shard {
         let mut snapshot_reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
 
         // Per-shard WAL writer (created only when persistence is actually enabled).
-        let appendonly_enabled = runtime_config
-            .read()
-            .map(|cfg| cfg.appendonly != "no")
-            .unwrap_or(false);
+        let appendonly_enabled = runtime_config.read().appendonly != "no";
         let mut wal_writer: Option<WalWriter> = match (&persistence_dir, appendonly_enabled) {
             (Some(dir), true) => match WalWriter::new(shard_id, std::path::Path::new(dir)) {
                 Ok(w) => {
@@ -533,7 +530,7 @@ impl super::Shard {
         // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
         let mut repl_backlog: Option<ReplicationBacklog> = None;
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
-        let repl_state: Option<Arc<RwLock<ReplicationState>>> = repl_state_ext;
+        let repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>> = repl_state_ext;
 
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();

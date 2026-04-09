@@ -26,7 +26,7 @@ pub fn handle_acl(
     acl_log: &mut AclLog,
     current_user: &str,
     _client_addr: &str,
-    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
 ) -> Frame {
     let sub = match sub_and_args.first().and_then(|f| extract_str(f)) {
         Some(s) => s.to_ascii_uppercase(),
@@ -275,9 +275,7 @@ pub fn handle_acl(
         }
 
         "SAVE" => {
-            let Ok(cfg) = runtime_config.read() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal config error"));
-            };
+            let cfg = runtime_config.read();
             let aclfile = cfg.aclfile.clone();
             drop(cfg);
             match aclfile {
@@ -307,9 +305,7 @@ pub fn handle_acl(
         }
 
         "LOAD" => {
-            let Ok(cfg) = runtime_config.read() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal config error"));
-            };
+            let cfg = runtime_config.read();
             let aclfile = cfg.aclfile.clone();
             drop(cfg);
             match aclfile {
@@ -370,7 +366,7 @@ mod tests {
     }
 
     fn make_runtime_config() -> Arc<RwLock<RuntimeConfig>> {
-        Arc::new(RwLock::new(RuntimeConfig::default()))
+        Arc::new(parking_lot::RwLock::new(RuntimeConfig::default()))
     }
 
     #[test]
@@ -631,7 +627,7 @@ mod tests {
         let aclfile = dir.path().join("test.acl");
         let aclfile_str = aclfile.to_str().unwrap().to_string();
 
-        let rc = Arc::new(RwLock::new(RuntimeConfig {
+        let rc = Arc::new(parking_lot::RwLock::new(RuntimeConfig {
             aclfile: Some(aclfile_str.clone()),
             ..RuntimeConfig::default()
         }));

@@ -96,7 +96,7 @@ pub async fn handle_connection_sharded(
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
     acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
@@ -261,7 +261,7 @@ pub async fn handle_connection_sharded_inner<
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
     acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
@@ -299,10 +299,7 @@ pub async fn handle_connection_sharded_inner<
         mut current_user,
         client_name_restored,
     ) = restore_migrated_state(migrated_state, &requirepass);
-    let acl_max_len = runtime_config
-        .read()
-        .map(|cfg| cfg.acllog_max_len)
-        .unwrap_or(128);
+    let acl_max_len = runtime_config.read().acllog_max_len;
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Transaction (MULTI/EXEC) connection-local state
@@ -1386,8 +1383,7 @@ pub async fn handle_connection_sharded_inner<
                         // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
-                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                            let rt = runtime_config.read().unwrap();
+                            let rt = runtime_config.read();
                             let mut guard = shard_databases.write_db(shard_id, selected_db);
                             if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
                                 drop(guard);

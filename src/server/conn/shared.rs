@@ -1,6 +1,8 @@
 #[cfg(feature = "runtime-tokio")]
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use bytes::Bytes;
 #[cfg(feature = "runtime-tokio")]
@@ -45,14 +47,10 @@ pub(crate) fn handle_config(
     let sub_args = &args[1..];
 
     if subcmd.eq_ignore_ascii_case(b"GET") {
-        let Ok(rt) = runtime_config.read() else {
-            return Frame::Error(Bytes::from_static(b"ERR internal config error"));
-        };
+        let rt = runtime_config.read();
         config_cmd::config_get(&rt, server_config, sub_args)
     } else if subcmd.eq_ignore_ascii_case(b"SET") {
-        let Ok(mut rt) = runtime_config.write() else {
-            return Frame::Error(Bytes::from_static(b"ERR internal config error"));
-        };
+        let mut rt = runtime_config.write();
         config_cmd::config_set(&mut rt, sub_args)
     } else {
         Frame::Error(Bytes::from(format!(

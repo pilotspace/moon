@@ -63,7 +63,7 @@ pub async fn handle_connection(
     aof_tx: Option<channel::MpscSender<AofMessage>>,
     change_counter: Option<Arc<AtomicU64>>,
     pubsub_registry: Arc<Mutex<PubSubRegistry>>,
-    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     tracking_table: Arc<Mutex<TrackingTable>>,
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
@@ -79,10 +79,7 @@ pub async fn handle_connection(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let acl_max_len = runtime_config
-        .read()
-        .map(|cfg| cfg.acllog_max_len)
-        .unwrap_or(128);
+    let acl_max_len = runtime_config.read().acllog_max_len;
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Pub/Sub connection-local state
@@ -676,8 +673,7 @@ pub async fn handle_connection(
                                 let db_count = db.len();
                                 for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
                                     if is_write {
-                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                        let rt = runtime_config.read().unwrap();
+                                        let rt = runtime_config.read();
                                         if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                             responses[resp_idx] = oom_frame;
                                             continue;
@@ -1115,8 +1111,7 @@ pub async fn handle_connection(
                                     guard.refresh_now();
                                 }
                                 let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
-                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                let rt = runtime_config.read().unwrap();
+                                let rt = runtime_config.read();
                                 if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                     responses[resp_idx] = oom_frame;
                                     continue;

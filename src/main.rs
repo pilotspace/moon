@@ -194,8 +194,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Build shared runtime config for sharded handlers
-    let runtime_config_shared: std::sync::Arc<std::sync::RwLock<moon::config::RuntimeConfig>> =
-        { std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config())) };
+    let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
+        { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 
