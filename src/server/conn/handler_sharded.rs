@@ -182,6 +182,7 @@ pub async fn handle_connection_sharded(
                         let mut pending = Some(returned_msg);
                         for _ in 0..8 {
                             tokio::task::yield_now().await;
+                            #[allow(clippy::unwrap_used)] // pending is always re-filled on retry via Err(returned_msg)
                             let msg = pending.take().unwrap();
                             let push_result = {
                                 let mut producers = dispatch_tx.borrow_mut();
@@ -339,6 +340,7 @@ pub async fn handle_connection_sharded_inner<
     loop {
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if subscription_count > 0 {
+            #[allow(clippy::unwrap_used)] // pubsub_rx is always Some when subscription_count > 0
             let rx = pubsub_rx.as_mut().unwrap();
             tokio::select! {
                 n = stream.read_buf(&mut read_buf) => {
@@ -361,6 +363,7 @@ pub async fn handle_connection_sharded_inner<
                                         }
                                         for arg in cmd_args {
                                             if let Some(ch) = extract_bytes(arg) {
+                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                 let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
                                                 if let Some(reason) = acl_deny {
                                                     let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
@@ -369,6 +372,7 @@ pub async fn handle_connection_sharded_inner<
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                     continue;
                                                 }
+                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 { pubsub_registry.write().subscribe(ch.clone(), sub); }
                                                 subscription_count += 1;
@@ -395,6 +399,7 @@ pub async fn handle_connection_sharded_inner<
                                         }
                                         for arg in cmd_args {
                                             if let Some(pat) = extract_bytes(arg) {
+                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                 let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, pat.as_ref()) };
                                                 if let Some(reason) = acl_deny {
                                                     let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
@@ -403,6 +408,7 @@ pub async fn handle_connection_sharded_inner<
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                     continue;
                                                 }
+                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 { pubsub_registry.write().psubscribe(pat.clone(), sub); }
                                                 subscription_count += 1;
@@ -653,6 +659,7 @@ pub async fn handle_connection_sharded_inner<
                     // --- CLUSTER subcommands ---
                     if cmd.eq_ignore_ascii_case(b"CLUSTER") {
                         if let Some(ref cs) = cluster_state {
+                            #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
                             let self_addr: std::net::SocketAddr =
                                 format!("127.0.0.1:{}", config_port)
                                     .parse()
@@ -717,6 +724,7 @@ pub async fn handle_connection_sharded_inner<
                             let maybe_key = extract_primary_key(cmd, cmd_args);
                             if let Some(key) = maybe_key {
                                 let slot = crate::cluster::slots::slot_for_key(key);
+                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                 let route = cs.read().unwrap().route_slot(slot, was_asking);
                                 match route {
                                     crate::cluster::SlotRoute::Local => {}
@@ -783,6 +791,7 @@ pub async fn handle_connection_sharded_inner<
                     // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
                     // so that low-privilege users cannot reach admin commands.
                     {
+                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                         let acl_guard = acl_table.read().unwrap();
                         if let Some(deny_reason) = acl_guard.check_command_permission(&current_user, cmd, cmd_args) {
                             drop(acl_guard);
@@ -1046,6 +1055,7 @@ pub async fn handle_connection_sharded_inner<
                             let message_arg = extract_bytes(&cmd_args[1]);
                             // ACL channel permission check for PUBLISH
                             if let Some(ref ch) = channel_arg {
+                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                 let acl_guard = acl_table.read().unwrap();
                                 if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
                                     drop(acl_guard);
@@ -1119,6 +1129,7 @@ pub async fn handle_connection_sharded_inner<
                         // Process subscribe arguments
                         for arg in cmd_args {
                             if let Some(ch) = extract_bytes(arg) {
+                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                 let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
                                 if let Some(reason) = acl_deny {
                                     write_buf.clear();
@@ -1127,6 +1138,7 @@ pub async fn handle_connection_sharded_inner<
                                     if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
                                     continue;
                                 }
+                                #[allow(clippy::unwrap_used)] // pubsub_tx is set to Some just above before this loop
                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                 if is_pattern {
                                     { pubsub_registry.write().psubscribe(ch.clone(), sub); }
@@ -1360,6 +1372,7 @@ pub async fn handle_connection_sharded_inner<
                         // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
+                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             let rt = runtime_config.read().unwrap();
                             let mut guard = shard_databases.write_db(shard_id, selected_db);
                             if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {

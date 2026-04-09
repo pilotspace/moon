@@ -428,6 +428,7 @@ pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
 /// Renames key to newkey. Returns an error when key does not exist.
 /// If source and destination are the same, returns OK without deleting.
 /// Overwrites destination if it exists. Preserves TTL.
+#[allow(clippy::unwrap_used)] // remove() after exists() check — key guaranteed present
 pub fn rename(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
         return err_wrong_args("RENAME");
@@ -462,6 +463,7 @@ pub fn rename(db: &mut Database, args: &[Frame]) -> Frame {
 ///
 /// Renames key to newkey only if newkey does not exist.
 /// Returns 1 if renamed, 0 if newkey already exists.
+#[allow(clippy::unwrap_used)] // remove() after exists() check — key guaranteed present
 pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
         return err_wrong_args("RENAMENX");

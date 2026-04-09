@@ -95,6 +95,8 @@ impl ResponseSlot {
             // SAFETY: Acquire load confirmed FILLED, which happens-after the producer's
             // Release store, so the UnsafeCell data write is visible. Single consumer
             // (connection owner) ensures no concurrent read.
+            // Atomic state == FILLED guarantees fill() wrote Some(data); see fill().
+            #[allow(clippy::unwrap_used)]
             let data = unsafe { (*self.data.get()).take().unwrap() };
             self.state.store(EMPTY, Ordering::Release);
             return Poll::Ready(data);
@@ -109,6 +111,7 @@ impl ResponseSlot {
         if state == FILLED {
             // SAFETY: Same reasoning as fast path above — Acquire load confirmed FILLED,
             // ensuring the producer's data write is visible. Single consumer, no aliasing.
+            #[allow(clippy::unwrap_used)] // fill() always writes Some before FILLED transition
             let data = unsafe { (*self.data.get()).take().unwrap() };
             self.state.store(EMPTY, Ordering::Release);
             return Poll::Ready(data);

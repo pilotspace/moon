@@ -423,6 +423,7 @@ pub async fn run_sharded(
 
     // Ctrl+C handler -- ctrlc crate sets handler on OS thread, signals our token
     let shutdown_signal = shutdown.clone();
+    #[allow(clippy::expect_used)] // Startup: no recovery possible without signal handler
     ctrlc::set_handler(move || {
         info!("Shutdown signal received");
         shutdown_signal.cancel();

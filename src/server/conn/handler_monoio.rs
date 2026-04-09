@@ -191,6 +191,7 @@ pub async fn handle_connection_sharded_monoio<
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if subscription_count > 0 {
+            #[allow(clippy::unwrap_used)] // pubsub_rx is always Some when subscription_count > 0
             let rx = pubsub_rx.as_ref().unwrap();
             let sub_tmp_buf = vec![0u8; 8192];
             monoio::select! {
@@ -224,6 +225,7 @@ pub async fn handle_connection_sharded_monoio<
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             // ACL channel permission check
                                                             let denied = {
+                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                                 let acl_guard = acl_table.read().unwrap();
                                                                 acl_guard.check_channel_permission(&current_user, channel.as_ref())
                                                             };
@@ -236,6 +238,7 @@ pub async fn handle_connection_sharded_monoio<
                                                                 if wr.is_err() { return (MonoioHandlerResult::Done, None); }
                                                                 continue;
                                                             }
+                                                            #[allow(clippy::unwrap_used)] // pubsub_tx is always Some when in subscriber mode
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.write().subscribe(channel.clone(), sub);
                                                             propagate_subscription(&all_remote_sub_maps, &channel, shard_id, num_shards, false);
@@ -310,6 +313,7 @@ pub async fn handle_connection_sharded_monoio<
                                                         if let Some(pattern) = extract_bytes(arg) {
                                                             // ACL channel permission check
                                                             let denied = {
+                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                                 let acl_guard = acl_table.read().unwrap();
                                                                 acl_guard.check_channel_permission(&current_user, pattern.as_ref())
                                                             };
@@ -322,6 +326,7 @@ pub async fn handle_connection_sharded_monoio<
                                                                 if wr.is_err() { return (MonoioHandlerResult::Done, None); }
                                                                 continue;
                                                             }
+                                                            #[allow(clippy::unwrap_used)] // pubsub_tx is always Some when in subscriber mode
                                                             let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                             pubsub_registry.write().psubscribe(pattern.clone(), sub);
                                                             propagate_subscription(&all_remote_sub_maps, &pattern, shard_id, num_shards, true);
@@ -614,6 +619,7 @@ pub async fn handle_connection_sharded_monoio<
             // --- CLUSTER subcommands ---
             if cmd.eq_ignore_ascii_case(b"CLUSTER") {
                 if let Some(ref cs) = cluster_state {
+                    #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
                     let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", config_port)
                         .parse()
                         .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
@@ -704,6 +710,7 @@ pub async fn handle_connection_sharded_monoio<
                     let maybe_key = extract_primary_key(cmd, cmd_args);
                     if let Some(key) = maybe_key {
                         let slot = crate::cluster::slots::slot_for_key(key);
+                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                         let route = cs.read().unwrap().route_slot(slot, was_asking);
                         match route {
                             crate::cluster::SlotRoute::Local => {} // proceed
@@ -979,6 +986,7 @@ pub async fn handle_connection_sharded_monoio<
                     // ACL channel permission check for PUBLISH
                     if let Some(ref ch) = channel {
                         let denied = {
+                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             let acl_guard = acl_table.read().unwrap();
                             acl_guard.check_channel_permission(&current_user, ch.as_ref())
                         };
@@ -1056,6 +1064,7 @@ pub async fn handle_connection_sharded_monoio<
                     if let Some(ch) = extract_bytes(arg) {
                         // ACL channel permission check
                         {
+                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             let acl_guard = acl_table.read().unwrap();
                             if let Some(deny_reason) =
                                 acl_guard.check_channel_permission(&current_user, ch.as_ref())
@@ -1067,6 +1076,7 @@ pub async fn handle_connection_sharded_monoio<
                                 continue;
                             }
                         }
+                        #[allow(clippy::unwrap_used)] // pubsub_tx is set to Some just above before this loop
                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                         if is_pattern {
                             pubsub_registry.write().psubscribe(ch.clone(), sub);
@@ -1220,6 +1230,7 @@ pub async fn handle_connection_sharded_monoio<
             // === ACL permission check (NOPERM gate) ===
             // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
             {
+                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                 let acl_guard = acl_table.read().unwrap();
                 if let Some(deny_reason) =
                     acl_guard.check_command_permission(&current_user, cmd, cmd_args)
@@ -1558,6 +1569,7 @@ pub async fn handle_connection_sharded_monoio<
                     // WRITE PATH: eviction + dispatch under write lock.
                     // When disk offload is enabled, use async spill: evicted keys
                     // are sent to SpillThread for background pwrite to NVMe.
+                    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                     let rt = runtime_config.read().unwrap();
                     let mut guard = shard_databases.write_db(shard_id, selected_db);
                     let evict_result = if let Some(ref sender) = spill_sender {

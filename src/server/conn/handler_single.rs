@@ -111,6 +111,7 @@ pub async fn handle_connection(
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if subscription_count > 0 {
+            #[allow(clippy::unwrap_used)] // pubsub_rx is always Some when subscription_count > 0
             let rx = pubsub_rx.as_mut().unwrap();
             tokio::select! {
                 result = framed.next() => {
@@ -129,6 +130,7 @@ pub async fn handle_connection(
                                             if let Some(channel) = extract_bytes(arg) {
                                                 // ACL channel permission check
                                                 let deny = {
+                                                    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                     let acl_guard = acl_table.read().unwrap();
                                                     acl_guard.check_channel_permission(&current_user, channel.as_ref())
                                                 };
@@ -136,6 +138,7 @@ pub async fn handle_connection(
                                                     let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
                                                     continue;
                                                 }
+                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().subscribe(channel.clone(), sub);
                                                 subscription_count += 1;
@@ -187,6 +190,7 @@ pub async fn handle_connection(
                                             if let Some(pattern) = extract_bytes(arg) {
                                                 // ACL channel permission check
                                                 let deny = {
+                                                    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                     let acl_guard = acl_table.read().unwrap();
                                                     acl_guard.check_channel_permission(&current_user, pattern.as_ref())
                                                 };
@@ -194,6 +198,7 @@ pub async fn handle_connection(
                                                     let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
                                                     continue;
                                                 }
+                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
                                                 let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                                 pubsub_registry.lock().psubscribe(pattern.clone(), sub);
                                                 subscription_count += 1;
@@ -671,12 +676,14 @@ pub async fn handle_connection(
                                 let db_count = db.len();
                                 for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
                                     if is_write {
+                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                         let rt = runtime_config.read().unwrap();
                                         if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                             responses[resp_idx] = oom_frame;
                                             continue;
                                         }
                                     }
+                                    #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
                                     let (response, quit) = match result {
@@ -740,6 +747,7 @@ pub async fn handle_connection(
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
                                         // ACL channel permission check
                                         let deny = {
+                                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                             let acl_guard = acl_table.read().unwrap();
                                             acl_guard.check_channel_permission(&current_user, channel_or_pattern.as_ref()).map(|r| r.to_string())
                                         };
@@ -747,6 +755,7 @@ pub async fn handle_connection(
                                             let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
                                             continue;
                                         }
+                                        #[allow(clippy::unwrap_used)] // pubsub_tx is set to Some just above before this loop
                                         let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
                                         {
                                             let mut registry = pubsub_registry.lock();
@@ -893,6 +902,7 @@ pub async fn handle_connection(
                         // === ACL permission check (NOPERM gate) ===
                         // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled via continue above.
                         // All remaining commands must pass through the permission gate.
+                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                         if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
                             &current_user, cmd, cmd_args,
                         ) {
@@ -915,6 +925,7 @@ pub async fn handle_connection(
                         // === ACL key pattern check ===
                         {
                             let is_write = metadata::is_write(cmd);
+                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             if let Some(deny_reason) = acl_table.read().unwrap().check_key_permission(
                                 &current_user, cmd, cmd_args, is_write,
                             ) {
@@ -1048,6 +1059,7 @@ pub async fn handle_connection(
                                     guard = db[current_db].read();
                                 }
                                 let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
+                                #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
 
                                 // FT.* read commands (FT.SEARCH, FT.INFO)
@@ -1103,12 +1115,14 @@ pub async fn handle_connection(
                                     guard.refresh_now();
                                 }
                                 let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
+                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                 let rt = runtime_config.read().unwrap();
                                 if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                     responses[resp_idx] = oom_frame;
                                     continue;
                                 }
                                 drop(rt);
+                                #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
 
                                 // FT.* vector commands: dispatch to VectorStore directly

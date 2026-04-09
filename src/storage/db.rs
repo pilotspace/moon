@@ -496,6 +496,7 @@ impl Database {
 
     /// Check if a key exists, performing lazy expiration.
     /// Optimized: single lookup via get instead of check_expired + contains_key.
+    #[allow(clippy::unwrap_used)] // remove() after get() returned Some — key guaranteed present
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -620,6 +621,7 @@ impl Database {
     ///
     /// New keys start with compact listpack encoding and are upgraded to
     /// full HashMap on first mutable access (eager upgrade).
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_hash(&mut self, key: &[u8]) -> Result<&mut HashMap<Bytes, Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -670,6 +672,7 @@ impl Database {
 
     /// Get a hash entry (read-only). Returns None if key missing, Err if wrong type.
     /// Upgrades compact encoding to full HashMap if found.
+    #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -696,6 +699,7 @@ impl Database {
 
     /// Get or create a list entry. Returns mutable ref to inner VecDeque.
     /// New keys start with full encoding. Upgrades compact listpack on access.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_list(&mut self, key: &[u8]) -> Result<&mut VecDeque<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -724,6 +728,7 @@ impl Database {
 
     /// Get a list entry (read-only). Returns None if key missing, Err if wrong type.
     /// Upgrades compact encoding to full VecDeque if found.
+    #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -750,6 +755,7 @@ impl Database {
 
     /// Get or create a set entry. Returns mutable ref to inner HashSet.
     /// New keys start with full encoding. Upgrades compact encodings on access.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; as_redis_value_mut() on known type
     pub fn get_or_create_set(&mut self, key: &[u8]) -> Result<&mut HashSet<Bytes>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -785,6 +791,7 @@ impl Database {
 
     /// Get a set entry (read-only). Returns None if key missing, Err if wrong type.
     /// Upgrades compact encodings to full HashSet if found.
+    #[allow(clippy::unwrap_used)] // as_redis_value_mut() on known compact type during upgrade
     pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -820,6 +827,7 @@ impl Database {
     /// Returns Err if the key exists but holds a non-set type.
     /// Returns Ok(None) if the key exists but is not an intset (caller should use get_or_create_set).
     /// Returns Ok(Some(&mut Intset)) if the key holds or was created as an intset.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
@@ -844,6 +852,7 @@ impl Database {
 
     /// Upgrade an intset entry to a full HashSet and return mutable ref.
     /// Panics if the key doesn't exist or isn't a SetIntset.
+    #[allow(clippy::unwrap_used)] // caller guarantees key exists and is SetIntset; upgrade is infallible
     pub fn upgrade_intset_to_set(&mut self, key: &[u8]) -> &mut HashSet<Bytes> {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -864,6 +873,7 @@ impl Database {
     /// Returns Ok(Some(&mut Listpack)) if the key is a HashListpack.
     /// Returns Ok(None) if the key already holds a full Hash (caller should fall through).
     /// Returns Err(WRONGTYPE) if the key holds a non-hash type.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_hash_listpack(
         &mut self,
         key: &[u8],
@@ -891,6 +901,7 @@ impl Database {
 
     /// Upgrade a HashListpack to full Hash. Returns mutable ref to the HashMap.
     /// Panics if the key doesn't exist or isn't a HashListpack.
+    #[allow(clippy::unwrap_used)] // caller guarantees key exists and is HashListpack; upgrade is infallible
     pub fn upgrade_hash_listpack_to_hash(&mut self, key: &[u8]) -> &mut HashMap<Bytes, Bytes> {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -911,6 +922,7 @@ impl Database {
     /// Returns Ok(Some(&mut Listpack)) if the key is a ListListpack.
     /// Returns Ok(None) if the key already holds a full List (caller should fall through).
     /// Returns Err(WRONGTYPE) if the key holds a non-list type.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_list_listpack(
         &mut self,
         key: &[u8],
@@ -938,6 +950,7 @@ impl Database {
 
     /// Upgrade a ListListpack to full List. Returns mutable ref to the VecDeque.
     /// Panics if the key doesn't exist or isn't a ListListpack.
+    #[allow(clippy::unwrap_used)] // caller guarantees key exists and is ListListpack; upgrade is infallible
     pub fn upgrade_list_listpack_to_list(&mut self, key: &[u8]) -> &mut VecDeque<Bytes> {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
@@ -958,6 +971,7 @@ impl Database {
     ///
     /// New keys start with SortedSetBPTree encoding. Legacy SortedSet (BTreeMap)
     /// entries are upgraded to SortedSetBPTree on access for backward compatibility.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present; legacy upgrade is infallible
     pub fn get_or_create_sorted_set(
         &mut self,
         key: &[u8],
@@ -996,6 +1010,7 @@ impl Database {
     }
 
     /// Get a sorted set entry (read-only). Returns None if key missing, Err if wrong type.
+    #[allow(clippy::unwrap_used)] // get_mut() after confirmed existence; legacy BTreeMap upgrade is infallible
     pub fn get_sorted_set(
         &mut self,
         key: &[u8],
@@ -1355,6 +1370,7 @@ impl Database {
     }
 
     /// Get or create a stream at the given key. Returns WRONGTYPE if key holds another type.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_stream(&mut self, key: &[u8]) -> Result<&mut StreamData, Frame> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;

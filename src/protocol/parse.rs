@@ -297,6 +297,7 @@ fn read_decimal_zc(buf: &Bytes, pos: &mut usize) -> Result<i64, ParseError> {
 /// Zero-copy frame extraction from a frozen `Bytes` buffer.
 /// Called AFTER validation succeeds, so all bounds are guaranteed safe.
 /// Uses `bytes.slice(start..end)` for zero-copy sub-slicing (Arc refcount bump only).
+#[allow(clippy::unwrap_used)] // Post-validation: pass 1 guarantees all CRLF/atoi succeed; divergence caught by cargo-fuzz
 fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, depth: usize) -> Frame {
     let type_byte = buf[*pos];
     *pos += 1;

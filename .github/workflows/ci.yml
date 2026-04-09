@@ -46,6 +46,16 @@ jobs:
         env:
           MOON_NO_URING: "1"
 
+  safety-audit:
+    name: Safety Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Audit unsafe blocks for SAFETY comments
+        run: bash scripts/audit-unsafe.sh
+      - name: Audit unwrap/expect ratchet
+        run: bash scripts/audit-unwrap.sh
+
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
