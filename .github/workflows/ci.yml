@@ -93,6 +93,26 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  redis-compat:
+    name: Redis Compat
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Run redis_compat integration tests
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+          cargo test --release --no-default-features --features runtime-tokio,jemalloc --test redis_compat -- --ignored
+        timeout-minutes: 5
+        env:
+          MOON_NO_URING: "1"
+
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
