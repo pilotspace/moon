@@ -365,6 +365,40 @@ pub fn connected_clients() -> u64 {
     CONNECTED_CLIENTS.load(Ordering::Relaxed)
 }
 
+/// Try to open a connection if under the maxclients limit.
+/// Returns true if the connection was accepted, false if at limit.
+/// When maxclients is 0, the limit is disabled (unlimited).
+#[inline]
+pub fn try_accept_connection(maxclients: usize) -> bool {
+    if maxclients == 0 {
+        record_connection_opened();
+        return true;
+    }
+    // CAS loop: only increment if under limit
+    let mut current = CONNECTED_CLIENTS.load(Ordering::Relaxed);
+    loop {
+        if current >= maxclients as u64 {
+            return false;
+        }
+        match CONNECTED_CLIENTS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+                if METRICS_INITIALIZED.load(Ordering::Relaxed) {
+                    counter!("moon_connections_total").increment(1);
+                    gauge!("moon_connected_clients").increment(1.0);
+                }
+                return true;
+            }
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 // ── Keyspace metrics ────────────────────────────────────────────────────
 
 /// Record keyspace hit/miss.

@@ -67,12 +67,17 @@ use super::{
 /// connection level same as the non-sharded handler.
 #[tracing::instrument(skip_all, level = "debug")]
 pub(crate) async fn handle_connection_sharded(
-    stream: TcpStream,
+    mut stream: TcpStream,
     ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
     client_id: u64,
 ) {
-    crate::admin::metrics_setup::record_connection_opened();
+    let maxclients = ctx.runtime_config.read().maxclients;
+    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.write_all(b"-ERR max number of clients reached\r\n").await;
+        return;
+    }
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())

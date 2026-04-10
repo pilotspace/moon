@@ -138,6 +138,7 @@ pub(crate) fn spawn_tokio_connection(
     let all_regs = all_pubsub_registries.to_vec();
     let all_rsm = all_remote_sub_maps.to_vec();
     let reqpass = rtcfg.read().requirepass.clone();
+    let maxclients_tokio = rtcfg.read().maxclients;
     let clk = cached_clock.clone();
 
     // Construct ConnectionContext from cloned shared state
@@ -178,7 +179,13 @@ pub(crate) fn spawn_tokio_connection(
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "unknown".to_string());
+        let maxclients = maxclients_tokio;
         tokio::task::spawn_local(async move {
+            // maxclients check for TLS connections (plain TCP checks in handle_connection_sharded)
+            if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                tracing::warn!("Shard {}: TLS connection rejected: maxclients reached", shard_id);
+                return;
+            }
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
@@ -198,6 +205,7 @@ pub(crate) fn spawn_tokio_connection(
                     tracing::warn!("Shard {}: TLS handshake failed: {}", shard_id, e);
                 }
             }
+            crate::admin::metrics_setup::record_connection_closed();
         });
     } else {
         // Plain TCP connection
@@ -460,10 +468,15 @@ pub(crate) fn spawn_monoio_connection(
                 spill_fid, do_dir,
             );
 
+            let maxclients = conn_ctx.runtime_config.read().maxclients;
             if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
                 // Load current TLS config from ArcSwap — new connections see reloaded certs
                 let tls_cfg = tls_swap.load_full();
                 monoio::spawn(async move {
+                    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                        tracing::warn!("Shard {}: TLS connection rejected: maxclients reached", shard_id);
+                        return;
+                    }
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
@@ -488,6 +501,7 @@ pub(crate) fn spawn_monoio_connection(
                             );
                         }
                     }
+                    crate::admin::metrics_setup::record_connection_closed();
                 });
             } else {
                 // Plain TCP connection
@@ -496,6 +510,10 @@ pub(crate) fn spawn_monoio_connection(
                 #[cfg(target_os = "linux")]
                 let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
+                    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                        tracing::warn!("Shard {}: connection rejected: maxclients reached", shard_id);
+                        return;
+                    }
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
@@ -552,6 +570,15 @@ pub(crate) fn spawn_monoio_connection(
                                 }
                             }
                         }
+                    }
+
+                    // Decrement connected_clients unless connection was migrated (stays alive on target shard)
+                    #[cfg(target_os = "linux")]
+                    let migrated = matches!(_result.0, crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { .. });
+                    #[cfg(not(target_os = "linux"))]
+                    let migrated = false;
+                    if !migrated {
+                        crate::admin::metrics_setup::record_connection_closed();
                     }
                 });
             }
