@@ -14,7 +14,7 @@ pub mod planner;
 
 pub use ast::{CypherQuery, Clause, Expr};
 pub use parser::{CypherError, Parser};
-pub use planner::{PhysicalPlan, PlanCache};
+pub use planner::{CostEstimate, PhysicalPlan, PlanCache, Strategy};
 
 /// Parse a Cypher query from a byte slice.
 ///

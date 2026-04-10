@@ -338,12 +338,18 @@ pub fn graph_ro_query(store: &GraphStore, args: &[Frame]) -> Frame {
 /// GRAPH.EXPLAIN <graph> <cypher_string>
 ///
 /// Returns the execution plan without running the query.
-pub fn graph_explain(args: &[Frame]) -> Frame {
+/// Includes cost-based strategy selection when graph stats are available.
+pub fn graph_explain(store: &GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.EXPLAIN' command",
         ));
     }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
 
     let cypher_bytes = match extract_bulk(&args[1]) {
         Some(b) => b,
@@ -375,7 +381,47 @@ pub fn graph_explain(args: &[Frame]) -> Frame {
         output.push_str(&format!("{i}: {op:?}"));
     }
 
+    // Append cost-based strategy selection if graph exists.
+    if let Some(graph) = store.get_graph(graph_name) {
+        let stats = &graph.stats;
+
+        // Extract traversal parameters from the plan operators.
+        let hops = extract_max_hops(&plan);
+        let k = 10u32; // Default k for vector search.
+        let dim = 128u32; // Default dimension estimate.
+
+        let estimate = cypher::planner::select_strategy(
+            stats,
+            1,     // start_nodes (single seed)
+            hops,
+            k,
+            dim,
+            None, // No specific start node degree without node ID.
+        );
+
+        output.push_str(&format!(
+            "\n--- Cost Estimation ---\nStrategy: {}\nGraph-first cost: {:.1}\nVector-first cost: {:.1}\nHub detected: {}",
+            estimate.strategy,
+            estimate.graph_first_cost,
+            estimate.vector_first_cost,
+            estimate.hub_detected,
+        ));
+    }
+
     Frame::BulkString(Bytes::from(output))
+}
+
+/// Extract the maximum hop count from Expand operators in a physical plan.
+fn extract_max_hops(plan: &cypher::planner::PhysicalPlan) -> u32 {
+    let mut max_hops = 1u32;
+    for op in &plan.operators {
+        if let cypher::planner::PhysicalOp::Expand { max_hops: mh, .. } = op {
+            if *mh > max_hops {
+                max_hops = *mh;
+            }
+        }
+    }
+    max_hops
 }
 
 // ---------------------------------------------------------------------------

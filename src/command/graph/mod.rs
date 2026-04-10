@@ -51,7 +51,7 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
         graph_ro_query(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
-        graph_explain(args)
+        graph_explain(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
         graph_vsearch(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
@@ -84,7 +84,7 @@ pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
         graph_ro_query(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
-        graph_explain(args)
+        graph_explain(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
         graph_vsearch(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
