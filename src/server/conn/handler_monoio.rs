@@ -111,6 +111,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
     let mut tmp_buf = vec![0u8; 8192];
 
+    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
+    let idle_timeout_secs = ctx.runtime_config.read().timeout;
+    let idle_timeout = if idle_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(idle_timeout_secs))
+    } else {
+        None
+    };
+
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
     let mut responses: Vec<Frame> = Vec::with_capacity(64);
@@ -387,18 +395,34 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if tmp_buf.len() < 8192 {
             tmp_buf.resize(8192, 0);
         }
-        let (result, returned_buf) = stream.read(tmp_buf).await;
-        tmp_buf = returned_buf;
-        match result {
-            Ok(0) => {
-                // Client half-closed — break out of loop.
-                // Stream drop (end of function) triggers monoio's cleanup.
-                break;
+        if let Some(dur) = idle_timeout {
+            // Timeout-aware read: select between read and sleep.
+            // monoio::select! drops the losing future, so tmp_buf ownership transfers.
+            // We allocate a fresh buffer when timeout is enabled (safety feature, not hot path).
+            let timeout_buf = std::mem::take(&mut tmp_buf);
+            monoio::select! {
+                read_result = stream.read(timeout_buf) => {
+                    let (result, returned_buf) = read_result;
+                    tmp_buf = returned_buf;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                _ = monoio::time::sleep(dur) => {
+                    tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
+                    break;
+                }
             }
-            Ok(n) => {
-                read_buf.extend_from_slice(&tmp_buf[..n]);
+        } else {
+            let (result, returned_buf) = stream.read(tmp_buf).await;
+            tmp_buf = returned_buf;
+            match result {
+                Ok(0) => break,
+                Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
 
         // Inline dispatch: handle GET/SET directly from raw bytes without Frame

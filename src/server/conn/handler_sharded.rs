@@ -234,6 +234,14 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Pre-allocated response slots for zero-allocation cross-shard dispatch.
     let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
+    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
+    let idle_timeout_secs = ctx.runtime_config.read().timeout;
+    let idle_timeout = if idle_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(idle_timeout_secs))
+    } else {
+        None
+    };
+
     let mut break_outer = false;
     loop {
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
@@ -442,10 +450,23 @@ pub(crate) async fn handle_connection_sharded_inner<
             continue;
         }
         tokio::select! {
-            result = stream.read_buf(&mut read_buf) => {
+            result = async {
+                if let Some(dur) = idle_timeout {
+                    match tokio::time::timeout(dur, stream.read_buf(&mut read_buf)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
+                    }
+                } else {
+                    stream.read_buf(&mut read_buf).await
+                }
+            } => {
                 match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
+                        break;
+                    }
                     Err(_) => break,
                 }
 
