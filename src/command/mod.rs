@@ -94,6 +94,12 @@ fn dispatch_inner(
             }
         }
         // 4-letter commands
+        (4, b'c') => {
+            // COPY
+            if cmd.eq_ignore_ascii_case(b"COPY") {
+                return resp(key::copy(db, args));
+            }
+        }
         (4, b'd') => {
             // DECR
             if cmd.eq_ignore_ascii_case(b"DECR") {

@@ -498,6 +498,70 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(1)
 }
 
+/// COPY source destination [DB destination-db] [REPLACE]
+///
+/// Copies the value stored at the source key to the destination key.
+/// Returns 1 if source was copied, 0 if destination already exists without REPLACE.
+pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("COPY");
+    }
+    let src = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("COPY"),
+    };
+    let dst = match extract_key(&args[1]) {
+        Some(k) => k,
+        None => return err_wrong_args("COPY"),
+    };
+
+    // Parse optional arguments: DB destination-db, REPLACE
+    let mut replace = false;
+    let mut i = 2;
+    while i < args.len() {
+        let arg = match extract_key(&args[i]) {
+            Some(k) => k,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        if arg.eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+            i += 1;
+        } else if arg.eq_ignore_ascii_case(b"DB") {
+            // Cross-DB copy requires shard_databases context not available here
+            return Frame::Error(Bytes::from_static(
+                b"ERR COPY with DB option is not supported yet",
+            ));
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+    }
+
+    // Check if source exists (with lazy expiry)
+    if !db.exists(src) {
+        return Frame::Error(Bytes::from_static(b"ERR no such key"));
+    }
+
+    // Same key: no data to copy, but it's valid
+    if src == dst {
+        return Frame::Integer(1);
+    }
+
+    // Check if destination exists
+    if db.exists(dst) && !replace {
+        return Frame::Integer(0);
+    }
+
+    // Clone the source entry (CompactEntry derives Clone)
+    let entry = db.get(src).cloned();
+    if let Some(cloned) = entry {
+        db.set(Bytes::copy_from_slice(dst), cloned);
+        Frame::Integer(1)
+    } else {
+        // Source expired between exists() and get() — race with lazy expiry
+        Frame::Error(Bytes::from_static(b"ERR no such key"))
+    }
+}
+
 /// Check if a value is large enough to warrant async drop.
 fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
     use crate::storage::compact_value::RedisValueRef;
@@ -1468,5 +1532,59 @@ mod tests {
             },
             _ => panic!("Expected array"),
         }
+    }
+
+    // --- COPY tests ---
+
+    #[test]
+    fn test_copy_basic() {
+        let mut db = setup_db_with_key(b"src", b"hello");
+        let result = copy(&mut db, &[bs(b"src"), bs(b"dst")]);
+        assert_eq!(result, Frame::Integer(1));
+        assert!(db.exists(b"src"));
+        assert!(db.exists(b"dst"));
+    }
+
+    #[test]
+    fn test_copy_dest_exists_no_replace() {
+        let mut db = setup_db_with_key(b"src", b"hello");
+        db.set(
+            Bytes::from_static(b"dst"),
+            Entry::new_string(Bytes::from_static(b"existing")),
+        );
+        let result = copy(&mut db, &[bs(b"src"), bs(b"dst")]);
+        assert_eq!(result, Frame::Integer(0));
+    }
+
+    #[test]
+    fn test_copy_with_replace() {
+        let mut db = setup_db_with_key(b"src", b"hello");
+        db.set(
+            Bytes::from_static(b"dst"),
+            Entry::new_string(Bytes::from_static(b"existing")),
+        );
+        let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"REPLACE")]);
+        assert_eq!(result, Frame::Integer(1));
+    }
+
+    #[test]
+    fn test_copy_nonexistent_source() {
+        let mut db = Database::new();
+        let result = copy(&mut db, &[bs(b"nosuchkey"), bs(b"dst")]);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_copy_same_key() {
+        let mut db = setup_db_with_key(b"src", b"hello");
+        let result = copy(&mut db, &[bs(b"src"), bs(b"src")]);
+        assert_eq!(result, Frame::Integer(1));
+    }
+
+    #[test]
+    fn test_copy_db_option_errors() {
+        let mut db = setup_db_with_key(b"src", b"hello");
+        let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"DB")]);
+        assert!(matches!(result, Frame::Error(_)));
     }
 }

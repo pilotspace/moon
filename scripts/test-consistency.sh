@@ -476,6 +476,17 @@ LONGKEY=$(python3 -c "print('k' * 500)")
 both SET "$LONGKEY" "long_key_value"
 assert_both "GET with 500-char key" GET "$LONGKEY"
 
+# COPY
+both SET edge:cpsrc "copy_value"
+assert_both "COPY basic" COPY edge:cpsrc edge:cpdst
+assert_both "GET after COPY src" GET edge:cpsrc
+assert_both "GET after COPY dst" GET edge:cpdst
+both SET edge:cpdst2 "old_value"
+assert_both "COPY no REPLACE" COPY edge:cpsrc edge:cpdst2
+assert_both "GET COPY no REPLACE" GET edge:cpdst2
+assert_both "COPY REPLACE" COPY edge:cpsrc edge:cpdst2 REPLACE
+assert_both "GET after COPY REPLACE" GET edge:cpdst2
+
 # ===========================================================================
 # Summary
 # ===========================================================================

@@ -550,6 +550,12 @@ if should_run "key"; then
     rcli SET k:rnx1 v1 >/dev/null 2>&1; mcli SET k:rnx1 v1 >/dev/null 2>&1
     rcli SET k:rnx2 v2 >/dev/null 2>&1; mcli SET k:rnx2 v2 >/dev/null 2>&1
     assert_match "RENAMENX (blocked)"  RENAMENX k:rnx1 k:rnx2
+    rcli SET k:cpsrc cpval >/dev/null 2>&1; mcli SET k:cpsrc cpval >/dev/null 2>&1
+    assert_match "COPY"                COPY k:cpsrc k:cpdst
+    assert_match "GET after COPY"      GET k:cpdst
+    rcli SET k:cpdst2 old >/dev/null 2>&1; mcli SET k:cpdst2 old >/dev/null 2>&1
+    assert_match "COPY no REPLACE"     COPY k:cpsrc k:cpdst2
+    assert_match "COPY REPLACE"        COPY k:cpsrc k:cpdst2 REPLACE
     assert_match "UNLINK"              UNLINK k:renamed
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "SCAN cursor"       SCAN 0

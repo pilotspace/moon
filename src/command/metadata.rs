@@ -686,6 +686,7 @@ mod tests {
             b"PERSIST",
             b"RENAME",
             b"RENAMENX",
+            b"COPY",
             b"HSET",
             b"HMSET",
             b"HDEL",
