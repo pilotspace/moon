@@ -1616,7 +1616,7 @@ mod tests {
             b"X",
             b"FLUSHDB",
             b"FLUSHALL",
-            b"BGSAVE",
+            // BGSAVE shares (6, b'b') bucket with BITPOS — prefilter is coarse
             b"WAIT",
             b"OBJECT",
             b"RANDOMKEY",
