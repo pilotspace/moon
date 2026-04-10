@@ -39,6 +39,7 @@
 
 pub mod acl;
 pub mod admin;
+pub mod auth_ratelimit;
 pub mod blocking;
 pub mod cluster;
 pub mod command;

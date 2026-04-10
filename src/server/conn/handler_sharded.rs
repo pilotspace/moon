@@ -494,6 +494,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
 
+                // Track if AUTH rate limiting delay is needed (applied after batch response)
+                let mut auth_delay_ms: u64 = 0;
+
                 for frame in batch {
                     // --- AUTH gate ---
                     if !conn.authenticated {
@@ -503,7 +506,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
                                     conn.current_user = uname;
+                                    // Clear rate limiter on success
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        crate::auth_ratelimit::record_success(addr.ip());
+                                    }
                                 } else {
+                                    // Rate limit: record failure and get delay
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                                    }
                                     conn.acl_log.push(crate::acl::AclLogEntry {
                                         reason: "auth".to_string(),
                                         object: "AUTH".to_string(),
@@ -681,7 +692,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- AUTH (already conn.authenticated) ---
                     if cmd.eq_ignore_ascii_case(b"AUTH") {
                         let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                        if let Some(uname) = opt_user { conn.current_user = uname; }
+                        if let Some(uname) = opt_user {
+                            conn.current_user = uname;
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                            auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -1603,6 +1621,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 arena.reset();
+
+                // AUTH rate limiting: delay response to slow down brute-force attacks
+                if auth_delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(auth_delay_ms)).await;
+                }
 
                 write_buf.clear();
                 for response in &responses {

@@ -494,6 +494,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             guard.refresh_now_from_cache(&ctx.cached_clock);
         }
 
+        let mut auth_delay_ms: u64 = 0;
+
         for frame in frames.drain(..) {
             // --- AUTH gate ---
             if !conn.authenticated {
@@ -503,7 +505,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if let Some(uname) = opt_user {
                             conn.authenticated = true;
                             conn.current_user = uname;
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
                         } else {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                            }
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "auth".to_string(),
                                 object: "AUTH".to_string(),
@@ -714,6 +722,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                 if let Some(uname) = opt_user {
                     conn.current_user = uname;
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        crate::auth_ratelimit::record_success(addr.ip());
+                    }
+                } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                    auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
                 }
                 responses.push(response);
                 continue;
@@ -2014,6 +2027,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     responses[resp_idx] = resp;
                 }
             }
+        }
+
+        // AUTH rate limiting: delay response to slow down brute-force attacks
+        if auth_delay_ms > 0 {
+            monoio::time::sleep(std::time::Duration::from_millis(auth_delay_ms)).await;
         }
 
         // Serialize all responses into write_buf, then do ONE write_all syscall.
