@@ -3,6 +3,7 @@
 //! Feature-gated under `graph` so the default build is unaffected.
 
 pub mod compaction;
+pub mod cypher;
 pub mod csr;
 pub mod index;
 pub mod memgraph;
@@ -22,5 +23,6 @@ pub use scoring::{CompositeScorer, DistanceScorer, TemporalDecayScorer, Weighted
 pub use segment::GraphSegmentHolder;
 pub use store::GraphStore;
 pub use traversal::{BoundedBfs, BoundedDfs, DijkstraTraversal, SegmentMergeReader};
+pub use cypher::{parse_cypher, is_read_only, CypherQuery, CypherError};
 pub use index::{EdgeTypeIndex, LabelIndex, MphNodeIndex, PropertyIndex};
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};

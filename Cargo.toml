@@ -70,6 +70,7 @@ monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 cudarc = { version = "0.12", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
 slotmap = "1"
 boomphf = "0.6"
+logos = { version = "0.14", optional = true }
 
 [features]
 # Platform-aware defaults:
@@ -89,7 +90,7 @@ simd-avx512 = []
 # OpenTelemetry exporter: reserves feature namespace for OTLP trace export.
 # When wired, will gate tracing-opentelemetry + opentelemetry-otlp dependencies.
 otel = []
-graph = []
+graph = ["dep:logos"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
