@@ -5,6 +5,7 @@
 //! Edge deletions use a Roaring validity bitmap without modifying CSR arrays.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use roaring::RoaringBitmap;
 use slotmap::Key;
@@ -13,13 +14,22 @@ use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::memgraph::FrozenMemGraph;
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 
-/// Errors from CSR construction.
+/// Errors from CSR construction or deserialization.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CsrError {
     /// Input graph has zero nodes.
     EmptyGraph,
     /// Edge references a node that does not exist in the frozen set.
     InvalidNodeRef,
+    /// CRC32 checksum mismatch on load -- data is corrupted.
+    ChecksumMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    /// Data too short or structurally invalid.
+    InvalidData(String),
+    /// I/O error description (not std::io::Error to keep PartialEq).
+    IoError(String),
 }
 
 /// Immutable CSR graph segment.
@@ -361,6 +371,202 @@ impl CsrSegment {
 
         buf
     }
+
+    /// Write CSR segment bytes to a file.
+    pub fn write_to_file(&self, path: &Path) -> Result<(), CsrError> {
+        let bytes = self.to_bytes();
+        std::fs::write(path, &bytes).map_err(|e| CsrError::IoError(e.to_string()))
+    }
+
+    /// Reconstruct a CsrSegment from serialized bytes (as produced by `to_bytes()`).
+    ///
+    /// Validates the CRC32 checksum. Returns `CsrError::ChecksumMismatch` on corruption.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, CsrError> {
+        let header_size = core::mem::size_of::<GraphSegmentHeader>(); // 128
+        if data.len() < header_size {
+            return Err(CsrError::InvalidData("data shorter than header".to_owned()));
+        }
+
+        // Parse header fields.
+        let magic: [u8; 4] = data[0..4]
+            .try_into()
+            .map_err(|_| CsrError::InvalidData("bad magic".to_owned()))?;
+        if magic != *b"MNGR" {
+            return Err(CsrError::InvalidData(format!(
+                "bad magic: {:?}",
+                magic
+            )));
+        }
+
+        let version = u32::from_le_bytes(read4(data, 4)?);
+        let node_count = u32::from_le_bytes(read4(data, 8)?);
+        let edge_count = u32::from_le_bytes(read4(data, 12)?);
+        let min_node_id = u64::from_le_bytes(read8(data, 16)?);
+        let max_node_id = u64::from_le_bytes(read8(data, 24)?);
+        let _ro_offset = u64::from_le_bytes(read8(data, 32)?);
+        let _ci_offset = u64::from_le_bytes(read8(data, 40)?);
+        let _em_offset = u64::from_le_bytes(read8(data, 48)?);
+        let _vb_offset = u64::from_le_bytes(read8(data, 56)?);
+        let created_lsn = u64::from_le_bytes(read8(data, 64)?);
+        let stored_checksum = u64::from_le_bytes(read8(data, 72)?);
+
+        // Validate CRC32.
+        let computed_checksum = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&node_count.to_le_bytes());
+            hasher.update(&edge_count.to_le_bytes());
+            hasher.update(&created_lsn.to_le_bytes());
+            hasher.finalize() as u64
+        };
+        if stored_checksum != computed_checksum {
+            return Err(CsrError::ChecksumMismatch {
+                expected: stored_checksum,
+                actual: computed_checksum,
+            });
+        }
+
+        let nc = node_count as usize;
+        let ec = edge_count as usize;
+        let em_elem_size = core::mem::size_of::<EdgeMeta>(); // 8
+        let nm_elem_size = core::mem::size_of::<NodeMeta>(); // 32
+
+        let expected_len =
+            header_size + (nc + 1) * 4 + ec * 4 + ec * em_elem_size + nc * nm_elem_size;
+        if data.len() < expected_len {
+            return Err(CsrError::InvalidData(format!(
+                "data too short: {} < {}",
+                data.len(),
+                expected_len
+            )));
+        }
+
+        // Parse row_offsets.
+        let mut pos = header_size;
+        let mut row_offsets = Vec::with_capacity(nc + 1);
+        for _ in 0..=nc {
+            row_offsets.push(u32::from_le_bytes(read4(data, pos)?));
+            pos += 4;
+        }
+
+        // Parse col_indices.
+        let mut col_indices = Vec::with_capacity(ec);
+        for _ in 0..ec {
+            col_indices.push(u32::from_le_bytes(read4(data, pos)?));
+            pos += 4;
+        }
+
+        // Parse edge_meta.
+        let mut edge_meta = Vec::with_capacity(ec);
+        for _ in 0..ec {
+            let edge_type = u16::from_le_bytes(read2(data, pos)?);
+            let flags = u16::from_le_bytes(read2(data, pos + 2)?);
+            let property_offset = u32::from_le_bytes(read4(data, pos + 4)?);
+            edge_meta.push(EdgeMeta {
+                edge_type,
+                flags,
+                property_offset,
+            });
+            pos += em_elem_size;
+        }
+
+        // Parse node_meta.
+        let mut node_meta = Vec::with_capacity(nc);
+        for _ in 0..nc {
+            let external_id = u64::from_le_bytes(read8(data, pos)?);
+            let label_bitmap = u32::from_le_bytes(read4(data, pos + 8)?);
+            let property_offset = u32::from_le_bytes(read4(data, pos + 12)?);
+            let nm_created_lsn = u64::from_le_bytes(read8(data, pos + 16)?);
+            let deleted_lsn = u64::from_le_bytes(read8(data, pos + 24)?);
+            node_meta.push(NodeMeta {
+                external_id,
+                label_bitmap,
+                property_offset,
+                created_lsn: nm_created_lsn,
+                deleted_lsn,
+            });
+            pos += nm_elem_size;
+        }
+
+        // Rebuild validity bitmap: all edges valid (fresh load).
+        let mut validity = RoaringBitmap::new();
+        for i in 0..ec as u32 {
+            validity.insert(i);
+        }
+
+        // Rebuild node_id_to_row from node_meta external_id.
+        // The external_id is the raw u64 from NodeKey::data().as_ffi().
+        // We need to reconstruct NodeKey from the u64 -- use KeyData::from_ffi.
+        let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(nc);
+        let mut sorted_keys = Vec::with_capacity(nc);
+        for (row, nm) in node_meta.iter().enumerate() {
+            let key_data = slotmap::KeyData::from_ffi(nm.external_id);
+            let nk = NodeKey::from(key_data);
+            node_id_to_row.insert(nk, row as u32);
+            sorted_keys.push(nk);
+        }
+
+        // Rebuild indexes.
+        let mph = MphNodeIndex::build(&sorted_keys);
+        let label_index = LabelIndex::build(&node_meta);
+        let edge_type_index = EdgeTypeIndex::build(&edge_meta);
+
+        let header = GraphSegmentHeader {
+            magic,
+            version,
+            node_count,
+            edge_count,
+            min_node_id,
+            max_node_id,
+            row_offsets_offset: _ro_offset,
+            col_indices_offset: _ci_offset,
+            edge_meta_offset: _em_offset,
+            validity_bitmap_offset: _vb_offset,
+            created_lsn,
+            checksum: stored_checksum,
+        };
+
+        Ok(Self {
+            header,
+            row_offsets,
+            col_indices,
+            edge_meta,
+            node_meta,
+            validity,
+            node_id_to_row,
+            mph,
+            label_index,
+            edge_type_index,
+            created_lsn,
+        })
+    }
+
+    /// Load a CsrSegment from a file, validating its CRC32 checksum.
+    pub fn from_file(path: &Path) -> Result<Self, CsrError> {
+        let data =
+            std::fs::read(path).map_err(|e| CsrError::IoError(e.to_string()))?;
+        Self::from_bytes(&data)
+    }
+}
+
+/// Read 2 bytes from `data` at `offset`.
+fn read2(data: &[u8], offset: usize) -> Result<[u8; 2], CsrError> {
+    data.get(offset..offset + 2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| CsrError::InvalidData(format!("read2 out of bounds at {offset}")))
+}
+
+/// Read 4 bytes from `data` at `offset`.
+fn read4(data: &[u8], offset: usize) -> Result<[u8; 4], CsrError> {
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| CsrError::InvalidData(format!("read4 out of bounds at {offset}")))
+}
+
+/// Read 8 bytes from `data` at `offset`.
+fn read8(data: &[u8], offset: usize) -> Result<[u8; 8], CsrError> {
+    data.get(offset..offset + 8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| CsrError::InvalidData(format!("read8 out of bounds at {offset}")))
 }
 
 #[cfg(test)]
@@ -602,5 +808,84 @@ mod tests {
 
         let type1 = csr.edges_by_type(row0, 1);
         assert_eq!(type1.len(), 3); // one less
+    }
+
+    // --- Phase 121: File I/O and persistence tests ---
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip() {
+        let frozen = build_small_graph();
+        let original = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
+        let bytes = original.to_bytes();
+        let restored = CsrSegment::from_bytes(&bytes).expect("from_bytes ok");
+
+        assert_eq!(restored.header.magic, *b"MNGR");
+        assert_eq!(restored.header.version, 1);
+        assert_eq!(restored.node_count(), original.node_count());
+        assert_eq!(restored.edge_count(), original.edge_count());
+        assert_eq!(restored.created_lsn, 42);
+        assert_eq!(restored.row_offsets, original.row_offsets);
+        assert_eq!(restored.col_indices, original.col_indices);
+
+        // Verify neighbor queries still work.
+        for row in 0..restored.node_count() {
+            assert_eq!(
+                restored.neighbors_out(row),
+                original.neighbors_out(row)
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_to_file_from_file_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let frozen = build_small_graph();
+        let original = CsrSegment::from_frozen(frozen, 55).expect("csr ok");
+
+        let path = dir.path().join("test_segment.csr");
+        original.write_to_file(&path).expect("write ok");
+        let restored = CsrSegment::from_file(&path).expect("from_file ok");
+
+        assert_eq!(restored.node_count(), original.node_count());
+        assert_eq!(restored.edge_count(), original.edge_count());
+        assert_eq!(restored.created_lsn, 55);
+    }
+
+    #[test]
+    fn test_from_bytes_checksum_mismatch() {
+        let frozen = build_small_graph();
+        let csr = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
+        let mut bytes = csr.to_bytes();
+
+        // Corrupt the checksum at offset 72 (checksum field).
+        bytes[72] ^= 0xFF;
+
+        let result = CsrSegment::from_bytes(&bytes);
+        match result {
+            Err(CsrError::ChecksumMismatch { .. }) => {} // expected
+            other => panic!("expected ChecksumMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_from_bytes_truncated_data() {
+        let result = CsrSegment::from_bytes(&[0u8; 10]);
+        assert!(matches!(result, Err(CsrError::InvalidData(_))));
+    }
+
+    #[test]
+    fn test_from_bytes_bad_magic() {
+        let frozen = build_small_graph();
+        let csr = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
+        let mut bytes = csr.to_bytes();
+        bytes[0] = b'X'; // corrupt magic
+        let result = CsrSegment::from_bytes(&bytes);
+        assert!(matches!(result, Err(CsrError::InvalidData(_))));
+    }
+
+    #[test]
+    fn test_from_file_nonexistent() {
+        let result = CsrSegment::from_file(Path::new("/nonexistent/segment.csr"));
+        assert!(matches!(result, Err(CsrError::IoError(_))));
     }
 }

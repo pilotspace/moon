@@ -4,8 +4,11 @@
 //! Zero memory when no graphs exist.
 
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::graph::index::PropertyIndex;
 use crate::graph::segment::GraphSegmentHolder;
@@ -121,6 +124,61 @@ impl GraphStore {
             None => 0,
         }
     }
+
+    /// Serialize graph metadata (names, thresholds, LSNs) to a JSON file.
+    ///
+    /// This captures enough information to recreate the GraphStore structure
+    /// on recovery. Actual graph data lives in CSR segment files and WAL.
+    pub fn save_metadata(&self, path: &Path) -> io::Result<()> {
+        let entries: Vec<GraphMetadataEntry> = match &self.graphs {
+            Some(map) => map
+                .values()
+                .map(|g| GraphMetadataEntry {
+                    name: String::from_utf8_lossy(&g.name).into_owned(),
+                    edge_threshold: g.edge_threshold,
+                    created_lsn: g.created_lsn,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let meta = GraphStoreMetadata { graphs: entries };
+        let json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json.as_bytes())
+    }
+
+    /// Load graph metadata from a JSON file and recreate graph shells.
+    ///
+    /// This creates empty NamedGraph entries (with fresh MemGraphs).
+    /// CSR segments and WAL data are loaded separately during recovery.
+    pub fn load_metadata(path: &Path) -> io::Result<Self> {
+        let data = std::fs::read(path)?;
+        let meta: GraphStoreMetadata = serde_json::from_slice(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut store = Self::new();
+        for entry in &meta.graphs {
+            let name = Bytes::from(entry.name.clone());
+            // Ignore duplicate errors (shouldn't happen from valid metadata).
+            let _ = store.create_graph(name, entry.edge_threshold, entry.created_lsn);
+        }
+        Ok(store)
+    }
+}
+
+/// Serializable graph metadata entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphMetadataEntry {
+    name: String,
+    edge_threshold: usize,
+    created_lsn: u64,
+}
+
+/// Top-level graph store metadata for JSON serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphStoreMetadata {
+    graphs: Vec<GraphMetadataEntry>,
 }
 
 #[cfg(test)]
@@ -213,5 +271,50 @@ mod tests {
 
         let g = store.get_graph(b"mutable").expect("exists");
         assert_eq!(g.edge_threshold, 2000);
+    }
+
+    // --- Phase 121: Metadata persistence tests ---
+
+    #[test]
+    fn test_save_load_metadata_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"social"), 64_000, 10)
+            .expect("ok");
+        store
+            .create_graph(Bytes::from_static(b"knowledge"), 32_000, 20)
+            .expect("ok");
+
+        let path = dir.path().join("graph_meta.json");
+        store.save_metadata(&path).expect("save ok");
+
+        let restored = GraphStore::load_metadata(&path).expect("load ok");
+        assert_eq!(restored.graph_count(), 2);
+
+        let g = restored.get_graph(b"social").expect("exists");
+        assert_eq!(g.edge_threshold, 64_000);
+        assert_eq!(g.created_lsn, 10);
+
+        let g = restored.get_graph(b"knowledge").expect("exists");
+        assert_eq!(g.edge_threshold, 32_000);
+        assert_eq!(g.created_lsn, 20);
+    }
+
+    #[test]
+    fn test_save_load_empty_store() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let store = GraphStore::new();
+        let path = dir.path().join("empty_meta.json");
+        store.save_metadata(&path).expect("save ok");
+
+        let restored = GraphStore::load_metadata(&path).expect("load ok");
+        assert_eq!(restored.graph_count(), 0);
+    }
+
+    #[test]
+    fn test_load_metadata_missing_file() {
+        let result = GraphStore::load_metadata(std::path::Path::new("/nonexistent/meta.json"));
+        assert!(result.is_err());
     }
 }
