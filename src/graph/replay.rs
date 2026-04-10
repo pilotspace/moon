@@ -383,40 +383,67 @@ impl GraphReplayCollector {
     }
 }
 
+/// Take the MemGraph out of the segment holder for mutation during replay.
+/// Swaps in `None` for the mutable segment, returning the owned MemGraph.
+fn take_memgraph(
+    graph: &mut crate::graph::store::NamedGraph,
+) -> (MemGraph, Vec<std::sync::Arc<crate::graph::csr::CsrSegment>>) {
+    use crate::graph::segment::GraphSegmentList;
+
+    // Clone the immutable list and extract the mutable Arc
+    let old_list = graph.segments.load().as_ref().clone();
+    let immutable = old_list.immutable;
+
+    // Swap in a list with no mutable segment to release the ArcSwap's reference
+    graph.segments.swap(GraphSegmentList {
+        mutable: None,
+        immutable: immutable.clone(),
+    });
+
+    // Now the only remaining Arc reference is in old_list.mutable
+    let mg = match old_list.mutable {
+        Some(arc_mg) => match std::sync::Arc::try_unwrap(arc_mg) {
+            Ok(mg) => mg,
+            Err(_arc) => {
+                // Fallback: create fresh MemGraph (shouldn't happen at startup)
+                tracing::warn!("MemGraph Arc has extra owners during replay, creating fresh");
+                MemGraph::new(graph.edge_threshold)
+            }
+        },
+        None => MemGraph::new(graph.edge_threshold),
+    };
+
+    (mg, immutable)
+}
+
+/// Put the MemGraph back into the segment holder after mutation.
+fn put_memgraph(
+    graph: &mut crate::graph::store::NamedGraph,
+    mg: MemGraph,
+    immutable: Vec<std::sync::Arc<crate::graph::csr::CsrSegment>>,
+) {
+    use crate::graph::segment::GraphSegmentList;
+    graph.segments.swap(GraphSegmentList {
+        mutable: Some(std::sync::Arc::new(mg)),
+        immutable,
+    });
+}
+
 /// Add a node to the graph's mutable MemGraph segment.
 /// Returns the NodeKey if successful.
 ///
-/// During single-threaded replay, we unwrap the Arc<MemGraph> to get exclusive
-/// access, add the node, then wrap it back. This is safe because replay runs
-/// at startup before any concurrent readers exist.
+/// During single-threaded replay, we take the MemGraph out of the segment holder,
+/// mutate it, and put it back. This is safe because replay runs at startup before
+/// any concurrent readers exist.
 fn add_node_to_graph(
     graph: &mut crate::graph::store::NamedGraph,
     labels: &SmallVec<[u16; 4]>,
     properties: &PropertyMap,
     embedding: &Option<Vec<f32>>,
 ) -> Option<crate::graph::types::NodeKey> {
-    use crate::graph::segment::GraphSegmentList;
-
-    let old_list = graph.segments.load().as_ref().clone();
-
-    let mut mg = match old_list.mutable {
-        Some(arc_mg) => match std::sync::Arc::try_unwrap(arc_mg) {
-            Ok(mg) => mg,
-            Err(_) => {
-                tracing::warn!("MemGraph Arc has multiple owners during replay");
-                return None;
-            }
-        },
-        None => MemGraph::new(graph.edge_threshold),
-    };
-
+    let (mut mg, immutable) = take_memgraph(graph);
     let nk = mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
-
-    graph.segments.swap(GraphSegmentList {
-        mutable: Some(std::sync::Arc::new(mg)),
-        immutable: old_list.immutable,
-    });
-
+    put_memgraph(graph, mg, immutable);
     Some(nk)
 }
 
@@ -429,27 +456,11 @@ fn add_edge_to_graph(
     weight: f64,
     properties: &Option<PropertyMap>,
 ) -> bool {
-    use crate::graph::segment::GraphSegmentList;
-
-    let old_list = graph.segments.load().as_ref().clone();
-
-    let mut mg = match old_list.mutable {
-        Some(arc_mg) => match std::sync::Arc::try_unwrap(arc_mg) {
-            Ok(mg) => mg,
-            Err(_) => return false,
-        },
-        None => return false,
-    };
-
+    let (mut mg, immutable) = take_memgraph(graph);
     let ok = mg
         .add_edge(src, dst, edge_type, weight, properties.clone(), 0)
         .is_ok();
-
-    graph.segments.swap(GraphSegmentList {
-        mutable: Some(std::sync::Arc::new(mg)),
-        immutable: old_list.immutable,
-    });
-
+    put_memgraph(graph, mg, immutable);
     ok
 }
 
@@ -458,25 +469,9 @@ fn remove_node_from_graph(
     graph: &mut crate::graph::store::NamedGraph,
     node_key: crate::graph::types::NodeKey,
 ) -> bool {
-    use crate::graph::segment::GraphSegmentList;
-
-    let old_list = graph.segments.load().as_ref().clone();
-
-    let mut mg = match old_list.mutable {
-        Some(arc_mg) => match std::sync::Arc::try_unwrap(arc_mg) {
-            Ok(mg) => mg,
-            Err(_) => return false,
-        },
-        None => return false,
-    };
-
+    let (mut mg, immutable) = take_memgraph(graph);
     let ok = mg.remove_node(node_key, 0);
-
-    graph.segments.swap(GraphSegmentList {
-        mutable: Some(std::sync::Arc::new(mg)),
-        immutable: old_list.immutable,
-    });
-
+    put_memgraph(graph, mg, immutable);
     ok
 }
 
