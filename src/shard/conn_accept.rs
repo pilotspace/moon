@@ -567,11 +567,14 @@ pub(crate) fn spawn_monoio_connection(
                     // Handle migration result: extract FD via dup() and send via SPSC.
                     // libc::dup is only available on Linux (target-specific dependency).
                     #[cfg(target_os = "linux")]
+                    let mut _migrated = false;
+                    #[cfg(target_os = "linux")]
                     if let (crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (_result.0, _result.1) {
                         use std::os::unix::io::{AsRawFd, FromRawFd};
                         use ringbuf::traits::Producer;
                         use crate::shard::mesh::ChannelMesh;
 
+                        _migrated = true;
                         let raw_fd = stream.as_raw_fd();
                         // SAFETY: raw_fd is a valid open socket fd from the monoio TcpStream.
                         // dup() creates a new, independent fd that we take ownership of.
@@ -611,12 +614,11 @@ pub(crate) fn spawn_monoio_connection(
 
                     // Decrement connected_clients unless connection was migrated (stays alive on target shard)
                     #[cfg(target_os = "linux")]
-                    let migrated = matches!(_result.0, crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { .. });
-                    #[cfg(not(target_os = "linux"))]
-                    let migrated = false;
-                    if !migrated {
+                    if !_migrated {
                         crate::admin::metrics_setup::record_connection_closed();
                     }
+                    #[cfg(not(target_os = "linux"))]
+                    crate::admin::metrics_setup::record_connection_closed();
                 });
             }
         }
