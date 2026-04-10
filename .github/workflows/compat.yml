@@ -349,3 +349,120 @@ jobs:
           JEOF
           cd /tmp/jedis-test && javac -cp "jedis.jar:commons-pool2.jar:slf4j-api.jar:gson.jar" CompatTest.java
           cd /tmp/jedis-test && java -ea -cp ".:jedis.jar:commons-pool2.jar:slf4j-api.jar:slf4j-simple.jar:gson.jar" CompatTest
+
+  lettuce:
+    name: lettuce (Java)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (tokio)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Start Moon
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+        env:
+          MOON_NO_URING: "1"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Run lettuce smoke test
+        env:
+          LETTUCE_VERSION: "6.5.2.RELEASE"
+          NETTY_VERSION: "4.1.116.Final"
+          REACTOR_VERSION: "3.7.2"
+          REACTIVE_STREAMS_VERSION: "1.0.4"
+        run: |
+          mkdir -p /tmp/lettuce-test
+          curl -sL "https://repo1.maven.org/maven2/io/lettuce/lettuce-core/${LETTUCE_VERSION}/lettuce-core-${LETTUCE_VERSION}.jar" -o /tmp/lettuce-test/lettuce-core.jar
+          curl -sL "https://repo1.maven.org/maven2/io/netty/netty-all/${NETTY_VERSION}/netty-all-${NETTY_VERSION}.jar" -o /tmp/lettuce-test/netty-all.jar
+          curl -sL "https://repo1.maven.org/maven2/io/projectreactor/reactor-core/${REACTOR_VERSION}/reactor-core-${REACTOR_VERSION}.jar" -o /tmp/lettuce-test/reactor-core.jar
+          curl -sL "https://repo1.maven.org/maven2/org/reactivestreams/reactive-streams/${REACTIVE_STREAMS_VERSION}/reactive-streams-${REACTIVE_STREAMS_VERSION}.jar" -o /tmp/lettuce-test/reactive-streams.jar
+          cat > /tmp/lettuce-test/LettuceTest.java << 'LEOF'
+          import io.lettuce.core.RedisClient;
+          import io.lettuce.core.api.StatefulRedisConnection;
+          import io.lettuce.core.api.sync.RedisCommands;
+          public class LettuceTest {
+              public static void main(String[] args) {
+                  RedisClient client = RedisClient.create("redis://127.0.0.1:6399");
+                  try (StatefulRedisConnection<String, String> conn = client.connect()) {
+                      RedisCommands<String, String> cmd = conn.sync();
+                      cmd.set("lettuce_key", "lettuce_value");
+                      String v = cmd.get("lettuce_key");
+                      assert "lettuce_value".equals(v) : "GET failed";
+                      cmd.hset("lettuce_hash", "f1", "v1");
+                      String hv = cmd.hget("lettuce_hash", "f1");
+                      assert "v1".equals(hv) : "HGET failed";
+                      System.out.println("lettuce: ALL TESTS PASSED");
+                  } finally {
+                      client.shutdown();
+                  }
+              }
+          }
+          LEOF
+          cd /tmp/lettuce-test && javac -cp "lettuce-core.jar:netty-all.jar:reactor-core.jar:reactive-streams.jar" LettuceTest.java
+          cd /tmp/lettuce-test && java -ea -cp ".:lettuce-core.jar:netty-all.jar:reactor-core.jar:reactive-streams.jar" LettuceTest
+
+  stackexchange-redis:
+    name: StackExchange.Redis (.NET)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (tokio)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+        env:
+          MOON_NO_URING: "1"
+      - name: Start Moon
+        run: |
+          ./target/release/moon --port 6399 --shards 1 &
+          sleep 2
+        env:
+          MOON_NO_URING: "1"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Run StackExchange.Redis smoke test
+        run: |
+          mkdir -p /tmp/se-redis-test
+          cd /tmp/se-redis-test
+          dotnet new console -n CompatTest --force
+          cd CompatTest
+          dotnet add package StackExchange.Redis
+          cat > Program.cs << 'CSEOF'
+          using StackExchange.Redis;
+
+          var mux = ConnectionMultiplexer.Connect("127.0.0.1:6399");
+          var db = mux.GetDatabase();
+
+          // SET / GET
+          db.StringSet("dotnet_key", "dotnet_value");
+          var v = db.StringGet("dotnet_key");
+          if (v != "dotnet_value") throw new Exception("GET failed");
+
+          // HSET / HGET
+          db.HashSet("dotnet_hash", "f1", "v1");
+          var hv = db.HashGet("dotnet_hash", "f1");
+          if (hv != "v1") throw new Exception("HGET failed");
+
+          // Pipeline (batch)
+          var batch = db.CreateBatch();
+          var t1 = batch.StringSetAsync("dp1", "pv1");
+          var t2 = batch.StringSetAsync("dp2", "pv2");
+          var t3 = batch.StringGetAsync("dp1");
+          var t4 = batch.StringGetAsync("dp2");
+          batch.Execute();
+          Task.WaitAll(t1, t2, t3, t4);
+          if (t3.Result != "pv1") throw new Exception("batch GET1 failed");
+          if (t4.Result != "pv2") throw new Exception("batch GET2 failed");
+
+          Console.WriteLine("StackExchange.Redis: ALL TESTS PASSED");
+          mux.Dispose();
+          CSEOF
+          dotnet run
