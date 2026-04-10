@@ -4,6 +4,8 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::storage::Database;
 use crate::vector::store::VectorStore;
+#[cfg(feature = "graph")]
+use crate::graph::store::GraphStore;
 
 /// Thread-safe wrapper over per-shard databases.
 ///
@@ -14,6 +16,9 @@ pub struct ShardDatabases {
     shards: Vec<Vec<RwLock<Database>>>,
     /// Per-shard VectorStore for FT.* commands in single-shard mode.
     vector_stores: Vec<Mutex<VectorStore>>,
+    /// Per-shard GraphStore for GRAPH.* commands.
+    #[cfg(feature = "graph")]
+    graph_stores: Vec<Mutex<GraphStore>>,
     /// Per-shard WAL append channel sender. Connection handlers send serialized
     /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
     /// Mutex<Option<>> for single-writer init, then read-only via wal_append().
@@ -34,10 +39,16 @@ impl ShardDatabases {
         let vector_stores = (0..num_shards)
             .map(|_| Mutex::new(VectorStore::new()))
             .collect();
+        #[cfg(feature = "graph")]
+        let graph_stores = (0..num_shards)
+            .map(|_| Mutex::new(GraphStore::new()))
+            .collect();
         let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
         Arc::new(Self {
             shards,
             vector_stores,
+            #[cfg(feature = "graph")]
+            graph_stores,
             wal_append_txs,
             num_shards,
             db_count,
@@ -75,6 +86,13 @@ impl ShardDatabases {
     #[inline]
     pub fn vector_store(&self, shard_id: usize) -> MutexGuard<'_, VectorStore> {
         self.vector_stores[shard_id].lock()
+    }
+
+    /// Acquire exclusive access to a shard's GraphStore.
+    #[cfg(feature = "graph")]
+    #[inline]
+    pub fn graph_store(&self, shard_id: usize) -> MutexGuard<'_, GraphStore> {
+        self.graph_stores[shard_id].lock()
     }
 
     /// Acquire a shared read lock on a specific database.

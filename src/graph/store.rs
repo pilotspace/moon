@@ -24,6 +24,10 @@ pub struct NamedGraph {
     pub name: Bytes,
     /// Segment holder (ArcSwap-based, lock-free reads).
     pub segments: GraphSegmentHolder,
+    /// Shard-local mutable write buffer. Writes go here; periodically
+    /// published to `segments` ArcSwap for concurrent readers.
+    /// Kept separate from ArcSwap to avoid Arc cloning on every mutation.
+    pub write_buf: crate::graph::memgraph::MemGraph,
     /// Edge threshold for mutable segment freeze.
     pub edge_threshold: usize,
     /// LSN at which this graph was created.
@@ -60,6 +64,7 @@ impl GraphStore {
             NamedGraph {
                 name,
                 segments: GraphSegmentHolder::new(edge_threshold),
+                write_buf: crate::graph::memgraph::MemGraph::new(edge_threshold),
                 edge_threshold,
                 created_lsn: lsn,
             },

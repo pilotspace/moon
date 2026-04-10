@@ -1,0 +1,355 @@
+//! GRAPH.* read command handlers.
+//!
+//! These commands read from GraphStore: NEIGHBORS, INFO, LIST.
+
+use bytes::Bytes;
+use slotmap::Key;
+
+use crate::graph::store::GraphStore;
+use crate::graph::types::Direction;
+use crate::protocol::Frame;
+
+use super::graph_write::extract_bulk;
+
+/// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>]
+///
+/// Returns an array of neighbor nodes/edges as RESP3 Maps.
+/// Default direction: BOTH (outgoing + incoming).
+/// DEPTH > 1 performs multi-hop expansion (BFS).
+pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.NEIGHBORS' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    let node_id = match parse_u64(&args[1]) {
+        Some(id) => id,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid node ID")),
+    };
+
+    let graph = match store.get_graph(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
+
+    // Parse optional TYPE and DEPTH arguments.
+    let mut edge_type_filter: Option<u16> = None;
+    let mut depth: u32 = 1;
+    let mut pos = 2;
+
+    while pos < args.len() {
+        let key = match extract_bulk(&args[pos]) {
+            Some(b) => b,
+            None => {
+                pos += 1;
+                continue;
+            }
+        };
+
+        if key.eq_ignore_ascii_case(b"TYPE") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR missing TYPE value"));
+            }
+            if let Some(type_name) = extract_bulk(&args[pos]) {
+                edge_type_filter = Some(super::graph_write::label_to_id(type_name));
+            }
+            pos += 1;
+        } else if key.eq_ignore_ascii_case(b"DEPTH") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR missing DEPTH value"));
+            }
+            depth = match parse_u32(&args[pos]) {
+                Some(d) if d > 0 => d,
+                _ => return Frame::Error(Bytes::from_static(b"ERR invalid DEPTH value")),
+            };
+            pos += 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Cap depth to prevent explosion.
+    let max_depth = 10u32;
+    if depth > max_depth {
+        return Frame::Error(Bytes::from_static(b"ERR DEPTH exceeds maximum (10)"));
+    }
+
+    let node_key = super::graph_write::external_id_to_node_key(node_id);
+
+    // Use write_buf (mutable MemGraph) for reading since it has current data.
+    // Future: merge with immutable CSR segments.
+    let memgraph = &graph.write_buf;
+
+    // Verify node exists.
+    if memgraph.get_node(node_key).is_none() {
+        return Frame::Error(Bytes::from_static(b"ERR node not found"));
+    }
+
+    // BFS expansion.
+    let lsn = u64::MAX - 1; // See all live data (MAX-1 because deleted_lsn=MAX means alive).
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(node_id);
+    let mut frontier = vec![node_key];
+    let mut results: Vec<Frame> = Vec::new();
+    // Cap total results.
+    let max_results = 10_000usize;
+
+    for _hop in 0..depth {
+        let mut next_frontier = Vec::new();
+
+        for &current in &frontier {
+            for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
+                // Apply edge type filter if specified.
+                if let Some(filter_type) = edge_type_filter {
+                    if let Some(edge) = memgraph.get_edge(edge_key) {
+                        if edge.edge_type != filter_type {
+                            continue;
+                        }
+                    }
+                }
+
+                let neighbor_ext_id = neighbor_key.data().as_ffi();
+
+                if visited.contains(&neighbor_ext_id) {
+                    continue;
+                }
+                visited.insert(neighbor_ext_id);
+
+                // Add edge as RESP3 Map.
+                if let Some(edge) = memgraph.get_edge(edge_key) {
+                    results.push(edge_to_frame(edge_key, edge));
+                }
+
+                // Add neighbor node as RESP3 Map.
+                if let Some(node) = memgraph.get_node(neighbor_key) {
+                    results.push(node_to_frame(neighbor_key, node));
+                }
+
+                if results.len() >= max_results {
+                    break;
+                }
+
+                next_frontier.push(neighbor_key);
+            }
+
+            if results.len() >= max_results {
+                break;
+            }
+        }
+
+        frontier = next_frontier;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+
+    Frame::Array(results.into())
+}
+
+/// GRAPH.INFO <graph>
+///
+/// Returns graph statistics as RESP3 Map.
+pub fn graph_info(store: &GraphStore, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.INFO' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    let graph = match store.get_graph(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
+
+    let memgraph = &graph.write_buf;
+    let segments = graph.segments.load();
+
+    let node_count = memgraph.node_count() as i64;
+    let edge_count = memgraph.edge_count() as i64;
+    let immutable_segments = segments.immutable.len() as i64;
+
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"name")),
+            Frame::BulkString(graph.name.clone()),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"node_count")),
+            Frame::Integer(node_count),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"edge_count")),
+            Frame::Integer(edge_count),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"immutable_segments")),
+            Frame::Integer(immutable_segments),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"edge_threshold")),
+            Frame::Integer(graph.edge_threshold as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"created_lsn")),
+            Frame::Integer(graph.created_lsn as i64),
+        ),
+    ])
+}
+
+/// GRAPH.LIST
+///
+/// Returns an array of all graph names.
+pub fn graph_list(store: &GraphStore) -> Frame {
+    let names = store.list_graphs();
+    let frames: Vec<Frame> = names
+        .into_iter()
+        .map(|name| Frame::BulkString(name.clone()))
+        .collect();
+    Frame::Array(frames.into())
+}
+
+// ---------------------------------------------------------------------------
+// RESP3 entity formatting
+// ---------------------------------------------------------------------------
+
+/// Format a node as a RESP3 Map: {id, labels, properties}.
+fn node_to_frame(
+    key: crate::graph::types::NodeKey,
+    node: &crate::graph::types::MutableNode,
+) -> Frame {
+    let external_id = key.data().as_ffi();
+
+    let labels: Vec<Frame> = node
+        .labels
+        .iter()
+        .map(|&l| Frame::Integer(l as i64))
+        .collect();
+
+    let props = properties_to_frame(&node.properties);
+
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"id")),
+            Frame::Integer(external_id as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"labels")),
+            Frame::Array(labels.into()),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"properties")),
+            props,
+        ),
+    ])
+}
+
+/// Format an edge as a RESP3 Map: {id, type, src, dst, properties}.
+fn edge_to_frame(
+    key: crate::graph::types::EdgeKey,
+    edge: &crate::graph::types::MutableEdge,
+) -> Frame {
+    let external_id = key.data().as_ffi();
+
+    let src_ext = edge.src.data().as_ffi();
+    let dst_ext = edge.dst.data().as_ffi();
+
+    let props = match &edge.properties {
+        Some(p) => properties_to_frame(p),
+        None => Frame::Map(Vec::new()),
+    };
+
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"id")),
+            Frame::Integer(external_id as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"type")),
+            Frame::Integer(edge.edge_type as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"src")),
+            Frame::Integer(src_ext as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"dst")),
+            Frame::Integer(dst_ext as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"weight")),
+            Frame::Double(edge.weight),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"properties")),
+            props,
+        ),
+    ])
+}
+
+/// Convert a PropertyMap to a RESP3 Map frame.
+fn properties_to_frame(props: &crate::graph::types::PropertyMap) -> Frame {
+    let pairs: Vec<(Frame, Frame)> = props
+        .iter()
+        .map(|(key, val)| {
+            let k = Frame::Integer(*key as i64);
+            let v = match val {
+                crate::graph::types::PropertyValue::Int(n) => Frame::Integer(*n),
+                crate::graph::types::PropertyValue::Float(f) => Frame::Double(*f),
+                crate::graph::types::PropertyValue::String(s) => Frame::BulkString(s.clone()),
+                crate::graph::types::PropertyValue::Bool(b) => Frame::Boolean(*b),
+                crate::graph::types::PropertyValue::Bytes(b) => Frame::BulkString(b.clone()),
+            };
+            (k, v)
+        })
+        .collect();
+    Frame::Map(pairs)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn parse_u64(frame: &Frame) -> Option<u64> {
+    match frame {
+        Frame::Integer(n) => {
+            if *n >= 0 {
+                Some(*n as u64)
+            } else {
+                None
+            }
+        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => {
+            core::str::from_utf8(b).ok()?.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+fn parse_u32(frame: &Frame) -> Option<u32> {
+    match frame {
+        Frame::Integer(n) => {
+            if *n >= 0 && *n <= u32::MAX as i64 {
+                Some(*n as u32)
+            } else {
+                None
+            }
+        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => {
+            core::str::from_utf8(b).ok()?.parse().ok()
+        }
+        _ => None,
+    }
+}

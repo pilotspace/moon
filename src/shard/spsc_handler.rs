@@ -93,7 +93,12 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::PipelineBatchSlotted { .. }
                         | ShardMessage::MultiExecuteSlotted { .. }
                         | ShardMessage::VectorSearch { .. }
-                        | ShardMessage::VectorCommand { .. } => {
+                        | ShardMessage::VectorCommand { .. }
+                        => {
+                            execute_batch.push(msg);
+                        }
+                        #[cfg(feature = "graph")]
+                        ShardMessage::GraphCommand { .. } => {
                             execute_batch.push(msg);
                         }
                         ShardMessage::MigrateConnection { fd, state } => {
@@ -846,6 +851,14 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::VectorCommand { command, reply_tx } => {
             let response = dispatch_vector_command(vector_store, &command);
+            let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "graph")]
+        ShardMessage::GraphCommand { command, reply_tx } => {
+            // GraphCommand is dispatched via connection handlers using ShardDatabases,
+            // not through SPSC. If we receive one here, dispatch it locally.
+            let mut gs = shard_databases.graph_store(shard_id);
+            let response = crate::command::graph::dispatch_graph_command(&mut gs, &command);
             let _ = reply_tx.send(response);
         }
         ShardMessage::Shutdown => {

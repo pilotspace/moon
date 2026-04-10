@@ -1274,6 +1274,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
 
+                    // --- GRAPH.* graph commands ---
+                    #[cfg(feature = "graph")]
+                    if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
+                        let response = {
+                            let mut gs = ctx.shard_databases.graph_store(ctx.shard_id);
+                            crate::command::graph::dispatch_graph_cmd_args(&mut gs, cmd, cmd_args)
+                        };
+                        responses.push(response);
+                        continue;
+                    }
+
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
                         let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;

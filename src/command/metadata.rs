@@ -68,6 +68,7 @@ impl AclCategories {
     pub const WRITE_CAT: Self = Self(1 << 16);
     pub const READ_CAT: Self = Self(1 << 17);
     pub const SEARCH: Self = Self(1 << 18);
+    pub const GRAPH: Self = Self(1 << 19);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
@@ -128,6 +129,7 @@ const SCR: AclCategories = AclCategories::SCRIPTING;
 const TXN: AclCategories = AclCategories::TRANSACTIONS;
 const DNG: AclCategories = AclCategories::DANGEROUS;
 const SRCH: AclCategories = AclCategories::SEARCH;
+const GRF: AclCategories = AclCategories::GRAPH;
 
 // ---------------------------------------------------------------------------
 // Static registry — phf perfect-hash map keyed by uppercase command name
@@ -383,6 +385,20 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "FT.SEARCH" => CommandMeta { name: "FT.SEARCH", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.DROPINDEX" => CommandMeta { name: "FT.DROPINDEX", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.INFO" => CommandMeta { name: "FT.INFO", arity: 2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
+
+    // ---- Graph commands ----
+    "GRAPH.CREATE" => CommandMeta { name: "GRAPH.CREATE", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.ADDNODE" => CommandMeta { name: "GRAPH.ADDNODE", arity: -3, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.ADDEDGE" => CommandMeta { name: "GRAPH.ADDEDGE", arity: -5, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.DELETE" => CommandMeta { name: "GRAPH.DELETE", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.NEIGHBORS" => CommandMeta { name: "GRAPH.NEIGHBORS", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.INFO" => CommandMeta { name: "GRAPH.INFO", arity: 2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.LIST" => CommandMeta { name: "GRAPH.LIST", arity: 1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.QUERY" => CommandMeta { name: "GRAPH.QUERY", arity: -3, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.RO_QUERY" => CommandMeta { name: "GRAPH.RO_QUERY", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.EXPLAIN" => CommandMeta { name: "GRAPH.EXPLAIN", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.VSEARCH" => CommandMeta { name: "GRAPH.VSEARCH", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.HYBRID" => CommandMeta { name: "GRAPH.HYBRID", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
 };
 
 // ---------------------------------------------------------------------------

@@ -272,6 +272,12 @@ pub enum ShardMessage {
         command: std::sync::Arc<Frame>,
         reply_tx: channel::OneshotSender<Frame>,
     },
+    /// Execute a GRAPH.* command on this shard's GraphStore.
+    #[cfg(feature = "graph")]
+    GraphCommand {
+        command: std::sync::Arc<Frame>,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
     /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
     PubSubPublish {
         channel: Bytes,
