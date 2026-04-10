@@ -8,7 +8,7 @@
 pub mod graph_read;
 pub mod graph_write;
 
-pub use graph_read::{graph_info, graph_list, graph_neighbors};
+pub use graph_read::{graph_info, graph_list, graph_neighbors, graph_query, graph_ro_query, graph_explain};
 pub use graph_write::{graph_addedge, graph_addnode, graph_create, graph_delete};
 
 use bytes::Bytes;
@@ -46,11 +46,12 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
         graph_list(store)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") {
         graph_delete(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN")
-    {
-        Frame::Error(Bytes::from_static(b"ERR Cypher parser not yet available"))
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+        graph_query(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
+        graph_ro_query(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
+        graph_explain(args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH")
         || cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID")
     {
@@ -78,11 +79,12 @@ pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame
         graph_list(store)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") {
         graph_delete(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN")
-    {
-        Frame::Error(Bytes::from_static(b"ERR Cypher parser not yet available"))
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+        graph_query(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
+        graph_ro_query(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
+        graph_explain(args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH")
         || cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID")
     {
@@ -247,15 +249,48 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_stub_commands() {
+    fn test_graph_query_no_graph() {
         let mut store = GraphStore::new();
         let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n) RETURN n"]));
         if let Frame::Error(msg) = &resp {
-            assert!(msg.as_ref().starts_with(b"ERR Cypher"));
+            assert!(msg.as_ref().starts_with(b"ERR graph not found"));
         } else {
-            panic!("expected error");
+            panic!("expected error, got {:?}", resp);
         }
+    }
 
+    #[test]
+    fn test_graph_query_parse_and_plan() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n:Person) RETURN n"]));
+        // Should return an array of plan operators (not an error).
+        assert!(matches!(resp, Frame::Array(_)), "expected Array, got {:?}", resp);
+    }
+
+    #[test]
+    fn test_graph_ro_query_rejects_writes() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.RO_QUERY", b"g", b"CREATE (n:Person)"]));
+        if let Frame::Error(msg) = &resp {
+            assert!(msg.as_ref().starts_with(b"ERR GRAPH.RO_QUERY"));
+        } else {
+            panic!("expected error for write in RO_QUERY");
+        }
+    }
+
+    #[test]
+    fn test_graph_explain() {
+        let mut store = GraphStore::new();
+        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.EXPLAIN", b"g", b"MATCH (n) RETURN n"]));
+        // EXPLAIN returns a BulkString with the plan.
+        assert!(matches!(resp, Frame::BulkString(_)), "expected BulkString, got {:?}", resp);
+    }
+
+    #[test]
+    fn test_graph_stub_commands() {
+        let mut store = GraphStore::new();
         let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.VSEARCH", b"g"]));
         if let Frame::Error(msg) = &resp {
             assert!(msg.as_ref().starts_with(b"ERR Hybrid"));

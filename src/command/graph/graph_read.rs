@@ -1,10 +1,11 @@
 //! GRAPH.* read command handlers.
 //!
-//! These commands read from GraphStore: NEIGHBORS, INFO, LIST.
+//! These commands read from GraphStore: NEIGHBORS, INFO, LIST, QUERY, RO_QUERY, EXPLAIN.
 
 use bytes::Bytes;
 use slotmap::Key;
 
+use crate::graph::cypher;
 use crate::graph::store::GraphStore;
 use crate::graph::types::Direction;
 use crate::protocol::Frame;
@@ -219,6 +220,137 @@ pub fn graph_list(store: &GraphStore) -> Frame {
         .map(|name| Frame::BulkString(name.clone()))
         .collect();
     Frame::Array(frames.into())
+}
+
+// ---------------------------------------------------------------------------
+// GRAPH.QUERY, GRAPH.RO_QUERY, GRAPH.EXPLAIN
+// ---------------------------------------------------------------------------
+
+/// GRAPH.QUERY <graph> <cypher_string>
+///
+/// Parses and compiles the Cypher query. Full execution is deferred to Phase 118+.
+/// Currently returns the compiled physical plan as a diagnostic array.
+pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    if store.get_graph(graph_name).is_none() {
+        return Frame::Error(Bytes::from_static(b"ERR graph not found"));
+    }
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let plan = match cypher::planner::compile(&query) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("ERR Cypher plan error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    // Return plan summary as array of operator descriptions.
+    let ops: Vec<Frame> = plan
+        .operators
+        .iter()
+        .map(|op| Frame::BulkString(Bytes::from(format!("{op:?}"))))
+        .collect();
+
+    Frame::Array(ops.into())
+}
+
+/// GRAPH.RO_QUERY <graph> <cypher_string>
+///
+/// Like GRAPH.QUERY but rejects write clauses (CREATE, DELETE, SET, MERGE).
+pub fn graph_ro_query(store: &GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.RO_QUERY' command",
+        ));
+    }
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    if !query.is_read_only() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR GRAPH.RO_QUERY does not allow write clauses (CREATE, DELETE, SET, MERGE)",
+        ));
+    }
+
+    // Delegate to the regular query handler for parsing/planning.
+    graph_query(store, args)
+}
+
+/// GRAPH.EXPLAIN <graph> <cypher_string>
+///
+/// Returns the execution plan without running the query.
+pub fn graph_explain(args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.EXPLAIN' command",
+        ));
+    }
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let plan = match cypher::planner::compile(&query) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("ERR Cypher plan error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    // Return plan as a formatted string.
+    let mut output = String::new();
+    for (i, op) in plan.operators.iter().enumerate() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!("{i}: {op:?}"));
+    }
+
+    Frame::BulkString(Bytes::from(output))
 }
 
 // ---------------------------------------------------------------------------
