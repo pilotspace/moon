@@ -153,3 +153,8 @@ harness = false
 [[bench]]
 name = "pubsub_hotpath"
 harness = false
+
+[[bench]]
+name = "graph_bench"
+harness = false
+required-features = ["graph"]
