@@ -120,7 +120,10 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
     }
 
     let lsn = 0; // Phase 113 MVCC provides real LSNs.
-    let node_key = graph.write_buf.add_node(labels, properties, embedding, lsn);
+    let node_key = graph.write_buf.add_node(labels.clone(), properties, embedding, lsn);
+
+    // Update graph stats incrementally.
+    graph.stats.on_node_insert(&labels);
 
     // Return the raw slotmap key as a u64 integer.
     let external_id = node_key.data().as_ffi();
@@ -212,8 +215,22 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
     };
 
     let lsn = 0;
+
+    // Capture old degrees for stats tracking before edge insertion.
+    let src_old_degree = graph
+        .write_buf
+        .get_node(src_key)
+        .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
+    let dst_old_degree = graph
+        .write_buf
+        .get_node(dst_key)
+        .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
+
     match graph.write_buf.add_edge(src_key, dst_key, edge_type_id, weight, props, lsn) {
         Ok(edge_key) => {
+            // Update graph stats incrementally.
+            graph.stats.on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
+
             let external_id = edge_key.data().as_ffi();
             Frame::Integer(external_id as i64)
         }

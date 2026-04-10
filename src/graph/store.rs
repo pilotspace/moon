@@ -9,6 +9,7 @@ use bytes::Bytes;
 
 use crate::graph::index::PropertyIndex;
 use crate::graph::segment::GraphSegmentHolder;
+use crate::graph::stats::GraphStats;
 
 /// Errors from GraphStore operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,6 +37,9 @@ pub struct NamedGraph {
     /// Optional property indexes for cross-segment numeric range queries.
     /// Key is the property name dictionary ID.
     pub property_indexes: HashMap<u16, PropertyIndex>,
+    /// Per-graph statistics for cost-based query planning.
+    /// Updated incrementally on node/edge insert/delete.
+    pub stats: GraphStats,
 }
 
 /// Per-shard graph store. No Arc, no Mutex -- fully owned by shard thread.
@@ -72,6 +76,7 @@ impl GraphStore {
                 edge_threshold,
                 created_lsn: lsn,
                 property_indexes: HashMap::new(),
+                stats: GraphStats::new(),
             },
         );
         Ok(())

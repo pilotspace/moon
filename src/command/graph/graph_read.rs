@@ -177,10 +177,31 @@ pub fn graph_info(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let memgraph = &graph.write_buf;
     let segments = graph.segments.load();
+    let stats = &graph.stats;
 
     let node_count = memgraph.node_count() as i64;
     let edge_count = memgraph.edge_count() as i64;
     let immutable_segments = segments.immutable.len() as i64;
+
+    // Degree distribution from GraphStats.
+    let degree_stats = Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"avg")),
+            Frame::Double(stats.degree_stats.avg),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"p50")),
+            Frame::Integer(stats.degree_stats.p50 as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"p99")),
+            Frame::Integer(stats.degree_stats.p99 as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"max")),
+            Frame::Integer(stats.degree_stats.max as i64),
+        ),
+    ]);
 
     Frame::Map(vec![
         (
@@ -206,6 +227,10 @@ pub fn graph_info(store: &GraphStore, args: &[Frame]) -> Frame {
         (
             Frame::SimpleString(Bytes::from_static(b"created_lsn")),
             Frame::Integer(graph.created_lsn as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"degree_stats")),
+            degree_stats,
         ),
     ])
 }
