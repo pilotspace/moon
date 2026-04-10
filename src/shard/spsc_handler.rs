@@ -101,6 +101,10 @@ pub(crate) fn drain_spsc_shared(
                         ShardMessage::GraphCommand { .. } => {
                             execute_batch.push(msg);
                         }
+                        #[cfg(feature = "graph")]
+                        ShardMessage::GraphTraverse { .. } => {
+                            execute_batch.push(msg);
+                        }
                         ShardMessage::MigrateConnection { fd, state } => {
                             pending_migrations.push((fd, state));
                         }
@@ -859,6 +863,24 @@ pub(crate) fn handle_shard_message_shared(
             // not through SPSC. If we receive one here, dispatch it locally.
             let mut gs = shard_databases.graph_store(shard_id);
             let response = crate::command::graph::dispatch_graph_command(&mut gs, &command);
+            let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "graph")]
+        ShardMessage::GraphTraverse {
+            graph_name,
+            node_ids,
+            remaining_hops: _,
+            edge_type_filter,
+            snapshot_lsn,
+            reply_tx,
+        } => {
+            let response = crate::graph::cross_shard::handle_graph_traverse(
+                &shard_databases.graph_store(shard_id),
+                &graph_name,
+                &node_ids,
+                edge_type_filter,
+                snapshot_lsn,
+            );
             let _ = reply_tx.send(response);
         }
         ShardMessage::Shutdown => {
