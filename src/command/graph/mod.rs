@@ -8,7 +8,7 @@
 pub mod graph_read;
 pub mod graph_write;
 
-pub use graph_read::{graph_info, graph_list, graph_neighbors, graph_query, graph_ro_query, graph_explain};
+pub use graph_read::{graph_info, graph_list, graph_neighbors, graph_query, graph_ro_query, graph_explain, graph_vsearch, graph_hybrid};
 pub use graph_write::{graph_addedge, graph_addnode, graph_create, graph_delete};
 
 use bytes::Bytes;
@@ -52,10 +52,10 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
         graph_ro_query(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
         graph_explain(args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID")
-    {
-        Frame::Error(Bytes::from_static(b"ERR Hybrid queries not yet available"))
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
+        graph_vsearch(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
+        graph_hybrid(store, args)
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* command"))
     }
@@ -85,10 +85,10 @@ pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame
         graph_ro_query(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
         graph_explain(args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID")
-    {
-        Frame::Error(Bytes::from_static(b"ERR Hybrid queries not yet available"))
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
+        graph_vsearch(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
+        graph_hybrid(store, args)
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* command"))
     }
@@ -289,13 +289,89 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_stub_commands() {
+    fn test_graph_vsearch_no_graph() {
         let mut store = GraphStore::new();
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.VSEARCH", b"g"]));
+        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.VSEARCH", b"g", b"1", b"2", b"3", b"1.0 0.0"]));
         if let Frame::Error(msg) = &resp {
-            assert!(msg.as_ref().starts_with(b"ERR Hybrid"));
+            assert!(msg.as_ref().starts_with(b"ERR graph not found"));
         } else {
-            panic!("expected error");
+            panic!("expected error, got {:?}", resp);
+        }
+    }
+
+    #[test]
+    fn test_graph_hybrid_no_graph() {
+        let mut store = GraphStore::new();
+        // Need graph + mode + at least one more arg to pass arg count check.
+        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.HYBRID", b"g", b"FILTER", b"1"]));
+        if let Frame::Error(msg) = &resp {
+            assert!(msg.as_ref().starts_with(b"ERR graph not found"));
+        } else {
+            panic!("expected error, got {:?}", resp);
+        }
+    }
+
+    #[test]
+    fn test_graph_vsearch_with_graph() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+
+        // Add two nodes with embeddings.
+        let n1 = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
+        );
+        let n2 = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
+        );
+
+        let id1 = if let Frame::Integer(id) = n1 { id } else { panic!("expected int") };
+        let id2 = if let Frame::Integer(id) = n2 { id } else { panic!("expected int") };
+
+        let id1_str = id1.to_string();
+        let id2_str = id2.to_string();
+        dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.ADDEDGE", b"g", id1_str.as_bytes(), id2_str.as_bytes(), b"KNOWS"]),
+        );
+
+        // VSEARCH: nodes don't have embeddings, so expect empty result array.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.VSEARCH", b"g", id1_str.as_bytes(), b"1", b"10", b"1.0 0.0"]),
+        );
+        if let Frame::Array(items) = &resp {
+            assert_eq!(items.len(), 0); // No embeddings on nodes.
+        } else {
+            panic!("expected Array, got {:?}", resp);
+        }
+    }
+
+    #[test]
+    fn test_graph_hybrid_walk_bad_args() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.HYBRID", b"g", b"WALK"]),
+        );
+        // Not enough args for WALK.
+        assert!(matches!(resp, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_graph_hybrid_unknown_mode() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.HYBRID", b"g", b"BADMODE", b"extra"]),
+        );
+        if let Frame::Error(msg) = &resp {
+            assert!(msg.as_ref().starts_with(b"ERR unknown GRAPH.HYBRID mode"));
+        } else {
+            panic!("expected error, got {:?}", resp);
         }
     }
 
