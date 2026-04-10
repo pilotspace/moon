@@ -32,6 +32,28 @@ pub(super) fn format_score(score: f64) -> String {
     }
 }
 
+/// Zero-alloc version of `format_score` — returns `Bytes` directly.
+pub(crate) fn format_score_bytes(score: f64) -> Bytes {
+    if score == f64::INFINITY {
+        Bytes::from_static(b"inf")
+    } else if score == f64::NEG_INFINITY {
+        Bytes::from_static(b"-inf")
+    } else {
+        use std::fmt::Write;
+        let mut buf = String::with_capacity(24);
+        let _ = write!(buf, "{}", score);
+        Bytes::from(buf)
+    }
+}
+
+/// Aggregate operation for ZUNION/ZINTER/ZUNIONSTORE/ZINTERSTORE.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum AggregateOp {
+    Sum,
+    Min,
+    Max,
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers -- CRITICAL for dual structure consistency
 // ---------------------------------------------------------------------------

@@ -748,3 +748,160 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Frame::Array(results.into()),
     ])
 }
+
+// ---------------------------------------------------------------------------
+// SINTERCARD numkeys key [key ...] [LIMIT limit]
+// ---------------------------------------------------------------------------
+
+/// SINTERCARD numkeys key [key ...] [LIMIT limit]
+pub fn sintercard(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("SINTERCARD");
+    }
+    let numkeys = match parse_int(&args[0]) {
+        Some(n) if n > 0 => n as usize,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR numkeys can't be non-positive value",
+            ));
+        }
+    };
+    if args.len() < 1 + numkeys {
+        return err_wrong_args("SINTERCARD");
+    }
+
+    let mut limit: usize = 0;
+    let remaining = &args[1 + numkeys..];
+    if remaining.len() >= 2 {
+        let kw = match extract_bytes(&remaining[0]) {
+            Some(b) => b,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        if kw.eq_ignore_ascii_case(b"LIMIT") {
+            match parse_int(&remaining[1]) {
+                Some(l) if l >= 0 => limit = l as usize,
+                _ => {
+                    return Frame::Error(Bytes::from_static(b"ERR LIMIT can't be negative"));
+                }
+            }
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+    } else if !remaining.is_empty() {
+        return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+    }
+
+    let key_frames = &args[1..1 + numkeys];
+    let keys: Vec<&Bytes> = key_frames.iter().filter_map(extract_bytes).collect();
+    if keys.len() != numkeys {
+        return err_wrong_args("SINTERCARD");
+    }
+
+    let sets = match collect_sets(db, &keys) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
+    for s in sets {
+        match s {
+            Some(set) => concrete.push(set),
+            None => return Frame::Integer(0),
+        }
+    }
+
+    if concrete.is_empty() {
+        return Frame::Integer(0);
+    }
+
+    concrete.sort_by_key(|s| s.len());
+    let smallest = &concrete[0];
+    let rest = &concrete[1..];
+
+    let mut count: usize = 0;
+    for member in smallest {
+        if rest.iter().all(|s| s.contains(member)) {
+            count += 1;
+            if limit > 0 && count >= limit {
+                break;
+            }
+        }
+    }
+
+    Frame::Integer(count as i64)
+}
+
+/// SINTERCARD readonly path
+pub fn sintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("SINTERCARD");
+    }
+    let numkeys = match parse_int(&args[0]) {
+        Some(n) if n > 0 => n as usize,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR numkeys can't be non-positive value",
+            ));
+        }
+    };
+    if args.len() < 1 + numkeys {
+        return err_wrong_args("SINTERCARD");
+    }
+
+    let mut limit: usize = 0;
+    let remaining = &args[1 + numkeys..];
+    if remaining.len() >= 2 {
+        let kw = match extract_bytes(&remaining[0]) {
+            Some(b) => b,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        if kw.eq_ignore_ascii_case(b"LIMIT") {
+            match parse_int(&remaining[1]) {
+                Some(l) if l >= 0 => limit = l as usize,
+                _ => {
+                    return Frame::Error(Bytes::from_static(b"ERR LIMIT can't be negative"));
+                }
+            }
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+    } else if !remaining.is_empty() {
+        return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+    }
+
+    let key_frames = &args[1..1 + numkeys];
+    let keys: Vec<&Bytes> = key_frames.iter().filter_map(extract_bytes).collect();
+    if keys.len() != numkeys {
+        return err_wrong_args("SINTERCARD");
+    }
+
+    // Use readonly path to get sets
+    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
+    for key in &keys {
+        match db.get_set_ref_if_alive(key, now_ms) {
+            Ok(Some(sref)) => concrete.push(sref.members().into_iter().collect()),
+            Ok(None) => return Frame::Integer(0),
+            Err(e) => return e,
+        }
+    }
+
+    if concrete.is_empty() {
+        return Frame::Integer(0);
+    }
+
+    concrete.sort_by_key(|s| s.len());
+    let smallest = &concrete[0];
+    let rest = &concrete[1..];
+
+    let mut count: usize = 0;
+    for member in smallest {
+        if rest.iter().all(|s| s.contains(member)) {
+            count += 1;
+            if limit > 0 && count >= limit {
+                break;
+            }
+        }
+    }
+
+    Frame::Integer(count as i64)
+}

@@ -411,3 +411,69 @@ pub fn sdiffstore(db: &mut Database, args: &[Frame]) -> Frame {
     }
     Frame::Integer(count)
 }
+
+// ---------------------------------------------------------------------------
+// SMOVE source destination member
+// ---------------------------------------------------------------------------
+
+/// SMOVE source destination member
+pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 3 {
+        return err_wrong_args("SMOVE");
+    }
+    let source = match extract_bytes(&args[0]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("SMOVE"),
+    };
+    let destination = match extract_bytes(&args[1]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("SMOVE"),
+    };
+    let member = match extract_bytes(&args[2]) {
+        Some(m) => m.clone(),
+        None => return err_wrong_args("SMOVE"),
+    };
+
+    match db.get_set(&source) {
+        Ok(None) => return Frame::Integer(0),
+        Err(e) => return e,
+        Ok(Some(_)) => {}
+    }
+    match db.get_set(&destination) {
+        Ok(_) => {}
+        Err(e) => return e,
+    }
+
+    if source == destination {
+        let src_set = match db.get_or_create_set(&source) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        return if src_set.contains(&member) {
+            Frame::Integer(1)
+        } else {
+            Frame::Integer(0)
+        };
+    }
+
+    let src_set = match db.get_or_create_set(&source) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if !src_set.remove(&member) {
+        return Frame::Integer(0);
+    }
+    let src_empty = src_set.is_empty();
+
+    let dst_set = match db.get_or_create_set(&destination) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    dst_set.insert(member);
+
+    if src_empty {
+        db.remove(&source);
+    }
+
+    Frame::Integer(1)
+}

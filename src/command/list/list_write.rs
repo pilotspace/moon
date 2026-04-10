@@ -607,3 +607,177 @@ pub fn lmove(db: &mut Database, args: &[Frame]) -> Frame {
 
     Frame::BulkString(value)
 }
+
+// ---------------------------------------------------------------------------
+// LPUSHX key element [element ...]
+// ---------------------------------------------------------------------------
+
+/// LPUSHX key element [element ...]
+/// Pushes elements to the front of the list ONLY if the key already exists as a list.
+pub fn lpushx(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("LPUSHX");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("LPUSHX"),
+    };
+
+    match db.get_list(key) {
+        Ok(None) => return Frame::Integer(0),
+        Err(e) => return e,
+        Ok(Some(_)) => {}
+    }
+
+    let list = match db.get_or_create_list(key) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    for arg in &args[1..] {
+        let val = match extract_bytes(arg) {
+            Some(v) => v.clone(),
+            None => return err_wrong_args("LPUSHX"),
+        };
+        list.push_front(val);
+    }
+    Frame::Integer(list.len() as i64)
+}
+
+// ---------------------------------------------------------------------------
+// RPUSHX key element [element ...]
+// ---------------------------------------------------------------------------
+
+/// RPUSHX key element [element ...]
+/// Pushes elements to the back of the list ONLY if the key already exists as a list.
+pub fn rpushx(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("RPUSHX");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("RPUSHX"),
+    };
+
+    match db.get_list(key) {
+        Ok(None) => return Frame::Integer(0),
+        Err(e) => return e,
+        Ok(Some(_)) => {}
+    }
+
+    let list = match db.get_or_create_list(key) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    for arg in &args[1..] {
+        let val = match extract_bytes(arg) {
+            Some(v) => v.clone(),
+            None => return err_wrong_args("RPUSHX"),
+        };
+        list.push_back(val);
+    }
+    Frame::Integer(list.len() as i64)
+}
+
+// ---------------------------------------------------------------------------
+// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
+// ---------------------------------------------------------------------------
+
+/// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
+/// Pops elements from the first non-empty list among the specified keys.
+pub fn lmpop(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 3 {
+        return err_wrong_args("LMPOP");
+    }
+    let numkeys = match parse_i64(&args[0]) {
+        Some(n) if n > 0 => n as usize,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR numkeys can't be non-positive value",
+            ));
+        }
+    };
+    if args.len() < 1 + numkeys + 1 {
+        return err_wrong_args("LMPOP");
+    }
+
+    let dir_bytes = match extract_bytes(&args[1 + numkeys]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+    };
+    let left = if dir_bytes.eq_ignore_ascii_case(b"LEFT") {
+        true
+    } else if dir_bytes.eq_ignore_ascii_case(b"RIGHT") {
+        false
+    } else {
+        return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+    };
+
+    let mut count: usize = 1;
+    let remaining = &args[2 + numkeys..];
+    if remaining.len() >= 2 {
+        if let Some(kw) = extract_bytes(&remaining[0]) {
+            if kw.eq_ignore_ascii_case(b"COUNT") {
+                match parse_i64(&remaining[1]) {
+                    Some(c) if c > 0 => count = c as usize,
+                    _ => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR COUNT value of LMPOP command is not an integer or out of range",
+                        ));
+                    }
+                }
+            } else {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+        }
+    } else if !remaining.is_empty() {
+        return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+    }
+
+    for i in 0..numkeys {
+        let key = match extract_bytes(&args[1 + i]) {
+            Some(k) => k.clone(),
+            None => return err_wrong_args("LMPOP"),
+        };
+
+        let list_len = match db.get_list(&key) {
+            Ok(Some(l)) => l.len(),
+            Ok(None) => continue,
+            Err(e) => return e,
+        };
+        if list_len == 0 {
+            continue;
+        }
+
+        let n = count.min(list_len);
+        let list = match db.get_or_create_list(&key) {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+        let mut elems = Vec::with_capacity(n);
+        for _ in 0..n {
+            let val = if left {
+                list.pop_front()
+            } else {
+                list.pop_back()
+            };
+            match val {
+                Some(v) => elems.push(Frame::BulkString(v)),
+                None => break,
+            }
+        }
+
+        if list.is_empty() {
+            db.remove(&key);
+        }
+
+        if elems.is_empty() {
+            continue;
+        }
+        return Frame::Array(framevec![
+            Frame::BulkString(key),
+            Frame::Array(elems.into()),
+        ]);
+    }
+
+    Frame::Null
+}

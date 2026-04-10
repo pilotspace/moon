@@ -8,6 +8,7 @@ pub mod db_read;
 pub mod engine;
 pub mod entry;
 pub mod eviction;
+pub mod hll;
 pub mod intset;
 pub mod listpack;
 pub mod stream;

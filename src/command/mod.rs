@@ -2,8 +2,10 @@ pub mod acl;
 pub mod client;
 pub mod config;
 pub mod connection;
+pub mod functions;
 pub mod hash;
 pub mod helpers;
+pub mod hll;
 pub mod key;
 pub mod list;
 pub mod metadata;
@@ -263,6 +265,15 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"LMOVE") {
                 return resp(list::lmove(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"LMPOP") {
+                return resp(list::lmpop(db, args));
+            }
+        }
+        (5, b'p') => {
+            // PFADD
+            if cmd.eq_ignore_ascii_case(b"PFADD") {
+                return resp(hll::pfadd(db, args));
+            }
         }
         (5, b'r') => {
             // RPUSH
@@ -293,6 +304,12 @@ fn dispatch_inner(
                     // SDIFF
                     if cmd.eq_ignore_ascii_case(b"SDIFF") {
                         return resp(set::sdiff(db, args));
+                    }
+                }
+                b'm' => {
+                    // SMOVE
+                    if cmd.eq_ignore_ascii_case(b"SMOVE") {
+                        return resp(set::smove(db, args));
                     }
                 }
                 b's' => {
@@ -326,6 +343,12 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"ZSCAN") {
                 return resp(sorted_set::zscan(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZDIFF") {
+                return resp(sorted_set::zdiff(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZMPOP") {
+                return resp(sorted_set::zmpop(db, args));
             }
         }
         // 6-letter commands
@@ -382,6 +405,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"LINDEX") {
                 return resp(list::lindex(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"LPUSHX") {
+                return resp(list::lpushx(db, args));
+            }
         }
         (6, b'o') => {
             // OBJECT
@@ -402,6 +428,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"RENAME") {
                 return resp(key::rename(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"RPUSHX") {
+                return resp(list::rpushx(db, args));
             }
         }
         (6, b's') => {
@@ -463,6 +492,12 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"ZCOUNT") {
                 return resp(sorted_set::zcount(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"ZUNION") {
+                return resp(sorted_set::zunion(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZINTER") {
+                return resp(sorted_set::zinter(db, args));
+            }
         }
         // 7-letter commands
         (7, b'c') => {
@@ -500,6 +535,12 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"PERSIST") {
                 return resp(key::persist(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"PFCOUNT") {
+                return resp(hll::pfcount(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"PFMERGE") {
+                return resp(hll::pfmerge(db, args));
+            }
         }
         (7, b's') => {
             // SLOWLOG
@@ -511,7 +552,7 @@ fn dispatch_inner(
             }
         }
         (7, b'z') => {
-            // ZINCRBY ZPOPMIN ZPOPMAX
+            // ZINCRBY ZPOPMIN ZPOPMAX ZMSCORE
             if cmd.eq_ignore_ascii_case(b"ZINCRBY") {
                 return resp(sorted_set::zincrby(db, args));
             }
@@ -520,6 +561,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"ZPOPMAX") {
                 return resp(sorted_set::zpopmax(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZMSCORE") {
+                return resp(sorted_set::zmscore(db, args));
             }
         }
         // 8-letter commands
@@ -579,13 +623,22 @@ fn dispatch_inner(
             }
         }
         // 10-letter commands
+        (10, b'h') => {
+            // HRANDFIELD
+            if cmd.eq_ignore_ascii_case(b"HRANDFIELD") {
+                return resp(hash::hrandfield(db, args));
+            }
+        }
         (10, b's') => {
-            // SMISMEMBER SDIFFSTORE
+            // SMISMEMBER SDIFFSTORE SINTERCARD
             if cmd.eq_ignore_ascii_case(b"SMISMEMBER") {
                 return resp(set::smismember(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"SDIFFSTORE") {
                 return resp(set::sdiffstore(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"SINTERCARD") {
+                return resp(set::sintercard(db, args));
             }
         }
         (10, b'x') => {
@@ -595,6 +648,12 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"XAUTOCLAIM") {
                 return resp(stream::xautoclaim(db, args));
+            }
+        }
+        (10, b'z') => {
+            // ZINTERCARD
+            if cmd.eq_ignore_ascii_case(b"ZINTERCARD") {
+                return resp(sorted_set::zintercard(db, args));
             }
         }
         // 11-letter commands
@@ -623,6 +682,12 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"ZINTERSTORE") {
                 return resp(sorted_set::zinterstore(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZRANGESTORE") {
+                return resp(sorted_set::zrangestore(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
+                return resp(sorted_set::zrandmember(db, args));
             }
         }
         // 12-letter commands
@@ -704,12 +769,14 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
         | (7, b'h')  // HGETALL, HEXISTS
+        | (7, b'p')  // PFCOUNT
         | (8, b'g')  // GETRANGE
         | (8, b's')  // SMEMBERS
         | (8, b'z')  // ZREVRANK
         | (9, b's')  // SISMEMBER
         | (9, b'z')  // ZREVRANGE, ZLEXCOUNT
-        | (10, b's') // SMISMEMBER
+        | (10, b'h') // HRANDFIELD
+        | (10, b's') // SMISMEMBER, SINTERCARD
         | (11, b's') // SRANDMEMBER
         | (13, b'z') // ZRANGEBYSCORE
         | (16, b'z') // ZREVRANGEBYSCORE
@@ -912,6 +979,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(hash::hexists_readonly(db, args, now_ms));
             }
         }
+        (7, b'p') => {
+            // PFCOUNT (read-only path)
+            if cmd.eq_ignore_ascii_case(b"PFCOUNT") {
+                return resp(hll::pfcount_readonly(db, args, now_ms));
+            }
+        }
         (8, b'g') => {
             // GETRANGE
             if cmd.eq_ignore_ascii_case(b"GETRANGE") {
@@ -945,10 +1018,19 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(sorted_set::zlexcount_readonly(db, args, now_ms));
             }
         }
+        (10, b'h') => {
+            // HRANDFIELD
+            if cmd.eq_ignore_ascii_case(b"HRANDFIELD") {
+                return resp(hash::hrandfield_readonly(db, args, now_ms));
+            }
+        }
         (10, b's') => {
-            // SMISMEMBER
+            // SMISMEMBER SINTERCARD
             if cmd.eq_ignore_ascii_case(b"SMISMEMBER") {
                 return resp(set::smismember_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"SINTERCARD") {
+                return resp(set::sintercard_readonly(db, args, now_ms));
             }
         }
         (11, b's') => {

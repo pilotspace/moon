@@ -150,6 +150,9 @@ pub async fn handle_connection_sharded_monoio<
     let mut pubsub_tx: Option<channel::MpscSender<bytes::Bytes>> = None;
     let mut pubsub_rx: Option<channel::MpscReceiver<bytes::Bytes>> = None;
 
+    // Functions API registry (per-connection, lazy init)
+    let func_registry = Rc::new(RefCell::new(crate::scripting::FunctionRegistry::new()));
+
     // Transaction (MULTI/EXEC) connection-local state
     let mut in_multi: bool = false;
     let mut command_queue: Vec<Frame> = Vec::new();
@@ -1273,6 +1276,54 @@ pub async fn handle_connection_sharded_monoio<
                 }
             }
 
+            // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
+            // Placed AFTER ACL check. Respects MULTI queue — if in_multi,
+            // fall through to the MULTI queue gate instead of executing.
+            if !in_multi {
+                if cmd.eq_ignore_ascii_case(b"FUNCTION") {
+                    let response = crate::command::functions::handle_function(
+                        &mut func_registry.borrow_mut(),
+                        cmd_args,
+                    );
+                    responses.push(response);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"FCALL") {
+                    let response = {
+                        let mut guard = shard_databases.write_db(shard_id, selected_db);
+                        let db_count = shard_databases.db_count();
+                        crate::command::functions::handle_fcall(
+                            &func_registry.borrow(),
+                            cmd_args,
+                            &mut guard,
+                            shard_id,
+                            num_shards,
+                            selected_db,
+                            db_count,
+                        )
+                    };
+                    responses.push(response);
+                    continue;
+                }
+                if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+                    let response = {
+                        let mut guard = shard_databases.write_db(shard_id, selected_db);
+                        let db_count = shard_databases.db_count();
+                        crate::command::functions::handle_fcall_ro(
+                            &func_registry.borrow(),
+                            cmd_args,
+                            &mut guard,
+                            shard_id,
+                            num_shards,
+                            selected_db,
+                            db_count,
+                        )
+                    };
+                    responses.push(response);
+                    continue;
+                }
+            }
+
             // --- MULTI ---
             if cmd.eq_ignore_ascii_case(b"MULTI") {
                 if in_multi {
@@ -1320,12 +1371,15 @@ pub async fn handle_connection_sharded_monoio<
                 continue;
             }
 
-            // --- BLOCKING COMMANDS (BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX) ---
+            // --- BLOCKING COMMANDS ---
             if cmd.eq_ignore_ascii_case(b"BLPOP")
                 || cmd.eq_ignore_ascii_case(b"BRPOP")
                 || cmd.eq_ignore_ascii_case(b"BLMOVE")
                 || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
                 || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
+                || cmd.eq_ignore_ascii_case(b"BLMPOP")
+                || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
+                || cmd.eq_ignore_ascii_case(b"BZMPOP")
             {
                 // Inside MULTI: queue as non-blocking variant
                 if in_multi {

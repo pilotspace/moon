@@ -8,9 +8,11 @@ use crate::storage::db::SortedSetRef;
 
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
+use std::collections::HashMap;
+
 use super::{
-    format_score, glob_match, lex_in_range, parse_lex_bound, parse_score_bound, zrange_by_lex,
-    zrange_by_rank, zrange_by_score, zrange_from_entries,
+    AggregateOp, format_score, format_score_bytes, glob_match, lex_in_range, parse_lex_bound,
+    parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -1266,5 +1268,469 @@ pub fn zscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             Frame::Array(framevec![])
         ]),
         Err(e) => e,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for ZDIFF / ZUNION / ZINTER (non-STORE variants)
+// ---------------------------------------------------------------------------
+
+/// Parse `numkeys k1 [k2 ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES]` args.
+fn parse_setop_args(
+    args: &[Frame],
+    cmd_name: &str,
+    supports_weights: bool,
+) -> Result<(Vec<Bytes>, Vec<f64>, AggregateOp, bool), Frame> {
+    if args.is_empty() {
+        return Err(err_wrong_args(cmd_name));
+    }
+    let numkeys_bytes = match extract_bytes(&args[0]) {
+        Some(b) => b,
+        None => return Err(err_wrong_args(cmd_name)),
+    };
+    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => return Err(err("ERR value is not an integer or out of range")),
+    };
+
+    if args.len() < 1 + numkeys {
+        return Err(err_wrong_args(cmd_name));
+    }
+
+    let keys: Vec<Bytes> = (0..numkeys)
+        .map(|j| {
+            extract_bytes(&args[1 + j])
+                .cloned()
+                .unwrap_or_else(Bytes::new)
+        })
+        .collect();
+
+    let mut weights: Vec<f64> = vec![1.0; numkeys];
+    let mut aggregate = AggregateOp::Sum;
+    let mut withscores = false;
+
+    let mut i = 1 + numkeys;
+    while i < args.len() {
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if supports_weights && opt.eq_ignore_ascii_case(b"WEIGHTS") {
+            for w in 0..numkeys {
+                if i + 1 + w >= args.len() {
+                    return Err(err_wrong_args(cmd_name));
+                }
+                let wb = match extract_bytes(&args[i + 1 + w]) {
+                    Some(b) => b,
+                    None => return Err(err_wrong_args(cmd_name)),
+                };
+                let wval: f64 = match std::str::from_utf8(wb).ok().and_then(|s| s.parse().ok()) {
+                    Some(v) => v,
+                    None => return Err(err("ERR weight value is not a float")),
+                };
+                weights[w] = wval;
+            }
+            i += 1 + numkeys;
+        } else if supports_weights && opt.eq_ignore_ascii_case(b"AGGREGATE") {
+            if i + 1 >= args.len() {
+                return Err(err_wrong_args(cmd_name));
+            }
+            let agg_b = match extract_bytes(&args[i + 1]) {
+                Some(b) => b.as_ref(),
+                None => return Err(err_wrong_args(cmd_name)),
+            };
+            aggregate = if agg_b.eq_ignore_ascii_case(b"SUM") {
+                AggregateOp::Sum
+            } else if agg_b.eq_ignore_ascii_case(b"MIN") {
+                AggregateOp::Min
+            } else if agg_b.eq_ignore_ascii_case(b"MAX") {
+                AggregateOp::Max
+            } else {
+                return Err(err("ERR syntax error"));
+            };
+            i += 2;
+        } else if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    Ok((keys, weights, aggregate, withscores))
+}
+
+/// Read all source sorted sets into temporary HashMaps.
+fn collect_source_sets(
+    db: &mut Database,
+    keys: &[Bytes],
+) -> Result<Vec<HashMap<Bytes, f64>>, Frame> {
+    let mut source_data: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(keys.len());
+    for key in keys {
+        match db.get_sorted_set(key) {
+            Ok(Some((members, _))) => {
+                source_data.push(members.clone());
+            }
+            Ok(None) => {
+                source_data.push(HashMap::new());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(source_data)
+}
+
+/// Format a result map into a Frame::Array, optionally with scores.
+fn result_map_to_frame(result: &HashMap<Bytes, f64>, withscores: bool) -> Frame {
+    let mut entries: Vec<(&Bytes, f64)> = result.iter().map(|(m, s)| (m, *s)).collect();
+    entries.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    let cap = if withscores {
+        entries.len() * 2
+    } else {
+        entries.len()
+    };
+    let mut frames = Vec::with_capacity(cap);
+    for (member, score) in entries {
+        frames.push(Frame::BulkString(member.clone()));
+        if withscores {
+            frames.push(Frame::BulkString(format_score_bytes(score)));
+        }
+    }
+    Frame::Array(frames.into())
+}
+
+// ---------------------------------------------------------------------------
+// ZDIFF numkeys key [key ...] [WITHSCORES]
+// ---------------------------------------------------------------------------
+
+pub fn zdiff(db: &mut Database, args: &[Frame]) -> Frame {
+    let (keys, _, _, withscores) = match parse_setop_args(args, "ZDIFF", false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_data = match collect_source_sets(db, &keys) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
+    if let Some(first) = source_data.first() {
+        'outer: for (member, score) in first {
+            for src in source_data.iter().skip(1) {
+                if src.contains_key(member) {
+                    continue 'outer;
+                }
+            }
+            result_map.insert(member.clone(), *score);
+        }
+    }
+    result_map_to_frame(&result_map, withscores)
+}
+
+// ---------------------------------------------------------------------------
+// ZUNION numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES]
+// ---------------------------------------------------------------------------
+
+pub fn zunion(db: &mut Database, args: &[Frame]) -> Frame {
+    let (keys, weights, aggregate, withscores) = match parse_setop_args(args, "ZUNION", true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_data = match collect_source_sets(db, &keys) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
+    for (idx, src) in source_data.iter().enumerate() {
+        for (member, score) in src {
+            let weighted = *score * weights[idx];
+            result_map
+                .entry(member.clone())
+                .and_modify(|existing| {
+                    *existing = match aggregate {
+                        AggregateOp::Sum => *existing + weighted,
+                        AggregateOp::Min => existing.min(weighted),
+                        AggregateOp::Max => existing.max(weighted),
+                    };
+                })
+                .or_insert(weighted);
+        }
+    }
+    result_map_to_frame(&result_map, withscores)
+}
+
+// ---------------------------------------------------------------------------
+// ZINTER numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES]
+// ---------------------------------------------------------------------------
+
+pub fn zinter(db: &mut Database, args: &[Frame]) -> Frame {
+    let (keys, weights, aggregate, withscores) = match parse_setop_args(args, "ZINTER", true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_data = match collect_source_sets(db, &keys) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
+    if let Some(first) = source_data.first() {
+        for (member, score) in first {
+            let weighted = *score * weights[0];
+            let mut final_score = weighted;
+            let mut in_all = true;
+            for (idx, src) in source_data.iter().enumerate().skip(1) {
+                match src.get(member) {
+                    Some(s) => {
+                        let ws = *s * weights[idx];
+                        final_score = match aggregate {
+                            AggregateOp::Sum => final_score + ws,
+                            AggregateOp::Min => final_score.min(ws),
+                            AggregateOp::Max => final_score.max(ws),
+                        };
+                    }
+                    None => {
+                        in_all = false;
+                        break;
+                    }
+                }
+            }
+            if in_all {
+                result_map.insert(member.clone(), final_score);
+            }
+        }
+    }
+    result_map_to_frame(&result_map, withscores)
+}
+
+// ---------------------------------------------------------------------------
+// ZINTERCARD numkeys key [key ...] [LIMIT n]
+// ---------------------------------------------------------------------------
+
+pub fn zintercard(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("ZINTERCARD");
+    }
+    let numkeys_bytes = match extract_bytes(&args[0]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZINTERCARD"),
+    };
+    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => return err("ERR numkeys can't be non-positive value"),
+    };
+    if args.len() < 1 + numkeys {
+        return err_wrong_args("ZINTERCARD");
+    }
+    let keys: Vec<Bytes> = (0..numkeys)
+        .map(|j| {
+            extract_bytes(&args[1 + j])
+                .cloned()
+                .unwrap_or_else(Bytes::new)
+        })
+        .collect();
+    let mut limit: usize = 0;
+    let mut i = 1 + numkeys;
+    while i < args.len() {
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"LIMIT") {
+            if i + 1 >= args.len() {
+                return err_wrong_args("ZINTERCARD");
+            }
+            let lb = match extract_bytes(&args[i + 1]) {
+                Some(b) => b,
+                None => return err_wrong_args("ZINTERCARD"),
+            };
+            limit = match std::str::from_utf8(lb).ok().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return err("ERR value is not an integer or out of range"),
+            };
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let source_data = match collect_source_sets(db, &keys) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if source_data.iter().any(|s| s.is_empty()) {
+        return Frame::Integer(0);
+    }
+    let mut indices: Vec<usize> = (0..source_data.len()).collect();
+    indices.sort_by_key(|&i| source_data[i].len());
+    let smallest_idx = indices[0];
+    let mut count: i64 = 0;
+    for member in source_data[smallest_idx].keys() {
+        let mut in_all = true;
+        for &idx in indices.iter().skip(1) {
+            if !source_data[idx].contains_key(member) {
+                in_all = false;
+                break;
+            }
+        }
+        if in_all {
+            count += 1;
+            if limit > 0 && count >= limit as i64 {
+                break;
+            }
+        }
+    }
+    Frame::Integer(count)
+}
+
+// ---------------------------------------------------------------------------
+// ZMSCORE key member [member ...]
+// ---------------------------------------------------------------------------
+
+pub fn zmscore(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("ZMSCORE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZMSCORE"),
+    };
+    match db.get_sorted_set(key) {
+        Ok(Some((members, _))) => {
+            let mut result = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                let member = match extract_bytes(arg) {
+                    Some(m) => m,
+                    None => {
+                        result.push(Frame::Null);
+                        continue;
+                    }
+                };
+                match members.get(member) {
+                    Some(score) => {
+                        result.push(Frame::BulkString(format_score_bytes(*score)));
+                    }
+                    None => result.push(Frame::Null),
+                }
+            }
+            Frame::Array(result.into())
+        }
+        Ok(None) => {
+            let mut result = Vec::with_capacity(args.len() - 1);
+            for _ in &args[1..] {
+                result.push(Frame::Null);
+            }
+            Frame::Array(result.into())
+        }
+        Err(e) => e,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZRANDMEMBER key [count [WITHSCORES]]
+// ---------------------------------------------------------------------------
+
+pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
+    use rand::seq::IndexedRandom;
+    if args.is_empty() || args.len() > 3 {
+        return err_wrong_args("ZRANDMEMBER");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZRANDMEMBER"),
+    };
+    let (members_map, _) = match db.get_sorted_set(key) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            return if args.len() == 1 {
+                Frame::Null
+            } else {
+                Frame::Array(framevec![])
+            };
+        }
+        Err(e) => return e,
+    };
+    if members_map.is_empty() {
+        return if args.len() == 1 {
+            Frame::Null
+        } else {
+            Frame::Array(framevec![])
+        };
+    }
+    let entries: Vec<(&Bytes, f64)> = members_map.iter().map(|(m, s)| (m, *s)).collect();
+    let mut rng = rand::rng();
+    if args.len() == 1 {
+        return if let Some(chosen) = entries.choose(&mut rng) {
+            Frame::BulkString(chosen.0.clone())
+        } else {
+            Frame::Null
+        };
+    }
+    let count_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZRANDMEMBER"),
+    };
+    let count: i64 = match std::str::from_utf8(count_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(c) => c,
+        None => return err("ERR value is not an integer or out of range"),
+    };
+    let withscores = if args.len() == 3 {
+        let opt = match extract_bytes(&args[2]) {
+            Some(b) => b,
+            None => return err("ERR syntax error"),
+        };
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            true
+        } else {
+            return err("ERR syntax error");
+        }
+    } else {
+        false
+    };
+    if count == 0 {
+        return Frame::Array(framevec![]);
+    }
+    if count > 0 {
+        let n = std::cmp::min(count as usize, entries.len());
+        let chosen: Vec<&(&Bytes, f64)> = entries.sample(&mut rng, n).collect();
+        let cap = if withscores { n * 2 } else { n };
+        let mut result = Vec::with_capacity(cap);
+        for (member, score) in chosen {
+            result.push(Frame::BulkString((*member).clone()));
+            if withscores {
+                result.push(Frame::BulkString(format_score_bytes(*score)));
+            }
+        }
+        Frame::Array(result.into())
+    } else {
+        // Negative count: allow duplicates. Cap to prevent OOM on extreme values.
+        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
+        let cap = if withscores { n * 2 } else { n };
+        let mut result = Vec::with_capacity(cap);
+        for _ in 0..n {
+            if let Some(chosen) = entries.choose(&mut rng) {
+                result.push(Frame::BulkString(chosen.0.clone()));
+                if withscores {
+                    result.push(Frame::BulkString(format_score_bytes(chosen.1)));
+                }
+            }
+        }
+        Frame::Array(result.into())
     }
 }

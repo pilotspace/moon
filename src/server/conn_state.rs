@@ -43,6 +43,7 @@ pub struct ConnectionContext {
     pub cluster_state: Option<Arc<RwLock<ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<ScriptCache>>,
+    pub func_registry: Rc<RefCell<crate::scripting::FunctionRegistry>>,
     pub config_port: u16,
     pub acl_table: Arc<RwLock<crate::acl::AclTable>>,
     pub runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,

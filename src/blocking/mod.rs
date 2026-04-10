@@ -22,8 +22,16 @@ pub enum BlockedCommand {
         wherefrom: Direction,
         whereto: Direction,
     },
+    BLMPop {
+        dir: Direction,
+        count: u32,
+    },
     BZPopMin,
     BZPopMax,
+    BZMPop {
+        min: bool,
+        count: u32,
+    },
     XRead {
         /// (key, last_seen_id) pairs -- read entries > last_seen_id from each stream.
         streams: Vec<(Bytes, crate::storage::stream::StreamId)>,

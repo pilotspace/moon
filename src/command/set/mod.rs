@@ -108,9 +108,12 @@ pub use set_read::sunion_readonly;
 // ---------------------------------------------------------------------------
 // Re-exports: write operations
 // ---------------------------------------------------------------------------
+pub use set_read::sintercard;
+pub use set_read::sintercard_readonly;
 pub use set_write::sadd;
 pub use set_write::sdiffstore;
 pub use set_write::sinterstore;
+pub use set_write::smove;
 pub use set_write::spop;
 pub use set_write::srem;
 pub use set_write::sunionstore;
