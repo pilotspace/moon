@@ -40,6 +40,7 @@
 pub mod acl;
 pub mod admin;
 pub mod auth_ratelimit;
+pub mod client_pause;
 pub mod client_registry;
 pub mod blocking;
 pub mod cluster;

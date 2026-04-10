@@ -493,6 +493,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             continue;
         }
 
+        // CLIENT PAUSE: delay processing if server is paused
+        crate::client_pause::expire_if_needed();
+        if let Some(remaining) = crate::client_pause::check_pause(true) {
+            monoio::time::sleep(remaining).await;
+        }
+
         // Process frames with shard routing, cross-shard dispatch, and AOF logging
         // Note: do NOT clear write_buf -- it may contain responses from inline dispatch.
         // The inline path appends directly; the normal path appends via encode_frame below.
@@ -1000,7 +1006,41 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                             continue;
                         }
-                        if sub_bytes.eq_ignore_ascii_case(b"PAUSE") || sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                        if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
+                            if cmd_args.len() < 2 {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                                )));
+                            } else {
+                                let timeout_bytes = match &cmd_args[1] {
+                                    Frame::BulkString(b) => Some(b.as_ref()),
+                                    Frame::SimpleString(b) => Some(b.as_ref()),
+                                    _ => None,
+                                };
+                                match timeout_bytes.and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<u64>().ok()) {
+                                    Some(ms) => {
+                                        let mode = if cmd_args.len() > 2 {
+                                            match &cmd_args[2] {
+                                                Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"WRITE") => crate::client_pause::PauseMode::Write,
+                                                _ => crate::client_pause::PauseMode::All,
+                                            }
+                                        } else {
+                                            crate::client_pause::PauseMode::All
+                                        };
+                                        crate::client_pause::pause(ms, mode);
+                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    }
+                                    None => {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR timeout is not a valid integer or out of range",
+                                        )));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                            crate::client_pause::unpause();
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             continue;
                         }

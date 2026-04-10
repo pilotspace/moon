@@ -506,6 +506,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if break_outer { break; }
                 if batch.is_empty() { continue; }
 
+                // CLIENT PAUSE: delay processing if server is paused
+                // Check with is_write=true (conservative — pauses all batches in ALL mode)
+                crate::client_pause::expire_if_needed();
+                if let Some(remaining) = crate::client_pause::check_pause(true) {
+                    tokio::time::sleep(remaining).await;
+                }
+
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(ctx.num_shards);
@@ -1016,8 +1023,41 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                     continue;
                                 }
-                                if sub_bytes.eq_ignore_ascii_case(b"PAUSE") || sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
-                                    // Placeholder — will be implemented in P1.4
+                                if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
+                                    if cmd_args.len() < 2 {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                                        )));
+                                    } else {
+                                        let timeout_bytes = match &cmd_args[1] {
+                                            Frame::BulkString(b) => Some(b.as_ref()),
+                                            Frame::SimpleString(b) => Some(b.as_ref()),
+                                            _ => None,
+                                        };
+                                        match timeout_bytes.and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<u64>().ok()) {
+                                            Some(ms) => {
+                                                let mode = if cmd_args.len() > 2 {
+                                                    match &cmd_args[2] {
+                                                        Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"WRITE") => crate::client_pause::PauseMode::Write,
+                                                        _ => crate::client_pause::PauseMode::All,
+                                                    }
+                                                } else {
+                                                    crate::client_pause::PauseMode::All
+                                                };
+                                                crate::client_pause::pause(ms, mode);
+                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                            }
+                                            None => {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR timeout is not a valid integer or out of range",
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                                    crate::client_pause::unpause();
                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     continue;
                                 }
