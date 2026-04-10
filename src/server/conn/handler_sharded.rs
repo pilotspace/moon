@@ -10,32 +10,21 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use bumpalo::Bump;
 use bytes::{Bytes, BytesMut};
-use ringbuf::HeapProd;
 use ringbuf::traits::Producer;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
-
-/// Type alias to distinguish pre-existing std::sync::RwLock (for ACL, runtime config, etc.)
-/// from parking_lot::RwLock (used for pubsub types added in this PR).
-type StdRwLock<T> = std::sync::RwLock<T>;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
-use crate::config::{RuntimeConfig, ServerConfig};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
-use crate::pubsub::PubSubRegistry;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::shard::shared_databases::ShardDatabases;
-use crate::storage::entry::CachedClock;
 use crate::storage::eviction::try_evict_if_needed;
-use crate::tracking::{TrackingState, TrackingTable};
+use crate::tracking::TrackingState;
 
-use super::affinity::{AffinityTracker, MigratedConnectionState};
+use super::affinity::MigratedConnectionState;
 use crate::server::response_slot::ResponseSlotPool;
 
 /// Result of `handle_connection_sharded_inner` execution.
@@ -59,7 +48,7 @@ pub enum HandlerResult {
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command, handle_config,
-    is_multi_key_command, propagate_subscription, restore_migrated_state, unpropagate_subscription,
+    is_multi_key_command, propagate_subscription, unpropagate_subscription,
 };
 
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
@@ -77,38 +66,11 @@ use super::{
 /// Connection-level commands (AUTH, SUBSCRIBE, MULTI/EXEC) are handled at the
 /// connection level same as the non-sharded handler.
 #[tracing::instrument(skip_all, level = "debug")]
-pub async fn handle_connection_sharded(
+pub(crate) async fn handle_connection_sharded(
     stream: TcpStream,
-    shard_databases: Arc<ShardDatabases>,
-    shard_id: usize,
-    num_shards: usize,
-    dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
-    blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
-    requirepass: Option<String>,
-    aof_tx: Option<channel::MpscSender<AofMessage>>,
-    tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
-    repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
-    cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
-    lua: std::rc::Rc<mlua::Lua>,
-    script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
-    config_port: u16,
-    acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
-    config: Arc<ServerConfig>,
-    spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
-    snapshot_trigger_tx: channel::WatchSender<u64>,
-    cached_clock: CachedClock,
-    remote_subscriber_map: Arc<
-        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
-    >,
-    all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
-    all_remote_sub_maps: Vec<
-        Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
-    >,
-    pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) {
     crate::admin::metrics_setup::record_connection_opened();
     let peer_addr = stream
@@ -118,32 +80,9 @@ pub async fn handle_connection_sharded(
     let result = handle_connection_sharded_inner(
         stream,
         peer_addr,
-        shard_databases,
-        shard_id,
-        num_shards,
-        dispatch_tx.clone(),
-        pubsub_registry,
-        blocking_registry,
+        ctx,
         shutdown,
-        requirepass,
-        aof_tx,
-        tracking_table,
         client_id,
-        repl_state,
-        cluster_state,
-        lua,
-        script_cache,
-        config_port,
-        acl_table,
-        runtime_config,
-        config,
-        spsc_notifiers.clone(),
-        snapshot_trigger_tx,
-        cached_clock,
-        remote_subscriber_map,
-        all_pubsub_registries,
-        all_remote_sub_maps,
-        pubsub_affinity,
         true, // can_migrate: plain TCP supports FD extraction
         BytesMut::new(),
         None, // fresh connection, no migrated state
@@ -164,17 +103,17 @@ pub async fn handle_connection_sharded(
             Ok(std_stream) => {
                 let raw_fd = std_stream.into_raw_fd();
                 let msg = ShardMessage::MigrateConnection { fd: raw_fd, state };
-                let target_idx = ChannelMesh::target_index(shard_id, target_shard);
+                let target_idx = ChannelMesh::target_index(ctx.shard_id, target_shard);
                 let push_result = {
-                    let mut producers = dispatch_tx.borrow_mut();
+                    let mut producers = ctx.dispatch_tx.borrow_mut();
                     producers[target_idx].try_push(msg)
                 };
                 match push_result {
                     Ok(()) => {
-                        spsc_notifiers[target_shard].notify_one();
+                        ctx.spsc_notifiers[target_shard].notify_one();
                         tracing::info!(
                             "Shard {}: migrated connection {} to shard {}",
-                            shard_id,
+                            ctx.shard_id,
                             client_id,
                             target_shard
                         );
@@ -188,15 +127,15 @@ pub async fn handle_connection_sharded(
                             // pending is always re-filled on retry via Err(returned_msg)
                             let msg = pending.take().unwrap();
                             let push_result = {
-                                let mut producers = dispatch_tx.borrow_mut();
+                                let mut producers = ctx.dispatch_tx.borrow_mut();
                                 producers[target_idx].try_push(msg)
                             };
                             match push_result {
                                 Ok(()) => {
-                                    spsc_notifiers[target_shard].notify_one();
+                                    ctx.spsc_notifiers[target_shard].notify_one();
                                     tracing::info!(
                                         "Shard {}: migrated connection {} to shard {} (after retry)",
-                                        shard_id,
+                                        ctx.shard_id,
                                         client_id,
                                         target_shard
                                     );
@@ -213,14 +152,14 @@ pub async fn handle_connection_sharded(
                         }
                         tracing::warn!(
                             "Shard {}: migration SPSC full, connection {} lost",
-                            shard_id,
+                            ctx.shard_id,
                             client_id
                         );
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Shard {}: migration into_std failed: {}", shard_id, e);
+                tracing::warn!("Shard {}: migration into_std failed: {}", ctx.shard_id, e);
                 // Stream consumed by into_std attempt, connection lost either way
             }
         }
@@ -239,41 +178,14 @@ pub async fn handle_connection_sharded(
 /// Returns `(HandlerResult, Option<S>)`: the stream is returned when migration is triggered
 /// so the concrete caller can extract the raw FD. `can_migrate` controls whether the
 /// AffinityTracker is active (set to `false` for TLS connections).
-pub async fn handle_connection_sharded_inner<
+pub(crate) async fn handle_connection_sharded_inner<
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 >(
     stream: S,
     peer_addr: String,
-    shard_databases: Arc<ShardDatabases>,
-    shard_id: usize,
-    num_shards: usize,
-    dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
-    blocking_registry: Rc<RefCell<crate::blocking::BlockingRegistry>>,
+    ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
-    requirepass: Option<String>,
-    aof_tx: Option<channel::MpscSender<AofMessage>>,
-    tracking_table: Rc<RefCell<TrackingTable>>,
     client_id: u64,
-    repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
-    cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
-    lua: std::rc::Rc<mlua::Lua>,
-    script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
-    config_port: u16,
-    acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
-    config: Arc<ServerConfig>,
-    spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
-    snapshot_trigger_tx: channel::WatchSender<u64>,
-    cached_clock: CachedClock,
-    remote_subscriber_map: Arc<
-        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
-    >,
-    all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
-    all_remote_sub_maps: Vec<
-        Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
-    >,
-    pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
@@ -292,65 +204,37 @@ pub async fn handle_connection_sharded_inner<
     };
     let mut write_buf = BytesMut::with_capacity(8192);
     let parse_config = crate::protocol::ParseConfig::default();
-    let (
-        mut protocol_version,
-        mut selected_db,
-        mut authenticated,
-        mut current_user,
-        client_name_restored,
-    ) = restore_migrated_state(migrated_state, &requirepass);
-    let acl_max_len = runtime_config.read().acllog_max_len;
-    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
+    let mut conn = super::core::ConnectionState::new(
+        client_id,
+        peer_addr.clone(),
+        &ctx.requirepass,
+        ctx.shard_id,
+        ctx.num_shards,
+        can_migrate,
+        ctx.runtime_config.read().acllog_max_len,
+        migrated_state,
+    );
 
-    // Functions API registry (per-shard, lazy init)
+    use crate::pubsub::{self, subscriber::Subscriber};
+
+    // Functions API registry (per-shard, lazy init) — kept as local because Rc<RefCell<>> is !Send
     let func_registry = std::rc::Rc::new(std::cell::RefCell::new(
         crate::scripting::FunctionRegistry::new(),
     ));
-
-    // Transaction (MULTI/EXEC) connection-local state
-    let mut in_multi: bool = false;
-    let mut command_queue: Vec<Frame> = Vec::new();
-
-    // Client tracking state
-    let mut tracking_state = TrackingState::default();
-    let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
-
-    // Pub/Sub subscriber mode state
-    use crate::pubsub::{self, subscriber::Subscriber};
-    let mut pubsub_tx: Option<channel::MpscSender<Bytes>> = None;
-    let mut pubsub_rx: Option<channel::MpscReceiver<Bytes>> = None;
-    let mut subscriber_id: u64 = 0;
-    let mut subscription_count: usize = 0;
-
-    // RESP3/HELLO connection-local state
-    let mut client_name: Option<Bytes> = client_name_restored;
-
-    // Cluster ASKING flag: set by ASKING command, cleared unconditionally before routing check.
-    let mut asking: bool = false;
 
     // Per-connection arena for batch processing temporaries.
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
     let mut arena = Bump::with_capacity(4096);
 
-    // Connection affinity: only track when multi-shard AND migration is possible (plain TCP).
-    // Single-shard has no cross-shard traffic; TLS connections cannot transfer session state.
-    let mut affinity_tracker = if num_shards > 1 && can_migrate {
-        Some(AffinityTracker::new(shard_id, num_shards))
-    } else {
-        None
-    };
-
     // Pre-allocated response slots for zero-allocation cross-shard dispatch.
-    let response_pool = ResponseSlotPool::new(num_shards, shard_id);
+    let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
     let mut break_outer = false;
-    // Migration target: set when AffinityTracker triggers, acted on after batch response flush.
-    let mut migration_target: Option<usize> = None;
     loop {
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
-        if subscription_count > 0 {
-            #[allow(clippy::unwrap_used)] // pubsub_rx is always Some when subscription_count > 0
-            let rx = pubsub_rx.as_mut().unwrap();
+        if conn.subscription_count > 0 {
+            #[allow(clippy::unwrap_used)] // conn.pubsub_rx is always Some when conn.subscription_count > 0
+            let rx = conn.pubsub_rx.as_mut().unwrap();
             tokio::select! {
                 n = stream.read_buf(&mut read_buf) => {
                     match n {
@@ -373,7 +257,7 @@ pub async fn handle_connection_sharded_inner<
                                         for arg in cmd_args {
                                             if let Some(ch) = extract_bytes(arg) {
                                                 #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
+                                                let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, ch.as_ref()) };
                                                 if let Some(reason) = acl_deny {
                                                     let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                                     write_buf.clear();
@@ -381,19 +265,19 @@ pub async fn handle_connection_sharded_inner<
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                     continue;
                                                 }
-                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                { pubsub_registry.write().subscribe(ch.clone(), sub); }
-                                                subscription_count += 1;
+                                                #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
+                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                { ctx.pubsub_registry.write().subscribe(ch.clone(), sub); }
+                                                conn.subscription_count += 1;
                                                 // Register pub/sub affinity for this client IP
-                                                if subscription_count == 1 {
+                                                if conn.subscription_count == 1 {
                                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                        pubsub_affinity.write().register(addr.ip(), shard_id);
+                                                        ctx.pubsub_affinity.write().register(addr.ip(), ctx.shard_id);
                                                     }
                                                 }
-                                                propagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
+                                                propagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
                                                 write_buf.clear();
-                                                let resp = pubsub::subscribe_response(&ch, subscription_count);
+                                                let resp = pubsub::subscribe_response(&ch, conn.subscription_count);
                                                 crate::protocol::serialize(&resp, &mut write_buf);
                                                 if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                             }
@@ -409,7 +293,7 @@ pub async fn handle_connection_sharded_inner<
                                         for arg in cmd_args {
                                             if let Some(pat) = extract_bytes(arg) {
                                                 #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, pat.as_ref()) };
+                                                let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, pat.as_ref()) };
                                                 if let Some(reason) = acl_deny {
                                                     let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                                     write_buf.clear();
@@ -417,77 +301,77 @@ pub async fn handle_connection_sharded_inner<
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                     continue;
                                                 }
-                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
-                                                { pubsub_registry.write().psubscribe(pat.clone(), sub); }
-                                                subscription_count += 1;
+                                                #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
+                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                { ctx.pubsub_registry.write().psubscribe(pat.clone(), sub); }
+                                                conn.subscription_count += 1;
                                                 // Register pub/sub affinity for this client IP
-                                                if subscription_count == 1 {
+                                                if conn.subscription_count == 1 {
                                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                                        pubsub_affinity.write().register(addr.ip(), shard_id);
+                                                        ctx.pubsub_affinity.write().register(addr.ip(), ctx.shard_id);
                                                     }
                                                 }
-                                                propagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
+                                                propagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
                                                 write_buf.clear();
-                                                let resp = pubsub::psubscribe_response(&pat, subscription_count);
+                                                let resp = pubsub::psubscribe_response(&pat, conn.subscription_count);
                                                 crate::protocol::serialize(&resp, &mut write_buf);
                                                 if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                             }
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
                                         if cmd_args.is_empty() {
-                                            let removed = { pubsub_registry.write().unsubscribe_all(subscriber_id) };
+                                            let removed = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
                                             if removed.is_empty() {
-                                                subscription_count = pubsub_registry.read().total_subscription_count(subscriber_id);
+                                                conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
                                                 write_buf.clear();
-                                                crate::protocol::serialize(&pubsub::unsubscribe_response(&Bytes::from_static(b""), subscription_count), &mut write_buf);
+                                                crate::protocol::serialize(&pubsub::unsubscribe_response(&Bytes::from_static(b""), conn.subscription_count), &mut write_buf);
                                                 if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                             } else {
                                                 for ch in &removed {
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    unpropagate_subscription(&all_remote_sub_maps, ch, shard_id, num_shards, false);
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards, false);
                                                     write_buf.clear();
-                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(ch, subscription_count), &mut write_buf);
+                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(ch, conn.subscription_count), &mut write_buf);
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                 }
                                             }
                                         } else {
                                             for arg in cmd_args {
                                                 if let Some(ch) = extract_bytes(arg) {
-                                                    { pubsub_registry.write().unsubscribe(ch.as_ref(), subscriber_id); }
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    unpropagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
+                                                    { ctx.pubsub_registry.write().unsubscribe(ch.as_ref(), conn.subscriber_id); }
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
                                                     write_buf.clear();
-                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(&ch, subscription_count), &mut write_buf);
+                                                    crate::protocol::serialize(&pubsub::unsubscribe_response(&ch, conn.subscription_count), &mut write_buf);
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                 }
                                             }
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") {
                                         if cmd_args.is_empty() {
-                                            let removed = { pubsub_registry.write().punsubscribe_all(subscriber_id) };
+                                            let removed = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
                                             if removed.is_empty() {
-                                                subscription_count = pubsub_registry.read().total_subscription_count(subscriber_id);
+                                                conn.subscription_count = ctx.pubsub_registry.read().total_subscription_count(conn.subscriber_id);
                                                 write_buf.clear();
-                                                crate::protocol::serialize(&pubsub::punsubscribe_response(&Bytes::from_static(b""), subscription_count), &mut write_buf);
+                                                crate::protocol::serialize(&pubsub::punsubscribe_response(&Bytes::from_static(b""), conn.subscription_count), &mut write_buf);
                                                 if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                             } else {
                                                 for pat in &removed {
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    unpropagate_subscription(&all_remote_sub_maps, pat, shard_id, num_shards, true);
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&ctx.all_remote_sub_maps, pat, ctx.shard_id, ctx.num_shards, true);
                                                     write_buf.clear();
-                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(pat, subscription_count), &mut write_buf);
+                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(pat, conn.subscription_count), &mut write_buf);
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                 }
                                             }
                                         } else {
                                             for arg in cmd_args {
                                                 if let Some(pat) = extract_bytes(arg) {
-                                                    { pubsub_registry.write().punsubscribe(pat.as_ref(), subscriber_id); }
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    unpropagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
+                                                    { ctx.pubsub_registry.write().punsubscribe(pat.as_ref(), conn.subscriber_id); }
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    unpropagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
                                                     write_buf.clear();
-                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(&pat, subscription_count), &mut write_buf);
+                                                    crate::protocol::serialize(&pubsub::punsubscribe_response(&pat, conn.subscription_count), &mut write_buf);
                                                     if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                                 }
                                             }
@@ -507,9 +391,9 @@ pub async fn handle_connection_sharded_inner<
                                         sub_break = true;
                                         break;
                                     } else if cmd.eq_ignore_ascii_case(b"RESET") {
-                                        { pubsub_registry.write().unsubscribe_all(subscriber_id); }
-                                        { pubsub_registry.write().punsubscribe_all(subscriber_id); }
-                                        subscription_count = 0;
+                                        { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id); }
+                                        { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id); }
+                                        conn.subscription_count = 0;
                                         write_buf.clear();
                                         crate::protocol::serialize(&Frame::SimpleString(Bytes::from_static(b"RESET")), &mut write_buf);
                                         if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
@@ -524,14 +408,14 @@ pub async fn handle_connection_sharded_inner<
                                         if stream.write_all(&write_buf).await.is_err() { sub_break = true; break; }
                                     }
                                 }
-                                if subscription_count == 0 { break; }
+                                if conn.subscription_count == 0 { break; }
                             }
                             Ok(None) => break,
                             Err(_) => { return (HandlerResult::Done, None); }
                         }
                     }
                     if sub_break { break; }
-                    if subscription_count == 0 { continue; }
+                    if conn.subscription_count == 0 { continue; }
                 }
                 msg = rx.recv_async() => {
                     match msg {
@@ -578,25 +462,25 @@ pub async fn handle_connection_sharded_inner<
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
 
                 for frame in batch {
                     // --- AUTH gate ---
-                    if !authenticated {
+                    if !conn.authenticated {
                         match extract_command(&frame) {
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
-                                let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
+                                let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                                 if let Some(uname) = opt_user {
-                                    authenticated = true;
-                                    current_user = uname;
+                                    conn.authenticated = true;
+                                    conn.current_user = uname;
                                 } else {
-                                    acl_log.push(crate::acl::AclLogEntry {
+                                    conn.acl_log.push(crate::acl::AclLogEntry {
                                         reason: "auth".to_string(),
                                         object: "AUTH".to_string(),
-                                        username: current_user.clone(),
+                                        username: conn.current_user.clone(),
                                         client_addr: peer_addr.clone(),
                                         timestamp_ms: std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -610,19 +494,19 @@ pub async fn handle_connection_sharded_inner<
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
                                 let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
                                     cmd_args,
-                                    protocol_version,
+                                    conn.protocol_version,
                                     client_id,
-                                    &acl_table,
-                                    &mut authenticated,
+                                    &ctx.acl_table,
+                                    &mut conn.authenticated,
                                 );
                                 if !matches!(&response, Frame::Error(_)) {
-                                    protocol_version = new_proto;
+                                    conn.protocol_version = new_proto;
                                 }
                                 if let Some(name) = new_name {
-                                    client_name = Some(name);
+                                    conn.client_name = Some(name);
                                 }
                                 if let Some(uname) = opt_user {
-                                    current_user = uname;
+                                    conn.current_user = uname;
                                 }
                                 responses.push(response);
                                 continue;
@@ -660,17 +544,17 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- ASKING ---
                     if cmd.eq_ignore_ascii_case(b"ASKING") {
-                        asking = true;
+                        conn.asking = true;
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         continue;
                     }
 
                     // --- CLUSTER subcommands ---
                     if cmd.eq_ignore_ascii_case(b"CLUSTER") {
-                        if let Some(ref cs) = cluster_state {
+                        if let Some(ref cs) = ctx.cluster_state {
                             #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
                             let self_addr: std::net::SocketAddr =
-                                format!("127.0.0.1:{}", config_port)
+                                format!("127.0.0.1:{}", ctx.config_port)
                                     .parse()
                                     .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
                             let resp = crate::cluster::command::handle_cluster_command(
@@ -688,17 +572,17 @@ pub async fn handle_connection_sharded_inner<
                     // --- Lua scripting: EVAL / EVALSHA ---
                     if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
                         let response = {
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            let db_count = shard_databases.db_count();
+                            let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let db_count = ctx.shard_databases.db_count();
                             if cmd.eq_ignore_ascii_case(b"EVAL") {
                                 crate::scripting::handle_eval(
-                                    &lua, &script_cache, cmd_args, &mut guard,
-                                    shard_id, num_shards, selected_db, db_count,
+                                    &ctx.lua, &ctx.script_cache, cmd_args, &mut guard,
+                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
-                                    &lua, &script_cache, cmd_args, &mut guard,
-                                    shard_id, num_shards, selected_db, db_count,
+                                    &ctx.lua, &ctx.script_cache, cmd_args, &mut guard,
+                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             }
                         };
@@ -708,15 +592,15 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- SCRIPT subcommands ---
                     if cmd.eq_ignore_ascii_case(b"SCRIPT") {
-                        let (response, fanout) = crate::scripting::handle_script_subcommand(&script_cache, cmd_args);
+                        let (response, fanout) = crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
                         if let Some((sha1, script_bytes)) = fanout {
-                            let mut producers = dispatch_tx.borrow_mut();
-                            for target in 0..num_shards {
-                                if target == shard_id { continue; }
-                                let idx = ChannelMesh::target_index(shard_id, target);
+                            let mut producers = ctx.dispatch_tx.borrow_mut();
+                            for target in 0..ctx.num_shards {
+                                if target == ctx.shard_id { continue; }
+                                let idx = ChannelMesh::target_index(ctx.shard_id, target);
                                 let msg = ShardMessage::ScriptLoad { sha1: sha1.clone(), script: script_bytes.clone() };
                                 if producers[idx].try_push(msg).is_ok() {
-                                    spsc_notifiers[target].notify_one();
+                                    ctx.spsc_notifiers[target].notify_one();
                                 }
                             }
                             drop(producers);
@@ -727,9 +611,9 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Cluster slot routing (pre-dispatch) ---
                     if crate::cluster::cluster_enabled() {
-                        if let Some(ref cs) = cluster_state {
-                            let was_asking = asking;
-                            asking = false;
+                        if let Some(ref cs) = ctx.cluster_state {
+                            let was_asking = conn.asking;
+                            conn.asking = false;
                             let maybe_key = extract_primary_key(cmd, cmd_args);
                             if let Some(key) = maybe_key {
                                 let slot = crate::cluster::slots::slot_for_key(key);
@@ -767,10 +651,10 @@ pub async fn handle_connection_sharded_inner<
                         }
                     }
 
-                    // --- AUTH (already authenticated) ---
+                    // --- AUTH (already conn.authenticated) ---
                     if cmd.eq_ignore_ascii_case(b"AUTH") {
-                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
-                        if let Some(uname) = opt_user { current_user = uname; }
+                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
+                        if let Some(uname) = opt_user { conn.current_user = uname; }
                         responses.push(response);
                         continue;
                     }
@@ -778,11 +662,11 @@ pub async fn handle_connection_sharded_inner<
                     // --- HELLO ---
                     if cmd.eq_ignore_ascii_case(b"HELLO") {
                         let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                            cmd_args, protocol_version, client_id, &acl_table, &mut authenticated,
+                            cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
                         );
-                        if !matches!(&response, Frame::Error(_)) { protocol_version = new_proto; }
-                        if let Some(name) = new_name { client_name = Some(name); }
-                        if let Some(uname) = opt_user { current_user = uname; }
+                        if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
+                        if let Some(name) = new_name { conn.client_name = Some(name); }
+                        if let Some(uname) = opt_user { conn.current_user = uname; }
                         responses.push(response);
                         continue;
                     }
@@ -790,7 +674,7 @@ pub async fn handle_connection_sharded_inner<
                     // --- ACL ---
                     if cmd.eq_ignore_ascii_case(b"ACL") {
                         let response = crate::command::acl::handle_acl(
-                            cmd_args, &acl_table, &mut acl_log, &current_user, &peer_addr, &runtime_config,
+                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config,
                         );
                         responses.push(response);
                         continue;
@@ -801,13 +685,13 @@ pub async fn handle_connection_sharded_inner<
                     // so that low-privilege users cannot reach admin commands.
                     {
                         #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                        let acl_guard = acl_table.read().unwrap();
-                        if let Some(deny_reason) = acl_guard.check_command_permission(&current_user, cmd, cmd_args) {
+                        let acl_guard = ctx.acl_table.read().unwrap();
+                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
                             drop(acl_guard);
-                            acl_log.push(crate::acl::AclLogEntry {
+                            conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: current_user.clone(),
+                                username: conn.current_user.clone(),
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
@@ -815,12 +699,12 @@ pub async fn handle_connection_sharded_inner<
                             continue;
                         }
                         let is_write_for_acl = metadata::is_write(cmd);
-                        if let Some(deny_reason) = acl_guard.check_key_permission(&current_user, cmd, cmd_args, is_write_for_acl) {
+                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
                             drop(acl_guard);
-                            acl_log.push(crate::acl::AclLogEntry {
+                            conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: current_user.clone(),
+                                username: conn.current_user.clone(),
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
@@ -830,9 +714,9 @@ pub async fn handle_connection_sharded_inner<
                     }
 
                     // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
-                    // Placed AFTER ACL check. Respects MULTI queue — if in_multi,
+                    // Placed AFTER ACL check. Respects MULTI queue — if conn.in_multi,
                     // fall through to the MULTI queue gate instead of executing.
-                    if !in_multi {
+                    if !conn.in_multi {
                         if cmd.eq_ignore_ascii_case(b"FUNCTION") {
                             let response = crate::command::functions::handle_function(
                                 &mut func_registry.borrow_mut(), cmd_args,
@@ -842,11 +726,11 @@ pub async fn handle_connection_sharded_inner<
                         }
                         if cmd.eq_ignore_ascii_case(b"FCALL") {
                             let response = {
-                                let mut guard = shard_databases.write_db(shard_id, selected_db);
-                                let db_count = shard_databases.db_count();
+                                let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                                let db_count = ctx.shard_databases.db_count();
                                 crate::command::functions::handle_fcall(
                                     &func_registry.borrow(), cmd_args, &mut guard,
-                                    shard_id, num_shards, selected_db, db_count,
+                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             };
                             responses.push(response);
@@ -854,11 +738,11 @@ pub async fn handle_connection_sharded_inner<
                         }
                         if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
                             let response = {
-                                let mut guard = shard_databases.write_db(shard_id, selected_db);
-                                let db_count = shard_databases.db_count();
+                                let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                                let db_count = ctx.shard_databases.db_count();
                                 crate::command::functions::handle_fcall_ro(
                                     &func_registry.borrow(), cmd_args, &mut guard,
-                                    shard_id, num_shards, selected_db, db_count,
+                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             };
                             responses.push(response);
@@ -868,7 +752,7 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- CONFIG ---
                     if cmd.eq_ignore_ascii_case(b"CONFIG") {
-                        responses.push(handle_config(cmd_args, &runtime_config, &config));
+                        responses.push(handle_config(cmd_args, &ctx.runtime_config, &ctx.config));
                         continue;
                     }
 
@@ -884,7 +768,7 @@ pub async fn handle_connection_sharded_inner<
                         use crate::command::connection::{replicaof, ReplicaofAction};
                         let (resp, action) = replicaof(cmd_args);
                         if let Some(action) = action {
-                            if let Some(ref rs) = repl_state {
+                            if let Some(ref rs) = ctx.repl_state {
                                 match action {
                                     ReplicaofAction::StartReplication { host, port } => {
                                         if let Ok(mut rs_guard) = rs.write() {
@@ -896,7 +780,7 @@ pub async fn handle_connection_sharded_inner<
                                         let rs_clone = Arc::clone(rs);
                                         let cfg = crate::replication::replica::ReplicaTaskConfig {
                                             master_host: host, master_port: port,
-                                            repl_state: rs_clone, num_shards,
+                                            repl_state: rs_clone, num_shards: ctx.num_shards,
                                             persistence_dir: None, listening_port: 0,
                                         };
                                         tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
@@ -925,7 +809,7 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- INFO ---
                     if cmd.eq_ignore_ascii_case(b"INFO") {
-                        let guard = shard_databases.read_db(shard_id, selected_db);
+                        let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                         let response_text = {
                             let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
                             match resp_frame {
@@ -935,7 +819,7 @@ pub async fn handle_connection_sharded_inner<
                         };
                         drop(guard);
                         let mut response_text = response_text;
-                        if let Some(ref rs) = repl_state {
+                        if let Some(ref rs) = ctx.repl_state {
                             if let Ok(rs_guard) = rs.try_read() {
                                 response_text.push_str(
                                     &crate::replication::handshake::build_info_replication(&rs_guard),
@@ -947,7 +831,7 @@ pub async fn handle_connection_sharded_inner<
                     }
 
                     // --- READONLY enforcement ---
-                    if let Some(ref rs) = repl_state {
+                    if let Some(ref rs) = ctx.repl_state {
                         if let Ok(rs_guard) = rs.try_read() {
                             if matches!(rs_guard.role, crate::replication::state::ReplicationRole::Replica { .. }) {
                                 if metadata::is_write(cmd) {
@@ -974,13 +858,13 @@ pub async fn handle_connection_sharded_inner<
                                             b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
                                         )));
                                     } else {
-                                        client_name = extract_bytes(&cmd_args[1]);
+                                        conn.client_name = extract_bytes(&cmd_args[1]);
                                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     }
                                     continue;
                                 }
                                 if sub_bytes.eq_ignore_ascii_case(b"GETNAME") {
-                                    responses.push(match &client_name {
+                                    responses.push(match &conn.client_name {
                                         Some(name) => Frame::BulkString(name.clone()),
                                         None => Frame::Null,
                                     });
@@ -990,16 +874,16 @@ pub async fn handle_connection_sharded_inner<
                                     match crate::command::client::parse_tracking_args(cmd_args) {
                                         Ok(config_parsed) => {
                                             if config_parsed.enable {
-                                                tracking_state.enabled = true;
-                                                tracking_state.bcast = config_parsed.bcast;
-                                                tracking_state.noloop = config_parsed.noloop;
-                                                tracking_state.optin = config_parsed.optin;
-                                                tracking_state.optout = config_parsed.optout;
-                                                if tracking_rx.is_none() {
+                                                conn.tracking_state.enabled = true;
+                                                conn.tracking_state.bcast = config_parsed.bcast;
+                                                conn.tracking_state.noloop = config_parsed.noloop;
+                                                conn.tracking_state.optin = config_parsed.optin;
+                                                conn.tracking_state.optout = config_parsed.optout;
+                                                if conn.tracking_rx.is_none() {
                                                     let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                                                    tracking_state.invalidation_tx = Some(tx.clone());
-                                                    tracking_rx = Some(rx);
-                                                    let mut table = tracking_table.borrow_mut();
+                                                    conn.tracking_state.invalidation_tx = Some(tx.clone());
+                                                    conn.tracking_rx = Some(rx);
+                                                    let mut table = ctx.tracking_table.borrow_mut();
                                                     table.register_client(client_id, tx);
                                                     if let Some(target) = config_parsed.redirect {
                                                         table.set_redirect(client_id, target);
@@ -1010,9 +894,9 @@ pub async fn handle_connection_sharded_inner<
                                                 }
                                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                             } else {
-                                                tracking_state = TrackingState::default();
-                                                tracking_table.borrow_mut().untrack_all(client_id);
-                                                tracking_rx = None;
+                                                conn.tracking_state = TrackingState::default();
+                                                ctx.tracking_table.borrow_mut().untrack_all(client_id);
+                                                conn.tracking_rx = None;
                                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                             }
                                             continue;
@@ -1034,11 +918,11 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- MULTI ---
                     if cmd.eq_ignore_ascii_case(b"MULTI") {
-                        if in_multi {
+                        if conn.in_multi {
                             responses.push(Frame::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
                         } else {
-                            in_multi = true;
-                            command_queue.clear();
+                            conn.in_multi = true;
+                            conn.command_queue.clear();
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         }
                         continue;
@@ -1046,12 +930,12 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- EXEC ---
                     if cmd.eq_ignore_ascii_case(b"EXEC") {
-                        if !in_multi {
+                        if !conn.in_multi {
                             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
                         } else {
-                            in_multi = false;
-                            let result = execute_transaction_sharded(&shard_databases, shard_id, &command_queue, selected_db, &cached_clock);
-                            command_queue.clear();
+                            conn.in_multi = false;
+                            let result = execute_transaction_sharded(&ctx.shard_databases, ctx.shard_id, &conn.command_queue, conn.selected_db, &ctx.cached_clock);
+                            conn.command_queue.clear();
                             responses.push(result);
                         }
                         continue;
@@ -1059,11 +943,11 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- DISCARD ---
                     if cmd.eq_ignore_ascii_case(b"DISCARD") {
-                        if !in_multi {
+                        if !conn.in_multi {
                             responses.push(Frame::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
                         } else {
-                            in_multi = false;
-                            command_queue.clear();
+                            conn.in_multi = false;
+                            conn.command_queue.clear();
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         }
                         continue;
@@ -1076,15 +960,15 @@ pub async fn handle_connection_sharded_inner<
                         || cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
                         || cmd.eq_ignore_ascii_case(b"BZMPOP")
                     {
-                        if in_multi {
+                        if conn.in_multi {
                             let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
-                            command_queue.push(nb_frame);
+                            conn.command_queue.push(nb_frame);
                             responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                             continue;
                         }
                         write_buf.clear();
                         for response in responses.iter() {
-                            if protocol_version >= 3 {
+                            if conn.protocol_version >= 3 {
                                 crate::protocol::serialize_resp3(response, &mut write_buf);
                             } else {
                                 crate::protocol::serialize(response, &mut write_buf);
@@ -1092,10 +976,10 @@ pub async fn handle_connection_sharded_inner<
                         }
                         if stream.write_all(&write_buf).await.is_err() { arena.reset(); return (HandlerResult::Done, None); }
                         let blocking_response = handle_blocking_command(
-                            cmd, cmd_args, selected_db, &shard_databases, &blocking_registry,
-                            shard_id, num_shards, &dispatch_tx, &shutdown,
+                            cmd, cmd_args, conn.selected_db, &ctx.shard_databases, &ctx.blocking_registry,
+                            ctx.shard_id, ctx.num_shards, &ctx.dispatch_tx, &shutdown,
                         ).await;
-                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, protocol_version);
+                        let blocking_response = apply_resp3_conversion(cmd, blocking_response, conn.protocol_version);
                         responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
                         break;
@@ -1111,8 +995,8 @@ pub async fn handle_connection_sharded_inner<
                             // ACL channel permission check for PUBLISH
                             if let Some(ref ch) = channel_arg {
                                 #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                let acl_guard = acl_table.read().unwrap();
-                                if let Some(deny_reason) = acl_guard.check_channel_permission(&current_user, ch.as_ref()) {
+                                let acl_guard = ctx.acl_table.read().unwrap();
+                                if let Some(deny_reason) = acl_guard.check_channel_permission(&conn.current_user, ch.as_ref()) {
                                     drop(acl_guard);
                                     responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                                     continue;
@@ -1120,15 +1004,15 @@ pub async fn handle_connection_sharded_inner<
                             }
                             match (channel_arg, message_arg) {
                                 (Some(ch), Some(msg)) => {
-                                    let local_count = { pubsub_registry.write().publish(&ch, &msg) };
+                                    let local_count = { ctx.pubsub_registry.write().publish(&ch, &msg) };
                                     // Targeted fanout: only send to shards that have subscribers
-                                    let targets = remote_subscriber_map.read().target_shards(&ch);
+                                    let targets = ctx.remote_subscriber_map.read().target_shards(&ch);
                                     if targets.is_empty() {
                                         // Fast path: no remote subscribers, return local count immediately
                                         responses.push(Frame::Integer(local_count));
                                     } else {
                                         // Filter to remote targets only (skip self)
-                                        let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != shard_id).collect();
+                                        let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != ctx.shard_id).collect();
                                         if remote_targets.is_empty() {
                                             responses.push(Frame::Integer(local_count));
                                         } else {
@@ -1160,19 +1044,19 @@ pub async fn handle_connection_sharded_inner<
                             continue;
                         }
                         // Allocate pubsub channel if not yet created
-                        if pubsub_tx.is_none() {
+                        if conn.pubsub_tx.is_none() {
                             let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
-                            pubsub_tx = Some(tx);
-                            pubsub_rx = Some(rx);
+                            conn.pubsub_tx = Some(tx);
+                            conn.pubsub_rx = Some(rx);
                         }
-                        if subscriber_id == 0 {
-                            subscriber_id = crate::pubsub::next_subscriber_id();
+                        if conn.subscriber_id == 0 {
+                            conn.subscriber_id = crate::pubsub::next_subscriber_id();
                         }
                         // Flush accumulated responses before entering subscriber mode
                         if !responses.is_empty() {
                             write_buf.clear();
                             for resp in &responses {
-                                if protocol_version >= 3 {
+                                if conn.protocol_version >= 3 {
                                     crate::protocol::serialize_resp3(resp, &mut write_buf);
                                 } else {
                                     crate::protocol::serialize(resp, &mut write_buf);
@@ -1185,7 +1069,7 @@ pub async fn handle_connection_sharded_inner<
                         for arg in cmd_args {
                             if let Some(ch) = extract_bytes(arg) {
                                 #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                let acl_deny = { acl_table.read().unwrap().check_channel_permission(&current_user, ch.as_ref()) };
+                                let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, ch.as_ref()) };
                                 if let Some(reason) = acl_deny {
                                     write_buf.clear();
                                     let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
@@ -1193,26 +1077,26 @@ pub async fn handle_connection_sharded_inner<
                                     if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
                                     continue;
                                 }
-                                #[allow(clippy::unwrap_used)] // pubsub_tx is set to Some just above before this loop
-                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                #[allow(clippy::unwrap_used)] // conn.pubsub_tx is set to Some just above before this loop
+                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
                                 if is_pattern {
-                                    { pubsub_registry.write().psubscribe(ch.clone(), sub); }
+                                    { ctx.pubsub_registry.write().psubscribe(ch.clone(), sub); }
                                 } else {
-                                    { pubsub_registry.write().subscribe(ch.clone(), sub); }
+                                    { ctx.pubsub_registry.write().subscribe(ch.clone(), sub); }
                                 }
-                                subscription_count += 1;
+                                conn.subscription_count += 1;
                                 // Register pub/sub affinity for this client IP
-                                if subscription_count == 1 {
+                                if conn.subscription_count == 1 {
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                        pubsub_affinity.write().register(addr.ip(), shard_id);
+                                        ctx.pubsub_affinity.write().register(addr.ip(), ctx.shard_id);
                                     }
                                 }
-                                propagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, is_pattern);
+                                propagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, is_pattern);
                                 write_buf.clear();
                                 let resp = if is_pattern {
-                                    pubsub::psubscribe_response(&ch, subscription_count)
+                                    pubsub::psubscribe_response(&ch, conn.subscription_count)
                                 } else {
-                                    pubsub::subscribe_response(&ch, subscription_count)
+                                    pubsub::subscribe_response(&ch, conn.subscription_count)
                                 };
                                 crate::protocol::serialize(&resp, &mut write_buf);
                                 if stream.write_all(&write_buf).await.is_err() { return (HandlerResult::Done, None); }
@@ -1243,7 +1127,7 @@ pub async fn handle_connection_sharded_inner<
                             Some(ref sc) if sc.eq_ignore_ascii_case(b"CHANNELS") => {
                                 let pattern = if cmd_args.len() > 1 { extract_bytes(&cmd_args[1]) } else { None };
                                 let mut all_channels: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
-                                for reg in &all_pubsub_registries {
+                                for reg in &ctx.all_pubsub_registries {
                                     let guard = reg.read();
                                     all_channels.extend(guard.active_channels(pattern.as_deref()));
                                 }
@@ -1253,7 +1137,7 @@ pub async fn handle_connection_sharded_inner<
                             Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMSUB") => {
                                 let channels: Vec<Bytes> = cmd_args[1..].iter().filter_map(|a| extract_bytes(a)).collect();
                                 let mut counts: HashMap<Bytes, i64> = HashMap::new();
-                                for reg in &all_pubsub_registries {
+                                for reg in &ctx.all_pubsub_registries {
                                     let guard = reg.read();
                                     for (ch, c) in guard.numsub(&channels) {
                                         *counts.entry(ch).or_insert(0) += c;
@@ -1268,7 +1152,7 @@ pub async fn handle_connection_sharded_inner<
                             }
                             Some(ref sc) if sc.eq_ignore_ascii_case(b"NUMPAT") => {
                                 let mut total: usize = 0;
-                                for reg in &all_pubsub_registries {
+                                for reg in &ctx.all_pubsub_registries {
                                     total += reg.read().numpat();
                                 }
                                 responses.push(Frame::Integer(total as i64));
@@ -1281,15 +1165,15 @@ pub async fn handle_connection_sharded_inner<
                     }
 
                     // --- MULTI queue mode ---
-                    if in_multi {
-                        command_queue.push(frame);
+                    if conn.in_multi {
+                        conn.command_queue.push(frame);
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                         continue;
                     }
 
                     // --- BGSAVE ---
                     if cmd.eq_ignore_ascii_case(b"BGSAVE") {
-                        responses.push(crate::command::persistence::bgsave_start_sharded(&snapshot_trigger_tx, num_shards));
+                        responses.push(crate::command::persistence::bgsave_start_sharded(&ctx.snapshot_trigger_tx, ctx.num_shards));
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SAVE") {
@@ -1301,10 +1185,10 @@ pub async fn handle_connection_sharded_inner<
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
-                        if let Some(ref tx) = aof_tx {
+                        if let Some(ref tx) = ctx.aof_tx {
                             responses.push(crate::command::persistence::bgrewriteaof_start_sharded(
                                 tx,
-                                shard_databases.clone(),
+                                ctx.shard_databases.clone(),
                             ));
                         } else {
                             responses.push(Frame::Error(Bytes::from_static(
@@ -1316,24 +1200,24 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if cmd.eq_ignore_ascii_case(b"KEYS") {
-                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
+                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SCAN") {
-                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
+                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                        let response = crate::shard::coordinator::coordinate_dbsize(shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &()).await;
+                        let response = crate::shard::coordinator::coordinate_dbsize(ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &()).await;
                         responses.push(response);
                         continue;
                     }
 
                     // --- FT.* vector search commands ---
                     if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
-                        if num_shards > 1 {
+                        if ctx.num_shards > 1 {
                             // Multi-shard: dispatch via SPSC
                             if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                 let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
@@ -1345,9 +1229,9 @@ pub async fn handle_connection_sharded_inner<
                                         } else {
                                             crate::shard::coordinator::scatter_vector_search_remote(
                                                 index_name, query_blob, k,
-                                                shard_id, num_shards,
-                                                &shard_databases,
-                                                &dispatch_tx, &spsc_notifiers,
+                                                ctx.shard_id, ctx.num_shards,
+                                                &ctx.shard_databases,
+                                                &ctx.dispatch_tx, &ctx.spsc_notifiers,
                                             ).await
                                         }
                                     }
@@ -1358,9 +1242,9 @@ pub async fn handle_connection_sharded_inner<
                             }
                             let response = crate::shard::coordinator::broadcast_vector_command(
                                 std::sync::Arc::new(frame),
-                                shard_id, num_shards,
-                                &shard_databases,
-                                &dispatch_tx, &spsc_notifiers,
+                                ctx.shard_id, ctx.num_shards,
+                                &ctx.shard_databases,
+                                &ctx.dispatch_tx, &ctx.spsc_notifiers,
                             ).await;
                             responses.push(response);
                             continue;
@@ -1368,8 +1252,8 @@ pub async fn handle_connection_sharded_inner<
                             // Single-shard: no SPSC channels available.
                             // Dispatch directly to shard's VectorStore via shared access.
                             let response = {
-                                let shard_databases_ref = &shard_databases;
-                                let mut vs = shard_databases_ref.vector_store(shard_id);
+                                let shard_databases_ref = &ctx.shard_databases;
+                                let mut vs = shard_databases_ref.vector_store(ctx.shard_id);
                                 if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                     crate::command::vector_search::ft_create(&mut vs, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
@@ -1391,16 +1275,16 @@ pub async fn handle_connection_sharded_inner<
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, shard_id, num_shards, selected_db, &shard_databases, &dispatch_tx, &spsc_notifiers, &cached_clock, &()).await;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
                         responses.push(response);
                         continue;
                     }
 
                     // --- Routing: keyless, local, or remote ---
-                    let target_shard = extract_primary_key(cmd, cmd_args).map(|key| key_to_shard(key, num_shards));
+                    let target_shard = extract_primary_key(cmd, cmd_args).map(|key| key_to_shard(key, ctx.num_shards));
                     let is_local = match target_shard {
                         None => true,
-                        Some(s) if s == shard_id => true,
+                        Some(s) if s == ctx.shard_id => true,
                         _ => false,
                     };
 
@@ -1408,18 +1292,18 @@ pub async fn handle_connection_sharded_inner<
                     // Only sample when we have a concrete target shard (key-bearing command).
                     // Migration is deferred until AFTER the current batch is fully processed
                     // and all responses are written, ensuring no command/response desync.
-                    if let (Some(tracker), Some(target)) = (&mut affinity_tracker, target_shard) {
+                    if let (Some(tracker), Some(target)) = (&mut conn.affinity_tracker, target_shard) {
                         if let Some(migrate_to) = tracker.record(target) {
                             // Migration preconditions: not in MULTI, no active CLIENT TRACKING
                             // (tracking connections need untrack_all cleanup which doesn't transfer)
-                            if !in_multi && !tracking_state.enabled {
-                                migration_target = Some(migrate_to);
+                            if !conn.in_multi && !conn.tracking_state.enabled {
+                                conn.migration_target = Some(migrate_to);
                             }
                         }
                     }
 
-                    let is_write = if aof_tx.is_some() || tracking_state.enabled { metadata::is_write(cmd) } else { false };
-                    let aof_bytes = if is_write && aof_tx.is_some() { Some(aof::serialize_command(&frame)) } else { None };
+                    let is_write = if ctx.aof_tx.is_some() || conn.tracking_state.enabled { metadata::is_write(cmd) } else { false };
+                    let aof_bytes = if is_write && ctx.aof_tx.is_some() { Some(aof::serialize_command(&frame)) } else { None };
 
                     if is_local {
                         // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
@@ -1427,8 +1311,8 @@ pub async fn handle_connection_sharded_inner<
                         // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
-                            let rt = runtime_config.read();
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
+                            let rt = ctx.runtime_config.read();
+                            let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
                                 drop(guard);
                                 drop(rt);
@@ -1437,10 +1321,10 @@ pub async fn handle_connection_sharded_inner<
                             }
                             drop(rt);
 
-                            let db_count = shard_databases.db_count();
-                            guard.refresh_now_from_cache(&cached_clock);
+                            let db_count = ctx.shard_databases.db_count();
+                            guard.refresh_now_from_cache(&ctx.cached_clock);
                             let dispatch_start = std::time::Instant::now();
-                            let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                            let result = dispatch(&mut guard, cmd, cmd_args, &mut conn.selected_db, db_count);
                             let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                 crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -1450,7 +1334,7 @@ pub async fn handle_connection_sharded_inner<
                                     elapsed_us,
                                     args.as_slice(),
                                     peer_addr.as_bytes(),
-                                    client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                 );
                             }
                             let response = match result {
@@ -1466,11 +1350,11 @@ pub async fn handle_connection_sharded_inner<
                                     || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
                                 if needs_wake {
                                     if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                        let mut reg = blocking_registry.borrow_mut();
+                                        let mut reg = ctx.blocking_registry.borrow_mut();
                                         if cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH") || cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                            crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, selected_db, &key);
+                                            crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, conn.selected_db, &key);
                                         } else {
-                                            crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, selected_db, &key);
+                                            crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, conn.selected_db, &key);
                                         }
                                     }
                                 }
@@ -1483,7 +1367,7 @@ pub async fn handle_connection_sharded_inner<
                                 && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
                             {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut vs = shard_databases.vector_store(shard_id);
+                                    let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                                     crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &key, cmd_args);
                                 }
                             }
@@ -1493,7 +1377,7 @@ pub async fn handle_connection_sharded_inner<
                             if !matches!(response, Frame::Error(_))
                                 && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                             {
-                                let mut vs = shard_databases.vector_store(shard_id);
+                                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                                 for arg in cmd_args.iter() {
                                     if let Some(key) = extract_bytes(arg) {
                                         vs.mark_deleted_for_key(key.as_ref());
@@ -1502,27 +1386,27 @@ pub async fn handle_connection_sharded_inner<
                             }
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
-                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
+                                    if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
                                 }
                             }
-                            if tracking_state.enabled && !matches!(response, Frame::Error(_)) {
+                            if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let senders = tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                                    let senders = ctx.tracking_table.borrow_mut().invalidate_key(&key, client_id);
                                     if !senders.is_empty() {
                                         let push = crate::tracking::invalidation::invalidation_push(&[key]);
                                         for tx in senders { let _ = tx.try_send(push.clone()); }
                                     }
                                 }
                             }
-                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                             responses.push(response);
                         } else {
                             // READ PATH: shared lock — no contention with other shards' reads
-                            let guard = shard_databases.read_db(shard_id, selected_db);
-                            let now_ms = cached_clock.ms();
-                            let db_count = shard_databases.db_count();
+                            let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                            let now_ms = ctx.cached_clock.ms();
+                            let db_count = ctx.shard_databases.db_count();
                             let dispatch_start = std::time::Instant::now();
-                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
                             let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                 crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -1532,7 +1416,7 @@ pub async fn handle_connection_sharded_inner<
                                     elapsed_us,
                                     args.as_slice(),
                                     peer_addr.as_bytes(),
-                                    client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                 );
                             }
                             drop(guard);
@@ -1545,17 +1429,17 @@ pub async fn handle_connection_sharded_inner<
                                     crate::admin::metrics_setup::record_command_error(cmd_str);
                                 }
                             }
-                            if tracking_state.enabled && !tracking_state.bcast {
+                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
+                                    ctx.tracking_table.borrow_mut().track_key(client_id, &key, conn.tracking_state.noloop);
                                 }
                             }
-                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                             responses.push(response);
                         }
                     } else if let Some(target) = target_shard {
                         // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
-                        // By this point in_multi is false (MULTI queuing happens earlier with `continue`).
+                        // By this point conn.in_multi is false (MULTI queuing happens earlier with `continue`).
                         // Read commands execute directly on the target shard's database via RwLock read guard,
                         // avoiding ~88us of two async scheduling hops through the SPSC channel.
                         //
@@ -1564,10 +1448,10 @@ pub async fn handle_connection_sharded_inner<
                         // execute before the deferred writes, violating command ordering. Fall through
                         // to SPSC dispatch to preserve pipeline semantics.
                         if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) {
-                            let guard = shard_databases.read_db(target, selected_db);
-                            let now_ms = cached_clock.ms();
-                            let db_count = shard_databases.db_count();
-                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            let guard = ctx.shard_databases.read_db(target, conn.selected_db);
+                            let now_ms = ctx.cached_clock.ms();
+                            let db_count = ctx.shard_databases.db_count();
+                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
                             drop(guard);
                             let response = match result {
                                 DispatchResult::Response(f) => f,
@@ -1579,12 +1463,12 @@ pub async fn handle_connection_sharded_inner<
                                 }
                             }
                             // Client tracking for cross-shard reads
-                            if tracking_state.enabled && !tracking_state.bcast {
+                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
+                                    ctx.tracking_table.borrow_mut().track_key(client_id, &key, conn.tracking_state.noloop);
                                 }
                             }
-                            let response = apply_resp3_conversion(cmd, response, protocol_version);
+                            let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                             responses.push(response);
                             continue;
                         }
@@ -1597,7 +1481,7 @@ pub async fn handle_connection_sharded_inner<
                         } else {
                             Bytes::new()
                         };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes, selected_db));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(frame), aof_bytes, cmd_bytes, conn.selected_db));
                     }
                 }
 
@@ -1608,30 +1492,30 @@ pub async fn handle_connection_sharded_inner<
                         let slot_ptr = response_pool.slot_ptr(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
-                        let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(selected_db);
+                        let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(conn.selected_db);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
-                        let target_idx = ChannelMesh::target_index(shard_id, target);
+                        let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         {
                             let mut pending = msg;
                             loop {
-                                let push_result = { let mut producers = dispatch_tx.borrow_mut(); producers[target_idx].try_push(pending) };
+                                let push_result = { let mut producers = ctx.dispatch_tx.borrow_mut(); producers[target_idx].try_push(pending) };
                                 match push_result {
-                                    Ok(()) => { spsc_notifiers[target].notify_one(); break; }
+                                    Ok(()) => { ctx.spsc_notifiers[target].notify_one(); break; }
                                     Err(val) => { pending = val; tokio::task::yield_now().await; }
                                 }
                             }
                         }
                         reply_futures.push((meta, target));
                     }
-                    let proto_ver = protocol_version;
+                    let proto_ver = conn.protocol_version;
                     for (meta, target) in reply_futures {
                         let shard_responses = response_pool.future_for(target).await;
                         for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(resp, Frame::Error(_)) {
-                                    if let Some(ref tx) = aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
+                                    if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes)); }
                                 }
                             }
                             responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
@@ -1643,20 +1527,20 @@ pub async fn handle_connection_sharded_inner<
                 if !publish_batches.is_empty() {
                     let mut batch_slots: Vec<(std::sync::Arc<crate::shard::dispatch::PubSubResponseSlot>, Vec<usize>)> = Vec::new();
                     {
-                        let mut producers = dispatch_tx.borrow_mut();
+                        let mut producers = ctx.dispatch_tx.borrow_mut();
                         for (target, entries) in publish_batches.drain() {
                             let n = entries.len();
                             let slot = std::sync::Arc::new(crate::shard::dispatch::PubSubResponseSlot::with_counts(1, n));
                             let resp_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
                             let pairs: Vec<(Bytes, Bytes)> = entries.into_iter().map(|(_, ch, msg)| (ch, msg)).collect();
 
-                            let idx = ChannelMesh::target_index(shard_id, target);
+                            let idx = ChannelMesh::target_index(ctx.shard_id, target);
                             let batch_msg = ShardMessage::PubSubPublishBatch {
                                 pairs,
                                 slot: slot.clone(),
                             };
                             if producers[idx].try_push(batch_msg).is_ok() {
-                                spsc_notifiers[target].notify_one();
+                                ctx.spsc_notifiers[target].notify_one();
                             } else {
                                 slot.add(0); // push failed, mark as done
                             }
@@ -1679,7 +1563,7 @@ pub async fn handle_connection_sharded_inner<
 
                 write_buf.clear();
                 for response in &responses {
-                    if protocol_version >= 3 {
+                    if conn.protocol_version >= 3 {
                         crate::protocol::serialize_resp3(response, &mut write_buf);
                     } else {
                         crate::protocol::serialize(response, &mut write_buf);
@@ -1692,13 +1576,13 @@ pub async fn handle_connection_sharded_inner<
                 // Check if migration was triggered during frame processing.
                 // All responses for the current batch have been written, so the
                 // client sees no interruption -- TCP socket stays open.
-                if let Some(target_shard) = migration_target {
+                if let Some(target_shard) = conn.migration_target {
                     let migrated_state = MigratedConnectionState {
-                        selected_db,
-                        authenticated,
-                        client_name: client_name.clone(),
-                        protocol_version,
-                        current_user: current_user.clone(),
+                        selected_db: conn.selected_db,
+                        authenticated: conn.authenticated,
+                        client_name: conn.client_name.clone(),
+                        protocol_version: conn.protocol_version,
+                        current_user: conn.current_user.clone(),
                         flags: 0,
                         read_buf_remainder: read_buf.split(),
                         client_id,
@@ -1722,7 +1606,7 @@ pub async fn handle_connection_sharded_inner<
             _ = shutdown.cancelled() => {
                 write_buf.clear();
                 let shutdown_err = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
-                if protocol_version >= 3 {
+                if conn.protocol_version >= 3 {
                     crate::protocol::serialize_resp3(&shutdown_err, &mut write_buf);
                 } else {
                     crate::protocol::serialize(&shutdown_err, &mut write_buf);
@@ -1734,23 +1618,23 @@ pub async fn handle_connection_sharded_inner<
     }
 
     // Clean up pub/sub subscriptions on disconnect
-    if subscriber_id > 0 {
-        let removed_channels = { pubsub_registry.write().unsubscribe_all(subscriber_id) };
-        let removed_patterns = { pubsub_registry.write().punsubscribe_all(subscriber_id) };
+    if conn.subscriber_id > 0 {
+        let removed_channels = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
+        let removed_patterns = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
         for ch in removed_channels {
-            unpropagate_subscription(&all_remote_sub_maps, &ch, shard_id, num_shards, false);
+            unpropagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
         }
         for pat in removed_patterns {
-            unpropagate_subscription(&all_remote_sub_maps, &pat, shard_id, num_shards, true);
+            unpropagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
         }
         // Remove affinity on disconnect (no subscriptions remain)
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-            pubsub_affinity.write().remove(&addr.ip());
+            ctx.pubsub_affinity.write().remove(&addr.ip());
         }
     }
 
-    if tracking_state.enabled {
-        tracking_table.borrow_mut().untrack_all(client_id);
+    if conn.tracking_state.enabled {
+        ctx.tracking_table.borrow_mut().untrack_all(client_id);
     }
 
     (HandlerResult::Done, None)

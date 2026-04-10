@@ -140,6 +140,16 @@ pub(crate) fn spawn_tokio_connection(
     let reqpass = rtcfg.read().requirepass.clone();
     let clk = cached_clock.clone();
 
+    // Construct ConnectionContext from cloned shared state
+    let conn_ctx = crate::server::conn::ConnectionContext::new(
+        sdbs, shard_id, num_shards, psr, blk, reqpass, aof, trk, rs, cs,
+        lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk,
+        rsm, all_regs, all_rsm, aff,
+        None, // spill_sender (tokio handler doesn't use tiered storage)
+        Rc::new(std::cell::Cell::new(0)), // spill_file_id placeholder
+        None, // disk_offload_dir
+    );
+
     if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
         // Load current TLS config from ArcSwap — new connections see reloaded certs
         let tls_cfg = tls_swap.load_full();
@@ -154,32 +164,9 @@ pub(crate) fn spawn_tokio_connection(
                     let _ = handle_connection_sharded_inner(
                         tls_stream,
                         peer_addr,
-                        sdbs,
-                        shard_id,
-                        num_shards,
-                        dtx,
-                        psr,
-                        blk,
+                        &conn_ctx,
                         sd,
-                        reqpass,
-                        aof,
-                        trk,
                         cid,
-                        rs,
-                        cs,
-                        lua,
-                        sc,
-                        cp,
-                        acl,
-                        rtcfg,
-                        scfg,
-                        notifiers,
-                        snap_tx,
-                        clk,
-                        rsm,
-                        all_regs,
-                        all_rsm,
-                        aff,
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
@@ -195,9 +182,7 @@ pub(crate) fn spawn_tokio_connection(
         // Plain TCP connection
         tokio::task::spawn_local(async move {
             handle_connection_sharded(
-                tcp_stream, sdbs, shard_id, num_shards, dtx, psr, blk, sd, reqpass, aof, trk, cid,
-                rs, cs, lua, sc, cp, acl, rtcfg, scfg, notifiers, snap_tx, clk, rsm, all_regs,
-                all_rsm, aff,
+                tcp_stream, &conn_ctx, sd, cid,
             )
             .await;
         });
@@ -311,38 +296,25 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
             let migration_buf = take_migration_read_buf(&mut state);
 
+            let conn_ctx = crate::server::conn::ConnectionContext::new(
+                sdbs, shard_id, num_shards, psr, blk,
+                None, // requirepass: None = pre-authenticated
+                aof, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx,
+                notifiers, snap_tx, clk, rsm, all_regs, all_rsm, aff,
+                None, // spill_sender
+                Rc::new(std::cell::Cell::new(0)), // spill_file_id
+                None, // disk_offload_dir
+            );
+
             // State restoration happens directly via migrated_state parameter —
             // no synthetic RESP commands, no leaked responses.
             tokio::task::spawn_local(async move {
                 let _ = handle_connection_sharded_inner(
                     tcp_stream,
                     peer_addr,
-                    sdbs,
-                    shard_id,
-                    num_shards,
-                    dtx,
-                    psr,
-                    blk,
+                    &conn_ctx,
                     sd,
-                    None, // requirepass: None = pre-authenticated
-                    aof,
-                    trk,
                     cid,
-                    rs,
-                    cs,
-                    lua,
-                    sc,
-                    cp,
-                    acl,
-                    rtcfg,
-                    scfg,
-                    notifiers,
-                    snap_tx,
-                    clk,
-                    rsm,
-                    all_regs,
-                    all_rsm,
-                    aff,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     Some(&state),
@@ -442,6 +414,15 @@ pub(crate) fn spawn_monoio_connection(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
 
+            // Construct ConnectionContext from cloned shared state
+            let reqpass = rtcfg.read().requirepass.clone();
+            let conn_ctx = crate::server::conn::ConnectionContext::new(
+                sdbs, shard_id, num_shards, psr, blk, reqpass, aof, trk, rs, cs,
+                lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk,
+                rsm, all_regs, all_rsm, aff,
+                spill_tx, spill_fid, do_dir,
+            );
+
             if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
                 // Load current TLS config from ArcSwap — new connections see reloaded certs
                 let tls_cfg = tls_swap.load_full();
@@ -449,42 +430,15 @@ pub(crate) fn spawn_monoio_connection(
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            let reqpass = rtcfg.read().requirepass.clone();
                             let _ = handle_connection_sharded_monoio(
                                 tls_stream,
                                 peer_addr,
-                                sdbs,
-                                shard_id,
-                                num_shards,
-                                dtx,
-                                psr,
-                                blk,
+                                &conn_ctx,
                                 sd,
-                                reqpass,
-                                aof,
-                                trk,
                                 cid,
-                                rs,
-                                cs,
-                                lua,
-                                sc,
-                                cp,
-                                acl,
-                                rtcfg,
-                                scfg,
-                                notifiers,
-                                snap_tx,
-                                clk,
-                                rsm,
-                                all_regs,
-                                all_rsm,
-                                aff,
                                 false, // can_migrate: TLS connections cannot transfer session state
                                 BytesMut::new(),
                                 pw,
-                                spill_tx.clone(),
-                                spill_fid.clone(),
-                                do_dir.clone(),
                                 None, // fresh connection
                             )
                             .await;
@@ -505,42 +459,15 @@ pub(crate) fn spawn_monoio_connection(
                 #[cfg(target_os = "linux")]
                 let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
-                    let reqpass = rtcfg.read().requirepass.clone();
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
-                        sdbs,
-                        shard_id,
-                        num_shards,
-                        dtx,
-                        psr,
-                        blk,
+                        &conn_ctx,
                         sd,
-                        reqpass,
-                        aof,
-                        trk,
                         cid,
-                        rs,
-                        cs,
-                        lua,
-                        sc,
-                        cp,
-                        acl,
-                        rtcfg,
-                        scfg,
-                        notifiers,
-                        snap_tx,
-                        clk,
-                        rsm,
-                        all_regs,
-                        all_rsm,
-                        aff,
                         cfg!(target_os = "linux"), // can_migrate: FD dup requires libc (Linux only)
                         BytesMut::new(),
                         pw,
-                        spill_tx,
-                        spill_fid,
-                        do_dir,
                         None, // fresh connection
                     )
                     .await;
@@ -706,42 +633,24 @@ pub(crate) fn spawn_migrated_monoio_connection(
 
             let migration_buf = take_migration_read_buf(&mut state);
 
+            let conn_ctx = crate::server::conn::ConnectionContext::new(
+                sdbs, shard_id, num_shards, psr, blk,
+                None, // requirepass: None = pre-authenticated
+                aof, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx,
+                notifiers, snap_tx, clk, rsm, all_regs, all_rsm, aff,
+                spill_tx, spill_fid, do_dir,
+            );
+
             monoio::spawn(async move {
                 let _ = handle_connection_sharded_monoio(
                     tcp_stream,
                     peer_addr,
-                    sdbs,
-                    shard_id,
-                    num_shards,
-                    dtx,
-                    psr,
-                    blk,
+                    &conn_ctx,
                     sd,
-                    None, // requirepass: None = pre-authenticated
-                    aof,
-                    trk,
                     cid,
-                    rs,
-                    cs,
-                    lua,
-                    sc,
-                    cp,
-                    acl,
-                    rtcfg,
-                    scfg,
-                    notifiers,
-                    snap_tx,
-                    clk,
-                    rsm,
-                    all_regs,
-                    all_rsm,
-                    aff,
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     pw,
-                    spill_tx,
-                    spill_fid,
-                    do_dir,
                     Some(&state),
                 )
                 .await;

@@ -11,7 +11,6 @@ use bumpalo::collections::Vec as BumpVec;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio_util::codec::Framed;
@@ -77,29 +76,16 @@ pub async fn handle_connection(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let mut framed = Framed::new(stream, RespCodec::default());
-    let mut selected_db: usize = 0;
-    let mut authenticated = requirepass.is_none();
-    let mut current_user: String = "default".to_string();
-    let acl_max_len = runtime_config.read().acllog_max_len;
-    let mut acl_log = crate::acl::AclLog::new(acl_max_len);
-
-    // Pub/Sub connection-local state
-    let mut subscription_count: usize = 0;
-    let mut pubsub_rx: Option<channel::MpscReceiver<Bytes>> = None;
-    let mut pubsub_tx: Option<channel::MpscSender<Bytes>> = None;
-    let mut subscriber_id: u64 = 0;
-
-    // Client tracking state
-    let mut tracking_state = TrackingState::default();
-    let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
-
-    // RESP3/HELLO connection-local state
-    let mut client_name: Option<Bytes> = None;
-
-    // Transaction (MULTI/EXEC) connection-local state
-    let mut in_multi: bool = false;
-    let mut command_queue: Vec<Frame> = Vec::new();
-    let mut watched_keys: HashMap<Bytes, u32> = HashMap::new();
+    let mut conn = super::core::ConnectionState::new(
+        client_id,
+        peer_addr.clone(),
+        &requirepass,
+        0,     // shard_id: single-shard mode
+        1,     // num_shards: single-shard mode
+        false, // can_migrate: handler_single doesn't support migration
+        runtime_config.read().acllog_max_len,
+        None,  // no migrated state
+    );
 
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.
@@ -108,9 +94,9 @@ pub async fn handle_connection(
 
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
-        if subscription_count > 0 {
-            #[allow(clippy::unwrap_used)] // pubsub_rx is always Some when subscription_count > 0
-            let rx = pubsub_rx.as_mut().unwrap();
+        if conn.subscription_count > 0 {
+            #[allow(clippy::unwrap_used)] // conn.pubsub_rx is always Some when conn.subscription_count > 0
+            let rx = conn.pubsub_rx.as_mut().unwrap();
             tokio::select! {
                 result = framed.next() => {
                     match result {
@@ -130,17 +116,17 @@ pub async fn handle_connection(
                                                 let deny = {
                                                     #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                     let acl_guard = acl_table.read().unwrap();
-                                                    acl_guard.check_channel_permission(&current_user, channel.as_ref())
+                                                    acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
                                                 };
                                                 if let Some(deny_reason) = deny {
                                                     let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
                                                     continue;
                                                 }
-                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
+                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
                                                 pubsub_registry.lock().subscribe(channel.clone(), sub);
-                                                subscription_count += 1;
-                                                if framed.send(pubsub::subscribe_response(&channel, subscription_count)).await.is_err() {
+                                                conn.subscription_count += 1;
+                                                if framed.send(pubsub::subscribe_response(&channel, conn.subscription_count)).await.is_err() {
                                                     break;
                                                 }
                                             }
@@ -149,18 +135,18 @@ pub async fn handle_connection(
                                     _ if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") => {
                                         if cmd_args.is_empty() {
                                             // Unsubscribe from all channels
-                                            let removed = pubsub_registry.lock().unsubscribe_all(subscriber_id);
+                                            let removed = pubsub_registry.lock().unsubscribe_all(conn.subscriber_id);
                                             if removed.is_empty() {
                                                 // No channels, send response with count 0
-                                                subscription_count = pubsub_registry.lock().total_subscription_count(subscriber_id);
+                                                conn.subscription_count = pubsub_registry.lock().total_subscription_count(conn.subscriber_id);
                                                 let _ = framed.send(pubsub::unsubscribe_response(
                                                     &Bytes::from_static(b""),
-                                                    subscription_count,
+                                                    conn.subscription_count,
                                                 )).await;
                                             } else {
                                                 for ch in &removed {
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    if framed.send(pubsub::unsubscribe_response(ch, subscription_count)).await.is_err() {
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    if framed.send(pubsub::unsubscribe_response(ch, conn.subscription_count)).await.is_err() {
                                                         break;
                                                     }
                                                 }
@@ -168,9 +154,9 @@ pub async fn handle_connection(
                                         } else {
                                             for arg in cmd_args {
                                                 if let Some(channel) = extract_bytes(arg) {
-                                                    pubsub_registry.lock().unsubscribe(channel.as_ref(), subscriber_id);
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    if framed.send(pubsub::unsubscribe_response(&channel, subscription_count)).await.is_err() {
+                                                    pubsub_registry.lock().unsubscribe(channel.as_ref(), conn.subscriber_id);
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    if framed.send(pubsub::unsubscribe_response(&channel, conn.subscription_count)).await.is_err() {
                                                         break;
                                                     }
                                                 }
@@ -190,17 +176,17 @@ pub async fn handle_connection(
                                                 let deny = {
                                                     #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                                     let acl_guard = acl_table.read().unwrap();
-                                                    acl_guard.check_channel_permission(&current_user, pattern.as_ref())
+                                                    acl_guard.check_channel_permission(&conn.current_user, pattern.as_ref())
                                                 };
                                                 if let Some(deny_reason) = deny {
                                                     let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
                                                     continue;
                                                 }
-                                                #[allow(clippy::unwrap_used)] // pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                                #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
+                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
                                                 pubsub_registry.lock().psubscribe(pattern.clone(), sub);
-                                                subscription_count += 1;
-                                                if framed.send(pubsub::psubscribe_response(&pattern, subscription_count)).await.is_err() {
+                                                conn.subscription_count += 1;
+                                                if framed.send(pubsub::psubscribe_response(&pattern, conn.subscription_count)).await.is_err() {
                                                     break;
                                                 }
                                             }
@@ -208,17 +194,17 @@ pub async fn handle_connection(
                                     }
                                     _ if cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE") => {
                                         if cmd_args.is_empty() {
-                                            let removed = pubsub_registry.lock().punsubscribe_all(subscriber_id);
+                                            let removed = pubsub_registry.lock().punsubscribe_all(conn.subscriber_id);
                                             if removed.is_empty() {
-                                                subscription_count = pubsub_registry.lock().total_subscription_count(subscriber_id);
+                                                conn.subscription_count = pubsub_registry.lock().total_subscription_count(conn.subscriber_id);
                                                 let _ = framed.send(pubsub::punsubscribe_response(
                                                     &Bytes::from_static(b""),
-                                                    subscription_count,
+                                                    conn.subscription_count,
                                                 )).await;
                                             } else {
                                                 for pat in &removed {
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    if framed.send(pubsub::punsubscribe_response(pat, subscription_count)).await.is_err() {
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    if framed.send(pubsub::punsubscribe_response(pat, conn.subscription_count)).await.is_err() {
                                                         break;
                                                     }
                                                 }
@@ -226,9 +212,9 @@ pub async fn handle_connection(
                                         } else {
                                             for arg in cmd_args {
                                                 if let Some(pattern) = extract_bytes(arg) {
-                                                    pubsub_registry.lock().punsubscribe(pattern.as_ref(), subscriber_id);
-                                                    subscription_count = subscription_count.saturating_sub(1);
-                                                    if framed.send(pubsub::punsubscribe_response(&pattern, subscription_count)).await.is_err() {
+                                                    pubsub_registry.lock().punsubscribe(pattern.as_ref(), conn.subscriber_id);
+                                                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                                                    if framed.send(pubsub::punsubscribe_response(&pattern, conn.subscription_count)).await.is_err() {
                                                         break;
                                                     }
                                                 }
@@ -242,16 +228,16 @@ pub async fn handle_connection(
                                             framed.codec().protocol_version(),
                                             client_id,
                                             &acl_table,
-                                            &mut authenticated,
+                                            &mut conn.authenticated,
                                         );
                                         if !matches!(&response, Frame::Error(_)) {
                                             framed.codec_mut().set_protocol_version(new_proto);
                                         }
                                         if let Some(name) = new_name {
-                                            client_name = Some(name);
+                                            conn.client_name = Some(name);
                                         }
                                         if let Some(uname) = opt_user {
-                                            current_user = uname;
+                                            conn.current_user = uname;
                                         }
                                         let _ = framed.send(response).await;
                                     }
@@ -275,8 +261,8 @@ pub async fn handle_connection(
                                     }
                                 }
                             }
-                            // If subscription_count dropped to 0, exit subscriber mode
-                            if subscription_count == 0 {
+                            // If conn.subscription_count dropped to 0, exit subscriber mode
+                            if conn.subscription_count == 0 {
                                 continue;
                             }
                         }
@@ -341,19 +327,19 @@ pub async fn handle_connection(
                 // === Phase 1: Connection-level intercepts ===
                 for frame in batch {
                     // --- AUTH gate (unauthenticated) ---
-                    if !authenticated {
+                    if !conn.authenticated {
                         match extract_command(&frame) {
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
                                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                                 if let Some(uname) = opt_user {
-                                    authenticated = true;
-                                    current_user = uname;
+                                    conn.authenticated = true;
+                                    conn.current_user = uname;
                                 } else {
                                     // Log failed auth attempt
-                                    acl_log.push(crate::acl::AclLogEntry {
+                                    conn.acl_log.push(crate::acl::AclLogEntry {
                                         reason: "auth".to_string(),
                                         object: "AUTH".to_string(),
-                                        username: current_user.clone(),
+                                        username: conn.current_user.clone(),
                                         client_addr: peer_addr.clone(),
                                         timestamp_ms: std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -371,17 +357,17 @@ pub async fn handle_connection(
                                     framed.codec().protocol_version(),
                                     client_id,
                                     &acl_table,
-                                    &mut authenticated,
+                                    &mut conn.authenticated,
                                 );
                                 // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
                                 if !matches!(&response, Frame::Error(_)) {
                                     framed.codec_mut().set_protocol_version(new_proto);
                                 }
                                 if let Some(name) = new_name {
-                                    client_name = Some(name);
+                                    conn.client_name = Some(name);
                                 }
                                 if let Some(uname) = opt_user {
-                                    current_user = uname;
+                                    conn.current_user = uname;
                                 }
                                 responses.push(response);
                                 continue;
@@ -402,11 +388,11 @@ pub async fn handle_connection(
 
                     // --- Connection-level command intercepts (no db lock needed) ---
                     if let Some((cmd, cmd_args)) = extract_command(&frame) {
-                        // AUTH when already authenticated
+                        // AUTH when already conn.authenticated
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
                             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                             if let Some(uname) = opt_user {
-                                current_user = uname;
+                                conn.current_user = uname;
                             }
                             responses.push(response);
                             continue;
@@ -418,17 +404,17 @@ pub async fn handle_connection(
                                 framed.codec().protocol_version(),
                                 client_id,
                                 &acl_table,
-                                &mut authenticated,
+                                &mut conn.authenticated,
                             );
                             // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
                             if !matches!(&response, Frame::Error(_)) {
                                 framed.codec_mut().set_protocol_version(new_proto);
                             }
                             if let Some(name) = new_name {
-                                client_name = Some(name);
+                                conn.client_name = Some(name);
                             }
                             if let Some(uname) = opt_user {
-                                current_user = uname;
+                                conn.current_user = uname;
                             }
                             responses.push(response);
                             continue;
@@ -438,8 +424,8 @@ pub async fn handle_connection(
                             let response = crate::command::acl::handle_acl(
                                 cmd_args,
                                 &acl_table,
-                                &mut acl_log,
-                                &current_user,
+                                &mut conn.acl_log,
+                                &conn.current_user,
                                 &peer_addr,
                                 &runtime_config,
                             );
@@ -460,13 +446,13 @@ pub async fn handle_connection(
                                                 b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
                                             )));
                                         } else {
-                                            client_name = extract_bytes(&cmd_args[1]);
+                                            conn.client_name = extract_bytes(&cmd_args[1]);
                                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                         }
                                         continue;
                                     }
                                     if sub_bytes.eq_ignore_ascii_case(b"GETNAME") {
-                                        responses.push(match &client_name {
+                                        responses.push(match &conn.client_name {
                                             Some(name) => Frame::BulkString(name.clone()),
                                             None => Frame::Null,
                                         });
@@ -476,16 +462,16 @@ pub async fn handle_connection(
                                         match crate::command::client::parse_tracking_args(cmd_args) {
                                             Ok(config_parsed) => {
                                                 if config_parsed.enable {
-                                                    tracking_state.enabled = true;
-                                                    tracking_state.bcast = config_parsed.bcast;
-                                                    tracking_state.noloop = config_parsed.noloop;
-                                                    tracking_state.optin = config_parsed.optin;
-                                                    tracking_state.optout = config_parsed.optout;
+                                                    conn.tracking_state.enabled = true;
+                                                    conn.tracking_state.bcast = config_parsed.bcast;
+                                                    conn.tracking_state.noloop = config_parsed.noloop;
+                                                    conn.tracking_state.optin = config_parsed.optin;
+                                                    conn.tracking_state.optout = config_parsed.optout;
 
-                                                    if tracking_rx.is_none() {
+                                                    if conn.tracking_rx.is_none() {
                                                         let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                                                        tracking_state.invalidation_tx = Some(tx.clone());
-                                                        tracking_rx = Some(rx);
+                                                        conn.tracking_state.invalidation_tx = Some(tx.clone());
+                                                        conn.tracking_rx = Some(rx);
 
                                                         let mut table = tracking_table.lock();
                                                         table.register_client(client_id, tx);
@@ -498,9 +484,9 @@ pub async fn handle_connection(
                                                     }
                                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                                 } else {
-                                                    tracking_state = TrackingState::default();
+                                                    conn.tracking_state = TrackingState::default();
                                                     tracking_table.lock().untrack_all(client_id);
-                                                    tracking_rx = None;
+                                                    conn.tracking_rx = None;
                                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                                 }
                                                 continue;
@@ -629,7 +615,7 @@ pub async fn handle_connection(
                         // --- INFO (append replication section) ---
                         if cmd.eq_ignore_ascii_case(b"INFO") {
                             if let Some(ref rs) = repl_state {
-                                let guard = db[selected_db].read();
+                                let guard = db[conn.selected_db].read();
                                 let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
                                 drop(guard);
                                 let mut response_text = match resp_frame {
@@ -669,7 +655,7 @@ pub async fn handle_connection(
                         if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
                             // Execute any pending dispatchable frames before switching modes
                             if !dispatchable.is_empty() {
-                                let mut guard = db[selected_db].write();
+                                let mut guard = db[conn.selected_db].write();
                                 guard.refresh_now();
                                 let db_count = db.len();
                                 for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
@@ -683,7 +669,7 @@ pub async fn handle_connection(
                                     #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     let dispatch_start = std::time::Instant::now();
-                                    let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                                    let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
                                     let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                                     if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
                                         crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -693,7 +679,7 @@ pub async fn handle_connection(
                                             elapsed_us,
                                             args.as_slice(),
                                             peer_addr.as_bytes(),
-                                            client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                         );
                                     }
                                     let (response, quit) = match result {
@@ -746,11 +732,11 @@ pub async fn handle_connection(
                                 )))).await;
                             } else {
                                 // Allocate subscriber resources if not yet done
-                                if pubsub_tx.is_none() {
+                                if conn.pubsub_tx.is_none() {
                                     let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
-                                    subscriber_id = pubsub::next_subscriber_id();
-                                    pubsub_tx = Some(tx);
-                                    pubsub_rx = Some(rx);
+                                    conn.subscriber_id = pubsub::next_subscriber_id();
+                                    conn.pubsub_tx = Some(tx);
+                                    conn.pubsub_rx = Some(rx);
                                 }
                                 let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                                 for arg in cmd_args {
@@ -759,14 +745,14 @@ pub async fn handle_connection(
                                         let deny = {
                                             #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                                             let acl_guard = acl_table.read().unwrap();
-                                            acl_guard.check_channel_permission(&current_user, channel_or_pattern.as_ref()).map(|r| r.to_string())
+                                            acl_guard.check_channel_permission(&conn.current_user, channel_or_pattern.as_ref()).map(|r| r.to_string())
                                         };
                                         if let Some(deny_reason) = deny {
                                             let _ = framed.send(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)))).await;
                                             continue;
                                         }
-                                        #[allow(clippy::unwrap_used)] // pubsub_tx is set to Some just above before this loop
-                                        let sub = Subscriber::new(pubsub_tx.clone().unwrap(), subscriber_id);
+                                        #[allow(clippy::unwrap_used)] // conn.pubsub_tx is set to Some just above before this loop
+                                        let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
                                         {
                                             let mut registry = pubsub_registry.lock();
                                             if is_pattern {
@@ -775,11 +761,11 @@ pub async fn handle_connection(
                                                 registry.subscribe(channel_or_pattern.clone(), sub);
                                             }
                                         }
-                                        subscription_count += 1;
+                                        conn.subscription_count += 1;
                                         let response = if is_pattern {
-                                            pubsub::psubscribe_response(&channel_or_pattern, subscription_count)
+                                            pubsub::psubscribe_response(&channel_or_pattern, conn.subscription_count)
                                         } else {
-                                            pubsub::subscribe_response(&channel_or_pattern, subscription_count)
+                                            pubsub::subscribe_response(&channel_or_pattern, conn.subscription_count)
                                         };
                                         if framed.send(response).await.is_err() {
                                             break_outer = true;
@@ -833,33 +819,33 @@ pub async fn handle_connection(
                         }
                         // MULTI
                         if cmd.eq_ignore_ascii_case(b"MULTI") {
-                            if in_multi {
+                            if conn.in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR MULTI calls can not be nested"),
                                 ));
                             } else {
-                                in_multi = true;
-                                command_queue.clear();
+                                conn.in_multi = true;
+                                conn.command_queue.clear();
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             }
                             continue;
                         }
                         // EXEC
                         if cmd.eq_ignore_ascii_case(b"EXEC") {
-                            if !in_multi {
+                            if !conn.in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR EXEC without MULTI"),
                                 ));
                             } else {
-                                in_multi = false;
+                                conn.in_multi = false;
                                 let (result, txn_aof_entries) = execute_transaction(
                                     &db,
-                                    &command_queue,
-                                    &watched_keys,
-                                    &mut selected_db,
+                                    &conn.command_queue,
+                                    &conn.watched_keys,
+                                    &mut conn.selected_db,
                                 );
-                                command_queue.clear();
-                                watched_keys.clear();
+                                conn.command_queue.clear();
+                                conn.watched_keys.clear();
                                 responses.push(result);
                                 aof_entries.extend(txn_aof_entries);
                             }
@@ -867,21 +853,21 @@ pub async fn handle_connection(
                         }
                         // DISCARD
                         if cmd.eq_ignore_ascii_case(b"DISCARD") {
-                            if !in_multi {
+                            if !conn.in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR DISCARD without MULTI"),
                                 ));
                             } else {
-                                in_multi = false;
-                                command_queue.clear();
-                                watched_keys.clear();
+                                conn.in_multi = false;
+                                conn.command_queue.clear();
+                                conn.watched_keys.clear();
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             }
                             continue;
                         }
                         // WATCH
                         if cmd.eq_ignore_ascii_case(b"WATCH") {
-                            if in_multi {
+                            if conn.in_multi {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR WATCH inside MULTI is not allowed"),
                                 ));
@@ -890,11 +876,11 @@ pub async fn handle_connection(
                                     Bytes::from_static(b"ERR wrong number of arguments for 'watch' command"),
                                 ));
                             } else {
-                                let guard = db[selected_db].read();
+                                let guard = db[conn.selected_db].read();
                                 for arg in cmd_args {
                                     if let Frame::BulkString(key) = arg {
                                         let version = guard.get_version(key);
-                                        watched_keys.insert(key.clone(), version);
+                                        conn.watched_keys.insert(key.clone(), version);
                                     }
                                 }
                                 // guard dropped here
@@ -904,7 +890,7 @@ pub async fn handle_connection(
                         }
                         // UNWATCH
                         if cmd.eq_ignore_ascii_case(b"UNWATCH") {
-                            watched_keys.clear();
+                            conn.watched_keys.clear();
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             continue;
                         }
@@ -914,12 +900,12 @@ pub async fn handle_connection(
                         // All remaining commands must pass through the permission gate.
                         #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                         if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
-                            &current_user, cmd, cmd_args,
+                            &conn.current_user, cmd, cmd_args,
                         ) {
-                            acl_log.push(crate::acl::AclLogEntry {
+                            conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: current_user.clone(),
+                                username: conn.current_user.clone(),
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -937,12 +923,12 @@ pub async fn handle_connection(
                             let is_write = metadata::is_write(cmd);
                             #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             if let Some(deny_reason) = acl_table.read().unwrap().check_key_permission(
-                                &current_user, cmd, cmd_args, is_write,
+                                &conn.current_user, cmd, cmd_args, is_write,
                             ) {
-                                acl_log.push(crate::acl::AclLogEntry {
+                                conn.acl_log.push(crate::acl::AclLogEntry {
                                     reason: "command".to_string(),
                                     object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                    username: current_user.clone(),
+                                    username: conn.current_user.clone(),
                                     client_addr: peer_addr.clone(),
                                     timestamp_ms: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -958,7 +944,7 @@ pub async fn handle_connection(
                     }
 
                     // --- MULTI queue mode ---
-                    if in_multi {
+                    if conn.in_multi {
                         // Reject FT.* commands inside MULTI — vector hooks are not
                         // wired through the transaction execution path yet.
                         if let Some((cmd, _)) = extract_command(&frame) {
@@ -969,7 +955,7 @@ pub async fn handle_connection(
                                 continue;
                             }
                         }
-                        command_queue.push(frame);
+                        conn.command_queue.push(frame);
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                         continue;
                     }
@@ -1057,15 +1043,15 @@ pub async fn handle_connection(
 
                         if run_is_read {
                             // === Read run: shared read lock ===
-                            // Re-acquire guard if selected_db changes mid-run.
-                            let mut current_db = selected_db;
+                            // Re-acquire guard if conn.selected_db changes mid-run.
+                            let mut current_db = conn.selected_db;
                             let mut guard = db[current_db].read();
                             let now_ms = crate::storage::entry::current_time_ms();
                             let proto = framed.codec().protocol_version();
                             for j in run_start..i {
-                                if selected_db != current_db {
+                                if conn.selected_db != current_db {
                                     drop(guard);
-                                    current_db = selected_db;
+                                    current_db = conn.selected_db;
                                     guard = db[current_db].read();
                                 }
                                 let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
@@ -1091,7 +1077,7 @@ pub async fn handle_connection(
                                 }
 
                                 let dispatch_start = std::time::Instant::now();
-                                let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut selected_db, db_count);
+                                let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count);
                                 let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                                 if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
                                     crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -1101,7 +1087,7 @@ pub async fn handle_connection(
                                         elapsed_us,
                                         args.as_slice(),
                                         peer_addr.as_bytes(),
-                                        client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                        conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                     );
                                 }
                                 let (response, quit) = match result {
@@ -1109,9 +1095,9 @@ pub async fn handle_connection(
                                     DispatchResult::Quit(f) => (f, true),
                                 };
                                 // Track key on read for client-side caching invalidation
-                                if tracking_state.enabled && !tracking_state.bcast {
+                                if conn.tracking_state.enabled && !conn.tracking_state.bcast {
                                     if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
-                                        tracking_table.lock().track_key(client_id, &key, tracking_state.noloop);
+                                        tracking_table.lock().track_key(client_id, &key, conn.tracking_state.noloop);
                                     }
                                 }
                                 // Apply RESP3 response conversion if needed
@@ -1125,15 +1111,15 @@ pub async fn handle_connection(
                             // read guard dropped here
                         } else {
                             // === Write run: exclusive write lock ===
-                            // Re-acquire guard if selected_db changes mid-run (e.g. SELECT).
-                            let mut current_db = selected_db;
+                            // Re-acquire guard if conn.selected_db changes mid-run (e.g. SELECT).
+                            let mut current_db = conn.selected_db;
                             let mut guard = db[current_db].write();
                             guard.refresh_now();
                             for j in run_start..i {
                                 // Re-acquire guard if a previous SELECT changed the db
-                                if selected_db != current_db {
+                                if conn.selected_db != current_db {
                                     drop(guard);
-                                    current_db = selected_db;
+                                    current_db = conn.selected_db;
                                     guard = db[current_db].write();
                                     guard.refresh_now();
                                 }
@@ -1176,7 +1162,7 @@ pub async fn handle_connection(
                                 let is_hset = d_cmd.eq_ignore_ascii_case(b"HSET");
 
                                 let dispatch_start = std::time::Instant::now();
-                                let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                                let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
                                 let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                                 if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
                                     crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -1186,7 +1172,7 @@ pub async fn handle_connection(
                                         elapsed_us,
                                         args.as_slice(),
                                         peer_addr.as_bytes(),
-                                        client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                        conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
                                     );
                                 }
                                 let (response, quit) = match result {
@@ -1262,7 +1248,7 @@ pub async fn handle_connection(
             }
             // Deliver tracking invalidation Push frames to client
             msg = async {
-                if let Some(ref mut rx) = tracking_rx {
+                if let Some(ref mut rx) = conn.tracking_rx {
                     rx.recv_async().await.ok()
                 } else {
                     std::future::pending().await
@@ -1284,14 +1270,14 @@ pub async fn handle_connection(
     }
 
     // Cleanup: remove subscriber from all channels/patterns on disconnect
-    if subscriber_id != 0 {
+    if conn.subscriber_id != 0 {
         let mut registry = pubsub_registry.lock();
-        registry.unsubscribe_all(subscriber_id);
-        registry.punsubscribe_all(subscriber_id);
+        registry.unsubscribe_all(conn.subscriber_id);
+        registry.punsubscribe_all(conn.subscriber_id);
     }
 
     // Cleanup: remove tracking state on disconnect
-    if tracking_state.enabled {
+    if conn.tracking_state.enabled {
         tracking_table.lock().untrack_all(client_id);
     }
 }

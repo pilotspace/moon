@@ -65,8 +65,11 @@ pub(crate) struct ConnectionContext {
     pub all_remote_sub_maps:
         Vec<Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
     pub pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
+    #[allow(dead_code)] // Only used by monoio handler (tiered storage)
     pub spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    #[allow(dead_code)] // Only used by monoio handler (tiered storage)
     pub spill_file_id: Rc<std::cell::Cell<u64>>,
+    #[allow(dead_code)] // Only used by monoio handler (tiered storage)
     pub disk_offload_dir: Option<std::path::PathBuf>,
 }
 
@@ -143,12 +146,14 @@ impl ConnectionContext {
 /// Initialized fresh per connection (or restored from `MigratedConnectionState`).
 /// Bundling these fields eliminates the 15+ local variables at the top of each handler.
 pub(crate) struct ConnectionState {
+    #[allow(dead_code)] // Used in Phase 4 (shared dispatch extraction)
     pub client_id: u64,
+    #[allow(dead_code)] // Used in Phase 4 (shared dispatch extraction)
     pub peer_addr: String,
     pub protocol_version: u8,
     pub selected_db: usize,
     pub authenticated: bool,
-    pub current_user: Bytes,
+    pub current_user: String,
     pub client_name: Option<Bytes>,
     pub asking: bool,
     pub acl_log: AclLog,
@@ -159,9 +164,6 @@ pub(crate) struct ConnectionState {
     pub pubsub_tx: Option<channel::MpscSender<bytes::Bytes>>,
     pub pubsub_rx: Option<channel::MpscReceiver<bytes::Bytes>>,
 
-    // Functions API
-    pub func_registry: Rc<RefCell<crate::scripting::FunctionRegistry>>,
-
     // Transaction (MULTI/EXEC)
     pub in_multi: bool,
     pub command_queue: Vec<Frame>,
@@ -171,6 +173,7 @@ pub(crate) struct ConnectionState {
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
 
     // WATCH/EXEC optimistic locking (handler_single only)
+    #[allow(dead_code)] // Only used by handler_single (tokio feature)
     pub watched_keys: HashMap<Bytes, u32>,
 
     // Connection affinity (migration)
@@ -199,7 +202,7 @@ impl ConnectionState {
             protocol_version,
             selected_db,
             authenticated,
-            current_user: current_user.into(),
+            current_user,
             client_name,
             asking: false,
             acl_log: AclLog::new(acl_max_len),
@@ -207,7 +210,6 @@ impl ConnectionState {
             subscriber_id: 0,
             pubsub_tx: None,
             pubsub_rx: None,
-            func_registry: Rc::new(RefCell::new(crate::scripting::FunctionRegistry::new())),
             in_multi: false,
             command_queue: Vec::new(),
             tracking_state: TrackingState::default(),
@@ -226,6 +228,7 @@ impl ConnectionState {
 /// Action returned by ConnectionCore's command processing.
 ///
 /// Handlers translate these into runtime-specific I/O operations.
+#[allow(dead_code)] // Reserved for Phase 4 (shared dispatch extraction)
 pub(crate) enum CoreAction {
     /// Write response frame(s) to the client.
     Respond(Vec<Frame>),

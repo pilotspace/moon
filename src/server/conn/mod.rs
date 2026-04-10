@@ -40,8 +40,10 @@ pub(crate) use util::{
 // Re-export handler functions at the module level so external callers
 // can use crate::server::conn::{handle_connection_sharded, ...}
 #[cfg(feature = "runtime-monoio")]
-pub use handler_monoio::handle_connection_sharded_monoio;
+#[allow(unused_imports)]
+pub(crate) use handler_monoio::handle_connection_sharded_monoio;
 #[cfg(feature = "runtime-tokio")]
-pub use handler_sharded::{handle_connection_sharded, handle_connection_sharded_inner};
+#[allow(unused_imports)]
+pub(crate) use handler_sharded::{handle_connection_sharded, handle_connection_sharded_inner};
 #[cfg(feature = "runtime-tokio")]
 pub use handler_single::handle_connection;
