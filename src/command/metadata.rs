@@ -691,6 +691,8 @@ mod tests {
             b"COPY",
             b"SETBIT",
             b"BITOP",
+            b"GEOADD",
+            b"GEOSEARCHSTORE",
             b"HSET",
             b"HMSET",
             b"HDEL",

@@ -582,6 +582,14 @@ if should_run "key"; then
     assert_match "SORT DESC"           SORT k:sortl DESC
     assert_match "SORT ALPHA"          SORT k:sortl ALPHA
     assert_match "SORT LIMIT"          SORT k:sortl LIMIT 0 2
+
+    # GEO commands
+    rcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
+    mcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
+    assert_match "GEOPOS"              GEOPOS k:geo Palermo
+    assert_match "GEODIST km"          GEODIST k:geo Palermo Catania km
+    assert_match "GEOHASH"             GEOHASH k:geo Palermo
+    assert_match "GEOSEARCH"           GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC
 fi
 
 # ===========================================================================

@@ -518,6 +518,15 @@ assert_both "SORT LIMIT" SORT edge:sortl LIMIT 0 2
 assert_both "SORT STORE" SORT edge:sortl STORE edge:sorted
 assert_both "SORT STORE result" LRANGE edge:sorted 0 -1
 
+# GEOADD / GEOPOS / GEODIST / GEOHASH / GEOSEARCH
+both GEOADD edge:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+assert_both "GEOPOS" GEOPOS edge:geo Palermo
+assert_both "GEOPOS missing" GEOPOS edge:geo NonExistent
+assert_both "GEODIST m" GEODIST edge:geo Palermo Catania
+assert_both "GEODIST km" GEODIST edge:geo Palermo Catania km
+assert_both "GEOHASH" GEOHASH edge:geo Palermo
+assert_both "GEOADD count" GEOADD edge:geo 2.349014 48.864716 Paris
+
 # ===========================================================================
 # Summary
 # ===========================================================================

@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod functions;
+pub mod geo;
 pub mod hash;
 pub mod helpers;
 pub mod hll;
@@ -398,7 +399,13 @@ fn dispatch_inner(
             }
         }
         (6, b'g') => {
-            // GETBIT GETSET GETDEL
+            // GEOADD GEOPOS GETBIT GETSET GETDEL
+            if cmd.eq_ignore_ascii_case(b"GEOADD") {
+                return resp(geo::geoadd(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEOPOS") {
+                return resp(geo::geopos(db, args));
+            }
             if cmd.eq_ignore_ascii_case(b"GETBIT") {
                 return resp(string::getbit(db, args));
             }
@@ -527,6 +534,15 @@ fn dispatch_inner(
             }
         }
         // 7-letter commands
+        (7, b'g') => {
+            // GEODIST GEOHASH
+            if cmd.eq_ignore_ascii_case(b"GEODIST") {
+                return resp(geo::geodist(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEOHASH") {
+                return resp(geo::geohash(db, args));
+            }
+        }
         (7, b'c') => {
             // COMMAND
             if cmd.eq_ignore_ascii_case(b"COMMAND") {
@@ -634,6 +650,12 @@ fn dispatch_inner(
             }
         }
         // 9-letter commands
+        (9, b'g') => {
+            // GEOSEARCH
+            if cmd.eq_ignore_ascii_case(b"GEOSEARCH") {
+                return resp(geo::geosearch(db, args));
+            }
+        }
         (9, b's') => {
             // SISMEMBER
             if cmd.eq_ignore_ascii_case(b"SISMEMBER") {
@@ -735,6 +757,13 @@ fn dispatch_inner(
             // ZRANGEBYSCORE
             if cmd.eq_ignore_ascii_case(b"ZRANGEBYSCORE") {
                 return resp(sorted_set::zrangebyscore(db, args));
+            }
+        }
+        // 14-letter commands
+        (14, b'g') => {
+            // GEOSEARCHSTORE
+            if cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE") {
+                return resp(geo::geosearchstore(db, args));
             }
         }
         // 16-letter commands
