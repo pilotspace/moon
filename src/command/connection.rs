@@ -115,6 +115,21 @@ pub fn command(args: &[Frame]) -> Frame {
     Frame::Array(framevec![])
 }
 
+/// HEALTHZ command — liveness check. Always returns +OK if the server is running.
+pub fn healthz() -> Frame {
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// READYZ command — readiness check. Returns +OK when the server is fully
+/// initialized (shards accepting, persistence loaded), -ERR otherwise.
+pub fn readyz() -> Frame {
+    if crate::admin::metrics_setup::is_server_ready() {
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR server not ready"))
+    }
+}
+
 /// INFO command handler.
 ///
 /// Returns a BulkString with minimal INFO sections.
@@ -188,6 +203,38 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed) as u8
     );
+    sections.push_str("\r\n");
+
+    // # Stats
+    sections.push_str("# Stats\r\n");
+    let _ = write!(
+        sections,
+        "total_commands_processed:{}\r\n\
+         total_connections_received:{}\r\n",
+        crate::admin::metrics_setup::total_commands_processed(),
+        crate::admin::metrics_setup::total_connections_received(),
+    );
+    sections.push_str("\r\n");
+
+    // # CPU
+    sections.push_str("# CPU\r\n");
+    let (cpu_sys, cpu_user) = crate::admin::metrics_setup::get_cpu_usage();
+    let _ = write!(
+        sections,
+        "used_cpu_sys:{:.6}\r\n\
+         used_cpu_user:{:.6}\r\n",
+        cpu_sys, cpu_user,
+    );
+    sections.push_str("\r\n");
+
+    // # Replication
+    // NOTE: placeholder — always reports master with 0 replicas.
+    // TODO: wire to actual ReplicationState when replication is implemented.
+    sections.push_str("# Replication\r\n");
+    sections.push_str("role:master\r\n");
+    sections.push_str("connected_slaves:0\r\n");
+    sections.push_str("master_replid:0000000000000000000000000000000000000000\r\n");
+    sections.push_str("master_repl_offset:0\r\n");
     sections.push_str("\r\n");
 
     sections.push_str("# Keyspace\r\n");
@@ -267,7 +314,14 @@ pub fn auth_acl(
                     );
                 }
             };
-            match acl_table.read().unwrap().authenticate("default", &password) {
+            // Fail closed: if the ACL lock is poisoned, deny authentication
+            let Ok(table) = acl_table.read() else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
+                    None,
+                );
+            };
+            match table.authenticate("default", &password) {
                 Some(username) => (
                     Frame::SimpleString(Bytes::from_static(b"OK")),
                     Some(username),
@@ -299,7 +353,14 @@ pub fn auth_acl(
                     );
                 }
             };
-            match acl_table.read().unwrap().authenticate(&username, &password) {
+            // Fail closed: if the ACL lock is poisoned, deny authentication
+            let Ok(table) = acl_table.read() else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
+                    None,
+                );
+            };
+            match table.authenticate(&username, &password) {
                 Some(uname) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(uname)),
                 None => (
                     Frame::Error(Bytes::from_static(
@@ -393,7 +454,16 @@ pub fn hello_acl(
                         );
                     }
                 };
-                match acl_table.read().unwrap().authenticate(&username, &password) {
+                // Fail closed: if the ACL lock is poisoned, deny authentication
+                let Ok(table) = acl_table.read() else {
+                    return (
+                        Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
+                        current_proto,
+                        None,
+                        None,
+                    );
+                };
+                match table.authenticate(&username, &password) {
                     Some(uname) => {
                         *authenticated = true;
                         auth_user = Some(uname);

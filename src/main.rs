@@ -69,6 +69,59 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Validate persistence directory is accessible
+    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+        return Err(anyhow::anyhow!(
+            "failed to create persistence directory {:?}: {}",
+            config.dir,
+            e
+        ));
+    }
+
+    // --check-config: validate and exit without starting.
+    // Runs AFTER TLS cert/key validation, protected mode check, and persistence dir check
+    // so that real configuration errors are caught before reporting success.
+    // Remaining initialization (metrics, shards, AOF) is runtime-only and not validated here.
+    if config.check_config {
+        // Validate shard count is reasonable
+        if config.shards == 0 {
+            return Err(anyhow::anyhow!("--shards must be >= 1"));
+        }
+        // Validate admin port doesn't conflict with main port
+        if config.admin_port > 0 && config.admin_port == config.port {
+            return Err(anyhow::anyhow!(
+                "--admin-port ({}) must differ from --port ({})",
+                config.admin_port,
+                config.port
+            ));
+        }
+        if config.admin_port > 0 && config.tls_port > 0 && config.admin_port == config.tls_port {
+            return Err(anyhow::anyhow!(
+                "--admin-port ({}) must differ from --tls-port ({})",
+                config.admin_port,
+                config.tls_port
+            ));
+        }
+        if config.tls_port > 0 && config.tls_port == config.port {
+            return Err(anyhow::anyhow!(
+                "--tls-port ({}) must differ from --port ({})",
+                config.tls_port,
+                config.port
+            ));
+        }
+        info!("Configuration is valid.");
+        return Ok(());
+    }
+
+    // Initialize Prometheus metrics exporter (if admin_port > 0)
+    let readiness_flag = moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
+
+    // Initialize global slowlog with user-configured thresholds
+    moon::admin::metrics_setup::init_global_slowlog(
+        config.slowlog_max_len,
+        config.slowlog_log_slower_than,
+    );
+
     // Initialize vector distance dispatch table (must happen before any search).
     moon::vector::distance::init();
 
@@ -91,17 +144,6 @@ fn main() -> anyhow::Result<()> {
 
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
-
-    // Ensure persistence directory exists before spawning AOF writer.
-    // Fail fast if --dir is invalid or permission-denied: otherwise the AOF
-    // writer and recovery paths silently fall back and corrupt invariants.
-    if let Err(e) = std::fs::create_dir_all(&config.dir) {
-        return Err(anyhow::anyhow!(
-            "failed to create persistence directory {:?}: {}",
-            config.dir,
-            e
-        ));
-    }
 
     // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
     // The AOF writer task will be spawned on the listener runtime.
@@ -179,8 +221,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Build shared runtime config for sharded handlers
-    let runtime_config_shared: std::sync::Arc<std::sync::RwLock<moon::config::RuntimeConfig>> =
-        { std::sync::Arc::new(std::sync::RwLock::new(config.to_runtime_config())) };
+    let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
+        { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 
@@ -344,6 +386,12 @@ fn main() -> anyhow::Result<()> {
         .map(|s| std::mem::take(&mut s.databases))
         .collect();
     let shard_databases = ShardDatabases::new(all_dbs);
+
+    // All shards recovered — mark server as ready for /readyz.
+    if let Some(ref flag) = readiness_flag {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("All shards ready — /readyz returning 200");
+    }
 
     // Spawn shard threads
     let mut shard_handles = Vec::with_capacity(num_shards);

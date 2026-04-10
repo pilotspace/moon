@@ -441,6 +441,8 @@ pub fn load_rdb(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize
 
     // Verify CRC64: checksum covers everything except the last 8 bytes
     let payload = &data[..data.len() - 8];
+    #[allow(clippy::unwrap_used)]
+    // data[len-8..] is exactly 8 bytes — try_into::<[u8; 8]> is infallible
     let stored_crc = u64::from_le_bytes(data[data.len() - 8..].try_into().unwrap());
     let computed_crc = crc64_jones(payload);
     if stored_crc != computed_crc {

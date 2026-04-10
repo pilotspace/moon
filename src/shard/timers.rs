@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
@@ -26,10 +26,9 @@ pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id:
 pub(crate) fn run_eviction(
     shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
-    runtime_config: &Arc<RwLock<RuntimeConfig>>,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
 ) {
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let rt = runtime_config.read().unwrap();
+    let rt = runtime_config.read();
     if rt.maxmemory > 0 {
         let db_count = shard_databases.db_count();
         for i in 0..db_count {

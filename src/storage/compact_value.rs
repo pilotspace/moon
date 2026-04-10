@@ -230,6 +230,7 @@ impl CompactValue {
 
     /// Get the tagged pointer from a heap-allocated value.
     #[inline]
+    #[allow(clippy::unwrap_used)] // payload[4..12] is exactly 8 bytes — try_into::<[u8; 8]> is infallible
     fn heap_tagged_ptr(&self) -> usize {
         debug_assert!(!self.is_inline());
         usize::from_ne_bytes(self.payload[4..12].try_into().unwrap())

@@ -50,21 +50,20 @@ fn test_inline_get_miss() {
 }
 
 #[test]
-fn test_inline_set() {
+fn test_inline_set_falls_through() {
+    // SET is a write command — inline fast-path intentionally rejects it
+    // (must go through normal dispatch for ACL, replication, tracking, etc.)
     let dbs = make_dbs();
-    let mut read_buf = BytesMut::from(&b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"[..]);
+    let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let original_len = read_buf.len();
     let mut write_buf = BytesMut::new();
     let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
 
     let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx, 0, 1);
-    assert_eq!(result, 1);
-    assert!(read_buf.is_empty());
-    assert_eq!(&write_buf[..], b"+OK\r\n");
-
-    // Verify key was stored
-    let mut guard = dbs.write_db(0, 0);
-    let entry = guard.get(b"foo").expect("key should exist");
-    assert_eq!(entry.value.as_bytes().unwrap(), b"bar");
+    assert_eq!(result, 0, "SET should fall through inline dispatch");
+    assert_eq!(read_buf.len(), original_len, "buffer should be untouched");
+    assert!(write_buf.is_empty(), "no response should be written");
 }
 
 #[test]
@@ -142,26 +141,21 @@ fn test_inline_partial() {
 }
 
 #[test]
-fn test_inline_set_with_aof() {
+fn test_inline_set_with_aof_falls_through() {
+    // SET is a write command — inline fast-path intentionally rejects it
+    // even when AOF is configured.
     let dbs = make_dbs();
-    let (aof_sender, aof_receiver) = channel::mpsc_bounded::<AofMessage>(16);
+    let (aof_sender, _aof_receiver) = channel::mpsc_bounded::<AofMessage>(16);
     let aof_tx: Option<channel::MpscSender<AofMessage>> = Some(aof_sender);
     let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     let mut read_buf = BytesMut::from(&cmd[..]);
+    let original_len = read_buf.len();
     let mut write_buf = BytesMut::new();
 
     let result = try_inline_dispatch(&mut read_buf, &mut write_buf, &dbs, 0, 0, &aof_tx, 0, 1);
-    assert_eq!(result, 1);
-    assert_eq!(&write_buf[..], b"+OK\r\n");
-
-    // Verify AOF message was sent
-    let msg = aof_receiver.try_recv().expect("should have AOF message");
-    match msg {
-        AofMessage::Append(bytes) => {
-            assert_eq!(&bytes[..], &cmd[..]);
-        }
-        _ => panic!("expected Append message"),
-    }
+    assert_eq!(result, 0, "SET should fall through inline dispatch");
+    assert_eq!(read_buf.len(), original_len);
+    assert!(write_buf.is_empty());
 }
 
 #[test]

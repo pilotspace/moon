@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-BASELINE=98  # Accurate count after fixing set -e bug in script. Includes function-level #[allow] not detected by line grep + split submodule files without #[cfg(test)]. Target: 0
+BASELINE=0  # Target: zero un-annotated unwrap/expect in hot-path modules
 
 COUNT=0
 for mod in src/protocol src/command src/shard src/storage src/persistence src/server; do
@@ -19,18 +19,45 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
     while IFS= read -r line; do
         file=$(echo "$line" | cut -d: -f1)
         lineno=$(echo "$line" | cut -d: -f2)
-        # Check if preceding line has #[allow
-        prev=$((lineno - 1))
-        prev2=$((lineno - 2))
-        if sed -n "${prev}p;${prev2}p" "$file" 2>/dev/null | grep -q '#\[allow'; then
-            continue
+
+        # Skip files that are test-only modules (e.g., tests.rs included via #[cfg(test)] mod tests;)
+        basename=$(basename "$file")
+        if [ "$basename" = "tests.rs" ]; then
+            # Check if the parent mod.rs has a cfg(test) attribute adjacent to mod tests
+            # Handles both simple #[cfg(test)] and compound #[cfg(all(test, ...))]
+            dir=$(dirname "$file")
+            parent_mod="$dir/mod.rs"
+            if [ -f "$parent_mod" ] && awk '
+                /^[[:space:]]*#\[cfg\(.*test.*\)\]/ { cfg_test = 1; next }
+                cfg_test && /^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests/ { found = 1; exit }
+                { cfg_test = 0 }
+                END { exit(found ? 0 : 1) }
+            ' "$parent_mod"; then
+                continue
+            fi
         fi
+
         # Check if we're inside a #[cfg(test)] module
         # Simple heuristic: if line number > first #[cfg(test)] in file, skip
         test_start=$(grep -n '#\[cfg(test)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1 || true)
         if [ -n "$test_start" ] && [ "$lineno" -gt "$test_start" ]; then
             continue
         fi
+
+        # Skip comment-only lines (// or ///)
+        actual_line=$(sed -n "${lineno}p" "$file" 2>/dev/null)
+        stripped=$(echo "$actual_line" | sed 's/^[[:space:]]*//')
+        if echo "$stripped" | grep -q '^//'; then
+            continue
+        fi
+
+        # Check preceding 30 lines for #[allow — covers function-level annotations
+        start=$((lineno - 30))
+        if [ "$start" -lt 1 ]; then start=1; fi
+        if sed -n "${start},${lineno}p" "$file" 2>/dev/null | grep -q '#\[allow.*clippy::unwrap_used\|#\[allow.*clippy::expect_used'; then
+            continue
+        fi
+
         COUNT=$((COUNT + 1))
         echo "  UNANNOTATED: $file:$lineno"
     done < <(grep -rn '\.unwrap()\|\.expect(' "$mod" --include='*.rs' 2>/dev/null || true)

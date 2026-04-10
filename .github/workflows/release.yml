@@ -69,6 +69,38 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate SBOMs
+        run: |
+          # Per-variant SBOMs so each binary has an accurate dependency graph.
+          cargo cyclonedx --format json --no-default-features --features runtime-tokio,jemalloc \
+            --output-file artifacts/moon-sbom-tokio.json
+          cargo cyclonedx --format json --no-default-features --features runtime-monoio,jemalloc \
+            --output-file artifacts/moon-sbom-monoio.json
+          # Combined superset SBOM for convenience (covers all variants).
+          cargo cyclonedx --format json --output-file artifacts/moon-sbom.json
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum moon-linux-tokio moon-linux-monoio moon-macos-tokio moon-sbom.json moon-sbom-tokio.json moon-sbom-monoio.json > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          for f in artifacts/moon-*; do
+            cosign sign-blob --yes "$f" --output-signature "${f}.sig"
+          done
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,4 +111,9 @@ jobs:
             --generate-notes \
             artifacts/moon-linux-tokio \
             artifacts/moon-linux-monoio \
-            artifacts/moon-macos-tokio
+            artifacts/moon-macos-tokio \
+            artifacts/moon-sbom.json \
+            artifacts/moon-sbom-tokio.json \
+            artifacts/moon-sbom-monoio.json \
+            artifacts/SHA256SUMS.txt \
+            artifacts/moon-*.sig

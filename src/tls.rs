@@ -91,25 +91,41 @@ pub fn build_tls_config(
             )
         })?;
 
-    // Build server config -- with or without cipher suite filtering
-    let config_builder = if let Some(suite_names) = ciphersuites {
-        // Filter cipher suites: parse names, match to aws-lc-rs constants
-        let suites = resolve_cipher_suites(suite_names)?;
-        let provider = rustls::crypto::CryptoProvider {
-            cipher_suites: suites,
-            ..rustls::crypto::aws_lc_rs::default_provider()
-        };
-        rustls::ServerConfig::builder_with_provider(Arc::new(provider))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("TLS protocol versions: {}", e),
-                )
-            })?
-    } else {
-        rustls::ServerConfig::builder()
+    // Explicit default cipher suite allowlist.
+    //
+    // When --tls-ciphersuites is not specified, Moon uses this frozen set instead
+    // of accepting whatever rustls ships as defaults. This prevents a rustls
+    // upgrade from silently enabling weaker suites.
+    //
+    // Allowlist (all AEAD-only, PFS-required):
+    //   TLS 1.3: AES-256-GCM, AES-128-GCM, CHACHA20-POLY1305
+    //   TLS 1.2: ECDHE-ECDSA + ECDHE-RSA variants of the above
+    const DEFAULT_CIPHER_SUITES: &str = "\
+        TLS_AES_256_GCM_SHA384,\
+        TLS_AES_128_GCM_SHA256,\
+        TLS_CHACHA20_POLY1305_SHA256,\
+        TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,\
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,\
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,\
+        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,\
+        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,\
+        TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256";
+
+    // Build server config with explicit cipher suite allowlist
+    let suite_names = ciphersuites.unwrap_or(DEFAULT_CIPHER_SUITES);
+    let suites = resolve_cipher_suites(suite_names)?;
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: suites,
+        ..rustls::crypto::aws_lc_rs::default_provider()
     };
+    let config_builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("TLS protocol versions: {}", e),
+            )
+        })?;
 
     let config = if let Some(ca_path) = ca_cert_path {
         // mTLS: require client certificates

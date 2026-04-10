@@ -63,7 +63,7 @@ pub async fn handle_connection(
     aof_tx: Option<channel::MpscSender<AofMessage>>,
     change_counter: Option<Arc<AtomicU64>>,
     pubsub_registry: Arc<Mutex<PubSubRegistry>>,
-    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     tracking_table: Arc<Mutex<TrackingTable>>,
     client_id: u64,
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
@@ -79,10 +79,7 @@ pub async fn handle_connection(
     let mut selected_db: usize = 0;
     let mut authenticated = requirepass.is_none();
     let mut current_user: String = "default".to_string();
-    let acl_max_len = runtime_config
-        .read()
-        .map(|cfg| cfg.acllog_max_len)
-        .unwrap_or(128);
+    let acl_max_len = runtime_config.read().acllog_max_len;
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Pub/Sub connection-local state
@@ -676,8 +673,7 @@ pub async fn handle_connection(
                                 let db_count = db.len();
                                 for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
                                     if is_write {
-                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                        let rt = runtime_config.read().unwrap();
+                                        let rt = runtime_config.read();
                                         if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                             responses[resp_idx] = oom_frame;
                                             continue;
@@ -685,7 +681,20 @@ pub async fn handle_connection(
                                     }
                                     #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
+                                    let dispatch_start = std::time::Instant::now();
                                     let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                                    let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                                    if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
+                                        crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    }
+                                    if let Frame::Array(ref args) = disp_frame {
+                                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                            elapsed_us,
+                                            args.as_slice(),
+                                            peer_addr.as_bytes(),
+                                            client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                        );
+                                    }
                                     let (response, quit) = match result {
                                         DispatchResult::Response(f) => (f, false),
                                         DispatchResult::Quit(f) => (f, true),
@@ -1080,7 +1089,20 @@ pub async fn handle_connection(
                                     }
                                 }
 
+                                let dispatch_start = std::time::Instant::now();
                                 let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut selected_db, db_count);
+                                let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                                if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
+                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                }
+                                if let Frame::Array(ref args) = *disp_frame {
+                                    crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                        elapsed_us,
+                                        args.as_slice(),
+                                        peer_addr.as_bytes(),
+                                        client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                    );
+                                }
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
@@ -1115,8 +1137,7 @@ pub async fn handle_connection(
                                     guard.refresh_now();
                                 }
                                 let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
-                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                let rt = runtime_config.read().unwrap();
+                                let rt = runtime_config.read();
                                 if let Err(oom_frame) = try_evict_if_needed(&mut *guard, &rt) {
                                     responses[resp_idx] = oom_frame;
                                     continue;
@@ -1153,7 +1174,20 @@ pub async fn handle_connection(
                                 // HSET auto-indexing: after dispatch, check for vector index match
                                 let is_hset = d_cmd.eq_ignore_ascii_case(b"HSET");
 
+                                let dispatch_start = std::time::Instant::now();
                                 let result = dispatch(&mut *guard, d_cmd, d_args, &mut selected_db, db_count);
+                                let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                                if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
+                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                }
+                                if let Frame::Array(ref args) = *disp_frame {
+                                    crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                        elapsed_us,
+                                        args.as_slice(),
+                                        peer_addr.as_bytes(),
+                                        client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                    );
+                                }
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),

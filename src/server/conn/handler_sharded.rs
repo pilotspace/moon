@@ -76,6 +76,7 @@ use super::{
 ///
 /// Connection-level commands (AUTH, SUBSCRIBE, MULTI/EXEC) are handled at the
 /// connection level same as the non-sharded handler.
+#[tracing::instrument(skip_all, level = "debug")]
 pub async fn handle_connection_sharded(
     stream: TcpStream,
     shard_databases: Arc<ShardDatabases>,
@@ -95,7 +96,7 @@ pub async fn handle_connection_sharded(
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
     acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
@@ -109,6 +110,7 @@ pub async fn handle_connection_sharded(
     >,
     pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) {
+    crate::admin::metrics_setup::record_connection_opened();
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -222,6 +224,10 @@ pub async fn handle_connection_sharded(
                 // Stream consumed by into_std attempt, connection lost either way
             }
         }
+    } else {
+        // Only decrement connected_clients when the connection is actually closing,
+        // not when migrating to another shard (the connection stays alive).
+        crate::admin::metrics_setup::record_connection_closed();
     }
 }
 
@@ -255,7 +261,7 @@ pub async fn handle_connection_sharded_inner<
     script_cache: std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
     acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<std::sync::Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
@@ -293,10 +299,7 @@ pub async fn handle_connection_sharded_inner<
         mut current_user,
         client_name_restored,
     ) = restore_migrated_state(migrated_state, &requirepass);
-    let acl_max_len = runtime_config
-        .read()
-        .map(|cfg| cfg.acllog_max_len)
-        .unwrap_or(128);
+    let acl_max_len = runtime_config.read().acllog_max_len;
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
 
     // Transaction (MULTI/EXEC) connection-local state
@@ -824,6 +827,13 @@ pub async fn handle_connection_sharded_inner<
                     // --- CONFIG ---
                     if cmd.eq_ignore_ascii_case(b"CONFIG") {
                         responses.push(handle_config(cmd_args, &runtime_config, &config));
+                        continue;
+                    }
+
+                    // --- SLOWLOG ---
+                    if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
+                        let sl = crate::admin::metrics_setup::global_slowlog();
+                        responses.push(crate::admin::slowlog::handle_slowlog(sl, cmd_args));
                         continue;
                     }
 
@@ -1373,8 +1383,7 @@ pub async fn handle_connection_sharded_inner<
                         // cross-shard shared reads from other shard threads.
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
-                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                            let rt = runtime_config.read().unwrap();
+                            let rt = runtime_config.read();
                             let mut guard = shard_databases.write_db(shard_id, selected_db);
                             if let Err(oom_frame) = try_evict_if_needed(&mut guard, &rt) {
                                 drop(guard);
@@ -1386,12 +1395,29 @@ pub async fn handle_connection_sharded_inner<
 
                             let db_count = shard_databases.db_count();
                             guard.refresh_now_from_cache(&cached_clock);
+                            let dispatch_start = std::time::Instant::now();
                             let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                            let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                            if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                            }
+                            if let Frame::Array(ref args) = frame {
+                                crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                    elapsed_us,
+                                    args.as_slice(),
+                                    peer_addr.as_bytes(),
+                                    client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                );
+                            }
                             let response = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
-                            if !matches!(response, Frame::Error(_)) {
+                            if matches!(response, Frame::Error(_)) {
+                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                }
+                            } else {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
                                     || cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"ZADD");
                                 if needs_wake {
@@ -1451,12 +1477,30 @@ pub async fn handle_connection_sharded_inner<
                             let guard = shard_databases.read_db(shard_id, selected_db);
                             let now_ms = cached_clock.ms();
                             let db_count = shard_databases.db_count();
+                            let dispatch_start = std::time::Instant::now();
                             let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                            let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                            if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                            }
+                            if let Frame::Array(ref args) = frame {
+                                crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                    elapsed_us,
+                                    args.as_slice(),
+                                    peer_addr.as_bytes(),
+                                    client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                );
+                            }
                             drop(guard);
                             let response = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
+                            if matches!(response, Frame::Error(_)) {
+                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                }
+                            }
                             if tracking_state.enabled && !tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     tracking_table.borrow_mut().track_key(client_id, &key, tracking_state.noloop);
@@ -1485,6 +1529,11 @@ pub async fn handle_connection_sharded_inner<
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
                             };
+                            if matches!(response, Frame::Error(_)) {
+                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                }
+                            }
                             // Client tracking for cross-shard reads
                             if tracking_state.enabled && !tracking_state.bcast {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {

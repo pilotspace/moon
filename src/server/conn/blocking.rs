@@ -560,7 +560,12 @@ pub(crate) fn parse_blocking_timeout(cmd: &[u8], args: &[Frame]) -> Result<f64, 
             String::from_utf8_lossy(cmd).to_lowercase()
         ))));
     }
-    let timeout_frame = args.last().unwrap();
+    // args confirmed non-empty above — last() is guaranteed
+    let Some(timeout_frame) = args.last() else {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments",
+        )));
+    };
     let timeout_bytes = match timeout_frame {
         Frame::BulkString(b) | Frame::SimpleString(b) => b,
         _ => {

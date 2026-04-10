@@ -45,7 +45,7 @@ pub struct ConnectionContext {
     pub script_cache: Rc<RefCell<ScriptCache>>,
     pub config_port: u16,
     pub acl_table: Arc<RwLock<crate::acl::AclTable>>,
-    pub runtime_config: Arc<RwLock<RuntimeConfig>>,
+    pub runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     pub config: Arc<ServerConfig>,
     pub spsc_notifiers: Vec<Arc<channel::Notify>>,
     pub snapshot_trigger_tx: channel::WatchSender<u64>,

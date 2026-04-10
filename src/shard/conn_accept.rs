@@ -88,7 +88,7 @@ pub(crate) fn spawn_tokio_connection(
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
     acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
@@ -119,6 +119,8 @@ pub(crate) fn spawn_tokio_connection(
     let rs = repl_state.clone();
     let cs = cluster_state.clone();
     let cp = config_port;
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
     let lua = {
         let mut lua_opt = lua_rc.borrow_mut();
         if lua_opt.is_none() {
@@ -135,18 +137,7 @@ pub(crate) fn spawn_tokio_connection(
     let snap_tx = snapshot_trigger_tx.clone();
     let all_regs = all_pubsub_registries.to_vec();
     let all_rsm = all_remote_sub_maps.to_vec();
-    // Fail closed: if the config lock is poisoned, treat as requiring auth
-    // (deny by default) rather than silently disabling authentication.
-    let reqpass = match rtcfg.read() {
-        Ok(cfg) => cfg.requirepass.clone(),
-        Err(poisoned) => {
-            tracing::error!(
-                "Shard {}: RuntimeConfig lock poisoned, using last known config for auth",
-                shard_id
-            );
-            poisoned.into_inner().requirepass.clone()
-        }
-    };
+    let reqpass = rtcfg.read().requirepass.clone();
     let clk = cached_clock.clone();
 
     if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
@@ -243,7 +234,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
     acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
@@ -298,6 +289,8 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let rs = repl_state.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
+            #[allow(clippy::expect_used, clippy::unwrap_used)]
+            // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
@@ -383,7 +376,7 @@ pub(crate) fn spawn_monoio_connection(
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
     acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
@@ -422,6 +415,8 @@ pub(crate) fn spawn_monoio_connection(
             let do_dir = disk_offload_dir.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
+            #[allow(clippy::expect_used, clippy::unwrap_used)]
+            // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
@@ -454,10 +449,7 @@ pub(crate) fn spawn_monoio_connection(
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            let reqpass = match rtcfg.read() {
-                                Ok(cfg) => cfg.requirepass.clone(),
-                                Err(poisoned) => poisoned.into_inner().requirepass.clone(),
-                            };
+                            let reqpass = rtcfg.read().requirepass.clone();
                             let _ = handle_connection_sharded_monoio(
                                 tls_stream,
                                 peer_addr,
@@ -513,10 +505,7 @@ pub(crate) fn spawn_monoio_connection(
                 #[cfg(target_os = "linux")]
                 let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
-                    let reqpass = match rtcfg.read() {
-                        Ok(cfg) => cfg.requirepass.clone(),
-                        Err(poisoned) => poisoned.into_inner().requirepass.clone(),
-                    };
+                    let reqpass = rtcfg.read().requirepass.clone();
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
@@ -638,7 +627,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
     acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: &Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
     snapshot_trigger_tx: &channel::WatchSender<u64>,
@@ -687,6 +676,8 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let rs = repl_state.clone();
             let cs = cluster_state.clone();
             let cp = config_port;
+            #[allow(clippy::expect_used, clippy::unwrap_used)]
+            // Startup: Lua VM init failure is fatal; as_ref() after is_none() guard
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {

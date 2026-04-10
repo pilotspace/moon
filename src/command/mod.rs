@@ -41,6 +41,19 @@ pub fn dispatch(
     selected_db: &mut usize,
     db_count: usize,
 ) -> DispatchResult {
+    // Metrics recording is owned by the handler layer (handler_single,
+    // handler_sharded, handler_monoio) which has the full timing context
+    // needed for slowlog. Recording here would double-count.
+    dispatch_inner(db, cmd, args, selected_db, db_count)
+}
+
+fn dispatch_inner(
+    db: &mut Database,
+    cmd: &[u8],
+    args: &[Frame],
+    selected_db: &mut usize,
+    db_count: usize,
+) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
         return DispatchResult::Response(err_unknown(cmd));
@@ -383,7 +396,10 @@ pub fn dispatch(
             }
         }
         (6, b'r') => {
-            // RENAME
+            // READYZ RENAME
+            if cmd.eq_ignore_ascii_case(b"READYZ") {
+                return resp(connection::readyz());
+            }
             if cmd.eq_ignore_ascii_case(b"RENAME") {
                 return resp(key::rename(db, args));
             }
@@ -456,7 +472,10 @@ pub fn dispatch(
             }
         }
         (7, b'h') => {
-            // HGETALL HEXISTS HINCRBY
+            // HEALTHZ HGETALL HEXISTS HINCRBY
+            if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
+                return resp(connection::healthz());
+            }
             if cmd.eq_ignore_ascii_case(b"HGETALL") {
                 return resp(hash::hgetall(db, args));
             }
@@ -480,6 +499,15 @@ pub fn dispatch(
             }
             if cmd.eq_ignore_ascii_case(b"PERSIST") {
                 return resp(key::persist(db, args));
+            }
+        }
+        (7, b's') => {
+            // SLOWLOG
+            if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
+                return resp(crate::admin::slowlog::handle_slowlog(
+                    crate::admin::metrics_setup::global_slowlog(),
+                    args,
+                ));
             }
         }
         (7, b'z') => {
@@ -696,6 +724,11 @@ pub fn dispatch_read(
     _selected_db: &mut usize,
     _db_count: usize,
 ) -> DispatchResult {
+    // Metrics recording is owned by the handler layer — not here.
+    dispatch_read_inner(db, cmd, args, now_ms)
+}
+
+fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
         return DispatchResult::Response(err_unknown(cmd));

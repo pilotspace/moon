@@ -96,7 +96,7 @@ pub async fn handle_connection_sharded_monoio<
     script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
     config_port: u16,
     acl_table: Arc<StdRwLock<crate::acl::AclTable>>,
-    runtime_config: Arc<StdRwLock<RuntimeConfig>>,
+    runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     config: Arc<ServerConfig>,
     spsc_notifiers: Vec<Arc<channel::Notify>>,
     snapshot_trigger_tx: channel::WatchSender<u64>,
@@ -136,10 +136,7 @@ pub async fn handle_connection_sharded_monoio<
         client_name_restored,
     ) = restore_migrated_state(migrated_state, &requirepass);
     let db_count = shard_databases.db_count();
-    let acl_max_len = runtime_config
-        .read()
-        .map(|cfg| cfg.acllog_max_len)
-        .unwrap_or(128);
+    let acl_max_len = runtime_config.read().acllog_max_len;
     let mut acl_log = crate::acl::AclLog::new(acl_max_len);
     let mut tracking_state = TrackingState::default();
     let mut tracking_rx: Option<channel::MpscReceiver<Frame>> = None;
@@ -1573,9 +1570,7 @@ pub async fn handle_connection_sharded_monoio<
                     // WRITE PATH: eviction + dispatch under write lock.
                     // When disk offload is enabled, use async spill: evicted keys
                     // are sent to SpillThread for background pwrite to NVMe.
-                    #[allow(clippy::unwrap_used)]
-                    // std RwLock: poison = prior panic = unrecoverable
-                    let rt = runtime_config.read().unwrap();
+                    let rt = runtime_config.read();
                     let mut guard = shard_databases.write_db(shard_id, selected_db);
                     let evict_result = if let Some(ref sender) = spill_sender {
                         let mut fid = spill_file_id.get();
@@ -1603,7 +1598,20 @@ pub async fn handle_connection_sharded_monoio<
                     }
                     drop(rt);
 
+                    let dispatch_start = std::time::Instant::now();
                     let result = dispatch(&mut guard, cmd, cmd_args, &mut selected_db, db_count);
+                    let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                        crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                    }
+                    if let Frame::Array(ref args) = frame {
+                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                            elapsed_us,
+                            args.as_slice(),
+                            peer_addr.as_bytes(),
+                            client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                        );
+                    }
 
                     let response = match result {
                         DispatchResult::Response(f) => f,
@@ -1685,8 +1693,21 @@ pub async fn handle_connection_sharded_monoio<
                     // READ PATH: shared lock — no contention with other shards' reads
                     let guard = shard_databases.read_db(shard_id, selected_db);
                     let now_ms = cached_clock.ms();
+                    let dispatch_start = std::time::Instant::now();
                     let result =
                         dispatch_read(&guard, cmd, cmd_args, now_ms, &mut selected_db, db_count);
+                    let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
+                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                        crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                    }
+                    if let Frame::Array(ref args) = frame {
+                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                            elapsed_us,
+                            args.as_slice(),
+                            peer_addr.as_bytes(),
+                            client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                        );
+                    }
                     drop(guard);
 
                     let response = match result {

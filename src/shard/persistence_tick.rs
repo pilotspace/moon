@@ -274,7 +274,7 @@ pub(crate) fn run_eviction_tick(
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
-    runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
+    runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
     page_cache: &Option<PageCache>,
     next_file_id: &mut u64,
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
@@ -378,15 +378,12 @@ pub(crate) fn apply_spill_completions(
 /// Returns `true` when the pressure cascade should run. Uses actual
 /// aggregate database memory estimate vs maxmemory * threshold.
 pub(crate) fn should_run_pressure_cascade(
-    runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
+    runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
 ) -> bool {
-    let rt = match runtime_config.read() {
-        Ok(rt) => rt,
-        Err(_) => return false,
-    };
+    let rt = runtime_config.read();
     if rt.maxmemory == 0 {
         return false; // No memory limit set -- no pressure possible
     }
@@ -409,7 +406,7 @@ pub(crate) fn handle_memory_pressure(
     page_cache: &Option<PageCache>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
-    runtime_config: &std::sync::Arc<std::sync::RwLock<crate::config::RuntimeConfig>>,
+    runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_manifest: &mut Option<ShardManifest>,
     next_file_id: &mut u64,
@@ -462,7 +459,8 @@ pub(crate) fn handle_memory_pressure(
     // When a SpillThread is available, use the async path: entries are removed
     // from DashTable immediately (freeing RAM) and pwrite is deferred to the
     // background thread. Otherwise, fall back to synchronous spill.
-    if let Ok(rt) = runtime_config.read() {
+    {
+        let rt = runtime_config.read();
         if rt.maxmemory > 0 {
             // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
             let total_mem = shard_databases.aggregate_memory(shard_id);
@@ -521,7 +519,8 @@ pub(crate) fn handle_memory_pressure(
 
     // Step 4: NoEviction policy check -- if we reached here with noeviction,
     // log a warning. The actual OOM rejection is handled inside try_evict_if_needed.
-    if let Ok(rt) = runtime_config.read() {
+    {
+        let rt = runtime_config.read();
         if rt.maxmemory_policy == "noeviction" {
             tracing::warn!(
                 "Shard {}: memory pressure cascade exhausted; \

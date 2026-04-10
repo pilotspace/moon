@@ -36,6 +36,7 @@ use super::shared_databases::ShardDatabases;
 /// SnapshotBegin messages are collected into `pending_snapshot` for deferred handling
 /// (the caller has mutable access to snapshot_state). COW intercepts and WAL appends
 /// happen inline for Execute/MultiExecute write commands.
+#[tracing::instrument(skip_all, level = "debug")]
 pub(crate) fn drain_spsc_shared(
     shard_databases: &Arc<ShardDatabases>,
     consumers: &mut [HeapCons<ShardMessage>],

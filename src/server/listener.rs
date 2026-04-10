@@ -161,7 +161,7 @@ pub async fn run_with_shutdown(
     let pubsub_registry = Arc::new(Mutex::new(PubSubRegistry::new()));
 
     // Create shared runtime config (mutable via CONFIG SET)
-    let runtime_config = Arc::new(RwLock::new(config.to_runtime_config()));
+    let runtime_config = Arc::new(parking_lot::RwLock::new(config.to_runtime_config()));
 
     // Create shared tracking table for client-side caching invalidation
     let tracking_table = Arc::new(Mutex::new(TrackingTable::new()));

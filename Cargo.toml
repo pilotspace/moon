@@ -21,7 +21,9 @@ crc32c = "0.6"
 crossbeam-utils = "0.8"
 flume = "0.12"
 atomic-waker = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs"], optional = true }
+# Base features (rt, net) are always available for the admin HTTP server.
+# runtime-tokio adds the full feature set (multi-thread, io-util, signal, etc.).
+tokio = { version = "1", features = ["rt", "net", "macros"] }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -45,6 +47,8 @@ sha1_smol = { version = "1.0", features = ["std"] }
 sha2 = "0.11"
 hex = "0.4"
 ctrlc = "3.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 aws-lc-rs = { version = "1", optional = true }
@@ -57,6 +61,9 @@ socket2 = { version = "0.6", features = ["all"] }
 memmap2 = "0.9"
 lz4_flex = "0.13"
 dashmap = "6"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
@@ -73,7 +80,7 @@ cudarc = { version = "0.12", optional = true, default-features = false, features
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
-runtime-tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
+runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]
 simd-avx512 = []

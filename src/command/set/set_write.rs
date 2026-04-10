@@ -218,7 +218,10 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     let chosen: Vec<Bytes> = members.sample(&mut rng, n).cloned().collect();
 
     // Remove chosen members from the set
-    let set = db.get_or_create_set(&key).unwrap();
+    // Key confirmed as set type above via get_set(); get_or_create_set() cannot fail here
+    let Ok(set) = db.get_or_create_set(&key) else {
+        return Frame::Array(framevec![]);
+    };
     for m in &chosen {
         set.remove(m);
     }

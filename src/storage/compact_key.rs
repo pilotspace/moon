@@ -79,6 +79,7 @@ impl CompactKey {
 
     /// Reconstruct the raw pointer to the heap `Box<[u8]>` data.
     #[inline]
+    #[allow(clippy::unwrap_used)] // data[4..12] is exactly 8 bytes — try_into::<[u8; 8]> is infallible
     fn heap_ptr(&self) -> *mut u8 {
         let ptr_val = usize::from_le_bytes(self.data[4..12].try_into().unwrap());
         ptr_val as *mut u8
