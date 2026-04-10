@@ -8,6 +8,7 @@ pub mod memgraph;
 pub mod segment;
 pub mod store;
 pub mod types;
+pub mod visibility;
 
 pub use csr::CsrSegment;
 pub use memgraph::MemGraph;

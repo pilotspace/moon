@@ -53,6 +53,8 @@ pub struct MutableNode {
     pub created_lsn: u64,
     /// LSN at which this node was soft-deleted (u64::MAX if alive).
     pub deleted_lsn: u64,
+    /// Transaction ID that created this node (0 = no transaction / pre-MVCC).
+    pub txn_id: u64,
 }
 
 /// Mutable edge in MemGraph.
@@ -72,6 +74,8 @@ pub struct MutableEdge {
     pub created_lsn: u64,
     /// LSN at which this edge was soft-deleted (u64::MAX if alive).
     pub deleted_lsn: u64,
+    /// Transaction ID that created this edge (0 = no transaction / pre-MVCC).
+    pub txn_id: u64,
 }
 
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.

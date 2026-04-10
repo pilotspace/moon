@@ -68,6 +68,7 @@ impl MemGraph {
             embedding,
             created_lsn: lsn,
             deleted_lsn: u64::MAX,
+            txn_id: 0,
         })
     }
 
@@ -108,6 +109,7 @@ impl MemGraph {
             properties,
             created_lsn: lsn,
             deleted_lsn: u64::MAX,
+            txn_id: 0,
         });
 
         // Push edge key into src.outgoing and dst.incoming.
