@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use roaring::RoaringBitmap;
 use slotmap::Key;
 
+use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::memgraph::FrozenMemGraph;
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 
@@ -35,8 +36,15 @@ pub struct CsrSegment {
     pub node_meta: Vec<NodeMeta>,
     /// Validity bitmap: bit set = edge is live. One bit per edge.
     pub validity: RoaringBitmap,
-    /// Node key to CSR row index mapping (replaced by boomphf in Phase 116).
+    /// Node key to CSR row index mapping -- kept for backward compatibility.
+    /// Prefer `mph` for O(1) lookup with ~3 bits/key overhead.
     pub node_id_to_row: HashMap<NodeKey, u32>,
+    /// Minimal perfect hash index: NodeKey -> CSR row (~3 bits/key).
+    pub mph: MphNodeIndex,
+    /// Per-label Roaring bitmap index for O(1) label filtering.
+    pub label_index: LabelIndex,
+    /// Per-edge-type Roaring bitmap index for O(1) edge type filtering.
+    pub edge_type_index: EdgeTypeIndex,
     /// LSN at which this segment was created.
     pub created_lsn: u64,
 }
@@ -171,6 +179,12 @@ impl CsrSegment {
             checksum,
         };
 
+        // Build indexes (Phase 116).
+        let sorted_keys: Vec<NodeKey> = sorted_nodes.iter().map(|(k, _)| *k).collect();
+        let mph = MphNodeIndex::build(&sorted_keys);
+        let label_index = LabelIndex::build(&node_meta);
+        let edge_type_index = EdgeTypeIndex::build(&edge_meta);
+
         Ok(Self {
             header,
             row_offsets,
@@ -179,6 +193,9 @@ impl CsrSegment {
             node_meta,
             validity,
             node_id_to_row,
+            mph,
+            label_index,
+            edge_type_index,
             created_lsn: lsn,
         })
     }
@@ -211,8 +228,56 @@ impl CsrSegment {
     }
 
     /// Look up CSR row index for a NodeKey.
+    ///
+    /// Uses boomphf MPH (O(1), ~3 bits/key) with false-positive rejection.
+    /// Falls back to HashMap if MPH returns None (should not happen for valid keys).
     pub fn lookup_node(&self, key: NodeKey) -> Option<u32> {
-        self.node_id_to_row.get(&key).copied()
+        self.mph.lookup(key).or_else(|| self.node_id_to_row.get(&key).copied())
+    }
+
+    /// Returns valid outgoing neighbor row indices filtered by node label.
+    ///
+    /// Uses Roaring bitmap intersection: edges whose destination node carries
+    /// the given label are returned without scanning all neighbors.
+    pub fn neighbors_by_label(&self, row: u32, label: u16) -> Vec<u32> {
+        let start = self.row_offsets[row as usize] as usize;
+        let end = self.row_offsets[row as usize + 1] as usize;
+        let label_bm = match self.label_index.nodes_with_label(label) {
+            Some(bm) => bm,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        for idx in start..end {
+            if self.validity.contains(idx as u32) {
+                let dst_row = self.col_indices[idx];
+                if label_bm.contains(dst_row) {
+                    result.push(dst_row);
+                }
+            }
+        }
+        result
+    }
+
+    /// Returns valid outgoing neighbor edges filtered by edge type.
+    ///
+    /// Uses per-edge-type Roaring bitmap for O(1) membership test per edge.
+    pub fn edges_by_type(&self, row: u32, edge_type: u16) -> Vec<(u32, &EdgeMeta)> {
+        let start = self.row_offsets[row as usize] as usize;
+        let end = self.row_offsets[row as usize + 1] as usize;
+        let type_bm = match self.edge_type_index.edges_of_type(edge_type) {
+            Some(bm) => bm,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        for idx in start..end {
+            let idx32 = idx as u32;
+            if self.validity.contains(idx32) && type_bm.contains(idx32) {
+                result.push((self.col_indices[idx], &self.edge_meta[idx]));
+            }
+        }
+        result
     }
 
     /// Iterator over valid outgoing neighbor edges for a CSR row.
@@ -428,5 +493,114 @@ mod tests {
             CsrSegment::from_frozen(frozen, 1).unwrap_err(),
             CsrError::EmptyGraph
         );
+    }
+
+    // --- Phase 116: Index integration tests ---
+
+    #[test]
+    fn test_indexes_built_during_from_frozen() {
+        let frozen = build_small_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        // LabelIndex: 5 nodes with labels 0..4, each has exactly one label.
+        assert_eq!(csr.label_index.label_count(), 5);
+        for label in 0..5u16 {
+            let bm = csr.label_index.nodes_with_label(label).expect("label exists");
+            assert_eq!(bm.len(), 1);
+        }
+
+        // EdgeTypeIndex: 3 edge types (1, 2, 3).
+        assert_eq!(csr.edge_type_index.type_count(), 3);
+        // Type 1: 4 star edges from node 0.
+        let bm = csr.edge_type_index.edges_of_type(1).expect("type 1 exists");
+        assert_eq!(bm.len(), 4);
+        // Type 2: 3 chain edges.
+        let bm = csr.edge_type_index.edges_of_type(2).expect("type 2 exists");
+        assert_eq!(bm.len(), 3);
+        // Type 3: 3 cross edges.
+        let bm = csr.edge_type_index.edges_of_type(3).expect("type 3 exists");
+        assert_eq!(bm.len(), 3);
+
+        // MphNodeIndex: all 5 node keys resolvable.
+        assert_eq!(csr.mph.len(), 5);
+    }
+
+    #[test]
+    fn test_mph_lookup_matches_hashmap() {
+        let frozen = build_small_graph();
+        let node_keys: Vec<_> = frozen.nodes.iter().map(|(k, _)| *k).collect();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        // Every key should resolve to the same row via MPH as via HashMap.
+        for key in &node_keys {
+            let mph_row = csr.mph.lookup(*key).expect("mph finds key");
+            let map_row = csr.node_id_to_row.get(key).copied().expect("map finds key");
+            assert_eq!(mph_row, map_row);
+        }
+    }
+
+    #[test]
+    fn test_neighbors_by_label() {
+        // Build graph where node labels are: 0=label0, 1=label1, 2=label2, 3=label3, 4=label4
+        // Node 0 has outgoing edges to nodes 1,2,3,4 (star pattern).
+        // neighbors_by_label(row0, label=2) should return only node 2's row.
+        let frozen = build_small_graph();
+        let node_keys: Vec<_> = frozen.nodes.iter().map(|(k, _)| *k).collect();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        let row0 = csr.lookup_node(node_keys[0]).expect("row exists");
+
+        // Filter neighbors of node 0 by label 2 (only node 2 has label 2).
+        let filtered = csr.neighbors_by_label(row0, 2);
+        assert_eq!(filtered.len(), 1);
+        let row2 = csr.lookup_node(node_keys[2]).expect("row exists");
+        assert_eq!(filtered[0], row2);
+
+        // Filter by label 0 (only node 0 has it, but node 0 is not a neighbor of itself).
+        let filtered = csr.neighbors_by_label(row0, 0);
+        assert!(filtered.is_empty());
+
+        // Filter by non-existent label.
+        let filtered = csr.neighbors_by_label(row0, 31);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_edges_by_type() {
+        // Node 0 has 4 outgoing edges, all of type 1.
+        // Node 1 has outgoing edge to node 2 (type 2) and node 3->1 is incoming.
+        let frozen = build_small_graph();
+        let node_keys: Vec<_> = frozen.nodes.iter().map(|(k, _)| *k).collect();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        let row0 = csr.lookup_node(node_keys[0]).expect("row exists");
+
+        // All node 0's edges are type 1.
+        let type1 = csr.edges_by_type(row0, 1);
+        assert_eq!(type1.len(), 4);
+
+        // No type 2 edges from node 0.
+        let type2 = csr.edges_by_type(row0, 2);
+        assert!(type2.is_empty());
+
+        // No type 3 edges from node 0.
+        let type3 = csr.edges_by_type(row0, 3);
+        assert!(type3.is_empty());
+    }
+
+    #[test]
+    fn test_edges_by_type_with_deletion() {
+        let frozen = build_small_graph();
+        let node_keys: Vec<_> = frozen.nodes.iter().map(|(k, _)| *k).collect();
+        let mut csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        let row0 = csr.lookup_node(node_keys[0]).expect("row exists");
+
+        // Delete the first type-1 edge.
+        let first_edge_idx = csr.row_offsets[row0 as usize];
+        csr.mark_deleted(first_edge_idx);
+
+        let type1 = csr.edges_by_type(row0, 1);
+        assert_eq!(type1.len(), 3); // one less
     }
 }

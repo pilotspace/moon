@@ -10,6 +10,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::graph::csr::{CsrError, CsrSegment};
+use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeMeta};
 
 /// Compaction configuration.
@@ -292,6 +293,11 @@ pub fn compact_segments(
         checksum,
     };
 
+    // Build indexes from compacted data. MPH is empty (no NodeKeys in compaction).
+    let mph = MphNodeIndex::build(&[]);
+    let label_index = LabelIndex::build(&node_meta_vec);
+    let edge_type_index = EdgeTypeIndex::build(&edge_meta_vec);
+
     Ok(CsrSegment {
         header,
         row_offsets,
@@ -300,6 +306,9 @@ pub fn compact_segments(
         node_meta: node_meta_vec,
         validity,
         node_id_to_row,
+        mph,
+        label_index,
+        edge_type_index,
         created_lsn,
     })
 }

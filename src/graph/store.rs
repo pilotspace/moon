@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 
+use crate::graph::index::PropertyIndex;
 use crate::graph::segment::GraphSegmentHolder;
 
 /// Errors from GraphStore operations.
@@ -32,6 +33,9 @@ pub struct NamedGraph {
     pub edge_threshold: usize,
     /// LSN at which this graph was created.
     pub created_lsn: u64,
+    /// Optional property indexes for cross-segment numeric range queries.
+    /// Key is the property name dictionary ID.
+    pub property_indexes: HashMap<u16, PropertyIndex>,
 }
 
 /// Per-shard graph store. No Arc, no Mutex -- fully owned by shard thread.
@@ -67,6 +71,7 @@ impl GraphStore {
                 write_buf: crate::graph::memgraph::MemGraph::new(edge_threshold),
                 edge_threshold,
                 created_lsn: lsn,
+                property_indexes: HashMap::new(),
             },
         );
         Ok(())
