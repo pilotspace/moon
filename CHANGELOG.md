@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — High-Impact Redis Command Parity (2026-04-10)
+
+- **COPY command** — atomic key duplication with DESTINATION, REPLACE options (Redis 6.2+).
+- **Bit operations** — GETBIT, SETBIT, BITCOUNT (byte/bit range modes), BITOP (AND/OR/XOR/NOT), BITPOS (byte/bit range modes) with read-only dispatch variants.
+- **SORT command** — full BY/GET/LIMIT/ALPHA/ASC/DESC/STORE support for lists, sets, and sorted sets.
+- **Geospatial commands** — GEOADD (NX/XX/CH), GEOPOS, GEODIST (M/KM/FT/MI), GEOHASH (11-char base32), GEOSEARCH (FROMLONLAT/FROMMEMBER, BYRADIUS/BYBOX, WITHCOORD/WITHDIST/WITHHASH), GEOSEARCHSTORE.
+- **CONFIG REWRITE** — atomic write of runtime config to `<dir>/moon.conf` (tmpfile + rename). CONFIG RESETSTAT stub.
+- **CLIENT PAUSE/UNPAUSE** — delays command processing with WRITE-only mode support. CLIENT INFO, CLIENT LIST (stub), CLIENT NO-EVICT/NO-TOUCH accepted.
+- **MEMORY USAGE/DOCTOR/HELP** — key memory estimation via `estimate_memory()`.
+- **Lazyfree threshold** — configurable via `CONFIG SET lazyfree-threshold N` (default 64).
+- **GETBIT/SETBIT metadata** — added to PHF command registry.
+- **GEOADD/GEOSEARCHSTORE** — added to AOF write commands test list.
+
 ### Fixed — Wave 0-4 Gap Closure (2026-04-09)
 
 - **ZREVRANGEBYSCORE/ZREVRANGEBYLEX correctness bug:** Fixed double-swap of min/max bounds in `zrange_by_score` and `zrange_by_lex` that caused empty results for finite score ranges (e.g., `ZREVRANGEBYSCORE key 3 1`). Added finite-range test to `test-commands.sh`.
