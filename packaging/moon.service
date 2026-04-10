@@ -1,0 +1,29 @@
+[Unit]
+Description=Moon — High-Performance Redis-Compatible Server
+Documentation=https://github.com/tidwall/moon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moon
+Group=moon
+ExecStart=/usr/local/bin/moon --bind 0.0.0.0 --port 6379 --dir /var/lib/moon --appendonly yes
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/moon
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# OOM tuning — prefer killing other processes over moon
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

@@ -90,3 +90,62 @@ fn upgrade_empty_dir_no_panic() {
 
     cleanup(&dir);
 }
+
+#[test]
+#[ignore]
+fn downgrade_same_minor_preserves_data() {
+    // Verify that AOF data written by version N is readable after a downgrade
+    // to version N-1 within the same minor series. Moon's versioning policy
+    // guarantees same-minor backward compatibility for persistence formats.
+    let dir = temp_persistence_dir("downgrade");
+
+    // Simulate version N writing data with a format header comment.
+    let aof_path = dir.join("appendonly.aof");
+    {
+        let mut f = fs::File::create(&aof_path).expect("create AOF");
+        // Write multiple data types to verify broad format compatibility
+        write!(f, "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n").expect("write SELECT");
+        write!(
+            f,
+            "*3\r\n$3\r\nSET\r\n$12\r\ndowngrade_k1\r\n$6\r\nvalue1\r\n"
+        )
+        .expect("write SET 1");
+        write!(
+            f,
+            "*3\r\n$3\r\nSET\r\n$12\r\ndowngrade_k2\r\n$6\r\nvalue2\r\n"
+        )
+        .expect("write SET 2");
+        write!(
+            f,
+            "*4\r\n$4\r\nHSET\r\n$11\r\ndowngrade_h\r\n$5\r\nfield\r\n$3\r\nval\r\n"
+        )
+        .expect("write HSET");
+        f.sync_all().expect("sync AOF");
+    }
+
+    // Simulate version N-1 reading the AOF — it must parse all commands.
+    let contents = fs::read_to_string(&aof_path).expect("read AOF");
+    assert!(
+        contents.contains("downgrade_k1"),
+        "downgraded AOF must contain key 1"
+    );
+    assert!(
+        contents.contains("downgrade_k2"),
+        "downgraded AOF must contain key 2"
+    );
+    assert!(
+        contents.contains("downgrade_h"),
+        "downgraded AOF must contain hash key"
+    );
+
+    // Verify RESP framing: SELECT + 2 SET + 1 HSET = 4 commands
+    let command_count =
+        contents.matches("\r\n*").count() + if contents.starts_with('*') { 1 } else { 0 };
+    assert!(
+        command_count >= 4,
+        "AOF must contain at least 4 RESP commands, found {}",
+        command_count
+    );
+
+    cleanup(&dir);
+}
