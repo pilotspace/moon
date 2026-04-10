@@ -54,6 +54,7 @@ use crate::server::codec::RespCodec;
 /// into a batch, executes them under a single lock acquisition, then writes all
 /// responses outside the lock. This reduces lock acquisitions from N per pipeline
 /// to 1 per batch cycle.
+#[tracing::instrument(skip_all, level = "debug")]
 pub async fn handle_connection(
     stream: TcpStream,
     db: SharedDatabases,

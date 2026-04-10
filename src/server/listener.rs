@@ -176,6 +176,9 @@ pub async fn run_with_shutdown(
         ),
     ));
 
+    // Register repl_state globally for INFO command queries.
+    crate::admin::metrics_setup::set_global_repl_state(repl_state.clone());
+
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
     let acl_table: Arc<RwLock<crate::acl::AclTable>> = {
         let table = crate::acl::AclTable::load_or_default(&config);

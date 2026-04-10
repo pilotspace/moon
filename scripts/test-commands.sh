@@ -492,9 +492,8 @@ if should_run "sorted_set"; then
     # ZREVRANGEBYSCORE on clean key (ZPOPMIN/ZPOPMAX above mutated z:k1)
     rcli ZADD z:revtest 1 alpha 2 beta 3 gamma >/dev/null 2>&1; mcli ZADD z:revtest 1 alpha 2 beta 3 gamma >/dev/null 2>&1
     assert_match "ZRANGEBYSCORE 2"     ZRANGEBYSCORE z:revtest 1 3
-    # ZREVRANGEBYSCORE: known issue — moon returns empty for rev range queries
-    # TODO: investigate src/command/sorted_set.rs zrevrangebyscore implementation
     assert_match "ZREVRANGEBYSCORE"    ZREVRANGEBYSCORE z:revtest +inf -inf
+    assert_match "ZREVRANGEBYSCORE 2"  ZREVRANGEBYSCORE z:revtest 3 1
     assert_match "ZCOUNT"              ZCOUNT z:k1 2 5
     assert_match "ZINCRBY"             ZINCRBY z:k1 100 b
     assert_match "ZREM"                ZREM z:k1 e

@@ -79,6 +79,20 @@ jobs:
             exit 1
           fi
 
+  supply-chain:
+    name: Supply Chain Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny and cargo-audit
+        run: cargo install cargo-deny cargo-audit
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        run: cargo audit
+
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest

@@ -38,6 +38,7 @@ use crate::replication::state::{ReplicaInfo, ReplicationState};
 ///   2. Send backlog bytes from client_offset to current offset for each shard
 ///   3. Register replica with all shards for live streaming
 #[cfg(feature = "runtime-tokio")]
+#[tracing::instrument(skip_all, level = "debug", fields(repl_id = %client_repl_id, offset = client_offset))]
 pub async fn handle_psync_on_master(
     client_repl_id: &str,
     client_offset: i64,
@@ -194,6 +195,7 @@ pub async fn handle_psync_on_master(
 /// Same logic as the tokio variant but uses monoio ownership I/O for all TCP writes.
 /// Takes a mutable reference to `monoio::net::TcpStream` instead of `OwnedWriteHalf`.
 #[cfg(feature = "runtime-monoio")]
+#[tracing::instrument(skip_all, level = "debug", fields(repl_id = %client_repl_id, offset = client_offset))]
 pub async fn handle_psync_on_master(
     client_repl_id: &str,
     client_offset: i64,

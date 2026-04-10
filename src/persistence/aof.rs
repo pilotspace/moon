@@ -1052,6 +1052,7 @@ fn reopen_aof_sync(aof_path: &Path) -> Result<std::fs::File, std::io::Error> {
 ///
 /// Delegates to `rewrite_aof_sync` — the actual I/O is synchronous (temp write + rename).
 #[cfg(feature = "runtime-tokio")]
+#[tracing::instrument(skip_all, level = "info")]
 pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
     rewrite_aof_sync(&db, aof_path)
 }

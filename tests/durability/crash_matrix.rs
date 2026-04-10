@@ -239,6 +239,130 @@ mod tests {
         assert!(result.is_ok(), "{}", result.unwrap_err());
     }
 
+    /// Crash during BGSAVE: write keys, trigger BGSAVE, SIGKILL mid-snapshot.
+    /// After restart, AOF should recover all committed data regardless of
+    /// whether the RDB snapshot completed.
+    #[test]
+    #[ignore]
+    fn crash_during_bgsave() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+        let addr = "127.0.0.1:16404";
+
+        let mut server = start_moon(&[
+            "--port",
+            "16404",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
+        ]);
+        thread::sleep(Duration::from_millis(500));
+
+        // Write keys
+        write_keys(addr, 500);
+
+        // Trigger BGSAVE then immediately kill
+        send_resp_command(addr, "BGSAVE");
+        thread::sleep(Duration::from_millis(50));
+
+        // SAFETY: valid PID, SIGKILL is always valid
+        let ret = unsafe { libc::kill(server.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0);
+        let _ = server.wait();
+
+        // Restart and verify
+        let mut server2 = start_moon(&[
+            "--port",
+            "16404",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
+        ]);
+        thread::sleep(Duration::from_secs(2));
+
+        let after = get_dbsize(addr);
+        let _ = send_resp_command(addr, "SHUTDOWN NOSAVE");
+        let _ = server2.kill();
+        let _ = server2.wait();
+
+        assert!(
+            after >= 500,
+            "crash_during_bgsave: RPO violation — {} of 500 keys survived",
+            after,
+        );
+    }
+
+    /// Crash during BGREWRITEAOF: write keys, trigger rewrite, SIGKILL mid-compaction.
+    /// After restart, original AOF should be intact for recovery.
+    #[test]
+    #[ignore]
+    fn crash_during_bgrewriteaof() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+        let addr = "127.0.0.1:16405";
+
+        let mut server = start_moon(&[
+            "--port",
+            "16405",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
+        ]);
+        thread::sleep(Duration::from_millis(500));
+
+        write_keys(addr, 500);
+
+        // Trigger BGREWRITEAOF then immediately kill
+        send_resp_command(addr, "BGREWRITEAOF");
+        thread::sleep(Duration::from_millis(50));
+
+        // SAFETY: valid PID, SIGKILL is always valid
+        let ret = unsafe { libc::kill(server.id() as i32, libc::SIGKILL) };
+        assert_eq!(ret, 0);
+        let _ = server.wait();
+
+        // Restart and verify
+        let mut server2 = start_moon(&[
+            "--port",
+            "16405",
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--dir",
+            dir_str,
+        ]);
+        thread::sleep(Duration::from_secs(2));
+
+        let after = get_dbsize(addr);
+        let _ = send_resp_command(addr, "SHUTDOWN NOSAVE");
+        let _ = server2.kill();
+        let _ = server2.wait();
+
+        assert!(
+            after >= 500,
+            "crash_during_bgrewriteaof: RPO violation — {} of 500 keys survived",
+            after,
+        );
+    }
+
     /// G14: SIGKILL during disk-offload spill.
     ///
     /// Triggers cold-tier spill with a very low threshold, then crashes.

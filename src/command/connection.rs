@@ -130,11 +130,29 @@ pub fn readyz() -> Frame {
     }
 }
 
+/// Format bytes as human-readable (e.g. "1.23M", "456.78K").
+fn format_memory_human(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2}G", b / GB)
+    } else if b >= MB {
+        format!("{:.2}M", b / MB)
+    } else if b >= KB {
+        format!("{:.2}K", b / KB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 /// INFO command handler.
 ///
-/// Returns a BulkString with minimal INFO sections.
+/// Returns a BulkString with server info sections matching Redis INFO format.
 pub fn info(db: &Database, _args: &[Frame]) -> Frame {
-    let mut sections = String::new();
+    use std::fmt::Write as _;
+    let mut sections = String::with_capacity(2048);
 
     sections.push_str("# Server\r\n");
     sections.push_str("redis_version:0.1.0\r\n");
@@ -142,9 +160,24 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     sections.push_str("# Clients\r\n");
+    let _ = write!(
+        sections,
+        "connected_clients:{}\r\n",
+        crate::admin::metrics_setup::connected_clients(),
+    );
     sections.push_str("\r\n");
 
     sections.push_str("# Memory\r\n");
+    let rss = crate::admin::metrics_setup::get_rss_bytes();
+    let _ = write!(
+        sections,
+        "used_memory:{rss}\r\n\
+         used_memory_human:{human}\r\n\
+         used_memory_rss:{rss}\r\n\
+         used_memory_peak:{rss}\r\n",
+        rss = rss,
+        human = format_memory_human(rss),
+    );
     sections.push_str("\r\n");
 
     sections.push_str("# Persistence\r\n");
@@ -196,7 +229,6 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     sections.push_str("# MoonStore\r\n");
-    use std::fmt::Write as _;
     let _ = write!(
         sections,
         "disk_offload_enabled:{}\r\n",
@@ -228,13 +260,15 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     sections.push_str("\r\n");
 
     // # Replication
-    // NOTE: placeholder — always reports master with 0 replicas.
-    // TODO: wire to actual ReplicationState when replication is implemented.
     sections.push_str("# Replication\r\n");
-    sections.push_str("role:master\r\n");
-    sections.push_str("connected_slaves:0\r\n");
-    sections.push_str("master_replid:0000000000000000000000000000000000000000\r\n");
-    sections.push_str("master_repl_offset:0\r\n");
+    let (role, slaves, offset, repl_id) = crate::admin::metrics_setup::get_replication_info();
+    let _ = write!(
+        sections,
+        "role:{role}\r\n\
+         connected_slaves:{slaves}\r\n\
+         master_replid:{repl_id}\r\n\
+         master_repl_offset:{offset}\r\n",
+    );
     sections.push_str("\r\n");
 
     sections.push_str("# Keyspace\r\n");

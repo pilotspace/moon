@@ -263,27 +263,15 @@ pub(super) fn zrange_by_score(
     limit_offset: Option<i64>,
     limit_count: Option<i64>,
 ) -> Frame {
-    let (min_bound, max_bound) = if rev {
-        // With REV, max comes first in args
-        let max_b = match parse_score_bound(min_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let min_b = match parse_score_bound(max_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        (min_b, max_b)
-    } else {
-        let min_b = match parse_score_bound(min_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let max_b = match parse_score_bound(max_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        (min_b, max_b)
+    // All callers pass (min, max) in semantic order regardless of rev.
+    // The rev flag only affects iteration direction (entries.reverse below).
+    let min_bound = match parse_score_bound(min_arg) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let max_bound = match parse_score_bound(max_arg) {
+        Ok(b) => b,
+        Err(e) => return e,
     };
 
     let _ = members; // not directly needed; scores has all data
@@ -344,26 +332,13 @@ pub(super) fn zrange_by_lex(
     limit_offset: Option<i64>,
     limit_count: Option<i64>,
 ) -> Frame {
-    let (min_bound, max_bound) = if rev {
-        let max_b = match parse_lex_bound(min_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let min_b = match parse_lex_bound(max_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        (min_b, max_b)
-    } else {
-        let min_b = match parse_lex_bound(min_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let max_b = match parse_lex_bound(max_arg) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        (min_b, max_b)
+    let min_bound = match parse_lex_bound(min_arg) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let max_bound = match parse_lex_bound(max_arg) {
+        Ok(b) => b,
+        Err(e) => return e,
     };
 
     let mut entries: Vec<&Bytes> = Vec::new();

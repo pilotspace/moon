@@ -469,3 +469,176 @@ fn overwrite_different_type() {
     let v: String = c.get("ow:key").unwrap();
     assert_eq!(v, "new-val");
 }
+
+// ── Streams ────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn xadd_and_xlen() {
+    let mut c = sync_conn();
+    let _: () = redis::cmd("DEL")
+        .arg("compat:stream1")
+        .query(&mut c)
+        .unwrap();
+    let id: String = redis::cmd("XADD")
+        .arg("compat:stream1")
+        .arg("*")
+        .arg("field1")
+        .arg("value1")
+        .query(&mut c)
+        .unwrap();
+    assert!(!id.is_empty(), "XADD should return an entry ID");
+    let len: i64 = redis::cmd("XLEN")
+        .arg("compat:stream1")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(len, 1);
+}
+
+#[test]
+#[ignore]
+fn xrange_basic() {
+    let mut c = sync_conn();
+    let _: () = redis::cmd("DEL")
+        .arg("compat:stream2")
+        .query(&mut c)
+        .unwrap();
+    for i in 0..3 {
+        let _: String = redis::cmd("XADD")
+            .arg("compat:stream2")
+            .arg("*")
+            .arg("i")
+            .arg(i.to_string())
+            .query(&mut c)
+            .unwrap();
+    }
+    let entries: Vec<redis::Value> = redis::cmd("XRANGE")
+        .arg("compat:stream2")
+        .arg("-")
+        .arg("+")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+}
+
+#[test]
+#[ignore]
+fn xtrim_maxlen() {
+    let mut c = sync_conn();
+    let _: () = redis::cmd("DEL")
+        .arg("compat:stream3")
+        .query(&mut c)
+        .unwrap();
+    for i in 0..10 {
+        let _: String = redis::cmd("XADD")
+            .arg("compat:stream3")
+            .arg("*")
+            .arg("i")
+            .arg(i.to_string())
+            .query(&mut c)
+            .unwrap();
+    }
+    let trimmed: i64 = redis::cmd("XTRIM")
+        .arg("compat:stream3")
+        .arg("MAXLEN")
+        .arg("5")
+        .query(&mut c)
+        .unwrap();
+    assert!(trimmed >= 5, "XTRIM should remove at least 5 entries");
+    let len: i64 = redis::cmd("XLEN")
+        .arg("compat:stream3")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(len, 5);
+}
+
+// ── Lua scripting ──────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn eval_return_string() {
+    let mut c = sync_conn();
+    let result: String = redis::cmd("EVAL")
+        .arg("return 'hello'")
+        .arg(0)
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(result, "hello");
+}
+
+#[test]
+#[ignore]
+fn eval_keys_and_argv() {
+    let mut c = sync_conn();
+    let _: () = c.set("compat:lua1", "world").unwrap();
+    let result: String = redis::cmd("EVAL")
+        .arg("return redis.call('GET', KEYS[1])")
+        .arg(1)
+        .arg("compat:lua1")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(result, "world");
+}
+
+#[test]
+#[ignore]
+fn evalsha_after_script_load() {
+    let mut c = sync_conn();
+    let sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg("return 42")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(sha.len(), 40, "SHA1 should be 40 hex chars");
+    let result: i64 = redis::cmd("EVALSHA")
+        .arg(&sha)
+        .arg(0)
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(result, 42);
+}
+
+#[test]
+#[ignore]
+fn script_exists_and_flush() {
+    let mut c = sync_conn();
+    let sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg("return 1")
+        .query(&mut c)
+        .unwrap();
+    let exists: Vec<bool> = redis::cmd("SCRIPT")
+        .arg("EXISTS")
+        .arg(&sha)
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(exists, vec![true]);
+    let _: () = redis::cmd("SCRIPT").arg("FLUSH").query(&mut c).unwrap();
+    let exists2: Vec<bool> = redis::cmd("SCRIPT")
+        .arg("EXISTS")
+        .arg(&sha)
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(exists2, vec![false]);
+}
+
+// ── ACL ────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn acl_whoami() {
+    let mut c = sync_conn();
+    let user: String = redis::cmd("ACL").arg("WHOAMI").query(&mut c).unwrap();
+    assert_eq!(user, "default");
+}
+
+#[test]
+#[ignore]
+fn acl_list_contains_default() {
+    let mut c = sync_conn();
+    let users: Vec<String> = redis::cmd("ACL").arg("LIST").query(&mut c).unwrap();
+    assert!(
+        users.iter().any(|u| u.contains("default")),
+        "ACL LIST should contain 'default' user"
+    );
+}
