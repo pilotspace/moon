@@ -34,6 +34,20 @@ jobs:
             binary: moon-linux-aarch64-tokio
             cross: true
 
+          - name: linux-musl-tokio
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            features: runtime-tokio,jemalloc
+            binary: moon-linux-musl-tokio
+            musl: true
+
+          - name: linux-aarch64-musl-tokio
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            features: runtime-tokio,jemalloc
+            binary: moon-linux-aarch64-musl-tokio
+            cross: true
+
           - name: macos-tokio
             os: macos-latest
             target: aarch64-apple-darwin
@@ -49,18 +63,27 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross (aarch64)
+      - name: Install cross (aarch64/musl-cross)
         if: matrix.cross
         run: cargo install cross --locked
 
+      - name: Install musl-tools (x86_64 musl)
+        if: matrix.musl
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
       - name: Build
+        env:
+          CROSS: ${{ matrix.cross }}
+          FEATURES: ${{ matrix.features }}
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --no-default-features --features ${{ matrix.features }} --target ${{ matrix.target }}
+          if [ "$CROSS" = "true" ]; then
+            cross build --release --no-default-features --features "$FEATURES" --target "$TARGET"
           else
-            cargo build --release --no-default-features --features ${{ matrix.features }} --target ${{ matrix.target }}
+            cargo build --release --no-default-features --features "$FEATURES" --target "$TARGET"
           fi
-          cp target/${{ matrix.target }}/release/moon ${{ matrix.binary }}
+          cp "target/$TARGET/release/moon" "$BINARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -102,7 +125,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum moon-linux-tokio moon-linux-monoio moon-linux-aarch64-tokio moon-macos-tokio moon-sbom.json moon-sbom-tokio.json moon-sbom-monoio.json > SHA256SUMS.txt
+          sha256sum moon-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Install cosign
@@ -124,15 +147,10 @@ jobs:
           gh release create "$TAG" \
             --title "moon $TAG" \
             --generate-notes \
-            artifacts/moon-linux-tokio \
-            artifacts/moon-linux-monoio \
-            artifacts/moon-linux-aarch64-tokio \
-            artifacts/moon-macos-tokio \
-            artifacts/moon-sbom.json \
-            artifacts/moon-sbom-tokio.json \
-            artifacts/moon-sbom-monoio.json \
-            artifacts/SHA256SUMS.txt \
-            artifacts/moon-*.sig
+            artifacts/moon-linux-* \
+            artifacts/moon-macos-* \
+            artifacts/moon-sbom*.json \
+            artifacts/SHA256SUMS.txt
 
   docker:
     name: Docker Image
@@ -179,3 +197,67 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
+
+  package:
+    name: Build Packages (deb/rpm)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            binary: moon-linux-tokio
+            nfpm_arch: amd64
+          - arch: arm64
+            binary: moon-linux-aarch64-tokio
+            nfpm_arch: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.binary }}
+          path: target/release/
+
+      - name: Prepare binary
+        run: |
+          mv "target/release/${{ matrix.binary }}" target/release/moon
+          chmod +x target/release/moon
+
+      - name: Install nfpm
+        run: |
+          curl -sfL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_linux_amd64.tar.gz | tar xz -C /usr/local/bin nfpm
+
+      - name: Build deb
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.nfpm_arch }}
+        run: |
+          export VERSION="${VERSION#v}"
+          cd packaging
+          nfpm package --packager deb --target "../moon_${VERSION}_${ARCH}.deb"
+
+      - name: Build rpm
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.nfpm_arch }}
+        run: |
+          export VERSION="${VERSION#v}"
+          cd packaging
+          nfpm package --packager rpm --target "../moon-${VERSION}-1.${ARCH}.rpm"
+
+      - name: Upload packages to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.nfpm_arch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${VERSION#v}"
+          gh release upload "$TAG" \
+            "moon_${VER}_${ARCH}.deb" \
+            "moon-${VER}-1.${ARCH}.rpm" \
+            --clobber

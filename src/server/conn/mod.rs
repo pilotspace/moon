@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod blocking;
+pub mod core;
 #[cfg(feature = "runtime-monoio")]
 pub mod handler_monoio;
 #[cfg(feature = "runtime-tokio")]

@@ -1,0 +1,63 @@
+# nfpm configuration for building .deb and .rpm packages.
+# Usage: nfpm package --packager deb --target .
+#        nfpm package --packager rpm --target .
+# See: https://nfpm.goreleaser.com/
+
+name: moon
+arch: "${ARCH}"
+version: "${VERSION}"
+release: 1
+section: database
+priority: optional
+maintainer: "Moon Contributors"
+description: |
+  High-performance Redis-compatible server written in Rust.
+  Supports RESP2/RESP3 protocol, persistence (RDB + WAL),
+  replication, Lua scripting, vector search (FT.*), and pub/sub.
+vendor: Moon
+homepage: https://github.com/tindang/moon
+license: MIT
+
+contents:
+  - src: ../target/release/moon
+    dst: /usr/bin/moon
+    file_info:
+      mode: 0755
+
+  - src: moon.service
+    dst: /usr/lib/systemd/system/moon.service
+    file_info:
+      mode: 0644
+
+  - dst: /etc/moon
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /var/lib/moon
+    type: dir
+    file_info:
+      mode: 0750
+      owner: moon
+      group: moon
+
+  - dst: /var/log/moon
+    type: dir
+    file_info:
+      mode: 0750
+      owner: moon
+      group: moon
+
+scripts:
+  postinstall: scripts/postinstall.sh
+  preremove: scripts/preremove.sh
+
+overrides:
+  deb:
+    depends:
+      - libc6
+    recommends:
+      - redis-tools
+  rpm:
+    depends:
+      - glibc

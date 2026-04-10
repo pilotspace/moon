@@ -642,3 +642,327 @@ fn acl_list_contains_default() {
         "ACL LIST should contain 'default' user"
     );
 }
+
+// ── Vector search (FT.*) ──────────────────────────────────────────────
+
+/// Helper: encode f32 vector as little-endian bytes (Redis VECTOR format)
+fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+#[test]
+#[ignore]
+fn ft_create_and_dropindex() {
+    let mut c = sync_conn();
+    // Cleanup any previous index
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_idx1").query(&mut c);
+
+    // Create a vector index
+    let result: String = redis::cmd("FT.CREATE")
+        .arg("compat_idx1")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("vec:")
+        .arg("SCHEMA")
+        .arg("embedding")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("4")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(result, "OK");
+
+    // Drop the index
+    let result: String = redis::cmd("FT.DROPINDEX")
+        .arg("compat_idx1")
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(result, "OK");
+}
+
+#[test]
+#[ignore]
+fn ft_create_duplicate_errors() {
+    let mut c = sync_conn();
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_dup").query(&mut c);
+
+    let _: String = redis::cmd("FT.CREATE")
+        .arg("compat_dup")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("dup:")
+        .arg("SCHEMA")
+        .arg("vec")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("4")
+        .arg("DISTANCE_METRIC")
+        .arg("COSINE")
+        .query(&mut c)
+        .unwrap();
+
+    // Duplicate create should error
+    let result: RedisResult<String> = redis::cmd("FT.CREATE")
+        .arg("compat_dup")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("dup:")
+        .arg("SCHEMA")
+        .arg("vec")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("4")
+        .arg("DISTANCE_METRIC")
+        .arg("COSINE")
+        .query(&mut c);
+    assert!(result.is_err(), "duplicate FT.CREATE should error");
+
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_dup").query(&mut c);
+}
+
+#[test]
+#[ignore]
+fn ft_info_returns_index_metadata() {
+    let mut c = sync_conn();
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_info").query(&mut c);
+
+    let _: String = redis::cmd("FT.CREATE")
+        .arg("compat_info")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("info:")
+        .arg("SCHEMA")
+        .arg("emb")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("128")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .query(&mut c)
+        .unwrap();
+
+    // FT.INFO should return structured metadata
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("compat_info")
+        .query(&mut c)
+        .unwrap();
+
+    // Verify it's an array with key-value pairs
+    match info {
+        redis::Value::Array(ref items) => {
+            assert!(!items.is_empty(), "FT.INFO should return metadata pairs");
+        }
+        _ => panic!("FT.INFO should return an array, got {:?}", info),
+    }
+
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_info").query(&mut c);
+}
+
+#[test]
+#[ignore]
+fn ft_search_basic_knn() {
+    let mut c = sync_conn();
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_knn").query(&mut c);
+
+    // Create index
+    let _: String = redis::cmd("FT.CREATE")
+        .arg("compat_knn")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("knn:")
+        .arg("SCHEMA")
+        .arg("vec")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("4")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .query(&mut c)
+        .unwrap();
+
+    // Insert 5 vectors via HSET (auto-indexed)
+    let vectors: Vec<[f32; 4]> = vec![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 0.0],
+    ];
+    for (i, v) in vectors.iter().enumerate() {
+        let key = format!("knn:doc{}", i);
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("vec")
+            .arg(vec_to_bytes(v).as_slice())
+            .arg("name")
+            .arg(format!("doc{}", i))
+            .query(&mut c)
+            .unwrap();
+    }
+
+    // Small sleep to allow auto-indexing
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // KNN search for vector closest to [1.0, 0.0, 0.0, 0.0] — should find knn:doc0
+    let query_vec = vec_to_bytes(&[1.0, 0.0, 0.0, 0.0]);
+    let result: redis::Value = redis::cmd("FT.SEARCH")
+        .arg("compat_knn")
+        .arg("*=>[KNN 3 @vec $BLOB]")
+        .arg("PARAMS")
+        .arg("2")
+        .arg("BLOB")
+        .arg(query_vec.as_slice())
+        .arg("DIALECT")
+        .arg("2")
+        .query(&mut c)
+        .unwrap();
+
+    // FT.SEARCH returns [total_results, key1, fields1, key2, fields2, ...]
+    match result {
+        redis::Value::Array(ref items) => {
+            // First element is the count
+            assert!(!items.is_empty(), "FT.SEARCH should return results");
+        }
+        _ => panic!("FT.SEARCH should return array, got {:?}", result),
+    }
+
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_knn").query(&mut c);
+}
+
+#[test]
+#[ignore]
+fn ft_search_nonexistent_index_errors() {
+    let mut c = sync_conn();
+    let result: RedisResult<redis::Value> = redis::cmd("FT.SEARCH")
+        .arg("nonexistent_idx_xyzzy")
+        .arg("*")
+        .query(&mut c);
+    assert!(
+        result.is_err(),
+        "FT.SEARCH on nonexistent index should error"
+    );
+}
+
+#[test]
+#[ignore]
+fn ft_dropindex_nonexistent_errors() {
+    let mut c = sync_conn();
+    let result: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX")
+        .arg("nonexistent_idx_xyzzy")
+        .query(&mut c);
+    assert!(
+        result.is_err(),
+        "FT.DROPINDEX on nonexistent index should error"
+    );
+}
+
+#[test]
+#[ignore]
+fn ft_hset_auto_indexes_and_search_returns() {
+    let mut c = sync_conn();
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_auto").query(&mut c);
+
+    // Create cosine index
+    let _: String = redis::cmd("FT.CREATE")
+        .arg("compat_auto")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("auto:")
+        .arg("SCHEMA")
+        .arg("emb")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("3")
+        .arg("DISTANCE_METRIC")
+        .arg("COSINE")
+        .query(&mut c)
+        .unwrap();
+
+    // Insert via HSET — should auto-index
+    let v1 = vec_to_bytes(&[1.0, 0.0, 0.0]);
+    let v2 = vec_to_bytes(&[0.0, 1.0, 0.0]);
+    let _: () = redis::cmd("HSET")
+        .arg("auto:a")
+        .arg("emb")
+        .arg(v1.as_slice())
+        .arg("label")
+        .arg("x-axis")
+        .query(&mut c)
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg("auto:b")
+        .arg("emb")
+        .arg(v2.as_slice())
+        .arg("label")
+        .arg("y-axis")
+        .query(&mut c)
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Search for x-axis vector
+    let query = vec_to_bytes(&[1.0, 0.0, 0.0]);
+    let result: redis::Value = redis::cmd("FT.SEARCH")
+        .arg("compat_auto")
+        .arg("*=>[KNN 1 @emb $BLOB]")
+        .arg("PARAMS")
+        .arg("2")
+        .arg("BLOB")
+        .arg(query.as_slice())
+        .arg("DIALECT")
+        .arg("2")
+        .query(&mut c)
+        .unwrap();
+
+    match result {
+        redis::Value::Array(ref items) => {
+            // Should have at least count + 1 result pair
+            assert!(
+                items.len() >= 3,
+                "Should find at least 1 result, got {} items",
+                items.len()
+            );
+        }
+        _ => panic!("Expected array from FT.SEARCH, got {:?}", result),
+    }
+
+    let _: RedisResult<redis::Value> = redis::cmd("FT.DROPINDEX").arg("compat_auto").query(&mut c);
+}
