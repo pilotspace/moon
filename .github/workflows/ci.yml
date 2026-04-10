@@ -113,6 +113,20 @@ jobs:
         env:
           MOON_NO_URING: "1"
 
+  loom:
+    name: Loom Model Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom exhaustive exploration
+        run: cargo test --no-default-features --features runtime-tokio,jemalloc --test loom_response_slot
+        timeout-minutes: 5
+        env:
+          MOON_NO_URING: "1"
+          RUSTFLAGS: "--cfg loom"
+
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
