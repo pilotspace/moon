@@ -6,9 +6,11 @@ pub mod compaction;
 pub mod csr;
 pub mod memgraph;
 pub mod segment;
+pub mod store;
 pub mod types;
 
 pub use csr::CsrSegment;
 pub use memgraph::MemGraph;
 pub use segment::GraphSegmentHolder;
+pub use store::GraphStore;
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};
