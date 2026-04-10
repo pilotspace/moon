@@ -1,0 +1,41 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  MOON_NO_URING: "1"
+
+jobs:
+  durability:
+    name: Durability Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (release)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+      - name: Run crash matrix tests
+        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test durability
+        timeout-minutes: 10
+      - name: Run jepsen-lite tests
+        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test jepsen_lite
+        timeout-minutes: 10
+
+  replication:
+    name: Replication Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon (release)
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+      - name: Run replication hardening tests
+        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test replication_hardening
+        timeout-minutes: 10
