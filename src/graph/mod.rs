@@ -4,6 +4,7 @@
 
 pub mod compaction;
 pub mod csr;
+pub mod index;
 pub mod memgraph;
 pub mod replay;
 pub mod scoring;
@@ -21,4 +22,5 @@ pub use scoring::{CompositeScorer, DistanceScorer, TemporalDecayScorer, Weighted
 pub use segment::GraphSegmentHolder;
 pub use store::GraphStore;
 pub use traversal::{BoundedBfs, BoundedDfs, DijkstraTraversal, SegmentMergeReader};
+pub use index::{EdgeTypeIndex, LabelIndex, MphNodeIndex, PropertyIndex};
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};
