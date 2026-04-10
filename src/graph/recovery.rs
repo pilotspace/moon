@@ -190,10 +190,7 @@ pub fn save_graph_store(
             let seg_path = graph_data_dir.join(&seg_filename);
             if !seg_path.exists() {
                 seg.write_to_file(&seg_path).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to write CSR segment: {e:?}"),
-                    )
+                    io::Error::other(format!("failed to write CSR segment: {e:?}"))
                 })?;
             }
         }

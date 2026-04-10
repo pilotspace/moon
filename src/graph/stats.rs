@@ -249,7 +249,7 @@ impl GraphStats {
     /// Check if it is time to recompute percentiles.
     fn maybe_recompute(&mut self) {
         self.mutation_count += 1;
-        if self.mutation_count % RECOMPUTE_INTERVAL == 0 {
+        if self.mutation_count.is_multiple_of(RECOMPUTE_INTERVAL) {
             self.degree_stats
                 .recompute_percentiles(self.total_nodes, self.total_edges);
         }
