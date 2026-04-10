@@ -686,6 +686,9 @@ mod tests {
             requirepass: None,
             protected_mode: "yes".to_string(),
             acllog_max_len: 128,
+            client_pause_deadline_ms: 0,
+            client_pause_write_only: false,
+            lazyfree_threshold: 64,
         }
     }
 

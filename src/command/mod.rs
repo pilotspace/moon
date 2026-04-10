@@ -440,6 +440,27 @@ fn dispatch_inner(
                 return resp(list::lpushx(db, args));
             }
         }
+        (6, b'm') => {
+            // MEMORY
+            if cmd.eq_ignore_ascii_case(b"MEMORY") {
+                if let Some(sub) = args.first() {
+                    if let Some(sub_bytes) = crate::command::helpers::extract_bytes(sub) {
+                        if sub_bytes.eq_ignore_ascii_case(b"USAGE") {
+                            return resp(key::memory_usage(db, &args[1..]));
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"DOCTOR") {
+                            return resp(key::memory_doctor());
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"HELP") {
+                            return resp(key::memory_help());
+                        }
+                    }
+                }
+                return resp(Frame::Error(Bytes::from_static(
+                    b"ERR unknown subcommand. Try MEMORY USAGE, MEMORY DOCTOR, MEMORY HELP.",
+                )));
+            }
+        }
         (6, b'o') => {
             // OBJECT
             if cmd.eq_ignore_ascii_case(b"OBJECT") {

@@ -681,6 +681,34 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // === CLIENT PAUSE check ===
+                    // Extract pause info with short lock hold, then sleep outside lock scope
+                    let pause_wait_ms = {
+                        let rt = ctx.runtime_config.read();
+                        let deadline = rt.client_pause_deadline_ms;
+                        if deadline > 0 {
+                            let now = crate::storage::entry::current_time_ms();
+                            if now < deadline {
+                                let should_pause = if rt.client_pause_write_only {
+                                    crate::command::metadata::is_write(cmd)
+                                } else {
+                                    true
+                                };
+                                if should_pause { deadline.saturating_sub(now) } else { 0 }
+                            } else { 0 }
+                        } else { 0 }
+                    };
+                    if pause_wait_ms > 0 {
+                        #[cfg(feature = "runtime-tokio")]
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(pause_wait_ms)).await;
+                        }
+                        #[cfg(feature = "runtime-monoio")]
+                        {
+                            monoio::time::sleep(std::time::Duration::from_millis(pause_wait_ms)).await;
+                        }
+                    }
+
                     // === ACL permission check ===
                     // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
                     // so that low-privilege users cannot reach admin commands.
@@ -904,6 +932,73 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         }
                                         Err(err_frame) => { responses.push(err_frame); continue; }
                                     }
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
+                                    // CLIENT PAUSE timeout [WRITE|ALL]
+                                    if cmd_args.len() < 2 {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                                        )));
+                                    } else {
+                                        let timeout_ms = match extract_bytes(&cmd_args[1]) {
+                                            Some(b) => std::str::from_utf8(&b).ok().and_then(|s| s.parse::<u64>().ok()),
+                                            None => None,
+                                        };
+                                        match timeout_ms {
+                                            Some(ms) => {
+                                                let write_only = cmd_args.get(2)
+                                                    .and_then(|f| extract_bytes(f))
+                                                    .is_some_and(|b| b.eq_ignore_ascii_case(b"WRITE"));
+                                                let deadline = crate::storage::entry::current_time_ms() + ms;
+                                                let mut rt = ctx.runtime_config.write();
+                                                rt.client_pause_deadline_ms = deadline;
+                                                rt.client_pause_write_only = write_only;
+                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                            }
+                                            None => {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR timeout is not a valid integer or out of range",
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                                    let mut rt = ctx.runtime_config.write();
+                                    rt.client_pause_deadline_ms = 0;
+                                    rt.client_pause_write_only = false;
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"INFO") {
+                                    // CLIENT INFO — return info about current connection
+                                    let info = format!(
+                                        "id={} fd=-1 name={} db={}\r\n",
+                                        client_id,
+                                        conn.client_name.as_ref().map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default(),
+                                        conn.selected_db,
+                                    );
+                                    responses.push(Frame::BulkString(Bytes::from(info)));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"LIST") {
+                                    // CLIENT LIST — stub returning current client only
+                                    let info = format!(
+                                        "id={} fd=-1 name={} db={}\r\n",
+                                        client_id,
+                                        conn.client_name.as_ref().map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default(),
+                                        conn.selected_db,
+                                    );
+                                    responses.push(Frame::BulkString(Bytes::from(info)));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
+                                    || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
+                                {
+                                    // Accepted but no-op (per-connection flags)
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    continue;
                                 }
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "ERR unknown subcommand '{}'", String::from_utf8_lossy(&sub_bytes)

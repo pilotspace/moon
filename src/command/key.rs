@@ -562,6 +562,47 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// MEMORY USAGE key [SAMPLES count]
+///
+/// Returns the number of bytes a key and its value require to be stored.
+pub fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("MEMORY");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("MEMORY"),
+    };
+
+    match db.get(key) {
+        Some(entry) => {
+            let mem = key.len() + entry.value.estimate_memory() + 128; // same as entry_overhead
+            Frame::Integer(mem as i64)
+        }
+        None => Frame::Null,
+    }
+}
+
+/// MEMORY DOCTOR — report memory health issues.
+pub fn memory_doctor() -> Frame {
+    // Basic health report
+    Frame::BulkString(Bytes::from_static(
+        b"Sam, I have no memory problems",
+    ))
+}
+
+/// MEMORY HELP — list MEMORY subcommands.
+pub fn memory_help() -> Frame {
+    Frame::Array(
+        vec![
+            Frame::BulkString(Bytes::from_static(b"MEMORY DOCTOR - Return memory problems reports.")),
+            Frame::BulkString(Bytes::from_static(b"MEMORY HELP - Return this help message.")),
+            Frame::BulkString(Bytes::from_static(b"MEMORY USAGE <key> [SAMPLES <count>] - Return memory in bytes used by <key> and its value.")),
+        ]
+        .into(),
+    )
+}
+
 /// SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA] [STORE dest]
 ///
 /// Sort elements in a list, set, or sorted set.
