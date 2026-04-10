@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 
 use crate::graph::store::GraphStore;
 use crate::graph::types::{PropertyMap, PropertyValue};
+use crate::graph::wal;
 use crate::protocol::Frame;
 
 /// GRAPH.CREATE <name>
@@ -30,11 +31,13 @@ pub fn graph_create(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
     // Default edge threshold: 64K edges before freeze.
     let edge_threshold = 64_000;
-    // LSN 0 for now -- Phase 113 MVCC will provide real LSNs.
-    let lsn = 0;
+    let lsn = store.allocate_lsn();
 
     match store.create_graph(Bytes::copy_from_slice(name), edge_threshold, lsn) {
-        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        Ok(()) => {
+            store.wal_pending.push(wal::serialize_graph_create(name));
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
         Err(crate::graph::store::GraphStoreError::GraphAlreadyExists) => {
             Frame::Error(Bytes::from_static(b"ERR graph already exists"))
         }
@@ -64,10 +67,10 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid label")),
     };
 
-    let graph = match store.get_graph_mut(graph_name) {
-        Some(g) => g,
-        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
-    };
+    // Verify graph exists before parsing remaining args.
+    if store.get_graph(graph_name).is_none() {
+        return Frame::Error(Bytes::from_static(b"ERR graph not found"));
+    }
 
     // Hash label to u16 dictionary index.
     let label_id = label_to_id(label);
@@ -119,14 +122,32 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         }
     }
 
-    let lsn = 0; // Phase 113 MVCC provides real LSNs.
-    let node_key = graph.write_buf.add_node(labels.clone(), properties, embedding, lsn);
+    let lsn = store.allocate_lsn();
 
-    // Update graph stats incrementally.
-    graph.stats.on_node_insert(&labels);
+    // Scoped borrow of graph for mutation, then release for WAL push.
+    let external_id = {
+        let graph = match store.get_graph_mut(graph_name) {
+            Some(g) => g,
+            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+        };
 
-    // Return the raw slotmap key as a u64 integer.
-    let external_id = node_key.data().as_ffi();
+        let node_key = graph.write_buf.add_node(labels.clone(), properties.clone(), embedding.clone(), lsn);
+
+        // Update graph stats incrementally.
+        graph.stats.on_node_insert(&labels);
+
+        node_key.data().as_ffi()
+    };
+
+    // Serialize WAL record for the node insertion.
+    store.wal_pending.push(wal::serialize_add_node(
+        graph_name,
+        external_id,
+        &labels,
+        &properties,
+        embedding.as_deref(),
+    ));
+
     Frame::Integer(external_id as i64)
 }
 
@@ -160,10 +181,10 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid edge type")),
     };
 
-    let graph = match store.get_graph_mut(graph_name) {
-        Some(g) => g,
-        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
-    };
+    // Verify graph exists before parsing remaining args.
+    if store.get_graph(graph_name).is_none() {
+        return Frame::Error(Bytes::from_static(b"ERR graph not found"));
+    }
 
     let edge_type_id = label_to_id(edge_type_str);
 
@@ -214,24 +235,45 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
         Some(properties)
     };
 
-    let lsn = 0;
+    let lsn = store.allocate_lsn();
 
-    // Capture old degrees for stats tracking before edge insertion.
-    let src_old_degree = graph
-        .write_buf
-        .get_node(src_key)
-        .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
-    let dst_old_degree = graph
-        .write_buf
-        .get_node(dst_key)
-        .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
+    // Scoped borrow of graph for mutation, then release for WAL push.
+    let edge_result = {
+        let graph = match store.get_graph_mut(graph_name) {
+            Some(g) => g,
+            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+        };
 
-    match graph.write_buf.add_edge(src_key, dst_key, edge_type_id, weight, props, lsn) {
-        Ok(edge_key) => {
-            // Update graph stats incrementally.
-            graph.stats.on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
+        // Capture old degrees for stats tracking before edge insertion.
+        let src_old_degree = graph
+            .write_buf
+            .get_node(src_key)
+            .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
+        let dst_old_degree = graph
+            .write_buf
+            .get_node(dst_key)
+            .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
 
-            let external_id = edge_key.data().as_ffi();
+        match graph.write_buf.add_edge(src_key, dst_key, edge_type_id, weight, props.clone(), lsn) {
+            Ok(edge_key) => {
+                graph.stats.on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
+                Ok(edge_key.data().as_ffi())
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    match edge_result {
+        Ok(external_id) => {
+            store.wal_pending.push(wal::serialize_add_edge(
+                graph_name,
+                external_id,
+                src_id,
+                dst_id,
+                edge_type_id,
+                weight,
+                props.as_ref(),
+            ));
             Frame::Integer(external_id as i64)
         }
         Err(crate::graph::memgraph::GraphError::NodeNotFound) => {
@@ -262,7 +304,10 @@ pub fn graph_delete(store: &mut GraphStore, args: &[Frame]) -> Frame {
     };
 
     match store.drop_graph(name) {
-        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        Ok(()) => {
+            store.wal_pending.push(wal::serialize_drop_graph(name));
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
         Err(crate::graph::store::GraphStoreError::GraphNotFound) => {
             Frame::Error(Bytes::from_static(b"ERR graph not found"))
         }

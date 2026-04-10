@@ -95,6 +95,40 @@ impl ShardDatabases {
         self.graph_stores[shard_id].lock()
     }
 
+    /// Recover graph stores from persistence for all shards.
+    ///
+    /// Called once after construction during server startup. Loads graph
+    /// metadata and CSR segments from the persistence directory.
+    #[cfg(feature = "graph")]
+    pub fn recover_graph_stores(&self, persistence_dir: &std::path::Path) {
+        for shard_id in 0..self.num_shards {
+            match crate::graph::recovery::recover_graph_store(persistence_dir, shard_id) {
+                Ok(Some(result)) => {
+                    if result.store.graph_count() > 0 {
+                        tracing::info!(
+                            "Shard {}: recovered {} graph(s) ({} segments loaded, {} skipped)",
+                            shard_id,
+                            result.store.graph_count(),
+                            result.segments_loaded,
+                            result.segments_skipped,
+                        );
+                    }
+                    *self.graph_stores[shard_id].lock() = result.store;
+                }
+                Ok(None) => {
+                    // No graph metadata — clean start, nothing to recover.
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Shard {}: graph recovery failed: {}",
+                        shard_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     /// Acquire a shared read lock on a specific database.
     #[inline]
     pub fn read_db(&self, shard_id: usize, db_index: usize) -> RwLockReadGuard<'_, Database> {

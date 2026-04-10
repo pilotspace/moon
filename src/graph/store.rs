@@ -51,12 +51,33 @@ pub struct NamedGraph {
 /// ensuring zero allocation overhead when no graphs exist.
 pub struct GraphStore {
     graphs: Option<HashMap<Bytes, NamedGraph>>,
+    /// Monotonic LSN counter for MVCC versioning of graph mutations.
+    next_lsn: u64,
+    /// Pending WAL records produced by write handlers. Connection handlers
+    /// drain this after dispatch and send bytes via `shard_databases.wal_append()`.
+    pub(crate) wal_pending: Vec<Vec<u8>>,
 }
 
 impl GraphStore {
     /// Create an empty GraphStore with zero allocation.
     pub fn new() -> Self {
-        Self { graphs: None }
+        Self {
+            graphs: None,
+            next_lsn: 0,
+            wal_pending: Vec::new(),
+        }
+    }
+
+    /// Allocate the next monotonic LSN for a graph mutation.
+    pub fn allocate_lsn(&mut self) -> u64 {
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+        lsn
+    }
+
+    /// Drain all pending WAL records, returning them and leaving the vec empty.
+    pub fn drain_wal(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.wal_pending)
     }
 
     /// Create a new named graph. Lazily initializes the HashMap on first call.
@@ -316,5 +337,23 @@ mod tests {
     fn test_load_metadata_missing_file() {
         let result = GraphStore::load_metadata(std::path::Path::new("/nonexistent/meta.json"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_allocate_lsn_monotonic() {
+        let mut store = GraphStore::new();
+        assert_eq!(store.allocate_lsn(), 0);
+        assert_eq!(store.allocate_lsn(), 1);
+        assert_eq!(store.allocate_lsn(), 2);
+    }
+
+    #[test]
+    fn test_drain_wal_returns_and_clears() {
+        let mut store = GraphStore::new();
+        store.wal_pending.push(vec![1, 2, 3]);
+        store.wal_pending.push(vec![4, 5, 6]);
+        let drained = store.drain_wal();
+        assert_eq!(drained.len(), 2);
+        assert!(store.wal_pending.is_empty());
     }
 }

@@ -19,8 +19,6 @@ use crate::persistence::replay::DispatchReplayEngine;
 use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
 use crate::vector::store::VectorStore;
-#[cfg(feature = "graph")]
-use crate::graph::store::GraphStore;
 
 /// A shard owns all per-core state. No Arc, no Mutex -- fully owned by its thread.
 ///
@@ -40,9 +38,6 @@ pub struct Shard {
     pub pubsub_registry: PubSubRegistry,
     /// Per-shard vector store -- no Arc, no Mutex, fully owned by shard thread.
     pub vector_store: VectorStore,
-    /// Per-shard graph store -- lazy init, zero memory when unused.
-    #[cfg(feature = "graph")]
-    pub graph_store: GraphStore,
 }
 
 impl Shard {
@@ -56,8 +51,6 @@ impl Shard {
             runtime_config: config,
             pubsub_registry: PubSubRegistry::new(),
             vector_store: VectorStore::new(),
-            #[cfg(feature = "graph")]
-            graph_store: GraphStore::new(),
         }
     }
 

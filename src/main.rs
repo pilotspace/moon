@@ -403,6 +403,12 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let shard_databases = ShardDatabases::new(all_dbs);
 
+    // Recover graph stores from persistence (CSR segments + metadata).
+    #[cfg(feature = "graph")]
+    if let Some(ref dir) = persistence_dir {
+        shard_databases.recover_graph_stores(std::path::Path::new(dir));
+    }
+
     // All shards recovered — mark server as ready for /readyz.
     moon::admin::metrics_setup::set_server_ready();
     if let Some(ref flag) = readiness_flag {
