@@ -3,6 +3,7 @@
 //! Feature-gated under `graph` so the default build is unaffected.
 
 pub mod compaction;
+pub mod cross_shard;
 pub mod cypher;
 pub mod csr;
 pub mod hybrid;
@@ -31,5 +32,9 @@ pub use hybrid::{
     VectorToGraphExpansion,
 };
 pub use index::{EdgeTypeIndex, LabelIndex, MphNodeIndex, PropertyIndex};
+pub use cross_shard::{
+    handle_graph_traverse, graph_has_hash_tag, parse_traverse_response,
+    TraversalShardResult, DEFAULT_CROSS_SHARD_DEPTH_LIMIT,
+};
 pub use stats::GraphStats;
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};
