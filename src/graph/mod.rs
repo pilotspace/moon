@@ -10,6 +10,7 @@ pub mod store;
 pub mod traversal_guard;
 pub mod types;
 pub mod visibility;
+pub mod wal;
 
 pub use csr::CsrSegment;
 pub use memgraph::MemGraph;
