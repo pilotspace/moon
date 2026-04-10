@@ -220,6 +220,20 @@ pub(crate) async fn handle_connection_sharded_inner<
         migrated_state,
     );
 
+    // Register in global client registry for CLIENT LIST/INFO/KILL.
+    // RegistryGuard ensures deregister on all exit paths (including early returns).
+    crate::client_registry::register(
+        client_id,
+        peer_addr.clone(),
+        conn.current_user.clone(),
+        ctx.shard_id,
+    );
+    struct RegistryGuard(u64);
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) { crate::client_registry::deregister(self.0); }
+    }
+    let _registry_guard = RegistryGuard(client_id);
+
     use crate::pubsub::{self, subscriber::Subscriber};
 
     // Functions API registry (per-shard, lazy init) — kept as local because Rc<RefCell<>> is !Send
@@ -244,6 +258,11 @@ pub(crate) async fn handle_connection_sharded_inner<
 
     let mut break_outer = false;
     loop {
+        // Check if CLIENT KILL targeted this connection
+        if crate::client_registry::is_killed(client_id) {
+            break;
+        }
+
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -904,6 +923,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         )));
                                     } else {
                                         conn.client_name = extract_bytes(&cmd_args[1]);
+                                        let name_str = conn.client_name.as_ref().map(|b| String::from_utf8_lossy(b).to_string());
+                                        crate::client_registry::update(client_id, |e| { e.name = name_str; });
                                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     }
                                     continue;
@@ -948,6 +969,61 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         }
                                         Err(err_frame) => { responses.push(err_frame); continue; }
                                     }
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"LIST") {
+                                    // Update our own entry before listing
+                                    crate::client_registry::update(client_id, |e| {
+                                        e.db = conn.selected_db;
+                                        e.last_cmd_at = std::time::Instant::now();
+                                        e.flags = crate::client_registry::ClientFlags {
+                                            subscriber: conn.subscription_count > 0,
+                                            in_multi: conn.in_multi,
+                                            blocked: false,
+                                        };
+                                    });
+                                    let list = crate::client_registry::client_list();
+                                    responses.push(Frame::BulkString(Bytes::from(list)));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"INFO") {
+                                    crate::client_registry::update(client_id, |e| {
+                                        e.db = conn.selected_db;
+                                        e.last_cmd_at = std::time::Instant::now();
+                                    });
+                                    let info = crate::client_registry::client_info(client_id)
+                                        .unwrap_or_default();
+                                    responses.push(Frame::BulkString(Bytes::from(info)));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"KILL") {
+                                    let raw_args: Vec<&[u8]> = cmd_args[1..].iter()
+                                        .filter_map(|f| match f {
+                                            Frame::BulkString(b) => Some(b.as_ref()),
+                                            Frame::SimpleString(b) => Some(b.as_ref()),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    match crate::client_registry::parse_kill_args(&raw_args) {
+                                        Some(filter) => {
+                                            let count = crate::client_registry::kill_clients(&filter);
+                                            responses.push(Frame::Integer(count as i64));
+                                        }
+                                        None => {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR syntax error. Usage: CLIENT KILL [ID id] [ADDR addr] [USER user]",
+                                            )));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"PAUSE") || sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                                    // Placeholder — will be implemented in P1.4
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT") || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH") {
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    continue;
                                 }
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "ERR unknown subcommand '{}'", String::from_utf8_lossy(&sub_bytes)
