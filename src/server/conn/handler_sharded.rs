@@ -233,7 +233,8 @@ pub(crate) async fn handle_connection_sharded_inner<
     loop {
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if conn.subscription_count > 0 {
-            #[allow(clippy::unwrap_used)] // conn.pubsub_rx is always Some when conn.subscription_count > 0
+            #[allow(clippy::unwrap_used)]
+            // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_mut().unwrap();
             tokio::select! {
                 n = stream.read_buf(&mut read_buf) => {
@@ -1619,13 +1620,33 @@ pub(crate) async fn handle_connection_sharded_inner<
 
     // Clean up pub/sub subscriptions on disconnect
     if conn.subscriber_id > 0 {
-        let removed_channels = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
-        let removed_patterns = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
+        let removed_channels = {
+            ctx.pubsub_registry
+                .write()
+                .unsubscribe_all(conn.subscriber_id)
+        };
+        let removed_patterns = {
+            ctx.pubsub_registry
+                .write()
+                .punsubscribe_all(conn.subscriber_id)
+        };
         for ch in removed_channels {
-            unpropagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
+            unpropagate_subscription(
+                &ctx.all_remote_sub_maps,
+                &ch,
+                ctx.shard_id,
+                ctx.num_shards,
+                false,
+            );
         }
         for pat in removed_patterns {
-            unpropagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
+            unpropagate_subscription(
+                &ctx.all_remote_sub_maps,
+                &pat,
+                ctx.shard_id,
+                ctx.num_shards,
+                true,
+            );
         }
         // Remove affinity on disconnect (no subscriptions remain)
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {

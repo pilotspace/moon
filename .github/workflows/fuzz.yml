@@ -58,6 +58,7 @@ jobs:
           - wal_v3_record
           - gossip_deser
           - acl_rule
+          - rdb_load
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly

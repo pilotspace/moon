@@ -14,9 +14,9 @@ pub mod util;
 
 // Re-export for internal use
 #[allow(unused_imports)]
-pub(crate) use affinity::{AffinityTracker, MigratedConnectionState};
-#[allow(unused_imports)]
 pub(crate) use self::core::{ConnectionContext, ConnectionState};
+#[allow(unused_imports)]
+pub(crate) use affinity::{AffinityTracker, MigratedConnectionState};
 pub(crate) use blocking::convert_blocking_to_nonblocking;
 #[cfg(feature = "runtime-tokio")]
 pub(crate) use blocking::handle_blocking_command;

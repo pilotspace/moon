@@ -142,9 +142,30 @@ pub(crate) fn spawn_tokio_connection(
 
     // Construct ConnectionContext from cloned shared state
     let conn_ctx = crate::server::conn::ConnectionContext::new(
-        sdbs, shard_id, num_shards, psr, blk, reqpass, aof, trk, rs, cs,
-        lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk,
-        rsm, all_regs, all_rsm, aff,
+        sdbs,
+        shard_id,
+        num_shards,
+        psr,
+        blk,
+        reqpass,
+        aof,
+        trk,
+        rs,
+        cs,
+        lua,
+        sc,
+        cp,
+        acl,
+        rtcfg,
+        scfg,
+        dtx,
+        notifiers,
+        snap_tx,
+        clk,
+        rsm,
+        all_regs,
+        all_rsm,
+        aff,
         None, // spill_sender (tokio handler doesn't use tiered storage)
         Rc::new(std::cell::Cell::new(0)), // spill_file_id placeholder
         None, // disk_offload_dir
@@ -181,10 +202,7 @@ pub(crate) fn spawn_tokio_connection(
     } else {
         // Plain TCP connection
         tokio::task::spawn_local(async move {
-            handle_connection_sharded(
-                tcp_stream, &conn_ctx, sd, cid,
-            )
-            .await;
+            handle_connection_sharded(tcp_stream, &conn_ctx, sd, cid).await;
         });
     }
 }
@@ -297,13 +315,33 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let migration_buf = take_migration_read_buf(&mut state);
 
             let conn_ctx = crate::server::conn::ConnectionContext::new(
-                sdbs, shard_id, num_shards, psr, blk,
+                sdbs,
+                shard_id,
+                num_shards,
+                psr,
+                blk,
                 None, // requirepass: None = pre-authenticated
-                aof, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx,
-                notifiers, snap_tx, clk, rsm, all_regs, all_rsm, aff,
-                None, // spill_sender
+                aof,
+                trk,
+                rs,
+                cs,
+                lua,
+                sc,
+                cp,
+                acl,
+                rtcfg,
+                scfg,
+                dtx,
+                notifiers,
+                snap_tx,
+                clk,
+                rsm,
+                all_regs,
+                all_rsm,
+                aff,
+                None,                             // spill_sender
                 Rc::new(std::cell::Cell::new(0)), // spill_file_id
-                None, // disk_offload_dir
+                None,                             // disk_offload_dir
             );
 
             // State restoration happens directly via migrated_state parameter —
@@ -417,10 +455,9 @@ pub(crate) fn spawn_monoio_connection(
             // Construct ConnectionContext from cloned shared state
             let reqpass = rtcfg.read().requirepass.clone();
             let conn_ctx = crate::server::conn::ConnectionContext::new(
-                sdbs, shard_id, num_shards, psr, blk, reqpass, aof, trk, rs, cs,
-                lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk,
-                rsm, all_regs, all_rsm, aff,
-                spill_tx, spill_fid, do_dir,
+                sdbs, shard_id, num_shards, psr, blk, reqpass, aof, trk, rs, cs, lua, sc, cp, acl,
+                rtcfg, scfg, dtx, notifiers, snap_tx, clk, rsm, all_regs, all_rsm, aff, spill_tx,
+                spill_fid, do_dir,
             );
 
             if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
@@ -636,9 +673,8 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let conn_ctx = crate::server::conn::ConnectionContext::new(
                 sdbs, shard_id, num_shards, psr, blk,
                 None, // requirepass: None = pre-authenticated
-                aof, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx,
-                notifiers, snap_tx, clk, rsm, all_regs, all_rsm, aff,
-                spill_tx, spill_fid, do_dir,
+                aof, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk, rsm,
+                all_regs, all_rsm, aff, spill_tx, spill_fid, do_dir,
             );
 
             monoio::spawn(async move {

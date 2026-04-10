@@ -84,7 +84,7 @@ pub async fn handle_connection(
         1,     // num_shards: single-shard mode
         false, // can_migrate: handler_single doesn't support migration
         runtime_config.read().acllog_max_len,
-        None,  // no migrated state
+        None, // no migrated state
     );
 
     // Per-connection arena for batch processing temporaries.
@@ -95,7 +95,8 @@ pub async fn handle_connection(
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
-            #[allow(clippy::unwrap_used)] // conn.pubsub_rx is always Some when conn.subscription_count > 0
+            #[allow(clippy::unwrap_used)]
+            // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_mut().unwrap();
             tokio::select! {
                 result = framed.next() => {

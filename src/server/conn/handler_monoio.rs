@@ -28,8 +28,8 @@ use super::affinity::MigratedConnectionState;
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
-    handle_config, is_multi_key_command, propagate_subscription,
-    try_inline_dispatch_loop, unpropagate_subscription,
+    handle_config, is_multi_key_command, propagate_subscription, try_inline_dispatch_loop,
+    unpropagate_subscription,
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
@@ -125,7 +125,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
     loop {
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
-            #[allow(clippy::unwrap_used)] // conn.pubsub_rx is always Some when conn.subscription_count > 0
+            #[allow(clippy::unwrap_used)]
+            // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
             let sub_tmp_buf = vec![0u8; 8192];
             monoio::select! {
@@ -1015,7 +1016,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                         #[allow(clippy::unwrap_used)]
                         // conn.pubsub_tx is set to Some just above before this loop
-                        let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                        let sub =
+                            Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
                         if is_pattern {
                             ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
                         } else {
@@ -1032,7 +1034,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // Register pub/sub affinity for this client IP
                         if conn.subscription_count == 1 {
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                ctx.pubsub_affinity.write().register(addr.ip(), ctx.shard_id);
+                                ctx.pubsub_affinity
+                                    .write()
+                                    .register(addr.ip(), ctx.shard_id);
                             }
                         }
                         let resp = if is_pattern {
@@ -1190,9 +1194,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                 // === ACL key pattern check (same lock guard) ===
                 let is_write_for_acl = metadata::is_write(cmd);
-                if let Some(deny_reason) =
-                    acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl)
-                {
+                if let Some(deny_reason) = acl_guard.check_key_permission(
+                    &conn.current_user,
+                    cmd,
+                    cmd_args,
+                    is_write_for_acl,
+                ) {
                     drop(acl_guard);
                     conn.acl_log.push(crate::acl::AclLogEntry {
                         reason: "command".to_string(),
@@ -1223,7 +1230,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 if cmd.eq_ignore_ascii_case(b"FCALL") {
                     let response = {
-                        let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                        let mut guard =
+                            ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                         let db_count = ctx.shard_databases.db_count();
                         crate::command::functions::handle_fcall(
                             &func_registry.borrow(),
@@ -1240,7 +1248,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
                     let response = {
-                        let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                        let mut guard =
+                            ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                         let db_count = ctx.shard_databases.db_count();
                         crate::command::functions::handle_fcall_ro(
                             &func_registry.borrow(),
@@ -1537,7 +1546,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // Migration is deferred until AFTER the current batch is fully processed.
             if let (Some(tracker), Some(target)) = (&mut conn.affinity_tracker, target_shard) {
                 if let Some(migrate_to) = tracker.record(target) {
-                    if !conn.in_multi && conn.subscription_count == 0 && !conn.tracking_state.enabled {
+                    if !conn.in_multi
+                        && conn.subscription_count == 0
+                        && !conn.tracking_state.enabled
+                    {
                         conn.migration_target = Some(migrate_to);
                     }
                 }
@@ -1562,7 +1574,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let evict_result = if let Some(ref sender) = ctx.spill_sender {
                         let mut fid = ctx.spill_file_id.get();
-                        let dir = ctx.disk_offload_dir
+                        let dir = ctx
+                            .disk_offload_dir
                             .as_deref()
                             .unwrap_or(std::path::Path::new("."));
                         let res = try_evict_if_needed_async_spill(
@@ -1587,7 +1600,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     drop(rt);
 
                     let dispatch_start = std::time::Instant::now();
-                    let result = dispatch(&mut guard, cmd, cmd_args, &mut conn.selected_db, db_count);
+                    let result =
+                        dispatch(&mut guard, cmd, cmd_args, &mut conn.selected_db, db_count);
                     let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -1597,7 +1611,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             elapsed_us,
                             args.as_slice(),
                             peer_addr.as_bytes(),
-                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                            conn.client_name
+                                .as_ref()
+                                .map_or(b"" as &[u8], |n| n.as_ref()),
                         );
                     }
 
@@ -1665,8 +1681,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // Track key on write / invalidate tracked keys
                     if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            let senders =
-                                ctx.tracking_table.borrow_mut().invalidate_key(&key, client_id);
+                            let senders = ctx
+                                .tracking_table
+                                .borrow_mut()
+                                .invalidate_key(&key, client_id);
                             if !senders.is_empty() {
                                 let push = crate::tracking::invalidation::invalidation_push(&[key]);
                                 for tx in senders {
@@ -1682,8 +1700,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                     let now_ms = ctx.cached_clock.ms();
                     let dispatch_start = std::time::Instant::now();
-                    let result =
-                        dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
+                    let result = dispatch_read(
+                        &guard,
+                        cmd,
+                        cmd_args,
+                        now_ms,
+                        &mut conn.selected_db,
+                        db_count,
+                    );
                     let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
@@ -1693,7 +1717,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             elapsed_us,
                             args.as_slice(),
                             peer_addr.as_bytes(),
-                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                            conn.client_name
+                                .as_ref()
+                                .map_or(b"" as &[u8], |n| n.as_ref()),
                         );
                     }
                     drop(guard);
@@ -1737,8 +1763,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 {
                     let guard = ctx.shard_databases.read_db(target, conn.selected_db);
                     let now_ms = ctx.cached_clock.ms();
-                    let result =
-                        dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
+                    let result = dispatch_read(
+                        &guard,
+                        cmd,
+                        cmd_args,
+                        now_ms,
+                        &mut conn.selected_db,
+                        db_count,
+                    );
                     drop(guard);
                     let response = match result {
                         DispatchResult::Response(f) => f,
@@ -2013,13 +2045,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if conn.subscriber_id > 0 {
-        let removed_channels = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
-        let removed_patterns = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
+        let removed_channels = {
+            ctx.pubsub_registry
+                .write()
+                .unsubscribe_all(conn.subscriber_id)
+        };
+        let removed_patterns = {
+            ctx.pubsub_registry
+                .write()
+                .punsubscribe_all(conn.subscriber_id)
+        };
         for ch in removed_channels {
-            unpropagate_subscription(&ctx.all_remote_sub_maps, &ch, ctx.shard_id, ctx.num_shards, false);
+            unpropagate_subscription(
+                &ctx.all_remote_sub_maps,
+                &ch,
+                ctx.shard_id,
+                ctx.num_shards,
+                false,
+            );
         }
         for pat in removed_patterns {
-            unpropagate_subscription(&ctx.all_remote_sub_maps, &pat, ctx.shard_id, ctx.num_shards, true);
+            unpropagate_subscription(
+                &ctx.all_remote_sub_maps,
+                &pat,
+                ctx.shard_id,
+                ctx.num_shards,
+                true,
+            );
         }
         // Remove affinity on disconnect (no subscriptions remain)
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
