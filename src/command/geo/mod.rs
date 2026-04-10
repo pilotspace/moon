@@ -157,6 +157,10 @@ mod tests {
         assert_eq!(s.len(), 11);
         // Should start with "9q8y" for SF area
         // The exact prefix depends on our 52-bit encoding; just verify length and base32 chars
-        assert!(s.chars().all(|c| "0123456789bcdefghjkmnpqrstuvwxyz".contains(c)), "invalid chars: {s}");
+        assert!(
+            s.chars()
+                .all(|c| "0123456789bcdefghjkmnpqrstuvwxyz".contains(c)),
+            "invalid chars: {s}"
+        );
     }
 }

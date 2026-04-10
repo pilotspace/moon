@@ -651,15 +651,16 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
             RedisValueRef::ListListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
             RedisValueRef::Set(s) => s.iter().cloned().collect(),
             RedisValueRef::SetListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
-            RedisValueRef::SetIntset(is) => {
-                is.iter().map(|v| Bytes::from(v.to_string())).collect()
-            }
+            RedisValueRef::SetIntset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
             RedisValueRef::SortedSet { members, .. } => members.keys().cloned().collect(),
             RedisValueRef::SortedSetBPTree { members, .. } => members.keys().cloned().collect(),
             RedisValueRef::SortedSetListpack(lp) => {
                 // Listpack stores member, score pairs
                 let entries: Vec<_> = lp.iter().collect();
-                entries.chunks(2).filter_map(|c| c.first().map(|e| e.to_bytes())).collect()
+                entries
+                    .chunks(2)
+                    .filter_map(|c| c.first().map(|e| e.to_bytes()))
+                    .collect()
             }
             _ => {
                 return Frame::Error(Bytes::from_static(
@@ -685,10 +686,7 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
                 .collect()
         }
     } else {
-        elements
-            .iter()
-            .map(|e| Some(e.clone()))
-            .collect()
+        elements.iter().map(|e| Some(e.clone())).collect()
     };
 
     // Create indexed pairs for stable sort
@@ -1877,10 +1875,7 @@ mod tests {
     fn test_sort_limit() {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"3", b"1", b"2", b"4"]);
-        let result = sort(
-            &mut db,
-            &[bs(b"mylist"), bs(b"LIMIT"), bs(b"1"), bs(b"2")],
-        );
+        let result = sort(&mut db, &[bs(b"mylist"), bs(b"LIMIT"), bs(b"1"), bs(b"2")]);
         assert_eq!(
             result,
             Frame::Array(framevec![
@@ -1894,10 +1889,7 @@ mod tests {
     fn test_sort_store() {
         let mut db = Database::new();
         setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
-        let result = sort(
-            &mut db,
-            &[bs(b"mylist"), bs(b"STORE"), bs(b"sorted")],
-        );
+        let result = sort(&mut db, &[bs(b"mylist"), bs(b"STORE"), bs(b"sorted")]);
         assert_eq!(result, Frame::Integer(3));
         assert!(db.exists(b"sorted"));
     }

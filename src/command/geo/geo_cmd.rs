@@ -384,7 +384,11 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                 None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
             };
             i += 1;
-            let unit_mult = match args.get(i).and_then(|f| extract_bytes(f)).and_then(|b| parse_unit(b)) {
+            let unit_mult = match args
+                .get(i)
+                .and_then(|f| extract_bytes(f))
+                .and_then(|b| parse_unit(b))
+            {
                 Some(v) => v,
                 None => {
                     return (
@@ -392,7 +396,7 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                         Frame::Error(Bytes::from_static(
                             b"ERR unsupported unit provided. please use M, KM, FT, MI",
                         )),
-                    )
+                    );
                 }
             };
             radius_m = Some(r * unit_mult);
@@ -408,7 +412,11 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                 None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
             };
             i += 1;
-            let unit_mult = match args.get(i).and_then(|f| extract_bytes(f)).and_then(|b| parse_unit(b)) {
+            let unit_mult = match args
+                .get(i)
+                .and_then(|f| extract_bytes(f))
+                .and_then(|b| parse_unit(b))
+            {
                 Some(v) => v,
                 None => {
                     return (
@@ -416,7 +424,7 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                         Frame::Error(Bytes::from_static(
                             b"ERR unsupported unit provided. please use M, KM, FT, MI",
                         )),
-                    )
+                    );
                 }
             };
             box_width_m = Some(w * unit_mult);
@@ -582,7 +590,10 @@ mod tests {
                 bs(b"Catania"),
             ],
         );
-        let result = geodist(&mut db, &[bs(b"mygeo"), bs(b"Palermo"), bs(b"Catania"), bs(b"km")]);
+        let result = geodist(
+            &mut db,
+            &[bs(b"mygeo"), bs(b"Palermo"), bs(b"Catania"), bs(b"km")],
+        );
         match result {
             Frame::BulkString(b) => {
                 let dist: f64 = std::str::from_utf8(&b).unwrap().parse().unwrap();
@@ -671,14 +682,26 @@ mod tests {
         // NX should not update existing
         let result = geoadd(
             &mut db,
-            &[bs(b"g"), bs(b"NX"), bs(b"11.0"), bs(b"21.0"), bs(b"member1")],
+            &[
+                bs(b"g"),
+                bs(b"NX"),
+                bs(b"11.0"),
+                bs(b"21.0"),
+                bs(b"member1"),
+            ],
         );
         assert_eq!(result, Frame::Integer(0));
 
         // NX should add new
         let result = geoadd(
             &mut db,
-            &[bs(b"g"), bs(b"NX"), bs(b"12.0"), bs(b"22.0"), bs(b"member2")],
+            &[
+                bs(b"g"),
+                bs(b"NX"),
+                bs(b"12.0"),
+                bs(b"22.0"),
+                bs(b"member2"),
+            ],
         );
         assert_eq!(result, Frame::Integer(1));
     }

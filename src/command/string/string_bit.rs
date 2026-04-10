@@ -887,10 +887,7 @@ mod tests {
     #[test]
     fn test_bitop_not_requires_one_key() {
         let mut db = make_db();
-        let result = bitop(
-            &mut db,
-            &[bs(b"NOT"), bs(b"dest"), bs(b"a"), bs(b"b")],
-        );
+        let result = bitop(&mut db, &[bs(b"NOT"), bs(b"dest"), bs(b"a"), bs(b"b")]);
         assert!(matches!(result, Frame::Error(_)));
     }
 
