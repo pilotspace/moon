@@ -84,6 +84,9 @@ runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "toki
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]
 simd-avx512 = []
+# OpenTelemetry exporter: reserves feature namespace for OTLP trace export.
+# When wired, will gate tracing-opentelemetry + opentelemetry-otlp dependencies.
+otel = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
