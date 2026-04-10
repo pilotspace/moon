@@ -11,7 +11,7 @@ use crate::graph::csr::CsrSegment;
 use crate::graph::memgraph::MemGraph;
 
 /// Snapshot of all graph segments at a point in time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphSegmentList {
     /// Active mutable segment (None after freeze, before new one is created).
     pub mutable: Option<Arc<MemGraph>>,

@@ -5,6 +5,7 @@
 pub mod compaction;
 pub mod csr;
 pub mod memgraph;
+pub mod replay;
 pub mod segment;
 pub mod store;
 pub mod traversal_guard;
