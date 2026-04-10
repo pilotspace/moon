@@ -168,27 +168,30 @@ fn bench_bfs_2hop(c: &mut Criterion) {
 
 fn bench_edge_insert(c: &mut Criterion) {
     c.bench_function("graph_edge_insert", |b| {
-        // Pre-create a MemGraph with 2 nodes, re-create per iteration batch.
         b.iter_custom(|iters| {
-            let mut g = MemGraph::new(iters as usize + 10);
-            // Create enough distinct nodes to avoid self-loop rejections.
-            let mut nodes = Vec::with_capacity(iters as usize + 1);
-            for _i in 0..=(iters as usize) {
-                nodes.push(g.add_node(smallvec![0], empty_props(), None, 1));
+            let batch = iters.min(500_000) as usize;
+            let rounds = (iters as usize + batch - 1) / batch;
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..rounds {
+                let mut g = MemGraph::new(batch + 10);
+                let mut nodes = Vec::with_capacity(batch + 2);
+                for _ in 0..=(batch + 1) {
+                    nodes.push(g.add_node(smallvec![0], empty_props(), None, 1));
+                }
+                let start = std::time::Instant::now();
+                for i in 0..batch {
+                    let _ = black_box(g.add_edge(
+                        nodes[i],
+                        nodes[i + 1],
+                        1,
+                        1.0,
+                        None,
+                        black_box(i as u64 + 2),
+                    ));
+                }
+                total += start.elapsed();
             }
-
-            let start = std::time::Instant::now();
-            for i in 0..iters as usize {
-                let _ = black_box(g.add_edge(
-                    nodes[i],
-                    nodes[i + 1],
-                    1,
-                    1.0,
-                    None,
-                    black_box(i as u64 + 2),
-                ));
-            }
-            start.elapsed()
+            total
         })
     });
 }
@@ -200,8 +203,9 @@ fn bench_edge_insert(c: &mut Criterion) {
 fn bench_csr_freeze(c: &mut Criterion) {
     c.bench_function("graph_csr_freeze_64k", |b| {
         b.iter_custom(|iters| {
+            let rounds = iters.min(200) as usize;
             let mut total = std::time::Duration::ZERO;
-            for _ in 0..iters {
+            for _ in 0..rounds {
                 // Build a MemGraph with ~64K edges.
                 let (mut g, _nodes) = build_memgraph(2000, 32);
                 let start = std::time::Instant::now();
@@ -210,7 +214,8 @@ fn bench_csr_freeze(c: &mut Criterion) {
                 black_box(&csr);
                 total += start.elapsed();
             }
-            total
+            // Scale to requested iters to keep Criterion happy.
+            total * (iters as u32) / (rounds as u32)
         })
     });
 }
@@ -221,37 +226,57 @@ fn bench_csr_freeze(c: &mut Criterion) {
 
 fn bench_addnode_command(c: &mut Criterion) {
     c.bench_function("graph_addnode_command", |b| {
-        let mut g = MemGraph::new(1_000_000);
-        let mut lsn = 1u64;
-        b.iter(|| {
-            lsn += 1;
-            let nk = g.add_node(
-                black_box(smallvec![1, 2]),
-                black_box(empty_props()),
-                None,
-                black_box(lsn),
-            );
-            black_box(nk)
+        b.iter_custom(|iters| {
+            // Cap per-batch to avoid OOM on multi-billion iteration runs.
+            let batch = iters.min(500_000) as usize;
+            let rounds = (iters as usize + batch - 1) / batch;
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..rounds {
+                let mut g = MemGraph::new(batch + 1);
+                let start = std::time::Instant::now();
+                for i in 0..batch {
+                    let nk = g.add_node(
+                        black_box(smallvec![1, 2]),
+                        black_box(empty_props()),
+                        None,
+                        black_box(i as u64 + 1),
+                    );
+                    black_box(nk);
+                }
+                total += start.elapsed();
+            }
+            total
         })
     });
 }
 
 fn bench_addedge_command(c: &mut Criterion) {
-    // Pre-build a graph with many nodes so we can keep inserting edges.
-    let mut g = MemGraph::new(10_000_000);
-    let mut nodes = Vec::with_capacity(100_000);
-    for i in 0..100_000u64 {
-        nodes.push(g.add_node(smallvec![0], empty_props(), None, i + 1));
-    }
-    let mut idx = 0usize;
-
     c.bench_function("graph_addedge_command", |b| {
-        b.iter(|| {
-            let src = nodes[idx % nodes.len()];
-            let dst = nodes[(idx + 1) % nodes.len()];
-            idx += 2;
-            let result = g.add_edge(src, dst, 1, 1.0, None, black_box(idx as u64));
-            black_box(result)
+        b.iter_custom(|iters| {
+            let batch = iters.min(500_000) as usize;
+            let rounds = (iters as usize + batch - 1) / batch;
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..rounds {
+                let n = batch + 2;
+                let mut g = MemGraph::new(n + 1);
+                let mut nodes = Vec::with_capacity(n);
+                for i in 0..n {
+                    nodes.push(g.add_node(smallvec![0], empty_props(), None, i as u64 + 1));
+                }
+                let start = std::time::Instant::now();
+                for i in 0..batch {
+                    let _ = black_box(g.add_edge(
+                        nodes[i],
+                        nodes[i + 1],
+                        1,
+                        1.0,
+                        None,
+                        black_box(i as u64 + n as u64),
+                    ));
+                }
+                total += start.elapsed();
+            }
+            total
         })
     });
 }
