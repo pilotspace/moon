@@ -4,8 +4,10 @@
 
 pub mod csr;
 pub mod memgraph;
+pub mod segment;
 pub mod types;
 
 pub use csr::CsrSegment;
 pub use memgraph::MemGraph;
+pub use segment::GraphSegmentHolder;
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};

@@ -29,6 +29,7 @@ pub struct FrozenMemGraph {
 }
 
 /// Mutable graph segment backed by generational SlotMap indices.
+#[derive(Debug)]
 pub struct MemGraph {
     nodes: SlotMap<NodeKey, MutableNode>,
     edges: SlotMap<EdgeKey, MutableEdge>,
