@@ -58,3 +58,5 @@ pub mod storage;
 pub mod tls;
 pub mod tracking;
 pub mod vector;
+#[cfg(feature = "graph")]
+pub mod graph;
