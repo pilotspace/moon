@@ -58,7 +58,7 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remaining args must be triples: longitude latitude member
     let remaining = &args[i..];
-    if remaining.len() < 3 || remaining.len() % 3 != 0 {
+    if remaining.len() < 3 || !remaining.len().is_multiple_of(3) {
         return err_wrong_args("GEOADD");
     }
 
