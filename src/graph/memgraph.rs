@@ -257,6 +257,8 @@ pub struct NeighborIter<'a> {
     out_iter: core::slice::Iter<'a, EdgeKey>,
     in_iter: core::slice::Iter<'a, EdgeKey>,
     lsn: u64,
+    /// The source node (retained for future direction-aware queries).
+    #[allow(dead_code)]
     source: NodeKey,
 }
 

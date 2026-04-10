@@ -75,6 +75,7 @@ pub struct MutableEdge {
 }
 
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.
+#[derive(Debug)]
 #[repr(C, align(64))]
 pub struct GraphSegmentHeader {
     /// Magic bytes: b"MNGR" (Moon Graph).
@@ -98,6 +99,7 @@ const _: () = assert!(core::mem::size_of::<GraphSegmentHeader>() == 128);
 const _: () = assert!(core::mem::align_of::<GraphSegmentHeader>() == 64);
 
 /// Edge metadata stored in CSR alongside col_indices.
+#[derive(Debug)]
 #[repr(C, align(8))]
 pub struct EdgeMeta {
     /// Edge-type dictionary index.
@@ -112,6 +114,7 @@ const _: () = assert!(core::mem::size_of::<EdgeMeta>() == 8);
 const _: () = assert!(core::mem::align_of::<EdgeMeta>() == 8);
 
 /// Node metadata in CSR (parallel array indexed by CSR row).
+#[derive(Debug)]
 #[repr(C)]
 pub struct NodeMeta {
     /// External node ID (for reverse mapping).
