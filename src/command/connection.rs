@@ -271,6 +271,13 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     );
     sections.push_str("\r\n");
 
+    // # Commandstats — placeholder section for Redis 7.x parity.
+    // Per-command stats (calls, usec, usec_per_call) require a global registry;
+    // the record_command() path already tracks per-label counters in Prometheus.
+    // For now, emit the section header so redis-py parse_info recognizes it.
+    sections.push_str("# Commandstats\r\n");
+    sections.push_str("\r\n");
+
     sections.push_str("# Keyspace\r\n");
     let key_count = db.len();
     let expires_count = db.expires_count();

@@ -133,6 +133,10 @@ pub(crate) fn drain_spsc_shared(
         }
     }
 
+    if drained > 0 {
+        crate::admin::metrics_setup::record_spsc_drain(shard_id, drained as u64);
+    }
+
     // Process other messages (PubSubPublish, SnapshotBegin, etc.)
     for msg in other_messages {
         handle_shard_message_shared(

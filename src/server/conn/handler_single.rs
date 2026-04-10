@@ -70,6 +70,7 @@ pub async fn handle_connection(
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     vector_store: Option<Arc<Mutex<crate::vector::store::VectorStore>>>,
 ) {
+    crate::admin::metrics_setup::record_connection_opened();
     // Capture peer address before Framed wraps the stream (stream is moved)
     let peer_addr = stream
         .peer_addr()
@@ -1281,4 +1282,5 @@ pub async fn handle_connection(
     if conn.tracking_state.enabled {
         tracking_table.lock().untrack_all(client_id);
     }
+    crate::admin::metrics_setup::record_connection_closed();
 }

@@ -114,10 +114,12 @@ impl PubSubRegistry {
     /// Slow subscribers (full channel) are automatically removed.
     pub fn publish(&mut self, channel: &Bytes, message: &Bytes) -> i64 {
         let mut count: i64 = 0;
+        let mut slow_drops: i64 = 0;
 
         // Exact channel subscribers — pre-serialize once, send Bytes to all
         if let Some(subs) = self.channels.get_mut(channel) {
             let serialized = serialize_message_bytes(channel, message);
+            let before = subs.len();
             subs.retain(|sub| {
                 if sub.try_send(serialized.clone()) {
                     count += 1;
@@ -126,6 +128,7 @@ impl PubSubRegistry {
                     false // slow subscriber, remove
                 }
             });
+            slow_drops += (before - subs.len()) as i64;
             if subs.is_empty() {
                 self.channels.remove(channel);
             }
@@ -147,6 +150,7 @@ impl PubSubRegistry {
                         }
                     });
                     if subs.len() < before {
+                        slow_drops += (before - subs.len()) as i64;
                         had_removals = true;
                     }
                 }
@@ -155,6 +159,13 @@ impl PubSubRegistry {
             if had_removals {
                 self.patterns.retain(|(_, subs)| !subs.is_empty());
             }
+        }
+
+        if count > 0 {
+            crate::admin::metrics_setup::record_pubsub_published();
+        }
+        for _ in 0..slow_drops {
+            crate::admin::metrics_setup::record_pubsub_slow_drop();
         }
 
         count

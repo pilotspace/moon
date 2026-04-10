@@ -81,6 +81,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
+    crate::admin::metrics_setup::record_connection_opened();
+
     let mut read_buf = if initial_read_buf.is_empty() {
         BytesMut::with_capacity(8192)
     } else {
@@ -2079,5 +2081,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
     }
 
+    crate::admin::metrics_setup::record_connection_closed();
     (MonoioHandlerResult::Done, None)
 }

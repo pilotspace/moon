@@ -208,13 +208,17 @@ pub async fn aof_writer_task(
                     }
                     match fsync {
                         FsyncPolicy::Always => {
+                            let t = Instant::now();
                             if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                 error!("AOF sync failed (seq {}, always): {}", manifest.seq, e);
                                 write_error = true;
+                            } else {
+                                crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
                             }
                         }
                         FsyncPolicy::EverySec => {
                             if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
+                                let t = Instant::now();
                                 if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                     error!(
                                         "AOF sync failed (seq {}, everysec): {}",
@@ -222,6 +226,7 @@ pub async fn aof_writer_task(
                                     );
                                     // Non-fatal for everysec: retry next interval
                                 } else {
+                                    crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
                                     last_fsync = Instant::now();
                                 }
                             }

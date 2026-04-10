@@ -17,13 +17,19 @@ pub fn get(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GET"),
     };
     match db.get(key) {
-        Some(entry) => match entry.value.as_bytes_owned() {
-            Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
-        },
-        None => Frame::Null,
+        Some(entry) => {
+            crate::admin::metrics_setup::record_keyspace_hit();
+            match entry.value.as_bytes_owned() {
+                Some(v) => Frame::BulkString(v),
+                None => Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
+            }
+        }
+        None => {
+            crate::admin::metrics_setup::record_keyspace_miss();
+            Frame::Null
+        }
     }
 }
 
@@ -42,11 +48,17 @@ pub fn mget(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
         match db.get(key) {
-            Some(entry) => match entry.value.as_bytes_owned() {
-                Some(v) => results.push(Frame::BulkString(v)),
-                None => results.push(Frame::Null),
-            },
-            None => results.push(Frame::Null),
+            Some(entry) => {
+                crate::admin::metrics_setup::record_keyspace_hit();
+                match entry.value.as_bytes_owned() {
+                    Some(v) => results.push(Frame::BulkString(v)),
+                    None => results.push(Frame::Null),
+                }
+            }
+            None => {
+                crate::admin::metrics_setup::record_keyspace_miss();
+                results.push(Frame::Null);
+            }
         }
     }
     Frame::Array(results.into())
