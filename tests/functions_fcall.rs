@@ -7,7 +7,7 @@
 //! Requires a running moon server on the port specified by MOON_PORT (default 16479):
 //!   ./target/release/moon --port 16479 --shards 1
 //!
-//! Run with: cargo test --release --test functions_fcall
+//! Run with: cargo test --release --test functions_fcall -- --ignored
 
 const MOON_PORT: u16 = 16479;
 
@@ -39,6 +39,7 @@ async fn flush_functions(con: &mut redis::aio::MultiplexedConnection) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_load_and_fcall() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -57,6 +58,7 @@ async fn function_load_and_fcall() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_load_missing_header_errors() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -72,6 +74,7 @@ async fn function_load_missing_header_errors() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_load_duplicate_without_replace_errors() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -95,6 +98,7 @@ async fn function_load_duplicate_without_replace_errors() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_load_replace_succeeds() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -122,6 +126,7 @@ async fn function_load_replace_succeeds() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_list_returns_libraries() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -142,6 +147,7 @@ async fn function_list_returns_libraries() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_delete_removes() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -169,6 +175,7 @@ async fn function_delete_removes() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn fcall_ro_rejects_writes() {
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
@@ -189,6 +196,7 @@ async fn fcall_ro_rejects_writes() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn function_dump_restore_stats_deferred() {
     let mut con = get_conn().await;
 

@@ -32,6 +32,7 @@ async fn cleanup_keys(conn: &mut redis::aio::MultiplexedConnection, keys: &[&str
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn blpop_timeout_returns_nil() {
     let mut conn = get_conn().await;
     cleanup_keys(&mut conn, &["empty_key_blpop"]).await;
@@ -70,6 +71,7 @@ async fn blpop_timeout_returns_nil() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn brpop_wakes_on_rpush() {
     let mut conn = get_conn().await;
     cleanup_keys(&mut conn, &["wake_key"]).await;
@@ -111,6 +113,7 @@ async fn brpop_wakes_on_rpush() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn blmpop_count_greater_than_one() {
     let mut conn = get_conn().await;
     cleanup_keys(&mut conn, &["blmpop_key"]).await;
@@ -169,6 +172,7 @@ async fn blmpop_count_greater_than_one() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn brpoplpush_legacy_alias() {
     let mut conn = get_conn().await;
     cleanup_keys(&mut conn, &["brpl_src", "brpl_dst"]).await;
@@ -202,6 +206,7 @@ async fn brpoplpush_legacy_alias() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore] // Requires running moon server on port 16479
 async fn connection_drop_cleans_registry() {
     let mut conn = get_conn().await;
     cleanup_keys(&mut conn, &["drop_test_key"]).await;
