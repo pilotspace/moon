@@ -7,6 +7,7 @@ pub mod csr;
 pub mod memgraph;
 pub mod segment;
 pub mod store;
+pub mod traversal_guard;
 pub mod types;
 pub mod visibility;
 
