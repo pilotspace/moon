@@ -259,7 +259,7 @@ impl super::Shard {
         // Per-shard SO_REUSEPORT listener (Linux + monoio).
         // Each shard creates its own listener; the kernel distributes connections via SO_REUSEPORT.
         #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
-        let per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
+        let mut per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
             if let Some(ref addr) = bind_addr {
                 match conn_accept::create_reuseport_socket(addr) {
                     Ok(std_listener) => match monoio::net::TcpListener::from_std(std_listener) {
@@ -292,6 +292,47 @@ impl super::Shard {
                 None
             }
         };
+
+        // Dedicated monoio::spawn accept task: avoids io_uring cancel/resubmit race
+        // that occurs when accept() is a branch in monoio::select!.
+        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        let local_accept_rx: Option<flume::Receiver<std::net::TcpStream>> = {
+            if let Some(listener) = per_shard_monoio_listener.take() {
+                let (tx, rx) = flume::bounded(256);
+                let shard_id_copy = self.id;
+                monoio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                let std_stream = {
+                                    use std::os::unix::io::{FromRawFd, IntoRawFd};
+                                    let fd = stream.into_raw_fd();
+                                    // SAFETY: fd is a valid socket from monoio TcpStream::into_raw_fd(),
+                                    // which relinquished ownership. We take sole ownership here.
+                                    unsafe { std::net::TcpStream::from_raw_fd(fd) }
+                                };
+                                if tx.send(std_stream).is_err() {
+                                    break; // receiver dropped, shard shutting down
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Shard {}: per-shard accept error: {}",
+                                    shard_id_copy,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                });
+                Some(rx)
+            } else {
+                None
+            }
+        };
+
+        #[cfg(all(feature = "runtime-monoio", not(target_os = "linux")))]
+        let local_accept_rx: Option<flume::Receiver<std::net::TcpStream>> = None;
 
         #[cfg(not(any(
             all(target_os = "linux", feature = "runtime-tokio"),
@@ -1094,6 +1135,46 @@ impl super::Shard {
                 }
             }
 
+            // Drain per-shard accept channel (dedicated monoio::spawn task, no cancel race)
+            #[cfg(feature = "runtime-monoio")]
+            if let Some(ref rx) = local_accept_rx {
+                while let Ok(std_tcp_stream) = rx.try_recv() {
+                    conn_accept::spawn_monoio_connection(
+                        std_tcp_stream,
+                        false,
+                        &tls_config,
+                        &shard_databases,
+                        &dispatch_tx,
+                        &pubsub_arc,
+                        &blocking_rc,
+                        &shutdown,
+                        &aof_tx,
+                        &tracking_rc,
+                        &lua_rc,
+                        &script_cache_rc,
+                        &acl_table,
+                        &runtime_config,
+                        &server_config,
+                        &all_notifiers,
+                        &snapshot_trigger_tx,
+                        &repl_state,
+                        &cluster_state,
+                        &cached_clock,
+                        &remote_sub_map_arc,
+                        &all_pubsub_registries,
+                        &all_remote_sub_maps,
+                        &affinity_tracker,
+                        shard_id,
+                        num_shards,
+                        config_port,
+                        &pending_wakers,
+                        &spill_sender,
+                        &spill_file_id,
+                        &disk_offload_dir,
+                    );
+                }
+            }
+
             // Non-blocking drain: process all pending connections before entering select!.
             // monoio::select! drops and recreates conn_rx.recv_async() every iteration
             // (when timer tick fires), leaving queued connections unprocessed for ~1ms.
@@ -1141,46 +1222,11 @@ impl super::Shard {
             }
 
             // Monoio runtime: full event loop.
+            // Per-shard accept is handled by the dedicated monoio::spawn task above,
+            // drained via local_accept_rx.try_recv() before entering select!.
             #[cfg(feature = "runtime-monoio")]
             monoio::select! {
-                // Per-shard SO_REUSEPORT accept (Linux only, monoio path)
-                result = async {
-                    #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
-                    if let Some(ref listener) = per_shard_monoio_listener {
-                        return listener.accept().await;
-                    }
-                    // Never resolves on non-Linux or when per_shard_monoio_listener is None
-                    std::future::pending::<std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>>().await
-                } => {
-                    match result {
-                        Ok((stream, _addr)) => {
-                            // Convert monoio TcpStream -> std::net::TcpStream (same pattern as listener.rs)
-                            let std_stream = {
-                                use std::os::unix::io::{IntoRawFd, FromRawFd};
-                                let fd = stream.into_raw_fd();
-                                // SAFETY: fd is a valid socket from monoio TcpStream::into_raw_fd(),
-                                // which relinquished ownership. We take sole ownership here.
-                                unsafe { std::net::TcpStream::from_raw_fd(fd) }
-                            };
-                            conn_accept::spawn_monoio_connection(
-                                std_stream, false, &tls_config,
-                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                                &acl_table, &runtime_config, &server_config, &all_notifiers,
-                                &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                                &all_remote_sub_maps, &affinity_tracker,
-                                shard_id, num_shards, config_port,
-                                &pending_wakers,
-                                &spill_sender, &spill_file_id, &disk_offload_dir,
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!("Shard {}: per-shard accept error (monoio): {}", shard_id, e);
-                        }
-                    }
-                }
-                // Accept new connections from listener (MPSC fallback, always active on non-Linux)
+                // Accept new connections from listener (MPSC fallback, always active for TLS/non-Linux)
                 stream = conn_rx.recv_async() => {
                     match stream {
                         Ok((std_tcp_stream, is_tls)) => {

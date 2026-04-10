@@ -459,8 +459,7 @@ fn main() -> anyhow::Result<()> {
                             },
                             #[cfg(feature = "runtime-monoio")]
                             {
-                                let _ = &shard_bind_addr;
-                                None
+                                Some(shard_bind_addr)
                             },
                             shard_persistence_dir,
                             shard_snap_rx,
@@ -615,10 +614,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // monoio: disable per-shard accept. The listener thread handles all accepts
-        // and dispatches via MPSC (conn_txs). Per-shard SO_REUSEPORT accept with monoio
-        // has an io_uring cancel/resubmit race in monoio::select! that drops connections.
-        let per_shard_accept = false;
+        // monoio: per-shard SO_REUSEPORT accept is re-enabled on Linux.
+        // The io_uring cancel/resubmit race in monoio::select! is avoided by using
+        // a dedicated monoio::spawn() accept task instead of an accept branch in select!.
+        // Central listener remains as fallback for TLS or non-Linux platforms.
+        let per_shard_accept = cfg!(target_os = "linux");
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
             if let Err(e) = server::listener::run_sharded(
                 config,
