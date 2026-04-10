@@ -575,6 +575,13 @@ if should_run "key"; then
     assert_match "BITOP NOT"           BITOP NOT k:bitdst k:bits
     assert_match "BITPOS 1"            BITPOS k:bits 1
     assert_match "BITPOS 0"            BITPOS k:bits 0
+
+    # SORT
+    rcli RPUSH k:sortl 3 1 2 >/dev/null 2>&1; mcli RPUSH k:sortl 3 1 2 >/dev/null 2>&1
+    assert_match "SORT numeric"        SORT k:sortl
+    assert_match "SORT DESC"           SORT k:sortl DESC
+    assert_match "SORT ALPHA"          SORT k:sortl ALPHA
+    assert_match "SORT LIMIT"          SORT k:sortl LIMIT 0 2
 fi
 
 # ===========================================================================

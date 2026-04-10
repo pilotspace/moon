@@ -562,6 +562,234 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA] [STORE dest]
+///
+/// Sort elements in a list, set, or sorted set.
+pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("SORT");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("SORT"),
+    };
+
+    // Parse options
+    let mut by_pattern: Option<&[u8]> = None;
+    let mut get_patterns: Vec<&[u8]> = Vec::new();
+    let mut limit_offset: usize = 0;
+    let mut limit_count: Option<usize> = None;
+    let mut descending = false;
+    let mut alpha = false;
+    let mut store_dest: Option<&[u8]> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        let arg = match extract_key(&args[i]) {
+            Some(a) => a,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        if arg.eq_ignore_ascii_case(b"BY") {
+            i += 1;
+            by_pattern = Some(match extract_key(args.get(i).unwrap_or(&Frame::Null)) {
+                Some(p) => p,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            });
+        } else if arg.eq_ignore_ascii_case(b"GET") {
+            i += 1;
+            let pat = match extract_key(args.get(i).unwrap_or(&Frame::Null)) {
+                Some(p) => p,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            get_patterns.push(pat);
+        } else if arg.eq_ignore_ascii_case(b"LIMIT") {
+            let off = match args.get(i + 1).and_then(|f| parse_int(f)) {
+                Some(v) if v >= 0 => v as usize,
+                _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            let cnt = match args.get(i + 2).and_then(|f| parse_int(f)) {
+                Some(v) if v >= 0 => v as usize,
+                _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            limit_offset = off;
+            limit_count = Some(cnt);
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"ASC") {
+            descending = false;
+        } else if arg.eq_ignore_ascii_case(b"DESC") {
+            descending = true;
+        } else if arg.eq_ignore_ascii_case(b"ALPHA") {
+            alpha = true;
+        } else if arg.eq_ignore_ascii_case(b"STORE") {
+            i += 1;
+            store_dest = Some(match extract_key(args.get(i).unwrap_or(&Frame::Null)) {
+                Some(d) => d,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            });
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+        i += 1;
+    }
+
+    // Extract elements from the key
+    use crate::storage::compact_value::RedisValueRef;
+    let elements: Vec<Bytes> = match db.get(key) {
+        None => {
+            // Non-existent key: return empty result
+            return if let Some(dest) = store_dest {
+                // STORE with empty → create empty list
+                let entry = crate::storage::entry::Entry::new_list();
+                db.set(Bytes::copy_from_slice(dest), entry);
+                Frame::Integer(0)
+            } else {
+                Frame::Array(crate::framevec![])
+            };
+        }
+        Some(entry) => match entry.value.as_redis_value() {
+            RedisValueRef::List(l) => l.iter().cloned().collect(),
+            RedisValueRef::ListListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            RedisValueRef::Set(s) => s.iter().cloned().collect(),
+            RedisValueRef::SetListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            RedisValueRef::SetIntset(is) => {
+                is.iter().map(|v| Bytes::from(v.to_string())).collect()
+            }
+            RedisValueRef::SortedSet { members, .. } => members.keys().cloned().collect(),
+            RedisValueRef::SortedSetBPTree { members, .. } => members.keys().cloned().collect(),
+            RedisValueRef::SortedSetListpack(lp) => {
+                // Listpack stores member, score pairs
+                let entries: Vec<_> = lp.iter().collect();
+                entries.chunks(2).filter_map(|c| c.first().map(|e| e.to_bytes())).collect()
+            }
+            _ => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        },
+    };
+
+    // Resolve sort keys (BY pattern or element itself)
+    let sort_keys: Vec<Option<Bytes>> = if let Some(pattern) = by_pattern {
+        if pattern == b"nosort" {
+            // BY nosort = skip sorting
+            elements.iter().map(|_| None).collect()
+        } else {
+            elements
+                .iter()
+                .map(|elem| {
+                    let lookup_key = apply_pattern(pattern, elem);
+                    db.get(&lookup_key)
+                        .and_then(|e| e.value.as_bytes().map(|b| Bytes::copy_from_slice(b)))
+                })
+                .collect()
+        }
+    } else {
+        elements
+            .iter()
+            .map(|e| Some(e.clone()))
+            .collect()
+    };
+
+    // Create indexed pairs for stable sort
+    let mut indices: Vec<usize> = (0..elements.len()).collect();
+
+    // Sort (skip if BY nosort)
+    let no_sort = by_pattern.is_some_and(|p| p == b"nosort");
+    if !no_sort {
+        indices.sort_by(|&a, &b| {
+            let ka = sort_keys[a].as_ref();
+            let kb = sort_keys[b].as_ref();
+            let cmp = match (ka, kb) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(va), Some(vb)) => {
+                    if alpha {
+                        va.cmp(vb)
+                    } else {
+                        let fa = std::str::from_utf8(va)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let fb = std::str::from_utf8(vb)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                }
+            };
+            if descending { cmp.reverse() } else { cmp }
+        });
+    }
+
+    // Apply LIMIT
+    let start = limit_offset.min(indices.len());
+    let count = limit_count.unwrap_or(indices.len());
+    let end = (start + count).min(indices.len());
+    let selected = &indices[start..end];
+
+    // Build results
+    let results: Vec<Frame> = if get_patterns.is_empty() {
+        selected
+            .iter()
+            .map(|&idx| Frame::BulkString(elements[idx].clone()))
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(selected.len() * get_patterns.len());
+        for &idx in selected {
+            for pat in &get_patterns {
+                if *pat == b"#" {
+                    out.push(Frame::BulkString(elements[idx].clone()));
+                } else {
+                    let lookup_key = apply_pattern(pat, &elements[idx]);
+                    match db.get(&lookup_key) {
+                        Some(e) => match e.value.as_bytes() {
+                            Some(v) => out.push(Frame::BulkString(Bytes::copy_from_slice(v))),
+                            None => out.push(Frame::Null),
+                        },
+                        None => out.push(Frame::Null),
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    // STORE or return
+    if let Some(dest) = store_dest {
+        let count = results.len() as i64;
+        let mut list = std::collections::VecDeque::with_capacity(results.len());
+        for frame in results {
+            if let Frame::BulkString(b) = frame {
+                list.push_back(b);
+            }
+        }
+        let mut entry = crate::storage::entry::Entry::new_list();
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            crate::storage::entry::RedisValue::List(list),
+        );
+        db.set(Bytes::copy_from_slice(dest), entry);
+        Frame::Integer(count)
+    } else {
+        Frame::Array(results.into())
+    }
+}
+
+/// Apply a SORT pattern by replacing the first `*` with the element value.
+fn apply_pattern(pattern: &[u8], element: &[u8]) -> Bytes {
+    if let Some(pos) = pattern.iter().position(|&b| b == b'*') {
+        let mut result = Vec::with_capacity(pattern.len() + element.len());
+        result.extend_from_slice(&pattern[..pos]);
+        result.extend_from_slice(element);
+        result.extend_from_slice(&pattern[pos + 1..]);
+        Bytes::from(result)
+    } else {
+        Bytes::copy_from_slice(pattern)
+    }
+}
+
 /// Check if a value is large enough to warrant async drop.
 fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
     use crate::storage::compact_value::RedisValueRef;
@@ -1586,5 +1814,122 @@ mod tests {
         let mut db = setup_db_with_key(b"src", b"hello");
         let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"DB")]);
         assert!(matches!(result, Frame::Error(_)));
+    }
+
+    // --- SORT tests ---
+
+    fn setup_list(db: &mut Database, key: &[u8], vals: &[&[u8]]) {
+        use std::collections::VecDeque;
+        let list: VecDeque<Bytes> = vals.iter().map(|v| Bytes::copy_from_slice(v)).collect();
+        let mut entry = Entry::new_list();
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            crate::storage::entry::RedisValue::List(list),
+        );
+        db.set(Bytes::copy_from_slice(key), entry);
+    }
+
+    #[test]
+    fn test_sort_numeric() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
+        let result = sort(&mut db, &[bs(b"mylist")]);
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"1")),
+                Frame::BulkString(Bytes::from_static(b"2")),
+                Frame::BulkString(Bytes::from_static(b"3")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_alpha() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"c", b"a", b"b"]);
+        let result = sort(&mut db, &[bs(b"mylist"), bs(b"ALPHA")]);
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"a")),
+                Frame::BulkString(Bytes::from_static(b"b")),
+                Frame::BulkString(Bytes::from_static(b"c")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_desc() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"1", b"3", b"2"]);
+        let result = sort(&mut db, &[bs(b"mylist"), bs(b"DESC")]);
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"3")),
+                Frame::BulkString(Bytes::from_static(b"2")),
+                Frame::BulkString(Bytes::from_static(b"1")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_limit() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"3", b"1", b"2", b"4"]);
+        let result = sort(
+            &mut db,
+            &[bs(b"mylist"), bs(b"LIMIT"), bs(b"1"), bs(b"2")],
+        );
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"2")),
+                Frame::BulkString(Bytes::from_static(b"3")),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sort_store() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"mylist", &[b"3", b"1", b"2"]);
+        let result = sort(
+            &mut db,
+            &[bs(b"mylist"), bs(b"STORE"), bs(b"sorted")],
+        );
+        assert_eq!(result, Frame::Integer(3));
+        assert!(db.exists(b"sorted"));
+    }
+
+    #[test]
+    fn test_sort_nonexistent() {
+        let mut db = Database::new();
+        let result = sort(&mut db, &[bs(b"nokey")]);
+        assert_eq!(result, Frame::Array(framevec![]));
+    }
+
+    #[test]
+    fn test_sort_set() {
+        let mut db = Database::new();
+        let mut s = std::collections::HashSet::new();
+        s.insert(Bytes::from_static(b"3"));
+        s.insert(Bytes::from_static(b"1"));
+        s.insert(Bytes::from_static(b"2"));
+        let mut entry = Entry::new_set();
+        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+            crate::storage::entry::RedisValue::Set(s),
+        );
+        db.set(Bytes::from_static(b"myset"), entry);
+        let result = sort(&mut db, &[bs(b"myset")]);
+        // Sort result should be [1, 2, 3] regardless of HashSet order
+        assert_eq!(
+            result,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"1")),
+                Frame::BulkString(Bytes::from_static(b"2")),
+                Frame::BulkString(Bytes::from_static(b"3")),
+            ])
+        );
     }
 }

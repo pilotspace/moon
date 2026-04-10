@@ -204,6 +204,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"SPOP") {
                 return resp(set::spop(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"SORT") {
+                return resp(key::sort(db, args));
+            }
         }
         (4, b't') => {
             // TYPE

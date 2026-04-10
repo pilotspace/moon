@@ -509,6 +509,15 @@ both SET edge:bpos "\x00\xff"
 assert_both "BITPOS 1" BITPOS edge:bpos 1
 assert_both "BITPOS 0" BITPOS edge:bpos 0
 
+# SORT
+both RPUSH edge:sortl 3 1 2
+assert_both "SORT numeric" SORT edge:sortl
+assert_both "SORT DESC" SORT edge:sortl DESC
+assert_both "SORT ALPHA" SORT edge:sortl ALPHA
+assert_both "SORT LIMIT" SORT edge:sortl LIMIT 0 2
+assert_both "SORT STORE" SORT edge:sortl STORE edge:sorted
+assert_both "SORT STORE result" LRANGE edge:sorted 0 -1
+
 # ===========================================================================
 # Summary
 # ===========================================================================
