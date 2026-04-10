@@ -2,6 +2,7 @@
 //!
 //! Feature-gated under `graph` so the default build is unaffected.
 
+pub mod compaction;
 pub mod csr;
 pub mod memgraph;
 pub mod segment;
