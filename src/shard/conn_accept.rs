@@ -68,6 +68,27 @@ fn take_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
     std::mem::take(&mut state.read_buf_remainder)
 }
 
+/// Set TCP keepalive on a raw file descriptor.
+///
+/// Sets SO_KEEPALIVE and TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (macOS) to detect
+/// dead connections. Called once per accepted socket.
+#[cfg(unix)]
+fn set_tcp_keepalive(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
+    if keepalive_secs == 0 {
+        return;
+    }
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    // SAFETY: we borrow the fd temporarily — socket2::Socket does NOT take ownership
+    // because we call into_raw_fd() before this scope ends, preventing double-close.
+    let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(keepalive_secs));
+    // Ignore errors — keepalive is best-effort
+    let _ = sock.set_tcp_keepalive(&ka);
+    // Release ownership back — we don't own this fd
+    let _ = sock.into_raw_fd();
+}
+
 /// Spawn a new tokio connection handler task (plain TCP or TLS).
 ///
 /// Clones all required Rc/Arc shared state and spawns via `tokio::task::spawn_local`.
@@ -139,7 +160,15 @@ pub(crate) fn spawn_tokio_connection(
     let all_rsm = all_remote_sub_maps.to_vec();
     let reqpass = rtcfg.read().requirepass.clone();
     let maxclients_tokio = rtcfg.read().maxclients;
+    let tcp_keepalive_secs = rtcfg.read().tcp_keepalive;
     let clk = cached_clock.clone();
+
+    // Set TCP keepalive on accepted socket
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        set_tcp_keepalive(tcp_stream.as_raw_fd(), tcp_keepalive_secs);
+    }
 
     // Construct ConnectionContext from cloned shared state
     let conn_ctx = crate::server::conn::ConnectionContext::new(
@@ -414,6 +443,14 @@ pub(crate) fn spawn_monoio_connection(
     disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
     use crate::server::connection::handle_connection_sharded_monoio;
+
+    // Set TCP keepalive on accepted socket before converting to monoio
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let keepalive_secs = runtime_config.read().tcp_keepalive;
+        set_tcp_keepalive(std_tcp_stream.as_raw_fd(), keepalive_secs);
+    }
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {

@@ -211,6 +211,14 @@ pub async fn run_with_shutdown(
                             }
                         }
 
+                        // Set TCP keepalive on accepted socket
+                        if config.tcp_keepalive > 0 {
+                            let ka = socket2::TcpKeepalive::new()
+                                .with_time(std::time::Duration::from_secs(config.tcp_keepalive));
+                            let sock = socket2::SockRef::from(&stream);
+                            let _ = sock.set_tcp_keepalive(&ka);
+                        }
+
                         debug!("New connection from {}", addr);
                         let db = db.clone();
                         let conn_token = token.child_token();
