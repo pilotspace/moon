@@ -640,7 +640,8 @@ pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
             Frame::Array(result.into())
         }
     } else {
-        let n = count.unsigned_abs() as usize;
+        // Negative count: allow duplicates. Cap to fields.len() to prevent OOM on i64::MIN.
+        let n = std::cmp::min(count.unsigned_abs() as usize, fields.len() * 10);
         if with_values {
             let mut result = Vec::with_capacity(n * 2);
             for _ in 0..n {
@@ -693,8 +694,11 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     }
     let mut rng = rand::rng();
     if args.len() == 1 {
-        let (field, _) = entries.choose(&mut rng).unwrap();
-        return Frame::BulkString(field.clone());
+        return if let Some((field, _)) = entries.choose(&mut rng) {
+            Frame::BulkString(field.clone())
+        } else {
+            Frame::Null
+        };
     }
     let count_bytes = match extract_bytes(&args[1]) {
         Some(b) => b,
@@ -746,20 +750,23 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
             Frame::Array(result.into())
         }
     } else {
-        let n = count.unsigned_abs() as usize;
+        // Negative count: allow duplicates. Cap to prevent OOM on extreme values.
+        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
         if with_values {
             let mut result = Vec::with_capacity(n * 2);
             for _ in 0..n {
-                let (field, value) = entries.choose(&mut rng).unwrap();
-                result.push(Frame::BulkString(field.clone()));
-                result.push(Frame::BulkString(value.clone()));
+                if let Some((field, value)) = entries.choose(&mut rng) {
+                    result.push(Frame::BulkString(field.clone()));
+                    result.push(Frame::BulkString(value.clone()));
+                }
             }
             Frame::Array(result.into())
         } else {
             let mut result = Vec::with_capacity(n);
             for _ in 0..n {
-                let (field, _) = entries.choose(&mut rng).unwrap();
-                result.push(Frame::BulkString(field.clone()));
+                if let Some((field, _)) = entries.choose(&mut rng) {
+                    result.push(Frame::BulkString(field.clone()));
+                }
             }
             Frame::Array(result.into())
         }

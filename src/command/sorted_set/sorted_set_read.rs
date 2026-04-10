@@ -1673,8 +1673,11 @@ pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
     let entries: Vec<(&Bytes, f64)> = members_map.iter().map(|(m, s)| (m, *s)).collect();
     let mut rng = rand::rng();
     if args.len() == 1 {
-        let chosen = entries.choose(&mut rng).unwrap();
-        return Frame::BulkString(chosen.0.clone());
+        return if let Some(chosen) = entries.choose(&mut rng) {
+            Frame::BulkString(chosen.0.clone())
+        } else {
+            Frame::Null
+        };
     }
     let count_bytes = match extract_bytes(&args[1]) {
         Some(b) => b,
@@ -1687,10 +1690,19 @@ pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
         Some(c) => c,
         None => return err("ERR value is not an integer or out of range"),
     };
-    let withscores = args.len() == 3
-        && extract_bytes(&args[2])
-            .map(|b| b.eq_ignore_ascii_case(b"WITHSCORES"))
-            .unwrap_or(false);
+    let withscores = if args.len() == 3 {
+        let opt = match extract_bytes(&args[2]) {
+            Some(b) => b,
+            None => return err("ERR syntax error"),
+        };
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            true
+        } else {
+            return err("ERR syntax error");
+        }
+    } else {
+        false
+    };
     if count == 0 {
         return Frame::Array(framevec![]);
     }
@@ -1707,14 +1719,16 @@ pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
         }
         Frame::Array(result.into())
     } else {
-        let n = count.unsigned_abs() as usize;
+        // Negative count: allow duplicates. Cap to prevent OOM on extreme values.
+        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
         let cap = if withscores { n * 2 } else { n };
         let mut result = Vec::with_capacity(cap);
         for _ in 0..n {
-            let chosen = entries.choose(&mut rng).unwrap();
-            result.push(Frame::BulkString(chosen.0.clone()));
-            if withscores {
-                result.push(Frame::BulkString(format_score_bytes(chosen.1)));
+            if let Some(chosen) = entries.choose(&mut rng) {
+                result.push(Frame::BulkString(chosen.0.clone()));
+                if withscores {
+                    result.push(Frame::BulkString(format_score_bytes(chosen.1)));
+                }
             }
         }
         Frame::Array(result.into())

@@ -31,11 +31,11 @@ MOON_PID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --requests)  REQUESTS="$2"; shift 2 ;;
-        --shards)    SHARDS="$2"; shift 2 ;;
-        --clients)   CLIENTS="$2"; shift 2 ;;
-        --section)   SECTION="$2"; shift 2 ;;
-        --help)      sed -n '2,/^###/p' "$0" | head -n -1; exit 0 ;;
+        --requests)  if [[ $# -lt 2 ]] || [[ -z "$2" ]] || [[ "$2" == -* ]]; then echo "Error: --requests requires a value"; exit 1; fi; REQUESTS="$2"; shift 2 ;;
+        --shards)    if [[ $# -lt 2 ]] || [[ -z "$2" ]] || [[ "$2" == -* ]]; then echo "Error: --shards requires a value"; exit 1; fi; SHARDS="$2"; shift 2 ;;
+        --clients)   if [[ $# -lt 2 ]] || [[ -z "$2" ]] || [[ "$2" == -* ]]; then echo "Error: --clients requires a value"; exit 1; fi; CLIENTS="$2"; shift 2 ;;
+        --section)   if [[ $# -lt 2 ]] || [[ -z "$2" ]] || [[ "$2" == -* ]]; then echo "Error: --section requires a value"; exit 1; fi; SECTION="$2"; shift 2 ;;
+        --help)      awk '/^###/{n++} n==1' "$0"; exit 0 ;;
         *)           echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -44,8 +44,8 @@ log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
 cleanup() {
     log "Cleaning up..."
-    [[ -n "${MOON_PID:-}" ]] && kill "$MOON_PID" 2>/dev/null; wait "$MOON_PID" 2>/dev/null || true
-    [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
+    if [[ -n "${MOON_PID:-}" ]]; then kill "$MOON_PID" 2>/dev/null || true; wait "$MOON_PID" 2>/dev/null || true; fi
+    if [[ -n "${REDIS_PID:-}" ]]; then kill "$REDIS_PID" 2>/dev/null || true; wait "$REDIS_PID" 2>/dev/null || true; fi
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
     pkill -f "moon.*${PORT_MOON}" 2>/dev/null || true
 }

@@ -584,7 +584,7 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
                 return err_wrong_args("ZRANGESTORE");
             }
         } else {
-            i += 1;
+            return err("ERR syntax error");
         }
     }
 

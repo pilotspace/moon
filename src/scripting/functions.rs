@@ -119,7 +119,17 @@ impl FunctionRegistry {
     /// `redis.register_function(name, fn)` register functions.
     ///
     /// If `replace` is true, an existing library with the same name is replaced.
+    /// Maximum function body size (512 KB, matching Redis default proto-max-bulk-len).
+    const MAX_BODY_SIZE: usize = 512 * 1024;
+
     pub fn load(&mut self, body: &[u8], replace: bool) -> Result<Bytes, LoadError> {
+        if body.len() > Self::MAX_BODY_SIZE {
+            return Err(LoadError::LuaError(format!(
+                "Function body too large ({} bytes, max {})",
+                body.len(),
+                Self::MAX_BODY_SIZE
+            )));
+        }
         let (lib_name, _rest) = parse_shebang(body)?;
 
         // Check for existing library

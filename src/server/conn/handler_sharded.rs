@@ -829,42 +829,41 @@ pub async fn handle_connection_sharded_inner<
                         }
                     }
 
-                    // --- Functions API: FUNCTION subcommands ---
-                    // Placed AFTER ACL check so unprivileged users cannot manage functions.
-                    if cmd.eq_ignore_ascii_case(b"FUNCTION") {
-                        let response = crate::command::functions::handle_function(
-                            &mut func_registry.borrow_mut(), cmd_args,
-                        );
-                        responses.push(response);
-                        continue;
-                    }
-
-                    // --- Functions API: FCALL ---
-                    if cmd.eq_ignore_ascii_case(b"FCALL") {
-                        let response = {
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            let db_count = shard_databases.db_count();
-                            crate::command::functions::handle_fcall(
-                                &func_registry.borrow(), cmd_args, &mut guard,
-                                shard_id, num_shards, selected_db, db_count,
-                            )
-                        };
-                        responses.push(response);
-                        continue;
-                    }
-
-                    // --- Functions API: FCALL_RO ---
-                    if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
-                        let response = {
-                            let mut guard = shard_databases.write_db(shard_id, selected_db);
-                            let db_count = shard_databases.db_count();
-                            crate::command::functions::handle_fcall_ro(
-                                &func_registry.borrow(), cmd_args, &mut guard,
-                                shard_id, num_shards, selected_db, db_count,
-                            )
-                        };
-                        responses.push(response);
-                        continue;
+                    // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
+                    // Placed AFTER ACL check. Respects MULTI queue — if in_multi,
+                    // fall through to the MULTI queue gate instead of executing.
+                    if !in_multi {
+                        if cmd.eq_ignore_ascii_case(b"FUNCTION") {
+                            let response = crate::command::functions::handle_function(
+                                &mut func_registry.borrow_mut(), cmd_args,
+                            );
+                            responses.push(response);
+                            continue;
+                        }
+                        if cmd.eq_ignore_ascii_case(b"FCALL") {
+                            let response = {
+                                let mut guard = shard_databases.write_db(shard_id, selected_db);
+                                let db_count = shard_databases.db_count();
+                                crate::command::functions::handle_fcall(
+                                    &func_registry.borrow(), cmd_args, &mut guard,
+                                    shard_id, num_shards, selected_db, db_count,
+                                )
+                            };
+                            responses.push(response);
+                            continue;
+                        }
+                        if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+                            let response = {
+                                let mut guard = shard_databases.write_db(shard_id, selected_db);
+                                let db_count = shard_databases.db_count();
+                                crate::command::functions::handle_fcall_ro(
+                                    &func_registry.borrow(), cmd_args, &mut guard,
+                                    shard_id, num_shards, selected_db, db_count,
+                                )
+                            };
+                            responses.push(response);
+                            continue;
+                        }
                     }
 
                     // --- CONFIG ---

@@ -49,8 +49,9 @@ pub fn murmurhash64a(key: &[u8], seed: u64) -> u64 {
     // Process 8-byte chunks
     let chunks = len / 8;
     for i in 0..chunks {
-        let mut k =
-            u64::from_le_bytes(key[i * 8..i * 8 + 8].try_into().expect("slice length is 8"));
+        // Loop invariant: i < chunks where chunks = len / 8, so i*8+8 <= len.
+        #[allow(clippy::unwrap_used)]
+        let mut k = u64::from_le_bytes(key[i * 8..i * 8 + 8].try_into().unwrap());
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
@@ -223,22 +224,29 @@ impl SparseOp {
     }
 }
 
-/// Decode one sparse opcode at `data[pos..]`. Returns (op, bytes_consumed).
-fn sparse_decode(data: &[u8], pos: usize) -> (SparseOp, usize) {
+/// Decode one sparse opcode at `data[pos..]`. Returns `Some((op, bytes_consumed))`
+/// or `None` if `pos` is out of bounds or the opcode is truncated.
+fn sparse_decode(data: &[u8], pos: usize) -> Option<(SparseOp, usize)> {
+    if pos >= data.len() {
+        return None;
+    }
     let b = data[pos];
     if b & 0x80 != 0 {
         // VAL: 1vvvvvxx
         let val = ((b >> 2) & 0x1F) + 1;
         let runlen = (b & 0x03) as u16 + 1;
-        (SparseOp::Val(val, runlen), 1)
+        Some((SparseOp::Val(val, runlen), 1))
     } else if b & 0x40 != 0 {
         // XZERO: 01xxxxxx yyyyyyyy (2 bytes)
+        if pos + 1 >= data.len() {
+            return None;
+        }
         let runlen = (((b & 0x3F) as u16) << 8 | data[pos + 1] as u16) + 1;
-        (SparseOp::XZero(runlen), 2)
+        Some((SparseOp::XZero(runlen), 2))
     } else {
         // ZERO: 00xxxxxx
         let runlen = (b & 0x3F) as u16 + 1;
-        (SparseOp::Zero(runlen), 1)
+        Some((SparseOp::Zero(runlen), 1))
     }
 }
 
@@ -388,7 +396,9 @@ impl Hll {
     }
 
     fn cached_card(&self) -> u64 {
-        let raw = u64::from_le_bytes(self.buf[8..16].try_into().expect("8 bytes"));
+        // from_bytes() validates buf.len() >= 16 (HLL_HDR_SIZE); new_sparse/new_dense guarantee it.
+        #[allow(clippy::unwrap_used)]
+        let raw = u64::from_le_bytes(self.buf[8..16].try_into().unwrap());
         raw & !(1u64 << 63)
     }
 
@@ -435,7 +445,9 @@ impl Hll {
         let mut pos = 0;
         let mut reg_idx = 0usize;
         while pos < payload.len() {
-            let (op, consumed) = sparse_decode(payload, pos);
+            let Some((op, consumed)) = sparse_decode(payload, pos) else {
+                break;
+            };
             pos += consumed;
             match op {
                 SparseOp::Zero(n) | SparseOp::XZero(n) => {
@@ -508,7 +520,9 @@ impl Hll {
         let mut found_reg_start = 0;
 
         while pos < payload_len {
-            let (op, consumed) = sparse_decode(payload, pos);
+            let Some((op, consumed)) = sparse_decode(payload, pos) else {
+                break;
+            };
             let span = op.span() as usize;
             if reg_pos + span > index {
                 found_pos = pos;
@@ -601,7 +615,9 @@ impl Hll {
         let payload = self.sparse_payload();
         let mut pos = 0;
         while pos < payload.len() {
-            let (op, consumed) = sparse_decode(payload, pos);
+            let Some((op, consumed)) = sparse_decode(payload, pos) else {
+                break;
+            };
             pos += consumed;
             match op {
                 SparseOp::Zero(n) | SparseOp::XZero(n) => {
@@ -655,7 +671,9 @@ impl Hll {
             let mut pos = 0;
             let mut reg_idx = 0;
             while pos < payload.len() {
-                let (op, consumed) = sparse_decode(payload, pos);
+                let Some((op, consumed)) = sparse_decode(payload, pos) else {
+                    break;
+                };
                 pos += consumed;
                 let span = op.span() as usize;
                 let val = op.value();
@@ -965,11 +983,11 @@ mod tests {
 
         // Decode sparse payload and verify structure
         let payload = &bytes[HLL_HDR_SIZE..];
-        let (op1, c1) = sparse_decode(payload, 0);
+        let (op1, c1) = sparse_decode(payload, 0).unwrap();
         assert!(matches!(op1, SparseOp::XZero(5938)));
-        let (op2, c2) = sparse_decode(payload, c1);
+        let (op2, c2) = sparse_decode(payload, c1).unwrap();
         assert!(matches!(op2, SparseOp::Val(2, 1)));
-        let (op3, _c3) = sparse_decode(payload, c1 + c2);
+        let (op3, _c3) = sparse_decode(payload, c1 + c2).unwrap();
         assert!(matches!(op3, SparseOp::XZero(10445)));
     }
 

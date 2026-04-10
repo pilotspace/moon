@@ -8,7 +8,7 @@ def resp(*args):
     parts = [f"*{len(args)}\r\n"]
     for a in args:
         s = str(a)
-        parts.append(f"${len(s)}\r\n{s}\r\n")
+        parts.append(f"${len(s.encode('utf-8'))}\r\n{s}\r\n")
     return "".join(parts)
 
 def pipe(port, commands):
@@ -16,7 +16,7 @@ def pipe(port, commands):
     data = "".join(commands)
     p = subprocess.run(
         ["redis-cli", "-p", str(port), "--pipe"],
-        input=data.encode(), capture_output=True
+        input=data.encode(), capture_output=True, check=True
     )
 
 def seed(port):
@@ -74,11 +74,11 @@ def seed(port):
     body = '#!lua name=benchlib\nredis.register_function("echo1", function(keys, args) return args[1] end)'
     subprocess.run(
         ["redis-cli", "-p", str(port), "FUNCTION", "FLUSH"],
-        capture_output=True
+        capture_output=True, check=True
     )
     subprocess.run(
         ["redis-cli", "-p", str(port), "FUNCTION", "LOAD", "REPLACE", body],
-        capture_output=True
+        capture_output=True, check=True
     )
 
 if __name__ == "__main__":
