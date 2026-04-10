@@ -37,6 +37,7 @@ pub enum PropertyValue {
 pub type PropertyMap = SmallVec<[(u16, PropertyValue); 4]>;
 
 /// Mutable node in MemGraph adjacency list.
+#[derive(Debug)]
 pub struct MutableNode {
     /// Label dictionary indices.
     pub labels: SmallVec<[u16; 4]>,
@@ -55,6 +56,7 @@ pub struct MutableNode {
 }
 
 /// Mutable edge in MemGraph.
+#[derive(Debug)]
 pub struct MutableEdge {
     /// Source node key.
     pub src: NodeKey,
