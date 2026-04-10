@@ -1,6 +1,9 @@
 use std::io;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+use tracing::info;
+
 /// Map cipher suite name strings to rustls cipher suite constants.
 /// Supports both TLS 1.3 and TLS 1.2 suites from aws-lc-rs provider.
 fn resolve_cipher_suites(names: &str) -> io::Result<Vec<rustls::SupportedCipherSuite>> {
@@ -169,6 +172,97 @@ pub fn build_tls_config(
     };
 
     Ok(Arc::new(config))
+}
+
+/// Shared TLS configuration that supports atomic hot-reload via SIGHUP.
+///
+/// On SIGHUP, cert/key files are re-read from disk and the `ArcSwap` is
+/// updated atomically. In-flight TLS handshakes continue with the old config;
+/// new connections immediately pick up the reloaded config.
+pub type SharedTlsConfig = Arc<ArcSwap<rustls::ServerConfig>>;
+
+/// Wrap a freshly-built `Arc<ServerConfig>` in an `ArcSwap` for hot-reload.
+pub fn make_shared(config: Arc<rustls::ServerConfig>) -> SharedTlsConfig {
+    Arc::new(ArcSwap::from(config))
+}
+
+/// Reload TLS certificates from disk and swap into the shared config.
+///
+/// Returns `Ok(())` on success. On failure, the existing config is untouched
+/// and an error is logged — the server continues serving with the old certs.
+pub fn reload_tls_config(
+    shared: &SharedTlsConfig,
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: Option<&str>,
+    ciphersuites: Option<&str>,
+) -> io::Result<()> {
+    let new_config = build_tls_config(cert_path, key_path, ca_cert_path, ciphersuites)?;
+    shared.store(new_config);
+    info!("TLS certificates reloaded successfully");
+    Ok(())
+}
+
+/// Spawn a background thread that listens for SIGHUP and reloads TLS certs.
+///
+/// Works on both tokio and monoio runtimes — uses a plain OS thread with
+/// `sigwait()` to avoid async runtime dependencies.
+#[cfg(target_os = "linux")]
+pub fn spawn_sighup_reload_thread(
+    shared: SharedTlsConfig,
+    cert_path: String,
+    key_path: String,
+    ca_cert_path: Option<String>,
+    ciphersuites: Option<String>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SIGHUP_REGISTERED: AtomicBool = AtomicBool::new(false);
+    if SIGHUP_REGISTERED.swap(true, Ordering::SeqCst) {
+        tracing::warn!("SIGHUP reload thread already registered, skipping duplicate");
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tls-sighup".to_string())
+        .spawn(move || {
+            // Block SIGHUP in this thread and use sigwait to receive it
+            // SAFETY: sigset_t is a plain C struct, sigemptyset/sigaddset/sigwait
+            // are signal-safe POSIX functions. We block SIGHUP only in this thread.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGHUP);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+
+                loop {
+                    let mut sig: libc::c_int = 0;
+                    let ret = libc::sigwait(&set, &mut sig);
+                    if ret != 0 {
+                        tracing::error!("sigwait failed: {}", io::Error::from_raw_os_error(ret));
+                        continue;
+                    }
+                    if sig == libc::SIGHUP {
+                        info!("SIGHUP received — reloading TLS certificates");
+                        if let Err(e) = reload_tls_config(
+                            &shared,
+                            &cert_path,
+                            &key_path,
+                            ca_cert_path.as_deref(),
+                            ciphersuites.as_deref(),
+                        ) {
+                            tracing::error!(
+                                "TLS reload failed, keeping old certificates: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn TLS SIGHUP reload thread");
+
+    info!("TLS SIGHUP reload thread started — send SIGHUP to reload certificates");
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ impl super::Shard {
     pub async fn run(
         &mut self,
         conn_rx: channel::MpscReceiver<(crate::runtime::TcpStream, bool)>,
-        tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
+        tls_config: Option<crate::tls::SharedTlsConfig>,
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,

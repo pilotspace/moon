@@ -77,7 +77,7 @@ fn take_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
 pub(crate) fn spawn_tokio_connection(
     tcp_stream: tokio::net::TcpStream,
     is_tls: bool,
-    tls_config: &Option<Arc<rustls::ServerConfig>>,
+    tls_config: &Option<crate::tls::SharedTlsConfig>,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
@@ -140,9 +140,9 @@ pub(crate) fn spawn_tokio_connection(
     let reqpass = rtcfg.read().requirepass.clone();
     let clk = cached_clock.clone();
 
-    if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
-        // TLS handshake before handler spawn (wrap-before-spawn pattern)
-        let tls_cfg = tls_cfg_ref.clone();
+    if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
+        // Load current TLS config from ArcSwap — new connections see reloaded certs
+        let tls_cfg = tls_swap.load_full();
         let peer_addr = tcp_stream
             .peer_addr()
             .map(|a| a.to_string())
@@ -365,7 +365,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
 pub(crate) fn spawn_monoio_connection(
     std_tcp_stream: crate::runtime::TcpStream,
     is_tls: bool,
-    tls_config: &Option<Arc<rustls::ServerConfig>>,
+    tls_config: &Option<crate::tls::SharedTlsConfig>,
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
@@ -442,9 +442,9 @@ pub(crate) fn spawn_monoio_connection(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
 
-            if let (true, Some(tls_cfg_ref)) = (is_tls, tls_config.as_ref()) {
-                // Monoio TLS handshake before handler spawn
-                let tls_cfg = tls_cfg_ref.clone();
+            if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
+                // Load current TLS config from ArcSwap — new connections see reloaded certs
+                let tls_cfg = tls_swap.load_full();
                 monoio::spawn(async move {
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     match acceptor.accept(tcp_stream).await {

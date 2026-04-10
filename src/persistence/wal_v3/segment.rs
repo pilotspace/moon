@@ -203,6 +203,7 @@ impl WalWriterV3 {
     }
 
     /// Rotate to a new segment: flush + fsync current, open next.
+    #[tracing::instrument(skip_all, level = "debug")]
     fn rotate_segment(&mut self) -> std::io::Result<()> {
         // Flush remaining buffer to current segment
         if let Some(ref mut file) = self.current_file {

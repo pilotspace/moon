@@ -43,8 +43,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Build TLS configuration if tls_port is set
-    let tls_config: Option<std::sync::Arc<rustls::ServerConfig>> = if config.tls_port > 0 {
+    // Build TLS configuration if tls_port is set.
+    // Uses ArcSwap for SIGHUP-based certificate hot-reload.
+    let tls_config: Option<moon::tls::SharedTlsConfig> = if config.tls_port > 0 {
         let cert = config
             .tls_cert_file
             .as_ref()
@@ -64,7 +65,19 @@ fn main() -> anyhow::Result<()> {
             "TLS enabled on port {} (TLS 1.3, rustls + aws-lc-rs)",
             config.tls_port
         );
-        Some(tls_cfg)
+        let shared = moon::tls::make_shared(tls_cfg);
+
+        // Spawn SIGHUP reload thread (Linux only)
+        #[cfg(target_os = "linux")]
+        moon::tls::spawn_sighup_reload_thread(
+            shared.clone(),
+            cert.clone(),
+            key.clone(),
+            config.tls_ca_cert_file.clone(),
+            config.tls_ciphersuites.clone(),
+        );
+
+        Some(shared)
     } else {
         None
     };
