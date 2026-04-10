@@ -586,9 +586,7 @@ pub fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
 /// MEMORY DOCTOR — report memory health issues.
 pub fn memory_doctor() -> Frame {
     // Basic health report
-    Frame::BulkString(Bytes::from_static(
-        b"Sam, I have no memory problems",
-    ))
+    Frame::BulkString(Bytes::from_static(b"Sam, I have no memory problems"))
 }
 
 /// MEMORY HELP — list MEMORY subcommands.
