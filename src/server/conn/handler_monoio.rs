@@ -113,7 +113,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
     );
     struct RegistryGuard(u64);
     impl Drop for RegistryGuard {
-        fn drop(&mut self) { crate::client_registry::deregister(self.0); }
+        fn drop(&mut self) {
+            crate::client_registry::deregister(self.0);
+        }
     }
     let _registry_guard = RegistryGuard(client_id);
 
@@ -438,7 +440,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             tmp_buf = returned_buf;
             match result {
                 Ok(0) => break,
-                Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                Ok(n) => {
+                    read_buf.extend_from_slice(&tmp_buf[..n]);
+                }
                 Err(_) => break,
             }
         }
@@ -903,8 +907,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 )));
                             } else {
                                 conn.client_name = extract_bytes(&cmd_args[1]);
-                                let name_str = conn.client_name.as_ref().map(|b| String::from_utf8_lossy(b).to_string());
-                                crate::client_registry::update(client_id, |e| { e.name = name_str; });
+                                let name_str = conn
+                                    .client_name
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string());
+                                crate::client_registry::update(client_id, |e| {
+                                    e.name = name_str;
+                                });
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             }
                             continue;
@@ -980,13 +989,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 e.db = conn.selected_db;
                                 e.last_cmd_at = std::time::Instant::now();
                             });
-                            let info = crate::client_registry::client_info(client_id)
-                                .unwrap_or_default();
+                            let info =
+                                crate::client_registry::client_info(client_id).unwrap_or_default();
                             responses.push(Frame::BulkString(Bytes::from(info)));
                             continue;
                         }
                         if sub_bytes.eq_ignore_ascii_case(b"KILL") {
-                            let raw_args: Vec<&[u8]> = cmd_args[1..].iter()
+                            let raw_args: Vec<&[u8]> = cmd_args[1..]
+                                .iter()
                                 .filter_map(|f| match f {
                                     Frame::BulkString(b) => Some(b.as_ref()),
                                     Frame::SimpleString(b) => Some(b.as_ref()),
@@ -1017,18 +1027,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     Frame::SimpleString(b) => Some(b.as_ref()),
                                     _ => None,
                                 };
-                                match timeout_bytes.and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<u64>().ok()) {
+                                match timeout_bytes
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
                                     Some(ms) => {
                                         let mode = if cmd_args.len() > 2 {
                                             match &cmd_args[2] {
-                                                Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"WRITE") => crate::client_pause::PauseMode::Write,
+                                                Frame::BulkString(b) | Frame::SimpleString(b)
+                                                    if b.eq_ignore_ascii_case(b"WRITE") =>
+                                                {
+                                                    crate::client_pause::PauseMode::Write
+                                                }
                                                 _ => crate::client_pause::PauseMode::All,
                                             }
                                         } else {
                                             crate::client_pause::PauseMode::All
                                         };
                                         crate::client_pause::pause(ms, mode);
-                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        responses
+                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     }
                                     None => {
                                         responses.push(Frame::Error(Bytes::from_static(
@@ -1044,7 +1062,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             continue;
                         }
-                        if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT") || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH") {
+                        if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
+                            || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
+                        {
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             continue;
                         }

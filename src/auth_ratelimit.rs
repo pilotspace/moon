@@ -62,7 +62,10 @@ pub fn record_failure(ip: IpAddr) -> u64 {
     record.last_failure = now;
 
     // Exponential backoff: 100ms * 2^(count-1), capped at 10s
-    let delay = BASE_DELAY_MS.saturating_mul(1u64.checked_shl(record.count.saturating_sub(1)).unwrap_or(u64::MAX));
+    let delay = BASE_DELAY_MS.saturating_mul(
+        1u64.checked_shl(record.count.saturating_sub(1))
+            .unwrap_or(u64::MAX),
+    );
     delay.min(MAX_DELAY_MS)
 }
 
@@ -92,11 +95,11 @@ mod tests {
     fn test_exponential_backoff() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101));
         record_success(ip);
-        assert_eq!(record_failure(ip), 100);   // 100 * 2^0
-        assert_eq!(record_failure(ip), 200);   // 100 * 2^1
-        assert_eq!(record_failure(ip), 400);   // 100 * 2^2
-        assert_eq!(record_failure(ip), 800);   // 100 * 2^3
-        assert_eq!(record_failure(ip), 1600);  // 100 * 2^4
+        assert_eq!(record_failure(ip), 100); // 100 * 2^0
+        assert_eq!(record_failure(ip), 200); // 100 * 2^1
+        assert_eq!(record_failure(ip), 400); // 100 * 2^2
+        assert_eq!(record_failure(ip), 800); // 100 * 2^3
+        assert_eq!(record_failure(ip), 1600); // 100 * 2^4
         record_success(ip);
     }
 

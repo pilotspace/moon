@@ -75,7 +75,9 @@ pub(crate) async fn handle_connection_sharded(
     let maxclients = ctx.runtime_config.read().maxclients;
     if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(b"-ERR max number of clients reached\r\n").await;
+        let _ = stream
+            .write_all(b"-ERR max number of clients reached\r\n")
+            .await;
         return;
     }
     let peer_addr = stream
@@ -230,7 +232,9 @@ pub(crate) async fn handle_connection_sharded_inner<
     );
     struct RegistryGuard(u64);
     impl Drop for RegistryGuard {
-        fn drop(&mut self) { crate::client_registry::deregister(self.0); }
+        fn drop(&mut self) {
+            crate::client_registry::deregister(self.0);
+        }
     }
     let _registry_guard = RegistryGuard(client_id);
 

@@ -99,7 +99,7 @@ mod tests {
         let _lock = TEST_LOCK.lock();
         unpause();
         pause(5000, PauseMode::Write);
-        assert!(check_pause(true).is_some());  // write blocked
+        assert!(check_pause(true).is_some()); // write blocked
         assert!(check_pause(false).is_none()); // read allowed
         unpause();
     }

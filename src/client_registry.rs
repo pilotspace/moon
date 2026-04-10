@@ -249,7 +249,10 @@ mod tests {
     fn test_update() {
         let id = 999_003;
         register(id, "10.0.0.5:8000".into(), "default".into(), 0);
-        update(id, |e| { e.name = Some("myconn".into()); e.db = 3; });
+        update(id, |e| {
+            e.name = Some("myconn".into());
+            e.db = 3;
+        });
         let info = client_info(id).unwrap();
         assert!(info.contains("name=myconn"));
         assert!(info.contains("db=3"));

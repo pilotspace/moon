@@ -81,8 +81,7 @@ fn set_tcp_keepalive(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
     // SAFETY: we borrow the fd temporarily — socket2::Socket does NOT take ownership
     // because we call into_raw_fd() before this scope ends, preventing double-close.
     let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
-    let ka = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(keepalive_secs));
+    let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(keepalive_secs));
     // Ignore errors — keepalive is best-effort
     let _ = sock.set_tcp_keepalive(&ka);
     // Release ownership back — we don't own this fd
@@ -212,7 +211,10 @@ pub(crate) fn spawn_tokio_connection(
         tokio::task::spawn_local(async move {
             // maxclients check for TLS connections (plain TCP checks in handle_connection_sharded)
             if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                tracing::warn!("Shard {}: TLS connection rejected: maxclients reached", shard_id);
+                tracing::warn!(
+                    "Shard {}: TLS connection rejected: maxclients reached",
+                    shard_id
+                );
                 return;
             }
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
@@ -511,7 +513,10 @@ pub(crate) fn spawn_monoio_connection(
                 let tls_cfg = tls_swap.load_full();
                 monoio::spawn(async move {
                     if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                        tracing::warn!("Shard {}: TLS connection rejected: maxclients reached", shard_id);
+                        tracing::warn!(
+                            "Shard {}: TLS connection rejected: maxclients reached",
+                            shard_id
+                        );
                         return;
                     }
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
@@ -548,7 +553,10 @@ pub(crate) fn spawn_monoio_connection(
                 let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
                     if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
-                        tracing::warn!("Shard {}: connection rejected: maxclients reached", shard_id);
+                        tracing::warn!(
+                            "Shard {}: connection rejected: maxclients reached",
+                            shard_id
+                        );
                         return;
                     }
                     let _result = handle_connection_sharded_monoio(
