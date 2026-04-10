@@ -11,6 +11,7 @@ pub mod memgraph;
 pub mod replay;
 pub mod scoring;
 pub mod segment;
+pub mod stats;
 pub mod store;
 pub mod traversal;
 pub mod traversal_guard;
@@ -30,4 +31,5 @@ pub use hybrid::{
     VectorToGraphExpansion,
 };
 pub use index::{EdgeTypeIndex, LabelIndex, MphNodeIndex, PropertyIndex};
+pub use stats::GraphStats;
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};
