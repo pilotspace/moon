@@ -1,17 +1,19 @@
-//! Connection state machine types for the ConnectionCore extraction (HYGIENE-02).
+//! Connection state machine types shared across all handlers.
 //!
-//! This module defines the shared types that will replace the 40+ parameter lists
-//! in handler_monoio, handler_sharded, and handler_single. The extraction proceeds
-//! in phases:
+//! `ConnectionContext` bundles the immutable per-shard references that every connection
+//! handler needs (databases, pubsub, ACL, config, etc.). Created once per shard and
+//! passed by reference to each connection handler.
 //!
-//! Phase 1 (this file): Define types. No handler changes yet.
-//! Phase 2: Migrate handler_single to use ConnectionContext + ConnectionState.
-//! Phase 3: Migrate handler_sharded and handler_monoio.
-//! Phase 4: Extract shared command routing into ConnectionCore::dispatch().
+//! `ConnectionState` bundles per-connection mutable state (selected_db, auth, pubsub,
+//! tracking, transactions, etc.). Initialized fresh per connection or restored from
+//! `MigratedConnectionState`.
+//!
+//! Phase 4 (future): Extract shared command routing into ConnectionCore::dispatch().
 
 use bytes::Bytes;
 use ringbuf::HeapProd;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -30,14 +32,12 @@ use crate::tracking::{TrackingState, TrackingTable};
 use super::affinity::{AffinityTracker, MigratedConnectionState};
 
 /// Type alias for std::sync::RwLock to distinguish from parking_lot::RwLock.
-#[allow(dead_code)]
-type StdRwLock<T> = std::sync::RwLock<T>;
+pub(crate) type StdRwLock<T> = std::sync::RwLock<T>;
 
 /// Immutable context shared across all connections on a shard.
 ///
 /// Created once per shard and passed by reference to each connection handler.
 /// Nothing in this struct is mutated during connection lifetime.
-#[allow(dead_code)]
 pub(crate) struct ConnectionContext {
     pub shard_databases: Arc<ShardDatabases>,
     pub shard_id: usize,
@@ -70,11 +70,78 @@ pub(crate) struct ConnectionContext {
     pub disk_offload_dir: Option<std::path::PathBuf>,
 }
 
+impl ConnectionContext {
+    /// Construct a new ConnectionContext from all required fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        shard_databases: Arc<ShardDatabases>,
+        shard_id: usize,
+        num_shards: usize,
+        pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
+        blocking_registry: Rc<RefCell<BlockingRegistry>>,
+        requirepass: Option<String>,
+        aof_tx: Option<channel::MpscSender<AofMessage>>,
+        tracking_table: Rc<RefCell<TrackingTable>>,
+        repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+        cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
+        lua: Rc<mlua::Lua>,
+        script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
+        config_port: u16,
+        acl_table: Arc<StdRwLock<AclTable>>,
+        runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
+        config: Arc<ServerConfig>,
+        dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+        spsc_notifiers: Vec<Arc<channel::Notify>>,
+        snapshot_trigger_tx: channel::WatchSender<u64>,
+        cached_clock: CachedClock,
+        remote_subscriber_map: Arc<
+            parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+        >,
+        all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
+        all_remote_sub_maps: Vec<
+            Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>,
+        >,
+        pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
+        spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+        spill_file_id: Rc<std::cell::Cell<u64>>,
+        disk_offload_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            shard_databases,
+            shard_id,
+            num_shards,
+            pubsub_registry,
+            blocking_registry,
+            requirepass,
+            aof_tx,
+            tracking_table,
+            repl_state,
+            cluster_state,
+            lua,
+            script_cache,
+            config_port,
+            acl_table,
+            runtime_config,
+            config,
+            dispatch_tx,
+            spsc_notifiers,
+            snapshot_trigger_tx,
+            cached_clock,
+            remote_subscriber_map,
+            all_pubsub_registries,
+            all_remote_sub_maps,
+            pubsub_affinity,
+            spill_sender,
+            spill_file_id,
+            disk_offload_dir,
+        }
+    }
+}
+
 /// Per-connection mutable state.
 ///
 /// Initialized fresh per connection (or restored from `MigratedConnectionState`).
 /// Bundling these fields eliminates the 15+ local variables at the top of each handler.
-#[allow(dead_code)]
 pub(crate) struct ConnectionState {
     pub client_id: u64,
     pub peer_addr: String,
@@ -103,6 +170,9 @@ pub(crate) struct ConnectionState {
     pub tracking_state: TrackingState,
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
 
+    // WATCH/EXEC optimistic locking (handler_single only)
+    pub watched_keys: HashMap<Bytes, u32>,
+
     // Connection affinity (migration)
     pub affinity_tracker: Option<AffinityTracker>,
     pub migration_target: Option<usize>,
@@ -110,7 +180,6 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     /// Create fresh connection state for a new client.
-    #[allow(dead_code)]
     pub fn new(
         client_id: u64,
         peer_addr: String,
@@ -143,6 +212,7 @@ impl ConnectionState {
             command_queue: Vec::new(),
             tracking_state: TrackingState::default(),
             tracking_rx: None,
+            watched_keys: HashMap::new(),
             affinity_tracker: if num_shards > 1 && can_migrate {
                 Some(AffinityTracker::new(shard_id, num_shards))
             } else {
@@ -156,7 +226,6 @@ impl ConnectionState {
 /// Action returned by ConnectionCore's command processing.
 ///
 /// Handlers translate these into runtime-specific I/O operations.
-#[allow(dead_code)]
 pub(crate) enum CoreAction {
     /// Write response frame(s) to the client.
     Respond(Vec<Frame>),
