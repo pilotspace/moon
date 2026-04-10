@@ -329,6 +329,28 @@ pub fn handle_acl(
             }
         }
 
+        "GENPASS" => {
+            // ACL GENPASS [bits] — generate cryptographically secure random password
+            let bits: usize = if let Some(arg) = args.first() {
+                match extract_str(arg).and_then(|s| s.parse().ok()) {
+                    Some(b) if b > 0 && b <= 4096 => b,
+                    _ => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR ACL GENPASS argument must be a positive integer up to 4096",
+                        ));
+                    }
+                }
+            } else {
+                256 // default: 256 bits = 64 hex chars
+            };
+            let byte_count = (bits + 7) / 8;
+            let buf: Vec<u8> = (0..byte_count).map(|_| rand::random::<u8>()).collect();
+            let hex = hex::encode(&buf);
+            // Truncate to exact number of hex chars for the requested bits
+            let hex_chars = (bits + 3) / 4; // 4 bits per hex char
+            Frame::BulkString(Bytes::from(hex[..hex_chars].to_string()))
+        }
+
         _ => Frame::Error(Bytes::from(format!(
             "ERR unknown subcommand '{}'. Try ACL HELP.",
             sub
@@ -667,6 +689,53 @@ mod tests {
         let mut log = AclLog::new(128);
         let rc = make_runtime_config();
         let args = vec![Frame::BulkString(Bytes::from_static(b"INVALID"))];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_acl_genpass_default() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+        let args = vec![Frame::BulkString(Bytes::from_static(b"GENPASS"))];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        match result {
+            Frame::BulkString(b) => {
+                assert_eq!(b.len(), 64); // 256 bits = 64 hex chars
+                assert!(b.iter().all(|&c| c.is_ascii_hexdigit()));
+            }
+            _ => panic!("Expected BulkString, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_acl_genpass_custom_bits() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"GENPASS")),
+            Frame::BulkString(Bytes::from_static(b"128")),
+        ];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
+        match result {
+            Frame::BulkString(b) => {
+                assert_eq!(b.len(), 32); // 128 bits = 32 hex chars
+            }
+            _ => panic!("Expected BulkString"),
+        }
+    }
+
+    #[test]
+    fn test_acl_genpass_invalid_bits() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"GENPASS")),
+            Frame::BulkString(Bytes::from_static(b"0")),
+        ];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc);
         assert!(matches!(result, Frame::Error(_)));
     }
