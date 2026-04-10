@@ -614,11 +614,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // monoio: per-shard SO_REUSEPORT accept is re-enabled on Linux.
-        // The io_uring cancel/resubmit race in monoio::select! is avoided by using
-        // a dedicated monoio::spawn() accept task instead of an accept branch in select!.
-        // Central listener remains as fallback for TLS or non-Linux platforms.
-        let per_shard_accept = cfg!(target_os = "linux");
+        // monoio: central listener always accepts (per_shard_accept=false).
+        // Per-shard SO_REUSEPORT accept is handled by dedicated monoio::spawn() tasks
+        // in each shard's event loop (avoids the io_uring cancel/resubmit race in select!).
+        // The central listener and per-shard listeners coexist via SO_REUSEPORT:
+        // kernel distributes connections across all bound sockets, per-shard handles some
+        // directly (no MPSC hop), central forwards the rest via conn_txs.
+        let per_shard_accept = false;
         RuntimeFactoryImpl::block_on_local("listener".to_string(), async move {
             if let Err(e) = server::listener::run_sharded(
                 config,
