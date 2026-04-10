@@ -236,6 +236,12 @@ fn dispatch_inner(
             }
         }
         // 5-letter commands
+        (5, b'b') => {
+            // BITOP
+            if cmd.eq_ignore_ascii_case(b"BITOP") {
+                return resp(string::bitop(db, args));
+            }
+        }
         (5, b'g') => {
             // GETEX
             if cmd.eq_ignore_ascii_case(b"GETEX") {
@@ -358,6 +364,12 @@ fn dispatch_inner(
             }
         }
         // 6-letter commands
+        (6, b'b') => {
+            // BITPOS
+            if cmd.eq_ignore_ascii_case(b"BITPOS") {
+                return resp(string::bitpos(db, args));
+            }
+        }
         (6, b'a') => {
             // APPEND
             if cmd.eq_ignore_ascii_case(b"APPEND") {
@@ -383,7 +395,10 @@ fn dispatch_inner(
             }
         }
         (6, b'g') => {
-            // GETSET GETDEL
+            // GETBIT GETSET GETDEL
+            if cmd.eq_ignore_ascii_case(b"GETBIT") {
+                return resp(string::getbit(db, args));
+            }
             if cmd.eq_ignore_ascii_case(b"GETSET") {
                 return resp(string::getset(db, args));
             }
@@ -446,6 +461,9 @@ fn dispatch_inner(
                 b'e' => {
                     if cmd.eq_ignore_ascii_case(b"SELECT") {
                         return resp(connection::select(args, selected_db, db_count));
+                    }
+                    if cmd.eq_ignore_ascii_case(b"SETBIT") {
+                        return resp(string::setbit(db, args));
                     }
                 }
                 b't' => {
@@ -577,6 +595,12 @@ fn dispatch_inner(
             // GETRANGE
             if cmd.eq_ignore_ascii_case(b"GETRANGE") {
                 return resp(string::getrange(db, args));
+            }
+        }
+        (8, b'b') => {
+            // BITCOUNT BITFIELD
+            if cmd.eq_ignore_ascii_case(b"BITCOUNT") {
+                return resp(string::bitcount(db, args));
             }
         }
         (8, b'r') => {
@@ -769,13 +793,16 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
         | (5, b's')  // SCARD, SDIFF, SSCAN
         | (5, b'z')  // ZCARD, ZRANK, ZSCAN
+        | (6, b'b')  // BITPOS
         | (6, b'e')  // EXISTS
+        | (6, b'g')  // GETBIT
         | (6, b'l')  // LRANGE, LINDEX
         | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
         | (7, b'h')  // HGETALL, HEXISTS
         | (7, b'p')  // PFCOUNT
+        | (8, b'b')  // BITCOUNT
         | (8, b'g')  // GETRANGE
         | (8, b's')  // SMEMBERS
         | (8, b'z')  // ZREVRANK
@@ -928,10 +955,22 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(sorted_set::zscan_readonly(db, args, now_ms));
             }
         }
+        (6, b'b') => {
+            // BITPOS
+            if cmd.eq_ignore_ascii_case(b"BITPOS") {
+                return resp(string::bitpos_readonly(db, args, now_ms));
+            }
+        }
         (6, b'e') => {
             // EXISTS
             if cmd.eq_ignore_ascii_case(b"EXISTS") {
                 return resp(key::exists_readonly(db, args, now_ms));
+            }
+        }
+        (6, b'g') => {
+            // GETBIT
+            if cmd.eq_ignore_ascii_case(b"GETBIT") {
+                return resp(string::getbit_readonly(db, args, now_ms));
             }
         }
         (6, b'l') => {
@@ -989,6 +1028,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // PFCOUNT (read-only path)
             if cmd.eq_ignore_ascii_case(b"PFCOUNT") {
                 return resp(hll::pfcount_readonly(db, args, now_ms));
+            }
+        }
+        (8, b'b') => {
+            // BITCOUNT
+            if cmd.eq_ignore_ascii_case(b"BITCOUNT") {
+                return resp(string::bitcount_readonly(db, args, now_ms));
             }
         }
         (8, b'g') => {

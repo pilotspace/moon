@@ -295,6 +295,8 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "PEXPIRETIME" => CommandMeta { name: "PEXPIRETIME", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
 
     // ---- Bitmap commands ----
+    "GETBIT" => CommandMeta { name: "GETBIT", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "SETBIT" => CommandMeta { name: "SETBIT", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "BITCOUNT" => CommandMeta { name: "BITCOUNT", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "BITOP" => CommandMeta { name: "BITOP", arity: -4, flags: W, first_key: 2, last_key: -1, step: 1, acl_categories: STR },
     "BITFIELD" => CommandMeta { name: "BITFIELD", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
@@ -687,6 +689,8 @@ mod tests {
             b"RENAME",
             b"RENAMENX",
             b"COPY",
+            b"SETBIT",
+            b"BITOP",
             b"HSET",
             b"HMSET",
             b"HDEL",

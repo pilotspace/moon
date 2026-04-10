@@ -561,6 +561,20 @@ if should_run "key"; then
     assert_moon_ok "SCAN cursor"       SCAN 0
     assert_moon_ok "KEYS pattern"      KEYS "k:*"
     assert_moon_ok "OBJECT HELP"       OBJECT HELP
+
+    # Bit operations
+    rcli SET k:bits "\xff\x0f" >/dev/null 2>&1; mcli SET k:bits "\xff\x0f" >/dev/null 2>&1
+    assert_match "GETBIT"              GETBIT k:bits 0
+    assert_match "SETBIT"              SETBIT k:bits 0 0
+    assert_match "BITCOUNT"            BITCOUNT k:bits
+    assert_match "BITCOUNT range"      BITCOUNT k:bits 0 0
+    rcli SET k:bits2 "\x0f\xff" >/dev/null 2>&1; mcli SET k:bits2 "\x0f\xff" >/dev/null 2>&1
+    assert_match "BITOP AND"           BITOP AND k:bitdst k:bits k:bits2
+    assert_match "BITOP OR"            BITOP OR k:bitdst k:bits k:bits2
+    assert_match "BITOP XOR"           BITOP XOR k:bitdst k:bits k:bits2
+    assert_match "BITOP NOT"           BITOP NOT k:bitdst k:bits
+    assert_match "BITPOS 1"            BITPOS k:bits 1
+    assert_match "BITPOS 0"            BITPOS k:bits 0
 fi
 
 # ===========================================================================

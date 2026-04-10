@@ -487,6 +487,28 @@ assert_both "GET COPY no REPLACE" GET edge:cpdst2
 assert_both "COPY REPLACE" COPY edge:cpsrc edge:cpdst2 REPLACE
 assert_both "GET after COPY REPLACE" GET edge:cpdst2
 
+# SETBIT / GETBIT
+both SETBIT edge:bits 7 1
+assert_both "GETBIT set" GETBIT edge:bits 7
+assert_both "GETBIT unset" GETBIT edge:bits 0
+both SETBIT edge:bits 0 1
+assert_both "BITCOUNT" BITCOUNT edge:bits
+
+# BITOP
+both SET edge:bop1 "\xff"
+both SET edge:bop2 "\x0f"
+assert_both "BITOP AND" BITOP AND edge:bopdst edge:bop1 edge:bop2
+assert_both "GET BITOP AND" GET edge:bopdst
+assert_both "BITOP OR" BITOP OR edge:bopdst edge:bop1 edge:bop2
+assert_both "GET BITOP OR" GET edge:bopdst
+assert_both "BITOP NOT" BITOP NOT edge:bopdst edge:bop1
+assert_both "GET BITOP NOT" GET edge:bopdst
+
+# BITPOS
+both SET edge:bpos "\x00\xff"
+assert_both "BITPOS 1" BITPOS edge:bpos 1
+assert_both "BITPOS 0" BITPOS edge:bpos 0
+
 # ===========================================================================
 # Summary
 # ===========================================================================

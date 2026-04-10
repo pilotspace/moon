@@ -1,6 +1,8 @@
+mod string_bit;
 mod string_read;
 mod string_write;
 
+pub use string_bit::*;
 pub use string_read::*;
 pub use string_write::*;
 
