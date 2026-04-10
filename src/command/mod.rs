@@ -8,6 +8,7 @@ pub mod hash;
 pub mod helpers;
 pub mod hll;
 pub mod key;
+pub mod key_extra;
 pub mod list;
 pub mod metadata;
 pub mod persistence;
@@ -98,7 +99,7 @@ fn dispatch_inner(
         (4, b'c') => {
             // COPY
             if cmd.eq_ignore_ascii_case(b"COPY") {
-                return resp(key::copy(db, args));
+                return resp(key_extra::copy(db, args));
             }
         }
         (4, b'd') => {
@@ -206,7 +207,7 @@ fn dispatch_inner(
                 return resp(set::spop(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"SORT") {
-                return resp(key::sort(db, args));
+                return resp(key_extra::sort(db, args));
             }
         }
         (4, b't') => {
@@ -446,13 +447,13 @@ fn dispatch_inner(
                 if let Some(sub) = args.first() {
                     if let Some(sub_bytes) = crate::command::helpers::extract_bytes(sub) {
                         if sub_bytes.eq_ignore_ascii_case(b"USAGE") {
-                            return resp(key::memory_usage(db, &args[1..]));
+                            return resp(key_extra::memory_usage(db, &args[1..]));
                         }
                         if sub_bytes.eq_ignore_ascii_case(b"DOCTOR") {
-                            return resp(key::memory_doctor());
+                            return resp(key_extra::memory_doctor());
                         }
                         if sub_bytes.eq_ignore_ascii_case(b"HELP") {
-                            return resp(key::memory_help());
+                            return resp(key_extra::memory_help());
                         }
                     }
                 }
