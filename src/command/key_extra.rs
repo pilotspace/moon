@@ -38,7 +38,6 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         };
         if arg.eq_ignore_ascii_case(b"REPLACE") {
             replace = true;
-            i += 1;
         } else if arg.eq_ignore_ascii_case(b"DB") {
             // Cross-DB copy requires shard_databases context not available here
             return Frame::Error(Bytes::from_static(
@@ -47,16 +46,17 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         } else {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
+        i += 1;
     }
 
-    // Check if source exists (with lazy expiry)
+    // Redis returns 0 (not error) when source doesn't exist
     if !db.exists(src) {
-        return Frame::Error(Bytes::from_static(b"ERR no such key"));
+        return Frame::Integer(0);
     }
 
-    // Same key: no data to copy, but it's valid
+    // Same key: source == dest, nothing to do
     if src == dst {
-        return Frame::Integer(1);
+        return Frame::Integer(0);
     }
 
     // Check if destination exists
@@ -247,11 +247,26 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
         elements.iter().map(|e| Some(e.clone())).collect()
     };
 
+    // For numeric sort (no ALPHA), validate all sort keys are parseable as f64
+    let no_sort = by_pattern.is_some_and(|p| p == b"nosort");
+    if !alpha && !no_sort {
+        for sk in &sort_keys {
+            if let Some(v) = sk {
+                if std::str::from_utf8(v)
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .is_none()
+                {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR One or more scores can't be converted into double",
+                    ));
+                }
+            }
+        }
+    }
+
     // Create indexed pairs for stable sort
     let mut indices: Vec<usize> = (0..elements.len()).collect();
-
-    // Sort (skip if BY nosort)
-    let no_sort = by_pattern.is_some_and(|p| p == b"nosort");
     if !no_sort {
         indices.sort_by(|&a, &b| {
             let ka = sort_keys[a].as_ref();
@@ -401,14 +416,16 @@ mod tests {
     fn test_copy_nonexistent_source() {
         let mut db = Database::new();
         let result = copy(&mut db, &[bs(b"nosuchkey"), bs(b"dst")]);
-        assert!(matches!(result, Frame::Error(_)));
+        // Redis returns 0 for missing source, not error
+        assert_eq!(result, Frame::Integer(0));
     }
 
     #[test]
     fn test_copy_same_key() {
         let mut db = setup_db_with_key(b"src", b"hello");
         let result = copy(&mut db, &[bs(b"src"), bs(b"src")]);
-        assert_eq!(result, Frame::Integer(1));
+        // Redis returns 0 for same-key copy
+        assert_eq!(result, Frame::Integer(0));
     }
 
     #[test]

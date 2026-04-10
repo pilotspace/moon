@@ -232,8 +232,8 @@ pub fn bitcount(db: &mut Database, args: &[Frame]) -> Frame {
     if use_bit {
         // BIT mode: count bits in the bit range
         let total_bits = (data.len() * 8) as i64;
-        let s = normalize_index(start, total_bits);
-        let e = normalize_index(end, total_bits);
+        let s = normalize_start(start, total_bits);
+        let e = normalize_end(end, total_bits);
         if s > e {
             return Frame::Integer(0);
         }
@@ -242,8 +242,8 @@ pub fn bitcount(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         // BYTE mode (default): count bits in the byte range
         let len = data.len() as i64;
-        let s = normalize_index(start, len);
-        let e = normalize_index(end, len);
+        let s = normalize_start(start, len);
+        let e = normalize_end(end, len);
         if s > e {
             return Frame::Integer(0);
         }
@@ -318,8 +318,8 @@ pub fn bitcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
     if use_bit {
         let total_bits = (data.len() * 8) as i64;
-        let s = normalize_index(start, total_bits);
-        let e = normalize_index(end, total_bits);
+        let s = normalize_start(start, total_bits);
+        let e = normalize_end(end, total_bits);
         if s > e {
             return Frame::Integer(0);
         }
@@ -327,8 +327,8 @@ pub fn bitcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Frame::Integer(count as i64)
     } else {
         let len = data.len() as i64;
-        let s = normalize_index(start, len);
-        let e = normalize_index(end, len);
+        let s = normalize_start(start, len);
+        let e = normalize_end(end, len);
         if s > e {
             return Frame::Integer(0);
         }
@@ -534,8 +534,8 @@ pub fn bitpos(db: &mut Database, args: &[Frame]) -> Frame {
 
     if use_bit {
         let total_bits = (data.len() * 8) as i64;
-        let s = normalize_index(start, total_bits) as usize;
-        let e = normalize_index(end, total_bits) as usize;
+        let s = normalize_start(start, total_bits) as usize;
+        let e = normalize_end(end, total_bits) as usize;
         if s > e {
             return Frame::Integer(-1);
         }
@@ -552,8 +552,8 @@ pub fn bitpos(db: &mut Database, args: &[Frame]) -> Frame {
         Frame::Integer(-1)
     } else {
         let len = data.len() as i64;
-        let s = normalize_index(start, len) as usize;
-        let e = normalize_index(end, len) as usize;
+        let s = normalize_start(start, len) as usize;
+        let e = normalize_end(end, len) as usize;
         if s > e {
             return Frame::Integer(-1);
         }
@@ -672,8 +672,8 @@ pub fn bitpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
     if use_bit {
         let total_bits = (data.len() * 8) as i64;
-        let s = normalize_index(start, total_bits) as usize;
-        let e = normalize_index(end, total_bits) as usize;
+        let s = normalize_start(start, total_bits) as usize;
+        let e = normalize_end(end, total_bits) as usize;
         if s > e {
             return Frame::Integer(-1);
         }
@@ -690,8 +690,8 @@ pub fn bitpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Frame::Integer(-1)
     } else {
         let len = data.len() as i64;
-        let s = normalize_index(start, len) as usize;
-        let e = normalize_index(end, len) as usize;
+        let s = normalize_start(start, len) as usize;
+        let e = normalize_end(end, len) as usize;
         if s > e {
             return Frame::Integer(-1);
         }
@@ -712,8 +712,19 @@ pub fn bitpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 }
 
-/// Normalize a Redis index (negative = from end) to a 0-based clamped index.
-fn normalize_index(idx: i64, len: i64) -> i64 {
+/// Normalize a start index: negative wraps from end, positive stays unclamped
+/// so callers detect empty ranges via `start > end`.
+fn normalize_start(idx: i64, len: i64) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let normalized = if idx < 0 { len + idx } else { idx };
+    normalized.max(0)
+}
+
+/// Normalize an end index: negative wraps from end, clamped to `len - 1`
+/// to prevent out-of-bounds slicing.
+fn normalize_end(idx: i64, len: i64) -> i64 {
     if len == 0 {
         return 0;
     }

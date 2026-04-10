@@ -699,13 +699,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                         } else { 0 }
                     };
                     if pause_wait_ms > 0 {
-                        #[cfg(feature = "runtime-tokio")]
-                        {
-                            tokio::time::sleep(std::time::Duration::from_millis(pause_wait_ms)).await;
-                        }
-                        #[cfg(feature = "runtime-monoio")]
-                        {
-                            monoio::time::sleep(std::time::Duration::from_millis(pause_wait_ms)).await;
+                        // Poll in 50ms intervals so CLIENT UNPAUSE takes effect quickly
+                        let mut remaining = pause_wait_ms;
+                        while remaining > 0 {
+                            let chunk = remaining.min(50);
+                            #[cfg(feature = "runtime-tokio")]
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(chunk)).await;
+                            }
+                            #[cfg(feature = "runtime-monoio")]
+                            {
+                                monoio::time::sleep(std::time::Duration::from_millis(chunk)).await;
+                            }
+                            remaining = remaining.saturating_sub(chunk);
+                            // Re-check if UNPAUSE was called
+                            let still_paused = {
+                                let rt = ctx.runtime_config.read();
+                                rt.client_pause_deadline_ms > 0
+                                    && crate::storage::entry::current_time_ms() < rt.client_pause_deadline_ms
+                            };
+                            if !still_paused {
+                                break;
+                            }
                         }
                     }
 
@@ -944,21 +959,37 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             Some(b) => std::str::from_utf8(&b).ok().and_then(|s| s.parse::<u64>().ok()),
                                             None => None,
                                         };
-                                        match timeout_ms {
-                                            Some(ms) => {
-                                                let write_only = cmd_args.get(2)
-                                                    .and_then(|f| extract_bytes(f))
-                                                    .is_some_and(|b| b.eq_ignore_ascii_case(b"WRITE"));
-                                                let deadline = crate::storage::entry::current_time_ms() + ms;
-                                                let mut rt = ctx.runtime_config.write();
-                                                rt.client_pause_deadline_ms = deadline;
-                                                rt.client_pause_write_only = write_only;
-                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        // Validate mode arg if present
+                                        let mode_valid = if cmd_args.len() >= 3 {
+                                            match extract_bytes(&cmd_args[2]) {
+                                                Some(b) => b.eq_ignore_ascii_case(b"WRITE") || b.eq_ignore_ascii_case(b"ALL"),
+                                                None => false,
                                             }
-                                            None => {
-                                                responses.push(Frame::Error(Bytes::from_static(
-                                                    b"ERR timeout is not a valid integer or out of range",
-                                                )));
+                                        } else {
+                                            true
+                                        };
+                                        // Reject extra trailing args
+                                        if cmd_args.len() > 3 || !mode_valid {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR syntax error",
+                                            )));
+                                        } else {
+                                            match timeout_ms {
+                                                Some(ms) => {
+                                                    let write_only = cmd_args.get(2)
+                                                        .and_then(|f| extract_bytes(f))
+                                                        .is_some_and(|b| b.eq_ignore_ascii_case(b"WRITE"));
+                                                    let deadline = crate::storage::entry::current_time_ms().saturating_add(ms);
+                                                    let mut rt = ctx.runtime_config.write();
+                                                    rt.client_pause_deadline_ms = deadline;
+                                                    rt.client_pause_write_only = write_only;
+                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                                }
+                                                None => {
+                                                    responses.push(Frame::Error(Bytes::from_static(
+                                                        b"ERR timeout is not a valid integer or out of range",
+                                                    )));
+                                                }
                                             }
                                         }
                                     }

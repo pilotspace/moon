@@ -131,39 +131,38 @@ pub fn geopos(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GEOPOS"),
     };
 
-    let members_map = match db.get_sorted_set(key) {
-        Ok(Some((members, _))) => Some(members.clone()),
-        Ok(None) => None,
-        Err(e) => return e,
+    // Collect scores first to avoid holding borrow across format! allocations
+    let scores: Vec<Option<f64>> = {
+        let members_map = match db.get_sorted_set(key) {
+            Ok(Some((members, _))) => Some(members),
+            Ok(None) => None,
+            Err(e) => return e,
+        };
+        args[1..]
+            .iter()
+            .map(|arg| {
+                let member = extract_bytes(arg)?;
+                members_map.as_ref()?.get(member).copied()
+            })
+            .collect()
     };
 
-    let mut results = Vec::with_capacity(args.len() - 1);
-    for arg in &args[1..] {
-        let member = match extract_bytes(arg) {
-            Some(m) => m,
-            None => {
-                results.push(Frame::Null);
-                continue;
+    let results: Vec<Frame> = scores
+        .into_iter()
+        .map(|opt_score| match opt_score {
+            Some(score) => {
+                let (lon, lat) = geohash_decode(score);
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from(format!("{:.4}", lon))),
+                        Frame::BulkString(Bytes::from(format!("{:.4}", lat))),
+                    ]
+                    .into(),
+                )
             }
-        };
-
-        match &members_map {
-            Some(m) => match m.get(member) {
-                Some(&score) => {
-                    let (lon, lat) = geohash_decode(score);
-                    results.push(Frame::Array(
-                        vec![
-                            Frame::BulkString(Bytes::from(format!("{:.4}", lon))),
-                            Frame::BulkString(Bytes::from(format!("{:.4}", lat))),
-                        ]
-                        .into(),
-                    ));
-                }
-                None => results.push(Frame::Null),
-            },
-            None => results.push(Frame::Null),
-        }
-    }
+            None => Frame::Null,
+        })
+        .collect();
 
     Frame::Array(results.into())
 }
@@ -269,7 +268,7 @@ pub fn geohash(db: &mut Database, args: &[Frame]) -> Frame {
 ///   BYRADIUS radius M|KM|FT|MI|BYBOX width height M|KM|FT|MI
 ///   [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
 pub fn geosearch(db: &mut Database, args: &[Frame]) -> Frame {
-    let (_, results) = geosearch_inner(db, args, false);
+    let (_matches, results) = geosearch_inner(db, args, false);
     results
 }
 
@@ -284,24 +283,42 @@ pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Shift args so args[0] is now the source key
-    let (count, _) = geosearch_inner(db, &args[1..], true);
+    let (matches, _) = geosearch_inner(db, &args[1..], true);
 
-    // Build sorted set from results and store
-    if count == 0 {
+    if matches.is_empty() {
         db.remove(&dest);
         return Frame::Integer(0);
     }
 
-    Frame::Integer(count as i64)
+    // Build a fresh sorted set from matches and store at dest
+    let mut new_members = std::collections::HashMap::new();
+    let mut new_tree = crate::storage::bptree::BPTree::new();
+    for (member, _dist, _lon, _lat, score) in &matches {
+        new_members.insert(member.clone(), *score);
+        new_tree.insert(OrderedFloat(*score), member.clone());
+    }
+    let mut entry = crate::storage::entry::Entry::new_sorted_set_bptree();
+    entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+        crate::storage::entry::RedisValue::SortedSetBPTree {
+            tree: new_tree,
+            members: new_members,
+        },
+    );
+    db.set(dest, entry);
+
+    Frame::Integer(matches.len() as i64)
 }
 
-fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usize, Frame) {
+/// Returned by geosearch_inner: (member, dist_m, lon, lat, score)
+type GeoMatch = (Bytes, f64, f64, f64, f64);
+
+fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (Vec<GeoMatch>, Frame) {
     if args.len() < 6 {
-        return (0, err_wrong_args("GEOSEARCH"));
+        return (Vec::new(), err_wrong_args("GEOSEARCH"));
     }
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
-        None => return (0, err_wrong_args("GEOSEARCH")),
+        None => return (Vec::new(), err_wrong_args("GEOSEARCH")),
     };
 
     // Parse source: FROMMEMBER or FROMLONLAT
@@ -322,13 +339,18 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
             i += 1;
             let member = match extract_bytes(args.get(i).unwrap_or(&Frame::Null)) {
                 Some(m) => m,
-                None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                None => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             // Look up member's score
             let members_map = match db.get_sorted_set(key) {
                 Ok(Some((members, _))) => members.clone(),
-                Ok(None) => return (0, Frame::Array(Vec::new().into())),
-                Err(e) => return (0, e),
+                Ok(None) => return (Vec::new(), Frame::Array(Vec::new().into())),
+                Err(e) => return (Vec::new(), e),
             };
             match members_map.get(member) {
                 Some(&score) => {
@@ -336,19 +358,29 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                     center_lon = lon;
                     center_lat = lat;
                 }
-                None => return (0, Frame::Array(Vec::new().into())),
+                None => return (Vec::new(), Frame::Array(Vec::new().into())),
             }
             found_from = true;
         } else if arg.eq_ignore_ascii_case(b"FROMLONLAT") {
             i += 1;
             center_lon = match args.get(i).and_then(|f| parse_f64(f)) {
                 Some(v) => v,
-                None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                None => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             i += 1;
             center_lat = match args.get(i).and_then(|f| parse_f64(f)) {
                 Some(v) => v,
-                None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                None => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             found_from = true;
         }
@@ -356,7 +388,10 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
     }
 
     if !found_from {
-        return (0, Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        return (
+            Vec::new(),
+            Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        );
     }
 
     // Parse shape: BYRADIUS or BYBOX
@@ -368,6 +403,16 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
     let mut withcoord = false;
     let mut withdist = false;
     let mut withhash = false;
+    let mut output_unit_mult = 1.0f64; // for WITHDIST: convert meters → query unit
+
+    let unit_err = || {
+        (
+            Vec::new(),
+            Frame::Error(Bytes::from_static(
+                b"ERR unsupported unit provided. please use M, KM, FT, MI",
+            )),
+        )
+    };
 
     while i < args.len() {
         let arg = match extract_bytes(&args[i]) {
@@ -378,10 +423,23 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
             }
         };
         if arg.eq_ignore_ascii_case(b"BYRADIUS") {
+            if box_width_m.is_some() {
+                return (
+                    Vec::new(),
+                    Frame::Error(Bytes::from_static(
+                        b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided",
+                    )),
+                );
+            }
             i += 1;
             let r = match args.get(i).and_then(|f| parse_f64(f)) {
                 Some(v) => v,
-                None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                None => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             i += 1;
             let unit_mult = match args
@@ -390,26 +448,38 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                 .and_then(|b| parse_unit(b))
             {
                 Some(v) => v,
-                None => {
-                    return (
-                        0,
-                        Frame::Error(Bytes::from_static(
-                            b"ERR unsupported unit provided. please use M, KM, FT, MI",
-                        )),
-                    );
-                }
+                None => return unit_err(),
             };
+            output_unit_mult = unit_mult;
             radius_m = Some(r * unit_mult);
         } else if arg.eq_ignore_ascii_case(b"BYBOX") {
+            if radius_m.is_some() {
+                return (
+                    Vec::new(),
+                    Frame::Error(Bytes::from_static(
+                        b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided",
+                    )),
+                );
+            }
             i += 1;
             let w = match args.get(i).and_then(|f| parse_f64(f)) {
                 Some(v) => v,
-                None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                None => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             i += 1;
             let h = match args.get(i).and_then(|f| parse_f64(f)) {
                 Some(v) => v,
-                None => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                None => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             i += 1;
             let unit_mult = match args
@@ -418,15 +488,9 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                 .and_then(|b| parse_unit(b))
             {
                 Some(v) => v,
-                None => {
-                    return (
-                        0,
-                        Frame::Error(Bytes::from_static(
-                            b"ERR unsupported unit provided. please use M, KM, FT, MI",
-                        )),
-                    );
-                }
+                None => return unit_err(),
             };
+            output_unit_mult = unit_mult;
             box_width_m = Some(w * unit_mult);
             box_height_m = Some(h * unit_mult);
         } else if arg.eq_ignore_ascii_case(b"ASC") {
@@ -437,7 +501,12 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
             i += 1;
             let c = match args.get(i).and_then(|f| parse_f64(f)) {
                 Some(v) if v > 0.0 => v as usize,
-                _ => return (0, Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                _ => {
+                    return (
+                        Vec::new(),
+                        Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                    );
+                }
             };
             count_limit = Some(c);
             // Skip optional ANY
@@ -454,13 +523,18 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
             withdist = true;
         } else if arg.eq_ignore_ascii_case(b"WITHHASH") {
             withhash = true;
+        } else {
+            return (
+                Vec::new(),
+                Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            );
         }
         i += 1;
     }
 
     if radius_m.is_none() && box_width_m.is_none() {
         return (
-            0,
+            Vec::new(),
             Frame::Error(Bytes::from_static(
                 b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided",
             )),
@@ -470,8 +544,8 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
     // Get all members with their coordinates
     let members_map = match db.get_sorted_set(key) {
         Ok(Some((members, _))) => members.clone(),
-        Ok(None) => return (0, Frame::Array(Vec::new().into())),
-        Err(e) => return (0, e),
+        Ok(None) => return (Vec::new(), Frame::Array(Vec::new().into())),
+        Err(e) => return (Vec::new(), e),
     };
 
     // Filter by shape
@@ -505,19 +579,23 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
         matches.truncate(limit);
     }
 
-    let total = matches.len();
     let has_extras = withcoord || withdist || withhash;
 
     let results: Vec<Frame> = matches
-        .into_iter()
+        .iter()
         .map(|(member, dist, lon, lat, score)| {
             if has_extras {
-                let mut entry = vec![Frame::BulkString(member)];
+                let mut entry = vec![Frame::BulkString(member.clone())];
                 if withdist {
-                    entry.push(Frame::BulkString(Bytes::from(format!("{:.4}", dist))));
+                    // Convert meters to the same unit used in BYRADIUS/BYBOX query
+                    let dist_in_unit = dist / output_unit_mult;
+                    entry.push(Frame::BulkString(Bytes::from(format!(
+                        "{:.4}",
+                        dist_in_unit
+                    ))));
                 }
                 if withhash {
-                    entry.push(Frame::Integer(score as i64));
+                    entry.push(Frame::Integer(*score as i64));
                 }
                 if withcoord {
                     entry.push(Frame::Array(
@@ -530,12 +608,12 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (usi
                 }
                 Frame::Array(entry.into())
             } else {
-                Frame::BulkString(member)
+                Frame::BulkString(member.clone())
             }
         })
         .collect();
 
-    (total, Frame::Array(results.into()))
+    (matches, Frame::Array(results.into()))
 }
 
 #[cfg(test)]

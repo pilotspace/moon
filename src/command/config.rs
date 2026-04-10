@@ -175,7 +175,7 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                     )));
                 }
             },
-            "lazyfree-lazy-eviction" | "lazyfree-threshold" => match value_str.parse::<usize>() {
+            "lazyfree-threshold" => match value_str.parse::<usize>() {
                 Ok(v) => runtime_config.lazyfree_threshold = v,
                 Err(_) => {
                     return Frame::Error(Bytes::from(format!(
@@ -247,6 +247,10 @@ pub fn config_rewrite(runtime_config: &RuntimeConfig, server_config: &ServerConf
     if let Some(ref aclfile) = runtime_config.aclfile {
         lines.push(format!("aclfile {}", aclfile));
     }
+    lines.push(format!(
+        "lazyfree-threshold {}",
+        runtime_config.lazyfree_threshold
+    ));
 
     let content = lines.join("\n") + "\n";
 
