@@ -290,10 +290,27 @@ impl<'a> Iterator for NeighborIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Process outgoing edges first, then incoming.
+        // Visibility rule: edge is visible at `lsn` if:
+        //   created_lsn <= lsn  AND  deleted_lsn > lsn
+        // Special case: lsn == u64::MAX means "see all live edges".
+        // Live edges have deleted_lsn = u64::MAX, so for lsn = u64::MAX
+        // we check deleted_lsn == u64::MAX (alive) instead of deleted_lsn > lsn
+        // (which would be false since nothing is > u64::MAX).
+        let is_visible = |edge: &MutableEdge| -> bool {
+            if edge.created_lsn > self.lsn {
+                return false;
+            }
+            if self.lsn == u64::MAX {
+                // "See everything alive" — only filter out deleted edges.
+                edge.deleted_lsn == u64::MAX
+            } else {
+                edge.deleted_lsn > self.lsn
+            }
+        };
         loop {
             if let Some(&ek) = self.out_iter.next() {
                 if let Some(edge) = self.edges.get(ek) {
-                    if edge.created_lsn <= self.lsn && edge.deleted_lsn > self.lsn {
+                    if is_visible(edge) {
                         return Some((ek, edge.dst));
                     }
                 }
@@ -301,7 +318,7 @@ impl<'a> Iterator for NeighborIter<'a> {
             }
             if let Some(&ek) = self.in_iter.next() {
                 if let Some(edge) = self.edges.get(ek) {
-                    if edge.created_lsn <= self.lsn && edge.deleted_lsn > self.lsn {
+                    if is_visible(edge) {
                         return Some((ek, edge.src));
                     }
                 }

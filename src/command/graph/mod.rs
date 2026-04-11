@@ -26,6 +26,7 @@ pub fn is_graph_write_cmd(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE")
         || cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE")
         || cmd.eq_ignore_ascii_case(b"GRAPH.DELETE")
+        || cmd.eq_ignore_ascii_case(b"GRAPH.DROP")
 }
 
 /// Quick-parse a GRAPH.QUERY's Cypher argument to determine if it contains write clauses.
@@ -80,7 +81,9 @@ pub fn dispatch_graph_write(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) 
         graph_addnode(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE") {
         graph_addedge(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") {
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE")
+        || cmd.eq_ignore_ascii_case(b"GRAPH.DROP")
+    {
         graph_delete(store, args)
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* write command"))
