@@ -216,6 +216,7 @@ impl WalWriterV3 {
         }
 
         self.current_sequence += 1;
+        crate::admin::metrics_setup::record_wal_rotation();
         self.open_new_segment()
     }
 

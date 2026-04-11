@@ -69,7 +69,9 @@ pub async fn handle_connection(
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     vector_store: Option<Arc<Mutex<crate::vector::store::VectorStore>>>,
+    #[cfg(feature = "graph")] graph_store: Option<Arc<Mutex<crate::graph::store::GraphStore>>>,
 ) {
+    crate::admin::metrics_setup::record_connection_opened();
     // Capture peer address before Framed wraps the stream (stream is moved)
     let peer_addr = stream
         .peer_addr()
@@ -989,6 +991,32 @@ pub async fn handle_connection(
                                 }
                             }
 
+                            // GRAPH.* graph commands: dispatch to GraphStore directly
+                            #[cfg(feature = "graph")]
+                            if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
+                                if let Some(ref gs) = graph_store {
+                                    let (response, wal_records) = {
+                                        let mut store = gs.lock();
+                                        let resp = crate::command::graph::dispatch_graph_cmd_args(&mut store, cmd, cmd_args);
+                                        let records = store.drain_wal();
+                                        (resp, records)
+                                    };
+                                    for record in wal_records {
+                                        if let Some(ref tx) = aof_tx {
+                                            let _ = tx.send_async(AofMessage::Append(bytes::Bytes::from(record))).await;
+                                        }
+                                        if let Some(ref counter) = change_counter {
+                                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                    responses.push(response);
+                                    continue;
+                                } else {
+                                    responses.push(Frame::Error(bytes::Bytes::from_static(b"ERR graph engine not initialized")));
+                                    continue;
+                                }
+                            }
+
                             let is_write = metadata::is_write(cmd);
 
                             // Serialize for AOF before dispatch
@@ -1281,4 +1309,5 @@ pub async fn handle_connection(
     if conn.tracking_state.enabled {
         tracking_table.lock().untrack_all(client_id);
     }
+    crate::admin::metrics_setup::record_connection_closed();
 }

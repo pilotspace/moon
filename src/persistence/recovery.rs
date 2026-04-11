@@ -599,7 +599,7 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         assert_eq!(result.commands_replayed, 0);
@@ -621,7 +621,7 @@ mod tests {
             .unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         // Control file should be updated to Running
@@ -653,7 +653,7 @@ mod tests {
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         assert_eq!(result.commands_replayed, 3);
@@ -690,7 +690,7 @@ mod tests {
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         assert_eq!(result.commands_replayed, 1);
@@ -724,7 +724,7 @@ mod tests {
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         // Only LSNs 3, 4, 5 should be replayed (skip 1, 2)
@@ -758,7 +758,7 @@ mod tests {
         clog::write_clog_page(&clog_dir, &page0).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         // Txns 1 and 3 should have been rolled back
@@ -819,7 +819,7 @@ mod tests {
         std::fs::write(seg_dir.join("codes.mpf"), &[0u8; 64]).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         assert_eq!(result.warm_segments_loaded, 1);
@@ -877,7 +877,7 @@ mod tests {
         write_datafile(&data_dir.join("heap-000007.mpf"), &[&page]).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         assert_eq!(result.kv_heap_entries_loaded, 3);
@@ -943,7 +943,7 @@ mod tests {
         std::fs::write(seg_dir.join("vamana.mpf"), &[0u8; 128]).unwrap();
 
         let mut databases = vec![Database::new()];
-        let engine = crate::persistence::replay::DispatchReplayEngine;
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
         assert_eq!(result.cold_segments_loaded, 1);

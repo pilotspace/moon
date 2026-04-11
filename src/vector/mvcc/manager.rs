@@ -33,6 +33,10 @@ pub struct TransactionManager {
     active: HashMap<u64, u64>,
     /// Write intents: point_id -> owning txn_id. First-writer-wins.
     write_intents: HashMap<u64, u64>,
+    /// Graph write intents: graph entity_id -> owning txn_id. First-writer-wins.
+    /// Used for node/edge conflict detection in graph operations.
+    #[cfg(feature = "graph")]
+    graph_write_intents: HashMap<u64, u64>,
     /// Committed transaction IDs (stored as u32 -- wraps beyond u32::MAX).
     committed: RoaringBitmap,
     /// Oldest active snapshot LSN (for zombie cleanup watermark).
@@ -46,6 +50,8 @@ impl TransactionManager {
             next_lsn: 1,
             active: HashMap::new(),
             write_intents: HashMap::new(),
+            #[cfg(feature = "graph")]
+            graph_write_intents: HashMap::new(),
             committed: RoaringBitmap::new(),
             oldest_snapshot: 0,
         }
@@ -116,6 +122,8 @@ impl TransactionManager {
             self.committed.insert(id);
         }
         self.write_intents.retain(|_, owner| *owner != txn_id);
+        #[cfg(feature = "graph")]
+        self.graph_write_intents.retain(|_, owner| *owner != txn_id);
         self.update_oldest_snapshot();
         true
     }
@@ -127,8 +135,73 @@ impl TransactionManager {
             return false;
         }
         self.write_intents.retain(|_, owner| *owner != txn_id);
+        #[cfg(feature = "graph")]
+        self.graph_write_intents.retain(|_, owner| *owner != txn_id);
         self.update_oldest_snapshot();
         true
+    }
+
+    /// Get the current LSN value (next_lsn - 1). Used by graph operations
+    /// to stamp nodes and edges with the current LSN without beginning a
+    /// full transaction.
+    #[inline]
+    pub fn current_lsn(&self) -> u64 {
+        self.next_lsn - 1
+    }
+
+    /// Allocate and return the next LSN without creating a transaction.
+    /// Used for graph operations that need a commit-LSN for atomic writes.
+    #[inline]
+    pub fn allocate_lsn(&mut self) -> u64 {
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+        lsn
+    }
+
+    /// Acquire a write intent on a graph entity (node or edge ID).
+    /// First-writer-wins conflict detection, same semantics as `acquire_write`.
+    #[cfg(feature = "graph")]
+    pub fn acquire_graph_write(
+        &mut self,
+        entity_id: u64,
+        txn_id: u64,
+    ) -> Result<(), ConflictError> {
+        match self.graph_write_intents.entry(entity_id) {
+            hash_map::Entry::Vacant(e) => {
+                e.insert(txn_id);
+                Ok(())
+            }
+            hash_map::Entry::Occupied(mut e) => {
+                let owner = *e.get();
+                if owner == txn_id {
+                    Ok(())
+                } else if Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id))
+                    || !self.active.contains_key(&owner)
+                {
+                    e.insert(txn_id);
+                    Ok(())
+                } else {
+                    Err(ConflictError {
+                        point_id: entity_id,
+                        owner,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Sweep graph write intents owned by aborted transactions.
+    #[cfg(feature = "graph")]
+    pub fn sweep_graph_zombies(&self) -> Vec<(u64, u64)> {
+        let mut zombies = Vec::new();
+        for (&entity_id, &owner) in &self.graph_write_intents {
+            let in_committed =
+                Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id));
+            if !self.active.contains_key(&owner) && !in_committed {
+                zombies.push((entity_id, owner));
+            }
+        }
+        zombies
     }
 
     /// Check if a transaction ID has been committed.
@@ -377,5 +450,98 @@ mod tests {
         mgr.commit(t1.txn_id);
         // No active txns -- oldest_snapshot should be next_lsn
         assert_eq!(mgr.oldest_snapshot(), mgr.next_lsn);
+    }
+
+    #[test]
+    fn test_current_lsn() {
+        let mut mgr = TransactionManager::new();
+        assert_eq!(mgr.current_lsn(), 0);
+        let _t1 = mgr.begin();
+        assert_eq!(mgr.current_lsn(), 1);
+    }
+
+    #[test]
+    fn test_allocate_lsn() {
+        let mut mgr = TransactionManager::new();
+        let lsn1 = mgr.allocate_lsn();
+        let lsn2 = mgr.allocate_lsn();
+        assert_eq!(lsn1, 1);
+        assert_eq!(lsn2, 2);
+        assert!(lsn1 < lsn2);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_acquire_write_succeeds() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_acquire_write_idempotent() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_acquire_write_conflict() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        let t2 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+        let err = mgr.acquire_graph_write(500, t2.txn_id).unwrap_err();
+        assert_eq!(err.point_id, 500);
+        assert_eq!(err.owner, t1.txn_id);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_write_intents_released_on_commit() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+        mgr.commit(t1.txn_id);
+
+        // t2 can now acquire the same entity
+        let t2 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t2.txn_id).is_ok());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_write_intents_released_on_abort() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+        mgr.abort(t1.txn_id);
+
+        let t2 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t2.txn_id).is_ok());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_sweep_zombies_empty_after_cleanup() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        assert!(mgr.acquire_graph_write(500, t1.txn_id).is_ok());
+        mgr.abort(t1.txn_id);
+        // abort cleans up graph intents
+        assert!(mgr.sweep_graph_zombies().is_empty());
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_and_vector_intents_independent() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        // Same ID can be used in both vector and graph intents without conflict
+        assert!(mgr.acquire_write(100, t1.txn_id).is_ok());
+        assert!(mgr.acquire_graph_write(100, t1.txn_id).is_ok());
     }
 }

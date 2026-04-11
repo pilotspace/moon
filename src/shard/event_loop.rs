@@ -1125,6 +1125,18 @@ impl super::Shard {
                     {
                         persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
                     }
+                    // Persist graph store to disk on shutdown.
+                    #[cfg(feature = "graph")]
+                    if let Some(ref dir) = persistence_dir {
+                        let gs = shard_databases.graph_store_read(shard_id);
+                        if gs.graph_count() > 0 {
+                            if let Err(e) = crate::graph::recovery::save_graph_store(&gs, std::path::Path::new(dir), shard_id) {
+                                tracing::warn!("Shard {shard_id}: failed to save graph store on shutdown: {e}");
+                            } else {
+                                info!("Shard {shard_id}: graph store saved to {dir}");
+                            }
+                        }
+                    }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
                     }
