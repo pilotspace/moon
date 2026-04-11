@@ -10,7 +10,7 @@ pub mod graph_write;
 
 pub use graph_read::{
     graph_explain, graph_hybrid, graph_info, graph_list, graph_neighbors, graph_profile,
-    graph_query, graph_ro_query, graph_vsearch,
+    graph_query, graph_query_or_write, graph_query_write, graph_ro_query, graph_vsearch,
 };
 pub use graph_write::{graph_addedge, graph_addnode, graph_create, graph_delete};
 
@@ -84,6 +84,12 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
         }
     };
 
+    // GRAPH.QUERY needs special handling: route through write-aware handler
+    // that auto-detects read-only vs write queries.
+    if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+        return graph_query_or_write(store, args);
+    }
+
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
@@ -96,6 +102,12 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
 /// This is the pre-split equivalent of `dispatch_graph_command` for callers
 /// that already have the command bytes and argument slice separated.
 pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
+    // GRAPH.QUERY needs special handling: route through write-aware handler
+    // that auto-detects read-only vs write queries.
+    if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+        return graph_query_or_write(store, args);
+    }
+
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
@@ -591,6 +603,77 @@ mod tests {
             assert_eq!(items.len(), 4); // edge+B, edge+C
         } else {
             panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn test_graph_query_merge_upsert() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+
+        // First MERGE: should create Alice.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.age = 30 RETURN n",
+            ]),
+        );
+        // Should be Array with headers, rows, stats.
+        if let Frame::Array(items) = &resp {
+            assert_eq!(items.len(), 3, "expected [headers, rows, stats]");
+            // Check stats contain "Nodes created: 1".
+            if let Frame::BulkString(stats) = &items[2] {
+                let stats_str = core::str::from_utf8(stats.as_ref()).unwrap_or("");
+                assert!(
+                    stats_str.contains("Nodes created: 1"),
+                    "expected 'Nodes created: 1' in stats, got: {stats_str}"
+                );
+            }
+        } else {
+            panic!("expected Array, got {:?}", resp);
+        }
+
+        // Second MERGE: should find existing Alice (no new node).
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MERGE (n:Person {name: 'Alice'}) ON MATCH SET n.updated = true RETURN n",
+            ]),
+        );
+        if let Frame::Array(items) = &resp {
+            assert_eq!(items.len(), 3);
+            if let Frame::BulkString(stats) = &items[2] {
+                let stats_str = core::str::from_utf8(stats.as_ref()).unwrap_or("");
+                assert!(
+                    stats_str.contains("Nodes created: 0"),
+                    "expected 'Nodes created: 0' in stats, got: {stats_str}"
+                );
+            }
+        } else {
+            panic!("expected Array, got {:?}", resp);
+        }
+
+        // Verify read-only query still works.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MATCH (n:Person) RETURN n.name",
+            ]),
+        );
+        if let Frame::Array(items) = &resp {
+            assert_eq!(items.len(), 3);
+            // Should have 1 row with "Alice".
+            if let Frame::Array(rows) = &items[1] {
+                assert_eq!(rows.len(), 1, "expected 1 row for Alice");
+            }
+        } else {
+            panic!("expected Array, got {:?}", resp);
         }
     }
 

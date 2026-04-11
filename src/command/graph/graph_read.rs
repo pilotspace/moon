@@ -305,6 +305,90 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
     exec_result_to_frame(&result)
 }
 
+/// GRAPH.QUERY <graph> <cypher_string> — write-capable variant.
+///
+/// Called when the Cypher query contains write clauses (CREATE, DELETE, SET, MERGE).
+/// Takes `&mut GraphStore` to allow mutable access to the named graph.
+pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let plan = match cypher::planner::compile(&query) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("ERR Cypher plan error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let graph = match store.get_graph_mut(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
+
+    let params = std::collections::HashMap::new();
+    let result = match cypher::executor::execute_mut(graph, &plan, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("ERR Cypher execution error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    exec_result_to_frame(&result)
+}
+
+/// GRAPH.QUERY <graph> <cypher_string> — auto-routing handler.
+///
+/// Quick-parses the query to determine read-only vs write, then dispatches
+/// to `graph_query` (read) or `graph_query_write` (write) accordingly.
+pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
+        ));
+    }
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    // Quick-parse to check if query is read-only.
+    let is_read = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q.is_read_only(),
+        Err(_) => true, // Fallback to read path; it will re-parse and report the error.
+    };
+
+    if is_read {
+        // Reborrow as shared ref for read path.
+        graph_query(store, args)
+    } else {
+        graph_query_write(store, args)
+    }
+}
+
 /// GRAPH.RO_QUERY <graph> <cypher_string>
 ///
 /// Like GRAPH.QUERY but rejects write clauses (CREATE, DELETE, SET, MERGE).
