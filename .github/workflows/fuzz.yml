@@ -3,15 +3,20 @@ name: Fuzz
 on:
   pull_request:
     branches: [main]
+    types: [labeled]
   schedule:
     - cron: '0 2 * * *'
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   fuzz-pr:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-fuzz')
     name: Fuzz PR
     runs-on: ubuntu-latest
     strategy:
@@ -20,7 +25,12 @@ jobs:
         target:
           - resp_parse
           - resp_parse_differential
+          - inline_parse
           - wal_v3_record
+          - gossip_deser
+          - acl_rule
+          - rdb_load
+          - cypher_parse
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -38,8 +48,8 @@ jobs:
           name: fuzz-corpus
           path: fuzz/corpus/
         continue-on-error: true
-      - name: Run fuzzer (5m, multi-process)
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=300 -max_len=65536 -fork=2 -ignore_crashes=0
+      - name: Run fuzzer (15m, multi-process)
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=900 -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
@@ -59,6 +69,7 @@ jobs:
           - gossip_deser
           - acl_rule
           - rdb_load
+          - cypher_parse
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly

@@ -68,6 +68,9 @@ http-body-util = "0.1"
 tikv-jemallocator = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 cudarc = { version = "0.12", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
+slotmap = "1"
+boomphf = "0.6"
+logos = { version = "0.14", optional = true }
 
 [features]
 # Platform-aware defaults:
@@ -80,10 +83,14 @@ cudarc = { version = "0.12", optional = true, default-features = false, features
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
-runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
+runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "tokio/process", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]
 simd-avx512 = []
+# OpenTelemetry exporter: reserves feature namespace for OTLP trace export.
+# When wired, will gate tracing-opentelemetry + opentelemetry-otlp dependencies.
+otel = []
+graph = ["dep:logos"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -146,3 +153,13 @@ harness = false
 [[bench]]
 name = "pubsub_hotpath"
 harness = false
+
+[[bench]]
+name = "graph_bench"
+harness = false
+required-features = ["graph"]
+
+[[bench]]
+name = "graph_traversal"
+harness = false
+required-features = ["graph"]

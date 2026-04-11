@@ -96,6 +96,14 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::VectorCommand { .. } => {
                             execute_batch.push(msg);
                         }
+                        #[cfg(feature = "graph")]
+                        ShardMessage::GraphCommand { .. } => {
+                            execute_batch.push(msg);
+                        }
+                        #[cfg(feature = "graph")]
+                        ShardMessage::GraphTraverse { .. } => {
+                            execute_batch.push(msg);
+                        }
                         ShardMessage::MigrateConnection { fd, state } => {
                             pending_migrations.push((fd, state));
                         }
@@ -131,6 +139,10 @@ pub(crate) fn drain_spsc_shared(
                 vector_store,
             );
         }
+    }
+
+    if drained > 0 {
+        crate::admin::metrics_setup::record_spsc_drain(shard_id, drained as u64);
     }
 
     // Process other messages (PubSubPublish, SnapshotBegin, etc.)
@@ -842,6 +854,39 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::VectorCommand { command, reply_tx } => {
             let response = dispatch_vector_command(vector_store, &command);
+            let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "graph")]
+        ShardMessage::GraphCommand { command, reply_tx } => {
+            // GraphCommand is dispatched via connection handlers using ShardDatabases,
+            // not through SPSC. If we receive one here, dispatch it locally.
+            let (response, wal_records) = {
+                let mut gs = shard_databases.graph_store_write(shard_id);
+                let resp = crate::command::graph::dispatch_graph_command(&mut gs, &command);
+                let records = gs.drain_wal();
+                (resp, records)
+            };
+            for record in wal_records {
+                shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
+            }
+            let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "graph")]
+        ShardMessage::GraphTraverse {
+            graph_name,
+            node_ids,
+            remaining_hops: _,
+            edge_type_filter,
+            snapshot_lsn,
+            reply_tx,
+        } => {
+            let response = crate::graph::cross_shard::handle_graph_traverse(
+                &shard_databases.graph_store_read(shard_id),
+                &graph_name,
+                &node_ids,
+                edge_type_filter,
+                snapshot_lsn,
+            );
             let _ = reply_tx.send(response);
         }
         ShardMessage::Shutdown => {

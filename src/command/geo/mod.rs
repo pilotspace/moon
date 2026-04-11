@@ -131,9 +131,9 @@ pub(crate) fn parse_unit(unit: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::protocol::Frame;
     use crate::storage::Database;
+    use bytes::Bytes;
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))

@@ -14,7 +14,7 @@ bytes = "1"
 [dependencies.moon]
 path = ".."
 default-features = false
-features = ["runtime-tokio", "jemalloc"]
+features = ["runtime-tokio", "jemalloc", "graph"]
 
 [dependencies.tempfile]
 version = "3"
@@ -54,6 +54,11 @@ doc = false
 [[bin]]
 name = "acl_rule"
 path = "fuzz_targets/acl_rule.rs"
+doc = false
+
+[[bin]]
+name = "cypher_parse"
+path = "fuzz_targets/cypher_parse.rs"
 doc = false
 
 [workspace]

@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+#[cfg(feature = "graph")]
+use crate::graph::store::GraphStore;
 use crate::storage::Database;
 use crate::vector::store::VectorStore;
 
@@ -14,6 +16,9 @@ pub struct ShardDatabases {
     shards: Vec<Vec<RwLock<Database>>>,
     /// Per-shard VectorStore for FT.* commands in single-shard mode.
     vector_stores: Vec<Mutex<VectorStore>>,
+    /// Per-shard GraphStore for GRAPH.* commands.
+    #[cfg(feature = "graph")]
+    graph_stores: Vec<RwLock<GraphStore>>,
     /// Per-shard WAL append channel sender. Connection handlers send serialized
     /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
     /// Mutex<Option<>> for single-writer init, then read-only via wal_append().
@@ -34,10 +39,16 @@ impl ShardDatabases {
         let vector_stores = (0..num_shards)
             .map(|_| Mutex::new(VectorStore::new()))
             .collect();
+        #[cfg(feature = "graph")]
+        let graph_stores = (0..num_shards)
+            .map(|_| RwLock::new(GraphStore::new()))
+            .collect();
         let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
         Arc::new(Self {
             shards,
             vector_stores,
+            #[cfg(feature = "graph")]
+            graph_stores,
             wal_append_txs,
             num_shards,
             db_count,
@@ -75,6 +86,92 @@ impl ShardDatabases {
     #[inline]
     pub fn vector_store(&self, shard_id: usize) -> MutexGuard<'_, VectorStore> {
         self.vector_stores[shard_id].lock()
+    }
+
+    /// Acquire shared read access to a shard's GraphStore.
+    #[cfg(feature = "graph")]
+    #[inline]
+    pub fn graph_store_read(&self, shard_id: usize) -> RwLockReadGuard<'_, GraphStore> {
+        self.graph_stores[shard_id].read()
+    }
+
+    /// Acquire exclusive write access to a shard's GraphStore.
+    #[cfg(feature = "graph")]
+    #[inline]
+    pub fn graph_store_write(&self, shard_id: usize) -> RwLockWriteGuard<'_, GraphStore> {
+        self.graph_stores[shard_id].write()
+    }
+
+    /// Recover graph stores from persistence for all shards.
+    ///
+    /// Called once after construction during server startup. Loads graph
+    /// metadata and CSR segments from the persistence directory.
+    #[cfg(feature = "graph")]
+    pub fn recover_graph_stores(&self, persistence_dir: &std::path::Path) {
+        for shard_id in 0..self.num_shards {
+            match crate::graph::recovery::recover_graph_store(persistence_dir, shard_id) {
+                Ok(Some(result)) => {
+                    if result.store.graph_count() > 0 {
+                        tracing::info!(
+                            "Shard {}: recovered {} graph(s) ({} segments loaded, {} skipped)",
+                            shard_id,
+                            result.store.graph_count(),
+                            result.segments_loaded,
+                            result.segments_skipped,
+                        );
+                    }
+                    *self.graph_stores[shard_id].write() = result.store;
+                }
+                Ok(None) => {
+                    // No graph metadata — clean start, nothing to recover.
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: graph recovery failed: {}", shard_id, e);
+                }
+            }
+        }
+    }
+
+    /// Replay graph WAL commands into graph stores for all shards.
+    ///
+    /// Called after `recover_graph_stores` during startup. Reads per-shard
+    /// WAL files, filters graph commands via `GraphReplayCollector`, and
+    /// applies them to each shard's `GraphStore`.
+    #[cfg(feature = "graph")]
+    pub fn replay_graph_wal(&self, persistence_dir: &std::path::Path) {
+        use crate::persistence::replay::DispatchReplayEngine;
+        use crate::persistence::wal;
+
+        for shard_id in 0..self.num_shards {
+            let wal_file = wal::wal_path(persistence_dir, shard_id);
+            if !wal_file.exists() {
+                continue;
+            }
+            // Create a temporary engine to collect graph commands from the WAL.
+            let engine = DispatchReplayEngine::new();
+            // We need dummy databases for the KV replay path (graph commands
+            // are intercepted before KV dispatch, so these are unused).
+            let mut dummy_dbs: Vec<Database> =
+                (0..self.db_count).map(|_| Database::new()).collect();
+            match wal::replay_wal(&mut dummy_dbs, &wal_file, &engine) {
+                Ok(_) => {
+                    let graph_count = engine.graph_command_count();
+                    if graph_count > 0 {
+                        let mut gs = self.graph_stores[shard_id].write();
+                        let applied = engine.replay_graph_commands(&mut gs);
+                        tracing::info!(
+                            "Shard {}: replayed {} graph WAL commands ({} applied)",
+                            shard_id,
+                            graph_count,
+                            applied,
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: graph WAL replay failed: {}", shard_id, e);
+                }
+            }
+        }
     }
 
     /// Acquire a shared read lock on a specific database.

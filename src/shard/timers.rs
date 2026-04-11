@@ -14,11 +14,19 @@ use crate::persistence::wal::WalWriter;
 use super::shared_databases::ShardDatabases;
 
 /// Run cooperative active expiry across all databases.
+/// Shard 0 also updates the RSS gauge (once per expiry cycle, ~100ms).
 pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id: usize) {
     let db_count = shard_databases.db_count();
     for i in 0..db_count {
         let mut guard = shard_databases.write_db(shard_id, i);
         crate::server::expiration::expire_cycle_direct(&mut guard);
+    }
+    // Update RSS gauge on shard 0 only — cheap /proc read, avoids cross-shard contention
+    if shard_id == 0 {
+        let rss = crate::admin::metrics_setup::get_rss_bytes();
+        if rss > 0 {
+            crate::admin::metrics_setup::update_rss_bytes(rss);
+        }
     }
 }
 

@@ -533,6 +533,7 @@ fn evict_one_with_spill(
     }
 
     db.remove(key.as_bytes());
+    crate::admin::metrics_setup::record_eviction();
     true
 }
 

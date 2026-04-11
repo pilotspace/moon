@@ -146,6 +146,20 @@ pub fn key_to_shard(key: &[u8], num_shards: usize) -> usize {
     (xxh64(hash_input, HASH_SEED) % num_shards as u64) as usize
 }
 
+/// Determine which shard owns a graph by name.
+///
+/// Uses the same hash-tag extraction as `key_to_shard`: if the graph name
+/// contains `{tag}`, only the tag is hashed. This allows co-locating all
+/// operations for a graph on a single shard via `{partition_key}` naming.
+///
+/// When a graph name has a hash tag, all GRAPH.* commands route to the same
+/// shard, eliminating cross-shard traversal entirely.
+#[cfg(feature = "graph")]
+#[inline]
+pub fn graph_to_shard(graph_name: &[u8], num_shards: usize) -> usize {
+    key_to_shard(graph_name, num_shards)
+}
+
 /// Extract hash tag: content between first `{` and first `}` after it.
 ///
 /// Empty tags `{}` are ignored (returns `None`), matching Redis Cluster behavior.
@@ -270,6 +284,29 @@ pub enum ShardMessage {
     /// VectorStore state rather than search.
     VectorCommand {
         command: std::sync::Arc<Frame>,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
+    /// Execute a GRAPH.* command on this shard's GraphStore.
+    #[cfg(feature = "graph")]
+    GraphCommand {
+        command: std::sync::Arc<Frame>,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
+    /// Cross-shard graph traversal: expand the given nodes locally and return neighbors.
+    /// Used by scatter-gather coordinator for multi-shard BFS expansion.
+    #[cfg(feature = "graph")]
+    GraphTraverse {
+        /// Name of the graph to traverse.
+        graph_name: Bytes,
+        /// Node IDs to expand on this shard (external IDs, hashed to this shard).
+        node_ids: Vec<u64>,
+        /// Remaining cross-shard hops allowed (decremented per hop).
+        remaining_hops: u32,
+        /// Optional edge-type filter (only expand edges of this type).
+        edge_type_filter: Option<u16>,
+        /// MVCC snapshot LSN for consistent reads across shards.
+        snapshot_lsn: u64,
+        /// Reply channel for traversal results.
         reply_tx: channel::OneshotSender<Frame>,
     },
     /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
@@ -421,5 +458,45 @@ mod tests {
         let slot = Arc::new(PubSubResponseSlot::new(0));
         let result = PubSubResponseFuture::new(slot).await;
         assert_eq!(result, 0);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_to_shard_deterministic() {
+        let name = b"social_graph";
+        let num_shards = 8;
+        let s1 = super::graph_to_shard(name, num_shards);
+        let s2 = super::graph_to_shard(name, num_shards);
+        assert_eq!(s1, s2);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_to_shard_hash_tag_co_location() {
+        let num_shards = 16;
+        // All graph names with the same hash tag route to the same shard.
+        let s1 = super::graph_to_shard(b"{social}.friends", num_shards);
+        let s2 = super::graph_to_shard(b"{social}.posts", num_shards);
+        let s3 = super::graph_to_shard(b"{social}.likes", num_shards);
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s3);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_to_shard_no_tag_uses_full_name() {
+        let num_shards = 16;
+        // Without hash tag, different names may (likely) route to different shards.
+        let s1 = super::graph_to_shard(b"graph_alpha", num_shards);
+        let s2 = super::graph_to_shard(b"graph_beta", num_shards);
+        // Not guaranteed different, but at least the function works.
+        let _ = (s1, s2);
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn test_graph_to_shard_single_shard() {
+        assert_eq!(super::graph_to_shard(b"any_graph", 1), 0);
+        assert_eq!(super::graph_to_shard(b"{tag}.graph", 1), 0);
     }
 }

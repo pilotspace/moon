@@ -4,6 +4,8 @@ pub mod config;
 pub mod connection;
 pub mod functions;
 pub mod geo;
+#[cfg(feature = "graph")]
+pub mod graph;
 pub mod hash;
 pub mod helpers;
 pub mod hll;
