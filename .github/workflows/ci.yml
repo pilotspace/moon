@@ -15,9 +15,9 @@ env:
   MOON_NO_URING: "1"
 
 jobs:
-  # ── Fast lint gate (no cargo build) ──────────────────────────────────
+  # ── Fast gate: no compilation needed (~10s) ─────────────────────────
   lint:
-    name: Lint (fmt + safety)
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -25,14 +25,31 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
-      - name: Audit unsafe blocks for SAFETY comments
-        run: bash scripts/audit-unsafe.sh
-      - name: Audit unwrap/expect ratchet
-        run: bash scripts/audit-unwrap.sh
+      - run: bash scripts/audit-unsafe.sh
+      - run: bash scripts/audit-unwrap.sh
+      - name: CHANGELOG check
+        if: github.event_name == 'pull_request'
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
+            echo "skip-changelog label found — skipping"
+            exit 0
+          fi
+          git fetch origin main --depth=1
+          if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
+            echo "CHANGELOG.md updated"
+          else
+            echo "::error::CHANGELOG.md not updated. Add an entry or apply 'skip-changelog' label."
+            exit 1
+          fi
 
-  # ── Clippy (needs cargo check, but no full build) ───────────────────
-  clippy:
-    name: Clippy
+  # ── Main gate: clippy + test in one job, shared compilation ─────────
+  # Clippy checks compile the crate; test reuses those artifacts via
+  # cargo's incremental cache in the same runner. Saves ~5 min vs
+  # separate jobs that each compile from scratch.
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -40,25 +57,28 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
-      - run: cargo clippy --features graph -- -D warnings
-      - run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
+        with:
+          # Cache key covers all 3 feature combos so incremental builds hit.
+          shared-key: check-${{ hashFiles('Cargo.lock') }}
 
-  # ── Test (the big one — build + run) ────────────────────────────────
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-default-features --features runtime-tokio,jemalloc
+      # Clippy (3 feature configurations — shares compilation between runs)
+      - name: Clippy (default)
+        run: cargo clippy -- -D warnings
+      - name: Clippy (graph)
+        run: cargo clippy --features graph -- -D warnings
+      - name: Clippy (tokio)
+        run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
+
+      # Test — reuses .rlib artifacts from clippy's check compilation above.
+      # Only the test harness + test binaries need building (incremental).
+      - name: Test
+        run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
-      - name: Test (graph feature)
+      - name: Test (graph)
         run: "cargo test --no-default-features --features runtime-tokio,jemalloc,graph --lib graph::"
         timeout-minutes: 5
 
-  # ── MSRV — just needs to build, not test ────────────────────────────
+  # ── MSRV — minimal build, different cache key ───────────────────────
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
@@ -66,28 +86,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --no-default-features --features runtime-tokio
-
-  # ── CHANGELOG check (PR only) ──────────────────────────────────────
-  changelog:
-    name: CHANGELOG check
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
-      - name: Check CHANGELOG.md touched or skip-changelog label present
-        env:
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: |
-          if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
-            echo "skip-changelog label found — skipping check"
-            exit 0
-          fi
-          if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
-            echo "CHANGELOG.md updated"
-          else
-            echo "::error::CHANGELOG.md not updated. Add an entry or apply 'skip-changelog' label."
-            exit 1
-          fi
+          shared-key: msrv-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --no-default-features --features runtime-tokio
