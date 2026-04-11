@@ -1120,7 +1120,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 2);
 
         let entry = dbs[0].get(b"k1").unwrap();
@@ -1158,7 +1158,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 4);
 
         // Check hash
@@ -1195,7 +1195,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 2);
 
         let base_ts = dbs[0].base_timestamp();
@@ -1217,7 +1217,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new(), Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 3);
 
         assert!(dbs[0].get(b"k0").is_some());
@@ -1231,7 +1231,7 @@ mod tests {
         std::fs::write(&aof_path, b"").unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 0);
         assert_eq!(dbs[0].len(), 0);
     }
@@ -1248,7 +1248,7 @@ mod tests {
         std::fs::write(&aof_path, &aof_data).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         // Should have loaded the first command
         assert_eq!(count, 1);
         assert!(dbs[0].get(b"k1").is_some());
@@ -1303,7 +1303,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded_dbs = vec![Database::new()];
-        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert!(count >= 5, "Expected at least 5 commands, got {}", count);
 
         // Verify each type restored
@@ -1335,7 +1335,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded_dbs = vec![Database::new()];
-        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine).unwrap();
+        let count = replay_aof(&mut loaded_dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 2); // SET + PEXPIRE
 
         let base_ts = loaded_dbs[0].base_timestamp();
@@ -1363,7 +1363,7 @@ mod tests {
         std::fs::write(&aof_path, &commands).unwrap();
 
         let mut loaded = vec![Database::new()];
-        replay_aof(&mut loaded, &aof_path, &DispatchReplayEngine).unwrap();
+        replay_aof(&mut loaded, &aof_path, &DispatchReplayEngine::new()).unwrap();
 
         // Check strings
         assert_eq!(loaded[0].get(b"a").unwrap().value.as_bytes().unwrap(), b"1");

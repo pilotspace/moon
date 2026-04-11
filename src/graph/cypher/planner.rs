@@ -63,6 +63,12 @@ pub enum PhysicalOp {
     },
     /// Unwind a list into rows.
     Unwind { expr: Expr, alias: String },
+    /// MERGE: match-or-create pattern with conditional SET.
+    Merge {
+        pattern: Pattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+    },
 }
 
 /// Error during plan compilation.
@@ -100,10 +106,10 @@ impl PlanCache {
         self.cache.get(&hash).cloned()
     }
 
-    /// Insert a plan into the cache. Evicts oldest if at capacity.
+    /// Insert a plan into the cache. Evicts an arbitrary entry if at capacity.
     pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) {
         if self.cache.len() >= self.max_entries {
-            // Simple eviction: remove first key (not ideal but sufficient for now).
+            // Simple eviction: remove arbitrary key (HashMap has no ordering).
             if let Some(&first_key) = self.cache.keys().next() {
                 self.cache.remove(&first_key);
             }
@@ -279,10 +285,12 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                     items: s.items.clone(),
                 });
             }
-            Clause::Merge(_) => {
-                // MERGE is complex: pattern match + conditional create.
-                // For now, emit a basic pattern.
-                return Err(PlanError::Unsupported("MERGE not yet compiled".to_string()));
+            Clause::Merge(m) => {
+                ops.push(PhysicalOp::Merge {
+                    pattern: m.pattern.clone(),
+                    on_create: m.on_create.clone(),
+                    on_match: m.on_match.clone(),
+                });
             }
             Clause::With(w) => {
                 ops.push(PhysicalOp::Project {
@@ -343,13 +351,17 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
 
         // Subsequent node+edge pairs become expands.
         for (i, edge) in pattern.edges.iter().enumerate() {
+            let source_node = &pattern.nodes[i];
             let target = &pattern.nodes[i + 1];
             let (min_hops, max_hops) = edge.var_length.unwrap_or((1, 1));
             ops.push(PhysicalOp::Expand {
-                source: first
-                    .variable
-                    .clone()
-                    .unwrap_or_else(|| "_anon".to_string()),
+                source: source_node.variable.clone().unwrap_or_else(|| {
+                    if i == 0 {
+                        "_anon".to_string()
+                    } else {
+                        format!("_anon_{i}")
+                    }
+                }),
                 target: target
                     .variable
                     .clone()
@@ -445,6 +457,20 @@ mod tests {
             plan.operators
                 .iter()
                 .any(|op| matches!(op, PhysicalOp::ProcedureCall { .. }))
+        );
+    }
+
+    #[test]
+    fn test_compile_merge() {
+        let query =
+            parse_cypher(b"MERGE (n:Person {name: 'Alice'}) RETURN n").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Merge { .. })),
+            "expected Merge operator in plan, got: {:?}",
+            plan.operators
         );
     }
 

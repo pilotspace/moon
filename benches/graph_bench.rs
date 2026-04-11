@@ -13,7 +13,9 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use moon::graph::csr::CsrSegment;
+use moon::graph::csr::storage::CsrStorage;
 use moon::graph::memgraph::MemGraph;
+use moon::graph::simd;
 use moon::graph::traversal::{BoundedBfs, SegmentMergeReader};
 use moon::graph::types::{Direction, NodeKey, PropertyMap};
 
@@ -113,7 +115,7 @@ fn bench_bfs_2hop(c: &mut Criterion) {
     for &node_count in &[1_000usize, 10_000] {
         let (g, nodes) = build_memgraph(node_count, 10);
         let seed = nodes[0];
-        let csr_segments: Vec<Arc<CsrSegment>> = Vec::new();
+        let csr_segments: Vec<Arc<CsrStorage>> = Vec::new();
 
         group.bench_with_input(
             BenchmarkId::new("bfs_memgraph", node_count),
@@ -139,7 +141,7 @@ fn bench_bfs_2hop(c: &mut Criterion) {
     for &node_count in &[1_000usize, 10_000] {
         let (csr, nodes) = build_csr(node_count, 10);
         let seed = nodes[0];
-        let csr_segments = vec![Arc::new(csr)];
+        let csr_segments = vec![Arc::new(CsrStorage::Heap(csr))];
 
         group.bench_with_input(
             BenchmarkId::new("bfs_csr", node_count),
@@ -298,6 +300,52 @@ fn bench_neighbors_command(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// SIMD cosine similarity benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_cosine_similarity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cosine_similarity");
+
+    // 384-dim: typical embedding size (MiniLM, etc.)
+    let dim = 384;
+    let a: Vec<f32> = (0..dim).map(|i| ((i as f32) * 0.01).sin()).collect();
+    let b: Vec<f32> = (0..dim).map(|i| ((i as f32) * 0.02).cos()).collect();
+
+    group.bench_function("scalar_384d", |bench| {
+        bench.iter(|| {
+            black_box(simd::cosine_similarity_scalar_pub(
+                black_box(&a),
+                black_box(&b),
+            ))
+        })
+    });
+
+    group.bench_function("simd_384d", |bench| {
+        bench.iter(|| black_box(simd::cosine_similarity(black_box(&a), black_box(&b))))
+    });
+
+    // 768-dim: common for larger transformer models
+    let dim_768 = 768;
+    let a768: Vec<f32> = (0..dim_768).map(|i| ((i as f32) * 0.01).sin()).collect();
+    let b768: Vec<f32> = (0..dim_768).map(|i| ((i as f32) * 0.02).cos()).collect();
+
+    group.bench_function("scalar_768d", |bench| {
+        bench.iter(|| {
+            black_box(simd::cosine_similarity_scalar_pub(
+                black_box(&a768),
+                black_box(&b768),
+            ))
+        })
+    });
+
+    group.bench_function("simd_768d", |bench| {
+        bench.iter(|| black_box(simd::cosine_similarity(black_box(&a768), black_box(&b768))))
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion groups and main
 // ---------------------------------------------------------------------------
 
@@ -311,6 +359,7 @@ criterion_group!(
     bench_addnode_command,
     bench_addedge_command,
     bench_neighbors_command,
+    bench_cosine_similarity,
 );
 
 criterion_main!(graph_benchmarks);

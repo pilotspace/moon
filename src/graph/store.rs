@@ -10,6 +10,7 @@ use std::path::Path;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::graph::csr::CsrSegment;
 use crate::graph::index::PropertyIndex;
 use crate::graph::segment::GraphSegmentHolder;
 use crate::graph::stats::GraphStats;
@@ -43,6 +44,45 @@ pub struct NamedGraph {
     /// Per-graph statistics for cost-based query planning.
     /// Updated incrementally on node/edge insert/delete.
     pub stats: GraphStats,
+    /// Cypher plan cache: xxhash64 of query string → compiled PhysicalPlan.
+    /// Wrapped in Mutex for interior mutability (reads insert cache misses).
+    pub plan_cache: parking_lot::Mutex<crate::graph::cypher::planner::PlanCache>,
+}
+
+impl NamedGraph {
+    /// Returns true if the mutable write buffer has exceeded the edge threshold
+    /// and should be frozen + compacted into an immutable CSR segment.
+    pub fn should_compact(&self) -> bool {
+        self.write_buf.should_freeze()
+    }
+
+    /// Freeze the current MemGraph, convert to CSR, and push the new immutable
+    /// segment into the segment holder. Replaces write_buf with a fresh MemGraph.
+    ///
+    /// Returns `true` if compaction succeeded, `false` if freeze/CSR build failed.
+    pub fn freeze_and_compact(&mut self, lsn: u64) -> bool {
+        // Freeze: drains all live nodes/edges from write_buf.
+        let frozen = match self.write_buf.freeze() {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+
+        // Convert frozen MemGraph to a CSR segment.
+        match CsrSegment::from_frozen(frozen, lsn) {
+            Ok(csr) => {
+                self.segments.add_immutable(csr);
+                // Replace write_buf with a fresh empty MemGraph.
+                self.write_buf = crate::graph::memgraph::MemGraph::new(self.edge_threshold);
+                true
+            }
+            Err(_) => {
+                // CSR build failed -- write_buf is already frozen/drained.
+                // Replace with fresh MemGraph so writes can continue.
+                self.write_buf = crate::graph::memgraph::MemGraph::new(self.edge_threshold);
+                false
+            }
+        }
+    }
 }
 
 /// Per-shard graph store. No Arc, no Mutex -- fully owned by shard thread.
@@ -71,7 +111,7 @@ impl GraphStore {
     /// Allocate the next monotonic LSN for a graph mutation.
     pub fn allocate_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
+        self.next_lsn = self.next_lsn.saturating_add(1);
         lsn
     }
 
@@ -101,6 +141,9 @@ impl GraphStore {
                 created_lsn: lsn,
                 property_indexes: HashMap::new(),
                 stats: GraphStats::new(),
+                plan_cache: parking_lot::Mutex::new(crate::graph::cypher::planner::PlanCache::new(
+                    1024,
+                )),
             },
         );
         Ok(())

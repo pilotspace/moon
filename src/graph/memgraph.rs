@@ -31,6 +31,8 @@ pub struct FrozenMemGraph {
 pub struct MemGraph {
     nodes: SlotMap<NodeKey, MutableNode>,
     edges: SlotMap<EdgeKey, MutableEdge>,
+    /// Count of live (non-deleted) nodes.
+    live_node_count: usize,
     /// Count of live (non-deleted) edges.
     live_edge_count: usize,
     /// Edge count threshold that triggers freeze.
@@ -44,6 +46,7 @@ impl MemGraph {
         Self {
             nodes: SlotMap::with_key(),
             edges: SlotMap::with_key(),
+            live_node_count: 0,
             live_edge_count: 0,
             edge_threshold,
             frozen: false,
@@ -58,7 +61,7 @@ impl MemGraph {
         embedding: Option<Vec<f32>>,
         lsn: u64,
     ) -> NodeKey {
-        self.nodes.insert(MutableNode {
+        let key = self.nodes.insert(MutableNode {
             labels,
             outgoing: SmallVec::new(),
             incoming: SmallVec::new(),
@@ -67,7 +70,9 @@ impl MemGraph {
             created_lsn: lsn,
             deleted_lsn: u64::MAX,
             txn_id: 0,
-        })
+        });
+        self.live_node_count += 1;
+        key
     }
 
     /// Insert a new edge between `src` and `dst`. Validates both exist and are alive.
@@ -131,6 +136,7 @@ impl MemGraph {
             return false; // already deleted
         }
         node.deleted_lsn = lsn;
+        self.live_node_count = self.live_node_count.saturating_sub(1);
 
         // Collect incident edge keys (both outgoing and incoming).
         let edge_keys: SmallVec<[EdgeKey; 16]> = node
@@ -165,9 +171,23 @@ impl MemGraph {
         true
     }
 
+    /// Remove an edge by its external u64 id (used during WAL replay).
+    /// Reconstructs the EdgeKey from the ffi representation and delegates
+    /// to `remove_edge`.
+    pub fn remove_edge_by_id(&mut self, edge_id: u64, lsn: u64) -> bool {
+        let key_data = slotmap::KeyData::from_ffi(edge_id);
+        let edge_key = EdgeKey::from(key_data);
+        self.remove_edge(edge_key, lsn)
+    }
+
     /// O(1) node lookup by key.
     pub fn get_node(&self, key: NodeKey) -> Option<&MutableNode> {
         self.nodes.get(key)
+    }
+
+    /// O(1) mutable node lookup by key.
+    pub fn get_node_mut(&mut self, key: NodeKey) -> Option<&mut MutableNode> {
+        self.nodes.get_mut(key)
     }
 
     /// O(1) edge lookup by key.
@@ -205,12 +225,19 @@ impl MemGraph {
         }
     }
 
-    /// Number of live (non-deleted) nodes.
+    /// Iterate over all live (non-deleted) nodes. Yields `(NodeKey, &MutableNode)`.
+    pub fn iter_nodes(&self) -> impl Iterator<Item = (NodeKey, &MutableNode)> {
+        self.nodes.iter().filter(|(_, n)| n.deleted_lsn == u64::MAX)
+    }
+
+    /// Iterate over all live (non-deleted) edges. Yields `(EdgeKey, &MutableEdge)`.
+    pub fn iter_edges(&self) -> impl Iterator<Item = (EdgeKey, &MutableEdge)> {
+        self.edges.iter().filter(|(_, e)| e.deleted_lsn == u64::MAX)
+    }
+
+    /// Number of live (non-deleted) nodes. O(1) via maintained counter.
     pub fn node_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|n| n.deleted_lsn == u64::MAX)
-            .count()
+        self.live_node_count
     }
 
     /// Number of live (non-deleted) edges.
@@ -263,10 +290,27 @@ impl<'a> Iterator for NeighborIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Process outgoing edges first, then incoming.
+        // Visibility rule: edge is visible at `lsn` if:
+        //   created_lsn <= lsn  AND  deleted_lsn > lsn
+        // Special case: lsn == u64::MAX means "see all live edges".
+        // Live edges have deleted_lsn = u64::MAX, so for lsn = u64::MAX
+        // we check deleted_lsn == u64::MAX (alive) instead of deleted_lsn > lsn
+        // (which would be false since nothing is > u64::MAX).
+        let is_visible = |edge: &MutableEdge| -> bool {
+            if edge.created_lsn > self.lsn {
+                return false;
+            }
+            if self.lsn == u64::MAX {
+                // "See everything alive" — only filter out deleted edges.
+                edge.deleted_lsn == u64::MAX
+            } else {
+                edge.deleted_lsn > self.lsn
+            }
+        };
         loop {
             if let Some(&ek) = self.out_iter.next() {
                 if let Some(edge) = self.edges.get(ek) {
-                    if edge.created_lsn <= self.lsn && edge.deleted_lsn > self.lsn {
+                    if is_visible(edge) {
                         return Some((ek, edge.dst));
                     }
                 }
@@ -274,7 +318,7 @@ impl<'a> Iterator for NeighborIter<'a> {
             }
             if let Some(&ek) = self.in_iter.next() {
                 if let Some(edge) = self.edges.get(ek) {
-                    if edge.created_lsn <= self.lsn && edge.deleted_lsn > self.lsn {
+                    if is_visible(edge) {
                         return Some((ek, edge.src));
                     }
                 }

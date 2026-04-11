@@ -7,6 +7,7 @@ use slotmap::Key;
 
 use crate::graph::cypher;
 use crate::graph::store::GraphStore;
+use crate::graph::traversal::SegmentMergeReader;
 use crate::graph::types::Direction;
 use crate::protocol::Frame;
 
@@ -85,60 +86,75 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let node_key = super::graph_write::external_id_to_node_key(node_id);
 
-    // Use write_buf (mutable MemGraph) for reading since it has current data.
-    // Future: merge with immutable CSR segments.
     let memgraph = &graph.write_buf;
 
-    // Verify node exists.
+    // Verify node exists in the mutable write buffer.
+    // Nodes in CSR segments still have MemGraph entries (freeze copies, doesn't move).
     if memgraph.get_node(node_key).is_none() {
         return Frame::Error(Bytes::from_static(b"ERR node not found"));
     }
 
-    // BFS expansion.
+    // Build a SegmentMergeReader that sees both MemGraph and immutable CSR segments.
     let lsn = u64::MAX - 1; // See all live data (MAX-1 because deleted_lsn=MAX means alive).
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
+    let reader = SegmentMergeReader::new(
+        Some(memgraph),
+        csr_segs,
+        Direction::Both,
+        lsn,
+        edge_type_filter,
+    );
+
+    // TraversalGuard enforces bounded epoch hold (30s default timeout).
+    let guard = crate::graph::traversal_guard::TraversalGuard::with_default_timeout(lsn);
+
+    // BFS expansion using SegmentMergeReader for per-node neighbor lookup.
     let mut visited = std::collections::HashSet::new();
     visited.insert(node_id);
     let mut frontier = vec![node_key];
-    let mut results: Vec<Frame> = Vec::new();
+    let mut results: Vec<Frame> = Vec::with_capacity(128);
     // Cap total results.
     let max_results = 10_000usize;
 
     for _hop in 0..depth {
-        let mut next_frontier = Vec::new();
+        // Check traversal timeout at each hop.
+        if let Err(timeout) = guard.check_timeout() {
+            return Frame::Error(Bytes::from(format!("ERR {timeout}")));
+        }
+
+        let mut next_frontier = Vec::with_capacity(frontier.len() * 4);
 
         for &current in &frontier {
-            for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
-                // Apply edge type filter if specified.
-                if let Some(filter_type) = edge_type_filter {
-                    if let Some(edge) = memgraph.get_edge(edge_key) {
-                        if edge.edge_type != filter_type {
-                            continue;
-                        }
-                    }
-                }
-
-                let neighbor_ext_id = neighbor_key.data().as_ffi();
+            for merged in reader.neighbors(current) {
+                let neighbor_ext_id = merged.node.data().as_ffi();
 
                 if visited.contains(&neighbor_ext_id) {
                     continue;
                 }
                 visited.insert(neighbor_ext_id);
 
-                // Add edge as RESP3 Map.
-                if let Some(edge) = memgraph.get_edge(edge_key) {
-                    results.push(edge_to_frame(edge_key, edge));
+                // Add edge as RESP3 Map (from MemGraph if available, otherwise synthetic).
+                if let Some(edge) = memgraph.get_edge(merged.edge) {
+                    results.push(edge_to_frame(merged.edge, edge));
+                } else {
+                    // CSR-only edge: build a minimal edge frame from MergedNeighbor.
+                    results.push(merged_edge_to_frame(&merged));
                 }
 
                 // Add neighbor node as RESP3 Map.
-                if let Some(node) = memgraph.get_node(neighbor_key) {
-                    results.push(node_to_frame(neighbor_key, node));
+                if let Some(node) = memgraph.get_node(merged.node) {
+                    results.push(node_to_frame(merged.node, node));
+                } else {
+                    // CSR-only node: minimal node frame.
+                    results.push(merged_node_to_frame(&merged));
                 }
 
                 if results.len() >= max_results {
                     break;
                 }
 
-                next_frontier.push(neighbor_key);
+                next_frontier.push(merged.node);
             }
 
             if results.len() >= max_results {
@@ -253,8 +269,8 @@ pub fn graph_list(store: &GraphStore) -> Frame {
 
 /// GRAPH.QUERY <graph> <cypher_string>
 ///
-/// Parses and compiles the Cypher query. Full execution is deferred to Phase 118+.
-/// Currently returns the compiled physical plan as a diagnostic array.
+/// Parses the Cypher query, compiles to a physical plan, executes it against
+/// the named graph, and returns result rows with column headers and statistics.
 pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
@@ -267,9 +283,71 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
     };
 
-    if store.get_graph(graph_name).is_none() {
-        return Frame::Error(Bytes::from_static(b"ERR graph not found"));
+    let graph = match store.get_graph(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    // Plan cache: check for a cached plan before compiling.
+    let query_hash = cypher::planner::hash_query(cypher_bytes);
+    let plan = {
+        let cache = graph.plan_cache.lock();
+        cache.get(query_hash)
+    };
+    let plan = if let Some(cached) = plan {
+        cached
+    } else {
+        let p = match cypher::planner::compile(&query) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => {
+                let msg = format!("ERR Cypher plan error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        };
+        graph.plan_cache.lock().insert(query_hash, p.clone());
+        p
+    };
+
+    let params = std::collections::HashMap::new();
+    let result = match cypher::executor::execute(graph, &plan, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("ERR Cypher execution error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    exec_result_to_frame(&result)
+}
+
+/// GRAPH.QUERY <graph> <cypher_string> — write-capable variant.
+///
+/// Called when the Cypher query contains write clauses (CREATE, DELETE, SET, MERGE).
+/// Takes `&mut GraphStore` to allow mutable access to the named graph.
+pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
+        ));
     }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
 
     let cypher_bytes = match extract_bulk(&args[1]) {
         Some(b) => b,
@@ -292,14 +370,208 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         }
     };
 
-    // Return plan summary as array of operator descriptions.
-    let ops: Vec<Frame> = plan
-        .operators
-        .iter()
-        .map(|op| Frame::BulkString(Bytes::from(format!("{op:?}"))))
-        .collect();
+    let lsn = store.allocate_lsn();
 
-    Frame::Array(ops.into())
+    // Scoped borrow: get mutable graph, execute, release borrow before WAL push.
+    let result = {
+        let graph = match store.get_graph_mut(graph_name) {
+            Some(g) => g,
+            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+        };
+
+        let params = std::collections::HashMap::new();
+        match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("ERR Cypher execution error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        }
+    };
+
+    // Generate WAL records for mutations performed during execution.
+    for mutation in &result.mutations {
+        match mutation {
+            cypher::executor::MutationRecord::CreateNode {
+                node_id,
+                labels,
+                properties,
+                embedding,
+            } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_node(
+                        graph_name,
+                        *node_id,
+                        labels,
+                        properties,
+                        embedding.as_deref(),
+                    ));
+            }
+            cypher::executor::MutationRecord::CreateEdge {
+                edge_id,
+                src_id,
+                dst_id,
+                edge_type,
+                weight,
+                properties,
+            } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_edge(
+                        graph_name,
+                        *edge_id,
+                        *src_id,
+                        *dst_id,
+                        *edge_type,
+                        *weight,
+                        properties.as_ref(),
+                    ));
+            }
+        }
+    }
+
+    exec_result_to_frame(&result)
+}
+
+/// GRAPH.QUERY <graph> <cypher_string> — auto-routing handler.
+///
+/// Parses the Cypher query once, then dispatches to the read or write path
+/// based on whether the query contains write clauses.
+pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    // Parse once — no double-parse overhead.
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    if query.is_read_only() {
+        // Read path: compile plan (with cache), execute read-only.
+        let graph = match store.get_graph(graph_name) {
+            Some(g) => g,
+            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+        };
+
+        let query_hash = cypher::planner::hash_query(cypher_bytes);
+        let plan = {
+            let cache = graph.plan_cache.lock();
+            cache.get(query_hash)
+        };
+        let plan = if let Some(cached) = plan {
+            cached
+        } else {
+            let p = match cypher::planner::compile(&query) {
+                Ok(p) => std::sync::Arc::new(p),
+                Err(e) => {
+                    let msg = format!("ERR Cypher plan error: {e}");
+                    return Frame::Error(Bytes::from(msg));
+                }
+            };
+            graph.plan_cache.lock().insert(query_hash, p.clone());
+            p
+        };
+
+        let params = std::collections::HashMap::new();
+        let result = match cypher::executor::execute(graph, &plan, &params) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("ERR Cypher execution error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        };
+
+        exec_result_to_frame(&result)
+    } else {
+        // Write path: compile plan (no cache for writes), execute with mutations.
+        let plan = match cypher::planner::compile(&query) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("ERR Cypher plan error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        };
+
+        let lsn = store.allocate_lsn();
+
+        let result = {
+            let graph = match store.get_graph_mut(graph_name) {
+                Some(g) => g,
+                None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+            };
+
+            let params = std::collections::HashMap::new();
+            match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("ERR Cypher execution error: {e}");
+                    return Frame::Error(Bytes::from(msg));
+                }
+            }
+        };
+
+        // Generate WAL records for mutations.
+        for mutation in &result.mutations {
+            match mutation {
+                cypher::executor::MutationRecord::CreateNode {
+                    node_id,
+                    labels,
+                    properties,
+                    embedding,
+                } => {
+                    store
+                        .wal_pending
+                        .push(crate::graph::wal::serialize_add_node(
+                            graph_name,
+                            *node_id,
+                            labels,
+                            properties,
+                            embedding.as_deref(),
+                        ));
+                }
+                cypher::executor::MutationRecord::CreateEdge {
+                    edge_id,
+                    src_id,
+                    dst_id,
+                    edge_type,
+                    weight,
+                    properties,
+                } => {
+                    store
+                        .wal_pending
+                        .push(crate::graph::wal::serialize_add_edge(
+                            graph_name,
+                            *edge_id,
+                            *src_id,
+                            *dst_id,
+                            *edge_type,
+                            *weight,
+                            properties.as_ref(),
+                        ));
+                }
+            }
+        }
+
+        exec_result_to_frame(&result)
+    }
 }
 
 /// GRAPH.RO_QUERY <graph> <cypher_string>
@@ -407,6 +679,179 @@ pub fn graph_explain(store: &GraphStore, args: &[Frame]) -> Frame {
     Frame::BulkString(Bytes::from(output))
 }
 
+/// GRAPH.PROFILE <graph> <cypher_string>
+///
+/// Execute query with per-operator timing. Returns `[results, operator_profiles]`.
+pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.PROFILE' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    let graph = match store.get_graph(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let plan = match cypher::planner::compile(&query) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("ERR Cypher plan error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let params = std::collections::HashMap::new();
+    let profile = match cypher::executor::execute_profile(graph, &plan, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("ERR Cypher execution error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    profile_result_to_frame(&profile)
+}
+
+/// Convert a `ProfileResult` to a RESP3 Frame.
+///
+/// Format: Array [
+///   exec_result_frame,       // same format as GRAPH.QUERY
+///   Array [                  // per-operator profiles
+///     Array [name, row_count, duration_us],
+///     ...
+///   ]
+/// ]
+fn profile_result_to_frame(profile: &cypher::executor::ProfileResult) -> Frame {
+    let result_frame = exec_result_to_frame(&profile.exec_result);
+
+    let op_frames: Vec<Frame> = profile
+        .operator_profiles
+        .iter()
+        .map(|op| {
+            Frame::Array(
+                vec![
+                    Frame::BulkString(Bytes::from(op.name)),
+                    Frame::Integer(op.row_count as i64),
+                    Frame::Integer(op.duration_us as i64),
+                ]
+                .into(),
+            )
+        })
+        .collect();
+
+    Frame::Array(vec![result_frame, Frame::Array(op_frames.into())].into())
+}
+
+/// Convert an `ExecResult` to a RESP3 Frame.
+///
+/// Format: Array [
+///   Array [column_name_1, column_name_2, ...],   // headers
+///   Array [ Array [val1, val2, ...], ... ],        // rows
+///   BulkString "Nodes created: N, ..."             // stats
+/// ]
+fn exec_result_to_frame(result: &cypher::executor::ExecResult) -> Frame {
+    // 1. Headers
+    let headers: Vec<Frame> = result
+        .columns
+        .iter()
+        .map(|c| Frame::BulkString(Bytes::from(c.clone())))
+        .collect();
+
+    // 2. Rows -- each row is an array of values.
+    let rows: Vec<Frame> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let cells: Vec<Frame> = row.iter().map(value_to_frame).collect();
+            Frame::Array(cells.into())
+        })
+        .collect();
+
+    // 3. Stats — use write! to pre-allocated buffer instead of format!()
+    let mut stats_buf = Vec::with_capacity(128);
+    use std::io::Write as _;
+    let _ = write!(
+        stats_buf,
+        "Nodes created: {}, Nodes deleted: {}, Properties set: {}, \
+         Query internal execution time: {} us",
+        result.nodes_created, result.nodes_deleted, result.properties_set, result.execution_time_us
+    );
+
+    Frame::Array(
+        vec![
+            Frame::Array(headers.into()),
+            Frame::Array(rows.into()),
+            Frame::BulkString(Bytes::from(stats_buf)),
+        ]
+        .into(),
+    )
+}
+
+/// Convert an executor Value to a Frame.
+///
+/// Uses `itoa` + stack buffer for Node/Edge IDs to avoid per-row `format!()`
+/// heap allocations on the query result serialization hot path.
+fn value_to_frame(value: &cypher::executor::Value) -> Frame {
+    use cypher::executor::Value;
+    match value {
+        Value::Null => Frame::Null,
+        Value::Int(n) => Frame::Integer(*n),
+        Value::Float(f) => Frame::Double(*f),
+        Value::String(s) => Frame::BulkString(Bytes::from(s.clone())),
+        Value::Bool(b) => Frame::Boolean(*b),
+        Value::Node(key) => {
+            // "node:" (5) + max u64 (20 digits) = 25 bytes max
+            let mut buf = [0u8; 32];
+            buf[..5].copy_from_slice(b"node:");
+            let mut itoa_buf = itoa::Buffer::new();
+            let n = itoa_buf.format(key.data().as_ffi());
+            let end = 5 + n.len();
+            buf[5..end].copy_from_slice(n.as_bytes());
+            Frame::BulkString(Bytes::copy_from_slice(&buf[..end]))
+        }
+        Value::Edge(key) => {
+            let mut buf = [0u8; 32];
+            buf[..5].copy_from_slice(b"edge:");
+            let mut itoa_buf = itoa::Buffer::new();
+            let n = itoa_buf.format(key.data().as_ffi());
+            let end = 5 + n.len();
+            buf[5..end].copy_from_slice(n.as_bytes());
+            Frame::BulkString(Bytes::copy_from_slice(&buf[..end]))
+        }
+        Value::List(items) => {
+            let frames: Vec<Frame> = items.iter().map(value_to_frame).collect();
+            Frame::Array(frames.into())
+        }
+        Value::Map(entries) => {
+            let pairs: Vec<(Frame, Frame)> = entries
+                .iter()
+                .map(|(k, v)| (Frame::BulkString(Bytes::from(k.clone())), value_to_frame(v)))
+                .collect();
+            Frame::Map(pairs)
+        }
+    }
+}
+
 /// Extract the maximum hop count from Expand operators in a physical plan.
 fn extract_max_hops(plan: &cypher::planner::PhysicalPlan) -> u32 {
     let mut max_hops = 1u32;
@@ -425,6 +870,49 @@ fn extract_max_hops(plan: &cypher::planner::PhysicalPlan) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Format a node as a RESP3 Map: {id, labels, properties}.
+/// Format a CSR-only edge from a MergedNeighbor as a RESP3 Map.
+/// Used when the edge exists only in immutable CSR segments.
+fn merged_edge_to_frame(merged: &crate::graph::traversal::MergedNeighbor) -> Frame {
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"id")),
+            Frame::Integer(merged.edge.data().as_ffi() as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"type")),
+            Frame::Integer(merged.edge_type as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"weight")),
+            Frame::Double(merged.weight),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"properties")),
+            Frame::Map(Vec::new()),
+        ),
+    ])
+}
+
+/// Format a CSR-only node from a MergedNeighbor as a RESP3 Map.
+/// Used when the node exists only in immutable CSR segments.
+fn merged_node_to_frame(merged: &crate::graph::traversal::MergedNeighbor) -> Frame {
+    let external_id = merged.node.data().as_ffi();
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"id")),
+            Frame::Integer(external_id as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"labels")),
+            Frame::Array(Vec::new().into()),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"properties")),
+            Frame::Map(Vec::new()),
+        ),
+    ])
+}
+
 fn node_to_frame(
     key: crate::graph::types::NodeKey,
     node: &crate::graph::types::MutableNode,
@@ -620,6 +1108,7 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
 ///   FILTER <start_id> <hops> <k> <vector> — graph-filtered vector search (HYB-01)
 ///   EXPAND <k> <expansion_hops> <vector> — vector-to-graph expansion (HYB-02)
 ///   WALK <start_id> <max_depth> <beam_width> <min_sim> <vector> — vector-guided walk (HYB-03)
+///   RERANK <ref_node_id> <max_hops> <alpha> <k> <vector> — graph-constrained re-ranking (HYB-04)
 pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
@@ -714,9 +1203,49 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
+    } else if mode.eq_ignore_ascii_case(b"RERANK") {
+        // GRAPH.HYBRID g RERANK <ref_node_id> <max_hops> <alpha> <k> <vector>
+        if args.len() < 7 {
+            return Frame::Error(Bytes::from_static(
+                b"ERR RERANK requires: ref_node_id max_hops alpha k vector",
+            ));
+        }
+        let ref_id = match parse_u64(&args[2]) {
+            Some(id) => id,
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid ref node ID")),
+        };
+        let max_hops = match parse_u32(&args[3]) {
+            Some(h) if h > 0 && h <= 10 => h,
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid max_hops (1..10)")),
+        };
+        let alpha = match parse_f64(&args[4]) {
+            Some(a) => a.clamp(0.0, 1.0),
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid alpha")),
+        };
+        let k = match parse_u32(&args[5]) {
+            Some(k) if k > 0 => k as usize,
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid k")),
+        };
+        let query_vector = match extract_f32_vector(&args[6]) {
+            Some(v) if !v.is_empty() => v,
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid vector")),
+        };
+
+        let node_key = super::graph_write::external_id_to_node_key(ref_id);
+        let reranker = crate::graph::hybrid::GraphConstrainedReRanker::new(
+            node_key,
+            max_hops,
+            alpha,
+            query_vector,
+            k,
+        );
+        match reranker.execute(memgraph, lsn) {
+            Ok(results) => hybrid_results_to_frame(&results),
+            Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
+        }
     } else {
         Frame::Error(Bytes::from_static(
-            b"ERR unknown GRAPH.HYBRID mode (supported: FILTER, WALK)",
+            b"ERR unknown GRAPH.HYBRID mode (supported: FILTER, WALK, RERANK)",
         ))
     }
 }

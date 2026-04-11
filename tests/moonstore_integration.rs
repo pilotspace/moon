@@ -613,7 +613,7 @@ fn test_fpi_torn_page_crash_recovery() {
 
     // 7. Run recovery
     let mut databases = vec![Database::new()];
-    let engine = moon::persistence::replay::DispatchReplayEngine;
+    let engine = moon::persistence::replay::DispatchReplayEngine::new();
     let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
     // 8. Assertions
@@ -727,7 +727,7 @@ fn test_fpi_selective_recovery_only_fpi_pages_restored() {
         .unwrap();
 
     let mut databases = vec![Database::new()];
-    let engine = moon::persistence::replay::DispatchReplayEngine;
+    let engine = moon::persistence::replay::DispatchReplayEngine::new();
     let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
 
     assert_eq!(result.fpi_applied, 1, "Only 1 FPI record should be applied");

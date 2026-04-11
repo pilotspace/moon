@@ -6,22 +6,53 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  MOON_NO_URING: "1"
 
 jobs:
-  fmt:
-    name: Format
+  # ── Fast gate: no compilation needed (~10s) ─────────────────────────
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt
       - run: cargo fmt --check
+      - run: bash scripts/audit-unsafe.sh
+      - run: bash scripts/audit-unwrap.sh
+      - name: CHANGELOG check
+        if: github.event_name == 'pull_request'
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
+            echo "skip-changelog label found — skipping"
+            exit 0
+          fi
+          if git diff --name-only "${BASE_SHA}...${HEAD_SHA}" | grep -q CHANGELOG.md; then
+            echo "CHANGELOG.md updated"
+          else
+            echo "::error::CHANGELOG.md not updated. Add an entry or apply 'skip-changelog' label."
+            exit 1
+          fi
 
-  clippy:
-    name: Clippy
+  # ── Main gate: clippy + test in one job, shared compilation ─────────
+  # Clippy checks compile the crate; test reuses those artifacts via
+  # cargo's incremental cache in the same runner. Saves ~5 min vs
+  # separate jobs that each compile from scratch.
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -29,112 +60,28 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (default features)
+        with:
+          # Cache key covers all 3 feature combos so incremental builds hit.
+          shared-key: check-${{ hashFiles('Cargo.lock') }}
+
+      # Clippy (3 feature configurations — shares compilation between runs)
+      - name: Clippy (default)
         run: cargo clippy -- -D warnings
-      - name: Clippy (tokio runtime)
+      - name: Clippy (graph)
+        run: cargo clippy --features graph -- -D warnings
+      - name: Clippy (tokio)
         run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Unit tests
-        run: cargo test --lib --no-default-features --features runtime-tokio,jemalloc
+      # Test — reuses .rlib artifacts from clippy's check compilation above.
+      # Only the test harness + test binaries need building (incremental).
+      - name: Test
+        run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
-        env:
-          MOON_NO_URING: "1"
-      - name: Integration tests (server-spawning)
-        run: cargo test --no-default-features --features runtime-tokio,jemalloc --test integration --test replication_test
+      - name: Test (graph)
+        run: "cargo test --no-default-features --features runtime-tokio,jemalloc,graph --lib graph::"
         timeout-minutes: 5
-        env:
-          MOON_NO_URING: "1"
 
-  safety-audit:
-    name: Safety Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Audit unsafe blocks for SAFETY comments
-        run: bash scripts/audit-unsafe.sh
-      - name: Audit unwrap/expect ratchet
-        run: bash scripts/audit-unwrap.sh
-
-  changelog:
-    name: CHANGELOG check
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Check CHANGELOG.md touched or skip-changelog label present
-        env:
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: |
-          if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
-            echo "skip-changelog label found — skipping check"
-            exit 0
-          fi
-          if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
-            echo "CHANGELOG.md updated"
-          else
-            echo "::error::CHANGELOG.md not updated under [Unreleased]. Add a changelog entry or apply the 'skip-changelog' label."
-            exit 1
-          fi
-
-  supply-chain:
-    name: Supply Chain Security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-deny and cargo-audit
-        run: cargo install cargo-deny cargo-audit
-      - name: cargo deny check
-        run: cargo deny check
-      - name: cargo audit
-        run: cargo audit
-
-  redis-compat:
-    name: Redis Compat
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Build Moon
-        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
-      - name: Run redis_compat integration tests
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-          # TODO: Remove --skip flags when stream commands (XADD, XRANGE, XTRIM) are implemented.
-          # Tracked in ROADMAP as stream support milestone.
-          MOON_TEST_PORT=6399 cargo test --release --no-default-features --features runtime-tokio,jemalloc --test redis_compat -- --ignored --skip xadd --skip xrange --skip xtrim
-        timeout-minutes: 5
-        env:
-          MOON_NO_URING: "1"
-
-  loom:
-    name: Loom Model Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Run loom exhaustive exploration
-        run: cargo test --no-default-features --features runtime-tokio,jemalloc --test loom_response_slot
-        timeout-minutes: 5
-        env:
-          MOON_NO_URING: "1"
-          RUSTFLAGS: "--cfg loom"
-
+  # ── MSRV — minimal build, different cache key ───────────────────────
   msrv:
     name: MSRV (1.94)
     runs-on: ubuntu-latest
@@ -142,4 +89,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-${{ hashFiles('Cargo.lock') }}
       - run: cargo build --no-default-features --features runtime-tokio

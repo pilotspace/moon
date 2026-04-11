@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arc_swap::{ArcSwap, Guard};
 
-use crate::graph::csr::CsrSegment;
+use crate::graph::csr::{CsrSegment, CsrStorage};
 use crate::graph::memgraph::MemGraph;
 
 /// Snapshot of all graph segments at a point in time.
@@ -15,8 +15,8 @@ use crate::graph::memgraph::MemGraph;
 pub struct GraphSegmentList {
     /// Active mutable segment (None after freeze, before new one is created).
     pub mutable: Option<Arc<MemGraph>>,
-    /// Immutable CSR segments, newest first.
-    pub immutable: Vec<Arc<CsrSegment>>,
+    /// Immutable CSR segments (heap or mmap), newest first.
+    pub immutable: Vec<Arc<CsrStorage>>,
 }
 
 /// Lock-free segment holder for graph data.
@@ -50,10 +50,16 @@ impl GraphSegmentHolder {
     }
 
     /// Add a new immutable CSR segment (e.g. from compaction) to the list.
+    /// Wraps the CsrSegment in CsrStorage::Heap automatically.
     pub fn add_immutable(&self, csr: CsrSegment) {
+        self.add_immutable_storage(CsrStorage::from(csr));
+    }
+
+    /// Add a new immutable CsrStorage (heap or mmap) to the list.
+    pub fn add_immutable_storage(&self, storage: CsrStorage) {
         let current = self.segments.load();
         let mut new_immutable = current.immutable.clone();
-        new_immutable.insert(0, Arc::new(csr)); // newest first
+        new_immutable.insert(0, Arc::new(storage)); // newest first
         self.segments.store(Arc::new(GraphSegmentList {
             mutable: current.mutable.clone(),
             immutable: new_immutable,
@@ -64,13 +70,13 @@ impl GraphSegmentHolder {
     /// with a single compacted segment.
     pub fn replace_immutable(&self, old_lsns: &[u64], new_csr: CsrSegment) {
         let current = self.segments.load();
-        let mut new_immutable: Vec<Arc<CsrSegment>> = current
+        let mut new_immutable: Vec<Arc<CsrStorage>> = current
             .immutable
             .iter()
-            .filter(|seg| !old_lsns.contains(&seg.created_lsn))
+            .filter(|seg| !old_lsns.contains(&seg.created_lsn()))
             .cloned()
             .collect();
-        new_immutable.insert(0, Arc::new(new_csr)); // newest first
+        new_immutable.insert(0, Arc::new(CsrStorage::from(new_csr))); // newest first
         self.segments.store(Arc::new(GraphSegmentList {
             mutable: current.mutable.clone(),
             immutable: new_immutable,
@@ -144,7 +150,7 @@ mod tests {
         holder.add_immutable(csr);
         let snap = holder.load();
         assert_eq!(snap.immutable.len(), 1);
-        assert_eq!(snap.immutable[0].created_lsn, 10);
+        assert_eq!(snap.immutable[0].created_lsn(), 10);
     }
 
     #[test]
@@ -179,6 +185,6 @@ mod tests {
 
         let snap = holder.load();
         assert_eq!(snap.immutable.len(), 1);
-        assert_eq!(snap.immutable[0].created_lsn, 30);
+        assert_eq!(snap.immutable[0].created_lsn(), 30);
     }
 }

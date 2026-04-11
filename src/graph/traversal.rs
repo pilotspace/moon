@@ -12,13 +12,22 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::graph::csr::CsrSegment;
+use dashmap::DashSet;
+use parking_lot::Mutex;
+
+use crate::graph::csr::CsrStorage;
 use crate::graph::memgraph::MemGraph;
 use crate::graph::scoring::WeightedCostFn;
 use crate::graph::types::{Direction, EdgeKey, NodeKey};
 
 /// Default maximum frontier size for BFS (100K nodes).
 pub const DEFAULT_FRONTIER_CAP: usize = 100_000;
+
+/// Frontier size threshold above which parallel BFS is used.
+pub const PARALLEL_THRESHOLD: usize = 256;
+
+/// Number of nodes per morsel in parallel BFS expansion.
+pub const MORSEL_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Traversal errors
@@ -55,7 +64,7 @@ impl core::fmt::Display for TraversalError {
 // ---------------------------------------------------------------------------
 
 /// A neighbor edge from any segment (MemGraph or CSR).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct MergedNeighbor {
     /// The neighbor node key.
     pub node: NodeKey,
@@ -80,7 +89,7 @@ pub struct MergedNeighbor {
 /// Reads from all active segments for query-time merge.
 pub struct SegmentMergeReader<'a> {
     memgraph: Option<&'a MemGraph>,
-    csr_segments: &'a [Arc<CsrSegment>],
+    csr_segments: &'a [Arc<CsrStorage>],
     direction: Direction,
     snapshot_lsn: u64,
     edge_type_filter: Option<u16>,
@@ -90,7 +99,7 @@ impl<'a> SegmentMergeReader<'a> {
     /// Create a merge reader from a MemGraph and CSR segments.
     pub fn new(
         memgraph: Option<&'a MemGraph>,
-        csr_segments: &'a [Arc<CsrSegment>],
+        csr_segments: &'a [Arc<CsrStorage>],
         direction: Direction,
         snapshot_lsn: u64,
         edge_type_filter: Option<u16>,
@@ -106,12 +115,38 @@ impl<'a> SegmentMergeReader<'a> {
 
     /// Get all neighbors of a node, merged from all segments, deduplicated.
     ///
-    /// Returns a Vec to allow callers to iterate freely. Allocates once per
-    /// call (acceptable -- this is at the end of the command path, not hot loop).
+    /// Allocates per call. For BFS/DFS hot loops, prefer [`neighbors_into`]
+    /// which reuses caller-provided scratch buffers.
     pub fn neighbors(&self, node: NodeKey) -> Vec<MergedNeighbor> {
         let mut seen: HashSet<NodeKey> = HashSet::new();
         let mut result: Vec<MergedNeighbor> = Vec::new();
+        self.neighbors_inner(node, &mut seen, &mut result);
+        result
+    }
 
+    /// Zero-allocation neighbor query: clears and fills caller-provided buffers.
+    ///
+    /// `seen` and `out` are cleared at the start, then reused across calls
+    /// to avoid per-node HashSet/Vec allocation in BFS/DFS inner loops.
+    #[inline]
+    pub fn neighbors_into(
+        &self,
+        node: NodeKey,
+        seen: &mut HashSet<NodeKey>,
+        out: &mut Vec<MergedNeighbor>,
+    ) {
+        seen.clear();
+        out.clear();
+        self.neighbors_inner(node, seen, out);
+    }
+
+    /// Shared implementation for neighbors / neighbors_into.
+    fn neighbors_inner(
+        &self,
+        node: NodeKey,
+        seen: &mut HashSet<NodeKey>,
+        result: &mut Vec<MergedNeighbor>,
+    ) {
         // 1. Read from mutable MemGraph (highest priority -- newest data).
         if let Some(mg) = self.memgraph {
             for (edge_key, neighbor_key) in mg.neighbors(node, self.direction, self.snapshot_lsn) {
@@ -138,7 +173,7 @@ impl<'a> SegmentMergeReader<'a> {
         // 2. Read from immutable CSR segments (newest first).
         for csr in self.csr_segments {
             // Only include segments created at or before our snapshot.
-            if csr.created_lsn > self.snapshot_lsn {
+            if csr.created_lsn() > self.snapshot_lsn {
                 continue;
             }
             let Some(row) = csr.lookup_node(node) else {
@@ -152,42 +187,57 @@ impl<'a> SegmentMergeReader<'a> {
                 continue;
             }
 
-            for (col_idx, meta) in csr.neighbor_edges(row) {
+            let edge_type_filter = self.edge_type_filter;
+            let snapshot_lsn = self.snapshot_lsn;
+            let node_meta = csr.node_meta();
+            let csr_lsn = csr.created_lsn();
+
+            csr.for_each_neighbor_edge(row, |col_idx, meta| {
                 // Apply edge type filter.
-                if let Some(filter) = self.edge_type_filter {
+                if let Some(filter) = edge_type_filter {
                     if meta.edge_type != filter {
-                        continue;
+                        return;
                     }
                 }
 
                 // Resolve col_idx back to a NodeKey via node_meta.
-                if (col_idx as usize) < csr.node_meta.len() {
-                    let target_meta = &csr.node_meta[col_idx as usize];
+                if (col_idx as usize) < node_meta.len() {
+                    let target_meta = &node_meta[col_idx as usize];
                     // Check target node visibility (not deleted at snapshot).
                     if target_meta.deleted_lsn != u64::MAX
-                        && target_meta.deleted_lsn <= self.snapshot_lsn
+                        && target_meta.deleted_lsn <= snapshot_lsn
                     {
-                        continue;
+                        return;
                     }
                     let target_key: NodeKey =
                         slotmap::KeyData::from_ffi(target_meta.external_id).into();
 
                     if seen.insert(target_key) {
-                        // CSR EdgeMeta doesn't store weight/timestamp directly.
-                        // Use segment created_lsn as timestamp, 1.0 as default weight.
                         result.push(MergedNeighbor {
                             node: target_key,
                             edge: slotmap::KeyData::from_ffi(0).into(),
                             edge_type: meta.edge_type,
                             weight: 1.0,
-                            timestamp: csr.created_lsn,
+                            timestamp: csr_lsn,
                         });
                     }
                 }
-            }
+            });
         }
+    }
 
-        result
+    /// Hint sequential access on all CSR segments (for BFS/DFS traversals).
+    pub fn madvise_sequential(&self) {
+        for csr in self.csr_segments {
+            csr.madvise_sequential();
+        }
+    }
+
+    /// Hint random access on all CSR segments (for point lookups).
+    pub fn madvise_random(&self) {
+        for csr in self.csr_segments {
+            csr.madvise_random();
+        }
     }
 
     /// Check if a node exists in any segment.
@@ -253,6 +303,9 @@ impl BoundedBfs {
             return Err(TraversalError::NodeNotFound);
         }
 
+        // Hint the OS for sequential page access on mmap'd CSR segments.
+        reader.madvise_sequential();
+
         let mut visited_set: HashSet<NodeKey> = HashSet::new();
         visited_set.insert(start);
 
@@ -262,13 +315,17 @@ impl BoundedBfs {
         let mut frontier: VecDeque<(NodeKey, u32)> = VecDeque::new();
         frontier.push_back((start, 0));
 
+        // Scratch buffers reused across all neighbor lookups (avoids per-node alloc).
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
         while let Some((current, depth)) = frontier.pop_front() {
             if depth >= self.depth_limit {
                 continue;
             }
 
-            let neighbors = reader.neighbors(current);
-            for neighbor in neighbors {
+            reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+            for &neighbor in &nb_buf {
                 if visited_set.contains(&neighbor.node) {
                     continue;
                 }
@@ -283,9 +340,160 @@ impl BoundedBfs {
 
                 visited_set.insert(neighbor.node);
                 let next_depth = depth + 1;
-                result.push((neighbor.node, next_depth, Some(neighbor.clone())));
+                result.push((neighbor.node, next_depth, Some(neighbor)));
                 frontier.push_back((neighbor.node, next_depth));
             }
+        }
+
+        Ok(BfsResult { visited: result })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel BFS (PAR-01 through PAR-04)
+// ---------------------------------------------------------------------------
+
+/// Morsel-driven parallel BFS for large frontiers.
+///
+/// When the frontier exceeds [`PARALLEL_THRESHOLD`] (256) nodes, neighbor-list
+/// processing is split into [`MORSEL_SIZE`] (128) node morsels handled in
+/// parallel via `std::thread::scope`. Results merge into a shared
+/// `DashSet<NodeKey>` visited set. Falls back to sequential BFS for small
+/// frontiers (PAR-03), avoiding any parallelism overhead.
+///
+/// **Design note:** `SegmentMergeReader` borrows `&MemGraph` which is `!Send`,
+/// so `reader.neighbors()` calls remain on the main thread. The parallel phase
+/// processes the *already-collected* neighbor lists (owned `Vec<MergedNeighbor>`)
+/// across worker threads for visited-set filtering and result building.
+pub struct ParallelBfs {
+    pub depth_limit: u32,
+    pub frontier_cap: usize,
+}
+
+impl ParallelBfs {
+    /// Create with default frontier cap of 100K.
+    pub fn new(depth_limit: u32) -> Self {
+        Self {
+            depth_limit,
+            frontier_cap: DEFAULT_FRONTIER_CAP,
+        }
+    }
+
+    /// Create with custom frontier cap.
+    pub fn with_cap(depth_limit: u32, frontier_cap: usize) -> Self {
+        Self {
+            depth_limit,
+            frontier_cap,
+        }
+    }
+
+    /// Execute parallel BFS from a start node.
+    ///
+    /// For frontiers larger than [`PARALLEL_THRESHOLD`], neighbor lists are
+    /// collected sequentially (reader is `!Send`) then processed in parallel
+    /// morsels via `std::thread::scope`.
+    pub fn execute(
+        &self,
+        reader: &SegmentMergeReader<'_>,
+        start: NodeKey,
+    ) -> Result<BfsResult, TraversalError> {
+        if !reader.node_exists(start) {
+            return Err(TraversalError::NodeNotFound);
+        }
+
+        reader.madvise_sequential();
+
+        let mut visited_set: HashSet<NodeKey> = HashSet::new();
+        visited_set.insert(start);
+
+        let mut result: Vec<(NodeKey, u32, Option<MergedNeighbor>)> = vec![(start, 0, None)];
+        let mut frontier: Vec<NodeKey> = vec![start];
+        let mut depth: u32 = 0;
+
+        // Scratch buffers reused across all neighbor lookups.
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
+        while !frontier.is_empty() {
+            if depth >= self.depth_limit {
+                break;
+            }
+
+            let next_depth = depth + 1;
+
+            if frontier.len() <= PARALLEL_THRESHOLD {
+                // --- Sequential path: plain HashSet, no DashSet/Mutex overhead ---
+                let mut next_frontier = Vec::new();
+                for &node in &frontier {
+                    reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
+                    for &neighbor in &nb_buf {
+                        if visited_set.insert(neighbor.node) {
+                            result.push((neighbor.node, next_depth, Some(neighbor)));
+                            next_frontier.push(neighbor.node);
+                        }
+                    }
+                }
+                frontier = next_frontier;
+            } else {
+                // --- Parallel path: collect neighbors sequentially (reader is !Send),
+                //     then process in parallel morsels via std::thread::scope ---
+                let neighbor_lists: Vec<Vec<MergedNeighbor>> = frontier
+                    .iter()
+                    .map(|&node| {
+                        reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
+                        nb_buf.clone()
+                    })
+                    .collect();
+
+                // Upgrade to DashSet only for the parallel phase.
+                let dash_visited: DashSet<NodeKey> = DashSet::with_capacity(visited_set.len());
+                for &k in &visited_set {
+                    dash_visited.insert(k);
+                }
+
+                let per_morsel_results: Mutex<Vec<Vec<(NodeKey, u32, Option<MergedNeighbor>)>>> =
+                    Mutex::new(Vec::new());
+
+                std::thread::scope(|s| {
+                    for chunk in neighbor_lists.chunks(MORSEL_SIZE) {
+                        let visited_ref = &dash_visited;
+                        let per_morsel_ref = &per_morsel_results;
+                        s.spawn(move || {
+                            let mut local: Vec<(NodeKey, u32, Option<MergedNeighbor>)> = Vec::new();
+                            for neighbors in chunk {
+                                for &neighbor in neighbors {
+                                    if visited_ref.insert(neighbor.node) {
+                                        local.push((neighbor.node, next_depth, Some(neighbor)));
+                                    }
+                                }
+                            }
+                            per_morsel_ref.lock().push(local);
+                        });
+                    }
+                });
+
+                // Merge morsel results back into sequential structures.
+                let morsel_vecs = per_morsel_results.into_inner();
+                let mut next_frontier = Vec::new();
+                for morsel in &morsel_vecs {
+                    for entry in morsel {
+                        next_frontier.push(entry.0);
+                        visited_set.insert(entry.0);
+                        result.push(*entry);
+                    }
+                }
+                frontier = next_frontier;
+            }
+
+            // Check frontier cap.
+            if visited_set.len() >= self.frontier_cap {
+                return Err(TraversalError::FrontierCapExceeded {
+                    cap: self.frontier_cap,
+                    depth: next_depth,
+                });
+            }
+
+            depth = next_depth;
         }
 
         Ok(BfsResult { visited: result })
@@ -337,6 +545,10 @@ impl BoundedDfs {
         let mut stack: Vec<(NodeKey, u32, f64)> = Vec::new();
         stack.push((start, 0, 0.0));
 
+        // Scratch buffers reused across all neighbor lookups.
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
         while let Some((current, depth, cum_cost)) = stack.pop() {
             if visited_set.contains(&current) {
                 continue;
@@ -348,8 +560,8 @@ impl BoundedDfs {
                 continue;
             }
 
-            let neighbors = reader.neighbors(current);
-            for neighbor in neighbors {
+            reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+            for &neighbor in &nb_buf {
                 if visited_set.contains(&neighbor.node) {
                     continue;
                 }
@@ -390,7 +602,7 @@ struct DijkstraEntry {
 
 impl PartialEq for DijkstraEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.cost == other.cost
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -405,10 +617,21 @@ impl PartialOrd for DijkstraEntry {
 impl Ord for DijkstraEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap (BinaryHeap is max-heap).
-        other
-            .cost
-            .partial_cmp(&self.cost)
-            .unwrap_or(Ordering::Equal)
+        // NaN is treated as greater than all values (pushed to bottom, never selected).
+        match other.cost.partial_cmp(&self.cost) {
+            Some(ord) => ord,
+            None => {
+                // At least one is NaN. NaN entries sort last (greatest cost).
+                match (self.cost.is_nan(), other.cost.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less, // self is NaN = high cost → less priority
+                    (false, true) => Ordering::Greater, // other is NaN = high cost → self wins
+                    // Both NaN checks returned false — logically unreachable since
+                    // partial_cmp returns None only when at least one operand is NaN.
+                    _ => Ordering::Equal,
+                }
+            }
+        }
     }
 }
 
@@ -449,6 +672,10 @@ impl DijkstraTraversal {
             cost: 0.0,
         });
 
+        // Scratch buffers reused across all neighbor lookups.
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
         while let Some(DijkstraEntry { node, cost }) = heap.pop() {
             // Found target -- reconstruct path.
             if node == target {
@@ -471,8 +698,8 @@ impl DijkstraTraversal {
                 continue;
             }
 
-            let neighbors = reader.neighbors(node);
-            for neighbor in neighbors {
+            reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
+            for &neighbor in &nb_buf {
                 let edge_cost = self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
                 let new_cost = cost + edge_cost;
 
@@ -523,9 +750,10 @@ impl DijkstraTraversal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::csr::CsrSegment;
+    use crate::graph::csr::{CsrSegment, CsrStorage};
     use crate::graph::memgraph::MemGraph;
     use crate::graph::scoring::WeightedCostFn;
+    use slotmap::Key;
     use smallvec::smallvec;
 
     fn empty_props() -> crate::graph::types::PropertyMap {
@@ -543,7 +771,7 @@ mod tests {
         mg.add_edge(a, b, 1, 2.0, None, 2).expect("ok");
         mg.add_edge(a, c, 1, 3.0, None, 3).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -571,7 +799,7 @@ mod tests {
         mg2.add_edge(a2, b2, 1, 1.0, None, 2).expect("ok");
         let frozen = mg2.freeze().expect("ok");
         let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
-        let csr_segs = vec![Arc::new(csr)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
 
         let reader = SegmentMergeReader::new(
             Some(&mg),
@@ -601,13 +829,13 @@ mod tests {
         let first_edge_idx = csr.row_offsets[0]; // Row 0 = node a, first edge
         csr.mark_deleted(first_edge_idx);
 
-        let csr_segs = vec![Arc::new(csr)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
         let reader: SegmentMergeReader<'_> =
             SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
 
         // Look up the first node's key (row 0 in CSR).
         let node_a_key = {
-            let meta = &csr_segs[0].node_meta[0];
+            let meta = &csr_segs[0].node_meta()[0];
             let key: NodeKey = slotmap::KeyData::from_ffi(meta.external_id).into();
             key
         };
@@ -626,7 +854,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(a, c, 2, 1.0, None, 2).expect("ok"); // different type
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -645,7 +873,7 @@ mod tests {
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -671,7 +899,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(a, c, 1, 1.0, None, 2).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -699,7 +927,7 @@ mod tests {
         mg.add_edge(b, c, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(c, d, 1, 1.0, None, 2).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader =
             SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Both, u64::MAX - 1, None);
 
@@ -725,7 +953,7 @@ mod tests {
             mg.add_edge(center, leaf, 1, 1.0, None, 2).expect("ok");
         }
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -747,7 +975,7 @@ mod tests {
     #[test]
     fn test_bfs_node_not_found() {
         let mg = MemGraph::new(1000);
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -773,7 +1001,7 @@ mod tests {
         mg.add_edge(b, c, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(c, a, 1, 1.0, None, 2).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -799,7 +1027,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 10).expect("ok");
         mg.add_edge(b, c, 1, 2.0, None, 10).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -824,7 +1052,7 @@ mod tests {
         mg.add_edge(a, b, 1, 5.0, None, 100).expect("ok");
         mg.add_edge(b, c, 1, 10.0, None, 100).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -851,7 +1079,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 10).expect("ok");
         mg.add_edge(b, c, 1, 1.0, None, 10).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -879,7 +1107,7 @@ mod tests {
         mg.add_edge(a, b, 1, 3.0, None, 100).expect("ok");
         mg.add_edge(b, c, 1, 4.0, None, 100).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -911,7 +1139,7 @@ mod tests {
         let b = mg.add_node(smallvec![0], empty_props(), None, 1);
         // No edge from a to b.
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -931,7 +1159,7 @@ mod tests {
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -970,7 +1198,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 95).expect("ok");
         mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -994,7 +1222,7 @@ mod tests {
     #[test]
     fn test_dijkstra_node_not_found() {
         let mg = MemGraph::new(1000);
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -1021,7 +1249,7 @@ mod tests {
         mg1.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
         let frozen = mg1.freeze().expect("ok");
         let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
-        let csr_segs = vec![Arc::new(csr)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
 
         // MemGraph: a->c (new data not in CSR)
         let mut mg2 = MemGraph::new(1000);
@@ -1065,16 +1293,162 @@ mod tests {
         let frozen2 = mg2.freeze().expect("ok");
         let csr2 = CsrSegment::from_frozen(frozen2, 10).expect("ok");
 
-        let csr_segs = vec![Arc::new(csr1), Arc::new(csr2)];
+        let csr_segs = vec![
+            Arc::new(CsrStorage::from(csr1)),
+            Arc::new(CsrStorage::from(csr2)),
+        ];
         let reader: SegmentMergeReader<'_> =
             SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
 
         // Look up node 'a' from CSR 1.
         let node_a_key: NodeKey =
-            slotmap::KeyData::from_ffi(csr_segs[0].node_meta[0].external_id).into();
+            slotmap::KeyData::from_ffi(csr_segs[0].node_meta()[0].external_id).into();
 
         let neighbors = reader.neighbors(node_a_key);
         // Should find neighbor(s) from CSR 1 at minimum.
         assert!(!neighbors.is_empty());
+    }
+
+    // --- ParallelBfs tests ---
+
+    #[test]
+    fn test_parallel_bfs_small_frontier_matches_sequential() {
+        // Build a small graph (10 nodes in a chain with some branches).
+        let mut mg = MemGraph::new(1000);
+        let mut nodes = Vec::new();
+        for _ in 0..10 {
+            nodes.push(mg.add_node(smallvec![0], empty_props(), None, 1));
+        }
+        // Chain: 0->1->2->3->4
+        for i in 0..4 {
+            mg.add_edge(nodes[i], nodes[i + 1], 1, 1.0, None, 2)
+                .expect("ok");
+        }
+        // Branch: 0->5, 0->6, 1->7, 2->8, 3->9
+        mg.add_edge(nodes[0], nodes[5], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[0], nodes[6], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[1], nodes[7], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[2], nodes[8], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[3], nodes[9], 1, 1.0, None, 2)
+            .expect("ok");
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let seq_bfs = BoundedBfs::new(3);
+        let seq_result = seq_bfs.execute(&reader, nodes[0]).expect("ok");
+
+        let par_bfs = super::ParallelBfs::new(3);
+        let par_result = par_bfs.execute(&reader, nodes[0]).expect("ok");
+
+        // Compare visited sets (ignore order).
+        let mut seq_nodes: Vec<NodeKey> = seq_result.visited.iter().map(|v| v.0).collect();
+        let mut par_nodes: Vec<NodeKey> = par_result.visited.iter().map(|v| v.0).collect();
+        seq_nodes.sort_by_key(|k| k.data().as_ffi());
+        par_nodes.sort_by_key(|k| k.data().as_ffi());
+        assert_eq!(seq_nodes, par_nodes);
+    }
+
+    #[test]
+    fn test_parallel_bfs_large_frontier_triggers_parallel() {
+        // Build a hub node connected to 350+ nodes (> PARALLEL_THRESHOLD).
+        let mut mg = MemGraph::new(100_000);
+        let hub = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let leaf_count = 350;
+        let mut leaves = Vec::with_capacity(leaf_count);
+        for i in 0..leaf_count {
+            let leaf = mg.add_node(smallvec![0], empty_props(), None, (i + 2) as u64);
+            mg.add_edge(hub, leaf, 1, 1.0, None, 2).expect("ok");
+            leaves.push(leaf);
+        }
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let par_bfs = super::ParallelBfs::new(1);
+        let result = par_bfs.execute(&reader, hub).expect("ok");
+
+        // Hub + all 350 leaves = 351
+        assert_eq!(result.visited.len(), leaf_count + 1);
+    }
+
+    #[test]
+    fn test_parallel_bfs_respects_frontier_cap() {
+        // Set cap to 50, build a star that exceeds it.
+        let mut mg = MemGraph::new(100_000);
+        let hub = mg.add_node(smallvec![0], empty_props(), None, 1);
+        for i in 0..100 {
+            let leaf = mg.add_node(smallvec![0], empty_props(), None, (i + 2) as u64);
+            mg.add_edge(hub, leaf, 1, 1.0, None, 2).expect("ok");
+        }
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let par_bfs = super::ParallelBfs::with_cap(2, 50);
+        let err = par_bfs.execute(&reader, hub).unwrap_err();
+        match err {
+            TraversalError::FrontierCapExceeded { cap, depth: _ } => {
+                assert_eq!(cap, 50);
+            }
+            other => panic!("expected FrontierCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parallel_bfs_sequential_fallback() {
+        // Frontier < 256 nodes -- verify correctness matches BoundedBfs.
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let c = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let d = mg.add_node(smallvec![0], empty_props(), None, 1);
+        mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(a, c, 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(b, d, 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(c, d, 1, 1.0, None, 2).expect("ok");
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let seq = BoundedBfs::new(3);
+        let seq_result = seq.execute(&reader, a).expect("ok");
+
+        let par = super::ParallelBfs::new(3);
+        let par_result = par.execute(&reader, a).expect("ok");
+
+        let mut seq_nodes: Vec<NodeKey> = seq_result.visited.iter().map(|v| v.0).collect();
+        let mut par_nodes: Vec<NodeKey> = par_result.visited.iter().map(|v| v.0).collect();
+        seq_nodes.sort_by_key(|k| k.data().as_ffi());
+        par_nodes.sort_by_key(|k| k.data().as_ffi());
+        assert_eq!(seq_nodes, par_nodes);
     }
 }

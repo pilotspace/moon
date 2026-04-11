@@ -103,7 +103,7 @@ const _: () = assert!(core::mem::size_of::<GraphSegmentHeader>() == 128);
 const _: () = assert!(core::mem::align_of::<GraphSegmentHeader>() == 64);
 
 /// Edge metadata stored in CSR alongside col_indices.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, align(8))]
 pub struct EdgeMeta {
     /// Edge-type dictionary index.

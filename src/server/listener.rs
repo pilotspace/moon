@@ -84,7 +84,7 @@ pub async fn run_with_shutdown(
                 std::mem::replace(&mut *guard, Database::new())
             })
             .collect();
-        match aof::replay_aof(&mut dbs_vec, &aof_path, &DispatchReplayEngine) {
+        match aof::replay_aof(&mut dbs_vec, &aof_path, &DispatchReplayEngine::new()) {
             Ok(n) => info!(
                 "AOF loaded: {} commands replayed from {}",
                 n,
@@ -189,6 +189,11 @@ pub async fn run_with_shutdown(
     let vector_store: Arc<Mutex<crate::vector::store::VectorStore>> =
         Arc::new(Mutex::new(crate::vector::store::VectorStore::new()));
 
+    // GraphStore for single-shard GRAPH.* commands
+    #[cfg(feature = "graph")]
+    let graph_store: Arc<Mutex<crate::graph::store::GraphStore>> =
+        Arc::new(Mutex::new(crate::graph::store::GraphStore::new()));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -235,10 +240,14 @@ pub async fn run_with_shutdown(
                         let rs = repl_state.clone();
                         let acl = acl_table.clone();
                         let vs = vector_store.clone();
+                        #[cfg(feature = "graph")]
+                        let gs = graph_store.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
                             aof_tx, change_counter, pubsub, rt_config,
                             tracking, cid, Some(rs), acl, Some(vs),
+                            #[cfg(feature = "graph")]
+                            Some(gs),
                         ));
                     }
                     Err(e) => {

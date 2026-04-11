@@ -177,6 +177,10 @@ impl GraphReplayCollector {
                     let Some(dim) = parse_usize(args[pos + 1]) else {
                         return false;
                     };
+                    // Reject unreasonably large dimensions to prevent DoS from malformed WAL.
+                    if dim > 65536 {
+                        return false;
+                    }
                     let embed_bytes = args[pos + 2];
                     if embed_bytes.len() == dim * 4 {
                         let mut vec = Vec::with_capacity(dim);
@@ -258,118 +262,290 @@ impl GraphReplayCollector {
         }
     }
 
-    /// Two-pass replay: creates -> nodes -> edges -> removes -> drops.
+    /// Epoch-aware replay: respects temporal ordering of create/drop boundaries.
     ///
-    /// This ensures that edges are inserted after their referenced nodes exist,
-    /// even if the WAL recorded them in a different order.
+    /// Commands are split into "epochs" per graph. An epoch starts at a Create
+    /// and ends at a Drop. Within each epoch, nodes are inserted before edges
+    /// (handling out-of-order WAL records). Across epochs, operations are
+    /// processed in WAL order, so create→drop→recreate sequences replay correctly.
     ///
     /// Returns the number of commands successfully replayed.
     pub fn replay_into(&self, store: &mut GraphStore) -> usize {
         let mut replayed = 0;
-        self.replay_per_graph(store, &mut replayed);
+        self.replay_epoch_aware(store, &mut replayed);
         replayed
     }
 
-    /// Internal: replay commands grouped by graph, building fresh MemGraphs.
-    fn replay_per_graph(&self, store: &mut GraphStore, replayed: &mut usize) {
+    /// Internal: epoch-aware replay that processes commands in WAL order.
+    ///
+    /// An "epoch" is a contiguous sequence of mutations between a Create and
+    /// the next Drop (or end-of-WAL). Within each epoch:
+    ///
+    ///   1. Create the graph
+    ///   2. Insert all nodes (so edges can reference them)
+    ///   3. Insert all edges
+    ///   4. Process removes (nodes, edges)
+    ///
+    /// Then if a Drop follows, drop the graph before starting the next epoch.
+    fn replay_epoch_aware(&self, store: &mut GraphStore, replayed: &mut usize) {
         use std::collections::HashMap;
 
-        // Phase 1: Collect graph creates and process them
-        for cmd in &self.commands {
-            if let GraphCommand::Create { name } = cmd {
-                if store.create_graph(name.clone(), 64_000, 0).is_ok() {
+        // Group commands into epochs. Each epoch is bounded by Create..Drop.
+        // epoch_key = (graph_name, epoch_index).
+        struct Epoch {
+            graph_name: Bytes,
+            create_idx: Option<usize>,
+            node_indices: Vec<usize>,
+            edge_indices: Vec<usize>,
+            remove_node_indices: Vec<usize>,
+            remove_edge_indices: Vec<usize>,
+            drop_idx: Option<usize>,
+        }
+
+        // Track current open epoch per graph name.
+        let mut current_epoch: HashMap<Bytes, usize> = HashMap::new();
+        let mut epochs: Vec<Epoch> = Vec::new();
+
+        for (idx, cmd) in self.commands.iter().enumerate() {
+            match cmd {
+                GraphCommand::Create { name } => {
+                    // If there's already an open epoch for this graph (mutations
+                    // arrived before the Create in WAL order), attach the Create
+                    // to the existing epoch instead of starting a new one.
+                    if let Some(&existing_eidx) = current_epoch.get(name) {
+                        if epochs[existing_eidx].create_idx.is_none() {
+                            epochs[existing_eidx].create_idx = Some(idx);
+                            // Keep current_epoch pointing to the same epoch.
+                        } else {
+                            // Previous epoch already has a Create — start a new one.
+                            let epoch_idx = epochs.len();
+                            epochs.push(Epoch {
+                                graph_name: name.clone(),
+                                create_idx: Some(idx),
+                                node_indices: Vec::new(),
+                                edge_indices: Vec::new(),
+                                remove_node_indices: Vec::new(),
+                                remove_edge_indices: Vec::new(),
+                                drop_idx: None,
+                            });
+                            current_epoch.insert(name.clone(), epoch_idx);
+                        }
+                    } else {
+                        let epoch_idx = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: name.clone(),
+                            create_idx: Some(idx),
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
+                        });
+                        current_epoch.insert(name.clone(), epoch_idx);
+                    }
+                }
+                GraphCommand::Drop { name } => {
+                    if let Some(&eidx) = current_epoch.get(name) {
+                        epochs[eidx].drop_idx = Some(idx);
+                        current_epoch.remove(name);
+                    } else {
+                        // Drop without a preceding Create in this WAL.
+                        // Still record it so the graph gets dropped.
+                        let epoch_idx = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: Some(idx),
+                        });
+                        // Don't insert into current_epoch — it's immediately closed.
+                        let _ = epoch_idx;
+                    }
+                }
+                GraphCommand::AddNode { graph_name, .. } => {
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
+                        });
+                        i
+                    });
+                    epochs[*eidx].node_indices.push(idx);
+                }
+                GraphCommand::AddEdge { graph_name, .. } => {
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
+                        });
+                        i
+                    });
+                    epochs[*eidx].edge_indices.push(idx);
+                }
+                GraphCommand::RemoveNode { graph_name, .. } => {
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
+                        });
+                        i
+                    });
+                    epochs[*eidx].remove_node_indices.push(idx);
+                }
+                GraphCommand::RemoveEdge { graph_name, .. } => {
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
+                        });
+                        i
+                    });
+                    epochs[*eidx].remove_edge_indices.push(idx);
+                }
+            }
+        }
+
+        // Replay epochs in order. This preserves temporal ordering across
+        // create/drop boundaries while ensuring nodes-before-edges within epochs.
+        for epoch in &epochs {
+            // 1. Create graph if this epoch has a Create command.
+            if epoch.create_idx.is_some() {
+                if store
+                    .create_graph(epoch.graph_name.clone(), 64_000, 0)
+                    .is_ok()
+                {
                     *replayed += 1;
                 }
             }
-        }
 
-        // Phase 2: For each graph, collect nodes and edges, replay in order.
-        // Build a node_id -> NodeKey map per graph for edge src/dst resolution.
-        let mut node_maps: HashMap<Bytes, HashMap<u64, crate::graph::types::NodeKey>> =
-            HashMap::new();
-
-        // Insert nodes
-        for cmd in &self.commands {
-            if let GraphCommand::AddNode {
-                graph_name,
-                node_id,
-                labels,
-                properties,
-                embedding,
-            } = cmd
+            // 2. Replay mutations (nodes → edges → removes) if graph exists.
+            if !epoch.node_indices.is_empty()
+                || !epoch.edge_indices.is_empty()
+                || !epoch.remove_node_indices.is_empty()
+                || !epoch.remove_edge_indices.is_empty()
             {
-                if let Some(graph) = store.get_graph_mut(graph_name) {
-                    // Get mutable access to the MemGraph through the segment holder.
-                    // During replay we create a fresh MemGraph if needed.
-                    let nk = add_node_to_graph(graph, labels, properties, embedding);
-                    if let Some(nk) = nk {
-                        node_maps
-                            .entry(graph_name.clone())
-                            .or_default()
-                            .insert(*node_id, nk);
+                let Some(graph) = store.get_graph_mut(&epoch.graph_name) else {
+                    continue;
+                };
+                let (mut mg, immutable) = take_memgraph(graph);
+
+                // Seed node_maps from immutable CSR segments so edges referencing
+                // CSR-resident nodes (loaded during recovery) can be resolved.
+                let mut node_map: HashMap<u64, crate::graph::types::NodeKey> = HashMap::new();
+                for csr_seg in &immutable {
+                    for nm in csr_seg.node_meta() {
+                        let key_data = slotmap::KeyData::from_ffi(nm.external_id);
+                        let node_key = crate::graph::types::NodeKey::from(key_data);
+                        node_map.insert(nm.external_id, node_key);
+                    }
+                }
+
+                // Insert nodes.
+                for &idx in &epoch.node_indices {
+                    if let GraphCommand::AddNode {
+                        node_id,
+                        labels,
+                        properties,
+                        embedding,
+                        ..
+                    } = &self.commands[idx]
+                    {
+                        let nk =
+                            mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
+                        node_map.insert(*node_id, nk);
                         *replayed += 1;
                     }
                 }
-            }
-        }
 
-        // Insert edges (after all nodes are in place)
-        for cmd in &self.commands {
-            if let GraphCommand::AddEdge {
-                graph_name,
-                src_id,
-                dst_id,
-                edge_type,
-                weight,
-                properties,
-                ..
-            } = cmd
-            {
-                let node_map = node_maps.get(graph_name);
-                let src_key = node_map.and_then(|m| m.get(src_id)).copied();
-                let dst_key = node_map.and_then(|m| m.get(dst_id)).copied();
-
-                if let (Some(src), Some(dst)) = (src_key, dst_key) {
-                    if let Some(graph) = store.get_graph_mut(graph_name) {
-                        if add_edge_to_graph(graph, src, dst, *edge_type, *weight, properties) {
-                            *replayed += 1;
+                // Insert edges.
+                for &idx in &epoch.edge_indices {
+                    if let GraphCommand::AddEdge {
+                        src_id,
+                        dst_id,
+                        edge_type,
+                        weight,
+                        properties,
+                        ..
+                    } = &self.commands[idx]
+                    {
+                        let src_key = node_map.get(src_id).copied();
+                        let dst_key = node_map.get(dst_id).copied();
+                        if let (Some(src), Some(dst)) = (src_key, dst_key) {
+                            if mg
+                                .add_edge(src, dst, *edge_type, *weight, properties.clone(), 0)
+                                .is_ok()
+                            {
+                                *replayed += 1;
+                            }
+                        } else {
+                            tracing::warn!(
+                                "WAL replay: dropping edge (src={}, dst={}) — \
+                                 referenced node(s) not found in WAL or CSR segments",
+                                src_id,
+                                dst_id
+                            );
                         }
                     }
                 }
-            }
-        }
 
-        // Phase 3: Process removes
-        for cmd in &self.commands {
-            match cmd {
-                GraphCommand::RemoveNode {
-                    graph_name,
-                    node_id,
-                } => {
-                    let node_map = node_maps.get(graph_name);
-                    if let Some(nk) = node_map.and_then(|m| m.get(node_id)).copied() {
-                        if let Some(graph) = store.get_graph_mut(graph_name) {
-                            if remove_node_from_graph(graph, nk) {
+                // Remove nodes.
+                for &idx in &epoch.remove_node_indices {
+                    if let GraphCommand::RemoveNode { node_id, .. } = &self.commands[idx] {
+                        if let Some(nk) = node_map.get(node_id).copied() {
+                            if mg.remove_node(nk, 0) {
                                 *replayed += 1;
                             }
                         }
                     }
                 }
-                GraphCommand::RemoveEdge { .. } => {
-                    // Edge removal by edge_id requires tracking edge_id -> EdgeKey mapping.
-                    // For now, edge removes during replay are logged and skipped.
-                    // This is acceptable because edge removes are rare during WAL replay,
-                    // and full persistence (Phase 121) will handle this properly.
-                    tracing::warn!("GRAPH.REMOVEEDGE during WAL replay is not yet supported");
-                }
-                _ => {}
-            }
-        }
 
-        // Phase 4: Process graph drops
-        for cmd in &self.commands {
-            if let GraphCommand::Drop { name } = cmd {
-                if store.drop_graph(name).is_ok() {
+                // Remove edges.
+                for &idx in &epoch.remove_edge_indices {
+                    if let GraphCommand::RemoveEdge { edge_id, .. } = &self.commands[idx] {
+                        if mg.remove_edge_by_id(*edge_id, 0) {
+                            *replayed += 1;
+                        } else {
+                            tracing::warn!(
+                                "WAL replay: REMOVEEDGE edge_id={} not found in mutable segment",
+                                edge_id
+                            );
+                        }
+                    }
+                }
+
+                put_memgraph(graph, mg, immutable);
+            }
+
+            // 3. Drop graph if this epoch ends with a Drop command.
+            if epoch.drop_idx.is_some() {
+                if store.drop_graph(&epoch.graph_name).is_ok() {
                     *replayed += 1;
                 }
             }
@@ -386,7 +562,7 @@ impl GraphReplayCollector {
 /// Swaps in `None` for the mutable segment, returning the owned MemGraph.
 fn take_memgraph(
     graph: &mut crate::graph::store::NamedGraph,
-) -> (MemGraph, Vec<std::sync::Arc<crate::graph::csr::CsrSegment>>) {
+) -> (MemGraph, Vec<std::sync::Arc<crate::graph::csr::CsrStorage>>) {
     use crate::graph::segment::GraphSegmentList;
 
     // Clone the immutable list and extract the mutable Arc
@@ -419,59 +595,13 @@ fn take_memgraph(
 fn put_memgraph(
     graph: &mut crate::graph::store::NamedGraph,
     mg: MemGraph,
-    immutable: Vec<std::sync::Arc<crate::graph::csr::CsrSegment>>,
+    immutable: Vec<std::sync::Arc<crate::graph::csr::CsrStorage>>,
 ) {
     use crate::graph::segment::GraphSegmentList;
     graph.segments.swap(GraphSegmentList {
         mutable: Some(std::sync::Arc::new(mg)),
         immutable,
     });
-}
-
-/// Add a node to the graph's mutable MemGraph segment.
-/// Returns the NodeKey if successful.
-///
-/// During single-threaded replay, we take the MemGraph out of the segment holder,
-/// mutate it, and put it back. This is safe because replay runs at startup before
-/// any concurrent readers exist.
-fn add_node_to_graph(
-    graph: &mut crate::graph::store::NamedGraph,
-    labels: &SmallVec<[u16; 4]>,
-    properties: &PropertyMap,
-    embedding: &Option<Vec<f32>>,
-) -> Option<crate::graph::types::NodeKey> {
-    let (mut mg, immutable) = take_memgraph(graph);
-    let nk = mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
-    put_memgraph(graph, mg, immutable);
-    Some(nk)
-}
-
-/// Add an edge to the graph's mutable MemGraph segment.
-fn add_edge_to_graph(
-    graph: &mut crate::graph::store::NamedGraph,
-    src: crate::graph::types::NodeKey,
-    dst: crate::graph::types::NodeKey,
-    edge_type: u16,
-    weight: f64,
-    properties: &Option<PropertyMap>,
-) -> bool {
-    let (mut mg, immutable) = take_memgraph(graph);
-    let ok = mg
-        .add_edge(src, dst, edge_type, weight, properties.clone(), 0)
-        .is_ok();
-    put_memgraph(graph, mg, immutable);
-    ok
-}
-
-/// Remove a node from the graph's mutable MemGraph segment.
-fn remove_node_from_graph(
-    graph: &mut crate::graph::store::NamedGraph,
-    node_key: crate::graph::types::NodeKey,
-) -> bool {
-    let (mut mg, immutable) = take_memgraph(graph);
-    let ok = mg.remove_node(node_key, 0);
-    put_memgraph(graph, mg, immutable);
-    ok
 }
 
 // --- Parsing helpers ---
@@ -628,6 +758,32 @@ mod tests {
         // Create + Drop = 2 replayed
         assert_eq!(replayed, 2);
         assert!(store.get_graph(b"temp").is_none());
+    }
+
+    #[test]
+    fn test_create_drop_recreate_temporal_ordering() {
+        let mut collector = GraphReplayCollector::new();
+
+        // WAL sequence: create → addnode → drop → create → addnode (different)
+        collector.collect_command(b"GRAPH.CREATE", &[b"g"]);
+        let node1_args: Vec<&[u8]> = vec![b"g", b"10", b"1", b"0", b"0"];
+        collector.collect_command(b"GRAPH.ADDNODE", &node1_args);
+        collector.collect_command(b"GRAPH.DROP", &[b"g"]);
+        collector.collect_command(b"GRAPH.CREATE", &[b"g"]);
+        let node2_args: Vec<&[u8]> = vec![b"g", b"20", b"1", b"1", b"0"];
+        collector.collect_command(b"GRAPH.ADDNODE", &node2_args);
+
+        let mut store = GraphStore::new();
+        let replayed = collector.replay_into(&mut store);
+
+        // create(1) + node(1) + drop(1) + create(1) + node(1) = 5
+        assert_eq!(replayed, 5);
+
+        // Final state: graph "g" exists with exactly 1 node (from second epoch).
+        let graph = store.get_graph(b"g").expect("graph should exist");
+        let segments = graph.segments.load();
+        let mg = segments.mutable.as_ref().expect("mutable exists");
+        assert_eq!(mg.node_count(), 1);
     }
 
     #[test]

@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [labeled]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +18,7 @@ env:
 jobs:
   durability:
     name: Durability Tests
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -21,7 +27,7 @@ jobs:
       - name: Build Moon (release)
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
       - name: Run crash matrix tests
-        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test durability
+        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test durability_tests
         timeout-minutes: 10
       - name: Run jepsen-lite tests
         run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test jepsen_lite
@@ -29,6 +35,7 @@ jobs:
 
   replication:
     name: Replication Tests
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

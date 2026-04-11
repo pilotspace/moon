@@ -7,6 +7,9 @@
 //! Parameters (`$name`) are stored as `Expr::Parameter` -- never interpolated
 //! into the query string, preventing Cypher injection (CVE-2024-8309).
 
+mod expr;
+mod pattern;
+
 use crate::graph::cypher::ast::*;
 use crate::graph::cypher::lexer::{Lexer, SpannedToken, Token};
 
@@ -181,189 +184,6 @@ impl<'a> Parser<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Pattern parsing
-    // -----------------------------------------------------------------------
-
-    fn parse_pattern_list(&mut self) -> Result<Vec<Pattern>, CypherError> {
-        let mut patterns = vec![self.parse_pattern()?];
-        while self.peek_is(|t| matches!(t, Token::Comma)) {
-            self.advance();
-            patterns.push(self.parse_pattern()?);
-        }
-        Ok(patterns)
-    }
-
-    fn parse_pattern(&mut self) -> Result<Pattern, CypherError> {
-        self.check_depth()?;
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-
-        // First node
-        nodes.push(self.parse_pattern_node()?);
-
-        // Alternating edge-node pairs
-        while self.peek_is_edge_start() {
-            edges.push(self.parse_pattern_edge()?);
-            nodes.push(self.parse_pattern_node()?);
-        }
-
-        self.current_depth = self.current_depth.saturating_sub(1);
-        Ok(Pattern { nodes, edges })
-    }
-
-    fn parse_pattern_node(&mut self) -> Result<PatternNode, CypherError> {
-        self.expect_token_match(|t| matches!(t, Token::LParen), "(")?;
-
-        let mut variable = None;
-        let mut labels = Vec::new();
-        let mut properties = Vec::new();
-
-        // Optional variable name
-        if self.peek_is(|t| matches!(t, Token::Ident(_))) {
-            variable = Some(self.parse_ident()?);
-        }
-
-        // Labels: `:Label1:Label2`
-        while self.peek_is(|t| matches!(t, Token::Colon)) {
-            self.advance();
-            labels.push(self.parse_ident()?);
-        }
-
-        // Properties: `{key: value, ...}`
-        if self.peek_is(|t| matches!(t, Token::LBrace)) {
-            properties = self.parse_property_map()?;
-        }
-
-        self.expect_token_match(|t| matches!(t, Token::RParen), ")")?;
-
-        Ok(PatternNode {
-            variable,
-            labels,
-            properties,
-        })
-    }
-
-    fn peek_is_edge_start(&mut self) -> bool {
-        self.peek_is(|t| matches!(t, Token::Minus | Token::ArrowLeft))
-    }
-
-    fn parse_pattern_edge(&mut self) -> Result<PatternEdge, CypherError> {
-        let mut direction = EdgeDirection::Both;
-        let left_arrow = self.peek_is(|t| matches!(t, Token::ArrowLeft));
-
-        if left_arrow {
-            // <-
-            self.advance();
-            direction = EdgeDirection::Left;
-        } else {
-            // -
-            self.expect_token_match(|t| matches!(t, Token::Minus), "-")?;
-        }
-
-        let mut variable = None;
-        let mut edge_types = Vec::new();
-        let mut var_length = None;
-
-        // Optional edge details in brackets
-        if self.peek_is(|t| matches!(t, Token::LBracket)) {
-            self.advance();
-
-            // Optional variable
-            if self.peek_is(|t| matches!(t, Token::Ident(_))) {
-                variable = Some(self.parse_ident()?);
-            }
-
-            // Edge types: `:TYPE1|TYPE2`
-            if self.peek_is(|t| matches!(t, Token::Colon)) {
-                self.advance();
-                edge_types.push(self.parse_ident()?);
-                while self.peek_is(|t| matches!(t, Token::Pipe)) {
-                    self.advance();
-                    edge_types.push(self.parse_ident()?);
-                }
-            }
-
-            // Variable length: `*`, `*1..3`, `*..3`, `*1..`
-            if self.peek_is(|t| matches!(t, Token::Star)) {
-                self.advance();
-                var_length = Some(self.parse_var_length()?);
-            }
-
-            self.expect_token_match(|t| matches!(t, Token::RBracket), "]")?;
-        }
-
-        // Right side: `->` or `-`
-        if self.peek_is(|t| matches!(t, Token::ArrowRight)) {
-            self.advance();
-            if direction == EdgeDirection::Left {
-                // `<-[]->`  is treated as both/undirected
-                direction = EdgeDirection::Both;
-            } else {
-                direction = EdgeDirection::Right;
-            }
-        } else if self.peek_is(|t| matches!(t, Token::Minus)) {
-            self.advance();
-            // `-[]-` stays as Both (unless already left)
-        }
-
-        Ok(PatternEdge {
-            variable,
-            edge_types,
-            direction,
-            var_length,
-        })
-    }
-
-    fn parse_var_length(&mut self) -> Result<(u32, u32), CypherError> {
-        let mut min = 1u32;
-        let mut max = u32::MAX;
-
-        if self.peek_is(|t| matches!(t, Token::Integer(_))) {
-            min = self.parse_u32_lit()?;
-            if self.peek_is(|t| matches!(t, Token::DotDot)) {
-                self.advance();
-                if self.peek_is(|t| matches!(t, Token::Integer(_))) {
-                    max = self.parse_u32_lit()?;
-                }
-            } else {
-                max = min; // `*3` means exactly 3 hops
-            }
-        } else if self.peek_is(|t| matches!(t, Token::DotDot)) {
-            self.advance();
-            min = 1;
-            if self.peek_is(|t| matches!(t, Token::Integer(_))) {
-                max = self.parse_u32_lit()?;
-            }
-        }
-        // Just `*` means `*1..MAX`
-
-        Ok((min, max))
-    }
-
-    fn parse_property_map(&mut self) -> Result<Vec<(String, Expr)>, CypherError> {
-        self.expect_token_match(|t| matches!(t, Token::LBrace), "{")?;
-        let mut props = Vec::new();
-
-        if !self.peek_is(|t| matches!(t, Token::RBrace)) {
-            let key = self.parse_ident()?;
-            self.expect_token_match(|t| matches!(t, Token::Colon), ":")?;
-            let value = self.parse_expression()?;
-            props.push((key, value));
-
-            while self.peek_is(|t| matches!(t, Token::Comma)) {
-                self.advance();
-                let key = self.parse_ident()?;
-                self.expect_token_match(|t| matches!(t, Token::Colon), ":")?;
-                let value = self.parse_expression()?;
-                props.push((key, value));
-            }
-        }
-
-        self.expect_token_match(|t| matches!(t, Token::RBrace), "}")?;
-        Ok(props)
-    }
-
-    // -----------------------------------------------------------------------
     // RETURN clause
     // -----------------------------------------------------------------------
 
@@ -377,7 +197,7 @@ impl<'a> Parser<'a> {
         Ok(Clause::Return(ReturnClause { items, distinct }))
     }
 
-    fn parse_return_items(&mut self) -> Result<Vec<ReturnItem>, CypherError> {
+    pub(super) fn parse_return_items(&mut self) -> Result<Vec<ReturnItem>, CypherError> {
         let mut items = vec![self.parse_return_item()?];
         while self.peek_is(|t| matches!(t, Token::Comma)) {
             self.advance();
@@ -602,344 +422,10 @@ impl<'a> Parser<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Expression parsing (precedence climbing)
-    // -----------------------------------------------------------------------
-
-    fn parse_expression(&mut self) -> Result<Expr, CypherError> {
-        self.check_depth()?;
-        let result = self.parse_or_expr();
-        self.current_depth = self.current_depth.saturating_sub(1);
-        result
-    }
-
-    fn parse_or_expr(&mut self) -> Result<Expr, CypherError> {
-        let mut left = self.parse_and_expr()?;
-        while self.peek_is(|t| matches!(t, Token::Or)) {
-            self.advance();
-            let right = self.parse_and_expr()?;
-            left = Expr::BinaryOp {
-                left: Box::new(left),
-                op: BinaryOperator::Or,
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_and_expr(&mut self) -> Result<Expr, CypherError> {
-        let mut left = self.parse_not_expr()?;
-        while self.peek_is(|t| matches!(t, Token::And)) {
-            self.advance();
-            let right = self.parse_not_expr()?;
-            left = Expr::BinaryOp {
-                left: Box::new(left),
-                op: BinaryOperator::And,
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_not_expr(&mut self) -> Result<Expr, CypherError> {
-        if self.peek_is(|t| matches!(t, Token::Not)) {
-            self.advance();
-            let expr = self.parse_not_expr()?;
-            return Ok(Expr::Not(Box::new(expr)));
-        }
-        self.parse_comparison()
-    }
-
-    fn parse_comparison(&mut self) -> Result<Expr, CypherError> {
-        let mut left = self.parse_addition()?;
-
-        // IS NULL / IS NOT NULL
-        if self.peek_is(|t| matches!(t, Token::Is)) {
-            self.advance();
-            let negated = self.peek_is(|t| matches!(t, Token::Not));
-            if negated {
-                self.advance();
-            }
-            self.expect_token_match(|t| matches!(t, Token::Null), "NULL")?;
-            return Ok(Expr::IsNull {
-                expr: Box::new(left),
-                negated,
-            });
-        }
-
-        // IN
-        if self.peek_is(|t| matches!(t, Token::In)) {
-            self.advance();
-            let list = self.parse_addition()?;
-            return Ok(Expr::InList {
-                expr: Box::new(left),
-                list: Box::new(list),
-            });
-        }
-
-        // Comparison operators
-        loop {
-            let op = if self.peek_is(|t| matches!(t, Token::Equal)) {
-                Some(BinaryOperator::Equal)
-            } else if self.peek_is(|t| matches!(t, Token::NotEqual)) {
-                Some(BinaryOperator::NotEqual)
-            } else if self.peek_is(|t| matches!(t, Token::LessThan)) {
-                Some(BinaryOperator::LessThan)
-            } else if self.peek_is(|t| matches!(t, Token::GreaterThan)) {
-                Some(BinaryOperator::GreaterThan)
-            } else if self.peek_is(|t| matches!(t, Token::LessEqual)) {
-                Some(BinaryOperator::LessEqual)
-            } else if self.peek_is(|t| matches!(t, Token::GreaterEqual)) {
-                Some(BinaryOperator::GreaterEqual)
-            } else if self.peek_is(|t| matches!(t, Token::RegexMatch)) {
-                Some(BinaryOperator::RegexMatch)
-            } else {
-                None
-            };
-
-            if let Some(op) = op {
-                self.advance();
-                let right = self.parse_addition()?;
-                left = Expr::BinaryOp {
-                    left: Box::new(left),
-                    op,
-                    right: Box::new(right),
-                };
-            } else {
-                break;
-            }
-        }
-
-        Ok(left)
-    }
-
-    fn parse_addition(&mut self) -> Result<Expr, CypherError> {
-        let mut left = self.parse_multiplication()?;
-        loop {
-            let op = if self.peek_is(|t| matches!(t, Token::Plus)) {
-                Some(BinaryOperator::Add)
-            } else if self.peek_is(|t| matches!(t, Token::Minus)) {
-                Some(BinaryOperator::Sub)
-            } else {
-                None
-            };
-
-            if let Some(op) = op {
-                self.advance();
-                let right = self.parse_multiplication()?;
-                left = Expr::BinaryOp {
-                    left: Box::new(left),
-                    op,
-                    right: Box::new(right),
-                };
-            } else {
-                break;
-            }
-        }
-        Ok(left)
-    }
-
-    fn parse_multiplication(&mut self) -> Result<Expr, CypherError> {
-        let mut left = self.parse_unary()?;
-        loop {
-            let op = if self.peek_is(|t| matches!(t, Token::Star)) {
-                Some(BinaryOperator::Mul)
-            } else if self.peek_is(|t| matches!(t, Token::Slash)) {
-                Some(BinaryOperator::Div)
-            } else if self.peek_is(|t| matches!(t, Token::Percent)) {
-                Some(BinaryOperator::Mod)
-            } else {
-                None
-            };
-
-            if let Some(op) = op {
-                self.advance();
-                let right = self.parse_unary()?;
-                left = Expr::BinaryOp {
-                    left: Box::new(left),
-                    op,
-                    right: Box::new(right),
-                };
-            } else {
-                break;
-            }
-        }
-        Ok(left)
-    }
-
-    fn parse_unary(&mut self) -> Result<Expr, CypherError> {
-        if self.peek_is(|t| matches!(t, Token::Minus)) {
-            self.advance();
-            let expr = self.parse_primary()?;
-            return Ok(Expr::Negate(Box::new(expr)));
-        }
-        self.parse_primary()
-    }
-
-    fn parse_primary(&mut self) -> Result<Expr, CypherError> {
-        let tok = self.peek_token_ref()?;
-
-        match &tok.token {
-            Token::Integer(_) => {
-                let t = self.advance();
-                if let Token::Integer(s) = t.token {
-                    let val = self.parse_i64_bytes(s, t.span.start)?;
-                    let mut expr = Expr::Integer(val);
-                    expr = self.parse_postfix(expr)?;
-                    Ok(expr)
-                } else {
-                    // Should not happen
-                    Ok(Expr::Null)
-                }
-            }
-            Token::Float(_) => {
-                let t = self.advance();
-                if let Token::Float(s) = t.token {
-                    let val = self.parse_f64_bytes(s, t.span.start)?;
-                    let mut expr = Expr::Float(val);
-                    expr = self.parse_postfix(expr)?;
-                    Ok(expr)
-                } else {
-                    Ok(Expr::Null)
-                }
-            }
-            Token::StringLit(_) => {
-                let t = self.advance();
-                if let Token::StringLit(s) = t.token {
-                    // Strip quotes
-                    let inner = &s[1..s.len() - 1];
-                    let val = String::from_utf8_lossy(inner).into_owned();
-                    Ok(Expr::StringLit(val))
-                } else {
-                    Ok(Expr::Null)
-                }
-            }
-            Token::True => {
-                self.advance();
-                Ok(Expr::Bool(true))
-            }
-            Token::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
-            }
-            Token::Null => {
-                self.advance();
-                Ok(Expr::Null)
-            }
-            Token::Parameter(_) => {
-                let t = self.advance();
-                if let Token::Parameter(s) = t.token {
-                    // Strip the `$` prefix
-                    let name = String::from_utf8_lossy(&s[1..]).into_owned();
-                    Ok(Expr::Parameter(name))
-                } else {
-                    Ok(Expr::Null)
-                }
-            }
-            Token::LParen => {
-                // Parenthesized expression
-                self.advance();
-                let expr = self.parse_expression()?;
-                self.expect_token_match(|t| matches!(t, Token::RParen), ")")?;
-                let expr = self.parse_postfix(expr)?;
-                Ok(expr)
-            }
-            Token::LBracket => {
-                // List literal
-                self.advance();
-                let mut items = Vec::new();
-                if !self.peek_is(|t| matches!(t, Token::RBracket)) {
-                    items.push(self.parse_expression()?);
-                    while self.peek_is(|t| matches!(t, Token::Comma)) {
-                        self.advance();
-                        items.push(self.parse_expression()?);
-                    }
-                }
-                self.expect_token_match(|t| matches!(t, Token::RBracket), "]")?;
-                Ok(Expr::List(items))
-            }
-            Token::LBrace => {
-                // Map literal
-                let props = self.parse_property_map()?;
-                Ok(Expr::MapLit(props))
-            }
-            Token::Ident(_) => {
-                let t = self.advance();
-                let name = if let Token::Ident(s) = t.token {
-                    String::from_utf8_lossy(s).into_owned()
-                } else {
-                    String::new()
-                };
-
-                // Check if function call: ident(...)
-                if self.peek_is(|t| matches!(t, Token::LParen)) {
-                    self.advance();
-                    let distinct = self.peek_is(|t| matches!(t, Token::Distinct));
-                    if distinct {
-                        self.advance();
-                    }
-                    let mut args = Vec::new();
-                    if !self.peek_is(|t| matches!(t, Token::RParen)) {
-                        // Check for star arg: count(*)
-                        if self.peek_is(|t| matches!(t, Token::Star)) {
-                            self.advance();
-                            args.push(Expr::Star);
-                        } else {
-                            args.push(self.parse_expression()?);
-                            while self.peek_is(|t| matches!(t, Token::Comma)) {
-                                self.advance();
-                                args.push(self.parse_expression()?);
-                            }
-                        }
-                    }
-                    self.expect_token_match(|t| matches!(t, Token::RParen), ")")?;
-                    let mut expr = Expr::FunctionCall {
-                        name,
-                        args,
-                        distinct,
-                    };
-                    expr = self.parse_postfix(expr)?;
-                    Ok(expr)
-                } else {
-                    let mut expr = Expr::Ident(name);
-                    expr = self.parse_postfix(expr)?;
-                    Ok(expr)
-                }
-            }
-            // Keywords that could be used as identifiers in some contexts
-            // (e.g., `node` is a common variable name but not a keyword in our lexer)
-            Token::Star => {
-                self.advance();
-                Ok(Expr::Star)
-            }
-            _ => {
-                let t = self.advance();
-                Err(CypherError::UnexpectedToken {
-                    offset: t.span.start,
-                    expected: "expression",
-                    found: format!("{:?}", t.token),
-                })
-            }
-        }
-    }
-
-    /// Parse postfix operators: property access `.prop`
-    fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, CypherError> {
-        while self.peek_is(|t| matches!(t, Token::Dot)) {
-            self.advance();
-            let prop = self.parse_ident()?;
-            expr = Expr::PropertyAccess {
-                object: Box::new(expr),
-                property: prop,
-            };
-        }
-        Ok(expr)
-    }
-
-    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn check_depth(&mut self) -> Result<(), CypherError> {
+    pub(super) fn check_depth(&mut self) -> Result<(), CypherError> {
         self.current_depth += 1;
         if self.current_depth > self.max_depth {
             return Err(CypherError::NestingDepthExceeded {
@@ -949,21 +435,21 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn peek_is<F>(&mut self, pred: F) -> bool
+    pub(super) fn peek_is<F>(&mut self, pred: F) -> bool
     where
         F: FnOnce(&Token<'_>) -> bool,
     {
         self.lexer.peek().map_or(false, |t| pred(&t.token))
     }
 
-    fn peek_token_ref(&mut self) -> Result<SpannedToken<'a>, CypherError> {
+    pub(super) fn peek_token_ref(&mut self) -> Result<SpannedToken<'a>, CypherError> {
         self.lexer
             .peek()
             .cloned()
             .ok_or(CypherError::UnexpectedEof { expected: "token" })
     }
 
-    fn advance(&mut self) -> SpannedToken<'a> {
+    pub(super) fn advance(&mut self) -> SpannedToken<'a> {
         // Caller must have checked peek() first
         self.lexer.next_token().unwrap_or(SpannedToken {
             token: Token::Null,
@@ -971,7 +457,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn expect_token_match<F>(
+    pub(super) fn expect_token_match<F>(
         &mut self,
         pred: F,
         expected: &'static str,
@@ -994,7 +480,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_ident(&mut self) -> Result<String, CypherError> {
+    pub(super) fn parse_ident(&mut self) -> Result<String, CypherError> {
         let tok = self.lexer.next_token().ok_or(CypherError::UnexpectedEof {
             expected: "identifier",
         })?;
@@ -1012,7 +498,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_u32_lit(&mut self) -> Result<u32, CypherError> {
+    pub(super) fn parse_u32_lit(&mut self) -> Result<u32, CypherError> {
         let tok = self.lexer.next_token().ok_or(CypherError::UnexpectedEof {
             expected: "integer",
         })?;
@@ -1031,7 +517,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_i64_bytes(&self, s: &[u8], offset: usize) -> Result<i64, CypherError> {
+    pub(super) fn parse_i64_bytes(&self, s: &[u8], offset: usize) -> Result<i64, CypherError> {
         let text = core::str::from_utf8(s).unwrap_or("?");
         text.parse::<i64>().map_err(|_| CypherError::InvalidNumber {
             offset,
@@ -1039,7 +525,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_f64_bytes(&self, s: &[u8], offset: usize) -> Result<f64, CypherError> {
+    pub(super) fn parse_f64_bytes(&self, s: &[u8], offset: usize) -> Result<f64, CypherError> {
         let text = core::str::from_utf8(s).unwrap_or("?");
         text.parse::<f64>().map_err(|_| CypherError::InvalidNumber {
             offset,

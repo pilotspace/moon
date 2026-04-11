@@ -3,15 +3,20 @@ name: Fuzz
 on:
   pull_request:
     branches: [main]
+    types: [labeled]
   schedule:
     - cron: '0 2 * * *'
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   fuzz-pr:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-fuzz')
     name: Fuzz PR
     runs-on: ubuntu-latest
     strategy:
@@ -25,6 +30,7 @@ jobs:
           - gossip_deser
           - acl_rule
           - rdb_load
+          - cypher_parse
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -63,6 +69,7 @@ jobs:
           - gossip_deser
           - acl_rule
           - rdb_load
+          - cypher_parse
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly

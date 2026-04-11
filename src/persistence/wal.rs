@@ -577,7 +577,7 @@ mod tests {
 
         // Replay into databases
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, writer.path(), &DispatchReplayEngine).unwrap();
+        let count = replay_wal(&mut dbs, writer.path(), &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 3);
 
         assert_eq!(
@@ -721,7 +721,7 @@ mod tests {
 
         // Replay
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, writer.path(), &DispatchReplayEngine).unwrap();
+        let count = replay_wal(&mut dbs, writer.path(), &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 4);
 
         // Verify hash
@@ -825,7 +825,7 @@ mod tests {
 
         // replay_wal should auto-detect v1 (no RRDWAL magic) and delegate to replay_aof
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &path, &DispatchReplayEngine).unwrap();
+        let count = replay_wal(&mut dbs, &path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 2);
         assert_eq!(
             dbs[0].get(b"oldkey1").unwrap().value.as_bytes().unwrap(),
@@ -884,7 +884,7 @@ mod tests {
 
         // Replay should stop after first block (3 commands)
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &corrupted_path, &DispatchReplayEngine).unwrap();
+        let count = replay_wal(&mut dbs, &corrupted_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 3, "should replay only first block's 3 commands");
 
         // Keys from block 1 should be set
@@ -927,7 +927,7 @@ mod tests {
 
         // Replay should return the 1 command from the valid first block
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &truncated_path, &DispatchReplayEngine).unwrap();
+        let count = replay_wal(&mut dbs, &truncated_path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             dbs[0].get(b"tkey").unwrap().value.as_bytes().unwrap(),
@@ -943,7 +943,7 @@ mod tests {
         // Writer creates file with just the 32-byte header (no appends, no flush)
         let path = wal_path(dir.path(), 0);
         let mut dbs = vec![Database::new()];
-        let count = replay_wal(&mut dbs, &path, &DispatchReplayEngine).unwrap();
+        let count = replay_wal(&mut dbs, &path, &DispatchReplayEngine::new()).unwrap();
         assert_eq!(count, 0);
     }
 }

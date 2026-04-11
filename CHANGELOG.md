@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Graph Engine Integration (v0.1.4, 2026-04-11)
+
+- **Property graph engine** (`src/graph/`, feature-gated under `graph`): segment-aligned CSR storage with SlotMap generational indices, ArcSwap lock-free reads, Roaring validity bitmaps, and Rabbit Order compaction for cache locality. 8,500+ LOC, 319 tests.
+- **12 GRAPH.\* commands**: CREATE, ADDNODE, ADDEDGE, NEIGHBORS, QUERY, RO_QUERY, EXPLAIN, VSEARCH, HYBRID, INFO, LIST, DELETE — all with RESP3 Map responses and ACL annotations.
+- **Cypher subset parser**: hand-rolled recursive descent with logos lexer, 12 clauses (MATCH/WHERE/RETURN/CREATE/DELETE/SET/MERGE/WITH/UNWIND/CALL/ORDER/LIMIT), parameterized queries ($param), nesting depth limit (64), plan caching.
+- **Hybrid graph+vector queries**: graph-filtered vector search, vector-to-graph expansion, vector-guided walk with automatic strategy selection.
+- **Traversal engine**: BFS/DFS/Dijkstra with bounded frontiers (100K cap), temporal decay + distance scoring, segment merge reader across mutable + immutable segments.
+- **Graph indexes**: per-label/type Roaring bitmaps, boomphf minimal perfect hash (~3 bits/key), property B-tree for range queries.
+- **Cross-shard traversal**: scatter-gather via SPSC mesh, graph hash tags for shard co-location, snapshot-LSN forwarding, configurable depth limit.
+- **Graph MVCC**: extends existing TransactionManager with graph write intents, snapshot-isolated multi-hop traversal, bounded epoch hold (30s).
+- **Graph WAL durability**: RESP-encoded graph commands in per-shard WAL, two-pass replay (nodes before edges), CRC32-validated CSR segment persistence.
+- **Cost-based planner**: GraphStats with incremental degree tracking, graph-first vs vector-first strategy selection, P99 hub detection.
+- **Criterion benchmarks**: CSR 1-hop 1.02ns, edge insert 64.8ns, 2-hop BFS 4.99µs, CSR freeze 5.12ms, SIMD cosine 384d 33.9ns.
+- **Fair comparison benchmark** (`tests/graph_bench_compare.rs`): Moon 2.4x FalkorDB on Cypher MATCH, 19x on native 1-hop, 23x on population.
+- **New dependencies**: `slotmap` 1.x (generational indices), `boomphf` 0.6 (MPH), `logos` 0.14 (Cypher lexer, optional).
+
 ### Added — Client Connection Security Hardening (2026-04-10)
 
 - **`--maxclients` (P0):** Connection limit with atomic CAS rejection (default 10000, 0=unlimited). Returns `-ERR max number of clients reached` when exceeded.
@@ -18,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ACL GENPASS (P1):** Cryptographically secure random password generation (1-4096 bits, hex output).
 - **CONFIG GET/SET** support for `maxclients`, `timeout`, `tcp-keepalive` (runtime-mutable).
 - **Monoio connection tracking:** Added missing `record_connection_opened` / `record_connection_closed` for accurate `connected_clients` metric.
+
+### Fixed — Deep Review Findings (2026-04-11)
+
+- **DoS protection**: `execute_profile` and `execute_mut` Cypher paths now enforce MAX_HOPS_LIMIT=20 and MAX_RESULT_ROWS=100K (were unbounded).
+- **WAL correctness**: Cypher DELETE passes actual LSN to `remove_node`/`remove_edge` (was hardcoded to 0).
+- **GRAPH.DROP metadata**: added missing phf dispatch table entry.
+- **SAFETY comments**: added to all 7 unsafe SIMD/mmap functions.
+- **BFS 30% faster**: scratch buffer reuse in SegmentMergeReader, zero-alloc CsrStorage callback, MergedNeighbor derives Copy.
+- **ParallelBfs**: uses plain HashSet on sequential path (was DashSet with 64 shards overhead).
+- **Recovery hardening**: CSR manifest path traversal validation, WAL embedding dimension cap (65536), LSN saturating_add.
+- **CI optimized**: consolidated 26 jobs → 4 per PR, concurrency groups cancel superseded runs, fixed org runner group for public repos.
 
 ### Fixed — Wave 0-4 Gap Closure (2026-04-09)
 

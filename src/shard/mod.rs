@@ -77,7 +77,7 @@ impl Shard {
                     &mut self.databases,
                     self.id,
                     &shard_dir,
-                    &DispatchReplayEngine,
+                    &DispatchReplayEngine::new(),
                     Some(std::path::Path::new(persistence_dir)),
                 ) {
                     Ok(result) => {
@@ -180,7 +180,7 @@ impl Shard {
         let wal_file = wal::wal_path(dir, self.id);
         let mut wal_replayed = 0usize;
         if wal_file.exists() {
-            match wal::replay_wal(&mut self.databases, &wal_file, &DispatchReplayEngine) {
+            match wal::replay_wal(&mut self.databases, &wal_file, &DispatchReplayEngine::new()) {
                 Ok(n) => {
                     info!("Shard {}: replayed {} WAL commands", self.id, n);
                     wal_replayed = n;
@@ -202,7 +202,7 @@ impl Shard {
                 match crate::persistence::aof::replay_aof(
                     &mut self.databases,
                     &aof_path,
-                    &DispatchReplayEngine,
+                    &DispatchReplayEngine::new(),
                 ) {
                     Ok(n) => {
                         info!("Shard {}: replayed {} AOF commands", self.id, n);

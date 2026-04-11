@@ -861,7 +861,7 @@ pub(crate) fn handle_shard_message_shared(
             // GraphCommand is dispatched via connection handlers using ShardDatabases,
             // not through SPSC. If we receive one here, dispatch it locally.
             let (response, wal_records) = {
-                let mut gs = shard_databases.graph_store(shard_id);
+                let mut gs = shard_databases.graph_store_write(shard_id);
                 let resp = crate::command::graph::dispatch_graph_command(&mut gs, &command);
                 let records = gs.drain_wal();
                 (resp, records)
@@ -881,7 +881,7 @@ pub(crate) fn handle_shard_message_shared(
             reply_tx,
         } => {
             let response = crate::graph::cross_shard::handle_graph_traverse(
-                &shard_databases.graph_store(shard_id),
+                &shard_databases.graph_store_read(shard_id),
                 &graph_name,
                 &node_ids,
                 edge_type_filter,
