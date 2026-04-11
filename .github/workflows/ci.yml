@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt
@@ -31,13 +33,14 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
             echo "skip-changelog label found — skipping"
             exit 0
           fi
-          git fetch origin main --depth=1
-          if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
+          if git diff --name-only "${BASE_SHA}...${HEAD_SHA}" | grep -q CHANGELOG.md; then
             echo "CHANGELOG.md updated"
           else
             echo "::error::CHANGELOG.md not updated. Add an entry or apply 'skip-changelog' label."
