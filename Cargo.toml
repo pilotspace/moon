@@ -158,3 +158,8 @@ harness = false
 name = "graph_bench"
 harness = false
 required-features = ["graph"]
+
+[[bench]]
+name = "graph_traversal"
+harness = false
+required-features = ["graph"]
