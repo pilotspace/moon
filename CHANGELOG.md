@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Lazyfree threshold** — configurable via `CONFIG SET lazyfree-threshold N` (default 64).
 - **GETBIT/SETBIT metadata** — added to PHF command registry.
 - **GEOADD/GEOSEARCHSTORE** — added to AOF write commands test list.
+- **EXPIREAT/PEXPIREAT** — absolute Unix timestamp expiry (seconds/milliseconds).
+- **EXPIRETIME/PEXPIRETIME** — read back absolute expiry timestamp.
+- **FLUSHDB/FLUSHALL** — clear all keys in current database.
+- **TIME** — server clock as `[seconds, microseconds]`.
+- **RANDOMKEY** — return a random key from the database.
+- **TOUCH** — refresh LRU/LFU access time without reading value.
+- **SHUTDOWN** — dispatch entry (graceful stop via signal handler).
 
 ### Fixed — Wave 0-4 Gap Closure (2026-04-09)
 
