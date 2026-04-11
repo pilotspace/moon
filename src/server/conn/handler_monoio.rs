@@ -81,7 +81,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
-    crate::admin::metrics_setup::record_connection_opened();
+    // NOTE: do NOT call record_connection_opened() here — the caller
+    // (conn_accept.rs) already increments via try_accept_connection().
 
     let mut read_buf = if initial_read_buf.is_empty() {
         BytesMut::with_capacity(8192)
@@ -989,116 +990,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                             }
                         }
-                        if sub_bytes.eq_ignore_ascii_case(b"LIST") {
-                            crate::client_registry::update(client_id, |e| {
-                                e.db = conn.selected_db;
-                                e.last_cmd_at = std::time::Instant::now();
-                                e.flags = crate::client_registry::ClientFlags {
-                                    subscriber: conn.subscription_count > 0,
-                                    in_multi: conn.in_multi,
-                                    blocked: false,
-                                };
-                            });
-                            let list = crate::client_registry::client_list();
-                            responses.push(Frame::BulkString(Bytes::from(list)));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"INFO") {
-                            crate::client_registry::update(client_id, |e| {
-                                e.db = conn.selected_db;
-                                e.last_cmd_at = std::time::Instant::now();
-                            });
-                            let info =
-                                crate::client_registry::client_info(client_id).unwrap_or_default();
-                            responses.push(Frame::BulkString(Bytes::from(info)));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"KILL") {
-                            let raw_args: Vec<&[u8]> = cmd_args[1..]
-                                .iter()
-                                .filter_map(|f| match f {
-                                    Frame::BulkString(b) => Some(b.as_ref()),
-                                    Frame::SimpleString(b) => Some(b.as_ref()),
-                                    _ => None,
-                                })
-                                .collect();
-                            match crate::client_registry::parse_kill_args(&raw_args) {
-                                Some(filter) => {
-                                    let count = crate::client_registry::kill_clients(&filter);
-                                    responses.push(Frame::Integer(count as i64));
-                                }
-                                None => {
-                                    responses.push(Frame::Error(Bytes::from_static(
-                                        b"ERR syntax error. Usage: CLIENT KILL [ID id] [ADDR addr] [USER user]",
-                                    )));
-                                }
-                            }
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
-                            if cmd_args.len() < 2 {
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
-                                )));
-                            } else {
-                                let timeout_bytes = match &cmd_args[1] {
-                                    Frame::BulkString(b) => Some(b.as_ref()),
-                                    Frame::SimpleString(b) => Some(b.as_ref()),
-                                    _ => None,
-                                };
-                                match timeout_bytes
-                                    .and_then(|b| std::str::from_utf8(b).ok())
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                {
-                                    Some(ms) => {
-                                        let mode = if cmd_args.len() > 2 {
-                                            match &cmd_args[2] {
-                                                Frame::BulkString(b) | Frame::SimpleString(b)
-                                                    if b.eq_ignore_ascii_case(b"WRITE") =>
-                                                {
-                                                    crate::client_pause::PauseMode::Write
-                                                }
-                                                _ => crate::client_pause::PauseMode::All,
-                                            }
-                                        } else {
-                                            crate::client_pause::PauseMode::All
-                                        };
-                                        crate::client_pause::pause(ms, mode);
-                                        responses
-                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                    }
-                                    None => {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            b"ERR timeout is not a valid integer or out of range",
-                                        )));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
-                            crate::client_pause::unpause();
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
-                            || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
-                        {
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                            continue;
-                        }
-                        // Unknown CLIENT subcommand
-                        responses.push(Frame::Error(Bytes::from(format!(
-                            "ERR unknown subcommand '{}'",
-                            String::from_utf8_lossy(&sub_bytes)
-                        ))));
-                        continue;
+                        // Admin CLIENT subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE,
+                        // NO-EVICT, NO-TOUCH) fall through to the ACL gate below.
                     }
                 }
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'client' command",
-                )));
-                continue;
+                // Fall through — admin subcommands handled after ACL check.
             }
 
             // --- PUBLISH: local delivery + cross-shard fan-out ---
@@ -1405,6 +1301,123 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                     continue;
                 }
+            }
+
+            // --- CLIENT admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE) ---
+            // Placed AFTER ACL check so restricted users cannot access admin ops.
+            if cmd.eq_ignore_ascii_case(b"CLIENT") {
+                if let Some(sub) = cmd_args.first() {
+                    if let Some(sub_bytes) = extract_bytes(sub) {
+                        if sub_bytes.eq_ignore_ascii_case(b"LIST") {
+                            crate::client_registry::update(client_id, |e| {
+                                e.db = conn.selected_db;
+                                e.last_cmd_at = std::time::Instant::now();
+                                e.flags = crate::client_registry::ClientFlags {
+                                    subscriber: conn.subscription_count > 0,
+                                    in_multi: conn.in_multi,
+                                    blocked: false,
+                                };
+                            });
+                            let list = crate::client_registry::client_list();
+                            responses.push(Frame::BulkString(Bytes::from(list)));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"INFO") {
+                            crate::client_registry::update(client_id, |e| {
+                                e.db = conn.selected_db;
+                                e.last_cmd_at = std::time::Instant::now();
+                            });
+                            let info =
+                                crate::client_registry::client_info(client_id).unwrap_or_default();
+                            responses.push(Frame::BulkString(Bytes::from(info)));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"KILL") {
+                            let raw_args: Vec<&[u8]> = cmd_args[1..]
+                                .iter()
+                                .filter_map(|f| match f {
+                                    Frame::BulkString(b) => Some(b.as_ref()),
+                                    Frame::SimpleString(b) => Some(b.as_ref()),
+                                    _ => None,
+                                })
+                                .collect();
+                            match crate::client_registry::parse_kill_args(&raw_args) {
+                                Some(filter) => {
+                                    let count = crate::client_registry::kill_clients(&filter);
+                                    responses.push(Frame::Integer(count as i64));
+                                }
+                                None => {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"ERR syntax error. Usage: CLIENT KILL [ID id] [ADDR addr] [USER user]",
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
+                            if cmd_args.len() < 2 {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                                )));
+                            } else {
+                                let timeout_bytes = match &cmd_args[1] {
+                                    Frame::BulkString(b) => Some(b.as_ref()),
+                                    Frame::SimpleString(b) => Some(b.as_ref()),
+                                    _ => None,
+                                };
+                                match timeout_bytes
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    Some(ms) => {
+                                        let mode = if cmd_args.len() > 2 {
+                                            match &cmd_args[2] {
+                                                Frame::BulkString(b) | Frame::SimpleString(b)
+                                                    if b.eq_ignore_ascii_case(b"WRITE") =>
+                                                {
+                                                    crate::client_pause::PauseMode::Write
+                                                }
+                                                _ => crate::client_pause::PauseMode::All,
+                                            }
+                                        } else {
+                                            crate::client_pause::PauseMode::All
+                                        };
+                                        crate::client_pause::pause(ms, mode);
+                                        responses
+                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    }
+                                    None => {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR timeout is not a valid integer or out of range",
+                                        )));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                            crate::client_pause::unpause();
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
+                            || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
+                        {
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            continue;
+                        }
+                        // Unknown CLIENT subcommand
+                        responses.push(Frame::Error(Bytes::from(format!(
+                            "ERR unknown subcommand '{}'",
+                            String::from_utf8_lossy(&sub_bytes)
+                        ))));
+                        continue;
+                    }
+                }
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR wrong number of arguments for 'client' command",
+                )));
+                continue;
             }
 
             // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
