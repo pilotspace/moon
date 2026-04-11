@@ -7,6 +7,7 @@ use slotmap::Key;
 
 use crate::graph::cypher;
 use crate::graph::store::GraphStore;
+use crate::graph::traversal::SegmentMergeReader;
 use crate::graph::types::Direction;
 use crate::protocol::Frame;
 
@@ -85,17 +86,27 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let node_key = super::graph_write::external_id_to_node_key(node_id);
 
-    // Use write_buf (mutable MemGraph) for reading since it has current data.
-    // Future: merge with immutable CSR segments.
     let memgraph = &graph.write_buf;
 
-    // Verify node exists.
+    // Verify node exists in the mutable write buffer.
+    // Nodes in CSR segments still have MemGraph entries (freeze copies, doesn't move).
     if memgraph.get_node(node_key).is_none() {
         return Frame::Error(Bytes::from_static(b"ERR node not found"));
     }
 
-    // BFS expansion.
+    // Build a SegmentMergeReader that sees both MemGraph and immutable CSR segments.
     let lsn = u64::MAX - 1; // See all live data (MAX-1 because deleted_lsn=MAX means alive).
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
+    let reader = SegmentMergeReader::new(
+        Some(memgraph),
+        csr_segs,
+        Direction::Both,
+        lsn,
+        edge_type_filter,
+    );
+
+    // BFS expansion using SegmentMergeReader for per-node neighbor lookup.
     let mut visited = std::collections::HashSet::new();
     visited.insert(node_id);
     let mut frontier = vec![node_key];
@@ -107,38 +118,35 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
         let mut next_frontier = Vec::with_capacity(frontier.len() * 4);
 
         for &current in &frontier {
-            for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
-                // Apply edge type filter if specified.
-                if let Some(filter_type) = edge_type_filter {
-                    if let Some(edge) = memgraph.get_edge(edge_key) {
-                        if edge.edge_type != filter_type {
-                            continue;
-                        }
-                    }
-                }
-
-                let neighbor_ext_id = neighbor_key.data().as_ffi();
+            for merged in reader.neighbors(current) {
+                let neighbor_ext_id = merged.node.data().as_ffi();
 
                 if visited.contains(&neighbor_ext_id) {
                     continue;
                 }
                 visited.insert(neighbor_ext_id);
 
-                // Add edge as RESP3 Map.
-                if let Some(edge) = memgraph.get_edge(edge_key) {
-                    results.push(edge_to_frame(edge_key, edge));
+                // Add edge as RESP3 Map (from MemGraph if available, otherwise synthetic).
+                if let Some(edge) = memgraph.get_edge(merged.edge) {
+                    results.push(edge_to_frame(merged.edge, edge));
+                } else {
+                    // CSR-only edge: build a minimal edge frame from MergedNeighbor.
+                    results.push(merged_edge_to_frame(&merged));
                 }
 
                 // Add neighbor node as RESP3 Map.
-                if let Some(node) = memgraph.get_node(neighbor_key) {
-                    results.push(node_to_frame(neighbor_key, node));
+                if let Some(node) = memgraph.get_node(merged.node) {
+                    results.push(node_to_frame(merged.node, node));
+                } else {
+                    // CSR-only node: minimal node frame.
+                    results.push(merged_node_to_frame(&merged));
                 }
 
                 if results.len() >= max_results {
                     break;
                 }
 
-                next_frontier.push(neighbor_key);
+                next_frontier.push(merged.node);
             }
 
             if results.len() >= max_results {
@@ -663,6 +671,49 @@ fn extract_max_hops(plan: &cypher::planner::PhysicalPlan) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Format a node as a RESP3 Map: {id, labels, properties}.
+/// Format a CSR-only edge from a MergedNeighbor as a RESP3 Map.
+/// Used when the edge exists only in immutable CSR segments.
+fn merged_edge_to_frame(merged: &crate::graph::traversal::MergedNeighbor) -> Frame {
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"id")),
+            Frame::Integer(merged.edge.data().as_ffi() as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"type")),
+            Frame::Integer(merged.edge_type as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"weight")),
+            Frame::Double(merged.weight),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"properties")),
+            Frame::Map(Vec::new()),
+        ),
+    ])
+}
+
+/// Format a CSR-only node from a MergedNeighbor as a RESP3 Map.
+/// Used when the node exists only in immutable CSR segments.
+fn merged_node_to_frame(merged: &crate::graph::traversal::MergedNeighbor) -> Frame {
+    let external_id = merged.node.data().as_ffi();
+    Frame::Map(vec![
+        (
+            Frame::SimpleString(Bytes::from_static(b"id")),
+            Frame::Integer(external_id as i64),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"labels")),
+            Frame::Array(Vec::new().into()),
+        ),
+        (
+            Frame::SimpleString(Bytes::from_static(b"properties")),
+            Frame::Map(Vec::new()),
+        ),
+    ])
+}
+
 fn node_to_frame(
     key: crate::graph::types::NodeKey,
     node: &crate::graph::types::MutableNode,

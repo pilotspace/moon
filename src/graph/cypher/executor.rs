@@ -13,6 +13,7 @@ use crate::command::graph::graph_write::label_to_id;
 use crate::graph::cypher::ast::*;
 use crate::graph::cypher::planner::*;
 use crate::graph::store::NamedGraph;
+use crate::graph::traversal::SegmentMergeReader;
 use crate::graph::types::*;
 
 /// Runtime value in the executor pipeline.
@@ -65,6 +66,25 @@ pub struct ProfileResult {
     pub operator_profiles: Vec<OpProfile>,
 }
 
+/// Record of a mutation performed during execute_mut, used for WAL generation.
+#[derive(Debug)]
+pub enum MutationRecord {
+    CreateNode {
+        node_id: u64,
+        labels: SmallVec<[u16; 4]>,
+        properties: PropertyMap,
+        embedding: Option<Vec<f32>>,
+    },
+    CreateEdge {
+        edge_id: u64,
+        src_id: u64,
+        dst_id: u64,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+    },
+}
+
 /// Execute result: column headers + data rows + statistics.
 pub struct ExecResult {
     pub columns: Vec<String>,
@@ -73,6 +93,8 @@ pub struct ExecResult {
     pub nodes_deleted: u64,
     pub properties_set: u64,
     pub execution_time_us: u64,
+    /// Mutations performed during execute_mut, for WAL record generation.
+    pub mutations: Vec<MutationRecord>,
 }
 
 /// Execute a physical plan against a named graph.
@@ -93,6 +115,10 @@ pub fn execute(
     let properties_set: u64 = 0;
 
     let memgraph = &graph.write_buf;
+
+    // Build a SegmentMergeReader for cross-segment neighbor queries.
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
 
     for op in &plan.operators {
         match op {
@@ -133,6 +159,21 @@ pub fn execute(
                     EdgeDirection::Both => Direction::Both,
                 };
 
+                // Build a per-expand SegmentMergeReader with the correct
+                // direction and edge type filter for this operator.
+                let edge_type_filter = if type_ids.len() == 1 {
+                    Some(type_ids[0])
+                } else {
+                    None
+                };
+                let reader = SegmentMergeReader::new(
+                    Some(memgraph),
+                    csr_segs,
+                    dir,
+                    u64::MAX,
+                    edge_type_filter,
+                );
+
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -141,23 +182,21 @@ pub fn execute(
                     };
 
                     if *max_hops <= 1 {
-                        // Single-hop expansion.
-                        for (edge_key, neighbor_key) in
-                            memgraph.neighbors(src_key, dir, u64::MAX)
-                        {
-                            if !type_ids.is_empty() {
-                                if let Some(edge) = memgraph.get_edge(edge_key) {
-                                    if !type_ids.contains(&edge.edge_type) {
-                                        continue;
-                                    }
-                                }
+                        // Single-hop expansion via SegmentMergeReader.
+                        for merged in reader.neighbors(src_key) {
+                            // Multi-type filter (SegmentMergeReader handles
+                            // single-type; we need extra check for multi-type).
+                            if type_ids.len() > 1
+                                && !type_ids.contains(&merged.edge_type)
+                            {
+                                continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(neighbor_key));
+                            new_row.insert(target.clone(), Value::Node(merged.node));
                             new_rows.push(new_row);
                         }
                     } else {
-                        // Variable-length expansion via BFS.
+                        // Variable-length expansion via BFS using SegmentMergeReader.
                         let mut frontier = vec![src_key];
                         let mut visited =
                             std::collections::HashSet::new();
@@ -166,27 +205,23 @@ pub fn execute(
                         for hop in 1..=*max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for (edge_key, neighbor_key) in
-                                    memgraph.neighbors(current, dir, u64::MAX)
-                                {
-                                    if visited.contains(&neighbor_key) {
+                                for merged in reader.neighbors(current) {
+                                    if visited.contains(&merged.node) {
                                         continue;
                                     }
-                                    if !type_ids.is_empty() {
-                                        if let Some(edge) = memgraph.get_edge(edge_key) {
-                                            if !type_ids.contains(&edge.edge_type) {
-                                                continue;
-                                            }
-                                        }
+                                    if type_ids.len() > 1
+                                        && !type_ids.contains(&merged.edge_type)
+                                    {
+                                        continue;
                                     }
-                                    visited.insert(neighbor_key);
-                                    next_frontier.push(neighbor_key);
+                                    visited.insert(merged.node);
+                                    next_frontier.push(merged.node);
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
                                         new_row.insert(
                                             target.clone(),
-                                            Value::Node(neighbor_key),
+                                            Value::Node(merged.node),
                                         );
                                         new_rows.push(new_row);
                                     }
