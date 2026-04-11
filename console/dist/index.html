@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moon Console</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0a0a0a; color: #e0e0e0; margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .container { text-align: center; }
+        h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+        p { color: #888; }
+        .status { color: #4ade80; font-family: monospace; margin-top: 2rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Moon Console</h1>
+        <p>Interactive data client for Moon server</p>
+        <div class="status" id="status">Connecting...</div>
+    </div>
+    <script>
+        fetch('/api/v1/info')
+            .then(r => r.json())
+            .then(d => {
+                document.getElementById('status').textContent = 'Connected - Gateway operational';
+            })
+            .catch(() => {
+                document.getElementById('status').textContent = 'Gateway not available';
+                document.getElementById('status').style.color = '#ef4444';
+            });
+    </script>
+</body>
+</html>

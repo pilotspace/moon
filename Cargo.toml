@@ -62,7 +62,7 @@ memmap2 = "0.9"
 lz4_flex = "0.13"
 dashmap = "6"
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
 http-body-util = "0.1"
 
 tikv-jemallocator = { version = "0.6", optional = true }
