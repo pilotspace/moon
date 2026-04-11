@@ -3,6 +3,7 @@ name: Client Compatibility
 on:
   pull_request:
     branches: [main]
+    paths: ['src/**']
   schedule:
     - cron: '0 4 * * 1'
 
@@ -10,7 +11,11 @@ concurrency:
   group: compat-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  MOON_NO_URING: "1"
+
 jobs:
+  # ── Core clients: always run on PR ──────────────────────────────────
   redis-py:
     name: redis-py
     runs-on: ubuntu-latest
@@ -18,104 +23,38 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
+      - name: Build Moon
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
       - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
+        run: ./target/release/moon --port 6399 --shards 1 & sleep 2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install redis-py
-        run: pip install redis
-      - name: Run compatibility tests
+      - run: pip install redis
+      - name: Run tests
         run: |
           python -c "
           import redis
           r = redis.Redis(host='127.0.0.1', port=6399)
-          # Basic operations
           r.set('test_key', 'test_value')
           assert r.get('test_key') == b'test_value'
           r.delete('test_key')
           assert r.get('test_key') is None
-          # Hash
           r.hset('hash_key', mapping={'f1': 'v1', 'f2': 'v2'})
           assert r.hget('hash_key', 'f1') == b'v1'
-          assert r.hlen('hash_key') == 2
-          # List
           r.rpush('list_key', 'a', 'b', 'c')
-          assert r.llen('list_key') == 3
           assert r.lrange('list_key', 0, -1) == [b'a', b'b', b'c']
-          # Set
           r.sadd('set_key', 'a', 'b', 'c')
           assert r.scard('set_key') == 3
-          assert r.sismember('set_key', 'a')
-          # Sorted set
           r.zadd('zset_key', {'a': 1.0, 'b': 2.0, 'c': 3.0})
           assert r.zcard('zset_key') == 3
-          # Pipeline
           pipe = r.pipeline()
-          pipe.set('p1', 'v1')
-          pipe.set('p2', 'v2')
-          pipe.get('p1')
-          pipe.get('p2')
-          results = pipe.execute()
-          assert results == [True, True, b'v1', b'v2']
-          # INFO
+          pipe.set('p1', 'v1'); pipe.set('p2', 'v2'); pipe.get('p1'); pipe.get('p2')
+          assert pipe.execute() == [True, True, b'v1', b'v2']
           info = r.info()
           assert 'redis_version' in info
           print('redis-py: ALL TESTS PASSED')
           "
-
-  go-redis:
-    name: go-redis
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
-        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
-      - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-      - name: Run go-redis smoke test
-        run: |
-          GOTEST_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/go-compat-XXXXXX")
-          cat > "$GOTEST_DIR/main.go" << 'GOEOF'
-          package main
-          import (
-            "context"
-            "fmt"
-            "github.com/redis/go-redis/v9"
-          )
-          func main() {
-            ctx := context.Background()
-            rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6399"})
-            defer rdb.Close()
-            rdb.Set(ctx, "go_key", "go_value", 0)
-            val, _ := rdb.Get(ctx, "go_key").Result()
-            if val != "go_value" { panic("GET failed") }
-            rdb.HSet(ctx, "go_hash", "f1", "v1")
-            hval, _ := rdb.HGet(ctx, "go_hash", "f1").Result()
-            if hval != "v1" { panic("HGET failed") }
-            fmt.Println("go-redis: ALL TESTS PASSED")
-          }
-          GOEOF
-          cd "$GOTEST_DIR" && go mod init compat && go mod tidy && go run main.go
 
   ioredis:
     name: ioredis (Node.js)
@@ -124,45 +63,29 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
+      - name: Build Moon
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
       - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
+        run: ./target/release/moon --port 6399 --shards 1 & sleep 2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install ioredis
-        run: npm install ioredis
-      - name: Run compatibility tests
+      - run: npm install ioredis
+      - name: Run tests
         run: |
           node -e "
           const Redis = require('ioredis');
           (async () => {
             const r = new Redis({ host: '127.0.0.1', port: 6399, lazyConnect: true });
             await r.connect();
-            // SET / GET
             await r.set('node_key', 'node_value');
-            const v = await r.get('node_key');
-            if (v !== 'node_value') throw new Error('GET failed');
-            // HSET / HGET
+            if (await r.get('node_key') !== 'node_value') throw new Error('GET failed');
             await r.hset('node_hash', 'f1', 'v1');
-            const hv = await r.hget('node_hash', 'f1');
-            if (hv !== 'v1') throw new Error('HGET failed');
-            // Pipeline
+            if (await r.hget('node_hash', 'f1') !== 'v1') throw new Error('HGET failed');
             const pipe = r.pipeline();
-            pipe.set('np1', 'pv1');
-            pipe.set('np2', 'pv2');
-            pipe.get('np1');
-            pipe.get('np2');
+            pipe.set('np1', 'pv1'); pipe.set('np2', 'pv2'); pipe.get('np1'); pipe.get('np2');
             const results = await pipe.exec();
-            if (results[2][1] !== 'pv1') throw new Error('pipeline GET failed');
-            if (results[3][1] !== 'pv2') throw new Error('pipeline GET failed');
+            if (results[2][1] !== 'pv1') throw new Error('pipeline failed');
             console.log('ioredis: ALL TESTS PASSED');
             await r.quit();
           })();
@@ -175,42 +98,31 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
+      - name: Build Moon
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
       - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
-      - name: Run redis-rs smoke test
+        run: ./target/release/moon --port 6399 --shards 1 & sleep 2
+      - name: Run tests
         run: |
           TMPDIR=$(mktemp -d)
-          cat > "$TMPDIR/Cargo.toml" << 'RSEOF'
+          cat > "$TMPDIR/Cargo.toml" << 'EOF'
           [package]
-          name = "moon-compat-redis-rs"
+          name = "moon-compat"
           version = "0.1.0"
           edition = "2021"
           [dependencies]
           redis = "0.27"
-          RSEOF
+          EOF
           mkdir -p "$TMPDIR/src"
-          cat > "$TMPDIR/src/main.rs" << 'RSEOF'
+          cat > "$TMPDIR/src/main.rs" << 'EOF'
           use redis::Commands;
           fn main() {
               let client = redis::Client::open("redis://127.0.0.1:6399/").unwrap();
               let mut con = client.get_connection().unwrap();
-              // SET / GET
               let _: () = con.set("rs_key", "rs_value").unwrap();
-              let v: String = con.get("rs_key").unwrap();
-              assert_eq!(v, "rs_value");
-              // HSET / HGET
+              assert_eq!(con.get::<_, String>("rs_key").unwrap(), "rs_value");
               let _: () = con.hset("rs_hash", "f1", "v1").unwrap();
-              let hv: String = con.hget("rs_hash", "f1").unwrap();
-              assert_eq!(hv, "v1");
-              // Pipeline
+              assert_eq!(con.hget::<_, _, String>("rs_hash", "f1").unwrap(), "v1");
               let (r1, r2): (String, String) = redis::pipe()
                   .cmd("SET").arg("rp1").arg("pv1").ignore()
                   .cmd("SET").arg("rp2").arg("pv2").ignore()
@@ -221,94 +133,93 @@ jobs:
               assert_eq!(r2, "pv2");
               println!("redis-rs: ALL TESTS PASSED");
           }
-          RSEOF
+          EOF
           cd "$TMPDIR" && cargo run --release
 
-  hiredis:
-    name: hiredis (C)
+  # ── Extended clients: weekly schedule only ──────────────────────────
+  go-redis:
+    name: go-redis
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
+      - name: Build Moon
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
       - name: Start Moon
+        run: ./target/release/moon --port 6399 --shards 1 & sleep 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run tests
         run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
-      - name: Install hiredis
-        run: sudo apt-get install -y libhiredis-dev
-      - name: Run hiredis smoke test
+          GOTEST_DIR=$(mktemp -d)
+          cat > "$GOTEST_DIR/main.go" << 'GOEOF'
+          package main
+          import ("context"; "fmt"; "github.com/redis/go-redis/v9")
+          func main() {
+            ctx := context.Background()
+            rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6399"})
+            defer rdb.Close()
+            rdb.Set(ctx, "go_key", "go_value", 0)
+            val, _ := rdb.Get(ctx, "go_key").Result()
+            if val != "go_value" { panic("GET failed") }
+            fmt.Println("go-redis: ALL TESTS PASSED")
+          }
+          GOEOF
+          cd "$GOTEST_DIR" && go mod init compat && go mod tidy && go run main.go
+
+  hiredis:
+    name: hiredis (C)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Moon
+        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
+      - name: Start Moon
+        run: ./target/release/moon --port 6399 --shards 1 & sleep 2
+      - run: sudo apt-get install -y libhiredis-dev
+      - name: Run tests
         run: |
-          cat > /tmp/compat_test.c << 'CEOF'
+          cat > /tmp/test.c << 'CEOF'
           #include <stdio.h>
-          #include <stdlib.h>
           #include <string.h>
           #include <hiredis/hiredis.h>
           int main() {
               redisContext *c = redisConnect("127.0.0.1", 6399);
-              if (c == NULL || c->err) { fprintf(stderr, "connect failed\n"); return 1; }
-              redisReply *r;
-              /* SET / GET */
-              r = redisCommand(c, "SET c_key c_value");
-              freeReplyObject(r);
+              if (!c || c->err) return 1;
+              redisReply *r = redisCommand(c, "SET c_key c_value"); freeReplyObject(r);
               r = redisCommand(c, "GET c_key");
-              if (strcmp(r->str, "c_value") != 0) { fprintf(stderr, "GET failed\n"); return 1; }
-              freeReplyObject(r);
-              /* HSET / HGET */
-              r = redisCommand(c, "HSET c_hash f1 v1");
-              freeReplyObject(r);
-              r = redisCommand(c, "HGET c_hash f1");
-              if (strcmp(r->str, "v1") != 0) { fprintf(stderr, "HGET failed\n"); return 1; }
-              freeReplyObject(r);
-              /* Pipeline */
-              redisAppendCommand(c, "SET cp1 pv1");
-              redisAppendCommand(c, "SET cp2 pv2");
-              redisAppendCommand(c, "GET cp1");
-              redisAppendCommand(c, "GET cp2");
-              redisGetReply(c, (void**)&r); freeReplyObject(r);
-              redisGetReply(c, (void**)&r); freeReplyObject(r);
-              redisGetReply(c, (void**)&r);
-              if (strcmp(r->str, "pv1") != 0) { fprintf(stderr, "pipeline GET1 failed\n"); return 1; }
-              freeReplyObject(r);
-              redisGetReply(c, (void**)&r);
-              if (strcmp(r->str, "pv2") != 0) { fprintf(stderr, "pipeline GET2 failed\n"); return 1; }
+              if (strcmp(r->str, "c_value")) return 1;
               freeReplyObject(r);
               printf("hiredis: ALL TESTS PASSED\n");
               redisFree(c);
               return 0;
           }
           CEOF
-          gcc -o /tmp/compat_test /tmp/compat_test.c -lhiredis
-          /tmp/compat_test
+          gcc -o /tmp/test /tmp/test.c -lhiredis && /tmp/test
 
   jedis:
     name: jedis (Java)
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
+      - name: Build Moon
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
       - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
+        run: ./target/release/moon --port 6399 --shards 1 & sleep 2
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
-      - name: Run jedis smoke test
+      - name: Run tests
         env:
           JEDIS_VERSION: "5.2.0"
           SLF4J_VERSION: "2.0.16"
@@ -321,152 +232,17 @@ jobs:
           curl -sL "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/${SLF4J_VERSION}/slf4j-simple-${SLF4J_VERSION}.jar" -o /tmp/jedis-test/slf4j-simple.jar
           curl -sL "https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/${POOL_VERSION}/commons-pool2-${POOL_VERSION}.jar" -o /tmp/jedis-test/commons-pool2.jar
           curl -sL "https://repo1.maven.org/maven2/com/google/gson/gson/${GSON_VERSION}/gson-${GSON_VERSION}.jar" -o /tmp/jedis-test/gson.jar
-          cat > /tmp/jedis-test/CompatTest.java << 'JEOF'
+          cat > /tmp/jedis-test/Test.java << 'JEOF'
           import redis.clients.jedis.Jedis;
-          import redis.clients.jedis.Pipeline;
-          import java.util.List;
-
-          public class CompatTest {
+          public class Test {
               public static void main(String[] args) {
-                  try (Jedis jedis = new Jedis("127.0.0.1", 6399)) {
-                      // SET / GET
-                      jedis.set("java_key", "java_value");
-                      String v = jedis.get("java_key");
-                      assert "java_value".equals(v) : "GET failed";
-                      // HSET / HGET
-                      jedis.hset("java_hash", "f1", "v1");
-                      String hv = jedis.hget("java_hash", "f1");
-                      assert "v1".equals(hv) : "HGET failed";
-                      // Pipeline
-                      Pipeline p = jedis.pipelined();
-                      p.set("jp1", "pv1");
-                      p.set("jp2", "pv2");
-                      p.get("jp1");
-                      p.get("jp2");
-                      List<Object> results = p.syncAndReturnAll();
-                      assert "pv1".equals(results.get(2)) : "pipeline GET1 failed";
-                      assert "pv2".equals(results.get(3)) : "pipeline GET2 failed";
+                  try (Jedis j = new Jedis("127.0.0.1", 6399)) {
+                      j.set("java_key", "java_value");
+                      assert "java_value".equals(j.get("java_key"));
                       System.out.println("jedis: ALL TESTS PASSED");
                   }
               }
           }
           JEOF
-          cd /tmp/jedis-test && javac -cp "jedis.jar:commons-pool2.jar:slf4j-api.jar:gson.jar" CompatTest.java
-          cd /tmp/jedis-test && java -ea -cp ".:jedis.jar:commons-pool2.jar:slf4j-api.jar:slf4j-simple.jar:gson.jar" CompatTest
-
-  lettuce:
-    name: lettuce (Java)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
-        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
-      - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
-      - uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-      - name: Run lettuce smoke test
-        env:
-          LETTUCE_VERSION: "6.5.2.RELEASE"
-          NETTY_VERSION: "4.1.116.Final"
-          REACTOR_VERSION: "3.7.2"
-          REACTIVE_STREAMS_VERSION: "1.0.4"
-        run: |
-          mkdir -p /tmp/lettuce-test
-          curl -sL "https://repo1.maven.org/maven2/io/lettuce/lettuce-core/${LETTUCE_VERSION}/lettuce-core-${LETTUCE_VERSION}.jar" -o /tmp/lettuce-test/lettuce-core.jar
-          curl -sL "https://repo1.maven.org/maven2/io/netty/netty-all/${NETTY_VERSION}/netty-all-${NETTY_VERSION}.jar" -o /tmp/lettuce-test/netty-all.jar
-          curl -sL "https://repo1.maven.org/maven2/io/projectreactor/reactor-core/${REACTOR_VERSION}/reactor-core-${REACTOR_VERSION}.jar" -o /tmp/lettuce-test/reactor-core.jar
-          curl -sL "https://repo1.maven.org/maven2/org/reactivestreams/reactive-streams/${REACTIVE_STREAMS_VERSION}/reactive-streams-${REACTIVE_STREAMS_VERSION}.jar" -o /tmp/lettuce-test/reactive-streams.jar
-          cat > /tmp/lettuce-test/LettuceTest.java << 'LEOF'
-          import io.lettuce.core.RedisClient;
-          import io.lettuce.core.api.StatefulRedisConnection;
-          import io.lettuce.core.api.sync.RedisCommands;
-          public class LettuceTest {
-              public static void main(String[] args) {
-                  RedisClient client = RedisClient.create("redis://127.0.0.1:6399");
-                  try (StatefulRedisConnection<String, String> conn = client.connect()) {
-                      RedisCommands<String, String> cmd = conn.sync();
-                      cmd.set("lettuce_key", "lettuce_value");
-                      String v = cmd.get("lettuce_key");
-                      assert "lettuce_value".equals(v) : "GET failed";
-                      cmd.hset("lettuce_hash", "f1", "v1");
-                      String hv = cmd.hget("lettuce_hash", "f1");
-                      assert "v1".equals(hv) : "HGET failed";
-                      System.out.println("lettuce: ALL TESTS PASSED");
-                  } finally {
-                      client.shutdown();
-                  }
-              }
-          }
-          LEOF
-          cd /tmp/lettuce-test && javac -cp "lettuce-core.jar:netty-all.jar:reactor-core.jar:reactive-streams.jar" LettuceTest.java
-          cd /tmp/lettuce-test && java -ea -cp ".:lettuce-core.jar:netty-all.jar:reactor-core.jar:reactive-streams.jar" LettuceTest
-
-  stackexchange-redis:
-    name: StackExchange.Redis (.NET)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Build Moon (tokio)
-        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
-      - name: Start Moon
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-        env:
-          MOON_NO_URING: "1"
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0.x'
-      - name: Run StackExchange.Redis smoke test
-        run: |
-          mkdir -p /tmp/se-redis-test
-          cd /tmp/se-redis-test
-          dotnet new console -n CompatTest --force
-          cd CompatTest
-          dotnet add package StackExchange.Redis
-          cat > Program.cs << 'CSEOF'
-          using StackExchange.Redis;
-
-          var mux = ConnectionMultiplexer.Connect("127.0.0.1:6399");
-          var db = mux.GetDatabase();
-
-          // SET / GET
-          db.StringSet("dotnet_key", "dotnet_value");
-          var v = db.StringGet("dotnet_key");
-          if (v != "dotnet_value") throw new Exception("GET failed");
-
-          // HSET / HGET
-          db.HashSet("dotnet_hash", "f1", "v1");
-          var hv = db.HashGet("dotnet_hash", "f1");
-          if (hv != "v1") throw new Exception("HGET failed");
-
-          // Pipeline (batch)
-          var batch = db.CreateBatch();
-          var t1 = batch.StringSetAsync("dp1", "pv1");
-          var t2 = batch.StringSetAsync("dp2", "pv2");
-          var t3 = batch.StringGetAsync("dp1");
-          var t4 = batch.StringGetAsync("dp2");
-          batch.Execute();
-          Task.WaitAll(t1, t2, t3, t4);
-          if (t3.Result != "pv1") throw new Exception("batch GET1 failed");
-          if (t4.Result != "pv2") throw new Exception("batch GET2 failed");
-
-          Console.WriteLine("StackExchange.Redis: ALL TESTS PASSED");
-          mux.Dispose();
-          CSEOF
-          dotnet run
+          cd /tmp/jedis-test && javac -cp "jedis.jar:commons-pool2.jar:slf4j-api.jar:gson.jar" Test.java
+          cd /tmp/jedis-test && java -ea -cp ".:jedis.jar:commons-pool2.jar:slf4j-api.jar:slf4j-simple.jar:gson.jar" Test

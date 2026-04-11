@@ -3,6 +3,7 @@ name: Fuzz
 on:
   pull_request:
     branches: [main]
+    types: [labeled]
   schedule:
     - cron: '0 2 * * *'
 
@@ -15,7 +16,7 @@ env:
 
 jobs:
   fuzz-pr:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-fuzz')
     name: Fuzz PR
     runs-on: ubuntu-latest
     strategy:

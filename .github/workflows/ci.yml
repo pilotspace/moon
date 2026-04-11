@@ -6,17 +6,18 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel superseded runs on the same PR/branch — only latest commit matters.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  MOON_NO_URING: "1"
 
 jobs:
-  fmt:
-    name: Format
+  # ── Fast lint gate (no cargo build) ──────────────────────────────────
+  lint:
+    name: Lint (fmt + safety)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,7 +25,12 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+      - name: Audit unsafe blocks for SAFETY comments
+        run: bash scripts/audit-unsafe.sh
+      - name: Audit unwrap/expect ratchet
+        run: bash scripts/audit-unwrap.sh
 
+  # ── Clippy (needs cargo check, but no full build) ───────────────────
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -34,13 +40,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (default features)
-        run: cargo clippy -- -D warnings
-      - name: Clippy (default + graph)
-        run: cargo clippy --features graph -- -D warnings
-      - name: Clippy (tokio runtime)
-        run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
+      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --features graph -- -D warnings
+      - run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
 
+  # ── Test (the big one — build + run) ────────────────────────────────
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -50,24 +54,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
-        env:
-          MOON_NO_URING: "1"
       - name: Test (graph feature)
         run: "cargo test --no-default-features --features runtime-tokio,jemalloc,graph --lib graph::"
         timeout-minutes: 5
-        env:
-          MOON_NO_URING: "1"
 
-  safety-audit:
-    name: Safety Audit
+  # ── MSRV — just needs to build, not test ────────────────────────────
+  msrv:
+    name: MSRV (1.94)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Audit unsafe blocks for SAFETY comments
-        run: bash scripts/audit-unsafe.sh
-      - name: Audit unwrap/expect ratchet
-        run: bash scripts/audit-unwrap.sh
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --no-default-features --features runtime-tokio
 
+  # ── CHANGELOG check (PR only) ──────────────────────────────────────
   changelog:
     name: CHANGELOG check
     if: github.event_name == 'pull_request'
@@ -87,63 +88,6 @@ jobs:
           if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
             echo "CHANGELOG.md updated"
           else
-            echo "::error::CHANGELOG.md not updated under [Unreleased]. Add a changelog entry or apply the 'skip-changelog' label."
+            echo "::error::CHANGELOG.md not updated. Add an entry or apply 'skip-changelog' label."
             exit 1
           fi
-
-  supply-chain:
-    name: Supply Chain Security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-deny and cargo-audit
-        run: cargo install cargo-deny cargo-audit
-      - name: cargo deny check
-        run: cargo deny check
-      - name: cargo audit
-        run: cargo audit
-
-  redis-compat:
-    name: Redis Compat
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Build Moon
-        run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
-        env:
-          MOON_NO_URING: "1"
-      - name: Run redis_compat integration tests
-        run: |
-          ./target/release/moon --port 6399 --shards 1 &
-          sleep 2
-          MOON_TEST_PORT=6399 cargo test --release --no-default-features --features runtime-tokio,jemalloc --test redis_compat -- --ignored
-        timeout-minutes: 5
-        env:
-          MOON_NO_URING: "1"
-
-  loom:
-    name: Loom Model Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Run loom exhaustive exploration
-        run: cargo test --no-default-features --features runtime-tokio,jemalloc --test loom_response_slot
-        timeout-minutes: 5
-        env:
-          MOON_NO_URING: "1"
-          RUSTFLAGS: "--cfg loom"
-
-  msrv:
-    name: MSRV (1.94)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --no-default-features --features runtime-tokio

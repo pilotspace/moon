@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [labeled]
 
 concurrency:
   group: integration-${{ github.ref }}
@@ -17,6 +18,7 @@ env:
 jobs:
   durability:
     name: Durability Tests
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -33,6 +35,7 @@ jobs:
 
   replication:
     name: Replication Tests
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
