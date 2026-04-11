@@ -330,7 +330,7 @@ fn main() -> anyhow::Result<()> {
                 let loaded = moon::persistence::aof_manifest::replay_multi_part(
                     &mut shards[0].databases,
                     manifest,
-                    &DispatchReplayEngine,
+                    &DispatchReplayEngine::new(),
                 )
                 .with_context(|| "multi-part AOF replay failed")?;
                 info!(

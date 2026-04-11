@@ -84,7 +84,7 @@ pub async fn run_with_shutdown(
                 std::mem::replace(&mut *guard, Database::new())
             })
             .collect();
-        match aof::replay_aof(&mut dbs_vec, &aof_path, &DispatchReplayEngine) {
+        match aof::replay_aof(&mut dbs_vec, &aof_path, &DispatchReplayEngine::new()) {
             Ok(n) => info!(
                 "AOF loaded: {} commands replayed from {}",
                 n,
