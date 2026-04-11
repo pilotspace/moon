@@ -426,11 +426,66 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
             }
             None => Frame::Null,
         }
+    } else if subcommand.eq_ignore_ascii_case(b"FREQ") {
+        if args.len() != 2 {
+            return err_wrong_args("OBJECT");
+        }
+        let key = match extract_key(&args[1]) {
+            Some(k) => k,
+            None => return err_wrong_args("OBJECT"),
+        };
+        match db.get(key) {
+            Some(entry) => Frame::Integer(entry.access_counter() as i64),
+            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
+        if args.len() != 2 {
+            return err_wrong_args("OBJECT");
+        }
+        let key = match extract_key(&args[1]) {
+            Some(k) => k,
+            None => return err_wrong_args("OBJECT"),
+        };
+        let now = db.now();
+        match db.get(key) {
+            Some(entry) => {
+                let last = entry.last_access();
+                // Wraparound-safe delta in seconds (16-bit)
+                let idle = (now.wrapping_sub(last)) & 0xFFFF;
+                Frame::Integer(idle as i64)
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
+        if args.len() != 2 {
+            return err_wrong_args("OBJECT");
+        }
+        let key = match extract_key(&args[1]) {
+            Some(k) => k,
+            None => return err_wrong_args("OBJECT"),
+        };
+        match db.get(key) {
+            // Moon doesn't use reference counting — always return 1
+            Some(_) => Frame::Integer(1),
+            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        }
     } else if subcommand.eq_ignore_ascii_case(b"HELP") {
         Frame::Array(framevec![
             Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
             Frame::BulkString(Bytes::from_static(
                 b"  Return the encoding of the object stored at <key>."
+            )),
+            Frame::BulkString(Bytes::from_static(b"OBJECT FREQ <key>")),
+            Frame::BulkString(Bytes::from_static(
+                b"  Return the access frequency of the object at <key>."
+            )),
+            Frame::BulkString(Bytes::from_static(b"OBJECT IDLETIME <key>")),
+            Frame::BulkString(Bytes::from_static(
+                b"  Return the idle time in seconds of the object at <key>."
+            )),
+            Frame::BulkString(Bytes::from_static(b"OBJECT REFCOUNT <key>")),
+            Frame::BulkString(Bytes::from_static(
+                b"  Return the reference count of the object at <key>."
             )),
             Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
             Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),

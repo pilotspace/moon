@@ -272,6 +272,45 @@ pub fn geosearch(db: &mut Database, args: &[Frame]) -> Frame {
     results
 }
 
+/// GEORADIUS key longitude latitude radius M|KM|FT|MI [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]
+///
+/// Deprecated since Redis 6.2 — translates to GEOSEARCH internally.
+pub fn georadius(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 5 {
+        return err_wrong_args("GEORADIUS");
+    }
+    // Translate: GEORADIUS key lon lat radius unit [opts...]
+    // → GEOSEARCH key FROMLONLAT lon lat BYRADIUS radius unit [opts...]
+    let mut new_args = Vec::with_capacity(args.len() + 3);
+    new_args.push(args[0].clone()); // key
+    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMLONLAT")));
+    new_args.push(args[1].clone()); // lon
+    new_args.push(args[2].clone()); // lat
+    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
+    new_args.push(args[3].clone()); // radius
+    new_args.push(args[4].clone()); // unit
+    new_args.extend_from_slice(&args[5..]); // remaining options
+    geosearch(db, &new_args)
+}
+
+/// GEORADIUSBYMEMBER key member radius M|KM|FT|MI [opts...]
+///
+/// Deprecated since Redis 6.2 — translates to GEOSEARCH internally.
+pub fn georadiusbymember(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 4 {
+        return err_wrong_args("GEORADIUSBYMEMBER");
+    }
+    let mut new_args = Vec::with_capacity(args.len() + 3);
+    new_args.push(args[0].clone()); // key
+    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMMEMBER")));
+    new_args.push(args[1].clone()); // member
+    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
+    new_args.push(args[2].clone()); // radius
+    new_args.push(args[3].clone()); // unit
+    new_args.extend_from_slice(&args[4..]); // remaining options
+    geosearch(db, &new_args)
+}
+
 /// GEOSEARCHSTORE destination source ...
 pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {

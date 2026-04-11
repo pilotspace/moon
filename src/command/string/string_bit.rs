@@ -745,6 +745,271 @@ fn count_bits_in_range(data: &[u8], start_bit: usize, end_bit: usize) -> u32 {
     count
 }
 
+/// BITFIELD key [GET encoding offset] [SET encoding offset value]
+///   [INCRBY encoding offset increment] [OVERFLOW WRAP|SAT|FAIL]
+///
+/// Treat a string as an array of packed integers of configurable width.
+pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("BITFIELD");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.clone(),
+        None => return err_wrong_args("BITFIELD"),
+    };
+
+    let base_ts = db.base_timestamp();
+    let (existing_data, existing_expiry_ms) = match db.get(&key) {
+        Some(entry) => {
+            let expiry = entry.expires_at_ms(base_ts);
+            match entry.value.as_bytes() {
+                Some(v) => (v.to_vec(), expiry),
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ));
+                }
+            }
+        }
+        None => (Vec::new(), 0),
+    };
+
+    let mut buf = existing_data;
+    let mut results = Vec::new();
+    let mut overflow = Overflow::Wrap;
+    let mut modified = false;
+    let mut i = 1;
+
+    while i < args.len() {
+        let subcmd = match extract_bytes(&args[i]) {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if subcmd.eq_ignore_ascii_case(b"OVERFLOW") {
+            i += 1;
+            let mode = match args.get(i).and_then(|f| extract_bytes(f)) {
+                Some(m) => m,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            if mode.eq_ignore_ascii_case(b"WRAP") {
+                overflow = Overflow::Wrap;
+            } else if mode.eq_ignore_ascii_case(b"SAT") {
+                overflow = Overflow::Sat;
+            } else if mode.eq_ignore_ascii_case(b"FAIL") {
+                overflow = Overflow::Fail;
+            } else {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            i += 1;
+            continue;
+        }
+
+        // Parse encoding and offset
+        let enc = match args.get(i + 1).and_then(|f| extract_bytes(f)) {
+            Some(e) => e,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        let offset_arg = match args.get(i + 2).and_then(|f| extract_bytes(f)) {
+            Some(o) => o,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+
+        let (signed, bits) = match parse_encoding(enc) {
+            Some(v) => v,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Invalid bitfield type. Use something like i8 u8 i16 u16 ...",
+                ));
+            }
+        };
+        let bit_offset = match parse_bit_offset(offset_arg, bits) {
+            Some(v) => v,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR bit offset is not an integer or out of range",
+                ));
+            }
+        };
+
+        if subcmd.eq_ignore_ascii_case(b"GET") {
+            let val = bf_get(&buf, bit_offset, bits, signed);
+            results.push(Frame::Integer(val));
+            i += 3;
+        } else if subcmd.eq_ignore_ascii_case(b"SET") {
+            let value = match args.get(i + 3).and_then(|f| parse_i64(f)) {
+                Some(v) => v,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            let old = bf_get(&buf, bit_offset, bits, signed);
+            bf_set(&mut buf, bit_offset, bits, value);
+            results.push(Frame::Integer(old));
+            modified = true;
+            i += 4;
+        } else if subcmd.eq_ignore_ascii_case(b"INCRBY") {
+            let increment = match args.get(i + 3).and_then(|f| parse_i64(f)) {
+                Some(v) => v,
+                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            };
+            let old = bf_get(&buf, bit_offset, bits, signed);
+            let (new_val, overflowed) = bf_incr(old, increment, bits, signed);
+            if overflowed && matches!(overflow, Overflow::Fail) {
+                results.push(Frame::Null);
+            } else {
+                let clamped = if overflowed && matches!(overflow, Overflow::Sat) {
+                    bf_saturate(old, increment, bits, signed)
+                } else {
+                    new_val
+                };
+                bf_set(&mut buf, bit_offset, bits, clamped);
+                results.push(Frame::Integer(clamped));
+                modified = true;
+            }
+            i += 4;
+        } else {
+            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        }
+    }
+
+    if modified {
+        let new_val = Bytes::from(buf);
+        let mut entry = if existing_expiry_ms > 0 {
+            Entry::new_string_with_expiry(new_val, existing_expiry_ms, base_ts)
+        } else {
+            Entry::new_string(new_val)
+        };
+        entry.set_last_access(db.now());
+        entry.set_access_counter(5);
+        db.set(key, entry);
+    }
+
+    Frame::Array(results.into())
+}
+
+#[derive(Clone, Copy)]
+enum Overflow {
+    Wrap,
+    Sat,
+    Fail,
+}
+
+/// Parse encoding like "u8", "i16", "u32" etc. Returns (signed, bits).
+fn parse_encoding(enc: &[u8]) -> Option<(bool, u32)> {
+    if enc.is_empty() {
+        return None;
+    }
+    let signed = match enc[0] | 0x20 {
+        b'i' => true,
+        b'u' => false,
+        _ => return None,
+    };
+    let bits: u32 = std::str::from_utf8(&enc[1..]).ok()?.parse().ok()?;
+    if bits == 0 || bits > 64 || (!signed && bits > 63) {
+        return None;
+    }
+    Some((signed, bits))
+}
+
+/// Parse bit offset: plain number or `#N` (type-multiplied).
+fn parse_bit_offset(arg: &[u8], type_bits: u32) -> Option<usize> {
+    if arg.first() == Some(&b'#') {
+        let n: usize = std::str::from_utf8(&arg[1..]).ok()?.parse().ok()?;
+        Some(n * type_bits as usize)
+    } else {
+        let n: usize = std::str::from_utf8(arg).ok()?.parse().ok()?;
+        Some(n)
+    }
+}
+
+/// Read `bits` bits starting at `bit_offset` from `data`, interpreting as signed/unsigned.
+fn bf_get(data: &[u8], bit_offset: usize, bits: u32, signed: bool) -> i64 {
+    let mut val: u64 = 0;
+    for b in 0..bits as usize {
+        let pos = bit_offset + b;
+        let byte_idx = pos / 8;
+        let bit_idx = 7 - (pos % 8);
+        if byte_idx < data.len() && (data[byte_idx] >> bit_idx) & 1 == 1 {
+            val |= 1 << (bits as usize - 1 - b);
+        }
+    }
+    if signed && bits < 64 && val & (1 << (bits - 1)) != 0 {
+        // Sign extend
+        val |= !0u64 << bits;
+    }
+    val as i64
+}
+
+/// Write `bits` bits starting at `bit_offset` into `data`.
+fn bf_set(data: &mut Vec<u8>, bit_offset: usize, bits: u32, value: i64) {
+    let val = value as u64;
+    let needed_bytes = (bit_offset + bits as usize + 7) / 8;
+    if data.len() < needed_bytes {
+        data.resize(needed_bytes, 0);
+    }
+    for b in 0..bits as usize {
+        let pos = bit_offset + b;
+        let byte_idx = pos / 8;
+        let bit_idx = 7 - (pos % 8);
+        if val & (1 << (bits as usize - 1 - b)) != 0 {
+            data[byte_idx] |= 1 << bit_idx;
+        } else {
+            data[byte_idx] &= !(1 << bit_idx);
+        }
+    }
+}
+
+/// Increment with overflow detection. Returns (result, overflowed).
+fn bf_incr(old: i64, incr: i64, bits: u32, signed: bool) -> (i64, bool) {
+    if signed {
+        let min = -(1i64 << (bits - 1));
+        let max = (1i64 << (bits - 1)) - 1;
+        match old.checked_add(incr) {
+            Some(v) if v >= min && v <= max => (v, false),
+            Some(v) => {
+                // Wrap
+                let range = 1i64 << bits;
+                let wrapped = ((v - min) % range + range) % range + min;
+                (wrapped, true)
+            }
+            None => {
+                // Overflow in i64 itself — definitely overflowed
+                let wrapped = old.wrapping_add(incr);
+                (wrapped, true)
+            }
+        }
+    } else {
+        let max = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let old_u = old as u64 & max;
+        let incr_u = incr as u64;
+        let sum = old_u.wrapping_add(incr_u);
+        let masked = sum & max;
+        (masked as i64, masked != sum || (incr < 0 && sum > old_u))
+    }
+}
+
+/// Saturate to min/max of the type.
+fn bf_saturate(_old: i64, incr: i64, bits: u32, signed: bool) -> i64 {
+    if signed {
+        let min = -(1i64 << (bits - 1));
+        let max = (1i64 << (bits - 1)) - 1;
+        if incr > 0 { max } else { min }
+    } else {
+        let max = if bits >= 64 {
+            i64::MAX
+        } else {
+            ((1u64 << bits) - 1) as i64
+        };
+        if incr > 0 { max } else { 0 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

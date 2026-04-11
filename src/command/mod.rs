@@ -71,6 +71,12 @@ fn dispatch_inner(
 
     match (len, b0) {
         // 3-letter commands
+        (3, b'l') => {
+            // LCS
+            if cmd.eq_ignore_ascii_case(b"LCS") {
+                return resp(string::lcs(db, args));
+            }
+        }
         (3, b'd') => {
             // DEL
             if cmd.eq_ignore_ascii_case(b"DEL") {
@@ -439,7 +445,7 @@ fn dispatch_inner(
             }
         }
         (6, b'l') => {
-            // LRANGE LINDEX
+            // LRANGE LINDEX LPUSHX LOLWUT
             if cmd.eq_ignore_ascii_case(b"LRANGE") {
                 return resp(list::lrange(db, args));
             }
@@ -448,6 +454,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"LPUSHX") {
                 return resp(list::lpushx(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"LOLWUT") {
+                return resp(Frame::BulkString(Bytes::from_static(b"Moon v0.1.0\n")));
             }
         }
         (6, b'm') => {
@@ -525,6 +534,14 @@ fn dispatch_inner(
                         return resp(string::getrange(db, args));
                     }
                 }
+                b'w' => {
+                    if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+                        // SWAPDB requires cross-database access not available in dispatch
+                        return resp(Frame::Error(Bytes::from_static(
+                            b"ERR SWAPDB is not supported in sharded mode",
+                        )));
+                    }
+                }
                 _ => {}
             }
         }
@@ -535,7 +552,10 @@ fn dispatch_inner(
             }
         }
         (6, b'x') => {
-            // XRANGE XGROUP XCLAIM
+            // XRANGE XGROUP XCLAIM XSETID
+            if cmd.eq_ignore_ascii_case(b"XSETID") {
+                return resp(stream::xsetid(db, args));
+            }
             if cmd.eq_ignore_ascii_case(b"XRANGE") {
                 return resp(stream::xrange(db, args));
             }
@@ -670,6 +690,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"BITCOUNT") {
                 return resp(string::bitcount(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"BITFIELD") {
+                return resp(string::bitfield(db, args));
+            }
         }
         (8, b'r') => {
             // RENAMENX
@@ -706,9 +729,12 @@ fn dispatch_inner(
         }
         // 9-letter commands
         (9, b'g') => {
-            // GEOSEARCH
+            // GEOSEARCH GEORADIUS
             if cmd.eq_ignore_ascii_case(b"GEOSEARCH") {
                 return resp(geo::geosearch(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEORADIUS") {
+                return resp(geo::georadius(db, args));
             }
         }
         (9, b'p') => {
@@ -850,6 +876,13 @@ fn dispatch_inner(
             // ZREVRANGEBYSCORE
             if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") {
                 return resp(sorted_set::zrevrangebyscore(db, args));
+            }
+        }
+        // 17-letter commands
+        (17, b'g') => {
+            // GEORADIUSBYMEMBER
+            if cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER") {
+                return resp(geo::georadiusbymember(db, args));
             }
         }
         _ => {}
