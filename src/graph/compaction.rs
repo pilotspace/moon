@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::graph::csr::{CsrError, CsrSegment};
+use crate::graph::csr::{CsrError, CsrSegment, CsrStorage};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeMeta};
 
@@ -60,7 +60,7 @@ struct MergedEdge {
 /// 3. Reorder: apply Rabbit Order for cache locality
 /// 4. Build: construct new CsrSegment with reordered node IDs
 pub fn compact_segments(
-    segments: &[Arc<CsrSegment>],
+    segments: &[Arc<CsrStorage>],
     config: &CompactionConfig,
 ) -> Result<CsrSegment, CompactionError> {
     if segments.len() < config.min_segments {
@@ -73,7 +73,7 @@ pub fn compact_segments(
     // Collect all unique nodes across segments.
     let mut all_node_ids: Vec<u64> = Vec::new();
     for seg in segments {
-        for nm in &seg.node_meta {
+        for nm in seg.node_meta() {
             all_node_ids.push(nm.external_id);
         }
     }
@@ -96,33 +96,38 @@ pub fn compact_segments(
         std::collections::HashMap::new();
 
     for seg in segments {
+        let seg_node_meta = seg.node_meta();
+        let seg_row_offsets = seg.row_offsets();
+        let seg_col_indices = seg.col_indices();
+        let seg_edge_meta = seg.edge_meta();
+        let seg_validity = seg.validity();
         for src_row in 0..seg.node_count() {
-            let src_ext = seg.node_meta[src_row as usize].external_id;
+            let src_ext = seg_node_meta[src_row as usize].external_id;
             let Some(&src_merged) = id_to_merged.get(&src_ext) else {
                 continue;
             };
 
-            let start = seg.row_offsets[src_row as usize] as usize;
-            let end = seg.row_offsets[src_row as usize + 1] as usize;
+            let start = seg_row_offsets[src_row as usize] as usize;
+            let end = seg_row_offsets[src_row as usize + 1] as usize;
 
             for edge_idx in start..end {
-                if !seg.validity.contains(edge_idx as u32) {
+                if !seg_validity.contains(edge_idx as u32) {
                     continue; // tombstoned
                 }
-                let dst_csr_row = seg.col_indices[edge_idx];
-                let dst_ext = seg.node_meta[dst_csr_row as usize].external_id;
+                let dst_csr_row = seg_col_indices[edge_idx];
+                let dst_ext = seg_node_meta[dst_csr_row as usize].external_id;
                 let Some(&dst_merged) = id_to_merged.get(&dst_ext) else {
                     continue;
                 };
 
-                let em = &seg.edge_meta[edge_idx];
+                let em = &seg_edge_meta[edge_idx];
                 let key = (src_merged, dst_merged, em.edge_type);
                 let new_edge = MergedEdge {
                     src_row: src_merged,
                     dst_row: dst_merged,
                     edge_type: em.edge_type,
                     flags: em.flags,
-                    created_lsn: seg.created_lsn,
+                    created_lsn: seg.created_lsn(),
                 };
 
                 edge_map
@@ -200,7 +205,7 @@ pub fn compact_segments(
     let mut best_node_meta: std::collections::HashMap<u64, NodeMeta> =
         std::collections::HashMap::with_capacity(node_count);
     for seg in segments {
-        for nm in &seg.node_meta {
+        for nm in seg.node_meta() {
             best_node_meta
                 .entry(nm.external_id)
                 .and_modify(|existing| {
@@ -263,7 +268,7 @@ pub fn compact_segments(
     let max_node_id = all_node_ids.last().copied().unwrap_or(0);
 
     // Max LSN across input segments.
-    let created_lsn = segments.iter().map(|s| s.created_lsn).max().unwrap_or(0);
+    let created_lsn = segments.iter().map(|s| s.created_lsn()).max().unwrap_or(0);
 
     // Checksum.
     let checksum = {
@@ -443,9 +448,9 @@ mod tests {
 
     #[test]
     fn test_merge_three_segments() {
-        let seg1 = Arc::new(make_csr(3, &[(0, 1), (1, 2)], 10));
-        let seg2 = Arc::new(make_csr(3, &[(0, 2)], 20));
-        let seg3 = Arc::new(make_csr(3, &[(1, 2)], 30));
+        let seg1 = Arc::new(CsrStorage::from(make_csr(3, &[(0, 1), (1, 2)], 10)));
+        let seg2 = Arc::new(CsrStorage::from(make_csr(3, &[(0, 2)], 20)));
+        let seg3 = Arc::new(CsrStorage::from(make_csr(3, &[(1, 2)], 30)));
 
         let config = CompactionConfig {
             min_segments: 2,
@@ -463,7 +468,7 @@ mod tests {
         // Tombstone one edge.
         seg.mark_deleted(0);
 
-        let seg = Arc::new(seg);
+        let seg = Arc::new(CsrStorage::from(seg));
         // Need 3 segments for default config; use min_segments=1 for this test.
         let config = CompactionConfig {
             min_segments: 1,
@@ -513,9 +518,9 @@ mod tests {
 
     #[test]
     fn test_edge_count_matches_live_input() {
-        let seg1 = Arc::new(make_csr(4, &[(0, 1), (1, 2), (2, 3)], 10));
-        let seg2 = Arc::new(make_csr(4, &[(0, 3), (1, 3)], 20));
-        let seg3 = Arc::new(make_csr(4, &[(0, 2)], 30));
+        let seg1 = Arc::new(CsrStorage::from(make_csr(4, &[(0, 1), (1, 2), (2, 3)], 10)));
+        let seg2 = Arc::new(CsrStorage::from(make_csr(4, &[(0, 3), (1, 3)], 20)));
+        let seg3 = Arc::new(CsrStorage::from(make_csr(4, &[(0, 2)], 30)));
 
         let config = CompactionConfig {
             min_segments: 2,
@@ -530,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_too_few_segments_error() {
-        let seg = Arc::new(make_csr(2, &[(0, 1)], 10));
+        let seg = Arc::new(CsrStorage::from(make_csr(2, &[(0, 1)], 10)));
         let config = CompactionConfig::default(); // min_segments = 3
         assert_eq!(
             compact_segments(&[seg], &config).unwrap_err(),

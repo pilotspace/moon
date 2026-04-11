@@ -418,7 +418,7 @@ impl GraphReplayCollector {
 /// Swaps in `None` for the mutable segment, returning the owned MemGraph.
 fn take_memgraph(
     graph: &mut crate::graph::store::NamedGraph,
-) -> (MemGraph, Vec<std::sync::Arc<crate::graph::csr::CsrSegment>>) {
+) -> (MemGraph, Vec<std::sync::Arc<crate::graph::csr::CsrStorage>>) {
     use crate::graph::segment::GraphSegmentList;
 
     // Clone the immutable list and extract the mutable Arc
@@ -451,7 +451,7 @@ fn take_memgraph(
 fn put_memgraph(
     graph: &mut crate::graph::store::NamedGraph,
     mg: MemGraph,
-    immutable: Vec<std::sync::Arc<crate::graph::csr::CsrSegment>>,
+    immutable: Vec<std::sync::Arc<crate::graph::csr::CsrStorage>>,
 ) {
     use crate::graph::segment::GraphSegmentList;
     graph.segments.swap(GraphSegmentList {

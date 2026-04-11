@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::graph::csr::CsrSegment;
+use crate::graph::csr::CsrStorage;
 use crate::graph::memgraph::MemGraph;
 use crate::graph::scoring::WeightedCostFn;
 use crate::graph::types::{Direction, EdgeKey, NodeKey};
@@ -80,7 +80,7 @@ pub struct MergedNeighbor {
 /// Reads from all active segments for query-time merge.
 pub struct SegmentMergeReader<'a> {
     memgraph: Option<&'a MemGraph>,
-    csr_segments: &'a [Arc<CsrSegment>],
+    csr_segments: &'a [Arc<CsrStorage>],
     direction: Direction,
     snapshot_lsn: u64,
     edge_type_filter: Option<u16>,
@@ -90,7 +90,7 @@ impl<'a> SegmentMergeReader<'a> {
     /// Create a merge reader from a MemGraph and CSR segments.
     pub fn new(
         memgraph: Option<&'a MemGraph>,
-        csr_segments: &'a [Arc<CsrSegment>],
+        csr_segments: &'a [Arc<CsrStorage>],
         direction: Direction,
         snapshot_lsn: u64,
         edge_type_filter: Option<u16>,
@@ -138,7 +138,7 @@ impl<'a> SegmentMergeReader<'a> {
         // 2. Read from immutable CSR segments (newest first).
         for csr in self.csr_segments {
             // Only include segments created at or before our snapshot.
-            if csr.created_lsn > self.snapshot_lsn {
+            if csr.created_lsn() > self.snapshot_lsn {
                 continue;
             }
             let Some(row) = csr.lookup_node(node) else {
@@ -161,8 +161,8 @@ impl<'a> SegmentMergeReader<'a> {
                 }
 
                 // Resolve col_idx back to a NodeKey via node_meta.
-                if (col_idx as usize) < csr.node_meta.len() {
-                    let target_meta = &csr.node_meta[col_idx as usize];
+                if (col_idx as usize) < csr.node_meta().len() {
+                    let target_meta = &csr.node_meta()[col_idx as usize];
                     // Check target node visibility (not deleted at snapshot).
                     if target_meta.deleted_lsn != u64::MAX
                         && target_meta.deleted_lsn <= self.snapshot_lsn
@@ -180,7 +180,7 @@ impl<'a> SegmentMergeReader<'a> {
                             edge: slotmap::KeyData::from_ffi(0).into(),
                             edge_type: meta.edge_type,
                             weight: 1.0,
-                            timestamp: csr.created_lsn,
+                            timestamp: csr.created_lsn(),
                         });
                     }
                 }
@@ -188,6 +188,20 @@ impl<'a> SegmentMergeReader<'a> {
         }
 
         result
+    }
+
+    /// Hint sequential access on all CSR segments (for BFS/DFS traversals).
+    pub fn madvise_sequential(&self) {
+        for csr in self.csr_segments {
+            csr.madvise_sequential();
+        }
+    }
+
+    /// Hint random access on all CSR segments (for point lookups).
+    pub fn madvise_random(&self) {
+        for csr in self.csr_segments {
+            csr.madvise_random();
+        }
     }
 
     /// Check if a node exists in any segment.
@@ -252,6 +266,9 @@ impl BoundedBfs {
         if !reader.node_exists(start) {
             return Err(TraversalError::NodeNotFound);
         }
+
+        // Hint the OS for sequential page access on mmap'd CSR segments.
+        reader.madvise_sequential();
 
         let mut visited_set: HashSet<NodeKey> = HashSet::new();
         visited_set.insert(start);
@@ -532,7 +549,7 @@ impl DijkstraTraversal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::csr::CsrSegment;
+    use crate::graph::csr::{CsrSegment, CsrStorage};
     use crate::graph::memgraph::MemGraph;
     use crate::graph::scoring::WeightedCostFn;
     use smallvec::smallvec;
@@ -552,7 +569,7 @@ mod tests {
         mg.add_edge(a, b, 1, 2.0, None, 2).expect("ok");
         mg.add_edge(a, c, 1, 3.0, None, 3).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -580,7 +597,7 @@ mod tests {
         mg2.add_edge(a2, b2, 1, 1.0, None, 2).expect("ok");
         let frozen = mg2.freeze().expect("ok");
         let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
-        let csr_segs = vec![Arc::new(csr)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
 
         let reader = SegmentMergeReader::new(
             Some(&mg),
@@ -610,13 +627,13 @@ mod tests {
         let first_edge_idx = csr.row_offsets[0]; // Row 0 = node a, first edge
         csr.mark_deleted(first_edge_idx);
 
-        let csr_segs = vec![Arc::new(csr)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
         let reader: SegmentMergeReader<'_> =
             SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
 
         // Look up the first node's key (row 0 in CSR).
         let node_a_key = {
-            let meta = &csr_segs[0].node_meta[0];
+            let meta = &csr_segs[0].node_meta()[0];
             let key: NodeKey = slotmap::KeyData::from_ffi(meta.external_id).into();
             key
         };
@@ -635,7 +652,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(a, c, 2, 1.0, None, 2).expect("ok"); // different type
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -654,7 +671,7 @@ mod tests {
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -680,7 +697,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(a, c, 1, 1.0, None, 2).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -708,7 +725,7 @@ mod tests {
         mg.add_edge(b, c, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(c, d, 1, 1.0, None, 2).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader =
             SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Both, u64::MAX - 1, None);
 
@@ -734,7 +751,7 @@ mod tests {
             mg.add_edge(center, leaf, 1, 1.0, None, 2).expect("ok");
         }
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -756,7 +773,7 @@ mod tests {
     #[test]
     fn test_bfs_node_not_found() {
         let mg = MemGraph::new(1000);
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -782,7 +799,7 @@ mod tests {
         mg.add_edge(b, c, 1, 1.0, None, 2).expect("ok");
         mg.add_edge(c, a, 1, 1.0, None, 2).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -808,7 +825,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 10).expect("ok");
         mg.add_edge(b, c, 1, 2.0, None, 10).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -833,7 +850,7 @@ mod tests {
         mg.add_edge(a, b, 1, 5.0, None, 100).expect("ok");
         mg.add_edge(b, c, 1, 10.0, None, 100).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -860,7 +877,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 10).expect("ok");
         mg.add_edge(b, c, 1, 1.0, None, 10).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -888,7 +905,7 @@ mod tests {
         mg.add_edge(a, b, 1, 3.0, None, 100).expect("ok");
         mg.add_edge(b, c, 1, 4.0, None, 100).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -920,7 +937,7 @@ mod tests {
         let b = mg.add_node(smallvec![0], empty_props(), None, 1);
         // No edge from a to b.
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -940,7 +957,7 @@ mod tests {
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -979,7 +996,7 @@ mod tests {
         mg.add_edge(a, b, 1, 1.0, None, 95).expect("ok");
         mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
 
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -1003,7 +1020,7 @@ mod tests {
     #[test]
     fn test_dijkstra_node_not_found() {
         let mg = MemGraph::new(1000);
-        let csr_segs: Vec<Arc<CsrSegment>> = vec![];
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
             Some(&mg),
             &csr_segs,
@@ -1030,7 +1047,7 @@ mod tests {
         mg1.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
         let frozen = mg1.freeze().expect("ok");
         let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
-        let csr_segs = vec![Arc::new(csr)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
 
         // MemGraph: a->c (new data not in CSR)
         let mut mg2 = MemGraph::new(1000);
@@ -1074,13 +1091,13 @@ mod tests {
         let frozen2 = mg2.freeze().expect("ok");
         let csr2 = CsrSegment::from_frozen(frozen2, 10).expect("ok");
 
-        let csr_segs = vec![Arc::new(csr1), Arc::new(csr2)];
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr1)), Arc::new(CsrStorage::from(csr2))];
         let reader: SegmentMergeReader<'_> =
             SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
 
         // Look up node 'a' from CSR 1.
         let node_a_key: NodeKey =
-            slotmap::KeyData::from_ffi(csr_segs[0].node_meta[0].external_id).into();
+            slotmap::KeyData::from_ffi(csr_segs[0].node_meta()[0].external_id).into();
 
         let neighbors = reader.neighbors(node_a_key);
         // Should find neighbor(s) from CSR 1 at minimum.

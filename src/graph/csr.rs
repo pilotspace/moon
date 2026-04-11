@@ -700,7 +700,7 @@ impl MmapCsrSegment {
         // SAFETY: EdgeMeta is #[repr(C, align(8))], size 8. We verify alignment
         // at runtime and fall back to heap loading if it's violated.
         let em_ptr = unsafe { base.add(em_start) } as *const EdgeMeta;
-        if (em_ptr as usize) % core::mem::align_of::<EdgeMeta>() != 0 {
+        if !(em_ptr as usize).is_multiple_of(core::mem::align_of::<EdgeMeta>()) {
             return Err(CsrError::InvalidData(
                 "edge_meta alignment violated in mmap".to_owned(),
             ));
@@ -709,7 +709,7 @@ impl MmapCsrSegment {
 
         let nm_start = em_start + ec * em_elem_size;
         let nm_ptr = unsafe { base.add(nm_start) } as *const NodeMeta;
-        if (nm_ptr as usize) % core::mem::align_of::<NodeMeta>() != 0 {
+        if !(nm_ptr as usize).is_multiple_of(core::mem::align_of::<NodeMeta>()) {
             return Err(CsrError::InvalidData(
                 "node_meta alignment violated in mmap".to_owned(),
             ));

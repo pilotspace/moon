@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::csr::CsrSegment;
+use crate::graph::csr::CsrStorage;
 
 /// Manifest entry for a single CSR segment file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,20 +43,20 @@ pub struct GraphManifest {
 }
 
 impl GraphManifest {
-    /// Build a manifest from live CSR segments.
+    /// Build a manifest from live CSR storage segments.
     ///
     /// `base_dir` is the relative directory prefix for segment file paths
     /// (e.g. `"graph_social"`). Segment files are named `seg_{lsn}.csr`.
-    pub fn from_segments(graph_name: &str, segments: &[Arc<CsrSegment>], base_dir: &str) -> Self {
+    pub fn from_segments(graph_name: &str, segments: &[Arc<CsrStorage>], base_dir: &str) -> Self {
         let entries: Vec<SegmentManifestEntry> = segments
             .iter()
             .map(|seg| SegmentManifestEntry {
-                segment_id: seg.created_lsn,
-                file_path: format!("{base_dir}/seg_{}.csr", seg.created_lsn),
-                node_count: seg.header.node_count,
-                edge_count: seg.header.edge_count,
-                frozen_lsn: seg.created_lsn,
-                checksum: seg.header.checksum,
+                segment_id: seg.created_lsn(),
+                file_path: format!("{base_dir}/seg_{}.csr", seg.created_lsn()),
+                node_count: seg.header().node_count,
+                edge_count: seg.header().edge_count,
+                frozen_lsn: seg.created_lsn(),
+                checksum: seg.header().checksum,
             })
             .collect();
 
@@ -96,6 +96,7 @@ impl GraphManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::csr::CsrSegment;
     use tempfile::TempDir;
 
     #[test]
@@ -143,7 +144,7 @@ mod tests {
         let frozen = mg.freeze().expect("ok");
         let csr = CsrSegment::from_frozen(frozen, 42).expect("ok");
 
-        let segments = vec![Arc::new(csr)];
+        let segments: Vec<Arc<CsrStorage>> = vec![Arc::new(CsrStorage::from(csr))];
         let manifest = GraphManifest::from_segments("test_graph", &segments, "graph_test");
 
         assert_eq!(manifest.graph_name, "test_graph");

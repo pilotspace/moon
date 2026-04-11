@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::graph::csr::{CsrError, CsrSegment};
+use crate::graph::csr::{CsrError, CsrStorage};
 use crate::graph::manifest::GraphManifest;
 use crate::graph::segment::GraphSegmentList;
 use crate::graph::store::GraphStore;
@@ -98,18 +98,18 @@ pub fn recover_graph_store(
             }
         };
 
-        let mut loaded_segments: Vec<Arc<CsrSegment>> = Vec::new();
+        let mut loaded_segments: Vec<Arc<CsrStorage>> = Vec::new();
 
         for entry in &manifest.segments {
             let seg_path = shard_dir.join(&entry.file_path);
-            match CsrSegment::from_file(&seg_path) {
+            match CsrStorage::from_file(&seg_path) {
                 Ok(seg) => {
                     tracing::info!(
                         graph = %graph_name,
                         segment_id = entry.segment_id,
                         nodes = seg.node_count(),
                         edges = seg.edge_count(),
-                        "loaded CSR segment"
+                        "loaded CSR segment via mmap"
                     );
                     loaded_segments.push(Arc::new(seg));
                     total_loaded += 1;
@@ -186,7 +186,7 @@ pub fn save_graph_store(
 
         // Write each CSR segment file.
         for seg in &segments.immutable {
-            let seg_filename = format!("seg_{}.csr", seg.created_lsn);
+            let seg_filename = format!("seg_{}.csr", seg.created_lsn());
             let seg_path = graph_data_dir.join(&seg_filename);
             if !seg_path.exists() {
                 seg.write_to_file(&seg_path)
@@ -306,7 +306,7 @@ mod tests {
         let graph = result.store.get_graph(b"test").expect("exists");
         let segs = graph.segments.load();
         assert_eq!(segs.immutable.len(), 1);
-        assert_eq!(segs.immutable[0].created_lsn, 200);
+        assert_eq!(segs.immutable[0].created_lsn(), 200);
     }
 
     #[test]
