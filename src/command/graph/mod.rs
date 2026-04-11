@@ -19,10 +19,57 @@ use bytes::Bytes;
 use crate::graph::store::GraphStore;
 use crate::protocol::Frame;
 
+/// Returns true if the GRAPH.* command is a write command.
+#[inline]
+pub fn is_graph_write_cmd(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"GRAPH.CREATE")
+        || cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE")
+        || cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE")
+        || cmd.eq_ignore_ascii_case(b"GRAPH.DELETE")
+}
+
+/// Dispatch read-only GRAPH.* commands. Takes &GraphStore (shared).
+pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
+    if cmd.eq_ignore_ascii_case(b"GRAPH.NEIGHBORS") {
+        graph_neighbors(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.INFO") {
+        graph_info(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
+        graph_list(store)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+        graph_query(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
+        graph_ro_query(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
+        graph_explain(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
+        graph_vsearch(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
+        graph_hybrid(store, args)
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* read command"))
+    }
+}
+
+/// Dispatch write GRAPH.* commands. Takes &mut GraphStore (exclusive).
+pub fn dispatch_graph_write(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
+    if cmd.eq_ignore_ascii_case(b"GRAPH.CREATE") {
+        graph_create(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE") {
+        graph_addnode(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE") {
+        graph_addedge(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") {
+        graph_delete(store, args)
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* write command"))
+    }
+}
+
 /// Dispatch a GRAPH.* command to the appropriate handler.
 ///
-/// Called by the shard event loop (spsc_handler) for cross-shard messages
-/// and by connection handlers for local-shard execution.
+/// Called by the shard event loop (spsc_handler) for cross-shard messages.
+/// Uses write access since SPSC commands may include both reads and writes.
 ///
 /// Returns a Frame response.
 pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame {
@@ -35,65 +82,10 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
         }
     };
 
-    if cmd.eq_ignore_ascii_case(b"GRAPH.CREATE") {
-        graph_create(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE") {
-        graph_addnode(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE") {
-        graph_addedge(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.NEIGHBORS") {
-        graph_neighbors(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.INFO") {
-        graph_info(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
-        graph_list(store)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") {
-        graph_delete(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-        graph_query(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
-        graph_ro_query(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
-        graph_explain(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
-        graph_vsearch(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
-        graph_hybrid(store, args)
+    if is_graph_write_cmd(cmd) {
+        dispatch_graph_write(store, cmd, args)
     } else {
-        Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* command"))
-    }
-}
-
-/// Dispatch a GRAPH.* command given pre-extracted cmd and args.
-///
-/// Used by connection handlers that have already extracted the command name.
-pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
-    if cmd.eq_ignore_ascii_case(b"GRAPH.CREATE") {
-        graph_create(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE") {
-        graph_addnode(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE") {
-        graph_addedge(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.NEIGHBORS") {
-        graph_neighbors(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.INFO") {
-        graph_info(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
-        graph_list(store)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") {
-        graph_delete(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-        graph_query(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
-        graph_ro_query(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
-        graph_explain(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
-        graph_vsearch(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
-        graph_hybrid(store, args)
-    } else {
-        Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* command"))
+        dispatch_graph_read(store, cmd, args)
     }
 }
 

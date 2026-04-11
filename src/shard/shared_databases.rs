@@ -18,7 +18,7 @@ pub struct ShardDatabases {
     vector_stores: Vec<Mutex<VectorStore>>,
     /// Per-shard GraphStore for GRAPH.* commands.
     #[cfg(feature = "graph")]
-    graph_stores: Vec<Mutex<GraphStore>>,
+    graph_stores: Vec<RwLock<GraphStore>>,
     /// Per-shard WAL append channel sender. Connection handlers send serialized
     /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
     /// Mutex<Option<>> for single-writer init, then read-only via wal_append().
@@ -41,7 +41,7 @@ impl ShardDatabases {
             .collect();
         #[cfg(feature = "graph")]
         let graph_stores = (0..num_shards)
-            .map(|_| Mutex::new(GraphStore::new()))
+            .map(|_| RwLock::new(GraphStore::new()))
             .collect();
         let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
         Arc::new(Self {
@@ -88,11 +88,18 @@ impl ShardDatabases {
         self.vector_stores[shard_id].lock()
     }
 
-    /// Acquire exclusive access to a shard's GraphStore.
+    /// Acquire shared read access to a shard's GraphStore.
     #[cfg(feature = "graph")]
     #[inline]
-    pub fn graph_store(&self, shard_id: usize) -> MutexGuard<'_, GraphStore> {
-        self.graph_stores[shard_id].lock()
+    pub fn graph_store_read(&self, shard_id: usize) -> RwLockReadGuard<'_, GraphStore> {
+        self.graph_stores[shard_id].read()
+    }
+
+    /// Acquire exclusive write access to a shard's GraphStore.
+    #[cfg(feature = "graph")]
+    #[inline]
+    pub fn graph_store_write(&self, shard_id: usize) -> RwLockWriteGuard<'_, GraphStore> {
+        self.graph_stores[shard_id].write()
     }
 
     /// Recover graph stores from persistence for all shards.
@@ -113,7 +120,7 @@ impl ShardDatabases {
                             result.segments_skipped,
                         );
                     }
-                    *self.graph_stores[shard_id].lock() = result.store;
+                    *self.graph_stores[shard_id].write() = result.store;
                 }
                 Ok(None) => {
                     // No graph metadata — clean start, nothing to recover.
