@@ -99,12 +99,12 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
     let mut visited = std::collections::HashSet::new();
     visited.insert(node_id);
     let mut frontier = vec![node_key];
-    let mut results: Vec<Frame> = Vec::new();
+    let mut results: Vec<Frame> = Vec::with_capacity(128);
     // Cap total results.
     let max_results = 10_000usize;
 
     for _hop in 0..depth {
-        let mut next_frontier = Vec::new();
+        let mut next_frontier = Vec::with_capacity(frontier.len() * 4);
 
         for &current in &frontier {
             for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
