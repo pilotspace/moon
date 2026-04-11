@@ -67,12 +67,19 @@ use super::{
 /// connection level same as the non-sharded handler.
 #[tracing::instrument(skip_all, level = "debug")]
 pub(crate) async fn handle_connection_sharded(
-    stream: TcpStream,
+    mut stream: TcpStream,
     ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
     client_id: u64,
 ) {
-    crate::admin::metrics_setup::record_connection_opened();
+    let maxclients = ctx.runtime_config.read().maxclients;
+    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+        use tokio::io::AsyncWriteExt;
+        let _ = stream
+            .write_all(b"-ERR max number of clients reached\r\n")
+            .await;
+        return;
+    }
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -215,6 +222,22 @@ pub(crate) async fn handle_connection_sharded_inner<
         migrated_state,
     );
 
+    // Register in global client registry for CLIENT LIST/INFO/KILL.
+    // RegistryGuard ensures deregister on all exit paths (including early returns).
+    crate::client_registry::register(
+        client_id,
+        peer_addr.clone(),
+        conn.current_user.clone(),
+        ctx.shard_id,
+    );
+    struct RegistryGuard(u64);
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            crate::client_registry::deregister(self.0);
+        }
+    }
+    let _registry_guard = RegistryGuard(client_id);
+
     use crate::pubsub::{self, subscriber::Subscriber};
 
     // Functions API registry (per-shard, lazy init) — kept as local because Rc<RefCell<>> is !Send
@@ -229,8 +252,21 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Pre-allocated response slots for zero-allocation cross-shard dispatch.
     let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
+    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
+    let idle_timeout_secs = ctx.runtime_config.read().timeout;
+    let idle_timeout = if idle_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(idle_timeout_secs))
+    } else {
+        None
+    };
+
     let mut break_outer = false;
     loop {
+        // Check if CLIENT KILL targeted this connection
+        if crate::client_registry::is_killed(client_id) {
+            break;
+        }
+
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -437,10 +473,23 @@ pub(crate) async fn handle_connection_sharded_inner<
             continue;
         }
         tokio::select! {
-            result = stream.read_buf(&mut read_buf) => {
+            result = async {
+                if let Some(dur) = idle_timeout {
+                    match tokio::time::timeout(dur, stream.read_buf(&mut read_buf)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout")),
+                    }
+                } else {
+                    stream.read_buf(&mut read_buf).await
+                }
+            } => {
                 match result {
                     Ok(0) => break, // connection closed
                     Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
+                        break;
+                    }
                     Err(_) => break,
                 }
 
@@ -461,12 +510,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if break_outer { break; }
                 if batch.is_empty() { continue; }
 
+                // CLIENT PAUSE: delay processing if server is paused
+                // Check with is_write=true (conservative — pauses all batches in ALL mode)
+                crate::client_pause::expire_if_needed();
+                if let Some(remaining) = crate::client_pause::check_pause(true) {
+                    tokio::time::sleep(remaining).await;
+                }
+
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
+
+                // Track if AUTH rate limiting delay is needed (applied after batch response)
+                let mut auth_delay_ms: u64 = 0;
 
                 for frame in batch {
                     // --- AUTH gate ---
@@ -477,7 +536,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
                                     conn.current_user = uname;
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        crate::auth_ratelimit::record_success(addr.ip());
+                                    }
                                 } else {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                                    }
                                     conn.acl_log.push(crate::acl::AclLogEntry {
                                         reason: "auth".to_string(),
                                         object: "AUTH".to_string(),
@@ -506,8 +571,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(name) = new_name {
                                     conn.client_name = Some(name);
                                 }
-                                if let Some(uname) = opt_user {
-                                    conn.current_user = uname;
+                                if let Some(ref uname) = opt_user {
+                                    conn.current_user = uname.clone();
+                                }
+                                // HELLO AUTH rate limiting (same as AUTH gate)
+                                if matches!(&response, Frame::Error(_)) {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                                    }
+                                } else if opt_user.is_some() {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        crate::auth_ratelimit::record_success(addr.ip());
+                                    }
                                 }
                                 responses.push(response);
                                 continue;
@@ -655,7 +730,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- AUTH (already conn.authenticated) ---
                     if cmd.eq_ignore_ascii_case(b"AUTH") {
                         let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                        if let Some(uname) = opt_user { conn.current_user = uname; }
+                        if let Some(uname) = opt_user {
+                            conn.current_user = uname;
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -667,7 +749,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         );
                         if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
                         if let Some(name) = new_name { conn.client_name = Some(name); }
-                        if let Some(uname) = opt_user { conn.current_user = uname; }
+                        if let Some(ref uname) = opt_user { conn.current_user = uname.clone(); }
+                        if matches!(&response, Frame::Error(_)) {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
+                        } else if opt_user.is_some() {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -903,6 +994,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         )));
                                     } else {
                                         conn.client_name = extract_bytes(&cmd_args[1]);
+                                        let name_str = conn.client_name.as_ref().map(|b| String::from_utf8_lossy(b).to_string());
+                                        crate::client_registry::update(client_id, |e| { e.name = name_str; });
                                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     }
                                     continue;
@@ -948,86 +1041,91 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         Err(err_frame) => { responses.push(err_frame); continue; }
                                     }
                                 }
+                                if sub_bytes.eq_ignore_ascii_case(b"LIST") {
+                                    // Update our own entry before listing
+                                    crate::client_registry::update(client_id, |e| {
+                                        e.db = conn.selected_db;
+                                        e.last_cmd_at = std::time::Instant::now();
+                                        e.flags = crate::client_registry::ClientFlags {
+                                            subscriber: conn.subscription_count > 0,
+                                            in_multi: conn.in_multi,
+                                            blocked: false,
+                                        };
+                                    });
+                                    let list = crate::client_registry::client_list();
+                                    responses.push(Frame::BulkString(Bytes::from(list)));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"INFO") {
+                                    crate::client_registry::update(client_id, |e| {
+                                        e.db = conn.selected_db;
+                                        e.last_cmd_at = std::time::Instant::now();
+                                    });
+                                    let info = crate::client_registry::client_info(client_id)
+                                        .unwrap_or_default();
+                                    responses.push(Frame::BulkString(Bytes::from(info)));
+                                    continue;
+                                }
+                                if sub_bytes.eq_ignore_ascii_case(b"KILL") {
+                                    let raw_args: Vec<&[u8]> = cmd_args[1..].iter()
+                                        .filter_map(|f| match f {
+                                            Frame::BulkString(b) => Some(b.as_ref()),
+                                            Frame::SimpleString(b) => Some(b.as_ref()),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    match crate::client_registry::parse_kill_args(&raw_args) {
+                                        Some(filter) => {
+                                            let count = crate::client_registry::kill_clients(&filter);
+                                            responses.push(Frame::Integer(count as i64));
+                                        }
+                                        None => {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR syntax error. Usage: CLIENT KILL [ID id] [ADDR addr] [USER user]",
+                                            )));
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
-                                    // CLIENT PAUSE timeout [WRITE|ALL]
                                     if cmd_args.len() < 2 {
                                         responses.push(Frame::Error(Bytes::from_static(
                                             b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
                                         )));
                                     } else {
-                                        let timeout_ms = match extract_bytes(&cmd_args[1]) {
-                                            Some(b) => std::str::from_utf8(&b).ok().and_then(|s| s.parse::<u64>().ok()),
-                                            None => None,
+                                        let timeout_bytes = match &cmd_args[1] {
+                                            Frame::BulkString(b) => Some(b.as_ref()),
+                                            Frame::SimpleString(b) => Some(b.as_ref()),
+                                            _ => None,
                                         };
-                                        // Validate mode arg if present
-                                        let mode_valid = if cmd_args.len() >= 3 {
-                                            match extract_bytes(&cmd_args[2]) {
-                                                Some(b) => b.eq_ignore_ascii_case(b"WRITE") || b.eq_ignore_ascii_case(b"ALL"),
-                                                None => false,
+                                        match timeout_bytes.and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<u64>().ok()) {
+                                            Some(ms) => {
+                                                let mode = if cmd_args.len() > 2 {
+                                                    match &cmd_args[2] {
+                                                        Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"WRITE") => crate::client_pause::PauseMode::Write,
+                                                        _ => crate::client_pause::PauseMode::All,
+                                                    }
+                                                } else {
+                                                    crate::client_pause::PauseMode::All
+                                                };
+                                                crate::client_pause::pause(ms, mode);
+                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                             }
-                                        } else {
-                                            true
-                                        };
-                                        // Reject extra trailing args
-                                        if cmd_args.len() > 3 || !mode_valid {
-                                            responses.push(Frame::Error(Bytes::from_static(
-                                                b"ERR syntax error",
-                                            )));
-                                        } else {
-                                            match timeout_ms {
-                                                Some(ms) => {
-                                                    let write_only = cmd_args.get(2)
-                                                        .and_then(|f| extract_bytes(f))
-                                                        .is_some_and(|b| b.eq_ignore_ascii_case(b"WRITE"));
-                                                    let deadline = crate::storage::entry::current_time_ms().saturating_add(ms);
-                                                    let mut rt = ctx.runtime_config.write();
-                                                    rt.client_pause_deadline_ms = deadline;
-                                                    rt.client_pause_write_only = write_only;
-                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                                }
-                                                None => {
-                                                    responses.push(Frame::Error(Bytes::from_static(
-                                                        b"ERR timeout is not a valid integer or out of range",
-                                                    )));
-                                                }
+                                            None => {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR timeout is not a valid integer or out of range",
+                                                )));
                                             }
                                         }
                                     }
                                     continue;
                                 }
                                 if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
-                                    let mut rt = ctx.runtime_config.write();
-                                    rt.client_pause_deadline_ms = 0;
-                                    rt.client_pause_write_only = false;
+                                    crate::client_pause::unpause();
                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     continue;
                                 }
-                                if sub_bytes.eq_ignore_ascii_case(b"INFO") {
-                                    // CLIENT INFO — return info about current connection
-                                    let info = format!(
-                                        "id={} fd=-1 name={} db={}\r\n",
-                                        client_id,
-                                        conn.client_name.as_ref().map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default(),
-                                        conn.selected_db,
-                                    );
-                                    responses.push(Frame::BulkString(Bytes::from(info)));
-                                    continue;
-                                }
-                                if sub_bytes.eq_ignore_ascii_case(b"LIST") {
-                                    // CLIENT LIST — stub returning current client only
-                                    let info = format!(
-                                        "id={} fd=-1 name={} db={}\r\n",
-                                        client_id,
-                                        conn.client_name.as_ref().map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default(),
-                                        conn.selected_db,
-                                    );
-                                    responses.push(Frame::BulkString(Bytes::from(info)));
-                                    continue;
-                                }
-                                if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
-                                    || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
-                                {
-                                    // Accepted but no-op (per-connection flags)
+                                if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT") || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH") {
                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     continue;
                                 }
@@ -1715,6 +1813,11 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 arena.reset();
 
+                // AUTH rate limiting: delay response to slow down brute-force attacks
+                if auth_delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(auth_delay_ms)).await;
+                }
+
                 write_buf.clear();
                 for response in &responses {
                     if conn.protocol_version >= 3 {
@@ -1726,6 +1829,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if stream.write_all(&write_buf).await.is_err() {
                     return (HandlerResult::Done, None);
                 }
+
+                // Update registry with current state after each batch
+                crate::client_registry::update(client_id, |e| {
+                    e.db = conn.selected_db;
+                    e.last_cmd_at = std::time::Instant::now();
+                    e.flags = crate::client_registry::ClientFlags {
+                        subscriber: conn.subscription_count > 0,
+                        in_multi: conn.in_multi,
+                        blocked: false,
+                    };
+                });
 
                 // Check if migration was triggered during frame processing.
                 // All responses for the current batch have been written, so the

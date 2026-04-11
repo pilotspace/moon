@@ -94,6 +94,18 @@ pub struct ServerConfig {
     #[arg(long, default_value = "yes")]
     pub protected_mode: String,
 
+    /// Maximum number of simultaneous client connections (0 = unlimited)
+    #[arg(long, default_value_t = 10000)]
+    pub maxclients: usize,
+
+    /// Close connections idle for more than N seconds (0 = disabled)
+    #[arg(long, default_value_t = 0)]
+    pub timeout: u64,
+
+    /// TCP keepalive interval in seconds (0 = disabled). Sets SO_KEEPALIVE on accepted sockets.
+    #[arg(long = "tcp-keepalive", default_value_t = 300)]
+    pub tcp_keepalive: u64,
+
     /// Maximum number of entries in the ACL log
     #[arg(long, default_value_t = 128)]
     pub acllog_max_len: usize,
@@ -289,6 +301,9 @@ impl ServerConfig {
             client_pause_deadline_ms: 0,
             client_pause_write_only: false,
             lazyfree_threshold: 64,
+            maxclients: self.maxclients,
+            timeout: self.timeout,
+            tcp_keepalive: self.tcp_keepalive,
         }
     }
 }
@@ -331,6 +346,12 @@ pub struct RuntimeConfig {
     pub client_pause_write_only: bool,
     /// Lazyfree threshold: collections with more elements than this are freed async.
     pub lazyfree_threshold: usize,
+    /// Maximum number of simultaneous client connections (0 = unlimited).
+    pub maxclients: usize,
+    /// Close connections idle for more than N seconds (0 = disabled).
+    pub timeout: u64,
+    /// TCP keepalive interval in seconds (0 = disabled).
+    pub tcp_keepalive: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -352,6 +373,9 @@ impl Default for RuntimeConfig {
             client_pause_deadline_ms: 0,
             client_pause_write_only: false,
             lazyfree_threshold: 64,
+            maxclients: 10000,
+            timeout: 0,
+            tcp_keepalive: 300,
         }
     }
 }

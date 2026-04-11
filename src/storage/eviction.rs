@@ -690,6 +690,9 @@ mod tests {
             client_pause_deadline_ms: 0,
             client_pause_write_only: false,
             lazyfree_threshold: 64,
+            maxclients: 10000,
+            timeout: 0,
+            tcp_keepalive: 300,
         }
     }
 

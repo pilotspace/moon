@@ -48,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OBJECT FREQ/IDLETIME/REFCOUNT** — LFU counter, idle seconds, reference count introspection.
 - **LOLWUT** — Easter egg returning Moon version.
 
+### Added — Client Connection Security Hardening (2026-04-10)
+
+- **`--maxclients` (P0):** Connection limit with atomic CAS rejection (default 10000, 0=unlimited). Returns `-ERR max number of clients reached` when exceeded.
+- **`--timeout` (P0):** Client idle timeout in seconds (default 0=disabled). Disconnects idle clients via `tokio::time::timeout` / `monoio::select!`.
+- **`--tcp-keepalive` (P0):** TCP keepalive interval (default 300s, 0=disabled). Sets `SO_KEEPALIVE` + `TCP_KEEPIDLE` on accepted sockets via `socket2`.
+- **AUTH rate limiting (P0):** Per-IP exponential backoff on AUTH failures (100ms base, 10s cap, 60s auto-reset). New module `src/auth_ratelimit.rs`.
+- **CLIENT LIST / INFO / KILL (P1):** Global client registry with Drop-guard deregister. Redis-compatible output format. Kill by ID/ADDR/USER. New module `src/client_registry.rs`.
+- **CLIENT PAUSE / UNPAUSE (P1):** Server-wide pause with ALL/WRITE modes and auto-expiry. New module `src/client_pause.rs`.
+- **CLIENT NO-EVICT / NO-TOUCH (P1):** Accepted stubs for Redis compatibility.
+- **ACL GENPASS (P1):** Cryptographically secure random password generation (1-4096 bits, hex output).
+- **CONFIG GET/SET** support for `maxclients`, `timeout`, `tcp-keepalive` (runtime-mutable).
+- **Monoio connection tracking:** Added missing `record_connection_opened` / `record_connection_closed` for accurate `connected_clients` metric.
+
 ### Fixed — Deep Review Findings (2026-04-11)
 
 - **DoS protection**: `execute_profile` and `execute_mut` Cypher paths now enforce MAX_HOPS_LIMIT=20 and MAX_RESULT_ROWS=100K (were unbounded).
