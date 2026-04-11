@@ -6,9 +6,7 @@
 use slotmap::SlotMap;
 use smallvec::SmallVec;
 
-use crate::graph::types::{
-    Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap,
-};
+use crate::graph::types::{Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap};
 
 /// Errors returned by MemGraph operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -181,12 +179,7 @@ impl MemGraph {
     ///
     /// Yields `(EdgeKey, NodeKey)` pairs -- the edge and the neighbor node.
     /// No heap allocation: iterates over borrowed SmallVec adjacency lists.
-    pub fn neighbors(
-        &self,
-        node: NodeKey,
-        direction: Direction,
-        lsn: u64,
-    ) -> NeighborIter<'_> {
+    pub fn neighbors(&self, node: NodeKey, direction: Direction, lsn: u64) -> NeighborIter<'_> {
         let Some(n) = self.nodes.get(node) else {
             return NeighborIter {
                 edges: &self.edges,

@@ -12,7 +12,7 @@ pub mod lexer;
 pub mod parser;
 pub mod planner;
 
-pub use ast::{CypherQuery, Clause, Expr};
+pub use ast::{Clause, CypherQuery, Expr};
 pub use parser::{CypherError, Parser};
 pub use planner::{CostEstimate, PhysicalPlan, PlanCache, Strategy};
 

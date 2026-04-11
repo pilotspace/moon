@@ -20,18 +20,11 @@ pub enum CypherError {
         found: String,
     },
     /// Unexpected end of input.
-    UnexpectedEof {
-        expected: &'static str,
-    },
+    UnexpectedEof { expected: &'static str },
     /// Nesting depth exceeded the configured limit.
-    NestingDepthExceeded {
-        limit: u32,
-    },
+    NestingDepthExceeded { limit: u32 },
     /// Invalid numeric literal.
-    InvalidNumber {
-        offset: usize,
-        value: String,
-    },
+    InvalidNumber { offset: usize, value: String },
     /// Empty query.
     EmptyQuery,
 }
@@ -43,7 +36,10 @@ impl core::fmt::Display for CypherError {
                 offset,
                 expected,
                 found,
-            } => write!(f, "unexpected token at {offset}: expected {expected}, found {found}"),
+            } => write!(
+                f,
+                "unexpected token at {offset}: expected {expected}, found {found}"
+            ),
             Self::UnexpectedEof { expected } => {
                 write!(f, "unexpected end of input: expected {expected}")
             }
@@ -420,10 +416,7 @@ impl<'a> Parser<'a> {
             self.advance();
             exprs.push(self.parse_expression()?);
         }
-        Ok(Clause::Delete(DeleteClause {
-            exprs,
-            detach,
-        }))
+        Ok(Clause::Delete(DeleteClause { exprs, detach }))
     }
 
     // -----------------------------------------------------------------------
@@ -967,9 +960,7 @@ impl<'a> Parser<'a> {
         self.lexer
             .peek()
             .cloned()
-            .ok_or(CypherError::UnexpectedEof {
-                expected: "token",
-            })
+            .ok_or(CypherError::UnexpectedEof { expected: "token" })
     }
 
     fn advance(&mut self) -> SpannedToken<'a> {
@@ -988,9 +979,10 @@ impl<'a> Parser<'a> {
     where
         F: FnOnce(&Token<'_>) -> bool,
     {
-        let tok = self.lexer.next_token().ok_or(CypherError::UnexpectedEof {
-            expected,
-        })?;
+        let tok = self
+            .lexer
+            .next_token()
+            .ok_or(CypherError::UnexpectedEof { expected })?;
         if pred(&tok.token) {
             Ok(tok)
         } else {
@@ -1200,13 +1192,7 @@ mod tests {
     fn test_where_is_null() {
         let q = parse("MATCH (n) WHERE n.email IS NULL RETURN n").expect("parse failed");
         if let Clause::Where(w) = &q.clauses[1] {
-            assert!(matches!(
-                w.expr,
-                Expr::IsNull {
-                    negated: false,
-                    ..
-                }
-            ));
+            assert!(matches!(w.expr, Expr::IsNull { negated: false, .. }));
         } else {
             panic!("expected Where clause");
         }
@@ -1216,13 +1202,7 @@ mod tests {
     fn test_where_is_not_null() {
         let q = parse("MATCH (n) WHERE n.email IS NOT NULL RETURN n").expect("parse failed");
         if let Clause::Where(w) = &q.clauses[1] {
-            assert!(matches!(
-                w.expr,
-                Expr::IsNull {
-                    negated: true,
-                    ..
-                }
-            ));
+            assert!(matches!(w.expr, Expr::IsNull { negated: true, .. }));
         } else {
             panic!("expected Where clause");
         }
@@ -1370,7 +1350,10 @@ mod tests {
         let q = parse("MATCH (n) SET n.name = 'Bob' RETURN n").expect("parse failed");
         if let Clause::Set(s) = &q.clauses[1] {
             assert_eq!(s.items.len(), 1);
-            if let SetItem::Property { variable, property, .. } = &s.items[0] {
+            if let SetItem::Property {
+                variable, property, ..
+            } = &s.items[0]
+            {
                 assert_eq!(variable, "n");
                 assert_eq!(property, "name");
             } else {
@@ -1383,10 +1366,8 @@ mod tests {
 
     #[test]
     fn test_merge_on_create() {
-        let q = parse(
-            "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.created = 1",
-        )
-        .expect("parse failed");
+        let q = parse("MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.created = 1")
+            .expect("parse failed");
         if let Clause::Merge(m) = &q.clauses[0] {
             assert_eq!(m.on_create.len(), 1);
             assert!(m.on_match.is_empty());
@@ -1427,8 +1408,7 @@ mod tests {
 
     #[test]
     fn test_order_by_limit() {
-        let q = parse("MATCH (n) RETURN n ORDER BY n.age DESC LIMIT 10")
-            .expect("parse failed");
+        let q = parse("MATCH (n) RETURN n ORDER BY n.age DESC LIMIT 10").expect("parse failed");
         assert!(matches!(q.clauses[2], Clause::OrderBy(_)));
         assert!(matches!(q.clauses[3], Clause::Limit(_)));
 
@@ -1451,8 +1431,8 @@ mod tests {
 
     #[test]
     fn test_optional_match() {
-        let q = parse("MATCH (n) OPTIONAL MATCH (n)-[:KNOWS]->(m) RETURN n, m")
-            .expect("parse failed");
+        let q =
+            parse("MATCH (n) OPTIONAL MATCH (n)-[:KNOWS]->(m) RETURN n, m").expect("parse failed");
         if let Clause::Match(m) = &q.clauses[1] {
             assert!(m.optional);
         } else {
@@ -1611,10 +1591,7 @@ mod tests {
     fn test_edge_with_variable() {
         let q = parse("MATCH (a)-[r:KNOWS]->(b) RETURN r").expect("parse failed");
         if let Clause::Match(m) = &q.clauses[0] {
-            assert_eq!(
-                m.patterns[0].edges[0].variable.as_deref(),
-                Some("r")
-            );
+            assert_eq!(m.patterns[0].edges[0].variable.as_deref(), Some("r"));
         }
     }
 

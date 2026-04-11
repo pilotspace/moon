@@ -301,7 +301,13 @@ impl VectorToGraphExpansion {
 
         for (node_key, score) in scored {
             let context = if self.expansion_hops > 0 {
-                collect_context(memgraph, node_key, self.expansion_hops, self.edge_type_filter, lsn)
+                collect_context(
+                    memgraph,
+                    node_key,
+                    self.expansion_hops,
+                    self.edge_type_filter,
+                    lsn,
+                )
             } else {
                 Vec::new()
             };
@@ -565,30 +571,10 @@ mod tests {
     /// Build a test graph: A -> B -> C -> D, each with embeddings.
     fn build_test_graph() -> (MemGraph, NodeKey, NodeKey, NodeKey, NodeKey) {
         let mut g = MemGraph::new(100_000);
-        let a = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![1.0, 0.0, 0.0]),
-            1,
-        );
-        let b = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![0.8, 0.6, 0.0]),
-            1,
-        );
-        let c = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![0.0, 1.0, 0.0]),
-            1,
-        );
-        let d = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![0.0, 0.0, 1.0]),
-            1,
-        );
+        let a = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0, 0.0]), 1);
+        let b = g.add_node(smallvec![0], empty_props(), Some(vec![0.8, 0.6, 0.0]), 1);
+        let c = g.add_node(smallvec![0], empty_props(), Some(vec![0.0, 1.0, 0.0]), 1);
+        let d = g.add_node(smallvec![0], empty_props(), Some(vec![0.0, 0.0, 1.0]), 1);
 
         g.add_edge(a, b, 1, 1.0, None, 2).expect("edge a->b");
         g.add_edge(b, c, 1, 1.0, None, 2).expect("edge b->c");
@@ -600,12 +586,7 @@ mod tests {
     /// Build a star graph: center -> [s1, s2, ..., sn], each with embeddings.
     fn build_star_graph(n: usize) -> (MemGraph, NodeKey, Vec<NodeKey>) {
         let mut g = MemGraph::new(100_000);
-        let center = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![1.0, 0.0, 0.0]),
-            1,
-        );
+        let center = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0, 0.0]), 1);
 
         let mut spokes = Vec::with_capacity(n);
         for i in 0..n {
@@ -772,7 +753,10 @@ mod tests {
         let mut search = GraphFilteredSearch::new(center, 1, vec![1.0, 0.0, 0.0], 10);
         search.frontier_cap = 5; // Very small cap.
         let result = search.execute(&g, u64::MAX - 1);
-        assert!(matches!(result, Err(HybridError::FrontierCapExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(HybridError::FrontierCapExceeded { .. })
+        ));
     }
 
     // --- HYB-02: Vector-to-graph expansion ---
@@ -900,12 +884,7 @@ mod tests {
     #[test]
     fn test_vector_walk_no_neighbors() {
         let mut g = MemGraph::new(100_000);
-        let a = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![1.0, 0.0]),
-            1,
-        );
+        let a = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0]), 1);
         // Isolated node.
         let walk = VectorGuidedWalk::new(a, vec![1.0, 0.0], 3);
         let results = walk.execute(&g, u64::MAX - 1).expect("ok");
@@ -947,25 +926,10 @@ mod tests {
     #[test]
     fn test_graph_filtered_scores_only_reachable() {
         let mut g = MemGraph::new(100_000);
-        let a = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![1.0, 0.0]),
-            1,
-        );
-        let b = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![0.9, 0.1]),
-            1,
-        );
+        let a = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0]), 1);
+        let b = g.add_node(smallvec![0], empty_props(), Some(vec![0.9, 0.1]), 1);
         // Disconnected node with perfect similarity.
-        let _c = g.add_node(
-            smallvec![0],
-            empty_props(),
-            Some(vec![1.0, 0.0]),
-            1,
-        );
+        let _c = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0]), 1);
         g.add_edge(a, b, 1, 1.0, None, 2).expect("edge");
 
         // C is disconnected from A. Only B should appear.

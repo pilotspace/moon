@@ -73,7 +73,9 @@ fn bench_csr_neighbor_1hop(c: &mut Criterion) {
     let (csr, nodes) = build_csr(1000, 50);
     // Pick a node in the middle for representative degree.
     let target_key = nodes[500];
-    let row = csr.lookup_node(target_key).expect("node should exist in CSR");
+    let row = csr
+        .lookup_node(target_key)
+        .expect("node should exist in CSR");
 
     c.bench_function("graph_neighbor_1hop_csr", |b| {
         b.iter(|| {

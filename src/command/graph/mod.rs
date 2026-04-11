@@ -8,7 +8,10 @@
 pub mod graph_read;
 pub mod graph_write;
 
-pub use graph_read::{graph_info, graph_list, graph_neighbors, graph_query, graph_ro_query, graph_explain, graph_vsearch, graph_hybrid};
+pub use graph_read::{
+    graph_explain, graph_hybrid, graph_info, graph_list, graph_neighbors, graph_query,
+    graph_ro_query, graph_vsearch,
+};
 pub use graph_write::{graph_addedge, graph_addnode, graph_create, graph_delete};
 
 use bytes::Bytes;
@@ -162,13 +165,10 @@ mod tests {
         let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.INFO", b"g"]));
         if let Frame::Map(pairs) = &resp {
             // node_count should be 1
-            let node_count = pairs.iter().find(|(k, _)| {
-                matches!(k, Frame::SimpleString(b) if b.as_ref() == b"node_count")
-            });
-            assert_eq!(
-                node_count.map(|(_, v)| v),
-                Some(&Frame::Integer(1))
-            );
+            let node_count = pairs
+                .iter()
+                .find(|(k, _)| matches!(k, Frame::SimpleString(b) if b.as_ref() == b"node_count"));
+            assert_eq!(node_count.map(|(_, v)| v), Some(&Frame::Integer(1)));
         } else {
             panic!("expected Map, got {:?}", resp);
         }
@@ -179,23 +179,33 @@ mod tests {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
 
-        let n1 = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        );
-        let n2 = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        );
+        let n1 =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]));
+        let n2 =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]));
 
-        let id1 = if let Frame::Integer(id) = n1 { id } else { panic!("expected int") };
-        let id2 = if let Frame::Integer(id) = n2 { id } else { panic!("expected int") };
+        let id1 = if let Frame::Integer(id) = n1 {
+            id
+        } else {
+            panic!("expected int")
+        };
+        let id2 = if let Frame::Integer(id) = n2 {
+            id
+        } else {
+            panic!("expected int")
+        };
 
         let id1_str = id1.to_string();
         let id2_str = id2.to_string();
         let resp = dispatch_graph_command(
             &mut store,
-            &make_cmd(&[b"GRAPH.ADDEDGE", b"g", id1_str.as_bytes(), id2_str.as_bytes(), b"KNOWS"]),
+            &make_cmd(&[
+                b"GRAPH.ADDEDGE",
+                b"g",
+                id1_str.as_bytes(),
+                id2_str.as_bytes(),
+                b"KNOWS",
+            ]),
         );
         assert!(matches!(resp, Frame::Integer(_)));
     }
@@ -214,14 +224,28 @@ mod tests {
             &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person", b"name", b"Bob"]),
         );
 
-        let id1 = if let Frame::Integer(id) = n1 { id } else { panic!("expected int") };
-        let id2 = if let Frame::Integer(id) = n2 { id } else { panic!("expected int") };
+        let id1 = if let Frame::Integer(id) = n1 {
+            id
+        } else {
+            panic!("expected int")
+        };
+        let id2 = if let Frame::Integer(id) = n2 {
+            id
+        } else {
+            panic!("expected int")
+        };
 
         let id1_str = id1.to_string();
         let id2_str = id2.to_string();
         dispatch_graph_command(
             &mut store,
-            &make_cmd(&[b"GRAPH.ADDEDGE", b"g", id1_str.as_bytes(), id2_str.as_bytes(), b"KNOWS"]),
+            &make_cmd(&[
+                b"GRAPH.ADDEDGE",
+                b"g",
+                id1_str.as_bytes(),
+                id2_str.as_bytes(),
+                b"KNOWS",
+            ]),
         );
 
         // Get neighbors of node 1.
@@ -251,7 +275,10 @@ mod tests {
     #[test]
     fn test_graph_query_no_graph() {
         let mut store = GraphStore::new();
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n) RETURN n"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n) RETURN n"]),
+        );
         if let Frame::Error(msg) = &resp {
             assert!(msg.as_ref().starts_with(b"ERR graph not found"));
         } else {
@@ -263,16 +290,26 @@ mod tests {
     fn test_graph_query_parse_and_plan() {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n:Person) RETURN n"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n:Person) RETURN n"]),
+        );
         // Should return an array of plan operators (not an error).
-        assert!(matches!(resp, Frame::Array(_)), "expected Array, got {:?}", resp);
+        assert!(
+            matches!(resp, Frame::Array(_)),
+            "expected Array, got {:?}",
+            resp
+        );
     }
 
     #[test]
     fn test_graph_ro_query_rejects_writes() {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.RO_QUERY", b"g", b"CREATE (n:Person)"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.RO_QUERY", b"g", b"CREATE (n:Person)"]),
+        );
         if let Frame::Error(msg) = &resp {
             assert!(msg.as_ref().starts_with(b"ERR GRAPH.RO_QUERY"));
         } else {
@@ -283,15 +320,25 @@ mod tests {
     #[test]
     fn test_graph_explain() {
         let mut store = GraphStore::new();
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.EXPLAIN", b"g", b"MATCH (n) RETURN n"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.EXPLAIN", b"g", b"MATCH (n) RETURN n"]),
+        );
         // EXPLAIN returns a BulkString with the plan.
-        assert!(matches!(resp, Frame::BulkString(_)), "expected BulkString, got {:?}", resp);
+        assert!(
+            matches!(resp, Frame::BulkString(_)),
+            "expected BulkString, got {:?}",
+            resp
+        );
     }
 
     #[test]
     fn test_graph_vsearch_no_graph() {
         let mut store = GraphStore::new();
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.VSEARCH", b"g", b"1", b"2", b"3", b"1.0 0.0"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.VSEARCH", b"g", b"1", b"2", b"3", b"1.0 0.0"]),
+        );
         if let Frame::Error(msg) = &resp {
             assert!(msg.as_ref().starts_with(b"ERR graph not found"));
         } else {
@@ -303,7 +350,10 @@ mod tests {
     fn test_graph_hybrid_no_graph() {
         let mut store = GraphStore::new();
         // Need graph + mode + at least one more arg to pass arg count check.
-        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.HYBRID", b"g", b"FILTER", b"1"]));
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.HYBRID", b"g", b"FILTER", b"1"]),
+        );
         if let Frame::Error(msg) = &resp {
             assert!(msg.as_ref().starts_with(b"ERR graph not found"));
         } else {
@@ -317,29 +367,46 @@ mod tests {
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
 
         // Add two nodes with embeddings.
-        let n1 = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        );
-        let n2 = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        );
+        let n1 =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]));
+        let n2 =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]));
 
-        let id1 = if let Frame::Integer(id) = n1 { id } else { panic!("expected int") };
-        let id2 = if let Frame::Integer(id) = n2 { id } else { panic!("expected int") };
+        let id1 = if let Frame::Integer(id) = n1 {
+            id
+        } else {
+            panic!("expected int")
+        };
+        let id2 = if let Frame::Integer(id) = n2 {
+            id
+        } else {
+            panic!("expected int")
+        };
 
         let id1_str = id1.to_string();
         let id2_str = id2.to_string();
         dispatch_graph_command(
             &mut store,
-            &make_cmd(&[b"GRAPH.ADDEDGE", b"g", id1_str.as_bytes(), id2_str.as_bytes(), b"KNOWS"]),
+            &make_cmd(&[
+                b"GRAPH.ADDEDGE",
+                b"g",
+                id1_str.as_bytes(),
+                id2_str.as_bytes(),
+                b"KNOWS",
+            ]),
         );
 
         // VSEARCH: nodes don't have embeddings, so expect empty result array.
         let resp = dispatch_graph_command(
             &mut store,
-            &make_cmd(&[b"GRAPH.VSEARCH", b"g", id1_str.as_bytes(), b"1", b"10", b"1.0 0.0"]),
+            &make_cmd(&[
+                b"GRAPH.VSEARCH",
+                b"g",
+                id1_str.as_bytes(),
+                b"1",
+                b"10",
+                b"1.0 0.0",
+            ]),
         );
         if let Frame::Array(items) = &resp {
             assert_eq!(items.len(), 0); // No embeddings on nodes.
@@ -352,10 +419,7 @@ mod tests {
     fn test_graph_hybrid_walk_bad_args() {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
-        let resp = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.HYBRID", b"g", b"WALK"]),
-        );
+        let resp = dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.HYBRID", b"g", b"WALK"]));
         // Not enough args for WALK.
         assert!(matches!(resp, Frame::Error(_)));
     }
@@ -381,29 +445,50 @@ mod tests {
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
 
         // Create chain: A -> B -> C
-        let a = if let Frame::Integer(id) = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        ) { id } else { panic!() };
-        let b = if let Frame::Integer(id) = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        ) { id } else { panic!() };
-        let c = if let Frame::Integer(id) = dispatch_graph_command(
-            &mut store,
-            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
-        ) { id } else { panic!() };
+        let a = if let Frame::Integer(id) =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]))
+        {
+            id
+        } else {
+            panic!()
+        };
+        let b = if let Frame::Integer(id) =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]))
+        {
+            id
+        } else {
+            panic!()
+        };
+        let c = if let Frame::Integer(id) =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]))
+        {
+            id
+        } else {
+            panic!()
+        };
 
         let a_s = a.to_string();
         let b_s = b.to_string();
         let c_s = c.to_string();
         dispatch_graph_command(
             &mut store,
-            &make_cmd(&[b"GRAPH.ADDEDGE", b"g", a_s.as_bytes(), b_s.as_bytes(), b"KNOWS"]),
+            &make_cmd(&[
+                b"GRAPH.ADDEDGE",
+                b"g",
+                a_s.as_bytes(),
+                b_s.as_bytes(),
+                b"KNOWS",
+            ]),
         );
         dispatch_graph_command(
             &mut store,
-            &make_cmd(&[b"GRAPH.ADDEDGE", b"g", b_s.as_bytes(), c_s.as_bytes(), b"KNOWS"]),
+            &make_cmd(&[
+                b"GRAPH.ADDEDGE",
+                b"g",
+                b_s.as_bytes(),
+                c_s.as_bytes(),
+                b"KNOWS",
+            ]),
         );
 
         // Depth 1 from A: should see B only (edge + node).

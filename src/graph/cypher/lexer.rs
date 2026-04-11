@@ -353,10 +353,7 @@ mod tests {
         assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::Minus));
         assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::LBracket));
         assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::RBracket));
-        assert_eq!(
-            lexer.next_token().map(|t| t.token),
-            Some(Token::ArrowRight)
-        );
+        assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::ArrowRight));
     }
 
     #[test]

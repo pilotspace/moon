@@ -331,8 +331,7 @@ impl GraphReplayCollector {
 
                 if let (Some(src), Some(dst)) = (src_key, dst_key) {
                     if let Some(graph) = store.get_graph_mut(graph_name) {
-                        if add_edge_to_graph(graph, src, dst, *edge_type, *weight, properties)
-                        {
+                        if add_edge_to_graph(graph, src, dst, *edge_type, *weight, properties) {
                             *replayed += 1;
                         }
                     }

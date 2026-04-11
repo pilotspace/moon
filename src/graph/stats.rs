@@ -194,12 +194,7 @@ impl GraphStats {
     /// Record an edge insertion with the given type.
     /// `src_old_degree` and `dst_old_degree` are the degrees of the source
     /// and destination nodes BEFORE this edge was added.
-    pub fn on_edge_insert(
-        &mut self,
-        edge_type: u16,
-        src_old_degree: u32,
-        dst_old_degree: u32,
-    ) {
+    pub fn on_edge_insert(&mut self, edge_type: u16, src_old_degree: u32, dst_old_degree: u32) {
         self.total_edges += 1;
         *self.edges_by_type.entry(edge_type).or_insert(0) += 1;
 

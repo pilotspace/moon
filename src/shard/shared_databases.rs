@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::storage::Database;
-use crate::vector::store::VectorStore;
 #[cfg(feature = "graph")]
 use crate::graph::store::GraphStore;
+use crate::storage::Database;
+use crate::vector::store::VectorStore;
 
 /// Thread-safe wrapper over per-shard databases.
 ///
@@ -119,11 +119,7 @@ impl ShardDatabases {
                     // No graph metadata — clean start, nothing to recover.
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Shard {}: graph recovery failed: {}",
-                        shard_id,
-                        e
-                    );
+                    tracing::error!("Shard {}: graph recovery failed: {}", shard_id, e);
                 }
             }
         }

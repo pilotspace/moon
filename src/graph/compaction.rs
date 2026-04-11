@@ -263,11 +263,7 @@ pub fn compact_segments(
     let max_node_id = all_node_ids.last().copied().unwrap_or(0);
 
     // Max LSN across input segments.
-    let created_lsn = segments
-        .iter()
-        .map(|s| s.created_lsn)
-        .max()
-        .unwrap_or(0);
+    let created_lsn = segments.iter().map(|s| s.created_lsn).max().unwrap_or(0);
 
     // Checksum.
     let checksum = {
@@ -388,8 +384,7 @@ pub fn rabbit_order_reorder(node_count: usize, edges: &[(u32, u32)]) -> Vec<u32>
             // Modularity gain of moving u from its community to target_comm.
             // delta_Q = edge_weight_to_comm / m - (sigma_tot * k_u) / (m2 * m / 2)
             // Simplified: delta_Q = edge_weight_to_comm / total_weight - sigma_tot * k_u / (m2 * total_weight)
-            let gain =
-                edge_weight_to_comm / total_weight - (sigma_tot * k_u) / (m2 * total_weight);
+            let gain = edge_weight_to_comm / total_weight - (sigma_tot * k_u) / (m2 * total_weight);
 
             if gain > best_gain {
                 best_gain = gain;
@@ -404,8 +399,7 @@ pub fn rabbit_order_reorder(node_count: usize, edges: &[(u32, u32)]) -> Vec<u32>
 
     // Assign contiguous IDs within each community.
     // Group nodes by community, then assign sequential IDs.
-    let mut comm_nodes: std::collections::HashMap<u32, Vec<u32>> =
-        std::collections::HashMap::new();
+    let mut comm_nodes: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
     for (node, &comm) in community.iter().enumerate() {
         comm_nodes.entry(comm).or_default().push(node as u32);
     }

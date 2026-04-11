@@ -93,8 +93,7 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::PipelineBatchSlotted { .. }
                         | ShardMessage::MultiExecuteSlotted { .. }
                         | ShardMessage::VectorSearch { .. }
-                        | ShardMessage::VectorCommand { .. }
-                        => {
+                        | ShardMessage::VectorCommand { .. } => {
                             execute_batch.push(msg);
                         }
                         #[cfg(feature = "graph")]

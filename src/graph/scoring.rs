@@ -267,9 +267,9 @@ mod tests {
         // TRAV-07: composite scorer produces monotonically decreasing ranked list
         let scorer = CompositeScorer::new(0.4, 0.3, 0.3, 0.01, 100);
         let mut scores: Vec<f64> = vec![
-            scorer.score(95, 0.5, 0.9), // recent, close, similar
-            scorer.score(80, 1.0, 0.7), // older, farther, less similar
-            scorer.score(50, 3.0, 0.4), // old, far, dissimilar
+            scorer.score(95, 0.5, 0.9),  // recent, close, similar
+            scorer.score(80, 1.0, 0.7),  // older, farther, less similar
+            scorer.score(50, 3.0, 0.4),  // old, far, dissimilar
             scorer.score(10, 10.0, 0.1), // ancient, very far, barely similar
         ];
         // Verify originally descending
