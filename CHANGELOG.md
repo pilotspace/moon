@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RANDOMKEY** — return a random key from the database.
 - **TOUCH** — refresh LRU/LFU access time without reading value.
 - **SHUTDOWN** — dispatch entry (graceful stop via signal handler).
+- **BITFIELD** — GET/SET/INCRBY with type specifiers (u8/i16/u32/...), OVERFLOW WRAP/SAT/FAIL.
+- **LCS** — Longest Common Substring with LEN option.
+- **XSETID** — set stream last-delivered ID without adding entries.
+- **GEORADIUS/GEORADIUSBYMEMBER** — deprecated wrappers translating to GEOSEARCH.
+- **OBJECT FREQ/IDLETIME/REFCOUNT** — LFU counter, idle seconds, reference count introspection.
+- **LOLWUT** — Easter egg returning Moon version.
 
 ### Fixed — Wave 0-4 Gap Closure (2026-04-09)
 
