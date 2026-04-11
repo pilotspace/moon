@@ -11,7 +11,7 @@
 //! since both GraphStore and VectorStore are per-shard, single-owner.
 
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::simd;
 
@@ -425,7 +425,126 @@ impl VectorGuidedWalk {
 }
 
 // ---------------------------------------------------------------------------
-// BFS collect helper (shared by HYB-01)
+// HYB-04: Graph-constrained re-ranking
+// ---------------------------------------------------------------------------
+
+/// Configuration for graph-constrained re-ranking.
+///
+/// Re-ranks ALL nodes with embeddings by a combined score:
+///   `alpha * vector_score + (1 - alpha) * 1 / (1 + graph_distance)`
+///
+/// Graph distances are computed via a single batch BFS from the reference node,
+/// giving O(frontier) cost instead of O(k * frontier) for per-candidate BFS.
+/// Nodes not reachable within `max_hops` receive a penalty distance of
+/// `max_hops + 1`.
+pub struct GraphConstrainedReRanker {
+    /// Reference node for graph distance computation.
+    pub reference_node: NodeKey,
+    /// Maximum BFS depth for distance computation.
+    pub max_hops: u32,
+    /// Weight for vector similarity score (0.0 = graph only, 1.0 = vector only).
+    pub alpha: f64,
+    /// Number of top results to return.
+    pub k: usize,
+    /// Query vector for cosine similarity scoring.
+    pub query_vector: Vec<f32>,
+    /// Maximum frontier size for BFS to prevent OOM.
+    pub frontier_cap: usize,
+}
+
+impl GraphConstrainedReRanker {
+    /// Create with defaults (frontier_cap=100K).
+    pub fn new(
+        reference_node: NodeKey,
+        max_hops: u32,
+        alpha: f64,
+        query_vector: Vec<f32>,
+        k: usize,
+    ) -> Self {
+        Self {
+            reference_node,
+            max_hops,
+            alpha,
+            k,
+            query_vector,
+            frontier_cap: 100_000,
+        }
+    }
+
+    /// Execute graph-constrained re-ranking.
+    ///
+    /// 1. Validate inputs (reference node exists, non-empty vector, alpha in range).
+    /// 2. Single batch BFS from reference node to compute graph distances.
+    /// 3. Iterate ALL nodes with embeddings, compute cosine similarity.
+    /// 4. Combine: `alpha * vector_score + (1-alpha) * 1/(1+graph_dist)`.
+    /// 5. Sort descending, return top-K.
+    pub fn execute(
+        &self,
+        memgraph: &MemGraph,
+        lsn: u64,
+    ) -> Result<Vec<HybridResult>, HybridError> {
+        if self.query_vector.is_empty() {
+            return Err(HybridError::EmptyQueryVector);
+        }
+
+        // Validate reference node exists.
+        if memgraph.get_node(self.reference_node).is_none() {
+            return Err(HybridError::NodeNotFound);
+        }
+
+        // Clamp alpha to [0.0, 1.0].
+        let alpha = self.alpha.clamp(0.0, 1.0);
+        let penalty_dist = self.max_hops + 1;
+
+        // Step 1: Single batch BFS from reference node — O(frontier).
+        let bfs_results = bfs_collect(
+            memgraph,
+            self.reference_node,
+            self.max_hops,
+            None,
+            self.frontier_cap,
+            lsn,
+        )?;
+
+        // Build O(1) distance lookup map.
+        let mut distance_map: HashMap<NodeKey, u32> =
+            HashMap::with_capacity(bfs_results.len() + 1);
+        distance_map.insert(self.reference_node, 0);
+        for (node_key, dist) in &bfs_results {
+            distance_map.insert(*node_key, *dist);
+        }
+
+        // Step 2: Score ALL nodes with embeddings.
+        let mut scored: Vec<HybridResult> = Vec::with_capacity(distance_map.len());
+
+        for (node_key, node) in memgraph.iter_nodes() {
+            let Some(embedding) = node.embedding.as_ref() else {
+                continue; // Skip nodes without embeddings.
+            };
+
+            let vector_score = simd::cosine_similarity(embedding, &self.query_vector);
+            let graph_dist = distance_map.get(&node_key).copied().unwrap_or(penalty_dist);
+            let graph_score = 1.0 / (1.0 + graph_dist as f64);
+            let combined = alpha * vector_score + (1.0 - alpha) * graph_score;
+
+            scored.push(HybridResult {
+                node: node_key,
+                score: combined,
+                graph_distance: Some(graph_dist),
+                context: Vec::new(),
+            });
+        }
+
+        // Step 3: Sort descending by combined score, take top-K.
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        scored.truncate(self.k);
+
+        Ok(scored)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BFS collect helper (shared by HYB-01, HYB-04)
 // ---------------------------------------------------------------------------
 
 /// BFS from a start node, collecting (NodeKey, graph_distance) pairs.
@@ -932,5 +1051,150 @@ mod tests {
         for cn in context {
             assert!(cn.hops >= 1 && cn.hops <= 2);
         }
+    }
+
+    // --- HYB-04: Graph-constrained re-ranking ---
+
+    /// Build a 5-node chain: A - B - C - D - E with distinct embeddings.
+    fn build_rerank_chain() -> (MemGraph, NodeKey, NodeKey, NodeKey, NodeKey, NodeKey) {
+        let mut g = MemGraph::new(100_000);
+        // A: very similar to query [1,0,0]
+        let a = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0, 0.0]), 1);
+        // B: moderately similar
+        let b = g.add_node(smallvec![0], empty_props(), Some(vec![0.7, 0.7, 0.0]), 1);
+        // C: less similar
+        let c = g.add_node(smallvec![0], empty_props(), Some(vec![0.0, 1.0, 0.0]), 1);
+        // D: even less similar
+        let d = g.add_node(smallvec![0], empty_props(), Some(vec![0.0, 0.5, 0.87]), 1);
+        // E: least similar (opposite direction)
+        let e = g.add_node(smallvec![0], empty_props(), Some(vec![-1.0, 0.0, 0.0]), 1);
+
+        g.add_edge(a, b, 1, 1.0, None, 2).expect("edge a->b");
+        g.add_edge(b, c, 1, 1.0, None, 2).expect("edge b->c");
+        g.add_edge(c, d, 1, 1.0, None, 2).expect("edge c->d");
+        g.add_edge(d, e, 1, 1.0, None, 2).expect("edge d->e");
+
+        (g, a, b, c, d, e)
+    }
+
+    #[test]
+    fn test_rerank_alpha_one_pure_vector() {
+        // alpha=1.0: graph distance is ignored, ranking == pure vector search.
+        let (g, a, _b, _c, _d, _e) = build_rerank_chain();
+
+        let reranker =
+            GraphConstrainedReRanker::new(a, 5, 1.0, vec![1.0, 0.0, 0.0], 5);
+        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+
+        // A has embedding [1,0,0], query is [1,0,0] => score 1.0 (highest).
+        // B has [0.7,0.7,0] => ~0.707
+        // Ranking should be: A first (perfect match), then B, then rest.
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node, a);
+        assert!((results[0].score - 1.0).abs() < 1e-5);
+
+        // Verify descending scores.
+        for w in results.windows(2) {
+            assert!(w[0].score >= w[1].score - 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_rerank_alpha_zero_pure_graph() {
+        // alpha=0.0: vector similarity is ignored, ranking == graph proximity.
+        let (g, a, b, c, _d, _e) = build_rerank_chain();
+
+        let reranker =
+            GraphConstrainedReRanker::new(a, 5, 0.0, vec![1.0, 0.0, 0.0], 5);
+        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+
+        // Graph distances: A=0, B=1, C=2, D=3, E=4.
+        // Graph score = 1/(1+d): A=1.0, B=0.5, C=0.333, D=0.25, E=0.2.
+        // So A should rank first (distance 0), then B (1), C (2), D (3), E (4).
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].node, a);
+        assert_eq!(results[0].graph_distance, Some(0));
+        assert_eq!(results[1].node, b);
+        assert_eq!(results[1].graph_distance, Some(1));
+        assert_eq!(results[2].node, c);
+        assert_eq!(results[2].graph_distance, Some(2));
+    }
+
+    #[test]
+    fn test_rerank_alpha_mixed_reorders() {
+        // alpha=0.7: vector-similar but far node (E with embedding flipped)
+        // vs graph-close but less similar node.
+        // Build: ref=C (middle). B is 1 hop, D is 1 hop.
+        // Give B a vector close to query, D a vector far from query.
+        // With alpha=0.7, B (close + similar) should beat A (far + similar).
+        let (g, a, b, c, _d, _e) = build_rerank_chain();
+
+        // Query vector [1,0,0]: A is most similar but 2 hops from C.
+        // B is 1 hop from C and moderately similar.
+        let reranker =
+            GraphConstrainedReRanker::new(c, 2, 0.3, vec![1.0, 0.0, 0.0], 5);
+        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+
+        // A: vector_score ~1.0, graph_dist=2, graph_score=1/3=0.333
+        //    combined = 0.3*1.0 + 0.7*0.333 = 0.300 + 0.233 = 0.533
+        // B: vector_score ~0.707, graph_dist=1, graph_score=0.5
+        //    combined = 0.3*0.707 + 0.7*0.5 = 0.212 + 0.350 = 0.562
+        // C: vector_score ~0.0, graph_dist=0, graph_score=1.0
+        //    combined = 0.3*0.0 + 0.7*1.0 = 0.700
+        // With alpha=0.3 (heavy graph weight), B should rank above A
+        // because B is closer in graph even though A is more similar.
+
+        // Find positions of A and B.
+        let pos_a = results.iter().position(|r| r.node == a);
+        let pos_b = results.iter().position(|r| r.node == b);
+        // B should be ranked higher (lower index) than A.
+        if let (Some(pa), Some(pb)) = (pos_a, pos_b) {
+            assert!(
+                pb < pa,
+                "B (1 hop, moderate similarity) should rank above A (2 hops, high similarity) with alpha=0.3"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rerank_unreachable_penalty() {
+        // Nodes not reachable within max_hops get graph_distance = max_hops + 1.
+        let (g, a, _b, _c, _d, e) = build_rerank_chain();
+
+        // max_hops=2: A can reach B(1), C(2). D and E are unreachable.
+        let reranker =
+            GraphConstrainedReRanker::new(a, 2, 0.5, vec![1.0, 0.0, 0.0], 10);
+        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+
+        // E should be reachable result with graph_distance = max_hops+1 = 3.
+        let e_result = results.iter().find(|r| r.node == e);
+        assert!(e_result.is_some(), "E should appear in results");
+        assert_eq!(
+            e_result.map(|r| r.graph_distance),
+            Some(Some(3)),
+            "unreachable E should get penalty distance 3 (max_hops+1)"
+        );
+    }
+
+    #[test]
+    fn test_rerank_empty_candidates() {
+        // Graph with no embeddings: should return empty results.
+        let mut g = MemGraph::new(100_000);
+        let a = g.add_node(smallvec![0], empty_props(), None, 1);
+
+        let reranker =
+            GraphConstrainedReRanker::new(a, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
+        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_rerank_node_not_found() {
+        let g = MemGraph::new(100_000);
+        let fake_key: NodeKey = slotmap::KeyData::from_ffi(999).into();
+        let reranker =
+            GraphConstrainedReRanker::new(fake_key, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
+        let result = reranker.execute(&g, u64::MAX - 1);
+        assert!(matches!(result, Err(HybridError::NodeNotFound)));
     }
 }

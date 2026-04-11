@@ -9,8 +9,8 @@ pub mod graph_read;
 pub mod graph_write;
 
 pub use graph_read::{
-    graph_explain, graph_hybrid, graph_info, graph_list, graph_neighbors, graph_query,
-    graph_ro_query, graph_vsearch,
+    graph_explain, graph_hybrid, graph_info, graph_list, graph_neighbors, graph_profile,
+    graph_query, graph_ro_query, graph_vsearch,
 };
 pub use graph_write::{graph_addedge, graph_addnode, graph_create, graph_delete};
 
@@ -42,6 +42,8 @@ pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Fr
         graph_ro_query(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
         graph_explain(store, args)
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.PROFILE") {
+        graph_profile(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.VSEARCH") {
         graph_vsearch(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.HYBRID") {
@@ -82,6 +84,18 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
         }
     };
 
+    if is_graph_write_cmd(cmd) {
+        dispatch_graph_write(store, cmd, args)
+    } else {
+        dispatch_graph_read(store, cmd, args)
+    }
+}
+
+/// Dispatch a GRAPH.* command by separate cmd + args (used by handler_single).
+///
+/// This is the pre-split equivalent of `dispatch_graph_command` for callers
+/// that already have the command bytes and argument slice separated.
+pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {

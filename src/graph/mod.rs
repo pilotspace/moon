@@ -30,8 +30,8 @@ pub use cross_shard::{
 pub use csr::{CsrSegment, CsrStorage, MmapCsrSegment};
 pub use cypher::{CypherError, CypherQuery, is_read_only, parse_cypher};
 pub use hybrid::{
-    FilterStrategy, GraphFilteredSearch, HybridError, HybridResult, VectorGuidedWalk,
-    VectorToGraphExpansion,
+    FilterStrategy, GraphConstrainedReRanker, GraphFilteredSearch, HybridError, HybridResult,
+    VectorGuidedWalk, VectorToGraphExpansion,
 };
 pub use index::{EdgeTypeIndex, LabelIndex, MphNodeIndex, PropertyIndex};
 pub use memgraph::MemGraph;
