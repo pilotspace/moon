@@ -49,10 +49,7 @@ impl DispatchReplayEngine {
     /// Must be called after WAL/AOF replay completes. Returns the number
     /// of graph commands successfully replayed.
     #[cfg(feature = "graph")]
-    pub fn replay_graph_commands(
-        &self,
-        store: &mut crate::graph::store::GraphStore,
-    ) -> usize {
+    pub fn replay_graph_commands(&self, store: &mut crate::graph::store::GraphStore) -> usize {
         self.graph_collector.borrow().replay_into(store)
     }
 

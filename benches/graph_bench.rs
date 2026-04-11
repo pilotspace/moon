@@ -321,12 +321,7 @@ fn bench_cosine_similarity(c: &mut Criterion) {
     });
 
     group.bench_function("simd_384d", |bench| {
-        bench.iter(|| {
-            black_box(simd::cosine_similarity(
-                black_box(&a),
-                black_box(&b),
-            ))
-        })
+        bench.iter(|| black_box(simd::cosine_similarity(black_box(&a), black_box(&b))))
     });
 
     // 768-dim: common for larger transformer models
@@ -344,12 +339,7 @@ fn bench_cosine_similarity(c: &mut Criterion) {
     });
 
     group.bench_function("simd_768d", |bench| {
-        bench.iter(|| {
-            black_box(simd::cosine_similarity(
-                black_box(&a768),
-                black_box(&b768),
-            ))
-        })
+        bench.iter(|| black_box(simd::cosine_similarity(black_box(&a768), black_box(&b768))))
     });
 
     group.finish();

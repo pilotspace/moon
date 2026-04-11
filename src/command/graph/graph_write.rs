@@ -177,9 +177,7 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
     // from the stored node refs (no clone — just borrows).
     drop(wal_record_no_id);
     if let Some(graph) = store.get_graph(graph_name) {
-        let nk = crate::graph::types::NodeKey::from(
-            slotmap::KeyData::from_ffi(external_id),
-        );
+        let nk = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(external_id));
         if let Some(node) = graph.write_buf.get_node(nk) {
             store.wal_pending.push(wal::serialize_add_node(
                 graph_name,
@@ -317,9 +315,8 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
             let stored_props = store
                 .get_graph(graph_name)
                 .and_then(|g| {
-                    let ek = crate::graph::types::EdgeKey::from(
-                        slotmap::KeyData::from_ffi(external_id),
-                    );
+                    let ek =
+                        crate::graph::types::EdgeKey::from(slotmap::KeyData::from_ffi(external_id));
                     g.write_buf.get_edge(ek)
                 })
                 .and_then(|e| e.properties.as_ref());

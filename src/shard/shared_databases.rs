@@ -151,9 +151,8 @@ impl ShardDatabases {
             let engine = DispatchReplayEngine::new();
             // We need dummy databases for the KV replay path (graph commands
             // are intercepted before KV dispatch, so these are unused).
-            let mut dummy_dbs: Vec<Database> = (0..self.db_count)
-                .map(|_| Database::new())
-                .collect();
+            let mut dummy_dbs: Vec<Database> =
+                (0..self.db_count).map(|_| Database::new()).collect();
             match wal::replay_wal(&mut dummy_dbs, &wal_file, &engine) {
                 Ok(_) => {
                     let graph_count = engine.graph_command_count();
@@ -169,11 +168,7 @@ impl ShardDatabases {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Shard {}: graph WAL replay failed: {}",
-                        shard_id,
-                        e
-                    );
+                    tracing::error!("Shard {}: graph WAL replay failed: {}", shard_id, e);
                 }
             }
         }

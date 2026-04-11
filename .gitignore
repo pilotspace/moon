@@ -81,3 +81,4 @@ ssh
 libnull.rlib
 fuzz
 shard-*/
+.serena/

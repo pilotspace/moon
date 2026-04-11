@@ -100,15 +100,18 @@ fn start_falkordb() -> bool {
     let _ = Command::new("docker")
         .args(["stop", "falkor_bench"])
         .output();
-    let _ = Command::new("docker")
-        .args(["rm", "falkor_bench"])
-        .output();
+    let _ = Command::new("docker").args(["rm", "falkor_bench"]).output();
     std::thread::sleep(Duration::from_millis(500));
 
     let result = Command::new("docker")
         .args([
-            "run", "-d", "--rm", "--name", "falkor_bench",
-            "-p", &format!("{FALKOR_PORT}:6379"),
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            "falkor_bench",
+            "-p",
+            &format!("{FALKOR_PORT}:6379"),
             "falkordb/falkordb:latest",
         ])
         .output();
@@ -206,9 +209,7 @@ impl LatencyStats {
 // Population helpers
 // ---------------------------------------------------------------------------
 
-async fn populate_moon(
-    conn: &mut redis::aio::MultiplexedConnection,
-) -> Vec<i64> {
+async fn populate_moon(conn: &mut redis::aio::MultiplexedConnection) -> Vec<i64> {
     redis::cmd("GRAPH.CREATE")
         .arg("bench")
         .query_async::<String>(conn)
@@ -267,9 +268,7 @@ async fn populate_falkordb(conn: &mut redis::aio::MultiplexedConnection) {
     let labels = ["Concept", "Fact", "Event", "Source", "Agent"];
     for i in 0..NODES {
         let label = labels[i % 5];
-        let cypher = format!(
-            "CREATE (:{label} {{id: {i}, name: 'k_{i}'}})"
-        );
+        let cypher = format!("CREATE (:{label} {{id: {i}, name: 'k_{i}'}})");
         let _: Value = redis::cmd("GRAPH.QUERY")
             .arg("bench")
             .arg(&cypher)
@@ -350,9 +349,7 @@ async fn bench_cypher_traversal(
     for i in 0..QUERIES {
         let nid = (i * 13) % NODES;
         let label_name = ["Concept", "Fact", "Event", "Source", "Agent"][nid % 5];
-        let q = format!(
-            "MATCH (a:{label_name} {{id: {nid}}})-[r]->(b) RETURN b.id LIMIT 50"
-        );
+        let q = format!("MATCH (a:{label_name} {{id: {nid}}})-[r]->(b) RETURN b.id LIMIT 50");
         let t = Instant::now();
         let _: Result<Value, _> = redis::cmd("GRAPH.QUERY")
             .arg("bench")
@@ -420,9 +417,7 @@ async fn bench_pipelined(
     let mut pipe = redis::pipe();
     for i in 0..batch {
         let idx = (i * 13) % node_ids.len();
-        pipe.cmd("GRAPH.NEIGHBORS")
-            .arg("bench")
-            .arg(node_ids[idx]);
+        pipe.cmd("GRAPH.NEIGHBORS").arg("bench").arg(node_ids[idx]);
     }
 
     let t = Instant::now();

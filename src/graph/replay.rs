@@ -366,75 +366,67 @@ impl GraphReplayCollector {
                     }
                 }
                 GraphCommand::AddNode { graph_name, .. } => {
-                    let eidx = current_epoch
-                        .entry(graph_name.clone())
-                        .or_insert_with(|| {
-                            let i = epochs.len();
-                            epochs.push(Epoch {
-                                graph_name: graph_name.clone(),
-                                create_idx: None,
-                                node_indices: Vec::new(),
-                                edge_indices: Vec::new(),
-                                remove_node_indices: Vec::new(),
-                                remove_edge_indices: Vec::new(),
-                                drop_idx: None,
-                            });
-                            i
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
                         });
+                        i
+                    });
                     epochs[*eidx].node_indices.push(idx);
                 }
                 GraphCommand::AddEdge { graph_name, .. } => {
-                    let eidx = current_epoch
-                        .entry(graph_name.clone())
-                        .or_insert_with(|| {
-                            let i = epochs.len();
-                            epochs.push(Epoch {
-                                graph_name: graph_name.clone(),
-                                create_idx: None,
-                                node_indices: Vec::new(),
-                                edge_indices: Vec::new(),
-                                remove_node_indices: Vec::new(),
-                                remove_edge_indices: Vec::new(),
-                                drop_idx: None,
-                            });
-                            i
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
                         });
+                        i
+                    });
                     epochs[*eidx].edge_indices.push(idx);
                 }
                 GraphCommand::RemoveNode { graph_name, .. } => {
-                    let eidx = current_epoch
-                        .entry(graph_name.clone())
-                        .or_insert_with(|| {
-                            let i = epochs.len();
-                            epochs.push(Epoch {
-                                graph_name: graph_name.clone(),
-                                create_idx: None,
-                                node_indices: Vec::new(),
-                                edge_indices: Vec::new(),
-                                remove_node_indices: Vec::new(),
-                                remove_edge_indices: Vec::new(),
-                                drop_idx: None,
-                            });
-                            i
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
                         });
+                        i
+                    });
                     epochs[*eidx].remove_node_indices.push(idx);
                 }
                 GraphCommand::RemoveEdge { graph_name, .. } => {
-                    let eidx = current_epoch
-                        .entry(graph_name.clone())
-                        .or_insert_with(|| {
-                            let i = epochs.len();
-                            epochs.push(Epoch {
-                                graph_name: graph_name.clone(),
-                                create_idx: None,
-                                node_indices: Vec::new(),
-                                edge_indices: Vec::new(),
-                                remove_node_indices: Vec::new(),
-                                remove_edge_indices: Vec::new(),
-                                drop_idx: None,
-                            });
-                            i
+                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
+                        let i = epochs.len();
+                        epochs.push(Epoch {
+                            graph_name: graph_name.clone(),
+                            create_idx: None,
+                            node_indices: Vec::new(),
+                            edge_indices: Vec::new(),
+                            remove_node_indices: Vec::new(),
+                            remove_edge_indices: Vec::new(),
+                            drop_idx: None,
                         });
+                        i
+                    });
                     epochs[*eidx].remove_edge_indices.push(idx);
                 }
             }
@@ -516,7 +508,8 @@ impl GraphReplayCollector {
                             tracing::warn!(
                                 "WAL replay: dropping edge (src={}, dst={}) — \
                                  referenced node(s) not found in WAL or CSR segments",
-                                src_id, dst_id
+                                src_id,
+                                dst_id
                             );
                         }
                     }

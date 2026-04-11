@@ -115,10 +115,7 @@ pub fn execute_mut(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(
-                                            target.clone(),
-                                            Value::Node(neighbor_key),
-                                        );
+                                        new_row.insert(target.clone(), Value::Node(neighbor_key));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -167,10 +164,8 @@ pub fn execute_mut(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect();
+                                    let entries: Vec<(String, Value)> =
+                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(&item.expr, row, &graph.write_buf, params)
@@ -321,15 +316,18 @@ pub fn execute_mut(
                         }
                         for (i, pe) in pattern.edges.iter().enumerate() {
                             let Some(&src) = node_keys.get(i) else { break };
-                            let Some(&dst) = node_keys.get(i + 1) else { break };
+                            let Some(&dst) = node_keys.get(i + 1) else {
+                                break;
+                            };
                             let edge_type = pe
                                 .edge_types
                                 .first()
                                 .map(|t| label_to_id(t.as_bytes()))
                                 .unwrap_or(0);
-                            if let Ok(ek) = graph.write_buf.add_edge(
-                                src, dst, edge_type, 1.0, None, lsn,
-                            ) {
+                            if let Ok(ek) = graph
+                                .write_buf
+                                .add_edge(src, dst, edge_type, 1.0, None, lsn)
+                            {
                                 mutations.push(MutationRecord::CreateEdge {
                                     edge_id: ek.data().as_ffi(),
                                     src_id: src.data().as_ffi(),
@@ -356,13 +354,10 @@ pub fn execute_mut(
                                 value,
                             } => {
                                 if let Some(Value::Node(nk)) = row.get(variable) {
-                                    let val =
-                                        eval_expr(value, row, &graph.write_buf, params);
+                                    let val = eval_expr(value, row, &graph.write_buf, params);
                                     if let Some(pv) = value_to_property_value(&val) {
                                         let pid = label_to_id(property.as_bytes());
-                                        if let Some(node) =
-                                            graph.write_buf.get_node_mut(*nk)
-                                        {
+                                        if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                                             // Update existing or append.
                                             let mut found = false;
                                             for entry in node.properties.iter_mut() {
@@ -457,9 +452,10 @@ pub fn execute_mut(
                                 }
                                 // All required properties must match.
                                 for (pid, pval) in &match_props {
-                                    let has_match = node.properties.iter().any(|(np, nv)| {
-                                        *np == *pid && *nv == *pval
-                                    });
+                                    let has_match = node
+                                        .properties
+                                        .iter()
+                                        .any(|(np, nv)| *np == *pid && *nv == *pval);
                                     if !has_match {
                                         return false;
                                     }
@@ -482,14 +478,10 @@ pub fn execute_mut(
                             );
                         } else {
                             // CREATE path: create node.
-                            let props: PropertyMap = match_props
-                                .into_iter()
-                                .collect();
+                            let props: PropertyMap = match_props.into_iter().collect();
                             let labels_clone = label_ids.clone();
                             let props_clone = props.clone();
-                            let nk = graph.write_buf.add_node(
-                                label_ids, props, None, lsn,
-                            );
+                            let nk = graph.write_buf.add_node(label_ids, props, None, lsn);
                             nodes_created += 1;
                             mutations.push(MutationRecord::CreateNode {
                                 node_id: nk.data().as_ffi(),
@@ -515,12 +507,10 @@ pub fn execute_mut(
                         let pe = &pattern.edges[0];
 
                         // Resolve or find source node.
-                        let src_key = resolve_or_find_node(
-                            src_pn, &new_row, &graph.write_buf, params,
-                        );
-                        let dst_key = resolve_or_find_node(
-                            dst_pn, &new_row, &graph.write_buf, params,
-                        );
+                        let src_key =
+                            resolve_or_find_node(src_pn, &new_row, &graph.write_buf, params);
+                        let dst_key =
+                            resolve_or_find_node(dst_pn, &new_row, &graph.write_buf, params);
 
                         let edge_type_id = pe
                             .edge_types
@@ -560,7 +550,12 @@ pub fn execute_mut(
                                 } else {
                                     // Create edge.
                                     if let Ok(ek) = graph.write_buf.add_edge(
-                                        sk, dk, edge_type_id, 1.0, None, lsn,
+                                        sk,
+                                        dk,
+                                        edge_type_id,
+                                        1.0,
+                                        None,
+                                        lsn,
                                     ) {
                                         mutations.push(MutationRecord::CreateEdge {
                                             edge_id: ek.data().as_ffi(),
@@ -600,18 +595,15 @@ pub fn execute_mut(
                                         .properties
                                         .iter()
                                         .filter_map(|(name, expr)| {
-                                            let val = eval_expr(
-                                                expr, &new_row, &graph.write_buf, params,
-                                            );
+                                            let val =
+                                                eval_expr(expr, &new_row, &graph.write_buf, params);
                                             value_to_property_value(&val)
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
                                         })
                                         .collect();
                                     let labels_clone = labels.clone();
                                     let props_clone = props.clone();
-                                    let nk = graph.write_buf.add_node(
-                                        labels, props, None, lsn,
-                                    );
+                                    let nk = graph.write_buf.add_node(labels, props, None, lsn);
                                     nodes_created += 1;
                                     mutations.push(MutationRecord::CreateNode {
                                         node_id: nk.data().as_ffi(),
@@ -633,18 +625,15 @@ pub fn execute_mut(
                                         .properties
                                         .iter()
                                         .filter_map(|(name, expr)| {
-                                            let val = eval_expr(
-                                                expr, &new_row, &graph.write_buf, params,
-                                            );
+                                            let val =
+                                                eval_expr(expr, &new_row, &graph.write_buf, params);
                                             value_to_property_value(&val)
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
                                         })
                                         .collect();
                                     let labels_clone = labels.clone();
                                     let props_clone = props.clone();
-                                    let nk = graph.write_buf.add_node(
-                                        labels, props, None, lsn,
-                                    );
+                                    let nk = graph.write_buf.add_node(labels, props, None, lsn);
                                     nodes_created += 1;
                                     mutations.push(MutationRecord::CreateNode {
                                         node_id: nk.data().as_ffi(),
@@ -654,9 +643,11 @@ pub fn execute_mut(
                                     });
                                     nk
                                 };
-                                if let Ok(ek) = graph.write_buf.add_edge(
-                                    sk, dk, edge_type_id, 1.0, None, lsn,
-                                ) {
+                                if let Ok(ek) =
+                                    graph
+                                        .write_buf
+                                        .add_edge(sk, dk, edge_type_id, 1.0, None, lsn)
+                                {
                                     mutations.push(MutationRecord::CreateEdge {
                                         edge_id: ek.data().as_ffi(),
                                         src_id: sk.data().as_ffi(),

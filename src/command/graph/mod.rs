@@ -81,9 +81,7 @@ pub fn dispatch_graph_write(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) 
         graph_addnode(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE") {
         graph_addedge(store, args)
-    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE")
-        || cmd.eq_ignore_ascii_case(b"GRAPH.DROP")
-    {
+    } else if cmd.eq_ignore_ascii_case(b"GRAPH.DELETE") || cmd.eq_ignore_ascii_case(b"GRAPH.DROP") {
         graph_delete(store, args)
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown GRAPH.* write command"))
@@ -494,10 +492,18 @@ mod tests {
 
         // Response should be Array with 2 elements: [exec_result, operator_profiles]
         if let Frame::Array(items) = &resp {
-            assert_eq!(items.len(), 2, "expected [results, profiles], got {} items", items.len());
+            assert_eq!(
+                items.len(),
+                2,
+                "expected [results, profiles], got {} items",
+                items.len()
+            );
 
             // First element is the exec result (Array with headers, rows, stats)
-            assert!(matches!(&items[0], Frame::Array(_)), "first element should be exec result array");
+            assert!(
+                matches!(&items[0], Frame::Array(_)),
+                "first element should be exec result array"
+            );
 
             // Second element is operator profiles array
             if let Frame::Array(profiles) = &items[1] {
@@ -510,7 +516,11 @@ mod tests {
 
                 // Each profile entry is [name, row_count, duration_us]
                 if let Frame::Array(first_profile) = &profiles[0] {
-                    assert_eq!(first_profile.len(), 3, "each profile should have 3 elements");
+                    assert_eq!(
+                        first_profile.len(),
+                        3,
+                        "each profile should have 3 elements"
+                    );
                     // First should be BulkString with operator name
                     assert!(
                         matches!(&first_profile[0], Frame::BulkString(b) if b.as_ref() == b"NodeScan"),
@@ -682,11 +692,7 @@ mod tests {
         // Verify read-only query still works.
         let resp = dispatch_graph_command(
             &mut store,
-            &make_cmd(&[
-                b"GRAPH.QUERY",
-                b"g",
-                b"MATCH (n:Person) RETURN n.name",
-            ]),
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n:Person) RETURN n.name"]),
         );
         if let Frame::Array(items) = &resp {
             assert_eq!(items.len(), 3);

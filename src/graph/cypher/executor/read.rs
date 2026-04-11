@@ -91,9 +91,7 @@ pub fn execute(
                         for merged in reader.neighbors(src_key) {
                             // Multi-type filter (SegmentMergeReader handles
                             // single-type; we need extra check for multi-type).
-                            if type_ids.len() > 1
-                                && !type_ids.contains(&merged.edge_type)
-                            {
+                            if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
                                 continue;
                             }
                             let mut new_row = row.clone();
@@ -108,8 +106,7 @@ pub fn execute(
                         let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
 
                         let mut frontier = vec![src_key];
-                        let mut visited =
-                            std::collections::HashSet::new();
+                        let mut visited = std::collections::HashSet::new();
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
@@ -119,9 +116,7 @@ pub fn execute(
                                     if visited.contains(&merged.node) {
                                         continue;
                                     }
-                                    if type_ids.len() > 1
-                                        && !type_ids.contains(&merged.edge_type)
-                                    {
+                                    if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
                                         continue;
                                     }
                                     visited.insert(merged.node);
@@ -129,10 +124,7 @@ pub fn execute(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(
-                                            target.clone(),
-                                            Value::Node(merged.node),
-                                        );
+                                        new_row.insert(target.clone(), Value::Node(merged.node));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -178,10 +170,8 @@ pub fn execute(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect();
+                                    let entries: Vec<(String, Value)> =
+                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(&item.expr, row, memgraph, params)
@@ -446,9 +436,7 @@ pub fn execute_profile(
                     };
 
                     if *max_hops <= 1 {
-                        for (edge_key, neighbor_key) in
-                            memgraph.neighbors(src_key, dir, u64::MAX)
-                        {
+                        for (edge_key, neighbor_key) in memgraph.neighbors(src_key, dir, u64::MAX) {
                             if !type_ids.is_empty() {
                                 if let Some(edge) = memgraph.get_edge(edge_key) {
                                     if !type_ids.contains(&edge.edge_type) {
@@ -492,10 +480,7 @@ pub fn execute_profile(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(
-                                            target.clone(),
-                                            Value::Node(neighbor_key),
-                                        );
+                                        new_row.insert(target.clone(), Value::Node(neighbor_key));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -541,10 +526,8 @@ pub fn execute_profile(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect();
+                                    let entries: Vec<(String, Value)> =
+                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(&item.expr, row, memgraph, params)

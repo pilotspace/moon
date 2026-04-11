@@ -72,15 +72,13 @@ impl NamedGraph {
             Ok(csr) => {
                 self.segments.add_immutable(csr);
                 // Replace write_buf with a fresh empty MemGraph.
-                self.write_buf =
-                    crate::graph::memgraph::MemGraph::new(self.edge_threshold);
+                self.write_buf = crate::graph::memgraph::MemGraph::new(self.edge_threshold);
                 true
             }
             Err(_) => {
                 // CSR build failed -- write_buf is already frozen/drained.
                 // Replace with fresh MemGraph so writes can continue.
-                self.write_buf =
-                    crate::graph::memgraph::MemGraph::new(self.edge_threshold);
+                self.write_buf = crate::graph::memgraph::MemGraph::new(self.edge_threshold);
                 false
             }
         }
@@ -143,9 +141,9 @@ impl GraphStore {
                 created_lsn: lsn,
                 property_indexes: HashMap::new(),
                 stats: GraphStats::new(),
-                plan_cache: parking_lot::Mutex::new(
-                    crate::graph::cypher::planner::PlanCache::new(1024),
-                ),
+                plan_cache: parking_lot::Mutex::new(crate::graph::cypher::planner::PlanCache::new(
+                    1024,
+                )),
             },
         );
         Ok(())

@@ -452,9 +452,7 @@ impl CsrSegment {
                 .checked_add(em_size)?
                 .checked_add(nm_size)
         })()
-        .ok_or_else(|| {
-            CsrError::InvalidData("size overflow in CSR header fields".to_owned())
-        })?;
+        .ok_or_else(|| CsrError::InvalidData("size overflow in CSR header fields".to_owned()))?;
         if data.len() < expected_len {
             return Err(CsrError::InvalidData(format!(
                 "data too short: {} < {}",
@@ -962,8 +960,7 @@ mod tests {
         // Write to file, then load via mmap.
         let path = dir.path().join("test_mmap.csr");
         original.write_to_file(&path).expect("write ok");
-        let mmap_seg =
-            MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
+        let mmap_seg = MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
 
         // Verify header.
         assert_eq!(mmap_seg.node_count(), original.node_count());
@@ -994,8 +991,7 @@ mod tests {
         let original = CsrSegment::from_frozen(frozen, 88).expect("csr ok");
         let path = dir.path().join("test_madvise.csr");
         original.write_to_file(&path).expect("write ok");
-        let mmap_seg =
-            MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
+        let mmap_seg = MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
 
         // Should not panic on any platform.
         mmap_seg.madvise_sequential();
@@ -1011,8 +1007,7 @@ mod tests {
         let path = dir.path().join("test_lookup.csr");
         original.write_to_file(&path).expect("write ok");
 
-        let mmap_seg =
-            MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
+        let mmap_seg = MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
 
         // All known keys should resolve.
         for key in &node_keys {
@@ -1036,8 +1031,7 @@ mod tests {
         let path = dir.path().join("test_neigh_edges.csr");
         original.write_to_file(&path).expect("write ok");
 
-        let mmap_seg =
-            MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
+        let mmap_seg = MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
 
         // Node 0 has 4 outgoing edges.
         let row0 = mmap_seg.lookup_node(node_keys[0]).expect("row exists");

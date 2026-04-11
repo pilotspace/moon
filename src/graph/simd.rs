@@ -188,18 +188,9 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f64 {
     }
 
     // Horizontal sum: combine 4 accumulators, then reduce 8 lanes to scalar.
-    let dot_combined = _mm256_add_ps(
-        _mm256_add_ps(dot0, dot1),
-        _mm256_add_ps(dot2, dot3),
-    );
-    let na_combined = _mm256_add_ps(
-        _mm256_add_ps(na0, na1),
-        _mm256_add_ps(na2, na3),
-    );
-    let nb_combined = _mm256_add_ps(
-        _mm256_add_ps(nb0, nb1),
-        _mm256_add_ps(nb2, nb3),
-    );
+    let dot_combined = _mm256_add_ps(_mm256_add_ps(dot0, dot1), _mm256_add_ps(dot2, dot3));
+    let na_combined = _mm256_add_ps(_mm256_add_ps(na0, na1), _mm256_add_ps(na2, na3));
+    let nb_combined = _mm256_add_ps(_mm256_add_ps(nb0, nb1), _mm256_add_ps(nb2, nb3));
 
     let dot_sum = hsum256_ps(dot_combined);
     let na_sum = hsum256_ps(na_combined);
@@ -304,7 +295,10 @@ mod tests {
         let a = [1.0f32, 0.0, 0.0, 0.0];
         let b = [0.0f32, 1.0, 0.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-6, "orthogonal vectors should have cosine 0.0, got {sim}");
+        assert!(
+            sim.abs() < 1e-6,
+            "orthogonal vectors should have cosine 0.0, got {sim}"
+        );
     }
 
     #[test]
@@ -329,7 +323,10 @@ mod tests {
         let a = [1.0f32, 2.0];
         let b = [1.0f32, 2.0, 3.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < f64::EPSILON, "mismatched lengths should return 0.0");
+        assert!(
+            sim.abs() < f64::EPSILON,
+            "mismatched lengths should return 0.0"
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::path::Path;
 
 use roaring::RoaringBitmap;
 
-use super::{CsrError, CsrSegment};
 use super::mmap::MmapCsrSegment;
+use super::{CsrError, CsrSegment};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 

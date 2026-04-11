@@ -147,7 +147,6 @@ impl<'a> SegmentMergeReader<'a> {
         seen: &mut HashSet<NodeKey>,
         result: &mut Vec<MergedNeighbor>,
     ) {
-
         // 1. Read from mutable MemGraph (highest priority -- newest data).
         if let Some(mg) = self.memgraph {
             for (edge_key, neighbor_key) in mg.neighbors(node, self.direction, self.snapshot_lsn) {
@@ -460,8 +459,7 @@ impl ParallelBfs {
                         let visited_ref = &dash_visited;
                         let per_morsel_ref = &per_morsel_results;
                         s.spawn(move || {
-                            let mut local: Vec<(NodeKey, u32, Option<MergedNeighbor>)> =
-                                Vec::new();
+                            let mut local: Vec<(NodeKey, u32, Option<MergedNeighbor>)> = Vec::new();
                             for neighbors in chunk {
                                 for &neighbor in neighbors {
                                     if visited_ref.insert(neighbor.node) {
@@ -754,8 +752,8 @@ mod tests {
     use super::*;
     use crate::graph::csr::{CsrSegment, CsrStorage};
     use crate::graph::memgraph::MemGraph;
-    use slotmap::Key;
     use crate::graph::scoring::WeightedCostFn;
+    use slotmap::Key;
     use smallvec::smallvec;
 
     fn empty_props() -> crate::graph::types::PropertyMap {
@@ -1295,7 +1293,10 @@ mod tests {
         let frozen2 = mg2.freeze().expect("ok");
         let csr2 = CsrSegment::from_frozen(frozen2, 10).expect("ok");
 
-        let csr_segs = vec![Arc::new(CsrStorage::from(csr1)), Arc::new(CsrStorage::from(csr2))];
+        let csr_segs = vec![
+            Arc::new(CsrStorage::from(csr1)),
+            Arc::new(CsrStorage::from(csr2)),
+        ];
         let reader: SegmentMergeReader<'_> =
             SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
 
@@ -1320,14 +1321,20 @@ mod tests {
         }
         // Chain: 0->1->2->3->4
         for i in 0..4 {
-            mg.add_edge(nodes[i], nodes[i + 1], 1, 1.0, None, 2).expect("ok");
+            mg.add_edge(nodes[i], nodes[i + 1], 1, 1.0, None, 2)
+                .expect("ok");
         }
         // Branch: 0->5, 0->6, 1->7, 2->8, 3->9
-        mg.add_edge(nodes[0], nodes[5], 1, 1.0, None, 2).expect("ok");
-        mg.add_edge(nodes[0], nodes[6], 1, 1.0, None, 2).expect("ok");
-        mg.add_edge(nodes[1], nodes[7], 1, 1.0, None, 2).expect("ok");
-        mg.add_edge(nodes[2], nodes[8], 1, 1.0, None, 2).expect("ok");
-        mg.add_edge(nodes[3], nodes[9], 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(nodes[0], nodes[5], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[0], nodes[6], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[1], nodes[7], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[2], nodes[8], 1, 1.0, None, 2)
+            .expect("ok");
+        mg.add_edge(nodes[3], nodes[9], 1, 1.0, None, 2)
+            .expect("ok");
 
         let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(

@@ -478,11 +478,7 @@ impl GraphConstrainedReRanker {
     /// 3. Iterate ALL nodes with embeddings, compute cosine similarity.
     /// 4. Combine: `alpha * vector_score + (1-alpha) * 1/(1+graph_dist)`.
     /// 5. Sort descending, return top-K.
-    pub fn execute(
-        &self,
-        memgraph: &MemGraph,
-        lsn: u64,
-    ) -> Result<Vec<HybridResult>, HybridError> {
+    pub fn execute(&self, memgraph: &MemGraph, lsn: u64) -> Result<Vec<HybridResult>, HybridError> {
         if self.query_vector.is_empty() {
             return Err(HybridError::EmptyQueryVector);
         }
@@ -507,8 +503,7 @@ impl GraphConstrainedReRanker {
         )?;
 
         // Build O(1) distance lookup map.
-        let mut distance_map: HashMap<NodeKey, u32> =
-            HashMap::with_capacity(bfs_results.len() + 1);
+        let mut distance_map: HashMap<NodeKey, u32> = HashMap::with_capacity(bfs_results.len() + 1);
         distance_map.insert(self.reference_node, 0);
         for (node_key, dist) in &bfs_results {
             distance_map.insert(*node_key, *dist);
@@ -1082,8 +1077,7 @@ mod tests {
         // alpha=1.0: graph distance is ignored, ranking == pure vector search.
         let (g, a, _b, _c, _d, _e) = build_rerank_chain();
 
-        let reranker =
-            GraphConstrainedReRanker::new(a, 5, 1.0, vec![1.0, 0.0, 0.0], 5);
+        let reranker = GraphConstrainedReRanker::new(a, 5, 1.0, vec![1.0, 0.0, 0.0], 5);
         let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
 
         // A has embedding [1,0,0], query is [1,0,0] => score 1.0 (highest).
@@ -1104,8 +1098,7 @@ mod tests {
         // alpha=0.0: vector similarity is ignored, ranking == graph proximity.
         let (g, a, b, c, _d, _e) = build_rerank_chain();
 
-        let reranker =
-            GraphConstrainedReRanker::new(a, 5, 0.0, vec![1.0, 0.0, 0.0], 5);
+        let reranker = GraphConstrainedReRanker::new(a, 5, 0.0, vec![1.0, 0.0, 0.0], 5);
         let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
 
         // Graph distances: A=0, B=1, C=2, D=3, E=4.
@@ -1131,8 +1124,7 @@ mod tests {
 
         // Query vector [1,0,0]: A is most similar but 2 hops from C.
         // B is 1 hop from C and moderately similar.
-        let reranker =
-            GraphConstrainedReRanker::new(c, 2, 0.3, vec![1.0, 0.0, 0.0], 5);
+        let reranker = GraphConstrainedReRanker::new(c, 2, 0.3, vec![1.0, 0.0, 0.0], 5);
         let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
 
         // A: vector_score ~1.0, graph_dist=2, graph_score=1/3=0.333
@@ -1162,8 +1154,7 @@ mod tests {
         let (g, a, _b, _c, _d, e) = build_rerank_chain();
 
         // max_hops=2: A can reach B(1), C(2). D and E are unreachable.
-        let reranker =
-            GraphConstrainedReRanker::new(a, 2, 0.5, vec![1.0, 0.0, 0.0], 10);
+        let reranker = GraphConstrainedReRanker::new(a, 2, 0.5, vec![1.0, 0.0, 0.0], 10);
         let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
 
         // E should be reachable result with graph_distance = max_hops+1 = 3.
@@ -1182,8 +1173,7 @@ mod tests {
         let mut g = MemGraph::new(100_000);
         let a = g.add_node(smallvec![0], empty_props(), None, 1);
 
-        let reranker =
-            GraphConstrainedReRanker::new(a, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
+        let reranker = GraphConstrainedReRanker::new(a, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
         let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
         assert!(results.is_empty());
     }
@@ -1192,8 +1182,7 @@ mod tests {
     fn test_rerank_node_not_found() {
         let g = MemGraph::new(100_000);
         let fake_key: NodeKey = slotmap::KeyData::from_ffi(999).into();
-        let reranker =
-            GraphConstrainedReRanker::new(fake_key, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
+        let reranker = GraphConstrainedReRanker::new(fake_key, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
         let result = reranker.execute(&g, u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::NodeNotFound)));
     }

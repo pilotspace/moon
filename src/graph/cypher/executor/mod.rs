@@ -113,8 +113,8 @@ use slotmap::Key;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::graph::store::GraphStore;
+    use bytes::Bytes;
     use smallvec::SmallVec;
 
     #[test]
@@ -134,8 +134,7 @@ mod tests {
 
         let query =
             crate::graph::cypher::parse_cypher(b"MATCH (n:Person) RETURN n.name").expect("parse");
-        let plan =
-            crate::graph::cypher::planner::compile(&query).expect("compile");
+        let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
         let result = execute(graph, &plan, &HashMap::new()).expect("exec");
 
@@ -171,10 +170,9 @@ mod tests {
             .write_buf
             .add_node(SmallVec::from_elem(label_id, 1), p2, None, 2);
 
-        let query = crate::graph::cypher::parse_cypher(
-            b"MATCH (n:Person) WHERE n.age > 30 RETURN n.age",
-        )
-        .expect("parse");
+        let query =
+            crate::graph::cypher::parse_cypher(b"MATCH (n:Person) WHERE n.age > 30 RETURN n.age")
+                .expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
         let result = execute(graph, &plan, &HashMap::new()).expect("exec");
@@ -204,10 +202,8 @@ mod tests {
             );
         }
 
-        let query = crate::graph::cypher::parse_cypher(
-            b"MATCH (n:Person) RETURN n LIMIT 3",
-        )
-        .expect("parse");
+        let query = crate::graph::cypher::parse_cypher(b"MATCH (n:Person) RETURN n LIMIT 3")
+            .expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
         let result = execute(graph, &plan, &HashMap::new()).expect("exec");
@@ -227,10 +223,7 @@ mod tests {
             compare_values(&Value::Int(5), &Value::Float(3.0)),
             Ordering::Greater
         );
-        assert_eq!(
-            compare_values(&Value::Null, &Value::Int(0)),
-            Ordering::Less
-        );
+        assert_eq!(compare_values(&Value::Null, &Value::Int(0)), Ordering::Less);
         assert_eq!(
             compare_values(&Value::String("abc".into()), &Value::String("def".into())),
             Ordering::Less
@@ -286,12 +279,14 @@ mod tests {
         let node = nodes[0].1;
         let name_id = label_to_id(b"name");
         let age_id = label_to_id(b"age");
-        assert!(node.properties.iter().any(|(p, v)| *p == name_id
-            && *v == PropertyValue::String(Bytes::from_static(b"Alice"))));
-        assert!(node
-            .properties
-            .iter()
-            .any(|(p, v)| *p == age_id && *v == PropertyValue::Int(30)));
+        assert!(node.properties.iter().any(
+            |(p, v)| *p == name_id && *v == PropertyValue::String(Bytes::from_static(b"Alice"))
+        ));
+        assert!(
+            node.properties
+                .iter()
+                .any(|(p, v)| *p == age_id && *v == PropertyValue::Int(30))
+        );
     }
 
     #[test]

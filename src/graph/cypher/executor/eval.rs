@@ -114,12 +114,8 @@ pub(crate) fn eval_expr(
                     if let Some(arg) = args.first() {
                         let v = eval_expr(arg, row, memgraph, params);
                         match v {
-                            Value::Node(k) => {
-                                Value::Int(k.data().as_ffi() as i64)
-                            }
-                            Value::Edge(k) => {
-                                Value::Int(k.data().as_ffi() as i64)
-                            }
+                            Value::Node(k) => Value::Int(k.data().as_ffi() as i64),
+                            Value::Edge(k) => Value::Int(k.data().as_ffi() as i64),
                             _ => Value::Null,
                         }
                     } else {
@@ -131,11 +127,8 @@ pub(crate) fn eval_expr(
                         let v = eval_expr(arg, row, memgraph, params);
                         if let Value::Node(k) = v {
                             if let Some(node) = memgraph.get_node(k) {
-                                let labels: Vec<Value> = node
-                                    .labels
-                                    .iter()
-                                    .map(|&l| Value::Int(l as i64))
-                                    .collect();
+                                let labels: Vec<Value> =
+                                    node.labels.iter().map(|&l| Value::Int(l as i64)).collect();
                                 return Value::List(labels);
                             }
                         }
@@ -175,9 +168,7 @@ pub(crate) fn eval_expr(
                         match v {
                             Value::Int(n) => Value::Int(n),
                             Value::Float(f) => Value::Int(f as i64),
-                            Value::String(s) => {
-                                s.parse::<i64>().map_or(Value::Null, Value::Int)
-                            }
+                            Value::String(s) => s.parse::<i64>().map_or(Value::Null, Value::Int),
                             _ => Value::Null,
                         }
                     } else {
@@ -190,9 +181,7 @@ pub(crate) fn eval_expr(
                         match v {
                             Value::Float(f) => Value::Float(f),
                             Value::Int(n) => Value::Float(n as f64),
-                            Value::String(s) => {
-                                s.parse::<f64>().map_or(Value::Null, Value::Float)
-                            }
+                            Value::String(s) => s.parse::<f64>().map_or(Value::Null, Value::Float),
                             _ => Value::Null,
                         }
                     } else {
@@ -262,10 +251,18 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
         },
 
         // Comparison operators
-        BinaryOperator::Equal => Value::Bool(compare_values(left, right) == std::cmp::Ordering::Equal),
-        BinaryOperator::NotEqual => Value::Bool(compare_values(left, right) != std::cmp::Ordering::Equal),
-        BinaryOperator::LessThan => Value::Bool(compare_values(left, right) == std::cmp::Ordering::Less),
-        BinaryOperator::GreaterThan => Value::Bool(compare_values(left, right) == std::cmp::Ordering::Greater),
+        BinaryOperator::Equal => {
+            Value::Bool(compare_values(left, right) == std::cmp::Ordering::Equal)
+        }
+        BinaryOperator::NotEqual => {
+            Value::Bool(compare_values(left, right) != std::cmp::Ordering::Equal)
+        }
+        BinaryOperator::LessThan => {
+            Value::Bool(compare_values(left, right) == std::cmp::Ordering::Less)
+        }
+        BinaryOperator::GreaterThan => {
+            Value::Bool(compare_values(left, right) == std::cmp::Ordering::Greater)
+        }
         BinaryOperator::LessEqual => {
             let ord = compare_values(left, right);
             Value::Bool(ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal)
@@ -377,19 +374,11 @@ pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Numeric comparison with i64/f64 promotion.
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (Value::Int(a), Value::Float(b)) => {
-            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float(a), Value::Int(b)) => {
-            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
-        }
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
         (Value::String(a), Value::String(b)) => a.cmp(b),
-        (Value::Node(a), Value::Node(b)) => {
-            a.data().as_ffi().cmp(&b.data().as_ffi())
-        }
-        (Value::Edge(a), Value::Edge(b)) => {
-            a.data().as_ffi().cmp(&b.data().as_ffi())
-        }
+        (Value::Node(a), Value::Node(b)) => a.data().as_ffi().cmp(&b.data().as_ffi()),
+        (Value::Edge(a), Value::Edge(b)) => a.data().as_ffi().cmp(&b.data().as_ffi()),
         _ => Ordering::Equal,
     }
 }
@@ -403,13 +392,9 @@ pub(crate) fn property_value_to_value(pv: &PropertyValue) -> Value {
     match pv {
         PropertyValue::Int(n) => Value::Int(*n),
         PropertyValue::Float(f) => Value::Float(*f),
-        PropertyValue::String(s) => {
-            Value::String(core::str::from_utf8(s).unwrap_or("").to_owned())
-        }
+        PropertyValue::String(s) => Value::String(core::str::from_utf8(s).unwrap_or("").to_owned()),
         PropertyValue::Bool(b) => Value::Bool(*b),
-        PropertyValue::Bytes(b) => {
-            Value::String(core::str::from_utf8(b).unwrap_or("").to_owned())
-        }
+        PropertyValue::Bytes(b) => Value::String(core::str::from_utf8(b).unwrap_or("").to_owned()),
     }
 }
 

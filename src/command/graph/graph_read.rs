@@ -398,13 +398,15 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 properties,
                 embedding,
             } => {
-                store.wal_pending.push(crate::graph::wal::serialize_add_node(
-                    graph_name,
-                    *node_id,
-                    labels,
-                    properties,
-                    embedding.as_deref(),
-                ));
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_node(
+                        graph_name,
+                        *node_id,
+                        labels,
+                        properties,
+                        embedding.as_deref(),
+                    ));
             }
             cypher::executor::MutationRecord::CreateEdge {
                 edge_id,
@@ -414,15 +416,17 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 weight,
                 properties,
             } => {
-                store.wal_pending.push(crate::graph::wal::serialize_add_edge(
-                    graph_name,
-                    *edge_id,
-                    *src_id,
-                    *dst_id,
-                    *edge_type,
-                    *weight,
-                    properties.as_ref(),
-                ));
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_edge(
+                        graph_name,
+                        *edge_id,
+                        *src_id,
+                        *dst_id,
+                        *edge_type,
+                        *weight,
+                        properties.as_ref(),
+                    ));
             }
         }
     }
@@ -533,13 +537,15 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                     properties,
                     embedding,
                 } => {
-                    store.wal_pending.push(crate::graph::wal::serialize_add_node(
-                        graph_name,
-                        *node_id,
-                        labels,
-                        properties,
-                        embedding.as_deref(),
-                    ));
+                    store
+                        .wal_pending
+                        .push(crate::graph::wal::serialize_add_node(
+                            graph_name,
+                            *node_id,
+                            labels,
+                            properties,
+                            embedding.as_deref(),
+                        ));
                 }
                 cypher::executor::MutationRecord::CreateEdge {
                     edge_id,
@@ -549,15 +555,17 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                     weight,
                     properties,
                 } => {
-                    store.wal_pending.push(crate::graph::wal::serialize_add_edge(
-                        graph_name,
-                        *edge_id,
-                        *src_id,
-                        *dst_id,
-                        *edge_type,
-                        *weight,
-                        properties.as_ref(),
-                    ));
+                    store
+                        .wal_pending
+                        .push(crate::graph::wal::serialize_add_edge(
+                            graph_name,
+                            *edge_id,
+                            *src_id,
+                            *dst_id,
+                            *edge_type,
+                            *weight,
+                            properties.as_ref(),
+                        ));
                 }
             }
         }
@@ -786,8 +794,7 @@ fn exec_result_to_frame(result: &cypher::executor::ExecResult) -> Frame {
         stats_buf,
         "Nodes created: {}, Nodes deleted: {}, Properties set: {}, \
          Query internal execution time: {} us",
-        result.nodes_created, result.nodes_deleted, result.properties_set,
-        result.execution_time_us
+        result.nodes_created, result.nodes_deleted, result.properties_set, result.execution_time_us
     );
 
     Frame::Array(
@@ -1225,8 +1232,13 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         };
 
         let node_key = super::graph_write::external_id_to_node_key(ref_id);
-        let reranker =
-            crate::graph::hybrid::GraphConstrainedReRanker::new(node_key, max_hops, alpha, query_vector, k);
+        let reranker = crate::graph::hybrid::GraphConstrainedReRanker::new(
+            node_key,
+            max_hops,
+            alpha,
+            query_vector,
+            k,
+        );
         match reranker.execute(memgraph, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),

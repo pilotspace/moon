@@ -57,14 +57,12 @@ impl MmapCsrSegment {
     /// The file is mapped read-only. CSR arrays are zero-copy slices into the
     /// mapped region. Validates magic bytes and CRC32 checksum.
     pub fn from_mmap_file(path: &Path) -> Result<Self, CsrError> {
-        let file =
-            std::fs::File::open(path).map_err(|e| CsrError::IoError(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| CsrError::IoError(e.to_string()))?;
 
         // SAFETY: The file is opened read-only. The Mmap handle keeps the
         // mapping alive for the lifetime of this struct. We validate all
         // offsets and lengths before constructing slices.
-        let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| CsrError::IoError(e.to_string()))?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| CsrError::IoError(e.to_string()))?;
 
         let header_size = core::mem::size_of::<GraphSegmentHeader>(); // 128
         if mmap.len() < header_size {
@@ -112,9 +110,7 @@ impl MmapCsrSegment {
                 .checked_add(em_size)?
                 .checked_add(nm_size)
         })()
-        .ok_or_else(|| {
-            CsrError::InvalidData("size overflow in CSR header fields".to_owned())
-        })?;
+        .ok_or_else(|| CsrError::InvalidData("size overflow in CSR header fields".to_owned()))?;
         if mmap.len() < expected_len {
             return Err(CsrError::InvalidData(format!(
                 "mmap'd data too short: {} < {expected_len}",
@@ -139,10 +135,12 @@ impl MmapCsrSegment {
         // the mmap region is large enough to hold all arrays. The types are
         // #[repr(C)] with known sizes validated by const assertions in types.rs.
         // The Mmap is immutable and lives as long as self (_mmap field).
+        // SAFETY: base + header_size is in-bounds (validated above), result is u32-aligned.
         let ro_ptr = unsafe { base.add(header_size) } as *const u32;
         let ro_len = nc + 1;
 
         let ci_start = header_size + ro_len * 4;
+        // SAFETY: base + ci_start is in-bounds (validated above), result is u32-aligned.
         let ci_ptr = unsafe { base.add(ci_start) } as *const u32;
         let ci_len = ec;
 
@@ -158,6 +156,7 @@ impl MmapCsrSegment {
         let em_len = ec;
 
         let nm_start = em_start + ec * em_elem_size;
+        // SAFETY: base + nm_start is in-bounds (validated above), alignment checked below.
         let nm_ptr = unsafe { base.add(nm_start) } as *const NodeMeta;
         if !(nm_ptr as usize).is_multiple_of(core::mem::align_of::<NodeMeta>()) {
             return Err(CsrError::InvalidData(
@@ -193,10 +192,9 @@ impl MmapCsrSegment {
 
         // Rebuild indexes from mmap'd slices.
         // SAFETY: pointers were validated above, mmap is alive for this scope.
-        let node_meta_slice =
-            unsafe { core::slice::from_raw_parts(nm_ptr, nm_len) };
-        let edge_meta_slice =
-            unsafe { core::slice::from_raw_parts(em_ptr, em_len) };
+        let node_meta_slice = unsafe { core::slice::from_raw_parts(nm_ptr, nm_len) };
+        // SAFETY: em_ptr validated above (alignment checked, mmap alive for scope).
+        let edge_meta_slice = unsafe { core::slice::from_raw_parts(em_ptr, em_len) };
 
         let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(nc);
         let mut sorted_keys = Vec::with_capacity(nc);

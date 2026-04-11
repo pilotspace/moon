@@ -1551,8 +1551,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     (resp, records)
                 } else {
                     let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
-                    let resp =
-                        crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
+                    let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
                     (resp, Vec::new())
                 };
                 for record in wal_records {
