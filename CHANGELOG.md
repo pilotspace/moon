@@ -18,8 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graph MVCC**: extends existing TransactionManager with graph write intents, snapshot-isolated multi-hop traversal, bounded epoch hold (30s).
 - **Graph WAL durability**: RESP-encoded graph commands in per-shard WAL, two-pass replay (nodes before edges), CRC32-validated CSR segment persistence.
 - **Cost-based planner**: GraphStats with incremental degree tracking, graph-first vs vector-first strategy selection, P99 hub detection.
-- **Criterion benchmarks**: CSR 1-hop 923ps, edge insert 44ns, 2-hop BFS 7.15µs, CSR freeze 5.23ms.
+- **Criterion benchmarks**: CSR 1-hop 1.02ns, edge insert 64.8ns, 2-hop BFS 4.99µs, CSR freeze 5.12ms, SIMD cosine 384d 33.9ns.
+- **Fair comparison benchmark** (`tests/graph_bench_compare.rs`): Moon 2.4x FalkorDB on Cypher MATCH, 19x on native 1-hop, 23x on population.
 - **New dependencies**: `slotmap` 1.x (generational indices), `boomphf` 0.6 (MPH), `logos` 0.14 (Cypher lexer, optional).
+
+### Fixed — Deep Review Findings (2026-04-11)
+
+- **DoS protection**: `execute_profile` and `execute_mut` Cypher paths now enforce MAX_HOPS_LIMIT=20 and MAX_RESULT_ROWS=100K (were unbounded).
+- **WAL correctness**: Cypher DELETE passes actual LSN to `remove_node`/`remove_edge` (was hardcoded to 0).
+- **GRAPH.DROP metadata**: added missing phf dispatch table entry.
+- **SAFETY comments**: added to all 7 unsafe SIMD/mmap functions.
+- **BFS 30% faster**: scratch buffer reuse in SegmentMergeReader, zero-alloc CsrStorage callback, MergedNeighbor derives Copy.
+- **ParallelBfs**: uses plain HashSet on sequential path (was DashSet with 64 shards overhead).
+- **Recovery hardening**: CSR manifest path traversal validation, WAL embedding dimension cap (65536), LSN saturating_add.
+- **CI optimized**: consolidated 26 jobs → 4 per PR, concurrency groups cancel superseded runs, fixed org runner group for public repos.
 
 ### Fixed — Wave 0-4 Gap Closure (2026-04-09)
 
