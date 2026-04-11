@@ -70,6 +70,9 @@ async fn start_server() -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     tokio::spawn(async move {

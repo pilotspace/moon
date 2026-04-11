@@ -51,6 +51,9 @@ pub fn config_get(
             runtime_config.protected_mode.clone(),
         ),
         (b"acllog-max-len", runtime_config.acllog_max_len.to_string()),
+        (b"maxclients", runtime_config.maxclients.to_string()),
+        (b"timeout", runtime_config.timeout.to_string()),
+        (b"tcp-keepalive", runtime_config.tcp_keepalive.to_string()),
     ];
 
     let mut result = Vec::new();
@@ -167,6 +170,33 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                 Err(_) => {
                     return Frame::Error(Bytes::from(format!(
                         "ERR Invalid argument '{}' for CONFIG SET 'acllog-max-len'",
+                        value_str
+                    )));
+                }
+            },
+            "maxclients" => match value_str.parse::<usize>() {
+                Ok(v) => runtime_config.maxclients = v,
+                Err(_) => {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR Invalid argument '{}' for CONFIG SET 'maxclients'",
+                        value_str
+                    )));
+                }
+            },
+            "timeout" => match value_str.parse::<u64>() {
+                Ok(v) => runtime_config.timeout = v,
+                Err(_) => {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR Invalid argument '{}' for CONFIG SET 'timeout'",
+                        value_str
+                    )));
+                }
+            },
+            "tcp-keepalive" => match value_str.parse::<u64>() {
+                Ok(v) => runtime_config.tcp_keepalive = v,
+                Err(_) => {
+                    return Frame::Error(Bytes::from(format!(
+                        "ERR Invalid argument '{}' for CONFIG SET 'tcp-keepalive'",
                         value_str
                     )));
                 }

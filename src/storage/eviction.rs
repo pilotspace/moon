@@ -687,6 +687,9 @@ mod tests {
             requirepass: None,
             protected_mode: "yes".to_string(),
             acllog_max_len: 128,
+            maxclients: 10000,
+            timeout: 0,
+            tcp_keepalive: 300,
         }
     }
 

@@ -68,6 +68,27 @@ fn take_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
     std::mem::take(&mut state.read_buf_remainder)
 }
 
+/// Set TCP keepalive on a raw file descriptor.
+///
+/// Sets SO_KEEPALIVE and TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (macOS) to detect
+/// dead connections. Called once per accepted socket.
+#[cfg(unix)]
+fn set_tcp_keepalive(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
+    if keepalive_secs == 0 {
+        return;
+    }
+    use std::os::unix::io::BorrowedFd;
+    // SAFETY: fd is a valid open socket owned by the caller. We borrow it
+    // for the duration of this function — SockRef does not close on drop.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let sock = socket2::SockRef::from(&borrowed);
+    let interval = std::cmp::max(keepalive_secs / 3, 1);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(keepalive_secs))
+        .with_interval(std::time::Duration::from_secs(interval));
+    let _ = sock.set_tcp_keepalive(&ka);
+}
+
 /// Spawn a new tokio connection handler task (plain TCP or TLS).
 ///
 /// Clones all required Rc/Arc shared state and spawns via `tokio::task::spawn_local`.
@@ -138,7 +159,16 @@ pub(crate) fn spawn_tokio_connection(
     let all_regs = all_pubsub_registries.to_vec();
     let all_rsm = all_remote_sub_maps.to_vec();
     let reqpass = rtcfg.read().requirepass.clone();
+    let maxclients_tokio = rtcfg.read().maxclients;
+    let tcp_keepalive_secs = rtcfg.read().tcp_keepalive;
     let clk = cached_clock.clone();
+
+    // Set TCP keepalive on accepted socket
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        set_tcp_keepalive(tcp_stream.as_raw_fd(), tcp_keepalive_secs);
+    }
 
     // Construct ConnectionContext from cloned shared state
     let conn_ctx = crate::server::conn::ConnectionContext::new(
@@ -178,7 +208,16 @@ pub(crate) fn spawn_tokio_connection(
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "unknown".to_string());
+        let maxclients = maxclients_tokio;
         tokio::task::spawn_local(async move {
+            // maxclients check for TLS connections (plain TCP checks in handle_connection_sharded)
+            if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                tracing::warn!(
+                    "Shard {}: TLS connection rejected: maxclients reached",
+                    shard_id
+                );
+                return;
+            }
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
@@ -198,6 +237,7 @@ pub(crate) fn spawn_tokio_connection(
                     tracing::warn!("Shard {}: TLS handshake failed: {}", shard_id, e);
                 }
             }
+            crate::admin::metrics_setup::record_connection_closed();
         });
     } else {
         // Plain TCP connection
@@ -407,6 +447,14 @@ pub(crate) fn spawn_monoio_connection(
 ) {
     use crate::server::connection::handle_connection_sharded_monoio;
 
+    // Set TCP keepalive on accepted socket before converting to monoio
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let keepalive_secs = runtime_config.read().tcp_keepalive;
+        set_tcp_keepalive(std_tcp_stream.as_raw_fd(), keepalive_secs);
+    }
+
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
             let aff = affinity_tracker.clone();
@@ -460,10 +508,18 @@ pub(crate) fn spawn_monoio_connection(
                 spill_fid, do_dir,
             );
 
+            let maxclients = conn_ctx.runtime_config.read().maxclients;
             if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {
                 // Load current TLS config from ArcSwap — new connections see reloaded certs
                 let tls_cfg = tls_swap.load_full();
                 monoio::spawn(async move {
+                    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                        tracing::warn!(
+                            "Shard {}: TLS connection rejected: maxclients reached",
+                            shard_id
+                        );
+                        return;
+                    }
                     let acceptor = monoio_rustls::TlsAcceptor::from(tls_cfg);
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
@@ -488,6 +544,7 @@ pub(crate) fn spawn_monoio_connection(
                             );
                         }
                     }
+                    crate::admin::metrics_setup::record_connection_closed();
                 });
             } else {
                 // Plain TCP connection
@@ -496,6 +553,13 @@ pub(crate) fn spawn_monoio_connection(
                 #[cfg(target_os = "linux")]
                 let notifiers2 = all_notifiers.to_vec();
                 monoio::spawn(async move {
+                    if !crate::admin::metrics_setup::try_accept_connection(maxclients) {
+                        tracing::warn!(
+                            "Shard {}: connection rejected: maxclients reached",
+                            shard_id
+                        );
+                        return;
+                    }
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
@@ -511,6 +575,8 @@ pub(crate) fn spawn_monoio_connection(
 
                     // Handle migration result: extract FD via dup() and send via SPSC.
                     // libc::dup is only available on Linux (target-specific dependency).
+                    #[cfg(target_os = "linux")]
+                    let mut _migrated = false;
                     #[cfg(target_os = "linux")]
                     if let (crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (_result.0, _result.1) {
                         use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -533,6 +599,7 @@ pub(crate) fn spawn_monoio_connection(
                             };
                             match push_result {
                                 Ok(()) => {
+                                    _migrated = true;
                                     notifiers2[target_shard].notify_one();
                                     tracing::info!(
                                         "Shard {}: migrated connection {} to shard {} (monoio)",
@@ -553,6 +620,14 @@ pub(crate) fn spawn_monoio_connection(
                             }
                         }
                     }
+
+                    // Decrement connected_clients unless connection was migrated (stays alive on target shard)
+                    #[cfg(target_os = "linux")]
+                    if !_migrated {
+                        crate::admin::metrics_setup::record_connection_closed();
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    crate::admin::metrics_setup::record_connection_closed();
                 });
             }
         }

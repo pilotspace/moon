@@ -81,7 +81,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
-    crate::admin::metrics_setup::record_connection_opened();
+    // NOTE: do NOT call record_connection_opened() here — the caller
+    // (conn_accept.rs) already increments via try_accept_connection().
 
     let mut read_buf = if initial_read_buf.is_empty() {
         BytesMut::with_capacity(8192)
@@ -104,12 +105,35 @@ pub(crate) async fn handle_connection_sharded_monoio<
     );
     let db_count = ctx.shard_databases.db_count();
 
+    // Register in global client registry for CLIENT LIST/INFO/KILL.
+    crate::client_registry::register(
+        client_id,
+        peer_addr.clone(),
+        conn.current_user.clone(),
+        ctx.shard_id,
+    );
+    struct RegistryGuard(u64);
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            crate::client_registry::deregister(self.0);
+        }
+    }
+    let _registry_guard = RegistryGuard(client_id);
+
     // Functions API registry (per-connection, lazy init) — kept as local because Rc<RefCell<>> is !Send
     let func_registry = Rc::new(RefCell::new(crate::scripting::FunctionRegistry::new()));
 
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
     let mut tmp_buf = vec![0u8; 8192];
+
+    // Client idle timeout: 0 = disabled (read once, avoid lock on hot path)
+    let idle_timeout_secs = ctx.runtime_config.read().timeout;
+    let idle_timeout = if idle_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(idle_timeout_secs))
+    } else {
+        None
+    };
 
     // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
     // These are cleared and reused each iteration instead of being recreated.
@@ -125,6 +149,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
 
     loop {
+        // Check if CLIENT KILL targeted this connection
+        if crate::client_registry::is_killed(client_id) {
+            break;
+        }
+
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -387,18 +416,36 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if tmp_buf.len() < 8192 {
             tmp_buf.resize(8192, 0);
         }
-        let (result, returned_buf) = stream.read(tmp_buf).await;
-        tmp_buf = returned_buf;
-        match result {
-            Ok(0) => {
-                // Client half-closed — break out of loop.
-                // Stream drop (end of function) triggers monoio's cleanup.
-                break;
+        if let Some(dur) = idle_timeout {
+            // Timeout-aware read: select between read and sleep.
+            // monoio::select! drops the losing future, so tmp_buf ownership transfers.
+            // We allocate a fresh buffer when timeout is enabled (safety feature, not hot path).
+            let timeout_buf = std::mem::take(&mut tmp_buf);
+            monoio::select! {
+                read_result = stream.read(timeout_buf) => {
+                    let (result, returned_buf) = read_result;
+                    tmp_buf = returned_buf;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => { read_buf.extend_from_slice(&tmp_buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                _ = monoio::time::sleep(dur) => {
+                    tracing::debug!("Connection {} idle timeout ({}s)", client_id, idle_timeout_secs);
+                    break;
+                }
             }
-            Ok(n) => {
-                read_buf.extend_from_slice(&tmp_buf[..n]);
+        } else {
+            let (result, returned_buf) = stream.read(tmp_buf).await;
+            tmp_buf = returned_buf;
+            match result {
+                Ok(0) => break,
+                Ok(n) => {
+                    read_buf.extend_from_slice(&tmp_buf[..n]);
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
 
         // Inline dispatch: handle GET/SET directly from raw bytes without Frame
@@ -451,6 +498,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             continue;
         }
 
+        // CLIENT PAUSE: delay processing if server is paused
+        crate::client_pause::expire_if_needed();
+        if let Some(remaining) = crate::client_pause::check_pause(true) {
+            monoio::time::sleep(remaining).await;
+        }
+
         // Process frames with shard routing, cross-shard dispatch, and AOF logging
         // Note: do NOT clear write_buf -- it may contain responses from inline dispatch.
         // The inline path appends directly; the normal path appends via encode_frame below.
@@ -470,6 +523,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             guard.refresh_now_from_cache(&ctx.cached_clock);
         }
 
+        let mut auth_delay_ms: u64 = 0;
+
         for frame in frames.drain(..) {
             // --- AUTH gate ---
             if !conn.authenticated {
@@ -479,7 +534,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if let Some(uname) = opt_user {
                             conn.authenticated = true;
                             conn.current_user = uname;
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
                         } else {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "auth".to_string(),
                                 object: "AUTH".to_string(),
@@ -509,8 +570,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if let Some(name) = new_name {
                             conn.client_name = Some(name);
                         }
-                        if let Some(uname) = opt_user {
-                            conn.current_user = uname;
+                        if let Some(ref uname) = opt_user {
+                            conn.current_user = uname.clone();
+                        }
+                        // HELLO AUTH rate limiting
+                        if matches!(&response, Frame::Error(_)) {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
+                        } else if opt_user.is_some() {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
                         }
                         responses.push(response);
                         continue;
@@ -690,6 +761,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                 if let Some(uname) = opt_user {
                     conn.current_user = uname;
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        crate::auth_ratelimit::record_success(addr.ip());
+                    }
+                } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                    auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
                 }
                 responses.push(response);
                 continue;
@@ -710,8 +786,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some(name) = new_name {
                     conn.client_name = Some(name);
                 }
-                if let Some(uname) = opt_user {
-                    conn.current_user = uname;
+                if let Some(ref uname) = opt_user {
+                    conn.current_user = uname.clone();
+                }
+                if matches!(&response, Frame::Error(_)) {
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                    }
+                } else if opt_user.is_some() {
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        crate::auth_ratelimit::record_success(addr.ip());
+                    }
                 }
                 responses.push(response);
                 continue;
@@ -842,6 +927,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 )));
                             } else {
                                 conn.client_name = extract_bytes(&cmd_args[1]);
+                                let name_str = conn
+                                    .client_name
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string());
+                                crate::client_registry::update(client_id, |e| {
+                                    e.name = name_str;
+                                });
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                             }
                             continue;
@@ -898,18 +990,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                             }
                         }
-                        // Unknown CLIENT subcommand
-                        responses.push(Frame::Error(Bytes::from(format!(
-                            "ERR unknown subcommand '{}'",
-                            String::from_utf8_lossy(&sub_bytes)
-                        ))));
-                        continue;
+                        // Admin CLIENT subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE,
+                        // NO-EVICT, NO-TOUCH) fall through to the ACL gate below.
                     }
                 }
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'client' command",
-                )));
-                continue;
+                // Fall through — admin subcommands handled after ACL check.
             }
 
             // --- PUBLISH: local delivery + cross-shard fan-out ---
@@ -1216,6 +1301,123 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                     continue;
                 }
+            }
+
+            // --- CLIENT admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE) ---
+            // Placed AFTER ACL check so restricted users cannot access admin ops.
+            if cmd.eq_ignore_ascii_case(b"CLIENT") {
+                if let Some(sub) = cmd_args.first() {
+                    if let Some(sub_bytes) = extract_bytes(sub) {
+                        if sub_bytes.eq_ignore_ascii_case(b"LIST") {
+                            crate::client_registry::update(client_id, |e| {
+                                e.db = conn.selected_db;
+                                e.last_cmd_at = std::time::Instant::now();
+                                e.flags = crate::client_registry::ClientFlags {
+                                    subscriber: conn.subscription_count > 0,
+                                    in_multi: conn.in_multi,
+                                    blocked: false,
+                                };
+                            });
+                            let list = crate::client_registry::client_list();
+                            responses.push(Frame::BulkString(Bytes::from(list)));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"INFO") {
+                            crate::client_registry::update(client_id, |e| {
+                                e.db = conn.selected_db;
+                                e.last_cmd_at = std::time::Instant::now();
+                            });
+                            let info =
+                                crate::client_registry::client_info(client_id).unwrap_or_default();
+                            responses.push(Frame::BulkString(Bytes::from(info)));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"KILL") {
+                            let raw_args: Vec<&[u8]> = cmd_args[1..]
+                                .iter()
+                                .filter_map(|f| match f {
+                                    Frame::BulkString(b) => Some(b.as_ref()),
+                                    Frame::SimpleString(b) => Some(b.as_ref()),
+                                    _ => None,
+                                })
+                                .collect();
+                            match crate::client_registry::parse_kill_args(&raw_args) {
+                                Some(filter) => {
+                                    let count = crate::client_registry::kill_clients(&filter);
+                                    responses.push(Frame::Integer(count as i64));
+                                }
+                                None => {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"ERR syntax error. Usage: CLIENT KILL [ID id] [ADDR addr] [USER user]",
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
+                            if cmd_args.len() < 2 {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                                )));
+                            } else {
+                                let timeout_bytes = match &cmd_args[1] {
+                                    Frame::BulkString(b) => Some(b.as_ref()),
+                                    Frame::SimpleString(b) => Some(b.as_ref()),
+                                    _ => None,
+                                };
+                                match timeout_bytes
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    Some(ms) => {
+                                        let mode = if cmd_args.len() > 2 {
+                                            match &cmd_args[2] {
+                                                Frame::BulkString(b) | Frame::SimpleString(b)
+                                                    if b.eq_ignore_ascii_case(b"WRITE") =>
+                                                {
+                                                    crate::client_pause::PauseMode::Write
+                                                }
+                                                _ => crate::client_pause::PauseMode::All,
+                                            }
+                                        } else {
+                                            crate::client_pause::PauseMode::All
+                                        };
+                                        crate::client_pause::pause(ms, mode);
+                                        responses
+                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                    }
+                                    None => {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR timeout is not a valid integer or out of range",
+                                        )));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                            crate::client_pause::unpause();
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            continue;
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
+                            || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
+                        {
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            continue;
+                        }
+                        // Unknown CLIENT subcommand
+                        responses.push(Frame::Error(Bytes::from(format!(
+                            "ERR unknown subcommand '{}'",
+                            String::from_utf8_lossy(&sub_bytes)
+                        ))));
+                        continue;
+                    }
+                }
+                responses.push(Frame::Error(Bytes::from_static(
+                    b"ERR wrong number of arguments for 'client' command",
+                )));
+                continue;
             }
 
             // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
@@ -2004,6 +2206,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
+        // AUTH rate limiting: delay response to slow down brute-force attacks
+        if auth_delay_ms > 0 {
+            monoio::time::sleep(std::time::Duration::from_millis(auth_delay_ms)).await;
+        }
+
         // Serialize all responses into write_buf, then do ONE write_all syscall.
         for response in &responses {
             codec.encode_frame(response, &mut write_buf);
@@ -2018,6 +2225,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 break;
             }
         }
+
+        // Update registry with current state after each batch
+        crate::client_registry::update(client_id, |e| {
+            e.db = conn.selected_db;
+            e.last_cmd_at = std::time::Instant::now();
+            e.flags = crate::client_registry::ClientFlags {
+                subscriber: conn.subscription_count > 0,
+                in_multi: conn.in_multi,
+                blocked: false,
+            };
+        });
 
         // Check if migration was triggered during frame processing.
         // All responses for the current batch have been written, so the

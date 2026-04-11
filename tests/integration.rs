@@ -72,6 +72,9 @@ async fn start_server() -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     tokio::spawn(async move {
@@ -141,6 +144,9 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     tokio::spawn(async move {
@@ -1282,6 +1288,9 @@ async fn start_server_with_persistence(
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     tokio::spawn(async move {
@@ -2135,6 +2144,9 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     tokio::spawn(async move {
@@ -2515,6 +2527,9 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     let cancel = token.clone();
@@ -3664,6 +3679,9 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     std::thread::spawn(move || {
@@ -4295,6 +4313,9 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        maxclients: 10000,
+        timeout: 0,
+        tcp_keepalive: 300,
     };
 
     tokio::spawn(async move {

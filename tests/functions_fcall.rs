@@ -7,9 +7,20 @@
 //! Requires a running moon server on the port specified by MOON_PORT (default 16479):
 //!   ./target/release/moon --port 16479 --shards 1
 //!
-//! Run with: cargo test --release --test functions_fcall
+//! Run with: cargo test --release --test functions_fcall -- --ignored
 
 const MOON_PORT: u16 = 16479;
+
+/// Skip test if moon server is not running on MOON_PORT.
+macro_rules! require_moon_server {
+    () => {
+        let client = redis::Client::open(format!("redis://127.0.0.1:{}/", MOON_PORT)).unwrap();
+        if client.get_multiplexed_async_connection().await.is_err() {
+            eprintln!("SKIP: moon server not running on port {}", MOON_PORT);
+            return;
+        }
+    };
+}
 
 /// Get a multiplexed connection.
 async fn get_conn() -> redis::aio::MultiplexedConnection {
@@ -41,6 +52,7 @@ async fn flush_functions(con: &mut redis::aio::MultiplexedConnection) {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_load_and_fcall() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -60,6 +72,7 @@ async fn function_load_and_fcall() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_load_missing_header_errors() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -76,6 +89,7 @@ async fn function_load_missing_header_errors() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_load_duplicate_without_replace_errors() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -100,6 +114,7 @@ async fn function_load_duplicate_without_replace_errors() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_load_replace_succeeds() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -128,6 +143,7 @@ async fn function_load_replace_succeeds() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_list_returns_libraries() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -149,6 +165,7 @@ async fn function_list_returns_libraries() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_delete_removes() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -177,6 +194,7 @@ async fn function_delete_removes() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn fcall_ro_rejects_writes() {
+    require_moon_server!();
     let mut con = get_conn().await;
     flush_functions(&mut con).await;
 
@@ -198,6 +216,7 @@ async fn fcall_ro_rejects_writes() {
 #[tokio::test]
 #[ignore] // Requires running Moon server on port 16479
 async fn function_dump_restore_stats_deferred() {
+    require_moon_server!();
     let mut con = get_conn().await;
 
     // FUNCTION DUMP
@@ -231,6 +250,7 @@ async fn function_dump_restore_stats_deferred() {
 #[tokio::test]
 #[ignore = "Phase 101: FUNCTION is RAM-only; persistence deferred"]
 async fn function_not_persistent_across_restart() {
+    require_moon_server!();
     // This test documents the known limitation that functions are RAM-only
     // and will not survive a server restart. When persistence is added
     // (future phase), this test should be un-ignored and verify that
