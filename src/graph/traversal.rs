@@ -64,7 +64,7 @@ impl core::fmt::Display for TraversalError {
 // ---------------------------------------------------------------------------
 
 /// A neighbor edge from any segment (MemGraph or CSR).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct MergedNeighbor {
     /// The neighbor node key.
     pub node: NodeKey,
@@ -115,11 +115,38 @@ impl<'a> SegmentMergeReader<'a> {
 
     /// Get all neighbors of a node, merged from all segments, deduplicated.
     ///
-    /// Returns a Vec to allow callers to iterate freely. Allocates once per
-    /// call (acceptable -- this is at the end of the command path, not hot loop).
+    /// Allocates per call. For BFS/DFS hot loops, prefer [`neighbors_into`]
+    /// which reuses caller-provided scratch buffers.
     pub fn neighbors(&self, node: NodeKey) -> Vec<MergedNeighbor> {
         let mut seen: HashSet<NodeKey> = HashSet::new();
         let mut result: Vec<MergedNeighbor> = Vec::new();
+        self.neighbors_inner(node, &mut seen, &mut result);
+        result
+    }
+
+    /// Zero-allocation neighbor query: clears and fills caller-provided buffers.
+    ///
+    /// `seen` and `out` are cleared at the start, then reused across calls
+    /// to avoid per-node HashSet/Vec allocation in BFS/DFS inner loops.
+    #[inline]
+    pub fn neighbors_into(
+        &self,
+        node: NodeKey,
+        seen: &mut HashSet<NodeKey>,
+        out: &mut Vec<MergedNeighbor>,
+    ) {
+        seen.clear();
+        out.clear();
+        self.neighbors_inner(node, seen, out);
+    }
+
+    /// Shared implementation for neighbors / neighbors_into.
+    fn neighbors_inner(
+        &self,
+        node: NodeKey,
+        seen: &mut HashSet<NodeKey>,
+        result: &mut Vec<MergedNeighbor>,
+    ) {
 
         // 1. Read from mutable MemGraph (highest priority -- newest data).
         if let Some(mg) = self.memgraph {
@@ -161,42 +188,43 @@ impl<'a> SegmentMergeReader<'a> {
                 continue;
             }
 
-            for (col_idx, meta) in csr.neighbor_edges(row) {
+            let edge_type_filter = self.edge_type_filter;
+            let snapshot_lsn = self.snapshot_lsn;
+            let node_meta = csr.node_meta();
+            let csr_lsn = csr.created_lsn();
+
+            csr.for_each_neighbor_edge(row, |col_idx, meta| {
                 // Apply edge type filter.
-                if let Some(filter) = self.edge_type_filter {
+                if let Some(filter) = edge_type_filter {
                     if meta.edge_type != filter {
-                        continue;
+                        return;
                     }
                 }
 
                 // Resolve col_idx back to a NodeKey via node_meta.
-                if (col_idx as usize) < csr.node_meta().len() {
-                    let target_meta = &csr.node_meta()[col_idx as usize];
+                if (col_idx as usize) < node_meta.len() {
+                    let target_meta = &node_meta[col_idx as usize];
                     // Check target node visibility (not deleted at snapshot).
                     if target_meta.deleted_lsn != u64::MAX
-                        && target_meta.deleted_lsn <= self.snapshot_lsn
+                        && target_meta.deleted_lsn <= snapshot_lsn
                     {
-                        continue;
+                        return;
                     }
                     let target_key: NodeKey =
                         slotmap::KeyData::from_ffi(target_meta.external_id).into();
 
                     if seen.insert(target_key) {
-                        // CSR EdgeMeta doesn't store weight/timestamp directly.
-                        // Use segment created_lsn as timestamp, 1.0 as default weight.
                         result.push(MergedNeighbor {
                             node: target_key,
                             edge: slotmap::KeyData::from_ffi(0).into(),
                             edge_type: meta.edge_type,
                             weight: 1.0,
-                            timestamp: csr.created_lsn(),
+                            timestamp: csr_lsn,
                         });
                     }
                 }
-            }
+            });
         }
-
-        result
     }
 
     /// Hint sequential access on all CSR segments (for BFS/DFS traversals).
@@ -288,13 +316,17 @@ impl BoundedBfs {
         let mut frontier: VecDeque<(NodeKey, u32)> = VecDeque::new();
         frontier.push_back((start, 0));
 
+        // Scratch buffers reused across all neighbor lookups (avoids per-node alloc).
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
         while let Some((current, depth)) = frontier.pop_front() {
             if depth >= self.depth_limit {
                 continue;
             }
 
-            let neighbors = reader.neighbors(current);
-            for neighbor in neighbors {
+            reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+            for &neighbor in &nb_buf {
                 if visited_set.contains(&neighbor.node) {
                     continue;
                 }
@@ -309,7 +341,7 @@ impl BoundedBfs {
 
                 visited_set.insert(neighbor.node);
                 let next_depth = depth + 1;
-                result.push((neighbor.node, next_depth, Some(neighbor.clone())));
+                result.push((neighbor.node, next_depth, Some(neighbor)));
                 frontier.push_back((neighbor.node, next_depth));
             }
         }
@@ -372,61 +404,68 @@ impl ParallelBfs {
 
         reader.madvise_sequential();
 
-        let visited: DashSet<NodeKey> = DashSet::new();
-        visited.insert(start);
+        let mut visited_set: HashSet<NodeKey> = HashSet::new();
+        visited_set.insert(start);
 
-        let result: Mutex<Vec<(NodeKey, u32, Option<MergedNeighbor>)>> =
-            Mutex::new(vec![(start, 0, None)]);
-
+        let mut result: Vec<(NodeKey, u32, Option<MergedNeighbor>)> = vec![(start, 0, None)];
         let mut frontier: Vec<NodeKey> = vec![start];
         let mut depth: u32 = 0;
+
+        // Scratch buffers reused across all neighbor lookups.
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
 
         while !frontier.is_empty() {
             if depth >= self.depth_limit {
                 break;
             }
 
-            // Phase 1: Collect neighbor lists sequentially (reader is !Send).
-            let neighbor_lists: Vec<(NodeKey, Vec<MergedNeighbor>)> = frontier
-                .iter()
-                .map(|&node| (node, reader.neighbors(node)))
-                .collect();
-
             let next_depth = depth + 1;
-            let mut next_frontier: Vec<NodeKey>;
 
             if frontier.len() <= PARALLEL_THRESHOLD {
-                // --- Sequential path (PAR-03): zero parallelism overhead ---
-                next_frontier = Vec::new();
-                let mut res = result.lock();
-                for (_src, neighbors) in &neighbor_lists {
-                    for neighbor in neighbors {
-                        if visited.insert(neighbor.node) {
-                            res.push((neighbor.node, next_depth, Some(neighbor.clone())));
+                // --- Sequential path: plain HashSet, no DashSet/Mutex overhead ---
+                let mut next_frontier = Vec::new();
+                for &node in &frontier {
+                    reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
+                    for &neighbor in &nb_buf {
+                        if visited_set.insert(neighbor.node) {
+                            result.push((neighbor.node, next_depth, Some(neighbor)));
                             next_frontier.push(neighbor.node);
                         }
                     }
                 }
+                frontier = next_frontier;
             } else {
-                // --- Parallel path (PAR-01): morsel-driven expansion ---
+                // --- Parallel path: collect neighbors sequentially (reader is !Send),
+                //     then process in parallel morsels via std::thread::scope ---
+                let neighbor_lists: Vec<Vec<MergedNeighbor>> = frontier
+                    .iter()
+                    .map(|&node| {
+                        reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
+                        nb_buf.clone()
+                    })
+                    .collect();
+
+                // Upgrade to DashSet only for the parallel phase.
+                let dash_visited: DashSet<NodeKey> = DashSet::with_capacity(visited_set.len());
+                for &k in &visited_set {
+                    dash_visited.insert(k);
+                }
+
                 let per_morsel_results: Mutex<Vec<Vec<(NodeKey, u32, Option<MergedNeighbor>)>>> =
                     Mutex::new(Vec::new());
 
                 std::thread::scope(|s| {
                     for chunk in neighbor_lists.chunks(MORSEL_SIZE) {
-                        let visited_ref = &visited;
+                        let visited_ref = &dash_visited;
                         let per_morsel_ref = &per_morsel_results;
                         s.spawn(move || {
                             let mut local: Vec<(NodeKey, u32, Option<MergedNeighbor>)> =
                                 Vec::new();
-                            for (_src, neighbors) in chunk {
-                                for neighbor in neighbors {
+                            for neighbors in chunk {
+                                for &neighbor in neighbors {
                                     if visited_ref.insert(neighbor.node) {
-                                        local.push((
-                                            neighbor.node,
-                                            next_depth,
-                                            Some(neighbor.clone()),
-                                        ));
+                                        local.push((neighbor.node, next_depth, Some(neighbor)));
                                     }
                                 }
                             }
@@ -435,33 +474,31 @@ impl ParallelBfs {
                     }
                 });
 
-                // Merge morsel results.
+                // Merge morsel results back into sequential structures.
                 let morsel_vecs = per_morsel_results.into_inner();
-                next_frontier = Vec::new();
-                let mut res = result.lock();
+                let mut next_frontier = Vec::new();
                 for morsel in &morsel_vecs {
                     for entry in morsel {
                         next_frontier.push(entry.0);
-                        res.push(entry.clone());
+                        visited_set.insert(entry.0);
+                        result.push(*entry);
                     }
                 }
+                frontier = next_frontier;
             }
 
             // Check frontier cap.
-            if visited.len() >= self.frontier_cap {
+            if visited_set.len() >= self.frontier_cap {
                 return Err(TraversalError::FrontierCapExceeded {
                     cap: self.frontier_cap,
                     depth: next_depth,
                 });
             }
 
-            frontier = next_frontier;
             depth = next_depth;
         }
 
-        Ok(BfsResult {
-            visited: result.into_inner(),
-        })
+        Ok(BfsResult { visited: result })
     }
 }
 
@@ -510,6 +547,10 @@ impl BoundedDfs {
         let mut stack: Vec<(NodeKey, u32, f64)> = Vec::new();
         stack.push((start, 0, 0.0));
 
+        // Scratch buffers reused across all neighbor lookups.
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
         while let Some((current, depth, cum_cost)) = stack.pop() {
             if visited_set.contains(&current) {
                 continue;
@@ -521,8 +562,8 @@ impl BoundedDfs {
                 continue;
             }
 
-            let neighbors = reader.neighbors(current);
-            for neighbor in neighbors {
+            reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+            for &neighbor in &nb_buf {
                 if visited_set.contains(&neighbor.node) {
                     continue;
                 }
@@ -587,7 +628,9 @@ impl Ord for DijkstraEntry {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Less, // self is NaN = high cost → less priority
                     (false, true) => Ordering::Greater, // other is NaN = high cost → self wins
-                    _ => unreachable!(),
+                    // Both NaN checks returned false — logically unreachable since
+                    // partial_cmp returns None only when at least one operand is NaN.
+                    _ => Ordering::Equal,
                 }
             }
         }
@@ -631,6 +674,10 @@ impl DijkstraTraversal {
             cost: 0.0,
         });
 
+        // Scratch buffers reused across all neighbor lookups.
+        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
+
         while let Some(DijkstraEntry { node, cost }) = heap.pop() {
             // Found target -- reconstruct path.
             if node == target {
@@ -653,8 +700,8 @@ impl DijkstraTraversal {
                 continue;
             }
 
-            let neighbors = reader.neighbors(node);
-            for neighbor in neighbors {
+            reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
+            for &neighbor in &nb_buf {
                 let edge_cost = self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
                 let new_cost = cost + edge_cost;
 

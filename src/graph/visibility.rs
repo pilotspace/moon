@@ -58,7 +58,11 @@ pub fn is_edge_visible(
 }
 
 /// Check if a transaction is in the committed bitmap.
-/// RoaringBitmap only supports u32; txn_ids beyond u32::MAX are treated as uncommitted.
+///
+/// RoaringBitmap only supports u32 keys. txn_ids beyond u32::MAX are treated
+/// as uncommitted. This is safe because graph txn_ids are allocated from a
+/// separate counter that stays within u32 range. If explicit transactions are
+/// added in the future, consider migrating to `RoaringTreemap` (u64 support).
 #[inline(always)]
 fn is_txn_committed(txn_id: u64, committed: &RoaringBitmap) -> bool {
     if txn_id > u32::MAX as u64 {

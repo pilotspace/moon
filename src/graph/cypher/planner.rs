@@ -106,10 +106,10 @@ impl PlanCache {
         self.cache.get(&hash).cloned()
     }
 
-    /// Insert a plan into the cache. Evicts oldest if at capacity.
+    /// Insert a plan into the cache. Evicts an arbitrary entry if at capacity.
     pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) {
         if self.cache.len() >= self.max_entries {
-            // Simple eviction: remove first key (not ideal but sufficient for now).
+            // Simple eviction: remove arbitrary key (HashMap has no ordering).
             if let Some(&first_key) = self.cache.keys().next() {
                 self.cache.remove(&first_key);
             }

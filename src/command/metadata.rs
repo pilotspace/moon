@@ -391,6 +391,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "GRAPH.ADDNODE" => CommandMeta { name: "GRAPH.ADDNODE", arity: -3, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.ADDEDGE" => CommandMeta { name: "GRAPH.ADDEDGE", arity: -5, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.DELETE" => CommandMeta { name: "GRAPH.DELETE", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.DROP" => CommandMeta { name: "GRAPH.DROP", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.NEIGHBORS" => CommandMeta { name: "GRAPH.NEIGHBORS", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.INFO" => CommandMeta { name: "GRAPH.INFO", arity: 2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.LIST" => CommandMeta { name: "GRAPH.LIST", arity: 1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },

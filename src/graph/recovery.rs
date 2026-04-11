@@ -102,6 +102,15 @@ pub fn recover_graph_store(
 
         for entry in &manifest.segments {
             let seg_path = shard_dir.join(&entry.file_path);
+            // Validate path does not escape the shard directory (defense-in-depth).
+            if !seg_path.starts_with(&shard_dir) {
+                tracing::warn!(
+                    graph = %graph_name,
+                    path = %seg_path.display(),
+                    "skipping segment with path traversal in manifest"
+                );
+                continue;
+            }
             match CsrStorage::from_file(&seg_path) {
                 Ok(seg) => {
                     tracing::info!(

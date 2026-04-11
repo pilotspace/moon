@@ -47,6 +47,8 @@ pub fn cosine_similarity_scalar_pub(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
+// SAFETY: Caller must ensure target is aarch64 (NEON mandatory on ARMv8-A).
+// Both slices must have equal length (checked by public dispatch function).
 unsafe fn cosine_similarity_neon(a: &[f32], b: &[f32]) -> f64 {
     use std::arch::aarch64::*;
 
@@ -133,6 +135,8 @@ unsafe fn cosine_similarity_neon(a: &[f32], b: &[f32]) -> f64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
+// SAFETY: Caller must ensure AVX2+FMA feature is available (runtime detected).
+// Both slices must have equal length (checked by public dispatch function).
 unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f64 {
     use std::arch::x86_64::*;
 
@@ -230,6 +234,7 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
+// SAFETY: Caller must ensure AVX2 feature is available.
 unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     // Sum high and low 128-bit halves.

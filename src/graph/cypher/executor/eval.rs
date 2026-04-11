@@ -318,10 +318,24 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
         },
 
         BinaryOperator::RegexMatch => {
-            // Basic regex matching -- just string contains for now.
+            // Cypher `=~` operator: regex match against the text.
+            // TODO: Add `regex` crate dependency for full regex support.
+            // For now, support basic patterns: exact match, prefix (*suffix),
+            // suffix (prefix*), and contains (*middle*).
             match (left, right) {
                 (Value::String(text), Value::String(pattern)) => {
-                    Value::Bool(text.contains(pattern.as_str()))
+                    let matched = if let Some(stripped) = pattern.strip_prefix(".*") {
+                        if let Some(middle) = stripped.strip_suffix(".*") {
+                            text.contains(middle)
+                        } else {
+                            text.ends_with(stripped)
+                        }
+                    } else if let Some(stripped) = pattern.strip_suffix(".*") {
+                        text.starts_with(stripped)
+                    } else {
+                        text == pattern
+                    };
+                    Value::Bool(matched)
                 }
                 _ => Value::Null,
             }

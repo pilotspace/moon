@@ -84,11 +84,17 @@ pub fn execute_mut(
                             new_rows.push(new_row);
                         }
                     } else {
+                        // Variable-length expansion via BFS.
+                        // Enforce limits to prevent DoS via exponential row growth.
+                        const MAX_HOPS_LIMIT: u32 = 20;
+                        const MAX_RESULT_ROWS: usize = 100_000;
+                        let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
+
                         let mut frontier = vec![src_key];
                         let mut visited = std::collections::HashSet::new();
                         visited.insert(src_key);
 
-                        for hop in 1..=*max_hops {
+                        for hop in 1..=capped_max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
                                 for (edge_key, neighbor_key) in
@@ -114,11 +120,17 @@ pub fn execute_mut(
                                             Value::Node(neighbor_key),
                                         );
                                         new_rows.push(new_row);
+                                        if new_rows.len() >= MAX_RESULT_ROWS {
+                                            break;
+                                        }
                                     }
+                                }
+                                if new_rows.len() >= MAX_RESULT_ROWS {
+                                    break;
                                 }
                             }
                             frontier = next_frontier;
-                            if frontier.is_empty() {
+                            if frontier.is_empty() || new_rows.len() >= MAX_RESULT_ROWS {
                                 break;
                             }
                         }
@@ -390,11 +402,11 @@ pub fn execute_mut(
                         let val = eval_expr(expr, row, &graph.write_buf, params);
                         match val {
                             Value::Node(nk) => {
-                                graph.write_buf.remove_node(nk, 0);
+                                graph.write_buf.remove_node(nk, lsn);
                                 nodes_deleted += 1;
                             }
                             Value::Edge(ek) => {
-                                graph.write_buf.remove_edge(ek, 0);
+                                graph.write_buf.remove_edge(ek, lsn);
                             }
                             _ => {}
                         }

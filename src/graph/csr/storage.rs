@@ -179,7 +179,21 @@ impl CsrStorage {
     }
 
     /// Iterator over valid outgoing neighbor edges for a CSR row.
+    ///
+    /// Note: materializes into Vec due to enum dispatch. For hot paths,
+    /// prefer [`for_each_neighbor_edge`] which avoids the allocation.
     pub fn neighbor_edges(&self, row: u32) -> Vec<(u32, EdgeMeta)> {
+        let mut out = Vec::new();
+        self.for_each_neighbor_edge(row, |col, meta| out.push((col, meta)));
+        out
+    }
+
+    /// Zero-allocation neighbor edge iteration via callback.
+    ///
+    /// Calls `f(col_idx, edge_meta)` for each valid outgoing edge from `row`.
+    /// Eliminates the Vec allocation in [`neighbor_edges`] for BFS/DFS hot loops.
+    #[inline]
+    pub fn for_each_neighbor_edge(&self, row: u32, mut f: impl FnMut(u32, EdgeMeta)) {
         let r = row as usize;
         let ro = self.row_offsets();
         let (start, end) = if r < self.node_count() as usize {
@@ -190,15 +204,11 @@ impl CsrStorage {
         let ci = self.col_indices();
         let em = self.edge_meta();
         let validity = self.validity();
-        (start..end)
-            .filter_map(|idx| {
-                if validity.contains(idx as u32) {
-                    Some((ci[idx], em[idx]))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        for idx in start..end {
+            if validity.contains(idx as u32) {
+                f(ci[idx], em[idx]);
+            }
+        }
     }
 
     /// Write the segment to a file (only supported for Heap variant).

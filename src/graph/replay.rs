@@ -177,6 +177,10 @@ impl GraphReplayCollector {
                     let Some(dim) = parse_usize(args[pos + 1]) else {
                         return false;
                     };
+                    // Reject unreasonably large dimensions to prevent DoS from malformed WAL.
+                    if dim > 65536 {
+                        return false;
+                    }
                     let embed_bytes = args[pos + 2];
                     if embed_bytes.len() == dim * 4 {
                         let mut vec = Vec::with_capacity(dim);

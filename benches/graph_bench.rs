@@ -13,6 +13,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use moon::graph::csr::CsrSegment;
+use moon::graph::csr::storage::CsrStorage;
 use moon::graph::memgraph::MemGraph;
 use moon::graph::simd;
 use moon::graph::traversal::{BoundedBfs, SegmentMergeReader};
@@ -114,7 +115,7 @@ fn bench_bfs_2hop(c: &mut Criterion) {
     for &node_count in &[1_000usize, 10_000] {
         let (g, nodes) = build_memgraph(node_count, 10);
         let seed = nodes[0];
-        let csr_segments: Vec<Arc<CsrSegment>> = Vec::new();
+        let csr_segments: Vec<Arc<CsrStorage>> = Vec::new();
 
         group.bench_with_input(
             BenchmarkId::new("bfs_memgraph", node_count),
@@ -140,7 +141,7 @@ fn bench_bfs_2hop(c: &mut Criterion) {
     for &node_count in &[1_000usize, 10_000] {
         let (csr, nodes) = build_csr(node_count, 10);
         let seed = nodes[0];
-        let csr_segments = vec![Arc::new(csr)];
+        let csr_segments = vec![Arc::new(CsrStorage::Heap(csr))];
 
         group.bench_with_input(
             BenchmarkId::new("bfs_csr", node_count),

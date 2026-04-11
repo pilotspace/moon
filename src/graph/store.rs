@@ -113,7 +113,7 @@ impl GraphStore {
     /// Allocate the next monotonic LSN for a graph mutation.
     pub fn allocate_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
+        self.next_lsn = self.next_lsn.saturating_add(1);
         lsn
     }
 
