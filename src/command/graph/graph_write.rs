@@ -282,6 +282,20 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 weight,
                 props.as_ref(),
             ));
+
+            // Check if compaction threshold reached after edge insertion.
+            // If so, freeze the mutable MemGraph and convert to an immutable
+            // CSR segment. This is synchronous and fast (<5ms at 64K edges).
+            let needs_compact = store
+                .get_graph(graph_name)
+                .is_some_and(|g| g.should_compact());
+            if needs_compact {
+                let compact_lsn = store.allocate_lsn();
+                if let Some(graph) = store.get_graph_mut(graph_name) {
+                    graph.freeze_and_compact(compact_lsn);
+                }
+            }
+
             Frame::Integer(external_id as i64)
         }
         Err(crate::graph::memgraph::GraphError::NodeNotFound) => Frame::Error(Bytes::from_static(

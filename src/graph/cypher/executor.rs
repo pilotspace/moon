@@ -432,6 +432,7 @@ pub fn execute(
         nodes_deleted,
         properties_set,
         execution_time_us: elapsed,
+        mutations: Vec::new(),
     })
 }
 
@@ -792,6 +793,7 @@ pub fn execute_profile(
             nodes_deleted,
             properties_set,
             execution_time_us: elapsed,
+            mutations: Vec::new(),
         },
         operator_profiles: profiles,
     })
@@ -1282,6 +1284,7 @@ pub fn execute_mut(
     graph: &mut NamedGraph,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
+    lsn: u64,
 ) -> Result<ExecResult, ExecError> {
     let start = std::time::Instant::now();
 
@@ -1290,6 +1293,7 @@ pub fn execute_mut(
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let mut nodes_created: u64 = 0;
     let mut nodes_deleted: u64 = 0;
+    let mut mutations: Vec<MutationRecord> = Vec::new();
     let mut properties_set: u64 = 0;
 
     for op in &plan.operators {
@@ -1536,7 +1540,6 @@ pub fn execute_mut(
             }
 
             PhysicalOp::CreatePattern { patterns } => {
-                let lsn = 0u64; // Placeholder LSN; WAL layer assigns real LSNs.
                 let mut new_rows = Vec::with_capacity(rows.len());
                 for row in &rows {
                     let mut new_row = row.clone();
@@ -1558,8 +1561,16 @@ pub fn execute_mut(
                                         .map(|pv| (label_to_id(name.as_bytes()), pv))
                                 })
                                 .collect();
+                            let labels_clone = labels.clone();
+                            let props_clone = props.clone();
                             let nk = graph.write_buf.add_node(labels, props, None, lsn);
                             nodes_created += 1;
+                            mutations.push(MutationRecord::CreateNode {
+                                node_id: nk.data().as_ffi(),
+                                labels: labels_clone,
+                                properties: props_clone,
+                                embedding: None,
+                            });
                             if let Some(ref var) = pn.variable {
                                 new_row.insert(var.clone(), Value::Node(nk));
                             }
@@ -1574,9 +1585,18 @@ pub fn execute_mut(
                                 .first()
                                 .map(|t| label_to_id(t.as_bytes()))
                                 .unwrap_or(0);
-                            let _ = graph.write_buf.add_edge(
+                            if let Ok(ek) = graph.write_buf.add_edge(
                                 src, dst, edge_type, 1.0, None, lsn,
-                            );
+                            ) {
+                                mutations.push(MutationRecord::CreateEdge {
+                                    edge_id: ek.data().as_ffi(),
+                                    src_id: src.data().as_ffi(),
+                                    dst_id: dst.data().as_ffi(),
+                                    edge_type,
+                                    weight: 1.0,
+                                    properties: None,
+                                });
+                            }
                         }
                     }
                     new_rows.push(new_row);
@@ -1657,7 +1677,6 @@ pub fn execute_mut(
                 on_create,
                 on_match,
             } => {
-                let lsn = 0u64;
                 let mut new_rows = Vec::with_capacity(rows.len());
 
                 for row in &rows {
@@ -1724,10 +1743,18 @@ pub fn execute_mut(
                             let props: PropertyMap = match_props
                                 .into_iter()
                                 .collect();
+                            let labels_clone = label_ids.clone();
+                            let props_clone = props.clone();
                             let nk = graph.write_buf.add_node(
                                 label_ids, props, None, lsn,
                             );
                             nodes_created += 1;
+                            mutations.push(MutationRecord::CreateNode {
+                                node_id: nk.data().as_ffi(),
+                                labels: labels_clone,
+                                properties: props_clone,
+                                embedding: None,
+                            });
                             if let Some(ref var) = pn.variable {
                                 new_row.insert(var.clone(), Value::Node(nk));
                             }
@@ -1790,9 +1817,18 @@ pub fn execute_mut(
                                     );
                                 } else {
                                     // Create edge.
-                                    let _ = graph.write_buf.add_edge(
+                                    if let Ok(ek) = graph.write_buf.add_edge(
                                         sk, dk, edge_type_id, 1.0, None, lsn,
-                                    );
+                                    ) {
+                                        mutations.push(MutationRecord::CreateEdge {
+                                            edge_id: ek.data().as_ffi(),
+                                            src_id: sk.data().as_ffi(),
+                                            dst_id: dk.data().as_ffi(),
+                                            edge_type: edge_type_id,
+                                            weight: 1.0,
+                                            properties: None,
+                                        });
+                                    }
                                     if let Some(ref var) = src_pn.variable {
                                         new_row.insert(var.clone(), Value::Node(sk));
                                     }
@@ -1810,7 +1846,9 @@ pub fn execute_mut(
                             }
                             _ => {
                                 // Create missing nodes and edge.
-                                let sk = src_key.unwrap_or_else(|| {
+                                let sk = if let Some(existing) = src_key {
+                                    existing
+                                } else {
                                     let labels: SmallVec<[u16; 4]> = src_pn
                                         .labels
                                         .iter()
@@ -1827,13 +1865,23 @@ pub fn execute_mut(
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
                                         })
                                         .collect();
+                                    let labels_clone = labels.clone();
+                                    let props_clone = props.clone();
                                     let nk = graph.write_buf.add_node(
                                         labels, props, None, lsn,
                                     );
                                     nodes_created += 1;
+                                    mutations.push(MutationRecord::CreateNode {
+                                        node_id: nk.data().as_ffi(),
+                                        labels: labels_clone,
+                                        properties: props_clone,
+                                        embedding: None,
+                                    });
                                     nk
-                                });
-                                let dk = dst_key.unwrap_or_else(|| {
+                                };
+                                let dk = if let Some(existing) = dst_key {
+                                    existing
+                                } else {
                                     let labels: SmallVec<[u16; 4]> = dst_pn
                                         .labels
                                         .iter()
@@ -1850,15 +1898,32 @@ pub fn execute_mut(
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
                                         })
                                         .collect();
+                                    let labels_clone = labels.clone();
+                                    let props_clone = props.clone();
                                     let nk = graph.write_buf.add_node(
                                         labels, props, None, lsn,
                                     );
                                     nodes_created += 1;
+                                    mutations.push(MutationRecord::CreateNode {
+                                        node_id: nk.data().as_ffi(),
+                                        labels: labels_clone,
+                                        properties: props_clone,
+                                        embedding: None,
+                                    });
                                     nk
-                                });
-                                let _ = graph.write_buf.add_edge(
+                                };
+                                if let Ok(ek) = graph.write_buf.add_edge(
                                     sk, dk, edge_type_id, 1.0, None, lsn,
-                                );
+                                ) {
+                                    mutations.push(MutationRecord::CreateEdge {
+                                        edge_id: ek.data().as_ffi(),
+                                        src_id: sk.data().as_ffi(),
+                                        dst_id: dk.data().as_ffi(),
+                                        edge_type: edge_type_id,
+                                        weight: 1.0,
+                                        properties: None,
+                                    });
+                                }
                                 if let Some(ref var) = src_pn.variable {
                                     new_row.insert(var.clone(), Value::Node(sk));
                                 }
@@ -1914,6 +1979,7 @@ pub fn execute_mut(
         nodes_deleted,
         properties_set,
         execution_time_us: elapsed,
+        mutations,
     })
 }
 
@@ -2184,7 +2250,7 @@ mod tests {
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
 
         let graph = store.get_graph_mut(b"test").expect("graph");
-        let result = execute_mut(graph, &plan, &HashMap::new()).expect("exec");
+        let result = execute_mut(graph, &plan, &HashMap::new(), 0).expect("exec");
 
         assert_eq!(result.nodes_created, 1);
         assert_eq!(result.rows.len(), 1);
@@ -2228,7 +2294,7 @@ mod tests {
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
 
         let graph = store.get_graph_mut(b"test").expect("graph");
-        let result = execute_mut(graph, &plan, &HashMap::new()).expect("exec");
+        let result = execute_mut(graph, &plan, &HashMap::new(), 0).expect("exec");
 
         assert_eq!(result.nodes_created, 0, "should not create a new node");
         assert_eq!(result.rows.len(), 1);
@@ -2262,7 +2328,7 @@ mod tests {
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
 
         let graph = store.get_graph_mut(b"test").expect("graph");
-        let result = execute_mut(graph, &plan, &HashMap::new()).expect("exec");
+        let result = execute_mut(graph, &plan, &HashMap::new(), 0).expect("exec");
 
         assert_eq!(result.nodes_created, 2, "should create two nodes");
         assert_eq!(result.rows.len(), 1);
