@@ -6,6 +6,10 @@ on:
   schedule:
     - cron: '0 2 * * *'
 
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

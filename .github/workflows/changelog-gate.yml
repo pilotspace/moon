@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: changelog-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   changelog-check:
     name: Require CHANGELOG update

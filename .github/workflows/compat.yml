@@ -6,6 +6,10 @@ on:
   schedule:
     - cron: '0 4 * * 1'
 
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   redis-py:
     name: redis-py

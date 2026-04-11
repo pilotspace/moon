@@ -14,6 +14,10 @@ on:
       - 'Cargo.toml'
       - 'benches/**'
 
+concurrency:
+  group: bench-gate-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   MOON_NO_URING: "1"
