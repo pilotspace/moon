@@ -374,8 +374,10 @@ pub fn try_accept_connection(maxclients: usize) -> bool {
         record_connection_opened();
         return true;
     }
-    // CAS loop: only increment if under limit
-    let mut current = CONNECTED_CLIENTS.load(Ordering::Relaxed);
+    // CAS loop: only increment if under limit.
+    // AcqRel on success ensures the counter increment is visible to other cores
+    // before the connection handler runs (important on ARM/weak-memory archs).
+    let mut current = CONNECTED_CLIENTS.load(Ordering::Acquire);
     loop {
         if current >= maxclients as u64 {
             return false;
@@ -383,8 +385,8 @@ pub fn try_accept_connection(maxclients: usize) -> bool {
         match CONNECTED_CLIENTS.compare_exchange_weak(
             current,
             current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         ) {
             Ok(_) => {
                 TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);

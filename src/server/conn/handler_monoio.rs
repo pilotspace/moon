@@ -2182,6 +2182,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
+        // Update registry with current state after each batch
+        crate::client_registry::update(client_id, |e| {
+            e.db = conn.selected_db;
+            e.last_cmd_at = std::time::Instant::now();
+            e.flags = crate::client_registry::ClientFlags {
+                subscriber: conn.subscription_count > 0,
+                in_multi: conn.in_multi,
+                blocked: false,
+            };
+        });
+
         // Check if migration was triggered during frame processing.
         // All responses for the current batch have been written, so the
         // client sees no interruption -- TCP socket stays open.

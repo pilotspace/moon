@@ -344,7 +344,8 @@ pub fn handle_acl(
                 256 // default: 256 bits = 64 hex chars
             };
             let byte_count = (bits + 7) / 8;
-            let buf: Vec<u8> = (0..byte_count).map(|_| rand::random::<u8>()).collect();
+            let mut buf = vec![0u8; byte_count];
+            rand::RngExt::fill(&mut rand::rng(), &mut buf[..]);
             let hex = hex::encode(&buf);
             // Truncate to exact number of hex chars for the requested bits
             let hex_chars = (bits + 3) / 4; // 4 bits per hex char

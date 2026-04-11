@@ -77,15 +77,13 @@ fn set_tcp_keepalive(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
     if keepalive_secs == 0 {
         return;
     }
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
-    // SAFETY: we borrow the fd temporarily — socket2::Socket does NOT take ownership
-    // because we call into_raw_fd() before this scope ends, preventing double-close.
-    let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
+    use std::os::unix::io::BorrowedFd;
+    // SAFETY: fd is a valid open socket owned by the caller. We borrow it
+    // for the duration of this function — SockRef does not close on drop.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let sock = socket2::SockRef::from(&borrowed);
     let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(keepalive_secs));
-    // Ignore errors — keepalive is best-effort
     let _ = sock.set_tcp_keepalive(&ka);
-    // Release ownership back — we don't own this fd
-    let _ = sock.into_raw_fd();
 }
 
 /// Spawn a new tokio connection handler task (plain TCP or TLS).
