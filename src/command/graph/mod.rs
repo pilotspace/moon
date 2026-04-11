@@ -417,6 +417,80 @@ mod tests {
     }
 
     #[test]
+    fn test_graph_profile_no_graph() {
+        let mut store = GraphStore::new();
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.PROFILE", b"g", b"MATCH (n) RETURN n"]),
+        );
+        if let Frame::Error(msg) = &resp {
+            assert!(msg.as_ref().starts_with(b"ERR graph not found"));
+        } else {
+            panic!("expected error, got {:?}", resp);
+        }
+    }
+
+    #[test]
+    fn test_graph_profile_basic() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person", b"name", b"Alice"]),
+        );
+
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.PROFILE", b"g", b"MATCH (n:Person) RETURN n.name"]),
+        );
+
+        // Response should be Array with 2 elements: [exec_result, operator_profiles]
+        if let Frame::Array(items) = &resp {
+            assert_eq!(items.len(), 2, "expected [results, profiles], got {} items", items.len());
+
+            // First element is the exec result (Array with headers, rows, stats)
+            assert!(matches!(&items[0], Frame::Array(_)), "first element should be exec result array");
+
+            // Second element is operator profiles array
+            if let Frame::Array(profiles) = &items[1] {
+                // Should have at least 2 operators: NodeScan + Project
+                assert!(
+                    profiles.len() >= 2,
+                    "expected at least 2 operator profiles, got {}",
+                    profiles.len()
+                );
+
+                // Each profile entry is [name, row_count, duration_us]
+                if let Frame::Array(first_profile) = &profiles[0] {
+                    assert_eq!(first_profile.len(), 3, "each profile should have 3 elements");
+                    // First should be BulkString with operator name
+                    assert!(
+                        matches!(&first_profile[0], Frame::BulkString(b) if b.as_ref() == b"NodeScan"),
+                        "first operator should be NodeScan, got {:?}",
+                        first_profile[0]
+                    );
+                    // Second should be Integer (row_count)
+                    assert!(matches!(&first_profile[1], Frame::Integer(_)));
+                    // Third should be Integer (duration_us)
+                    assert!(matches!(&first_profile[2], Frame::Integer(_)));
+                } else {
+                    panic!("expected Array for profile entry, got {:?}", profiles[0]);
+                }
+            } else {
+                panic!("expected Array for profiles, got {:?}", items[1]);
+            }
+        } else {
+            panic!("expected Array, got {:?}", resp);
+        }
+    }
+
+    #[test]
+    fn test_graph_profile_is_read_only() {
+        // GRAPH.PROFILE should NOT be a write command
+        assert!(!is_graph_write_cmd(b"GRAPH.PROFILE"));
+    }
+
+    #[test]
     fn test_graph_hybrid_unknown_mode() {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
