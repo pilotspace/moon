@@ -593,4 +593,31 @@ mod tests {
             panic!("expected Array");
         }
     }
+
+    #[test]
+    fn test_graph_hybrid_rerank_no_graph() {
+        let mut store = GraphStore::new();
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.HYBRID",
+                b"g",
+                b"RERANK",
+                b"1",
+                b"3",
+                b"0.7",
+                b"5",
+                b"1.0 0.0 0.0",
+            ]),
+        );
+        if let Frame::Error(msg) = &resp {
+            assert!(
+                msg.as_ref().starts_with(b"ERR graph not found"),
+                "expected 'ERR graph not found', got {:?}",
+                std::str::from_utf8(msg.as_ref())
+            );
+        } else {
+            panic!("expected error, got {:?}", resp);
+        }
+    }
 }
