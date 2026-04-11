@@ -1101,9 +1101,22 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
 /// table entirely.
 ///
 /// **GET:** read-only, no side-effects.  Handles cold storage fallback.
-/// **SET:** plain `SET key value` only (exactly *3 args, no NX/XX/EX/PX options).
-///   Handles maxmemory eviction and AOF append.  Caller must ensure
-///   `can_inline_writes` is false when tracking/replication/MULTI are active.
+///
+/// **SET:** plain `SET key value` only (exactly `*3` args, no NX/XX/EX/PX options).
+///   Side-effects handled by this path:
+///   - maxmemory eviction (`try_evict_if_needed`)
+///   - AOF append (raw RESP bytes, zero re-serialization)
+///
+///   Side-effects intentionally skipped (caller gates via `can_inline_writes`):
+///   - ACL permission check (caller sets `can_inline_writes = false` unless
+///     `cached_acl_unrestricted`)
+///   - CLIENT TRACKING invalidation (guarded by `!tracking_state.enabled`)
+///   - MULTI transaction queue (guarded by `!in_multi`)
+///   - Metrics / slowlog recording (matches existing inline GET behaviour)
+///
+///   Side-effects not applicable to plain SET:
+///   - Blocking-waiter wakeup (only for LPUSH/RPUSH/ZADD, not SET)
+///   - Vector auto-index (only for HSET, not SET)
 ///
 /// Returns the number of commands inlined (0 if none, 1 on success).
 /// On success the serialized response is appended to `write_buf`.

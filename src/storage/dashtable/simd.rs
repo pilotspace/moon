@@ -58,40 +58,41 @@ impl Group {
     #[cfg(target_arch = "aarch64")]
     #[inline]
     pub fn match_h2(&self, h2: u8) -> BitMask {
-        // SAFETY: NEON is mandatory on AArch64; Group is 16-byte aligned.
+        // SAFETY: `self.0.as_ptr()` is valid for 16 bytes (Group is [u8; 16]).
+        // `vdupq_n_u8` and all downstream NEON intrinsics are safe to invoke
+        // on AArch64 (NEON is mandatory in ARMv8-A); they require `unsafe` in
+        // Rust only because `core::arch` intrinsics are unconditionally unsafe.
+        // `vld1q_u8` has no alignment requirement (unlike SSE2 _mm_load_si128).
         unsafe {
-            use core::arch::aarch64::vdupq_n_u8;
-            Self::neon_match_eq(self.0.as_ptr(), vdupq_n_u8(h2))
+            use core::arch::aarch64::*;
+            let ctrl = vld1q_u8(self.0.as_ptr());
+            let needle = vdupq_n_u8(h2);
+            let cmp = vceqq_u8(ctrl, needle);
+            Self::neon_bitmask_from_cmp(cmp)
         }
     }
 
-    /// Shared NEON helper: given a comparison result vector (0xFF where matched,
-    /// 0x00 where not), extract a 16-bit mask with one bit per lane.
+    /// Convert a NEON comparison result (0xFF / 0x00 per byte) to a 16-bit mask.
     ///
     /// Technique: AND the comparison result with power-of-2 weights
     /// `[1,2,4,8,16,32,64,128]` for each 8-byte half, then horizontal-add each
     /// half into a single byte.  The two bytes form the 16-bit mask.
     #[cfg(target_arch = "aarch64")]
     #[inline]
-    unsafe fn neon_match_eq(ptr: *const u8, needle: core::arch::aarch64::uint8x16_t) -> BitMask {
-        use core::arch::aarch64::*;
-        let ctrl = vld1q_u8(ptr);
-        let cmp = vceqq_u8(ctrl, needle); // 0xFF per matching byte
-        Self::neon_bitmask_from_cmp(cmp)
-    }
-
-    /// Convert a NEON comparison result (0xFF / 0x00 per byte) to a 16-bit mask.
-    #[cfg(target_arch = "aarch64")]
-    #[inline]
-    unsafe fn neon_bitmask_from_cmp(cmp: core::arch::aarch64::uint8x16_t) -> BitMask {
-        use core::arch::aarch64::*;
-        // Power-of-2 weights: bit i within each 8-byte half
-        const POWERS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        let powers = vld1q_u8(POWERS.as_ptr());
-        let masked = vandq_u8(cmp, powers);
-        let lo = vaddv_u8(vget_low_u8(masked)) as u16;
-        let hi = vaddv_u8(vget_high_u8(masked)) as u16;
-        BitMask(lo | (hi << 8))
+    fn neon_bitmask_from_cmp(cmp: core::arch::aarch64::uint8x16_t) -> BitMask {
+        // SAFETY: All NEON intrinsics here operate on register-width vector
+        // types (no pointers, no memory access).  POWERS is a const array
+        // whose `.as_ptr()` is valid for 16 bytes for the lifetime of this
+        // function.  NEON is mandatory on AArch64.
+        unsafe {
+            use core::arch::aarch64::*;
+            const POWERS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let powers = vld1q_u8(POWERS.as_ptr());
+            let masked = vandq_u8(cmp, powers);
+            let lo = vaddv_u8(vget_low_u8(masked)) as u16;
+            let hi = vaddv_u8(vget_high_u8(masked)) as u16;
+            BitMask(lo | (hi << 8))
+        }
     }
 
     /// Scalar fallback for platforms without SIMD (neither x86_64 nor aarch64).
@@ -139,16 +140,20 @@ impl Group {
     }
 
     /// NEON path: find empty or deleted slots (bit 7 set).
+    ///
+    /// Both `EMPTY` (0xFF) and `DELETED` (0x80) have bit 7 set;
+    /// all FULL H2 values are in 0x00..0x7F (bit 7 clear).
+    /// We shift right by 7 to isolate bit 7, then compare with 1.
     #[cfg(target_arch = "aarch64")]
     #[inline]
     pub fn match_empty_or_deleted(&self) -> BitMask {
-        // SAFETY: NEON is mandatory on AArch64; Group is 16-byte aligned.
+        // SAFETY: `self.0.as_ptr()` is valid for 16 bytes (Group is [u8; 16]).
+        // `vld1q_u8` has no alignment requirement.  All NEON intrinsics are
+        // safe on AArch64 (mandatory in ARMv8-A); `unsafe` is only required
+        // because `core::arch` marks them unconditionally unsafe.
         unsafe {
             use core::arch::aarch64::*;
             let ctrl = vld1q_u8(self.0.as_ptr());
-            // Shift right by 7: EMPTY (0xFF) and DELETED (0x80) both have bit 7
-            // set, so after >>7 they become 0x01. FULL (0x00..0x7F) becomes 0x00.
-            // Then compare with 1 to get 0xFF for matches.
             let shifted = vshrq_n_u8(ctrl, 7);
             let ones = vdupq_n_u8(1);
             let cmp = vceqq_u8(shifted, ones);
