@@ -302,7 +302,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "BITFIELD" => CommandMeta { name: "BITFIELD", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "BITPOS" => CommandMeta { name: "BITPOS", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "LCS" => CommandMeta { name: "LCS", arity: -3, flags: R, first_key: 1, last_key: 2, step: 1, acl_categories: STR },
-    "XSETID" => CommandMeta { name: "XSETID", arity: -3, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "XSETID" => CommandMeta { name: "XSETID", arity: -3, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
 
     // ---- HyperLogLog commands ----
     "PFADD" => CommandMeta { name: "PFADD", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },

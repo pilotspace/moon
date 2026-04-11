@@ -54,9 +54,9 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Integer(0);
     }
 
-    // Same key: source == dest, nothing to do
+    // Same key: source == dest — Redis returns 1 only with REPLACE, else 0
     if src == dst {
-        return Frame::Integer(0);
+        return Frame::Integer(if replace { 1 } else { 0 });
     }
 
     // Check if destination exists
@@ -86,6 +86,30 @@ pub fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("MEMORY"),
     };
+
+    // Parse optional SAMPLES count; reject unknown trailing args
+    let mut i = 1;
+    let mut _samples: usize = 5; // default sample count (like Redis)
+    while i < args.len() {
+        let arg = match extract_key(&args[i]) {
+            Some(a) => a,
+            None => return err_wrong_args("MEMORY"),
+        };
+        if arg.eq_ignore_ascii_case(b"SAMPLES") {
+            i += 1;
+            let count_arg = match args.get(i).and_then(|f| extract_key(f)) {
+                Some(c) => c,
+                None => return err_wrong_args("MEMORY"),
+            };
+            match std::str::from_utf8(count_arg).ok().and_then(|s| s.parse::<usize>().ok()) {
+                Some(c) if c > 0 => _samples = c,
+                _ => return err_wrong_args("MEMORY"),
+            }
+        } else {
+            return err_wrong_args("MEMORY");
+        }
+        i += 1;
+    }
 
     match db.get(key) {
         Some(entry) => {

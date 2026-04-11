@@ -290,17 +290,25 @@ impl Database {
         self.data.keys()
     }
 
-    /// Return a random key from the database, or None if empty.
+    /// Return a random non-expired key from the database, or None if empty.
     pub fn random_key(&self) -> Option<Bytes> {
         if self.data.is_empty() {
             return None;
         }
-        // Pick a random index via simple hash of current time
-        let idx = (current_time_ms() as usize) % self.data.len();
-        self.data
-            .keys()
-            .nth(idx)
-            .map(|k| Bytes::copy_from_slice(k.as_ref()))
+        let now_ms = self.cached_now_ms;
+        let base_ts = self.base_timestamp;
+        // Collect non-expired keys (iterator is already O(n))
+        let live: Vec<_> = self
+            .data
+            .iter()
+            .filter(|(_, e)| !e.is_expired_at(base_ts, now_ms))
+            .map(|(k, _)| Bytes::copy_from_slice(k.as_ref()))
+            .collect();
+        if live.is_empty() {
+            return None;
+        }
+        let idx = (current_time_ms() as usize) % live.len();
+        Some(live.into_iter().nth(idx).unwrap_or_default())
     }
 
     /// Set or remove expiration on an existing key.

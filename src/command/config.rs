@@ -396,17 +396,20 @@ mod tests {
 
     #[test]
     fn test_config_rewrite() {
+        let tmp = std::env::temp_dir().join(format!("moon-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
         let mut rt = RuntimeConfig::default();
         rt.maxmemory = 1_073_741_824; // 1GB
         rt.maxmemory_policy = "allkeys-lru".to_string();
-        rt.dir = std::env::temp_dir().to_string_lossy().to_string();
+        rt.dir = tmp.to_string_lossy().to_string();
 
         let sc = default_server_config();
         let result = config_rewrite(&rt, &sc);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify file was created
-        let conf_path = std::path::Path::new(&rt.dir).join("moon.conf");
+        let conf_path = tmp.join("moon.conf");
         assert!(conf_path.exists());
         let content = std::fs::read_to_string(&conf_path).unwrap();
         assert!(content.contains("maxmemory 1073741824"));
@@ -414,6 +417,6 @@ mod tests {
         assert!(content.contains("port 6379"));
 
         // Cleanup
-        let _ = std::fs::remove_file(conf_path);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
