@@ -13,6 +13,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 
+use super::simd;
+
 use crate::graph::memgraph::MemGraph;
 use crate::graph::types::{Direction, NodeKey};
 
@@ -76,33 +78,6 @@ pub struct ContextNode {
     pub edge_type: u16,
     /// Hops from the result node.
     pub hops: u32,
-}
-
-// ---------------------------------------------------------------------------
-// Vector similarity (cosine distance, computed inline)
-// ---------------------------------------------------------------------------
-
-/// Compute cosine similarity between two vectors. Returns 0.0 on degenerate input.
-#[inline]
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot: f64 = 0.0;
-    let mut norm_a: f64 = 0.0;
-    let mut norm_b: f64 = 0.0;
-    for i in 0..a.len() {
-        let ai = a[i] as f64;
-        let bi = b[i] as f64;
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < f64::EPSILON {
-        return 0.0;
-    }
-    dot / denom
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +187,7 @@ impl GraphFilteredSearch {
                 continue; // Skip nodes without embeddings.
             };
 
-            let sim = cosine_similarity(embedding, &self.query_vector);
+            let sim = simd::cosine_similarity(embedding, &self.query_vector);
             scored.push(HybridResult {
                 node: *node_key,
                 score: sim,
@@ -288,7 +263,7 @@ impl VectorToGraphExpansion {
                 continue;
             };
 
-            let sim = cosine_similarity(embedding, &self.query_vector);
+            let sim = simd::cosine_similarity(embedding, &self.query_vector);
             scored.push((node_key, sim));
         }
 
@@ -375,7 +350,7 @@ impl VectorGuidedWalk {
         let seed_score = memgraph
             .get_node(self.seed_node)
             .and_then(|n| n.embedding.as_ref())
-            .map(|emb| cosine_similarity(emb, &self.query_vector))
+            .map(|emb| simd::cosine_similarity(emb, &self.query_vector))
             .unwrap_or(0.0);
 
         let mut results: Vec<HybridResult> = Vec::new();
@@ -402,7 +377,7 @@ impl VectorGuidedWalk {
                     let sim = memgraph
                         .get_node(neighbor_key)
                         .and_then(|n| n.embedding.as_ref())
-                        .map(|emb| cosine_similarity(emb, &self.query_vector))
+                        .map(|emb| simd::cosine_similarity(emb, &self.query_vector))
                         .unwrap_or(0.0);
 
                     // Use edge_key to avoid unused variable warning.
@@ -606,7 +581,7 @@ mod tests {
     fn test_cosine_identical() {
         let a = [1.0f32, 2.0, 3.0];
         let b = [1.0f32, 2.0, 3.0];
-        let sim = cosine_similarity(&a, &b);
+        let sim = simd::cosine_similarity(&a, &b);
         assert!((sim - 1.0).abs() < 1e-6);
     }
 
@@ -614,7 +589,7 @@ mod tests {
     fn test_cosine_orthogonal() {
         let a = [1.0f32, 0.0, 0.0];
         let b = [0.0f32, 1.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
+        let sim = simd::cosine_similarity(&a, &b);
         assert!(sim.abs() < 1e-6);
     }
 
@@ -622,13 +597,13 @@ mod tests {
     fn test_cosine_opposite() {
         let a = [1.0f32, 0.0];
         let b = [-1.0f32, 0.0];
-        let sim = cosine_similarity(&a, &b);
+        let sim = simd::cosine_similarity(&a, &b);
         assert!((sim + 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_cosine_empty() {
-        let sim = cosine_similarity(&[], &[]);
+        let sim = simd::cosine_similarity(&[], &[]);
         assert!(sim.abs() < f64::EPSILON);
     }
 
@@ -636,7 +611,7 @@ mod tests {
     fn test_cosine_mismatched_dims() {
         let a = [1.0f32, 0.0];
         let b = [1.0f32, 0.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
+        let sim = simd::cosine_similarity(&a, &b);
         assert!(sim.abs() < f64::EPSILON);
     }
 
