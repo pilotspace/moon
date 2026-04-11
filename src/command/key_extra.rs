@@ -333,8 +333,10 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
         let count = results.len() as i64;
         let mut list = std::collections::VecDeque::with_capacity(results.len());
         for frame in results {
-            if let Frame::BulkString(b) = frame {
-                list.push_back(b);
+            match frame {
+                Frame::BulkString(b) => list.push_back(b),
+                // Redis stores nil GET results as empty strings in SORT...STORE
+                _ => list.push_back(Bytes::new()),
             }
         }
         let mut entry = crate::storage::entry::Entry::new_list();
