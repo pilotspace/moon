@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs on the same PR/branch — only latest commit matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
