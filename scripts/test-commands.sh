@@ -550,11 +550,61 @@ if should_run "key"; then
     rcli SET k:rnx1 v1 >/dev/null 2>&1; mcli SET k:rnx1 v1 >/dev/null 2>&1
     rcli SET k:rnx2 v2 >/dev/null 2>&1; mcli SET k:rnx2 v2 >/dev/null 2>&1
     assert_match "RENAMENX (blocked)"  RENAMENX k:rnx1 k:rnx2
+    rcli SET k:cpsrc cpval >/dev/null 2>&1; mcli SET k:cpsrc cpval >/dev/null 2>&1
+    assert_match "COPY"                COPY k:cpsrc k:cpdst
+    assert_match "GET after COPY"      GET k:cpdst
+    rcli SET k:cpdst2 old >/dev/null 2>&1; mcli SET k:cpdst2 old >/dev/null 2>&1
+    assert_match "COPY no REPLACE"     COPY k:cpsrc k:cpdst2
+    assert_match "COPY REPLACE"        COPY k:cpsrc k:cpdst2 REPLACE
     assert_match "UNLINK"              UNLINK k:renamed
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "SCAN cursor"       SCAN 0
     assert_moon_ok "KEYS pattern"      KEYS "k:*"
     assert_moon_ok "OBJECT HELP"       OBJECT HELP
+
+    # Bit operations
+    rcli SET k:bits "\xff\x0f" >/dev/null 2>&1; mcli SET k:bits "\xff\x0f" >/dev/null 2>&1
+    assert_match "GETBIT"              GETBIT k:bits 0
+    assert_match "SETBIT"              SETBIT k:bits 0 0
+    assert_match "BITCOUNT"            BITCOUNT k:bits
+    assert_match "BITCOUNT range"      BITCOUNT k:bits 0 0
+    rcli SET k:bits2 "\x0f\xff" >/dev/null 2>&1; mcli SET k:bits2 "\x0f\xff" >/dev/null 2>&1
+    assert_match "BITOP AND"           BITOP AND k:bitdst k:bits k:bits2
+    assert_match "BITOP OR"            BITOP OR k:bitdst k:bits k:bits2
+    assert_match "BITOP XOR"           BITOP XOR k:bitdst k:bits k:bits2
+    assert_match "BITOP NOT"           BITOP NOT k:bitdst k:bits
+    assert_match "BITPOS 1"            BITPOS k:bits 1
+    assert_match "BITPOS 0"            BITPOS k:bits 0
+
+    # SORT
+    rcli RPUSH k:sortl 3 1 2 >/dev/null 2>&1; mcli RPUSH k:sortl 3 1 2 >/dev/null 2>&1
+    assert_match "SORT numeric"        SORT k:sortl
+    assert_match "SORT DESC"           SORT k:sortl DESC
+    assert_match "SORT ALPHA"          SORT k:sortl ALPHA
+    assert_match "SORT LIMIT"          SORT k:sortl LIMIT 0 2
+
+    # GEO commands
+    rcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
+    mcli GEOADD k:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
+    assert_match "GEOPOS"              GEOPOS k:geo Palermo
+    assert_match "GEODIST km"          GEODIST k:geo Palermo Catania km
+    assert_match "GEOHASH"             GEOHASH k:geo Palermo
+    assert_match "GEOSEARCH"           GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC
+    # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
+    rcli SET k:eat val >/dev/null 2>&1; mcli SET k:eat val >/dev/null 2>&1
+    assert_match "EXPIREAT"            EXPIREAT k:eat 9999999999
+    assert_match "TTL after EXPIREAT"  TTL k:eat
+    assert_match "EXPIRETIME"          EXPIRETIME k:eat
+    assert_match "PEXPIRETIME"         PEXPIRETIME k:eat
+
+    # TIME / RANDOMKEY / TOUCH
+    assert_moon_ok "TIME"              TIME
+    rcli SET k:rnd val >/dev/null 2>&1; mcli SET k:rnd val >/dev/null 2>&1
+    assert_moon_ok "RANDOMKEY"         RANDOMKEY
+    assert_match "TOUCH"               TOUCH k:rnd
+
+    # FLUSHDB
+    assert_match "FLUSHDB"             FLUSHDB
 fi
 
 # ===========================================================================

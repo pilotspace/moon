@@ -386,3 +386,100 @@ pub fn strlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => Frame::Integer(0),
     }
 }
+
+/// LCS key1 key2 [LEN] [IDX] [MINMATCHLEN len] [WITHMATCHLEN]
+///
+/// Returns the longest common substring of two string values.
+pub fn lcs(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("LCS");
+    }
+    let key1 = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("LCS"),
+    };
+    let key2 = match extract_bytes(&args[1]) {
+        Some(k) => k,
+        None => return err_wrong_args("LCS"),
+    };
+
+    let mut want_len = false;
+    let mut i = 2;
+    while i < args.len() {
+        let arg = match extract_bytes(&args[i]) {
+            Some(a) => a,
+            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        };
+        if arg.eq_ignore_ascii_case(b"LEN") {
+            want_len = true;
+        }
+        i += 1;
+    }
+
+    let s1 = match db.get(key1) {
+        Some(e) => match e.value.as_bytes() {
+            Some(v) => v.to_vec(),
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
+    let s2 = match db.get(key2) {
+        Some(e) => match e.value.as_bytes() {
+            Some(v) => v.to_vec(),
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let n = s1.len();
+    let m = s2.len();
+    // Guard against OOM: cap DP table size (n*m cells * 4 bytes each).
+    // 64MB cap ≈ 4096 * 4096 strings — generous for any real use case.
+    const MAX_LCS_CELLS: usize = 16 * 1024 * 1024; // 64MB at 4 bytes/cell
+    if n.saturating_mul(m) > MAX_LCS_CELLS {
+        return Frame::Error(Bytes::from_static(
+            b"ERR inputs too large for LCS computation",
+        ));
+    }
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for ii in 1..=n {
+        for jj in 1..=m {
+            if s1[ii - 1] == s2[jj - 1] {
+                dp[ii][jj] = dp[ii - 1][jj - 1] + 1;
+            } else {
+                dp[ii][jj] = dp[ii - 1][jj].max(dp[ii][jj - 1]);
+            }
+        }
+    }
+    let lcs_len = dp[n][m] as usize;
+
+    if want_len {
+        return Frame::Integer(lcs_len as i64);
+    }
+
+    // Backtrack to find LCS string
+    let mut lcs_bytes = Vec::with_capacity(lcs_len);
+    let mut ci = n;
+    let mut cj = m;
+    while ci > 0 && cj > 0 {
+        if s1[ci - 1] == s2[cj - 1] {
+            lcs_bytes.push(s1[ci - 1]);
+            ci -= 1;
+            cj -= 1;
+        } else if dp[ci - 1][cj] > dp[ci][cj - 1] {
+            ci -= 1;
+        } else {
+            cj -= 1;
+        }
+    }
+    lcs_bytes.reverse();
+    Frame::BulkString(Bytes::from(lcs_bytes))
+}

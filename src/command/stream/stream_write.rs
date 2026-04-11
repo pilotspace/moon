@@ -1,4 +1,4 @@
-//! Stream write command handlers: XADD, XDEL, XTRIM, XACK, XCLAIM, XAUTOCLAIM, XGROUP, XREADGROUP.
+//! Stream write command handlers: XADD, XDEL, XTRIM, XACK, XCLAIM, XAUTOCLAIM, XGROUP, XREADGROUP, XSETID.
 
 use bytes::Bytes;
 
@@ -823,5 +823,35 @@ pub fn xautoclaim(db: &mut Database, args: &[Frame]) -> Frame {
             ])
         }
         Err(e) => Frame::Error(Bytes::from(e)),
+    }
+}
+
+/// XSETID key last-id [ENTRIESADDED entries-added]
+///
+/// Sets the last delivered ID of a stream without adding entries.
+pub fn xsetid(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("XSETID");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("XSETID"),
+    };
+    let id_str = match extract_bytes(&args[1]) {
+        Some(s) => s,
+        None => return err_wrong_args("XSETID"),
+    };
+    let id = match StreamId::parse(id_str, 0) {
+        Ok(id) => id,
+        Err(e) => return Frame::Error(Bytes::from_static(e.as_bytes())),
+    };
+
+    match db.get_stream_mut(key) {
+        Ok(Some(stream)) => {
+            stream.last_id = id;
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        }
+        Ok(None) => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        Err(e) => e,
     }
 }

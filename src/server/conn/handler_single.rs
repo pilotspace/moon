@@ -500,6 +500,58 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
+                                    if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
+                                        // CLIENT PAUSE timeout [WRITE|ALL]
+                                        if cmd_args.len() < 2 {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
+                                            )));
+                                        } else {
+                                            let timeout_ms = match extract_bytes(&cmd_args[1]) {
+                                                Some(b) => std::str::from_utf8(&b).ok().and_then(|s| s.parse::<u64>().ok()),
+                                                None => None,
+                                            };
+                                            let mode_valid = if cmd_args.len() >= 3 {
+                                                match extract_bytes(&cmd_args[2]) {
+                                                    Some(b) => b.eq_ignore_ascii_case(b"WRITE") || b.eq_ignore_ascii_case(b"ALL"),
+                                                    None => false,
+                                                }
+                                            } else {
+                                                true
+                                            };
+                                            if cmd_args.len() > 3 || !mode_valid {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR syntax error",
+                                                )));
+                                            } else {
+                                                match timeout_ms {
+                                                    Some(ms) => {
+                                                        let write_only = cmd_args.get(2)
+                                                            .and_then(|f| extract_bytes(f))
+                                                            .is_some_and(|b| b.eq_ignore_ascii_case(b"WRITE"));
+                                                        let deadline = crate::storage::entry::current_time_ms().saturating_add(ms);
+                                                        let mut rt = runtime_config.write();
+                                                        rt.client_pause_deadline_ms = deadline;
+                                                        rt.client_pause_write_only = write_only;
+                                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                                    }
+                                                    None => {
+                                                        responses.push(Frame::Error(Bytes::from_static(
+                                                            b"ERR timeout is not a valid integer or out of range",
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
+                                        let mut rt = runtime_config.write();
+                                        rt.client_pause_deadline_ms = 0;
+                                        rt.client_pause_write_only = false;
+                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        continue;
+                                    }
                                     // Unknown CLIENT subcommand
                                     responses.push(Frame::Error(Bytes::from(format!(
                                         "ERR unknown subcommand '{}'",
@@ -942,6 +994,39 @@ pub async fn handle_connection(
                                     "NOPERM {}", deny_reason
                                 ))));
                                 continue;
+                            }
+                        }
+
+                        // === CLIENT PAUSE check ===
+                        let pause_wait_ms = {
+                            let rt = runtime_config.read();
+                            let deadline = rt.client_pause_deadline_ms;
+                            if deadline > 0 {
+                                let now = crate::storage::entry::current_time_ms();
+                                if now < deadline {
+                                    let should_pause = if rt.client_pause_write_only {
+                                        metadata::is_write(cmd)
+                                    } else {
+                                        true
+                                    };
+                                    if should_pause { deadline.saturating_sub(now) } else { 0 }
+                                } else { 0 }
+                            } else { 0 }
+                        };
+                        if pause_wait_ms > 0 {
+                            let mut remaining = pause_wait_ms;
+                            while remaining > 0 {
+                                let chunk = remaining.min(50);
+                                tokio::time::sleep(std::time::Duration::from_millis(chunk)).await;
+                                remaining = remaining.saturating_sub(chunk);
+                                let still_paused = {
+                                    let rt = runtime_config.read();
+                                    rt.client_pause_deadline_ms > 0
+                                        && crate::storage::entry::current_time_ms() < rt.client_pause_deadline_ms
+                                };
+                                if !still_paused {
+                                    break;
+                                }
                             }
                         }
                     }

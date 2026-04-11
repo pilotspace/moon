@@ -52,9 +52,14 @@ pub(crate) fn handle_config(
     } else if subcmd.eq_ignore_ascii_case(b"SET") {
         let mut rt = runtime_config.write();
         config_cmd::config_set(&mut rt, sub_args)
+    } else if subcmd.eq_ignore_ascii_case(b"REWRITE") {
+        let rt = runtime_config.read();
+        config_cmd::config_rewrite(&rt, server_config)
+    } else if subcmd.eq_ignore_ascii_case(b"RESETSTAT") {
+        config_cmd::config_resetstat()
     } else {
         Frame::Error(Bytes::from(format!(
-            "ERR unknown subcommand '{}'. Try CONFIG GET, CONFIG SET.",
+            "ERR unknown subcommand '{}'. Try CONFIG GET, CONFIG SET, CONFIG REWRITE, CONFIG RESETSTAT.",
             String::from_utf8_lossy(subcmd)
         )))
     }

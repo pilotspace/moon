@@ -772,6 +772,49 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // === CLIENT PAUSE check ===
+                    // Extract pause info with short lock hold, then sleep outside lock scope
+                    let pause_wait_ms = {
+                        let rt = ctx.runtime_config.read();
+                        let deadline = rt.client_pause_deadline_ms;
+                        if deadline > 0 {
+                            let now = crate::storage::entry::current_time_ms();
+                            if now < deadline {
+                                let should_pause = if rt.client_pause_write_only {
+                                    crate::command::metadata::is_write(cmd)
+                                } else {
+                                    true
+                                };
+                                if should_pause { deadline.saturating_sub(now) } else { 0 }
+                            } else { 0 }
+                        } else { 0 }
+                    };
+                    if pause_wait_ms > 0 {
+                        // Poll in 50ms intervals so CLIENT UNPAUSE takes effect quickly
+                        let mut remaining = pause_wait_ms;
+                        while remaining > 0 {
+                            let chunk = remaining.min(50);
+                            #[cfg(feature = "runtime-tokio")]
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(chunk)).await;
+                            }
+                            #[cfg(feature = "runtime-monoio")]
+                            {
+                                monoio::time::sleep(std::time::Duration::from_millis(chunk)).await;
+                            }
+                            remaining = remaining.saturating_sub(chunk);
+                            // Re-check if UNPAUSE was called
+                            let still_paused = {
+                                let rt = ctx.runtime_config.read();
+                                rt.client_pause_deadline_ms > 0
+                                    && crate::storage::entry::current_time_ms() < rt.client_pause_deadline_ms
+                            };
+                            if !still_paused {
+                                break;
+                            }
+                        }
+                    }
+
                     // === ACL permission check ===
                     // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
                     // so that low-privilege users cannot reach admin commands.

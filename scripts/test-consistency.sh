@@ -476,6 +476,73 @@ LONGKEY=$(python3 -c "print('k' * 500)")
 both SET "$LONGKEY" "long_key_value"
 assert_both "GET with 500-char key" GET "$LONGKEY"
 
+# COPY
+both SET edge:cpsrc "copy_value"
+assert_both "COPY basic" COPY edge:cpsrc edge:cpdst
+assert_both "GET after COPY src" GET edge:cpsrc
+assert_both "GET after COPY dst" GET edge:cpdst
+both SET edge:cpdst2 "old_value"
+assert_both "COPY no REPLACE" COPY edge:cpsrc edge:cpdst2
+assert_both "GET COPY no REPLACE" GET edge:cpdst2
+assert_both "COPY REPLACE" COPY edge:cpsrc edge:cpdst2 REPLACE
+assert_both "GET after COPY REPLACE" GET edge:cpdst2
+
+# SETBIT / GETBIT
+both SETBIT edge:bits 7 1
+assert_both "GETBIT set" GETBIT edge:bits 7
+assert_both "GETBIT unset" GETBIT edge:bits 0
+both SETBIT edge:bits 0 1
+assert_both "BITCOUNT" BITCOUNT edge:bits
+
+# BITOP
+both SET edge:bop1 "\xff"
+both SET edge:bop2 "\x0f"
+assert_both "BITOP AND" BITOP AND edge:bopdst edge:bop1 edge:bop2
+assert_both "GET BITOP AND" GET edge:bopdst
+assert_both "BITOP OR" BITOP OR edge:bopdst edge:bop1 edge:bop2
+assert_both "GET BITOP OR" GET edge:bopdst
+assert_both "BITOP NOT" BITOP NOT edge:bopdst edge:bop1
+assert_both "GET BITOP NOT" GET edge:bopdst
+
+# BITPOS
+both SET edge:bpos "\x00\xff"
+assert_both "BITPOS 1" BITPOS edge:bpos 1
+assert_both "BITPOS 0" BITPOS edge:bpos 0
+
+# SORT
+both RPUSH edge:sortl 3 1 2
+assert_both "SORT numeric" SORT edge:sortl
+assert_both "SORT DESC" SORT edge:sortl DESC
+assert_both "SORT ALPHA" SORT edge:sortl ALPHA
+assert_both "SORT LIMIT" SORT edge:sortl LIMIT 0 2
+assert_both "SORT STORE" SORT edge:sortl STORE edge:sorted
+assert_both "SORT STORE result" LRANGE edge:sorted 0 -1
+
+# GEOADD / GEOPOS / GEODIST / GEOHASH / GEOSEARCH
+both GEOADD edge:geo 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+assert_both "GEOPOS" GEOPOS edge:geo Palermo
+assert_both "GEOPOS missing" GEOPOS edge:geo NonExistent
+assert_both "GEODIST m" GEODIST edge:geo Palermo Catania
+assert_both "GEODIST km" GEODIST edge:geo Palermo Catania km
+assert_both "GEOHASH" GEOHASH edge:geo Palermo
+assert_both "GEOADD count" GEOADD edge:geo 2.349014 48.864716 Paris
+
+# EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
+both SET edge:eat "val"
+assert_both "EXPIREAT" EXPIREAT edge:eat 9999999999
+assert_both "EXPIRETIME" EXPIRETIME edge:eat
+assert_both "PEXPIRETIME" PEXPIRETIME edge:eat
+assert_both "EXPIRETIME missing" EXPIRETIME edge:nokey
+assert_both "PEXPIRETIME missing" PEXPIRETIME edge:nokey
+
+# TOUCH
+both SET edge:touch "val"
+assert_both "TOUCH" TOUCH edge:touch
+assert_both "TOUCH missing" TOUCH edge:nomiss
+
+# FLUSHDB (run last — clears all keys)
+assert_both "FLUSHDB" FLUSHDB
+
 # ===========================================================================
 # Summary
 # ===========================================================================

@@ -298,6 +298,9 @@ impl ServerConfig {
             requirepass: self.requirepass.clone(),
             protected_mode: self.protected_mode.clone(),
             acllog_max_len: self.acllog_max_len,
+            client_pause_deadline_ms: 0,
+            client_pause_write_only: false,
+            lazyfree_threshold: 64,
             maxclients: self.maxclients,
             timeout: self.timeout,
             tcp_keepalive: self.tcp_keepalive,
@@ -336,6 +339,13 @@ pub struct RuntimeConfig {
     pub protected_mode: String,
     /// Maximum number of entries in the ACL log (mutable via CONFIG SET).
     pub acllog_max_len: usize,
+    /// CLIENT PAUSE deadline (epoch ms). 0 = not paused.
+    /// Set by CLIENT PAUSE, cleared by CLIENT UNPAUSE or expiry.
+    pub client_pause_deadline_ms: u64,
+    /// CLIENT PAUSE mode: false = ALL (pause all), true = WRITE (pause writes only).
+    pub client_pause_write_only: bool,
+    /// Lazyfree threshold: collections with more elements than this are freed async.
+    pub lazyfree_threshold: usize,
     /// Maximum number of simultaneous client connections (0 = unlimited).
     pub maxclients: usize,
     /// Close connections idle for more than N seconds (0 = disabled).
@@ -360,6 +370,9 @@ impl Default for RuntimeConfig {
             requirepass: None,
             protected_mode: "yes".to_string(),
             acllog_max_len: 128,
+            client_pause_deadline_ms: 0,
+            client_pause_write_only: false,
+            lazyfree_threshold: 64,
             maxclients: 10000,
             timeout: 0,
             tcp_keepalive: 300,

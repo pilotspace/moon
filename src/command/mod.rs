@@ -3,12 +3,14 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod functions;
+pub mod geo;
 #[cfg(feature = "graph")]
 pub mod graph;
 pub mod hash;
 pub mod helpers;
 pub mod hll;
 pub mod key;
+pub mod key_extra;
 pub mod list;
 pub mod metadata;
 pub mod persistence;
@@ -71,6 +73,12 @@ fn dispatch_inner(
 
     match (len, b0) {
         // 3-letter commands
+        (3, b'l') => {
+            // LCS
+            if cmd.eq_ignore_ascii_case(b"LCS") {
+                return resp(string::lcs(db, args));
+            }
+        }
         (3, b'd') => {
             // DEL
             if cmd.eq_ignore_ascii_case(b"DEL") {
@@ -96,6 +104,12 @@ fn dispatch_inner(
             }
         }
         // 4-letter commands
+        (4, b'c') => {
+            // COPY
+            if cmd.eq_ignore_ascii_case(b"COPY") {
+                return resp(key_extra::copy(db, args));
+            }
+        }
         (4, b'd') => {
             // DECR
             if cmd.eq_ignore_ascii_case(b"DECR") {
@@ -200,11 +214,17 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"SPOP") {
                 return resp(set::spop(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"SORT") {
+                return resp(key_extra::sort(db, args));
+            }
         }
         (4, b't') => {
-            // TYPE
+            // TYPE TIME
             if cmd.eq_ignore_ascii_case(b"TYPE") {
                 return resp(key::type_cmd(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"TIME") {
+                return resp(key::time());
             }
         }
         (4, b'x') => {
@@ -232,6 +252,12 @@ fn dispatch_inner(
             }
         }
         // 5-letter commands
+        (5, b'b') => {
+            // BITOP
+            if cmd.eq_ignore_ascii_case(b"BITOP") {
+                return resp(string::bitop(db, args));
+            }
+        }
         (5, b'g') => {
             // GETEX
             if cmd.eq_ignore_ascii_case(b"GETEX") {
@@ -353,7 +379,19 @@ fn dispatch_inner(
                 return resp(sorted_set::zmpop(db, args));
             }
         }
+        (5, b't') => {
+            // TOUCH
+            if cmd.eq_ignore_ascii_case(b"TOUCH") {
+                return resp(key::touch(db, args));
+            }
+        }
         // 6-letter commands
+        (6, b'b') => {
+            // BITPOS
+            if cmd.eq_ignore_ascii_case(b"BITPOS") {
+                return resp(string::bitpos(db, args));
+            }
+        }
         (6, b'a') => {
             // APPEND
             if cmd.eq_ignore_ascii_case(b"APPEND") {
@@ -379,7 +417,16 @@ fn dispatch_inner(
             }
         }
         (6, b'g') => {
-            // GETSET GETDEL
+            // GEOADD GEOPOS GETBIT GETSET GETDEL
+            if cmd.eq_ignore_ascii_case(b"GEOADD") {
+                return resp(geo::geoadd(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEOPOS") {
+                return resp(geo::geopos(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GETBIT") {
+                return resp(string::getbit(db, args));
+            }
             if cmd.eq_ignore_ascii_case(b"GETSET") {
                 return resp(string::getset(db, args));
             }
@@ -400,7 +447,7 @@ fn dispatch_inner(
             }
         }
         (6, b'l') => {
-            // LRANGE LINDEX
+            // LRANGE LINDEX LPUSHX LOLWUT
             if cmd.eq_ignore_ascii_case(b"LRANGE") {
                 return resp(list::lrange(db, args));
             }
@@ -409,6 +456,30 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"LPUSHX") {
                 return resp(list::lpushx(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"LOLWUT") {
+                return resp(Frame::BulkString(Bytes::from_static(b"Moon v0.1.0\n")));
+            }
+        }
+        (6, b'm') => {
+            // MEMORY
+            if cmd.eq_ignore_ascii_case(b"MEMORY") {
+                if let Some(sub) = args.first() {
+                    if let Some(sub_bytes) = crate::command::helpers::extract_bytes(sub) {
+                        if sub_bytes.eq_ignore_ascii_case(b"USAGE") {
+                            return resp(key_extra::memory_usage(db, &args[1..]));
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"DOCTOR") {
+                            return resp(key_extra::memory_doctor());
+                        }
+                        if sub_bytes.eq_ignore_ascii_case(b"HELP") {
+                            return resp(key_extra::memory_help());
+                        }
+                    }
+                }
+                return resp(Frame::Error(Bytes::from_static(
+                    b"ERR unknown subcommand. Try MEMORY USAGE, MEMORY DOCTOR, MEMORY HELP.",
+                )));
             }
         }
         (6, b'o') => {
@@ -443,6 +514,9 @@ fn dispatch_inner(
                     if cmd.eq_ignore_ascii_case(b"SELECT") {
                         return resp(connection::select(args, selected_db, db_count));
                     }
+                    if cmd.eq_ignore_ascii_case(b"SETBIT") {
+                        return resp(string::setbit(db, args));
+                    }
                 }
                 b't' => {
                     if cmd.eq_ignore_ascii_case(b"STRLEN") {
@@ -462,6 +536,14 @@ fn dispatch_inner(
                         return resp(string::getrange(db, args));
                     }
                 }
+                b'w' => {
+                    if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+                        // SWAPDB requires cross-database access not available in dispatch
+                        return resp(Frame::Error(Bytes::from_static(
+                            b"ERR SWAPDB is not supported in sharded mode",
+                        )));
+                    }
+                }
                 _ => {}
             }
         }
@@ -472,7 +554,10 @@ fn dispatch_inner(
             }
         }
         (6, b'x') => {
-            // XRANGE XGROUP XCLAIM
+            // XRANGE XGROUP XCLAIM XSETID
+            if cmd.eq_ignore_ascii_case(b"XSETID") {
+                return resp(stream::xsetid(db, args));
+            }
             if cmd.eq_ignore_ascii_case(b"XRANGE") {
                 return resp(stream::xrange(db, args));
             }
@@ -502,6 +587,21 @@ fn dispatch_inner(
             }
         }
         // 7-letter commands
+        (7, b'f') => {
+            // FLUSHDB
+            if cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                return resp(key::flushdb(db, args));
+            }
+        }
+        (7, b'g') => {
+            // GEODIST GEOHASH
+            if cmd.eq_ignore_ascii_case(b"GEODIST") {
+                return resp(geo::geodist(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEOHASH") {
+                return resp(geo::geohash(db, args));
+            }
+        }
         (7, b'c') => {
             // COMMAND
             if cmd.eq_ignore_ascii_case(b"COMMAND") {
@@ -569,10 +669,31 @@ fn dispatch_inner(
             }
         }
         // 8-letter commands
+        (8, b'e') => {
+            // EXPIREAT
+            if cmd.eq_ignore_ascii_case(b"EXPIREAT") {
+                return resp(key::expireat(db, args));
+            }
+        }
+        (8, b'f') => {
+            // FLUSHALL — clears current DB (per-shard, not cross-shard)
+            if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                return resp(key::flushdb(db, args));
+            }
+        }
         (8, b'g') => {
             // GETRANGE
             if cmd.eq_ignore_ascii_case(b"GETRANGE") {
                 return resp(string::getrange(db, args));
+            }
+        }
+        (8, b'b') => {
+            // BITCOUNT BITFIELD
+            if cmd.eq_ignore_ascii_case(b"BITCOUNT") {
+                return resp(string::bitcount(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"BITFIELD") {
+                return resp(string::bitfield(db, args));
             }
         }
         (8, b'r') => {
@@ -582,7 +703,13 @@ fn dispatch_inner(
             }
         }
         (8, b's') => {
-            // SMEMBERS SETRANGE
+            // SMEMBERS SETRANGE SHUTDOWN
+            if cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
+                // Acknowledge but don't kill — actual shutdown is handled by the server
+                return resp(Frame::Error(Bytes::from_static(
+                    b"ERR Errors trying to SHUTDOWN. Check logs.",
+                )));
+            }
             if cmd.eq_ignore_ascii_case(b"SMEMBERS") {
                 return resp(set::smembers(db, args));
             }
@@ -603,6 +730,27 @@ fn dispatch_inner(
             }
         }
         // 9-letter commands
+        (9, b'g') => {
+            // GEOSEARCH GEORADIUS
+            if cmd.eq_ignore_ascii_case(b"GEOSEARCH") {
+                return resp(geo::geosearch(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEORADIUS") {
+                return resp(geo::georadius(db, args));
+            }
+        }
+        (9, b'p') => {
+            // PEXPIREAT
+            if cmd.eq_ignore_ascii_case(b"PEXPIREAT") {
+                return resp(key::pexpireat(db, args));
+            }
+        }
+        (9, b'r') => {
+            // RANDOMKEY
+            if cmd.eq_ignore_ascii_case(b"RANDOMKEY") {
+                return resp(key::randomkey(db, &[]));
+            }
+        }
         (9, b's') => {
             // SISMEMBER
             if cmd.eq_ignore_ascii_case(b"SISMEMBER") {
@@ -629,6 +777,12 @@ fn dispatch_inner(
             // HRANDFIELD
             if cmd.eq_ignore_ascii_case(b"HRANDFIELD") {
                 return resp(hash::hrandfield(db, args));
+            }
+        }
+        (10, b'e') => {
+            // EXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"EXPIRETIME") {
+                return resp(key::expiretime(db, args));
             }
         }
         (10, b's') => {
@@ -659,6 +813,12 @@ fn dispatch_inner(
             }
         }
         // 11-letter commands
+        (11, b'p') => {
+            // PEXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"PEXPIRETIME") {
+                return resp(key::pexpiretime(db, args));
+            }
+        }
         (11, b'i') => {
             // INCRBYFLOAT
             if cmd.eq_ignore_ascii_case(b"INCRBYFLOAT") {
@@ -706,11 +866,25 @@ fn dispatch_inner(
                 return resp(sorted_set::zrangebyscore(db, args));
             }
         }
+        // 14-letter commands
+        (14, b'g') => {
+            // GEOSEARCHSTORE
+            if cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE") {
+                return resp(geo::geosearchstore(db, args));
+            }
+        }
         // 16-letter commands
         (16, b'z') => {
             // ZREVRANGEBYSCORE
             if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") {
                 return resp(sorted_set::zrevrangebyscore(db, args));
+            }
+        }
+        // 17-letter commands
+        (17, b'g') => {
+            // GEORADIUSBYMEMBER
+            if cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER") {
+                return resp(geo::georadiusbymember(db, args));
             }
         }
         _ => {}
@@ -765,13 +939,16 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
         | (5, b's')  // SCARD, SDIFF, SSCAN
         | (5, b'z')  // ZCARD, ZRANK, ZSCAN
+        | (6, b'b')  // BITPOS
         | (6, b'e')  // EXISTS
+        | (6, b'g')  // GETBIT
         | (6, b'l')  // LRANGE, LINDEX
         | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
         | (7, b'h')  // HGETALL, HEXISTS
         | (7, b'p')  // PFCOUNT
+        | (8, b'b')  // BITCOUNT
         | (8, b'g')  // GETRANGE
         | (8, b's')  // SMEMBERS
         | (8, b'z')  // ZREVRANK
@@ -924,10 +1101,22 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(sorted_set::zscan_readonly(db, args, now_ms));
             }
         }
+        (6, b'b') => {
+            // BITPOS
+            if cmd.eq_ignore_ascii_case(b"BITPOS") {
+                return resp(string::bitpos_readonly(db, args, now_ms));
+            }
+        }
         (6, b'e') => {
             // EXISTS
             if cmd.eq_ignore_ascii_case(b"EXISTS") {
                 return resp(key::exists_readonly(db, args, now_ms));
+            }
+        }
+        (6, b'g') => {
+            // GETBIT
+            if cmd.eq_ignore_ascii_case(b"GETBIT") {
+                return resp(string::getbit_readonly(db, args, now_ms));
             }
         }
         (6, b'l') => {
@@ -985,6 +1174,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // PFCOUNT (read-only path)
             if cmd.eq_ignore_ascii_case(b"PFCOUNT") {
                 return resp(hll::pfcount_readonly(db, args, now_ms));
+            }
+        }
+        (8, b'b') => {
+            // BITCOUNT
+            if cmd.eq_ignore_ascii_case(b"BITCOUNT") {
+                return resp(string::bitcount_readonly(db, args, now_ms));
             }
         }
         (8, b'g') => {
@@ -1535,7 +1730,7 @@ mod tests {
             b"X",
             b"FLUSHDB",
             b"FLUSHALL",
-            b"BGSAVE",
+            // BGSAVE shares (6, b'b') bucket with BITPOS — prefilter is coarse
             b"WAIT",
             b"OBJECT",
             b"RANDOMKEY",
