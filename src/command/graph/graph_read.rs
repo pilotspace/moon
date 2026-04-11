@@ -253,8 +253,8 @@ pub fn graph_list(store: &GraphStore) -> Frame {
 
 /// GRAPH.QUERY <graph> <cypher_string>
 ///
-/// Parses and compiles the Cypher query. Full execution is deferred to Phase 118+.
-/// Currently returns the compiled physical plan as a diagnostic array.
+/// Parses the Cypher query, compiles to a physical plan, executes it against
+/// the named graph, and returns result rows with column headers and statistics.
 pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
@@ -267,9 +267,10 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
     };
 
-    if store.get_graph(graph_name).is_none() {
-        return Frame::Error(Bytes::from_static(b"ERR graph not found"));
-    }
+    let graph = match store.get_graph(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
 
     let cypher_bytes = match extract_bulk(&args[1]) {
         Some(b) => b,
@@ -292,14 +293,16 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         }
     };
 
-    // Return plan summary as array of operator descriptions.
-    let ops: Vec<Frame> = plan
-        .operators
-        .iter()
-        .map(|op| Frame::BulkString(Bytes::from(format!("{op:?}"))))
-        .collect();
+    let params = std::collections::HashMap::new();
+    let result = match cypher::executor::execute(graph, &plan, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("ERR Cypher execution error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
 
-    Frame::Array(ops.into())
+    exec_result_to_frame(&result)
 }
 
 /// GRAPH.RO_QUERY <graph> <cypher_string>
@@ -405,6 +408,74 @@ pub fn graph_explain(store: &GraphStore, args: &[Frame]) -> Frame {
     }
 
     Frame::BulkString(Bytes::from(output))
+}
+
+/// Convert an `ExecResult` to a RESP3 Frame.
+///
+/// Format: Array [
+///   Array [column_name_1, column_name_2, ...],   // headers
+///   Array [ Array [val1, val2, ...], ... ],        // rows
+///   BulkString "Nodes created: N, ..."             // stats
+/// ]
+fn exec_result_to_frame(result: &cypher::executor::ExecResult) -> Frame {
+    // 1. Headers
+    let headers: Vec<Frame> = result
+        .columns
+        .iter()
+        .map(|c| Frame::BulkString(Bytes::from(c.clone())))
+        .collect();
+
+    // 2. Rows -- each row is an array of values.
+    let rows: Vec<Frame> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let cells: Vec<Frame> = row.iter().map(value_to_frame).collect();
+            Frame::Array(cells.into())
+        })
+        .collect();
+
+    // 3. Stats
+    let stats = format!(
+        "Nodes created: {}, Nodes deleted: {}, Properties set: {}, \
+         Query internal execution time: {} us",
+        result.nodes_created, result.nodes_deleted, result.properties_set,
+        result.execution_time_us
+    );
+
+    Frame::Array(
+        vec![
+            Frame::Array(headers.into()),
+            Frame::Array(rows.into()),
+            Frame::BulkString(Bytes::from(stats)),
+        ]
+        .into(),
+    )
+}
+
+/// Convert an executor Value to a Frame.
+fn value_to_frame(value: &cypher::executor::Value) -> Frame {
+    use cypher::executor::Value;
+    match value {
+        Value::Null => Frame::Null,
+        Value::Int(n) => Frame::Integer(*n),
+        Value::Float(f) => Frame::Double(*f),
+        Value::String(s) => Frame::BulkString(Bytes::from(s.clone())),
+        Value::Bool(b) => Frame::Boolean(*b),
+        Value::Node(key) => Frame::BulkString(Bytes::from(format!("node:{}", key.data().as_ffi()))),
+        Value::Edge(key) => Frame::BulkString(Bytes::from(format!("edge:{}", key.data().as_ffi()))),
+        Value::List(items) => {
+            let frames: Vec<Frame> = items.iter().map(value_to_frame).collect();
+            Frame::Array(frames.into())
+        }
+        Value::Map(entries) => {
+            let pairs: Vec<(Frame, Frame)> = entries
+                .iter()
+                .map(|(k, v)| (Frame::BulkString(Bytes::from(k.clone())), value_to_frame(v)))
+                .collect();
+            Frame::Map(pairs)
+        }
+    }
 }
 
 /// Extract the maximum hop count from Expand operators in a physical plan.
