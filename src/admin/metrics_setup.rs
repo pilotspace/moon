@@ -615,3 +615,48 @@ pub fn init_global_slowlog(max_len: usize, threshold_us: u64) {
 pub fn global_slowlog() -> &'static crate::admin::slowlog::Slowlog {
     &GLOBAL_SLOWLOG
 }
+
+// ── SSE metrics publisher (console feature) ────────────────────────────
+
+/// Spawn a background task that publishes `MetricEvent` to the SSE
+/// broadcast channel at ~1 Hz. Reads from existing atomic counters.
+///
+/// Must be called from within a tokio runtime context (the admin thread).
+#[cfg(feature = "console")]
+pub fn spawn_metrics_publisher() {
+    use crate::admin::sse_stream::{MetricEvent, get_metrics_sender};
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
+        let mut prev_ops: u64 = 0;
+        let start = std::time::Instant::now();
+
+        loop {
+            interval.tick().await;
+
+            let sender = match get_metrics_sender() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let total_ops = TOTAL_COMMANDS.load(Ordering::Relaxed);
+            let ops_per_sec = total_ops.saturating_sub(prev_ops);
+            prev_ops = total_ops;
+
+            let event = MetricEvent {
+                event: "server_stats",
+                total_ops,
+                ops_per_sec,
+                // TODO: read from jemalloc or /proc/self/status in Phase 129
+                total_memory: get_rss_bytes(),
+                connected_clients: CONNECTED_CLIENTS.load(Ordering::Relaxed),
+                uptime_seconds: start.elapsed().as_secs(),
+                // TODO: aggregate from shard key counts in Phase 129
+                total_keys: 0,
+            };
+
+            // Fire-and-forget: if no SSE clients are connected, the message is dropped
+            let _ = sender.send(event);
+        }
+    });
+}

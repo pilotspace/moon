@@ -74,7 +74,7 @@ logos = { version = "0.14", optional = true }
 hyper-tungstenite = { version = "0.19", optional = true }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 mime_guess = { version = "2", optional = true }
-tokio-stream = { version = "0.1", optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 base64 = { version = "0.22", optional = true }
 
 [features]

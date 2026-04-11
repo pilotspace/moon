@@ -702,6 +702,12 @@ pub fn spawn_admin_server(
                 };
                 tracing::info!("Admin HTTP server listening on {}", addr);
 
+                #[cfg(feature = "console")]
+                {
+                    crate::admin::sse_stream::init_metrics_broadcast();
+                    crate::admin::metrics_setup::spawn_metrics_publisher();
+                }
+
                 loop {
                     let (stream, _) = match listener.accept().await {
                         Ok(c) => c,
