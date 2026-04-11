@@ -14,6 +14,7 @@ pub mod recovery;
 pub mod replay;
 pub mod scoring;
 pub mod segment;
+pub mod simd;
 pub mod stats;
 pub mod store;
 pub mod traversal;
