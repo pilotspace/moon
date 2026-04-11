@@ -139,6 +139,22 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         // Update graph stats incrementally.
         graph.stats.on_node_insert(&labels);
 
+        // Update PropertyIndex for numeric properties (range query support).
+        for (prop_id, prop_val) in &properties {
+            let val = match prop_val {
+                crate::graph::types::PropertyValue::Float(f) => Some(*f),
+                crate::graph::types::PropertyValue::Int(i) => Some(*i as f64),
+                _ => None,
+            };
+            if let Some(v) = val {
+                graph
+                    .property_indexes
+                    .entry(*prop_id)
+                    .or_insert_with(|| crate::graph::index::PropertyIndex::new(*prop_id))
+                    .insert(v, node_key.data().as_ffi() as u32);
+            }
+        }
+
         node_key.data().as_ffi()
     };
 

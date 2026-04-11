@@ -44,6 +44,9 @@ pub struct NamedGraph {
     /// Per-graph statistics for cost-based query planning.
     /// Updated incrementally on node/edge insert/delete.
     pub stats: GraphStats,
+    /// Cypher plan cache: xxhash64 of query string → compiled PhysicalPlan.
+    /// Wrapped in Mutex for interior mutability (reads insert cache misses).
+    pub plan_cache: parking_lot::Mutex<crate::graph::cypher::planner::PlanCache>,
 }
 
 impl NamedGraph {
@@ -140,6 +143,9 @@ impl GraphStore {
                 created_lsn: lsn,
                 property_indexes: HashMap::new(),
                 stats: GraphStats::new(),
+                plan_cache: parking_lot::Mutex::new(
+                    crate::graph::cypher::planner::PlanCache::new(1024),
+                ),
             },
         );
         Ok(())

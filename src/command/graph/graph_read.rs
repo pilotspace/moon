@@ -106,6 +106,9 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
         edge_type_filter,
     );
 
+    // TraversalGuard enforces bounded epoch hold (30s default timeout).
+    let guard = crate::graph::traversal_guard::TraversalGuard::with_default_timeout(lsn);
+
     // BFS expansion using SegmentMergeReader for per-node neighbor lookup.
     let mut visited = std::collections::HashSet::new();
     visited.insert(node_id);
@@ -115,6 +118,11 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
     let max_results = 10_000usize;
 
     for _hop in 0..depth {
+        // Check traversal timeout at each hop.
+        if let Err(timeout) = guard.check_timeout() {
+            return Frame::Error(Bytes::from(format!("ERR {timeout}")));
+        }
+
         let mut next_frontier = Vec::with_capacity(frontier.len() * 4);
 
         for &current in &frontier {
@@ -293,12 +301,24 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         }
     };
 
-    let plan = match cypher::planner::compile(&query) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("ERR Cypher plan error: {e}");
-            return Frame::Error(Bytes::from(msg));
-        }
+    // Plan cache: check for a cached plan before compiling.
+    let query_hash = cypher::planner::hash_query(cypher_bytes);
+    let plan = {
+        let cache = graph.plan_cache.lock();
+        cache.get(query_hash)
+    };
+    let plan = if let Some(cached) = plan {
+        cached
+    } else {
+        let p = match cypher::planner::compile(&query) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => {
+                let msg = format!("ERR Cypher plan error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        };
+        graph.plan_cache.lock().insert(query_hash, p.clone());
+        p
     };
 
     let params = std::collections::HashMap::new();

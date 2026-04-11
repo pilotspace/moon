@@ -31,6 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (default features)
         run: cargo clippy -- -D warnings
+      - name: Clippy (default + graph)
+        run: cargo clippy --features graph -- -D warnings
       - name: Clippy (tokio runtime)
         run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
 
@@ -43,6 +45,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
+        env:
+          MOON_NO_URING: "1"
+      - name: Test (graph feature)
+        run: cargo test --no-default-features --features runtime-tokio,jemalloc,graph --lib graph::
+        timeout-minutes: 5
         env:
           MOON_NO_URING: "1"
 
