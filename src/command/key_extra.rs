@@ -54,9 +54,11 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Integer(0);
     }
 
-    // Same key: source == dest — Redis returns 1 only with REPLACE, else 0
+    // Same key: Redis 7.x returns ERR for source == destination
     if src == dst {
-        return Frame::Integer(if replace { 1 } else { 0 });
+        return Frame::Error(Bytes::from_static(
+            b"ERR source and destination objects are the same",
+        ));
     }
 
     // Check if destination exists
@@ -450,8 +452,8 @@ mod tests {
     fn test_copy_same_key() {
         let mut db = setup_db_with_key(b"src", b"hello");
         let result = copy(&mut db, &[bs(b"src"), bs(b"src")]);
-        // Redis returns 0 for same-key copy
-        assert_eq!(result, Frame::Integer(0));
+        // Redis 7.x returns ERR for same-key copy
+        assert!(matches!(result, Frame::Error(_)));
     }
 
     #[test]

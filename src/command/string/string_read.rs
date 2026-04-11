@@ -429,6 +429,14 @@ pub fn lcs(db: &mut Database, args: &[Frame]) -> Frame {
 
     let n = s1.len();
     let m = s2.len();
+    // Guard against OOM: cap DP table size (n*m cells * 4 bytes each).
+    // 64MB cap ≈ 4096 * 4096 strings — generous for any real use case.
+    const MAX_LCS_CELLS: usize = 16 * 1024 * 1024; // 64MB at 4 bytes/cell
+    if n.saturating_mul(m) > MAX_LCS_CELLS {
+        return Frame::Error(Bytes::from_static(
+            b"ERR inputs too large for LCS computation",
+        ));
+    }
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for ii in 1..=n {
         for jj in 1..=m {

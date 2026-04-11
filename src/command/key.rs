@@ -229,14 +229,22 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("EXPIREAT"),
     };
     let timestamp = match parse_int(&args[1]) {
-        Some(n) if n > 0 => n as u64,
-        _ => {
+        Some(n) => n,
+        None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR invalid expire time in 'EXPIREAT' command",
             ));
         }
     };
-    let expires_at_ms = timestamp * 1000;
+    // Redis accepts 0 and negative timestamps as past-time expiry (deletes key immediately)
+    if timestamp <= 0 {
+        return if db.remove(key).is_some() {
+            Frame::Integer(1)
+        } else {
+            Frame::Integer(0)
+        };
+    }
+    let expires_at_ms = (timestamp as u64) * 1000;
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -256,14 +264,22 @@ pub fn pexpireat(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("PEXPIREAT"),
     };
     let timestamp_ms = match parse_int(&args[1]) {
-        Some(n) if n > 0 => n as u64,
-        _ => {
+        Some(n) => n,
+        None => {
             return Frame::Error(Bytes::from_static(
                 b"ERR invalid expire time in 'PEXPIREAT' command",
             ));
         }
     };
-    if db.set_expiry(key, timestamp_ms) {
+    // Redis accepts 0 and negative timestamps as past-time expiry (deletes key immediately)
+    if timestamp_ms <= 0 {
+        return if db.remove(key).is_some() {
+            Frame::Integer(1)
+        } else {
+            Frame::Integer(0)
+        };
+    }
+    if db.set_expiry(key, timestamp_ms as u64) {
         Frame::Integer(1)
     } else {
         Frame::Integer(0)
