@@ -14,7 +14,7 @@ pub mod parser;
 pub mod planner;
 
 pub use ast::{Clause, CypherQuery, Expr};
-pub use executor::{ExecResult, Value};
+pub use executor::{ExecResult, OpProfile, ProfileResult, Value};
 pub use parser::{CypherError, Parser};
 pub use planner::{CostEstimate, PhysicalPlan, PlanCache, Strategy};
 
