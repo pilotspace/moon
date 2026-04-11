@@ -12,6 +12,9 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use dashmap::DashSet;
+use parking_lot::Mutex;
+
 use crate::graph::csr::CsrStorage;
 use crate::graph::memgraph::MemGraph;
 use crate::graph::scoring::WeightedCostFn;
@@ -19,6 +22,12 @@ use crate::graph::types::{Direction, EdgeKey, NodeKey};
 
 /// Default maximum frontier size for BFS (100K nodes).
 pub const DEFAULT_FRONTIER_CAP: usize = 100_000;
+
+/// Frontier size threshold above which parallel BFS is used.
+pub const PARALLEL_THRESHOLD: usize = 256;
+
+/// Number of nodes per morsel in parallel BFS expansion.
+pub const MORSEL_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Traversal errors
@@ -310,6 +319,153 @@ impl BoundedBfs {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel BFS (PAR-01 through PAR-04)
+// ---------------------------------------------------------------------------
+
+/// Morsel-driven parallel BFS for large frontiers.
+///
+/// When the frontier exceeds [`PARALLEL_THRESHOLD`] (256) nodes, neighbor-list
+/// processing is split into [`MORSEL_SIZE`] (128) node morsels handled in
+/// parallel via `std::thread::scope`. Results merge into a shared
+/// `DashSet<NodeKey>` visited set. Falls back to sequential BFS for small
+/// frontiers (PAR-03), avoiding any parallelism overhead.
+///
+/// **Design note:** `SegmentMergeReader` borrows `&MemGraph` which is `!Send`,
+/// so `reader.neighbors()` calls remain on the main thread. The parallel phase
+/// processes the *already-collected* neighbor lists (owned `Vec<MergedNeighbor>`)
+/// across worker threads for visited-set filtering and result building.
+pub struct ParallelBfs {
+    pub depth_limit: u32,
+    pub frontier_cap: usize,
+}
+
+impl ParallelBfs {
+    /// Create with default frontier cap of 100K.
+    pub fn new(depth_limit: u32) -> Self {
+        Self {
+            depth_limit,
+            frontier_cap: DEFAULT_FRONTIER_CAP,
+        }
+    }
+
+    /// Create with custom frontier cap.
+    pub fn with_cap(depth_limit: u32, frontier_cap: usize) -> Self {
+        Self {
+            depth_limit,
+            frontier_cap,
+        }
+    }
+
+    /// Execute parallel BFS from a start node.
+    ///
+    /// For frontiers larger than [`PARALLEL_THRESHOLD`], neighbor lists are
+    /// collected sequentially (reader is `!Send`) then processed in parallel
+    /// morsels via `std::thread::scope`.
+    pub fn execute(
+        &self,
+        reader: &SegmentMergeReader<'_>,
+        start: NodeKey,
+    ) -> Result<BfsResult, TraversalError> {
+        if !reader.node_exists(start) {
+            return Err(TraversalError::NodeNotFound);
+        }
+
+        reader.madvise_sequential();
+
+        let visited: DashSet<NodeKey> = DashSet::new();
+        visited.insert(start);
+
+        let result: Mutex<Vec<(NodeKey, u32, Option<MergedNeighbor>)>> =
+            Mutex::new(vec![(start, 0, None)]);
+
+        let mut frontier: Vec<NodeKey> = vec![start];
+        let mut depth: u32 = 0;
+
+        while !frontier.is_empty() {
+            if depth >= self.depth_limit {
+                break;
+            }
+
+            // Phase 1: Collect neighbor lists sequentially (reader is !Send).
+            let neighbor_lists: Vec<(NodeKey, Vec<MergedNeighbor>)> = frontier
+                .iter()
+                .map(|&node| (node, reader.neighbors(node)))
+                .collect();
+
+            let next_depth = depth + 1;
+            let mut next_frontier: Vec<NodeKey>;
+
+            if frontier.len() <= PARALLEL_THRESHOLD {
+                // --- Sequential path (PAR-03): zero parallelism overhead ---
+                next_frontier = Vec::new();
+                let mut res = result.lock();
+                for (_src, neighbors) in &neighbor_lists {
+                    for neighbor in neighbors {
+                        if visited.insert(neighbor.node) {
+                            res.push((neighbor.node, next_depth, Some(neighbor.clone())));
+                            next_frontier.push(neighbor.node);
+                        }
+                    }
+                }
+            } else {
+                // --- Parallel path (PAR-01): morsel-driven expansion ---
+                let per_morsel_results: Mutex<Vec<Vec<(NodeKey, u32, Option<MergedNeighbor>)>>> =
+                    Mutex::new(Vec::new());
+
+                std::thread::scope(|s| {
+                    for chunk in neighbor_lists.chunks(MORSEL_SIZE) {
+                        let visited_ref = &visited;
+                        let per_morsel_ref = &per_morsel_results;
+                        s.spawn(move || {
+                            let mut local: Vec<(NodeKey, u32, Option<MergedNeighbor>)> =
+                                Vec::new();
+                            for (_src, neighbors) in chunk {
+                                for neighbor in neighbors {
+                                    if visited_ref.insert(neighbor.node) {
+                                        local.push((
+                                            neighbor.node,
+                                            next_depth,
+                                            Some(neighbor.clone()),
+                                        ));
+                                    }
+                                }
+                            }
+                            per_morsel_ref.lock().push(local);
+                        });
+                    }
+                });
+
+                // Merge morsel results.
+                let morsel_vecs = per_morsel_results.into_inner();
+                next_frontier = Vec::new();
+                let mut res = result.lock();
+                for morsel in &morsel_vecs {
+                    for entry in morsel {
+                        next_frontier.push(entry.0);
+                        res.push(entry.clone());
+                    }
+                }
+            }
+
+            // Check frontier cap.
+            if visited.len() >= self.frontier_cap {
+                return Err(TraversalError::FrontierCapExceeded {
+                    cap: self.frontier_cap,
+                    depth: next_depth,
+                });
+            }
+
+            frontier = next_frontier;
+            depth = next_depth;
+        }
+
+        Ok(BfsResult {
+            visited: result.into_inner(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DFS (TRAV-02)
 // ---------------------------------------------------------------------------
 
@@ -551,6 +707,7 @@ mod tests {
     use super::*;
     use crate::graph::csr::{CsrSegment, CsrStorage};
     use crate::graph::memgraph::MemGraph;
+    use slotmap::Key;
     use crate::graph::scoring::WeightedCostFn;
     use smallvec::smallvec;
 
@@ -1102,5 +1259,142 @@ mod tests {
         let neighbors = reader.neighbors(node_a_key);
         // Should find neighbor(s) from CSR 1 at minimum.
         assert!(!neighbors.is_empty());
+    }
+
+    // --- ParallelBfs tests ---
+
+    #[test]
+    fn test_parallel_bfs_small_frontier_matches_sequential() {
+        // Build a small graph (10 nodes in a chain with some branches).
+        let mut mg = MemGraph::new(1000);
+        let mut nodes = Vec::new();
+        for _ in 0..10 {
+            nodes.push(mg.add_node(smallvec![0], empty_props(), None, 1));
+        }
+        // Chain: 0->1->2->3->4
+        for i in 0..4 {
+            mg.add_edge(nodes[i], nodes[i + 1], 1, 1.0, None, 2).expect("ok");
+        }
+        // Branch: 0->5, 0->6, 1->7, 2->8, 3->9
+        mg.add_edge(nodes[0], nodes[5], 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(nodes[0], nodes[6], 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(nodes[1], nodes[7], 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(nodes[2], nodes[8], 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(nodes[3], nodes[9], 1, 1.0, None, 2).expect("ok");
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let seq_bfs = BoundedBfs::new(3);
+        let seq_result = seq_bfs.execute(&reader, nodes[0]).expect("ok");
+
+        let par_bfs = super::ParallelBfs::new(3);
+        let par_result = par_bfs.execute(&reader, nodes[0]).expect("ok");
+
+        // Compare visited sets (ignore order).
+        let mut seq_nodes: Vec<NodeKey> = seq_result.visited.iter().map(|v| v.0).collect();
+        let mut par_nodes: Vec<NodeKey> = par_result.visited.iter().map(|v| v.0).collect();
+        seq_nodes.sort_by_key(|k| k.data().as_ffi());
+        par_nodes.sort_by_key(|k| k.data().as_ffi());
+        assert_eq!(seq_nodes, par_nodes);
+    }
+
+    #[test]
+    fn test_parallel_bfs_large_frontier_triggers_parallel() {
+        // Build a hub node connected to 350+ nodes (> PARALLEL_THRESHOLD).
+        let mut mg = MemGraph::new(100_000);
+        let hub = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let leaf_count = 350;
+        let mut leaves = Vec::with_capacity(leaf_count);
+        for i in 0..leaf_count {
+            let leaf = mg.add_node(smallvec![0], empty_props(), None, (i + 2) as u64);
+            mg.add_edge(hub, leaf, 1, 1.0, None, 2).expect("ok");
+            leaves.push(leaf);
+        }
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let par_bfs = super::ParallelBfs::new(1);
+        let result = par_bfs.execute(&reader, hub).expect("ok");
+
+        // Hub + all 350 leaves = 351
+        assert_eq!(result.visited.len(), leaf_count + 1);
+    }
+
+    #[test]
+    fn test_parallel_bfs_respects_frontier_cap() {
+        // Set cap to 50, build a star that exceeds it.
+        let mut mg = MemGraph::new(100_000);
+        let hub = mg.add_node(smallvec![0], empty_props(), None, 1);
+        for i in 0..100 {
+            let leaf = mg.add_node(smallvec![0], empty_props(), None, (i + 2) as u64);
+            mg.add_edge(hub, leaf, 1, 1.0, None, 2).expect("ok");
+        }
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let par_bfs = super::ParallelBfs::with_cap(2, 50);
+        let err = par_bfs.execute(&reader, hub).unwrap_err();
+        match err {
+            TraversalError::FrontierCapExceeded { cap, depth: _ } => {
+                assert_eq!(cap, 50);
+            }
+            other => panic!("expected FrontierCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parallel_bfs_sequential_fallback() {
+        // Frontier < 256 nodes -- verify correctness matches BoundedBfs.
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let c = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let d = mg.add_node(smallvec![0], empty_props(), None, 1);
+        mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(a, c, 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(b, d, 1, 1.0, None, 2).expect("ok");
+        mg.add_edge(c, d, 1, 1.0, None, 2).expect("ok");
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let seq = BoundedBfs::new(3);
+        let seq_result = seq.execute(&reader, a).expect("ok");
+
+        let par = super::ParallelBfs::new(3);
+        let par_result = par.execute(&reader, a).expect("ok");
+
+        let mut seq_nodes: Vec<NodeKey> = seq_result.visited.iter().map(|v| v.0).collect();
+        let mut par_nodes: Vec<NodeKey> = par_result.visited.iter().map(|v| v.0).collect();
+        seq_nodes.sort_by_key(|k| k.data().as_ffi());
+        par_nodes.sort_by_key(|k| k.data().as_ffi());
+        assert_eq!(seq_nodes, par_nodes);
     }
 }

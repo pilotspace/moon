@@ -39,5 +39,5 @@ pub use scoring::{CompositeScorer, DistanceScorer, TemporalDecayScorer, Weighted
 pub use segment::GraphSegmentHolder;
 pub use stats::GraphStats;
 pub use store::GraphStore;
-pub use traversal::{BoundedBfs, BoundedDfs, DijkstraTraversal, SegmentMergeReader};
+pub use traversal::{BoundedBfs, BoundedDfs, DijkstraTraversal, ParallelBfs, SegmentMergeReader};
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};
