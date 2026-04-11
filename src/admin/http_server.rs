@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -22,13 +23,18 @@ struct AdminState {
     ready: Arc<AtomicBool>,
 }
 
+/// Wrap `Full<Bytes>` into a `BoxBody` for unified response types.
+fn full_body(data: Bytes) -> BoxBody<Bytes, Infallible> {
+    Full::new(data).map_err(|never| match never {}).boxed()
+}
+
 /// Build an HTTP response with the given status and body.
-fn response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
+fn response(status: StatusCode, body: &'static str) -> Response<BoxBody<Bytes, Infallible>> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"Internal Server Error"))))
+        .body(full_body(Bytes::from_static(body.as_bytes())))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b"Internal Server Error"))))
 }
 
 // ---------------------------------------------------------------------------
@@ -36,7 +42,7 @@ fn response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "console")]
-fn add_cors_headers(resp: &mut Response<Full<Bytes>>) {
+fn add_cors_headers<B>(resp: &mut Response<B>) {
     let h = resp.headers_mut();
     h.insert(
         "access-control-allow-origin",
@@ -57,13 +63,13 @@ fn add_cors_headers(resp: &mut Response<Full<Bytes>>) {
 }
 
 #[cfg(feature = "console")]
-fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<Full<Bytes>> {
+fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<BoxBody<Bytes, Infallible>> {
     let body = serde_json::to_vec(value).unwrap_or_default();
     let mut resp = Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"{}"))));
+        .body(full_body(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b"{}"))));
     add_cors_headers(&mut resp);
     resp
 }
@@ -73,8 +79,7 @@ fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<Full
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "console")]
-async fn read_body(req: Request<Incoming>) -> Result<Bytes, Response<Full<Bytes>>> {
-    use http_body_util::BodyExt;
+async fn read_body(req: Request<Incoming>) -> Result<Bytes, Response<BoxBody<Bytes, Infallible>>> {
     match req.collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(_) => Err(json_response(
@@ -133,10 +138,11 @@ fn extract_key_from_ttl_path(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Route incoming requests to the appropriate handler.
+#[allow(unused_mut)] // `req` is mutated only when `console` feature is enabled (WebSocket upgrade)
 async fn handle_request(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<AdminState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     #[cfg(feature = "console")]
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -159,10 +165,66 @@ async fn handle_request(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                .body(Full::new(Bytes::from(rendered)))
+                .body(full_body(Bytes::from(rendered)))
                 .unwrap_or_else(|_| {
-                    Response::new(Full::new(Bytes::from_static(b"Internal Server Error")))
+                    Response::new(full_body(Bytes::from_static(b"Internal Server Error")))
                 })
+        }
+
+        // SSE endpoint for real-time metric streaming (console feature only).
+        #[cfg(feature = "console")]
+        "/events" => {
+            return Ok(crate::admin::sse_stream::handle_sse_stream());
+        }
+
+        // WebSocket upgrade at /ws for interactive command sessions.
+        #[cfg(feature = "console")]
+        "/ws" => {
+            if hyper_tungstenite::is_upgrade_request(&req) {
+                match crate::admin::console_gateway::get_global_gateway() {
+                    Some(gw) => {
+                        let mut ws_config =
+                            hyper_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+                        // 4 MB hard limit on outgoing buffer (GW-08).
+                        ws_config.max_write_buffer_size = 4 * 1024 * 1024;
+                        // 64 KB max incoming message/frame.
+                        ws_config.max_message_size = Some(64 * 1024);
+                        ws_config.max_frame_size = Some(64 * 1024);
+                        match hyper_tungstenite::upgrade(&mut req, Some(ws_config)) {
+                            Ok((ws_response, ws_future)) => {
+                                let gw = gw.clone();
+                                tokio::spawn(async move {
+                                    match ws_future.await {
+                                        Ok(ws_stream) => {
+                                            crate::admin::ws_bridge::handle_ws_connection(
+                                                ws_stream, gw,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "WebSocket upgrade failed: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                });
+                                // Return 101 Switching Protocols to complete the upgrade.
+                                return Ok(ws_response.map(|b| b.map_err(|never| match never {}).boxed()));
+                            }
+                            Err(e) => {
+                                tracing::debug!("WebSocket upgrade error: {}", e);
+                                response(StatusCode::BAD_REQUEST, "WebSocket upgrade failed")
+                            }
+                        }
+                    }
+                    None => {
+                        response(StatusCode::SERVICE_UNAVAILABLE, "Console not initialized")
+                    }
+                }
+            } else {
+                response(StatusCode::BAD_REQUEST, "Expected WebSocket upgrade")
+            }
         }
 
         #[cfg(feature = "console")]
@@ -177,12 +239,21 @@ async fn handle_request(
         _ if method == hyper::Method::OPTIONS => {
             let mut resp = Response::builder()
                 .status(StatusCode::NO_CONTENT)
-                .body(Full::new(Bytes::new()))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+                .body(full_body(Bytes::new()))
+                .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
             add_cors_headers(&mut resp);
             resp
         }
 
+        // Static file serving with SPA fallback (console feature only).
+        #[cfg(feature = "console")]
+        _ => {
+            let path = req.uri().path();
+            let resp = crate::admin::static_files::serve_static_file(path);
+            resp.map(|b| b.map_err(|never| match never {}).boxed())
+        }
+
+        #[cfg(not(feature = "console"))]
         _ => response(StatusCode::NOT_FOUND, "Not Found"),
     };
     Ok(resp)
@@ -197,7 +268,7 @@ async fn handle_api_request(
     req: Request<Incoming>,
     path: &str,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     use hyper::Method;
 
     let method = req.method().clone();
@@ -261,7 +332,7 @@ async fn handle_api_request(
 async fn handle_command(
     req: Request<Incoming>,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let body = match read_body(req).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -344,7 +415,7 @@ fn frame_type_name(frame: &crate::protocol::Frame) -> &'static str {
 async fn handle_scan_keys(
     query: &str,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let params = parse_query_params(query);
     let pattern = params.get("pattern").map(|s| s.as_str()).unwrap_or("*");
     let cursor = params.get("cursor").map(|s| s.as_str()).unwrap_or("0");
@@ -389,7 +460,7 @@ async fn handle_get_key(
     key: &str,
     _query: &str,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let key_bytes = Bytes::from(key.to_string());
 
     // First, get the key type.
@@ -472,7 +543,7 @@ async fn handle_set_key(
     key: &str,
     req: Request<Incoming>,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let body = match read_body(req).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -518,7 +589,7 @@ async fn handle_set_key(
 async fn handle_delete_key(
     key: &str,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let key_bytes = Bytes::from(key.to_string());
 
     match gw.execute_command(0, "DEL", &[key_bytes]).await {
@@ -544,7 +615,7 @@ async fn handle_delete_key(
 async fn handle_get_ttl(
     key: &str,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let key_bytes = Bytes::from(key.to_string());
 
     match gw.execute_command(0, "TTL", &[key_bytes]).await {
@@ -569,7 +640,7 @@ async fn handle_set_ttl(
     key: &str,
     req: Request<Incoming>,
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     let body = match read_body(req).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -623,7 +694,7 @@ async fn handle_set_ttl(
 #[cfg(feature = "console")]
 async fn handle_info(
     gw: &crate::admin::console_gateway::ConsoleGateway,
-) -> Response<Full<Bytes>> {
+) -> Response<BoxBody<Bytes, Infallible>> {
     match gw.execute_command(0, "INFO", &[]).await {
         Ok(frame) => {
             let info_str = match &frame {
@@ -721,16 +792,17 @@ pub fn spawn_admin_server(
                     let io = hyper_util::rt::TokioIo::new(stream);
 
                     tokio::spawn(async move {
-                        if let Err(e) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(
-                                io,
-                                service_fn(move |req| {
-                                    let state = state.clone();
-                                    handle_request(req, state)
-                                }),
-                            )
-                            .await
-                        {
+                        let builder = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        );
+                        let conn = builder.serve_connection_with_upgrades(
+                            io,
+                            service_fn(move |req| {
+                                let state = state.clone();
+                                handle_request(req, state)
+                            }),
+                        );
+                        if let Err(e) = conn.await {
                             tracing::debug!("Admin HTTP connection error: {}", e);
                         }
                     });
