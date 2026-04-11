@@ -9,3 +9,10 @@ pub mod slowlog;
 
 #[cfg(feature = "console")]
 pub mod console_gateway;
+
+#[cfg(feature = "console")]
+pub mod sse_stream;
+#[cfg(feature = "console")]
+pub mod ws_bridge;
+#[cfg(feature = "console")]
+pub mod static_files;
