@@ -21,7 +21,7 @@ jobs:
       - name: Build Moon (release)
         run: cargo build --release --no-default-features --features runtime-tokio,jemalloc
       - name: Run crash matrix tests
-        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test durability
+        run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test durability_tests
         timeout-minutes: 10
       - name: Run jepsen-lite tests
         run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test jepsen_lite
