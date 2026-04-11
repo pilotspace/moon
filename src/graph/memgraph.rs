@@ -6,9 +6,7 @@
 use slotmap::SlotMap;
 use smallvec::SmallVec;
 
-use crate::graph::types::{
-    Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap,
-};
+use crate::graph::types::{Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap};
 
 /// Errors returned by MemGraph operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +31,8 @@ pub struct FrozenMemGraph {
 pub struct MemGraph {
     nodes: SlotMap<NodeKey, MutableNode>,
     edges: SlotMap<EdgeKey, MutableEdge>,
+    /// Count of live (non-deleted) nodes.
+    live_node_count: usize,
     /// Count of live (non-deleted) edges.
     live_edge_count: usize,
     /// Edge count threshold that triggers freeze.
@@ -46,6 +46,7 @@ impl MemGraph {
         Self {
             nodes: SlotMap::with_key(),
             edges: SlotMap::with_key(),
+            live_node_count: 0,
             live_edge_count: 0,
             edge_threshold,
             frozen: false,
@@ -60,7 +61,7 @@ impl MemGraph {
         embedding: Option<Vec<f32>>,
         lsn: u64,
     ) -> NodeKey {
-        self.nodes.insert(MutableNode {
+        let key = self.nodes.insert(MutableNode {
             labels,
             outgoing: SmallVec::new(),
             incoming: SmallVec::new(),
@@ -69,7 +70,9 @@ impl MemGraph {
             created_lsn: lsn,
             deleted_lsn: u64::MAX,
             txn_id: 0,
-        })
+        });
+        self.live_node_count += 1;
+        key
     }
 
     /// Insert a new edge between `src` and `dst`. Validates both exist and are alive.
@@ -133,6 +136,7 @@ impl MemGraph {
             return false; // already deleted
         }
         node.deleted_lsn = lsn;
+        self.live_node_count = self.live_node_count.saturating_sub(1);
 
         // Collect incident edge keys (both outgoing and incoming).
         let edge_keys: SmallVec<[EdgeKey; 16]> = node
@@ -181,12 +185,7 @@ impl MemGraph {
     ///
     /// Yields `(EdgeKey, NodeKey)` pairs -- the edge and the neighbor node.
     /// No heap allocation: iterates over borrowed SmallVec adjacency lists.
-    pub fn neighbors(
-        &self,
-        node: NodeKey,
-        direction: Direction,
-        lsn: u64,
-    ) -> NeighborIter<'_> {
+    pub fn neighbors(&self, node: NodeKey, direction: Direction, lsn: u64) -> NeighborIter<'_> {
         let Some(n) = self.nodes.get(node) else {
             return NeighborIter {
                 edges: &self.edges,
@@ -212,12 +211,9 @@ impl MemGraph {
         }
     }
 
-    /// Number of live (non-deleted) nodes.
+    /// Number of live (non-deleted) nodes. O(1) via maintained counter.
     pub fn node_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|n| n.deleted_lsn == u64::MAX)
-            .count()
+        self.live_node_count
     }
 
     /// Number of live (non-deleted) edges.

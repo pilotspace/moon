@@ -1539,12 +1539,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
                 let (response, wal_records) = {
                     let mut gs = ctx.shard_databases.graph_store(ctx.shard_id);
-                    let resp = crate::command::graph::dispatch_graph_cmd_args(&mut gs, cmd, cmd_args);
+                    let resp =
+                        crate::command::graph::dispatch_graph_cmd_args(&mut gs, cmd, cmd_args);
                     let records = gs.drain_wal();
                     (resp, records)
                 };
                 for record in wal_records {
-                    ctx.shard_databases.wal_append(ctx.shard_id, bytes::Bytes::from(record));
+                    ctx.shard_databases
+                        .wal_append(ctx.shard_id, bytes::Bytes::from(record));
                 }
                 responses.push(response);
                 continue;

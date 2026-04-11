@@ -131,7 +131,10 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
             None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
         };
 
-        let node_key = graph.write_buf.add_node(labels.clone(), properties.clone(), embedding.clone(), lsn);
+        let node_key =
+            graph
+                .write_buf
+                .add_node(labels.clone(), properties.clone(), embedding.clone(), lsn);
 
         // Update graph stats incrementally.
         graph.stats.on_node_insert(&labels);
@@ -254,9 +257,14 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
             .get_node(dst_key)
             .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
 
-        match graph.write_buf.add_edge(src_key, dst_key, edge_type_id, weight, props.clone(), lsn) {
+        match graph
+            .write_buf
+            .add_edge(src_key, dst_key, edge_type_id, weight, props.clone(), lsn)
+        {
             Ok(edge_key) => {
-                graph.stats.on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
+                graph
+                    .stats
+                    .on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
                 Ok(edge_key.data().as_ffi())
             }
             Err(e) => Err(e),
@@ -276,9 +284,9 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
             ));
             Frame::Integer(external_id as i64)
         }
-        Err(crate::graph::memgraph::GraphError::NodeNotFound) => {
-            Frame::Error(Bytes::from_static(b"ERR source or destination node not found"))
-        }
+        Err(crate::graph::memgraph::GraphError::NodeNotFound) => Frame::Error(Bytes::from_static(
+            b"ERR source or destination node not found",
+        )),
         Err(crate::graph::memgraph::GraphError::SelfLoop) => {
             Frame::Error(Bytes::from_static(b"ERR self-loops are not allowed"))
         }
@@ -364,9 +372,7 @@ fn parse_u64(frame: &Frame) -> Option<u64> {
                 None
             }
         }
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            core::str::from_utf8(b).ok()?.parse().ok()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => core::str::from_utf8(b).ok()?.parse().ok(),
         _ => None,
     }
 }
@@ -376,9 +382,7 @@ fn parse_f64(frame: &Frame) -> Option<f64> {
     match frame {
         Frame::Double(f) => Some(*f),
         Frame::Integer(n) => Some(*n as f64),
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            core::str::from_utf8(b).ok()?.parse().ok()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => core::str::from_utf8(b).ok()?.parse().ok(),
         _ => None,
     }
 }
@@ -417,4 +421,3 @@ fn parse_f32_blob(blob: &[u8]) -> Option<Vec<f32>> {
     }
     Some(vec)
 }
-

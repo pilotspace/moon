@@ -37,39 +37,24 @@ pub enum PhysicalOp {
         max_hops: u32,
     },
     /// Filter rows by a predicate expression.
-    Filter {
-        expr: Expr,
-    },
+    Filter { expr: Expr },
     /// Project specific columns.
     Project {
         items: Vec<ReturnItem>,
         distinct: bool,
     },
     /// Sort by expressions.
-    Sort {
-        items: Vec<(Expr, bool)>,
-    },
+    Sort { items: Vec<(Expr, bool)> },
     /// Limit output rows.
-    Limit {
-        count: Expr,
-    },
+    Limit { count: Expr },
     /// Skip output rows.
-    Skip {
-        count: Expr,
-    },
+    Skip { count: Expr },
     /// Create nodes/edges.
-    CreatePattern {
-        patterns: Vec<Pattern>,
-    },
+    CreatePattern { patterns: Vec<Pattern> },
     /// Delete nodes/edges.
-    DeleteEntities {
-        exprs: Vec<Expr>,
-        detach: bool,
-    },
+    DeleteEntities { exprs: Vec<Expr>, detach: bool },
     /// Set properties/labels.
-    SetProperties {
-        items: Vec<SetItem>,
-    },
+    SetProperties { items: Vec<SetItem> },
     /// Procedure call.
     ProcedureCall {
         procedure: String,
@@ -77,10 +62,7 @@ pub enum PhysicalOp {
         yields: Vec<YieldItem>,
     },
     /// Unwind a list into rows.
-    Unwind {
-        expr: Expr,
-        alias: String,
-    },
+    Unwind { expr: Expr, alias: String },
 }
 
 /// Error during plan compilation.
@@ -189,12 +171,7 @@ pub struct CostEstimate {
 ///
 /// The first term estimates traversal work, the second estimates vector
 /// scoring work on the resulting candidate set.
-pub fn estimate_graph_first_cost(
-    start_nodes: u64,
-    avg_degree: f64,
-    hops: u32,
-    dim: u32,
-) -> f64 {
+pub fn estimate_graph_first_cost(start_nodes: u64, avg_degree: f64, hops: u32, dim: u32) -> f64 {
     let neighborhood = (start_nodes as f64) * avg_degree.powi(hops as i32);
     // Traversal cost + vector scoring cost.
     neighborhood + neighborhood * (dim as f64)
@@ -206,12 +183,7 @@ pub fn estimate_graph_first_cost(
 ///
 /// The first term is the HNSW search cost (logarithmic in total nodes),
 /// the second is the graph expansion cost from each of the k results.
-pub fn estimate_vector_first_cost(
-    k: u32,
-    total_nodes: u64,
-    avg_degree: f64,
-    hops: u32,
-) -> f64 {
+pub fn estimate_vector_first_cost(k: u32, total_nodes: u64, avg_degree: f64, hops: u32) -> f64 {
     if total_nodes == 0 {
         return 0.0;
     }
@@ -243,8 +215,7 @@ pub fn select_strategy(
     let p99 = stats.degree_stats.p99;
 
     let graph_cost = estimate_graph_first_cost(start_nodes, avg_degree, hops, dim);
-    let vector_cost =
-        estimate_vector_first_cost(k, stats.total_nodes, avg_degree, hops);
+    let vector_cost = estimate_vector_first_cost(k, stats.total_nodes, avg_degree, hops);
 
     // Hub detection: if start node has degree >= P99, the graph-first
     // traversal may explode. Prefer vector-first in that case.
@@ -372,13 +343,17 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
 
         // Subsequent node+edge pairs become expands.
         for (i, edge) in pattern.edges.iter().enumerate() {
+            let source_node = &pattern.nodes[i];
             let target = &pattern.nodes[i + 1];
             let (min_hops, max_hops) = edge.var_length.unwrap_or((1, 1));
             ops.push(PhysicalOp::Expand {
-                source: first
-                    .variable
-                    .clone()
-                    .unwrap_or_else(|| "_anon".to_string()),
+                source: source_node.variable.clone().unwrap_or_else(|| {
+                    if i == 0 {
+                        "_anon".to_string()
+                    } else {
+                        format!("_anon_{i}")
+                    }
+                }),
                 target: target
                     .variable
                     .clone()
@@ -416,24 +391,24 @@ mod tests {
 
     #[test]
     fn test_compile_match_with_expand() {
-        let query =
-            parse_cypher(b"MATCH (a:Person)-[:KNOWS]->(b) RETURN b").expect("parse failed");
+        let query = parse_cypher(b"MATCH (a:Person)-[:KNOWS]->(b) RETURN b").expect("parse failed");
         let plan = compile(&query).expect("compile failed");
-        assert!(plan
-            .operators
-            .iter()
-            .any(|op| matches!(op, PhysicalOp::Expand { .. })));
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Expand { .. }))
+        );
     }
 
     #[test]
     fn test_compile_with_filter() {
-        let query =
-            parse_cypher(b"MATCH (n) WHERE n.age > 30 RETURN n").expect("parse failed");
+        let query = parse_cypher(b"MATCH (n) WHERE n.age > 30 RETURN n").expect("parse failed");
         let plan = compile(&query).expect("compile failed");
-        assert!(plan
-            .operators
-            .iter()
-            .any(|op| matches!(op, PhysicalOp::Filter { .. })));
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. }))
+        );
     }
 
     #[test]
@@ -441,9 +416,7 @@ mod tests {
         let mut cache = PlanCache::new(2);
         assert!(cache.is_empty());
 
-        let plan = Arc::new(PhysicalPlan {
-            operators: vec![],
-        });
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
         cache.insert(42, plan.clone());
         assert_eq!(cache.len(), 1);
         assert!(cache.get(42).is_some());
@@ -472,10 +445,11 @@ mod tests {
         )
         .expect("parse failed");
         let plan = compile(&query).expect("compile failed");
-        assert!(plan
-            .operators
-            .iter()
-            .any(|op| matches!(op, PhysicalOp::ProcedureCall { .. })));
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::ProcedureCall { .. }))
+        );
     }
 
     // --- Cost estimation tests ---

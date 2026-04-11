@@ -391,12 +391,8 @@ pub fn graph_explain(store: &GraphStore, args: &[Frame]) -> Frame {
         let dim = 128u32; // Default dimension estimate.
 
         let estimate = cypher::planner::select_strategy(
-            stats,
-            1,     // start_nodes (single seed)
-            hops,
-            k,
-            dim,
-            None, // No specific start node degree without node ID.
+            stats, 1, // start_nodes (single seed)
+            hops, k, dim, None, // No specific start node degree without node ID.
         );
 
         output.push_str(&format!(
@@ -573,7 +569,10 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
     while pos < args.len() {
         let key = match extract_bulk(&args[pos]) {
             Some(b) => b,
-            None => { pos += 1; continue; }
+            None => {
+                pos += 1;
+                continue;
+            }
         };
         if key.eq_ignore_ascii_case(b"THRESHOLD") {
             pos += 1;
@@ -600,7 +599,8 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
     let memgraph = &graph.write_buf;
     let lsn = u64::MAX - 1;
 
-    let mut search = crate::graph::hybrid::GraphFilteredSearch::new(node_key, hops, query_vector, k);
+    let mut search =
+        crate::graph::hybrid::GraphFilteredSearch::new(node_key, hops, query_vector, k);
     search.threshold = threshold;
     search.edge_type_filter = edge_type_filter;
 
@@ -648,7 +648,9 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
     if mode.eq_ignore_ascii_case(b"FILTER") {
         // GRAPH.HYBRID g FILTER <start_id> <hops> <k> <vector>
         if args.len() < 6 {
-            return Frame::Error(Bytes::from_static(b"ERR FILTER requires: start_id hops k vector"));
+            return Frame::Error(Bytes::from_static(
+                b"ERR FILTER requires: start_id hops k vector",
+            ));
         }
         let start_id = match parse_u64(&args[2]) {
             Some(id) => id,
@@ -668,7 +670,8 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         };
 
         let node_key = super::graph_write::external_id_to_node_key(start_id);
-        let search = crate::graph::hybrid::GraphFilteredSearch::new(node_key, hops, query_vector, k);
+        let search =
+            crate::graph::hybrid::GraphFilteredSearch::new(node_key, hops, query_vector, k);
         match search.execute(memgraph, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
@@ -702,7 +705,8 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         };
 
         let node_key = super::graph_write::external_id_to_node_key(start_id);
-        let mut walk = crate::graph::hybrid::VectorGuidedWalk::new(node_key, query_vector, max_depth);
+        let mut walk =
+            crate::graph::hybrid::VectorGuidedWalk::new(node_key, query_vector, max_depth);
         walk.beam_width = beam_width;
         walk.min_similarity = min_sim;
 
@@ -789,10 +793,7 @@ fn extract_f32_vector(frame: &Frame) -> Option<Vec<f32>> {
     };
 
     let text = core::str::from_utf8(bytes).ok()?;
-    let values: Result<Vec<f32>, _> = text
-        .split_whitespace()
-        .map(|s| s.parse::<f32>())
-        .collect();
+    let values: Result<Vec<f32>, _> = text.split_whitespace().map(|s| s.parse::<f32>()).collect();
     values.ok()
 }
 
@@ -801,9 +802,7 @@ fn parse_f64(frame: &Frame) -> Option<f64> {
     match frame {
         Frame::Double(f) => Some(*f),
         Frame::Integer(n) => Some(*n as f64),
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            core::str::from_utf8(b).ok()?.parse().ok()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => core::str::from_utf8(b).ok()?.parse().ok(),
         _ => None,
     }
 }
@@ -821,9 +820,7 @@ fn parse_u64(frame: &Frame) -> Option<u64> {
                 None
             }
         }
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            core::str::from_utf8(b).ok()?.parse().ok()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => core::str::from_utf8(b).ok()?.parse().ok(),
         _ => None,
     }
 }
@@ -837,9 +834,7 @@ fn parse_u32(frame: &Frame) -> Option<u32> {
                 None
             }
         }
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            core::str::from_utf8(b).ok()?.parse().ok()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => core::str::from_utf8(b).ok()?.parse().ok(),
         _ => None,
     }
 }

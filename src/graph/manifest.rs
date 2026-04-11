@@ -47,11 +47,7 @@ impl GraphManifest {
     ///
     /// `base_dir` is the relative directory prefix for segment file paths
     /// (e.g. `"graph_social"`). Segment files are named `seg_{lsn}.csr`.
-    pub fn from_segments(
-        graph_name: &str,
-        segments: &[Arc<CsrSegment>],
-        base_dir: &str,
-    ) -> Self {
+    pub fn from_segments(graph_name: &str, segments: &[Arc<CsrSegment>], base_dir: &str) -> Self {
         let entries: Vec<SegmentManifestEntry> = segments
             .iter()
             .map(|seg| SegmentManifestEntry {
@@ -76,20 +72,24 @@ impl GraphManifest {
         }
     }
 
-    /// Write this manifest as pretty-printed JSON to `path`.
+    /// Write this manifest as pretty-printed JSON to `path` atomically.
+    /// Uses write-to-temp + fsync + rename to prevent corruption on crash.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, e)
-        })?;
-        std::fs::write(path, json.as_bytes())
+        use std::io::Write;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp_path = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
     }
 
     /// Load a manifest from a JSON file at `path`.
     pub fn load(path: &Path) -> io::Result<Self> {
         let data = std::fs::read(path)?;
-        serde_json::from_slice(&data).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, e)
-        })
+        serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 

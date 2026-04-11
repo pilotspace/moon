@@ -22,10 +22,7 @@ pub enum CsrError {
     /// Edge references a node that does not exist in the frozen set.
     InvalidNodeRef,
     /// CRC32 checksum mismatch on load -- data is corrupted.
-    ChecksumMismatch {
-        expected: u64,
-        actual: u64,
-    },
+    ChecksumMismatch { expected: u64, actual: u64 },
     /// Data too short or structurally invalid.
     InvalidData(String),
     /// I/O error description (not std::io::Error to keep PartialEq).
@@ -81,8 +78,7 @@ impl CsrSegment {
         sorted_nodes.sort_by_key(|(k, _)| *k);
 
         // Build key->row mapping.
-        let mut node_id_to_row: HashMap<NodeKey, u32> =
-            HashMap::with_capacity(node_count);
+        let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(node_count);
         for (row, (key, _)) in sorted_nodes.iter().enumerate() {
             node_id_to_row.insert(*key, row as u32);
         }
@@ -211,9 +207,14 @@ impl CsrSegment {
     }
 
     /// Returns the slice of outgoing neighbor row indices for the given CSR row.
+    /// Returns an empty slice if `row` is out of bounds.
     pub fn neighbors_out(&self, row: u32) -> &[u32] {
-        let start = self.row_offsets[row as usize] as usize;
-        let end = self.row_offsets[row as usize + 1] as usize;
+        let r = row as usize;
+        if r >= self.header.node_count as usize {
+            return &[];
+        }
+        let start = self.row_offsets[r] as usize;
+        let end = self.row_offsets[r + 1] as usize;
         &self.col_indices[start..end]
     }
 
@@ -242,7 +243,9 @@ impl CsrSegment {
     /// Uses boomphf MPH (O(1), ~3 bits/key) with false-positive rejection.
     /// Falls back to HashMap if MPH returns None (should not happen for valid keys).
     pub fn lookup_node(&self, key: NodeKey) -> Option<u32> {
-        self.mph.lookup(key).or_else(|| self.node_id_to_row.get(&key).copied())
+        self.mph
+            .lookup(key)
+            .or_else(|| self.node_id_to_row.get(&key).copied())
     }
 
     /// Returns valid outgoing neighbor row indices filtered by node label.
@@ -250,8 +253,12 @@ impl CsrSegment {
     /// Uses Roaring bitmap intersection: edges whose destination node carries
     /// the given label are returned without scanning all neighbors.
     pub fn neighbors_by_label(&self, row: u32, label: u16) -> Vec<u32> {
-        let start = self.row_offsets[row as usize] as usize;
-        let end = self.row_offsets[row as usize + 1] as usize;
+        let r = row as usize;
+        if r >= self.header.node_count as usize {
+            return Vec::new();
+        }
+        let start = self.row_offsets[r] as usize;
+        let end = self.row_offsets[r + 1] as usize;
         let label_bm = match self.label_index.nodes_with_label(label) {
             Some(bm) => bm,
             None => return Vec::new(),
@@ -273,8 +280,12 @@ impl CsrSegment {
     ///
     /// Uses per-edge-type Roaring bitmap for O(1) membership test per edge.
     pub fn edges_by_type(&self, row: u32, edge_type: u16) -> Vec<(u32, &EdgeMeta)> {
-        let start = self.row_offsets[row as usize] as usize;
-        let end = self.row_offsets[row as usize + 1] as usize;
+        let r = row as usize;
+        if r >= self.header.node_count as usize {
+            return Vec::new();
+        }
+        let start = self.row_offsets[r] as usize;
+        let end = self.row_offsets[r + 1] as usize;
         let type_bm = match self.edge_type_index.edges_of_type(edge_type) {
             Some(bm) => bm,
             None => return Vec::new(),
@@ -292,9 +303,17 @@ impl CsrSegment {
 
     /// Iterator over valid outgoing neighbor edges for a CSR row.
     /// Yields (col_index, &EdgeMeta) pairs, skipping invalid edges via validity bitmap.
+    /// Returns an empty iterator if `row` is out of bounds.
     pub fn neighbor_edges(&self, row: u32) -> impl Iterator<Item = (u32, &EdgeMeta)> {
-        let start = self.row_offsets[row as usize] as usize;
-        let end = self.row_offsets[row as usize + 1] as usize;
+        let r = row as usize;
+        let (start, end) = if r < self.header.node_count as usize {
+            (
+                self.row_offsets[r] as usize,
+                self.row_offsets[r + 1] as usize,
+            )
+        } else {
+            (0, 0)
+        };
         let validity = &self.validity;
         (start..end).filter_map(move |idx| {
             if validity.contains(idx as u32) {
@@ -392,10 +411,7 @@ impl CsrSegment {
             .try_into()
             .map_err(|_| CsrError::InvalidData("bad magic".to_owned()))?;
         if magic != *b"MNGR" {
-            return Err(CsrError::InvalidData(format!(
-                "bad magic: {:?}",
-                magic
-            )));
+            return Err(CsrError::InvalidData(format!("bad magic: {:?}", magic)));
         }
 
         let version = u32::from_le_bytes(read4(data, 4)?);
@@ -542,8 +558,7 @@ impl CsrSegment {
 
     /// Load a CsrSegment from a file, validating its CRC32 checksum.
     pub fn from_file(path: &Path) -> Result<Self, CsrError> {
-        let data =
-            std::fs::read(path).map_err(|e| CsrError::IoError(e.to_string()))?;
+        let data = std::fs::read(path).map_err(|e| CsrError::IoError(e.to_string()))?;
         Self::from_bytes(&data)
     }
 }
@@ -583,20 +598,16 @@ mod tests {
         }
         // Create 10 edges: star pattern from node 0, plus some cross-edges.
         for i in 1..5 {
-            g.add_edge(nodes[0], nodes[i], 1, 1.0, None, 2)
-                .expect("ok");
+            g.add_edge(nodes[0], nodes[i], 1, 1.0, None, 2).expect("ok");
         }
         for i in 1..4 {
             g.add_edge(nodes[i], nodes[i + 1], 2, 0.5, None, 2)
                 .expect("ok");
         }
         // 3 more edges to reach 10
-        g.add_edge(nodes[4], nodes[1], 3, 2.0, None, 2)
-            .expect("ok");
-        g.add_edge(nodes[2], nodes[4], 3, 1.5, None, 2)
-            .expect("ok");
-        g.add_edge(nodes[3], nodes[1], 3, 0.8, None, 2)
-            .expect("ok");
+        g.add_edge(nodes[4], nodes[1], 3, 2.0, None, 2).expect("ok");
+        g.add_edge(nodes[2], nodes[4], 3, 1.5, None, 2).expect("ok");
+        g.add_edge(nodes[3], nodes[1], 3, 0.8, None, 2).expect("ok");
 
         g.freeze().expect("freeze ok")
     }
@@ -711,7 +722,10 @@ mod tests {
         // LabelIndex: 5 nodes with labels 0..4, each has exactly one label.
         assert_eq!(csr.label_index.label_count(), 5);
         for label in 0..5u16 {
-            let bm = csr.label_index.nodes_with_label(label).expect("label exists");
+            let bm = csr
+                .label_index
+                .nodes_with_label(label)
+                .expect("label exists");
             assert_eq!(bm.len(), 1);
         }
 
@@ -829,10 +843,7 @@ mod tests {
 
         // Verify neighbor queries still work.
         for row in 0..restored.node_count() {
-            assert_eq!(
-                restored.neighbors_out(row),
-                original.neighbors_out(row)
-            );
+            assert_eq!(restored.neighbors_out(row), original.neighbors_out(row));
         }
     }
 

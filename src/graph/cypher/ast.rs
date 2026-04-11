@@ -228,10 +228,7 @@ pub enum Expr {
     /// Parameter reference: `$name`.
     Parameter(String),
     /// Property access: `n.name`
-    PropertyAccess {
-        object: Box<Expr>,
-        property: String,
-    },
+    PropertyAccess { object: Box<Expr>, property: String },
     /// Binary operation.
     BinaryOp {
         left: Box<Expr>,
@@ -255,15 +252,9 @@ pub enum Expr {
     /// Star `*` (for RETURN *)
     Star,
     /// `expr IS NULL` / `expr IS NOT NULL`
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Expr>, negated: bool },
     /// `expr IN list_expr`
-    InList {
-        expr: Box<Expr>,
-        list: Box<Expr>,
-    },
+    InList { expr: Box<Expr>, list: Box<Expr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

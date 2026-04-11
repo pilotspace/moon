@@ -189,15 +189,13 @@ pub fn save_graph_store(
             let seg_filename = format!("seg_{}.csr", seg.created_lsn);
             let seg_path = graph_data_dir.join(&seg_filename);
             if !seg_path.exists() {
-                seg.write_to_file(&seg_path).map_err(|e| {
-                    io::Error::other(format!("failed to write CSR segment: {e:?}"))
-                })?;
+                seg.write_to_file(&seg_path)
+                    .map_err(|e| io::Error::other(format!("failed to write CSR segment: {e:?}")))?;
             }
         }
 
         // Write manifest.
-        let manifest =
-            GraphManifest::from_segments(&graph_name, &segments.immutable, &base_dir);
+        let manifest = GraphManifest::from_segments(&graph_name, &segments.immutable, &base_dir);
         let manifest_path = graph_data_dir.join("manifest.json");
         manifest.save(&manifest_path)?;
     }

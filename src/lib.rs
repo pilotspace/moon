@@ -44,6 +44,8 @@ pub mod cluster;
 pub mod command;
 pub mod config;
 pub mod error;
+#[cfg(feature = "graph")]
+pub mod graph;
 pub mod io;
 pub mod persistence;
 pub mod protocol;
@@ -58,5 +60,3 @@ pub mod storage;
 pub mod tls;
 pub mod tracking;
 pub mod vector;
-#[cfg(feature = "graph")]
-pub mod graph;

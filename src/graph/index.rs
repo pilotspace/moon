@@ -393,11 +393,31 @@ mod tests {
     #[test]
     fn test_edge_type_index_build_and_query() {
         let edge_meta = vec![
-            EdgeMeta { edge_type: 1, flags: 0, property_offset: 0 },
-            EdgeMeta { edge_type: 2, flags: 0, property_offset: 0 },
-            EdgeMeta { edge_type: 1, flags: 0, property_offset: 0 },
-            EdgeMeta { edge_type: 3, flags: 0, property_offset: 0 },
-            EdgeMeta { edge_type: 2, flags: 0, property_offset: 0 },
+            EdgeMeta {
+                edge_type: 1,
+                flags: 0,
+                property_offset: 0,
+            },
+            EdgeMeta {
+                edge_type: 2,
+                flags: 0,
+                property_offset: 0,
+            },
+            EdgeMeta {
+                edge_type: 1,
+                flags: 0,
+                property_offset: 0,
+            },
+            EdgeMeta {
+                edge_type: 3,
+                flags: 0,
+                property_offset: 0,
+            },
+            EdgeMeta {
+                edge_type: 2,
+                flags: 0,
+                property_offset: 0,
+            },
         ];
 
         let idx = EdgeTypeIndex::build(&edge_meta);

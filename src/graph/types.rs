@@ -4,8 +4,8 @@
 //! mutable node/edge structs, and `#[repr(C)]` on-disk segment headers.
 
 use bytes::Bytes;
-use smallvec::SmallVec;
 use slotmap::new_key_type;
+use smallvec::SmallVec;
 
 new_key_type! {
     /// 64-bit generational index for nodes. SlotMap prevents ABA on long-running servers.

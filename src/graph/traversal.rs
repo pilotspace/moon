@@ -28,14 +28,9 @@ pub const DEFAULT_FRONTIER_CAP: usize = 100_000;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraversalError {
     /// BFS frontier exceeded the configured cap.
-    FrontierCapExceeded {
-        cap: usize,
-        depth: u32,
-    },
+    FrontierCapExceeded { cap: usize, depth: u32 },
     /// Depth limit reached.
-    DepthExceeded {
-        limit: u32,
-    },
+    DepthExceeded { limit: u32 },
     /// Start node not found in any segment.
     NodeNotFound,
     /// Traversal timed out (epoch hold exceeded).
@@ -119,9 +114,7 @@ impl<'a> SegmentMergeReader<'a> {
 
         // 1. Read from mutable MemGraph (highest priority -- newest data).
         if let Some(mg) = self.memgraph {
-            for (edge_key, neighbor_key) in
-                mg.neighbors(node, self.direction, self.snapshot_lsn)
-            {
+            for (edge_key, neighbor_key) in mg.neighbors(node, self.direction, self.snapshot_lsn) {
                 if let Some(edge) = mg.get_edge(edge_key) {
                     // Apply edge type filter.
                     if let Some(filter) = self.edge_type_filter {
@@ -360,8 +353,7 @@ impl BoundedDfs {
                 if visited_set.contains(&neighbor.node) {
                     continue;
                 }
-                let edge_cost =
-                    self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
+                let edge_cost = self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
                 let new_cost = cum_cost + edge_cost;
 
                 // Max-cost pruning (TRAV-02).
@@ -398,7 +390,7 @@ struct DijkstraEntry {
 
 impl PartialEq for DijkstraEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.cost == other.cost
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -413,10 +405,19 @@ impl PartialOrd for DijkstraEntry {
 impl Ord for DijkstraEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap (BinaryHeap is max-heap).
-        other
-            .cost
-            .partial_cmp(&self.cost)
-            .unwrap_or(Ordering::Equal)
+        // NaN is treated as greater than all values (pushed to bottom, never selected).
+        match other.cost.partial_cmp(&self.cost) {
+            Some(ord) => ord,
+            None => {
+                // At least one is NaN. NaN entries sort last (greatest cost).
+                match (self.cost.is_nan(), other.cost.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less, // self is NaN = high cost → less priority
+                    (false, true) => Ordering::Greater, // other is NaN = high cost → self wins
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 }
 
@@ -481,8 +482,7 @@ impl DijkstraTraversal {
 
             let neighbors = reader.neighbors(node);
             for neighbor in neighbors {
-                let edge_cost =
-                    self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
+                let edge_cost = self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
                 let new_cost = cost + edge_cost;
 
                 let is_better = match dist.get(&neighbor.node) {
@@ -553,8 +553,13 @@ mod tests {
         mg.add_edge(a, c, 1, 3.0, None, 3).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let neighbors = reader.neighbors(a);
         assert_eq!(neighbors.len(), 2);
@@ -577,8 +582,13 @@ mod tests {
         let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
         let csr_segs = vec![Arc::new(csr)];
 
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         // Node b appears in both segments, but should be deduplicated.
         let neighbors = reader.neighbors(a);
@@ -645,8 +655,13 @@ mod tests {
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         assert!(reader.node_exists(a));
 
@@ -666,8 +681,13 @@ mod tests {
         mg.add_edge(a, c, 1, 1.0, None, 2).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let bfs = BoundedBfs::new(1);
         let result = bfs.execute(&reader, a).expect("ok");
@@ -715,8 +735,13 @@ mod tests {
         }
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let bfs = BoundedBfs::with_cap(1, cap);
         let err = bfs.execute(&reader, center).unwrap_err();
@@ -732,8 +757,13 @@ mod tests {
     fn test_bfs_node_not_found() {
         let mg = MemGraph::new(1000);
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let fake_key: NodeKey = slotmap::KeyData::from_ffi(9999).into();
         let bfs = BoundedBfs::new(3);
@@ -753,8 +783,13 @@ mod tests {
         mg.add_edge(c, a, 1, 1.0, None, 2).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let bfs = BoundedBfs::new(10);
         let result = bfs.execute(&reader, a).expect("ok");
@@ -774,8 +809,13 @@ mod tests {
         mg.add_edge(b, c, 1, 2.0, None, 10).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let cost_fn = WeightedCostFn::new(0.0, 1.0, 100);
         let dfs = BoundedDfs::new(5, 100.0, cost_fn);
@@ -794,8 +834,13 @@ mod tests {
         mg.add_edge(b, c, 1, 10.0, None, 100).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         // Max cost = 8.0 (distance_weight=1.0, time_weight=0.0)
         // a->b cost = 5.0, b->c cost = 5.0+10.0 = 15.0 > 8.0 (pruned)
@@ -816,8 +861,13 @@ mod tests {
         mg.add_edge(b, c, 1, 1.0, None, 10).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let cost_fn = WeightedCostFn::new(0.0, 1.0, 100);
         let dfs = BoundedDfs::new(1, f64::MAX, cost_fn); // depth=1
@@ -839,8 +889,13 @@ mod tests {
         mg.add_edge(b, c, 1, 4.0, None, 100).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         // distance_only cost: time_weight=0, distance_weight=1
         let cost_fn = WeightedCostFn::new(0.0, 1.0, 100);
@@ -866,8 +921,13 @@ mod tests {
         // No edge from a to b.
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let cost_fn = WeightedCostFn::new(0.0, 1.0, 100);
         let dijkstra = DijkstraTraversal::new(cost_fn, 10);
@@ -881,8 +941,13 @@ mod tests {
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let cost_fn = WeightedCostFn::new(0.0, 1.0, 100);
         let dijkstra = DijkstraTraversal::new(cost_fn, 10);
@@ -915,8 +980,13 @@ mod tests {
         mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
 
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let cost_fn = WeightedCostFn::new(0.5, 1.0, 100);
         let dijkstra = DijkstraTraversal::new(cost_fn, 10);
@@ -934,8 +1004,13 @@ mod tests {
     fn test_dijkstra_node_not_found() {
         let mg = MemGraph::new(1000);
         let csr_segs: Vec<Arc<CsrSegment>> = vec![];
-        let reader =
-            SegmentMergeReader::new(Some(&mg), &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
 
         let fake: NodeKey = slotmap::KeyData::from_ffi(9999).into();
         let cost_fn = WeightedCostFn::new(0.0, 1.0, 100);

@@ -57,6 +57,16 @@ pub fn is_edge_visible(
     )
 }
 
+/// Check if a transaction is in the committed bitmap.
+/// RoaringBitmap only supports u32; txn_ids beyond u32::MAX are treated as uncommitted.
+#[inline(always)]
+fn is_txn_committed(txn_id: u64, committed: &RoaringBitmap) -> bool {
+    if txn_id > u32::MAX as u64 {
+        return false;
+    }
+    committed.contains(txn_id as u32)
+}
+
 /// Shared visibility logic for both nodes and edges.
 ///
 /// `txn_id` is the transaction that created the entity (0 = no transaction / pre-MVCC).
@@ -72,7 +82,7 @@ fn is_entity_visible(
 ) -> bool {
     // Non-transactional read (snapshot_lsn == 0): skip MVCC, just check ownership + delete
     if snapshot_lsn == 0 {
-        if txn_id != 0 && !committed.contains(txn_id as u32) {
+        if txn_id != 0 && !is_txn_committed(txn_id, committed) {
             return false;
         }
         return deleted_lsn == u64::MAX;
@@ -88,7 +98,7 @@ fn is_entity_visible(
 
     // Transaction ownership check
     if txn_id != 0 && txn_id != my_txn_id {
-        if !committed.contains(txn_id as u32) {
+        if !is_txn_committed(txn_id, committed) {
             return false;
         }
     }

@@ -283,26 +283,68 @@ impl GraphReplayCollector {
             }
         }
 
-        // Phase 2: For each graph, collect nodes and edges, replay in order.
-        // Build a node_id -> NodeKey map per graph for edge src/dst resolution.
+        // Phase 2: Collect per-graph command lists for batched MemGraph access.
+        // This avoids take_memgraph/put_memgraph per-node/edge (O(N) atomic swaps).
+        let mut graph_nodes: HashMap<Bytes, Vec<usize>> = HashMap::new();
+        let mut graph_edges: HashMap<Bytes, Vec<usize>> = HashMap::new();
+        let mut graph_removes: HashMap<Bytes, Vec<usize>> = HashMap::new();
+
+        for (idx, cmd) in self.commands.iter().enumerate() {
+            match cmd {
+                GraphCommand::AddNode { graph_name, .. } => {
+                    graph_nodes.entry(graph_name.clone()).or_default().push(idx);
+                }
+                GraphCommand::AddEdge { graph_name, .. } => {
+                    graph_edges.entry(graph_name.clone()).or_default().push(idx);
+                }
+                GraphCommand::RemoveNode { graph_name, .. } => {
+                    graph_removes
+                        .entry(graph_name.clone())
+                        .or_default()
+                        .push(idx);
+                }
+                GraphCommand::RemoveEdge { .. } => {
+                    tracing::warn!("GRAPH.REMOVEEDGE during WAL replay is not yet supported");
+                }
+                _ => {}
+            }
+        }
+
+        // Collect all graph names that have any mutations.
+        let mut all_graphs: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
+        for k in graph_nodes.keys() {
+            all_graphs.insert(k.clone());
+        }
+        for k in graph_edges.keys() {
+            all_graphs.insert(k.clone());
+        }
+        for k in graph_removes.keys() {
+            all_graphs.insert(k.clone());
+        }
+
         let mut node_maps: HashMap<Bytes, HashMap<u64, crate::graph::types::NodeKey>> =
             HashMap::new();
 
-        // Insert nodes
-        for cmd in &self.commands {
-            if let GraphCommand::AddNode {
-                graph_name,
-                node_id,
-                labels,
-                properties,
-                embedding,
-            } = cmd
-            {
-                if let Some(graph) = store.get_graph_mut(graph_name) {
-                    // Get mutable access to the MemGraph through the segment holder.
-                    // During replay we create a fresh MemGraph if needed.
-                    let nk = add_node_to_graph(graph, labels, properties, embedding);
-                    if let Some(nk) = nk {
+        // For each graph: take memgraph once, replay all nodes+edges+removes, put back once.
+        for graph_name in &all_graphs {
+            let Some(graph) = store.get_graph_mut(graph_name) else {
+                continue;
+            };
+            let (mut mg, immutable) = take_memgraph(graph);
+
+            // Insert nodes
+            if let Some(node_indices) = graph_nodes.get(graph_name) {
+                for &idx in node_indices {
+                    if let GraphCommand::AddNode {
+                        node_id,
+                        labels,
+                        properties,
+                        embedding,
+                        ..
+                    } = &self.commands[idx]
+                    {
+                        let nk =
+                            mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
                         node_maps
                             .entry(graph_name.clone())
                             .or_default()
@@ -311,60 +353,49 @@ impl GraphReplayCollector {
                     }
                 }
             }
-        }
 
-        // Insert edges (after all nodes are in place)
-        for cmd in &self.commands {
-            if let GraphCommand::AddEdge {
-                graph_name,
-                src_id,
-                dst_id,
-                edge_type,
-                weight,
-                properties,
-                ..
-            } = cmd
-            {
-                let node_map = node_maps.get(graph_name);
-                let src_key = node_map.and_then(|m| m.get(src_id)).copied();
-                let dst_key = node_map.and_then(|m| m.get(dst_id)).copied();
-
-                if let (Some(src), Some(dst)) = (src_key, dst_key) {
-                    if let Some(graph) = store.get_graph_mut(graph_name) {
-                        if add_edge_to_graph(graph, src, dst, *edge_type, *weight, properties)
-                        {
-                            *replayed += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 3: Process removes
-        for cmd in &self.commands {
-            match cmd {
-                GraphCommand::RemoveNode {
-                    graph_name,
-                    node_id,
-                } => {
-                    let node_map = node_maps.get(graph_name);
-                    if let Some(nk) = node_map.and_then(|m| m.get(node_id)).copied() {
-                        if let Some(graph) = store.get_graph_mut(graph_name) {
-                            if remove_node_from_graph(graph, nk) {
+            // Insert edges (nodes already in memgraph)
+            if let Some(edge_indices) = graph_edges.get(graph_name) {
+                for &idx in edge_indices {
+                    if let GraphCommand::AddEdge {
+                        src_id,
+                        dst_id,
+                        edge_type,
+                        weight,
+                        properties,
+                        ..
+                    } = &self.commands[idx]
+                    {
+                        let node_map = node_maps.get(graph_name);
+                        let src_key = node_map.and_then(|m| m.get(src_id)).copied();
+                        let dst_key = node_map.and_then(|m| m.get(dst_id)).copied();
+                        if let (Some(src), Some(dst)) = (src_key, dst_key) {
+                            if mg
+                                .add_edge(src, dst, *edge_type, *weight, properties.clone(), 0)
+                                .is_ok()
+                            {
                                 *replayed += 1;
                             }
                         }
                     }
                 }
-                GraphCommand::RemoveEdge { .. } => {
-                    // Edge removal by edge_id requires tracking edge_id -> EdgeKey mapping.
-                    // For now, edge removes during replay are logged and skipped.
-                    // This is acceptable because edge removes are rare during WAL replay,
-                    // and full persistence (Phase 121) will handle this properly.
-                    tracing::warn!("GRAPH.REMOVEEDGE during WAL replay is not yet supported");
-                }
-                _ => {}
             }
+
+            // Process removes
+            if let Some(remove_indices) = graph_removes.get(graph_name) {
+                for &idx in remove_indices {
+                    if let GraphCommand::RemoveNode { node_id, .. } = &self.commands[idx] {
+                        let node_map = node_maps.get(graph_name);
+                        if let Some(nk) = node_map.and_then(|m| m.get(node_id)).copied() {
+                            if mg.remove_node(nk, 0) {
+                                *replayed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            put_memgraph(graph, mg, immutable);
         }
 
         // Phase 4: Process graph drops
@@ -427,52 +458,6 @@ fn put_memgraph(
         mutable: Some(std::sync::Arc::new(mg)),
         immutable,
     });
-}
-
-/// Add a node to the graph's mutable MemGraph segment.
-/// Returns the NodeKey if successful.
-///
-/// During single-threaded replay, we take the MemGraph out of the segment holder,
-/// mutate it, and put it back. This is safe because replay runs at startup before
-/// any concurrent readers exist.
-fn add_node_to_graph(
-    graph: &mut crate::graph::store::NamedGraph,
-    labels: &SmallVec<[u16; 4]>,
-    properties: &PropertyMap,
-    embedding: &Option<Vec<f32>>,
-) -> Option<crate::graph::types::NodeKey> {
-    let (mut mg, immutable) = take_memgraph(graph);
-    let nk = mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
-    put_memgraph(graph, mg, immutable);
-    Some(nk)
-}
-
-/// Add an edge to the graph's mutable MemGraph segment.
-fn add_edge_to_graph(
-    graph: &mut crate::graph::store::NamedGraph,
-    src: crate::graph::types::NodeKey,
-    dst: crate::graph::types::NodeKey,
-    edge_type: u16,
-    weight: f64,
-    properties: &Option<PropertyMap>,
-) -> bool {
-    let (mut mg, immutable) = take_memgraph(graph);
-    let ok = mg
-        .add_edge(src, dst, edge_type, weight, properties.clone(), 0)
-        .is_ok();
-    put_memgraph(graph, mg, immutable);
-    ok
-}
-
-/// Remove a node from the graph's mutable MemGraph segment.
-fn remove_node_from_graph(
-    graph: &mut crate::graph::store::NamedGraph,
-    node_key: crate::graph::types::NodeKey,
-) -> bool {
-    let (mut mg, immutable) = take_memgraph(graph);
-    let ok = mg.remove_node(node_key, 0);
-    put_memgraph(graph, mg, immutable);
-    ok
 }
 
 // --- Parsing helpers ---

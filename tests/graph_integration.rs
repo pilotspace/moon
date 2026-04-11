@@ -599,7 +599,10 @@ async fn test_graph_delete() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    assert!(graphs.is_empty(), "after delete, GRAPH.LIST should be empty");
+    assert!(
+        graphs.is_empty(),
+        "after delete, GRAPH.LIST should be empty"
+    );
 
     // INFO on deleted graph should error
     let result: Result<Value, _> = redis::cmd("GRAPH.INFO")
@@ -721,7 +724,13 @@ async fn test_graph_bulk_knowledge_graph() {
     }
 
     // Insert 200 edges (random connections, avoid self-loops)
-    let edge_types = ["RELATED_TO", "DERIVED_FROM", "OBSERVED_AT", "SUPERSEDES", "CITED_BY"];
+    let edge_types = [
+        "RELATED_TO",
+        "DERIVED_FROM",
+        "OBSERVED_AT",
+        "SUPERSEDES",
+        "CITED_BY",
+    ];
     let mut edge_count = 0;
     for i in 0..200 {
         let src_idx = i % 100;
@@ -779,10 +788,7 @@ async fn test_graph_bulk_knowledge_graph() {
 
     match &result {
         Value::Array(items) => {
-            assert!(
-                !items.is_empty(),
-                "Cypher should find Concept nodes"
-            );
+            assert!(!items.is_empty(), "Cypher should find Concept nodes");
         }
         _ => panic!("expected Array from Cypher"),
     }

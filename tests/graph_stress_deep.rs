@@ -75,7 +75,9 @@ async fn start_server() -> (u16, CancellationToken) {
     };
 
     tokio::spawn(async move {
-        listener::run_with_shutdown(config, server_token).await.unwrap();
+        listener::run_with_shutdown(config, server_token)
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -135,7 +137,10 @@ async fn stress_deep_chain_1000() {
             .unwrap();
     }
     let build_ms = start.elapsed().as_secs_f64() * 1000.0;
-    println!("  Build: {depth} nodes + {} edges in {build_ms:.1}ms", depth - 1);
+    println!(
+        "  Build: {depth} nodes + {} edges in {build_ms:.1}ms",
+        depth - 1
+    );
 
     // Query at various depths from root
     for query_depth in [1, 3, 5, 10] {
@@ -339,7 +344,9 @@ async fn stress_dense_clique_50() {
         }
     }
     let edge_ms = start.elapsed().as_secs_f64() * 1000.0;
-    println!("  Build: {clique_size} nodes in {node_ms:.1}ms + {edge_count} edges in {edge_ms:.1}ms");
+    println!(
+        "  Build: {clique_size} nodes in {node_ms:.1}ms + {edge_count} edges in {edge_ms:.1}ms"
+    );
 
     // 1-hop: each node connects to all others (49 neighbors)
     let start = Instant::now();
@@ -354,7 +361,10 @@ async fn stress_dense_clique_50() {
         Value::Array(items) => items.len(),
         _ => 0,
     };
-    println!("  1-hop from node 0: {count} items in {elapsed_us}µs (expect ~{} items)", (clique_size - 1) * 2);
+    println!(
+        "  1-hop from node 0: {count} items in {elapsed_us}µs (expect ~{} items)",
+        (clique_size - 1) * 2
+    );
 
     // 2-hop in a clique: every node reachable (all 50 nodes visible)
     // This is the explosion case: 49 neighbors × 49 neighbors = 2401 intermediate
@@ -423,14 +433,22 @@ async fn stress_power_law_2000() {
     // Leaves (80%): 1600 nodes with 1-3 edges each
     let start = Instant::now();
     let mut total_edges = 0u32;
-    let edge_types = ["RELATED_TO", "DERIVED_FROM", "OBSERVED_AT", "SUPERSEDES", "CITED_BY"];
+    let edge_types = [
+        "RELATED_TO",
+        "DERIVED_FROM",
+        "OBSERVED_AT",
+        "SUPERSEDES",
+        "CITED_BY",
+    ];
 
     // Hub edges (first 100 nodes, high degree)
     for i in 0..100 {
         let degree = 100 + (i * 2) % 200; // 100-300 edges per hub
         for j in 0..degree {
             let dst = (i * 7 + j * 13 + 100) % num_nodes;
-            if dst == i { continue; }
+            if dst == i {
+                continue;
+            }
             let result: Result<i64, _> = redis::cmd("GRAPH.ADDEDGE")
                 .arg("powerlaw")
                 .arg(ids[i])
@@ -451,7 +469,9 @@ async fn stress_power_law_2000() {
         let degree = 10 + (i % 20);
         for j in 0..degree {
             let dst = (i * 3 + j * 7 + 50) % num_nodes;
-            if dst == i { continue; }
+            if dst == i {
+                continue;
+            }
             let result: Result<i64, _> = redis::cmd("GRAPH.ADDEDGE")
                 .arg("powerlaw")
                 .arg(ids[i])
@@ -472,7 +492,9 @@ async fn stress_power_law_2000() {
         let degree = 1 + (i % 3);
         for j in 0..degree {
             let dst = (i + j * 11 + 1) % num_nodes;
-            if dst == i { continue; }
+            if dst == i {
+                continue;
+            }
             let result: Result<i64, _> = redis::cmd("GRAPH.ADDEDGE")
                 .arg("powerlaw")
                 .arg(ids[i])
@@ -489,7 +511,9 @@ async fn stress_power_law_2000() {
     }
     let edge_ms = start.elapsed().as_secs_f64() * 1000.0;
     let edge_ops = total_edges as f64 / (edge_ms / 1000.0);
-    println!("  Build: {num_nodes} nodes ({node_ops:.0}/s) + {total_edges} edges ({edge_ops:.0}/s)");
+    println!(
+        "  Build: {num_nodes} nodes ({node_ops:.0}/s) + {total_edges} edges ({edge_ops:.0}/s)"
+    );
 
     // Query hub node (high degree) — worst case 1-hop
     println!("\n  --- Hub Node Queries (high degree, worst case) ---");
@@ -502,7 +526,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Hub 1-hop: {count} items in {elapsed_us}µs");
 
     // 2-hop from hub — explosion: hub has 200+ neighbors, each has 10-200 neighbors
@@ -516,7 +543,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Hub 2-hop: {count} items in {elapsed_us}µs (fan-out explosion)");
 
     // 3-hop from hub — max depth, potentially touching 1000+ nodes
@@ -530,7 +560,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Hub 3-hop: {count} items in {elapsed_us}µs (deep explosion)");
 
     // Query leaf node (low degree) — best case
@@ -544,7 +577,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Leaf 1-hop: {count} items in {elapsed_us}µs");
 
     let start = Instant::now();
@@ -557,7 +593,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Leaf 3-hop: {count} items in {elapsed_us}µs");
 
     // Typed edge filter on hub — selective query
@@ -572,7 +611,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Hub TYPE=RELATED_TO: {count} items in {elapsed_us}µs");
 
     // Cypher on power-law graph
@@ -584,7 +626,10 @@ async fn stress_power_law_2000() {
         .await
         .unwrap();
     let elapsed_us = start.elapsed().as_micros();
-    let count = match &result { Value::Array(items) => items.len(), _ => 0 };
+    let count = match &result {
+        Value::Array(items) => items.len(),
+        _ => 0,
+    };
     println!("  Cypher MATCH Concept LIMIT 20: {count} items in {elapsed_us}µs");
 
     // Throughput: 1000 random 1-hop queries (mixed hub/leaf)
@@ -598,7 +643,9 @@ async fn stress_power_law_2000() {
             .arg(ids[idx])
             .query_async(&mut conn)
             .await;
-        if result.is_ok() { ok += 1; }
+        if result.is_ok() {
+            ok += 1;
+        }
     }
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let qps = ok as f64 / (elapsed_ms / 1000.0);
@@ -617,7 +664,9 @@ async fn stress_power_law_2000() {
             .arg("2")
             .query_async(&mut conn)
             .await;
-        if result.is_ok() { ok += 1; }
+        if result.is_ok() {
+            ok += 1;
+        }
     }
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let qps = ok as f64 / (elapsed_ms / 1000.0);

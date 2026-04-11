@@ -213,7 +213,9 @@ pub async fn aof_writer_task(
                                 error!("AOF sync failed (seq {}, always): {}", manifest.seq, e);
                                 write_error = true;
                             } else {
-                                crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                                crate::admin::metrics_setup::record_aof_fsync(
+                                    t.elapsed().as_micros() as u64,
+                                );
                             }
                         }
                         FsyncPolicy::EverySec => {
@@ -226,7 +228,9 @@ pub async fn aof_writer_task(
                                     );
                                     // Non-fatal for everysec: retry next interval
                                 } else {
-                                    crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                                    crate::admin::metrics_setup::record_aof_fsync(
+                                        t.elapsed().as_micros() as u64,
+                                    );
                                     last_fsync = Instant::now();
                                 }
                             }

@@ -136,7 +136,13 @@ async fn bench_graph_operations() {
     );
 
     // --- Edge Insertion ---
-    let edge_types = ["RELATED_TO", "DERIVED_FROM", "OBSERVED_AT", "SUPERSEDES", "CITED_BY"];
+    let edge_types = [
+        "RELATED_TO",
+        "DERIVED_FROM",
+        "OBSERVED_AT",
+        "SUPERSEDES",
+        "CITED_BY",
+    ];
     let mut edge_ok = 0u32;
 
     let start = Instant::now();
@@ -320,7 +326,10 @@ async fn bench_graph_operations() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    println!("\n  GRAPH.INFO response type: {:?}", std::mem::discriminant(&info));
+    println!(
+        "\n  GRAPH.INFO response type: {:?}",
+        std::mem::discriminant(&info)
+    );
 
     // --- Summary ---
     println!("\n============================================================");
@@ -328,10 +337,22 @@ async fn bench_graph_operations() {
     println!("============================================================");
     println!("  Node Insert:  {:>8.0} ops/s", node_ops);
     println!("  Edge Insert:  {:>8.0} ops/s", edge_ops);
-    println!("  1-Hop Query:  {:>8.0} qps  (avg {:>6.0}µs)", query_ops, avg_us);
-    println!("  2-Hop Query:  {:>8.0} qps  (avg {:>6.0}µs)", query_2hop_ops, avg_2hop_us);
-    println!("  Cypher Query: {:>8.0} qps  (avg {:>6.0}µs)", cypher_ops, avg_cypher_us);
-    println!("  Typed Query:  {:>8.0} qps  (avg {:>6.0}µs)", typed_ops, avg_typed_us);
+    println!(
+        "  1-Hop Query:  {:>8.0} qps  (avg {:>6.0}µs)",
+        query_ops, avg_us
+    );
+    println!(
+        "  2-Hop Query:  {:>8.0} qps  (avg {:>6.0}µs)",
+        query_2hop_ops, avg_2hop_us
+    );
+    println!(
+        "  Cypher Query: {:>8.0} qps  (avg {:>6.0}µs)",
+        cypher_ops, avg_cypher_us
+    );
+    println!(
+        "  Typed Query:  {:>8.0} qps  (avg {:>6.0}µs)",
+        typed_ops, avg_typed_us
+    );
     println!("  KV SET:       {:>8.0} ops/s (baseline)", set_ops);
     println!("  KV GET:       {:>8.0} ops/s (baseline)", get_ops);
     println!("============================================================");

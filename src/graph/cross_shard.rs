@@ -88,8 +88,7 @@ pub fn handle_graph_traverse(
             continue;
         }
 
-        for (edge_key, neighbor_key) in
-            memgraph.neighbors(node_key, Direction::Both, snapshot_lsn)
+        for (edge_key, neighbor_key) in memgraph.neighbors(node_key, Direction::Both, snapshot_lsn)
         {
             // Apply edge type filter.
             if let Some(filter) = edge_type_filter {
@@ -191,8 +190,8 @@ pub fn parse_traverse_response(frame: &Frame) -> Option<TraversalShardResult> {
         })
         .collect();
 
-    let truncated = items.len() > 4
-        && matches!(&items[4], Frame::BulkString(b) if b.as_ref() == b"TRUNCATED");
+    let truncated =
+        items.len() > 4 && matches!(&items[4], Frame::BulkString(b) if b.as_ref() == b"TRUNCATED");
 
     Some(TraversalShardResult {
         neighbor_ids,
@@ -326,8 +325,16 @@ mod tests {
             &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
         );
 
-        let id1 = if let Frame::Integer(id) = n1 { id as u64 } else { panic!("expected int") };
-        let id2 = if let Frame::Integer(id) = n2 { id as u64 } else { panic!("expected int") };
+        let id1 = if let Frame::Integer(id) = n1 {
+            id as u64
+        } else {
+            panic!("expected int")
+        };
+        let id2 = if let Frame::Integer(id) = n2 {
+            id as u64
+        } else {
+            panic!("expected int")
+        };
 
         let id1_str = id1.to_string();
         let id2_str = id2.to_string();
@@ -408,9 +415,7 @@ mod tests {
     fn test_parse_traverse_response_invalid() {
         assert!(parse_traverse_response(&Frame::Null).is_none());
         assert!(parse_traverse_response(&Frame::Integer(42)).is_none());
-        assert!(
-            parse_traverse_response(&Frame::Array(vec![Frame::Integer(1)].into())).is_none()
-        );
+        assert!(parse_traverse_response(&Frame::Array(vec![Frame::Integer(1)].into())).is_none());
     }
 
     #[test]
@@ -434,8 +439,16 @@ mod tests {
             &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person"]),
         );
 
-        let id1 = if let Frame::Integer(id) = n1 { id as u64 } else { panic!("expected int") };
-        let id2 = if let Frame::Integer(id) = n2 { id as u64 } else { panic!("expected int") };
+        let id1 = if let Frame::Integer(id) = n1 {
+            id as u64
+        } else {
+            panic!("expected int")
+        };
+        let id2 = if let Frame::Integer(id) = n2 {
+            id as u64
+        } else {
+            panic!("expected int")
+        };
 
         let id1_str = id1.to_string();
         let id2_str = id2.to_string();
@@ -454,7 +467,11 @@ mod tests {
         let resp = handle_graph_traverse(&store, b"g", &[id1], Some(9999), u64::MAX - 1);
         if let Frame::Array(items) = &resp {
             if let Frame::Array(neighbors) = &items[1] {
-                assert_eq!(neighbors.len(), 0, "non-matching filter should yield no neighbors");
+                assert_eq!(
+                    neighbors.len(),
+                    0,
+                    "non-matching filter should yield no neighbors"
+                );
             }
         } else {
             panic!("expected Array");
