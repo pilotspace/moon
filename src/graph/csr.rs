@@ -162,14 +162,10 @@ impl CsrSegment {
             validity.insert(i);
         }
 
-        // Compute CRC32 checksum of key header fields.
-        let checksum = {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&(node_count as u32).to_le_bytes());
-            hasher.update(&(edge_count as u32).to_le_bytes());
-            hasher.update(&lsn.to_le_bytes());
-            hasher.finalize() as u64
-        };
+        // CRC32 checksum placeholder — the real checksum covering the entire
+        // serialized payload is computed in `to_bytes()`. This field in the
+        // in-memory struct is updated after serialization during `write_to_file`.
+        let checksum = 0u64;
 
         let header = GraphSegmentHeader {
             magic: *b"MNGR",
@@ -327,6 +323,9 @@ impl CsrSegment {
 
     /// Serialize the CSR segment to a contiguous byte buffer.
     /// Layout: header (128B) | row_offsets | col_indices | edge_meta | node_meta
+    ///
+    /// The CRC32 checksum covers the entire payload (header fields +
+    /// all data arrays), ensuring corrupted array content is detected.
     pub fn to_bytes(&self) -> Vec<u8> {
         let header_size = core::mem::size_of::<GraphSegmentHeader>();
         let ro_size = self.row_offsets.len() * 4;
@@ -337,14 +336,12 @@ impl CsrSegment {
         let total = header_size + ro_size + ci_size + em_size + nm_size;
         let mut buf = Vec::with_capacity(total);
 
-        // Write header with computed offsets.
+        // Write header with computed offsets (checksum placeholder = 0).
         let ro_offset = header_size as u64;
         let ci_offset = ro_offset + ro_size as u64;
         let em_offset = ci_offset + ci_size as u64;
-        // validity_bitmap_offset: not written inline (Roaring needs separate serialization)
         let _nm_offset = em_offset + em_size as u64;
 
-        // Write magic, version, counts.
         buf.extend_from_slice(&self.header.magic);
         buf.extend_from_slice(&self.header.version.to_le_bytes());
         buf.extend_from_slice(&self.header.node_count.to_le_bytes());
@@ -356,7 +353,7 @@ impl CsrSegment {
         buf.extend_from_slice(&em_offset.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes()); // validity_bitmap_offset placeholder
         buf.extend_from_slice(&self.header.created_lsn.to_le_bytes());
-        buf.extend_from_slice(&self.header.checksum.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // checksum placeholder — filled below
 
         // Pad header to 128 bytes.
         while buf.len() < header_size {
@@ -388,6 +385,11 @@ impl CsrSegment {
             buf.extend_from_slice(&nm.created_lsn.to_le_bytes());
             buf.extend_from_slice(&nm.deleted_lsn.to_le_bytes());
         }
+
+        // Compute CRC32 over the entire buffer (with checksum field zeroed),
+        // then write the checksum at offset 72.
+        let checksum = compute_csr_checksum(&buf) as u64;
+        buf[72..80].copy_from_slice(&checksum.to_le_bytes());
 
         buf
     }
@@ -427,28 +429,27 @@ impl CsrSegment {
         let created_lsn = u64::from_le_bytes(read8(data, 64)?);
         let stored_checksum = u64::from_le_bytes(read8(data, 72)?);
 
-        // Validate CRC32.
-        let computed_checksum = {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&node_count.to_le_bytes());
-            hasher.update(&edge_count.to_le_bytes());
-            hasher.update(&created_lsn.to_le_bytes());
-            hasher.finalize() as u64
-        };
-        if stored_checksum != computed_checksum {
-            return Err(CsrError::ChecksumMismatch {
-                expected: stored_checksum,
-                actual: computed_checksum,
-            });
-        }
-
         let nc = node_count as usize;
         let ec = edge_count as usize;
         let em_elem_size = core::mem::size_of::<EdgeMeta>(); // 8
         let nm_elem_size = core::mem::size_of::<NodeMeta>(); // 32
 
-        let expected_len =
-            header_size + (nc + 1) * 4 + ec * 4 + ec * em_elem_size + nc * nm_elem_size;
+        // Use checked arithmetic to prevent integer overflow from attacker-controlled
+        // node_count/edge_count values bypassing the size validation.
+        let expected_len = (|| -> Option<usize> {
+            let ro_size = nc.checked_add(1)?.checked_mul(4)?;
+            let ci_size = ec.checked_mul(4)?;
+            let em_size = ec.checked_mul(em_elem_size)?;
+            let nm_size = nc.checked_mul(nm_elem_size)?;
+            header_size
+                .checked_add(ro_size)?
+                .checked_add(ci_size)?
+                .checked_add(em_size)?
+                .checked_add(nm_size)
+        })()
+        .ok_or_else(|| {
+            CsrError::InvalidData("size overflow in CSR header fields".to_owned())
+        })?;
         if data.len() < expected_len {
             return Err(CsrError::InvalidData(format!(
                 "data too short: {} < {}",
@@ -457,12 +458,39 @@ impl CsrSegment {
             )));
         }
 
+        // Validate CRC32 over the entire payload (not just header fields).
+        let computed_checksum = compute_csr_checksum(data) as u64;
+        if stored_checksum != computed_checksum {
+            return Err(CsrError::ChecksumMismatch {
+                expected: stored_checksum,
+                actual: computed_checksum,
+            });
+        }
+
         // Parse row_offsets.
         let mut pos = header_size;
         let mut row_offsets = Vec::with_capacity(nc + 1);
         for _ in 0..=nc {
             row_offsets.push(u32::from_le_bytes(read4(data, pos)?));
             pos += 4;
+        }
+
+        // Validate row_offsets: monotonically non-decreasing, bounded by edge_count.
+        for i in 0..row_offsets.len() {
+            if row_offsets[i] > edge_count {
+                return Err(CsrError::InvalidData(format!(
+                    "row_offsets[{i}] = {} exceeds edge_count = {edge_count}",
+                    row_offsets[i]
+                )));
+            }
+            if i > 0 && row_offsets[i] < row_offsets[i - 1] {
+                return Err(CsrError::InvalidData(format!(
+                    "row_offsets[{i}] = {} < row_offsets[{}] = {} (not monotonic)",
+                    row_offsets[i],
+                    i - 1,
+                    row_offsets[i - 1]
+                )));
+            }
         }
 
         // Parse col_indices.
@@ -652,33 +680,41 @@ impl MmapCsrSegment {
         let created_lsn = u64::from_le_bytes(read8(data, 64)?);
         let stored_checksum = u64::from_le_bytes(read8(data, 72)?);
 
-        // Validate CRC32.
-        let computed_checksum = {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&node_count.to_le_bytes());
-            hasher.update(&edge_count.to_le_bytes());
-            hasher.update(&created_lsn.to_le_bytes());
-            hasher.finalize() as u64
-        };
-        if stored_checksum != computed_checksum {
-            return Err(CsrError::ChecksumMismatch {
-                expected: stored_checksum,
-                actual: computed_checksum,
-            });
-        }
-
         let nc = node_count as usize;
         let ec = edge_count as usize;
         let em_elem_size = core::mem::size_of::<EdgeMeta>(); // 8
         let nm_elem_size = core::mem::size_of::<NodeMeta>(); // 32
 
-        let expected_len =
-            header_size + (nc + 1) * 4 + ec * 4 + ec * em_elem_size + nc * nm_elem_size;
+        // Use checked arithmetic to prevent integer overflow from attacker-controlled
+        // node_count/edge_count values bypassing the size validation.
+        let expected_len = (|| -> Option<usize> {
+            let ro_size = nc.checked_add(1)?.checked_mul(4)?;
+            let ci_size = ec.checked_mul(4)?;
+            let em_size = ec.checked_mul(em_elem_size)?;
+            let nm_size = nc.checked_mul(nm_elem_size)?;
+            header_size
+                .checked_add(ro_size)?
+                .checked_add(ci_size)?
+                .checked_add(em_size)?
+                .checked_add(nm_size)
+        })()
+        .ok_or_else(|| {
+            CsrError::InvalidData("size overflow in CSR header fields".to_owned())
+        })?;
         if mmap.len() < expected_len {
             return Err(CsrError::InvalidData(format!(
                 "mmap'd data too short: {} < {expected_len}",
                 mmap.len(),
             )));
+        }
+
+        // Validate CRC32 over the entire payload (not just header fields).
+        let computed_checksum = compute_csr_checksum(data) as u64;
+        if stored_checksum != computed_checksum {
+            return Err(CsrError::ChecksumMismatch {
+                expected: stored_checksum,
+                actual: computed_checksum,
+            });
         }
 
         // Compute array pointers from the mmap base.
@@ -715,6 +751,31 @@ impl MmapCsrSegment {
             ));
         }
         let nm_len = nc;
+
+        // Validate row_offsets: every entry must be <= edge_count and
+        // the array must be monotonically non-decreasing. Without this,
+        // corrupted CSR files cause panics via out-of-bounds slice indexing
+        // in neighbors_out() and neighbor_edges().
+        {
+            // SAFETY: ro_ptr was computed from a validated mmap region of sufficient size.
+            let ro_slice = unsafe { core::slice::from_raw_parts(ro_ptr, ro_len) };
+            for i in 0..ro_len {
+                if ro_slice[i] > edge_count {
+                    return Err(CsrError::InvalidData(format!(
+                        "row_offsets[{i}] = {} exceeds edge_count = {edge_count}",
+                        ro_slice[i]
+                    )));
+                }
+                if i > 0 && ro_slice[i] < ro_slice[i - 1] {
+                    return Err(CsrError::InvalidData(format!(
+                        "row_offsets[{i}] = {} < row_offsets[{}] = {} (not monotonic)",
+                        ro_slice[i],
+                        i - 1,
+                        ro_slice[i - 1]
+                    )));
+                }
+            }
+        }
 
         // Rebuild indexes from mmap'd slices.
         // SAFETY: pointers were validated above, mmap is alive for this scope.
@@ -1190,6 +1251,23 @@ impl From<CsrSegment> for CsrStorage {
 }
 
 /// Read 2 bytes from `data` at `offset`.
+/// Compute CRC32 checksum over the entire CSR buffer, with the checksum
+/// field itself (bytes 72..80) zeroed to avoid circular dependency.
+/// This covers header fields AND all data arrays (row_offsets, col_indices,
+/// edge_meta, node_meta), ensuring corrupted content is detected.
+fn compute_csr_checksum(buf: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    // Hash everything before the checksum field.
+    if buf.len() > 72 {
+        hasher.update(&buf[..72]);
+    }
+    // Skip bytes 72..80 (the checksum field itself).
+    if buf.len() > 80 {
+        hasher.update(&buf[80..]);
+    }
+    hasher.finalize()
+}
+
 fn read2(data: &[u8], offset: usize) -> Result<[u8; 2], CsrError> {
     data.get(offset..offset + 2)
         .and_then(|s| s.try_into().ok())

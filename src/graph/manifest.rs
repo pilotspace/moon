@@ -83,6 +83,13 @@ impl GraphManifest {
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
+        // Fsync the parent directory to ensure the rename metadata is durable.
+        // Without this, a crash between rename and directory fsync loses the manifest.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 

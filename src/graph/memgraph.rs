@@ -171,6 +171,15 @@ impl MemGraph {
         true
     }
 
+    /// Remove an edge by its external u64 id (used during WAL replay).
+    /// Reconstructs the EdgeKey from the ffi representation and delegates
+    /// to `remove_edge`.
+    pub fn remove_edge_by_id(&mut self, edge_id: u64, lsn: u64) -> bool {
+        let key_data = slotmap::KeyData::from_ffi(edge_id);
+        let edge_key = EdgeKey::from(key_data);
+        self.remove_edge(edge_key, lsn)
+    }
+
     /// O(1) node lookup by key.
     pub fn get_node(&self, key: NodeKey) -> Option<&MutableNode> {
         self.nodes.get(key)

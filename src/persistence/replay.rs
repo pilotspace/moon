@@ -82,7 +82,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
                 // encoded as RESP integers). If so, convert to string bytes
                 // for GraphReplayCollector which expects all-text args.
                 let has_integers = args.iter().any(|f| matches!(f, Frame::Integer(_)));
-                if has_integers {
+                let collected = if has_integers {
                     let owned: smallvec::SmallVec<[Vec<u8>; 8]> = args
                         .iter()
                         .filter_map(|f| match f {
@@ -95,7 +95,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
                         owned.iter().map(|v| v.as_slice()).collect();
                     self.graph_collector
                         .borrow_mut()
-                        .collect_command(cmd, &refs);
+                        .collect_command(cmd, &refs)
                 } else {
                     let bulk_args: smallvec::SmallVec<[&[u8]; 8]> = args
                         .iter()
@@ -106,7 +106,14 @@ impl CommandReplayEngine for DispatchReplayEngine {
                         .collect();
                     self.graph_collector
                         .borrow_mut()
-                        .collect_command(cmd, &bulk_args);
+                        .collect_command(cmd, &bulk_args)
+                };
+                if !collected {
+                    tracing::warn!(
+                        "WAL replay: malformed graph command {:?} with {} args — skipping",
+                        std::str::from_utf8(cmd).unwrap_or("<non-utf8>"),
+                        args.len()
+                    );
                 }
                 return;
             }

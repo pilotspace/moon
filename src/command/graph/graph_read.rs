@@ -432,8 +432,8 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
 /// GRAPH.QUERY <graph> <cypher_string> — auto-routing handler.
 ///
-/// Quick-parses the query to determine read-only vs write, then dispatches
-/// to `graph_query` (read) or `graph_query_write` (write) accordingly.
+/// Parses the Cypher query once, then dispatches to the read or write path
+/// based on whether the query contains write clauses.
 pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
@@ -441,22 +441,128 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         ));
     }
 
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
     let cypher_bytes = match extract_bulk(&args[1]) {
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
-    // Quick-parse to check if query is read-only.
-    let is_read = match cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => q.is_read_only(),
-        Err(_) => true, // Fallback to read path; it will re-parse and report the error.
+    // Parse once — no double-parse overhead.
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
     };
 
-    if is_read {
-        // Reborrow as shared ref for read path.
-        graph_query(store, args)
+    if query.is_read_only() {
+        // Read path: compile plan (with cache), execute read-only.
+        let graph = match store.get_graph(graph_name) {
+            Some(g) => g,
+            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+        };
+
+        let query_hash = cypher::planner::hash_query(cypher_bytes);
+        let plan = {
+            let cache = graph.plan_cache.lock();
+            cache.get(query_hash)
+        };
+        let plan = if let Some(cached) = plan {
+            cached
+        } else {
+            let p = match cypher::planner::compile(&query) {
+                Ok(p) => std::sync::Arc::new(p),
+                Err(e) => {
+                    let msg = format!("ERR Cypher plan error: {e}");
+                    return Frame::Error(Bytes::from(msg));
+                }
+            };
+            graph.plan_cache.lock().insert(query_hash, p.clone());
+            p
+        };
+
+        let params = std::collections::HashMap::new();
+        let result = match cypher::executor::execute(graph, &plan, &params) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("ERR Cypher execution error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        };
+
+        exec_result_to_frame(&result)
     } else {
-        graph_query_write(store, args)
+        // Write path: compile plan (no cache for writes), execute with mutations.
+        let plan = match cypher::planner::compile(&query) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("ERR Cypher plan error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
+        };
+
+        let lsn = store.allocate_lsn();
+
+        let result = {
+            let graph = match store.get_graph_mut(graph_name) {
+                Some(g) => g,
+                None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+            };
+
+            let params = std::collections::HashMap::new();
+            match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("ERR Cypher execution error: {e}");
+                    return Frame::Error(Bytes::from(msg));
+                }
+            }
+        };
+
+        // Generate WAL records for mutations.
+        for mutation in &result.mutations {
+            match mutation {
+                cypher::executor::MutationRecord::CreateNode {
+                    node_id,
+                    labels,
+                    properties,
+                    embedding,
+                } => {
+                    store.wal_pending.push(crate::graph::wal::serialize_add_node(
+                        graph_name,
+                        *node_id,
+                        labels,
+                        properties,
+                        embedding.as_deref(),
+                    ));
+                }
+                cypher::executor::MutationRecord::CreateEdge {
+                    edge_id,
+                    src_id,
+                    dst_id,
+                    edge_type,
+                    weight,
+                    properties,
+                } => {
+                    store.wal_pending.push(crate::graph::wal::serialize_add_edge(
+                        graph_name,
+                        *edge_id,
+                        *src_id,
+                        *dst_id,
+                        *edge_type,
+                        *weight,
+                        properties.as_ref(),
+                    ));
+                }
+            }
+        }
+
+        exec_result_to_frame(&result)
     }
 }
 
@@ -673,8 +779,11 @@ fn exec_result_to_frame(result: &cypher::executor::ExecResult) -> Frame {
         })
         .collect();
 
-    // 3. Stats
-    let stats = format!(
+    // 3. Stats — use write! to pre-allocated buffer instead of format!()
+    let mut stats_buf = Vec::with_capacity(128);
+    use std::io::Write as _;
+    let _ = write!(
+        stats_buf,
         "Nodes created: {}, Nodes deleted: {}, Properties set: {}, \
          Query internal execution time: {} us",
         result.nodes_created, result.nodes_deleted, result.properties_set,
@@ -685,13 +794,16 @@ fn exec_result_to_frame(result: &cypher::executor::ExecResult) -> Frame {
         vec![
             Frame::Array(headers.into()),
             Frame::Array(rows.into()),
-            Frame::BulkString(Bytes::from(stats)),
+            Frame::BulkString(Bytes::from(stats_buf)),
         ]
         .into(),
     )
 }
 
 /// Convert an executor Value to a Frame.
+///
+/// Uses `itoa` + stack buffer for Node/Edge IDs to avoid per-row `format!()`
+/// heap allocations on the query result serialization hot path.
 fn value_to_frame(value: &cypher::executor::Value) -> Frame {
     use cypher::executor::Value;
     match value {
@@ -700,8 +812,25 @@ fn value_to_frame(value: &cypher::executor::Value) -> Frame {
         Value::Float(f) => Frame::Double(*f),
         Value::String(s) => Frame::BulkString(Bytes::from(s.clone())),
         Value::Bool(b) => Frame::Boolean(*b),
-        Value::Node(key) => Frame::BulkString(Bytes::from(format!("node:{}", key.data().as_ffi()))),
-        Value::Edge(key) => Frame::BulkString(Bytes::from(format!("edge:{}", key.data().as_ffi()))),
+        Value::Node(key) => {
+            // "node:" (5) + max u64 (20 digits) = 25 bytes max
+            let mut buf = [0u8; 32];
+            buf[..5].copy_from_slice(b"node:");
+            let mut itoa_buf = itoa::Buffer::new();
+            let n = itoa_buf.format(key.data().as_ffi());
+            let end = 5 + n.len();
+            buf[5..end].copy_from_slice(n.as_bytes());
+            Frame::BulkString(Bytes::copy_from_slice(&buf[..end]))
+        }
+        Value::Edge(key) => {
+            let mut buf = [0u8; 32];
+            buf[..5].copy_from_slice(b"edge:");
+            let mut itoa_buf = itoa::Buffer::new();
+            let n = itoa_buf.format(key.data().as_ffi());
+            let end = 5 + n.len();
+            buf[5..end].copy_from_slice(n.as_bytes());
+            Frame::BulkString(Bytes::copy_from_slice(&buf[..end]))
+        }
         Value::List(items) => {
             let frames: Vec<Frame> = items.iter().map(value_to_frame).collect();
             Frame::Array(frames.into())

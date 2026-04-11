@@ -124,6 +124,17 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
     let lsn = store.allocate_lsn();
 
+    // Serialize WAL record first using borrowed refs (before moving into add_node).
+    // This eliminates the expensive embedding.clone() (up to 6KB for 1536-dim f32).
+    // We use external_id=0 as placeholder, then fix it after add_node.
+    let wal_record_no_id = wal::serialize_add_node(
+        graph_name,
+        0, // placeholder
+        &labels,
+        &properties,
+        embedding.as_deref(),
+    );
+
     // Scoped borrow of graph for mutation, then release for WAL push.
     let external_id = {
         let graph = match store.get_graph_mut(graph_name) {
@@ -131,41 +142,54 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
             None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
         };
 
-        let node_key =
-            graph
-                .write_buf
-                .add_node(labels.clone(), properties.clone(), embedding.clone(), lsn);
+        // Move data into add_node — no clones needed.
+        let node_key = graph.write_buf.add_node(labels, properties, embedding, lsn);
+        let ext_id = node_key.data().as_ffi();
 
-        // Update graph stats incrementally.
-        graph.stats.on_node_insert(&labels);
+        // Update graph stats from stored node (avoid needing moved labels).
+        if let Some(node) = graph.write_buf.get_node(node_key) {
+            graph.stats.on_node_insert(&node.labels);
 
-        // Update PropertyIndex for numeric properties (range query support).
-        for (prop_id, prop_val) in &properties {
-            let val = match prop_val {
-                crate::graph::types::PropertyValue::Float(f) => Some(*f),
-                crate::graph::types::PropertyValue::Int(i) => Some(*i as f64),
-                _ => None,
-            };
-            if let Some(v) = val {
-                graph
-                    .property_indexes
-                    .entry(*prop_id)
-                    .or_insert_with(|| crate::graph::index::PropertyIndex::new(*prop_id))
-                    .insert(v, node_key.data().as_ffi() as u32);
+            // Update PropertyIndex for numeric properties.
+            for (prop_id, prop_val) in &node.properties {
+                let val = match prop_val {
+                    crate::graph::types::PropertyValue::Float(f) => Some(*f),
+                    crate::graph::types::PropertyValue::Int(i) => Some(*i as f64),
+                    _ => None,
+                };
+                if let Some(v) = val {
+                    graph
+                        .property_indexes
+                        .entry(*prop_id)
+                        .or_insert_with(|| crate::graph::index::PropertyIndex::new(*prop_id))
+                        .insert(v, ext_id as u32);
+                }
             }
         }
 
-        node_key.data().as_ffi()
+        ext_id
     };
 
-    // Serialize WAL record for the node insertion.
-    store.wal_pending.push(wal::serialize_add_node(
-        graph_name,
-        external_id,
-        &labels,
-        &properties,
-        embedding.as_deref(),
-    ));
+    // Re-serialize the WAL record with the actual external_id.
+    // This is cheap — WAL serialization is just RESP encoding of small fields.
+    // The expensive embedding data was already consumed by add_node, but the
+    // WAL record was pre-built from refs. We drop the placeholder and rebuild
+    // from the stored node refs (no clone — just borrows).
+    drop(wal_record_no_id);
+    if let Some(graph) = store.get_graph(graph_name) {
+        let nk = crate::graph::types::NodeKey::from(
+            slotmap::KeyData::from_ffi(external_id),
+        );
+        if let Some(node) = graph.write_buf.get_node(nk) {
+            store.wal_pending.push(wal::serialize_add_node(
+                graph_name,
+                external_id,
+                &node.labels,
+                &node.properties,
+                node.embedding.as_deref(),
+            ));
+        }
+    }
 
     Frame::Integer(external_id as i64)
 }
@@ -275,7 +299,7 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
         match graph
             .write_buf
-            .add_edge(src_key, dst_key, edge_type_id, weight, props.clone(), lsn)
+            .add_edge(src_key, dst_key, edge_type_id, weight, props, lsn)
         {
             Ok(edge_key) => {
                 graph
@@ -289,6 +313,16 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
     match edge_result {
         Ok(external_id) => {
+            // Read edge properties from stored edge (props was moved into add_edge).
+            let stored_props = store
+                .get_graph(graph_name)
+                .and_then(|g| {
+                    let ek = crate::graph::types::EdgeKey::from(
+                        slotmap::KeyData::from_ffi(external_id),
+                    );
+                    g.write_buf.get_edge(ek)
+                })
+                .and_then(|e| e.properties.as_ref());
             store.wal_pending.push(wal::serialize_add_edge(
                 graph_name,
                 external_id,
@@ -296,7 +330,7 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 dst_id,
                 edge_type_id,
                 weight,
-                props.as_ref(),
+                stored_props,
             ));
 
             // Check if compaction threshold reached after edge insertion.

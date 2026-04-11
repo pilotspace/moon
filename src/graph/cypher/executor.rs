@@ -197,12 +197,17 @@ pub fn execute(
                         }
                     } else {
                         // Variable-length expansion via BFS using SegmentMergeReader.
+                        // Enforce limits to prevent DoS via exponential row growth.
+                        const MAX_HOPS_LIMIT: u32 = 20;
+                        const MAX_RESULT_ROWS: usize = 100_000;
+                        let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
+
                         let mut frontier = vec![src_key];
                         let mut visited =
                             std::collections::HashSet::new();
                         visited.insert(src_key);
 
-                        for hop in 1..=*max_hops {
+                        for hop in 1..=capped_max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
                                 for merged in reader.neighbors(current) {
@@ -224,11 +229,17 @@ pub fn execute(
                                             Value::Node(merged.node),
                                         );
                                         new_rows.push(new_row);
+                                        if new_rows.len() >= MAX_RESULT_ROWS {
+                                            break;
+                                        }
                                     }
+                                }
+                                if new_rows.len() >= MAX_RESULT_ROWS {
+                                    break;
                                 }
                             }
                             frontier = next_frontier;
-                            if frontier.is_empty() {
+                            if frontier.is_empty() || new_rows.len() >= MAX_RESULT_ROWS {
                                 break;
                             }
                         }
@@ -1577,9 +1588,13 @@ pub fn execute_mut(
                             node_keys.push(nk);
                         }
                         // Create edges.
+                        if pattern.edges.len() >= node_keys.len() && !pattern.edges.is_empty() {
+                            // More edges than nodes-1: malformed pattern, skip edges.
+                            continue;
+                        }
                         for (i, pe) in pattern.edges.iter().enumerate() {
-                            let src = node_keys[i];
-                            let dst = node_keys[i + 1];
+                            let Some(&src) = node_keys.get(i) else { break };
+                            let Some(&dst) = node_keys.get(i + 1) else { break };
                             let edge_type = pe
                                 .edge_types
                                 .first()
