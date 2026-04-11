@@ -350,19 +350,62 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         }
     };
 
-    let graph = match store.get_graph_mut(graph_name) {
-        Some(g) => g,
-        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
-    };
+    let lsn = store.allocate_lsn();
 
-    let params = std::collections::HashMap::new();
-    let result = match cypher::executor::execute_mut(graph, &plan, &params) {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = format!("ERR Cypher execution error: {e}");
-            return Frame::Error(Bytes::from(msg));
+    // Scoped borrow: get mutable graph, execute, release borrow before WAL push.
+    let result = {
+        let graph = match store.get_graph_mut(graph_name) {
+            Some(g) => g,
+            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+        };
+
+        let params = std::collections::HashMap::new();
+        match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("ERR Cypher execution error: {e}");
+                return Frame::Error(Bytes::from(msg));
+            }
         }
     };
+
+    // Generate WAL records for mutations performed during execution.
+    for mutation in &result.mutations {
+        match mutation {
+            cypher::executor::MutationRecord::CreateNode {
+                node_id,
+                labels,
+                properties,
+                embedding,
+            } => {
+                store.wal_pending.push(crate::graph::wal::serialize_add_node(
+                    graph_name,
+                    *node_id,
+                    labels,
+                    properties,
+                    embedding.as_deref(),
+                ));
+            }
+            cypher::executor::MutationRecord::CreateEdge {
+                edge_id,
+                src_id,
+                dst_id,
+                edge_type,
+                weight,
+                properties,
+            } => {
+                store.wal_pending.push(crate::graph::wal::serialize_add_edge(
+                    graph_name,
+                    *edge_id,
+                    *src_id,
+                    *dst_id,
+                    *edge_type,
+                    *weight,
+                    properties.as_ref(),
+                ));
+            }
+        }
+    }
 
     exec_result_to_frame(&result)
 }
