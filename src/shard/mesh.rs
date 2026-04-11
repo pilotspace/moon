@@ -173,6 +173,25 @@ impl ChannelMesh {
     }
 }
 
+/// Create N SPSC channels for the admin/console gateway.
+/// Returns (producers, consumers) where:
+/// - producers\[i\] sends to shard i (given to admin thread)
+/// - consumers\[i\] receives from admin (given to shard i)
+pub fn create_admin_channels(
+    num_shards: usize,
+    buffer_size: usize,
+) -> (Vec<HeapProd<ShardMessage>>, Vec<HeapCons<ShardMessage>>) {
+    let mut producers = Vec::with_capacity(num_shards);
+    let mut consumers = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        let rb = HeapRb::new(buffer_size);
+        let (prod, cons) = rb.split();
+        producers.push(prod);
+        consumers.push(cons);
+    }
+    (producers, consumers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

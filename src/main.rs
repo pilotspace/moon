@@ -245,6 +245,19 @@ fn main() -> anyhow::Result<()> {
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
 
+    // Create admin SPSC channels for the console gateway (one per shard).
+    #[cfg(feature = "console")]
+    let mut admin_consumers = {
+        let (admin_producers, admin_consumers) =
+            moon::shard::mesh::create_admin_channels(num_shards, CHANNEL_BUFFER_SIZE);
+        let gateway = std::sync::Arc::new(
+            moon::admin::console_gateway::ConsoleGateway::new(admin_producers, all_notifiers.clone()),
+        );
+        moon::admin::console_gateway::set_global_gateway(gateway);
+        tracing::info!("Console gateway initialized with {} shard channels", num_shards);
+        admin_consumers
+    };
+
     // Pre-create shared pubsub registries for cross-shard introspection reads.
     let all_pubsub_registries: Vec<
         std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
@@ -423,7 +436,20 @@ fn main() -> anyhow::Result<()> {
     let config_port = config.port;
     for (id, mut shard) in shards.into_iter().enumerate() {
         let producers = mesh.take_producers(id);
-        let consumers = mesh.take_consumers(id);
+        #[allow(unused_mut)]
+        let mut consumers = mesh.take_consumers(id);
+        // Append admin consumer for this shard (console gateway -> shard SPSC).
+        #[cfg(feature = "console")]
+        {
+            let admin_cons = std::mem::replace(
+                &mut admin_consumers[id],
+                {
+                    use ringbuf::traits::Split;
+                    ringbuf::HeapRb::new(1).split().1
+                },
+            );
+            consumers.push(admin_cons);
+        }
         let conn_rx = mesh.take_conn_rx(id);
         let shard_cancel = cancel_token.clone();
         let shard_aof_tx = aof_tx.clone();
