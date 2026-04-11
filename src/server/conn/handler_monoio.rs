@@ -538,7 +538,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         } else {
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
                             }
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "auth".to_string(),
@@ -569,8 +569,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if let Some(name) = new_name {
                             conn.client_name = Some(name);
                         }
-                        if let Some(uname) = opt_user {
-                            conn.current_user = uname;
+                        if let Some(ref uname) = opt_user {
+                            conn.current_user = uname.clone();
+                        }
+                        // HELLO AUTH rate limiting
+                        if matches!(&response, Frame::Error(_)) {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
+                        } else if opt_user.is_some() {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
                         }
                         responses.push(response);
                         continue;
@@ -754,7 +764,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         crate::auth_ratelimit::record_success(addr.ip());
                     }
                 } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                    auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                    auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
                 }
                 responses.push(response);
                 continue;
@@ -775,8 +785,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some(name) = new_name {
                     conn.client_name = Some(name);
                 }
-                if let Some(uname) = opt_user {
-                    conn.current_user = uname;
+                if let Some(ref uname) = opt_user {
+                    conn.current_user = uname.clone();
+                }
+                if matches!(&response, Frame::Error(_)) {
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                    }
+                } else if opt_user.is_some() {
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        crate::auth_ratelimit::record_success(addr.ip());
+                    }
                 }
                 responses.push(response);
                 continue;

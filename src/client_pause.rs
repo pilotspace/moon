@@ -63,13 +63,11 @@ pub fn check_pause(is_write: bool) -> Option<std::time::Duration> {
 }
 
 /// Clean up expired pause state (called periodically from handlers).
+/// Takes a write lock to avoid TOCTOU between expiry check and clear.
 pub fn expire_if_needed() {
-    let should_clear = {
-        let state = PAUSE.read();
-        state.active && Instant::now() >= state.until
-    };
-    if should_clear {
-        PAUSE.write().active = false;
+    let mut state = PAUSE.write();
+    if state.active && Instant::now() >= state.until {
+        state.active = false;
     }
 }
 

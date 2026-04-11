@@ -148,10 +148,19 @@ pub enum KillFilter {
 }
 
 /// Parse CLIENT KILL arguments into a KillFilter.
+///
+/// Supports both the legacy form (`CLIENT KILL addr:port`) and the modern
+/// filter form (`CLIENT KILL ID id`, `CLIENT KILL ADDR addr`, `CLIENT KILL USER user`).
 pub fn parse_kill_args(args: &[&[u8]]) -> Option<KillFilter> {
-    if args.len() < 2 {
+    if args.is_empty() {
         return None;
     }
+    // Legacy single-arg form: CLIENT KILL addr:port
+    if args.len() == 1 {
+        let addr = std::str::from_utf8(args[0]).ok()?;
+        return Some(KillFilter::Addr(addr.to_string()));
+    }
+    // Modern filter form: CLIENT KILL ID|ADDR|USER value
     let mut i = 0;
     while i + 1 < args.len() {
         let key = args[i];
@@ -168,11 +177,6 @@ pub fn parse_kill_args(args: &[&[u8]]) -> Option<KillFilter> {
             return Some(KillFilter::User(user.to_string()));
         }
         i += 2;
-    }
-    // Legacy single-arg form: CLIENT KILL addr:port
-    if args.len() == 1 {
-        let addr = std::str::from_utf8(args[0]).ok()?;
-        return Some(KillFilter::Addr(addr.to_string()));
     }
     None
 }

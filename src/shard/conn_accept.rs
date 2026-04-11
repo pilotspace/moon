@@ -82,7 +82,10 @@ fn set_tcp_keepalive(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
     // for the duration of this function — SockRef does not close on drop.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let sock = socket2::SockRef::from(&borrowed);
-    let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(keepalive_secs));
+    let interval = std::cmp::max(keepalive_secs / 3, 1);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(keepalive_secs))
+        .with_interval(std::time::Duration::from_secs(interval));
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
@@ -580,7 +583,6 @@ pub(crate) fn spawn_monoio_connection(
                         use ringbuf::traits::Producer;
                         use crate::shard::mesh::ChannelMesh;
 
-                        _migrated = true;
                         let raw_fd = stream.as_raw_fd();
                         // SAFETY: raw_fd is a valid open socket fd from the monoio TcpStream.
                         // dup() creates a new, independent fd that we take ownership of.
@@ -597,6 +599,7 @@ pub(crate) fn spawn_monoio_connection(
                             };
                             match push_result {
                                 Ok(()) => {
+                                    _migrated = true;
                                     notifiers2[target_shard].notify_one();
                                     tracing::info!(
                                         "Shard {}: migrated connection {} to shard {} (monoio)",

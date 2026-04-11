@@ -536,14 +536,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
                                     conn.current_user = uname;
-                                    // Clear rate limiter on success
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                         crate::auth_ratelimit::record_success(addr.ip());
                                     }
                                 } else {
-                                    // Rate limit: record failure and get delay
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                        auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
                                     }
                                     conn.acl_log.push(crate::acl::AclLogEntry {
                                         reason: "auth".to_string(),
@@ -573,8 +571,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(name) = new_name {
                                     conn.client_name = Some(name);
                                 }
-                                if let Some(uname) = opt_user {
-                                    conn.current_user = uname;
+                                if let Some(ref uname) = opt_user {
+                                    conn.current_user = uname.clone();
+                                }
+                                // HELLO AUTH rate limiting (same as AUTH gate)
+                                if matches!(&response, Frame::Error(_)) {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                                    }
+                                } else if opt_user.is_some() {
+                                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                        crate::auth_ratelimit::record_success(addr.ip());
+                                    }
                                 }
                                 responses.push(response);
                                 continue;
@@ -728,7 +736,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::auth_ratelimit::record_success(addr.ip());
                             }
                         } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                            auth_delay_ms = crate::auth_ratelimit::record_failure(addr.ip());
+                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
                         }
                         responses.push(response);
                         continue;
@@ -741,7 +749,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         );
                         if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
                         if let Some(name) = new_name { conn.client_name = Some(name); }
-                        if let Some(uname) = opt_user { conn.current_user = uname; }
+                        if let Some(ref uname) = opt_user { conn.current_user = uname.clone(); }
+                        if matches!(&response, Frame::Error(_)) {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
+                            }
+                        } else if opt_user.is_some() {
+                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                                crate::auth_ratelimit::record_success(addr.ip());
+                            }
+                        }
                         responses.push(response);
                         continue;
                     }
