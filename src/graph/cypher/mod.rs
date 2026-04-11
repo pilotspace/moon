@@ -8,11 +8,13 @@
 //! Nesting depth is limited (default 64) to prevent stack overflow DoS.
 
 pub mod ast;
+pub mod executor;
 pub mod lexer;
 pub mod parser;
 pub mod planner;
 
 pub use ast::{Clause, CypherQuery, Expr};
+pub use executor::{ExecResult, Value};
 pub use parser::{CypherError, Parser};
 pub use planner::{CostEstimate, PhysicalPlan, PlanCache, Strategy};
 

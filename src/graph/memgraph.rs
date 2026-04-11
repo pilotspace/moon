@@ -211,6 +211,16 @@ impl MemGraph {
         }
     }
 
+    /// Iterate over all live (non-deleted) nodes. Yields `(NodeKey, &MutableNode)`.
+    pub fn iter_nodes(&self) -> impl Iterator<Item = (NodeKey, &MutableNode)> {
+        self.nodes.iter().filter(|(_, n)| n.deleted_lsn == u64::MAX)
+    }
+
+    /// Iterate over all live (non-deleted) edges. Yields `(EdgeKey, &MutableEdge)`.
+    pub fn iter_edges(&self) -> impl Iterator<Item = (EdgeKey, &MutableEdge)> {
+        self.edges.iter().filter(|(_, e)| e.deleted_lsn == u64::MAX)
+    }
+
     /// Number of live (non-deleted) nodes. O(1) via maintained counter.
     pub fn node_count(&self) -> usize {
         self.live_node_count
