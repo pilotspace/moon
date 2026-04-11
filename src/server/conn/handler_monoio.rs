@@ -1537,10 +1537,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // --- GRAPH.* graph commands ---
             #[cfg(feature = "graph")]
             if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
-                let (response, wal_records) = if crate::command::graph::is_graph_write_cmd(cmd) {
+                let (response, wal_records) = if crate::command::graph::is_graph_write_cmd(cmd)
+                    || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                        && crate::command::graph::is_cypher_write_query(cmd_args))
+                {
                     let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                    let resp =
-                        crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args);
+                    let resp = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                        crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
+                    } else {
+                        crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args)
+                    };
                     let records = gs.drain_wal();
                     (resp, records)
                 } else {

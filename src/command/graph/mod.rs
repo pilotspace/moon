@@ -28,6 +28,25 @@ pub fn is_graph_write_cmd(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"GRAPH.DELETE")
 }
 
+/// Quick-parse a GRAPH.QUERY's Cypher argument to determine if it contains write clauses.
+/// Returns true if the Cypher has CREATE, DELETE, SET, or MERGE.
+/// Returns false on parse failure (fallback to read path — it will re-parse and report error).
+#[inline]
+pub fn is_cypher_write_query(args: &[crate::protocol::Frame]) -> bool {
+    use crate::command::graph::graph_write::extract_bulk;
+    if args.len() < 2 {
+        return false;
+    }
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return false,
+    };
+    match crate::graph::cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => !q.is_read_only(),
+        Err(_) => false,
+    }
+}
+
 /// Dispatch read-only GRAPH.* commands. Takes &GraphStore (shared).
 pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
     if cmd.eq_ignore_ascii_case(b"GRAPH.NEIGHBORS") {
