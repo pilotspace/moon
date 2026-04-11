@@ -290,6 +290,19 @@ impl Database {
         self.data.keys()
     }
 
+    /// Return a random key from the database, or None if empty.
+    pub fn random_key(&self) -> Option<Bytes> {
+        if self.data.is_empty() {
+            return None;
+        }
+        // Pick a random index via simple hash of current time
+        let idx = (current_time_ms() as usize) % self.data.len();
+        self.data
+            .keys()
+            .nth(idx)
+            .map(|k| Bytes::copy_from_slice(k.as_ref()))
+    }
+
     /// Set or remove expiration on an existing key.
     ///
     /// Performs lazy expiry check first. Returns `false` if the key does not

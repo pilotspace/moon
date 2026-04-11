@@ -211,9 +211,12 @@ fn dispatch_inner(
             }
         }
         (4, b't') => {
-            // TYPE
+            // TYPE TIME
             if cmd.eq_ignore_ascii_case(b"TYPE") {
                 return resp(key::type_cmd(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"TIME") {
+                return resp(key::time());
             }
         }
         (4, b'x') => {
@@ -366,6 +369,12 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"ZMPOP") {
                 return resp(sorted_set::zmpop(db, args));
+            }
+        }
+        (5, b't') => {
+            // TOUCH
+            if cmd.eq_ignore_ascii_case(b"TOUCH") {
+                return resp(key::touch(db, args));
             }
         }
         // 6-letter commands
@@ -556,6 +565,12 @@ fn dispatch_inner(
             }
         }
         // 7-letter commands
+        (7, b'f') => {
+            // FLUSHDB
+            if cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                return resp(key::flushdb(db, args));
+            }
+        }
         (7, b'g') => {
             // GEODIST GEOHASH
             if cmd.eq_ignore_ascii_case(b"GEODIST") {
@@ -632,6 +647,18 @@ fn dispatch_inner(
             }
         }
         // 8-letter commands
+        (8, b'e') => {
+            // EXPIREAT
+            if cmd.eq_ignore_ascii_case(b"EXPIREAT") {
+                return resp(key::expireat(db, args));
+            }
+        }
+        (8, b'f') => {
+            // FLUSHALL — clears current DB (per-shard, not cross-shard)
+            if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                return resp(key::flushdb(db, args));
+            }
+        }
         (8, b'g') => {
             // GETRANGE
             if cmd.eq_ignore_ascii_case(b"GETRANGE") {
@@ -651,7 +678,13 @@ fn dispatch_inner(
             }
         }
         (8, b's') => {
-            // SMEMBERS SETRANGE
+            // SMEMBERS SETRANGE SHUTDOWN
+            if cmd.eq_ignore_ascii_case(b"SHUTDOWN") {
+                // Acknowledge but don't kill — actual shutdown is handled by the server
+                return resp(Frame::Error(Bytes::from_static(
+                    b"ERR Errors trying to SHUTDOWN. Check logs.",
+                )));
+            }
             if cmd.eq_ignore_ascii_case(b"SMEMBERS") {
                 return resp(set::smembers(db, args));
             }
@@ -676,6 +709,18 @@ fn dispatch_inner(
             // GEOSEARCH
             if cmd.eq_ignore_ascii_case(b"GEOSEARCH") {
                 return resp(geo::geosearch(db, args));
+            }
+        }
+        (9, b'p') => {
+            // PEXPIREAT
+            if cmd.eq_ignore_ascii_case(b"PEXPIREAT") {
+                return resp(key::pexpireat(db, args));
+            }
+        }
+        (9, b'r') => {
+            // RANDOMKEY
+            if cmd.eq_ignore_ascii_case(b"RANDOMKEY") {
+                return resp(key::randomkey(db, &[]));
             }
         }
         (9, b's') => {
@@ -706,6 +751,12 @@ fn dispatch_inner(
                 return resp(hash::hrandfield(db, args));
             }
         }
+        (10, b'e') => {
+            // EXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"EXPIRETIME") {
+                return resp(key::expiretime(db, args));
+            }
+        }
         (10, b's') => {
             // SMISMEMBER SDIFFSTORE SINTERCARD
             if cmd.eq_ignore_ascii_case(b"SMISMEMBER") {
@@ -734,6 +785,12 @@ fn dispatch_inner(
             }
         }
         // 11-letter commands
+        (11, b'p') => {
+            // PEXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"PEXPIRETIME") {
+                return resp(key::pexpiretime(db, args));
+            }
+        }
         (11, b'i') => {
             // INCRBYFLOAT
             if cmd.eq_ignore_ascii_case(b"INCRBYFLOAT") {

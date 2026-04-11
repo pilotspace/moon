@@ -590,6 +590,21 @@ if should_run "key"; then
     assert_match "GEODIST km"          GEODIST k:geo Palermo Catania km
     assert_match "GEOHASH"             GEOHASH k:geo Palermo
     assert_match "GEOSEARCH"           GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC
+    # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
+    rcli SET k:eat val >/dev/null 2>&1; mcli SET k:eat val >/dev/null 2>&1
+    assert_match "EXPIREAT"            EXPIREAT k:eat 9999999999
+    assert_match "TTL after EXPIREAT"  TTL k:eat
+    assert_match "EXPIRETIME"          EXPIRETIME k:eat
+    assert_match "PEXPIRETIME"         PEXPIRETIME k:eat
+
+    # TIME / RANDOMKEY / TOUCH
+    assert_moon_ok "TIME"              TIME
+    rcli SET k:rnd val >/dev/null 2>&1; mcli SET k:rnd val >/dev/null 2>&1
+    assert_moon_ok "RANDOMKEY"         RANDOMKEY
+    assert_match "TOUCH"               TOUCH k:rnd
+
+    # FLUSHDB
+    assert_match "FLUSHDB"             FLUSHDB
 fi
 
 # ===========================================================================

@@ -217,6 +217,166 @@ pub fn persist(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// EXPIREAT key unix-time-seconds
+///
+/// Set the expiration for a key as a UNIX timestamp (seconds).
+pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("EXPIREAT");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("EXPIREAT"),
+    };
+    let timestamp = match parse_int(&args[1]) {
+        Some(n) if n > 0 => n as u64,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'EXPIREAT' command",
+            ));
+        }
+    };
+    let expires_at_ms = timestamp * 1000;
+    if db.set_expiry(key, expires_at_ms) {
+        Frame::Integer(1)
+    } else {
+        Frame::Integer(0)
+    }
+}
+
+/// PEXPIREAT key unix-time-milliseconds
+///
+/// Set the expiration for a key as a UNIX timestamp in milliseconds.
+pub fn pexpireat(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("PEXPIREAT");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("PEXPIREAT"),
+    };
+    let timestamp_ms = match parse_int(&args[1]) {
+        Some(n) if n > 0 => n as u64,
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'PEXPIREAT' command",
+            ));
+        }
+    };
+    if db.set_expiry(key, timestamp_ms) {
+        Frame::Integer(1)
+    } else {
+        Frame::Integer(0)
+    }
+}
+
+/// EXPIRETIME key
+///
+/// Returns the absolute Unix timestamp (in seconds) at which the key will expire.
+/// Returns -2 if key doesn't exist, -1 if key has no expiry.
+pub fn expiretime(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("EXPIRETIME");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("EXPIRETIME"),
+    };
+    let base_ts = db.base_timestamp();
+    match db.get(key) {
+        None => Frame::Integer(-2),
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                Frame::Integer((entry.expires_at_ms(base_ts) / 1000) as i64)
+            }
+        }
+    }
+}
+
+/// PEXPIRETIME key
+///
+/// Returns the absolute Unix timestamp (in milliseconds) at which the key will expire.
+pub fn pexpiretime(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("PEXPIRETIME");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("PEXPIRETIME"),
+    };
+    let base_ts = db.base_timestamp();
+    match db.get(key) {
+        None => Frame::Integer(-2),
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                Frame::Integer(entry.expires_at_ms(base_ts) as i64)
+            }
+        }
+    }
+}
+
+/// RANDOMKEY
+///
+/// Returns a random key from the currently selected database.
+pub fn randomkey(db: &mut Database, _args: &[Frame]) -> Frame {
+    match db.random_key() {
+        Some(key) => Frame::BulkString(key),
+        None => Frame::Null,
+    }
+}
+
+/// TOUCH key [key ...]
+///
+/// Alters the last access time of a key(s). Returns the number of keys that exist.
+pub fn touch(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("TOUCH");
+    }
+    let mut count = 0i64;
+    for arg in args {
+        let key = match extract_key(arg) {
+            Some(k) => k,
+            None => continue,
+        };
+        if db.exists(key) {
+            // exists() already does lazy expiry + access tracking
+            count += 1;
+        }
+    }
+    Frame::Integer(count)
+}
+
+/// TIME
+///
+/// Returns the current server time as a two-element array:
+/// [unix-seconds, microseconds-since-epoch-second].
+pub fn time() -> Frame {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let micros = now.subsec_micros();
+    Frame::Array(
+        vec![
+            Frame::BulkString(Bytes::from(secs.to_string())),
+            Frame::BulkString(Bytes::from(micros.to_string())),
+        ]
+        .into(),
+    )
+}
+
+/// FLUSHDB [ASYNC|SYNC]
+///
+/// Delete all keys in the currently selected database.
+pub fn flushdb(db: &mut Database, _args: &[Frame]) -> Frame {
+    db.clear();
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
 /// TYPE key
 ///
 /// Returns the string representation of the type of the value stored at key.
@@ -1468,5 +1628,112 @@ mod tests {
             },
             _ => panic!("Expected array"),
         }
+    }
+
+    // --- EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME tests ---
+
+    #[test]
+    fn test_expireat() {
+        let mut db = setup_db_with_key(b"k", b"v");
+        let future_ts = (current_time_ms() / 1000 + 3600) as i64;
+        let result = expireat(
+            &mut db,
+            &[
+                bs(b"k"),
+                Frame::BulkString(Bytes::from(future_ts.to_string())),
+            ],
+        );
+        assert_eq!(result, Frame::Integer(1));
+        assert!(db.get(b"k").unwrap().has_expiry());
+    }
+
+    #[test]
+    fn test_expireat_missing() {
+        let mut db = Database::new();
+        let result = expireat(&mut db, &[bs(b"k"), bs(b"9999999999")]);
+        assert_eq!(result, Frame::Integer(0));
+    }
+
+    #[test]
+    fn test_pexpireat() {
+        let mut db = setup_db_with_key(b"k", b"v");
+        let future_ms = (current_time_ms() + 3_600_000) as i64;
+        let result = pexpireat(
+            &mut db,
+            &[
+                bs(b"k"),
+                Frame::BulkString(Bytes::from(future_ms.to_string())),
+            ],
+        );
+        assert_eq!(result, Frame::Integer(1));
+    }
+
+    #[test]
+    fn test_expiretime() {
+        let mut db = setup_db_with_key(b"k", b"v");
+        // No expiry → -1
+        let result = expiretime(&mut db, &[bs(b"k")]);
+        assert_eq!(result, Frame::Integer(-1));
+        // Missing → -2
+        let result = expiretime(&mut db, &[bs(b"nope")]);
+        assert_eq!(result, Frame::Integer(-2));
+    }
+
+    #[test]
+    fn test_pexpiretime() {
+        let mut db = setup_db_with_key(b"k", b"v");
+        let result = pexpiretime(&mut db, &[bs(b"k")]);
+        assert_eq!(result, Frame::Integer(-1));
+    }
+
+    // --- RANDOMKEY / TOUCH / TIME / FLUSHDB tests ---
+
+    #[test]
+    fn test_randomkey_empty() {
+        let mut db = Database::new();
+        assert_eq!(randomkey(&mut db, &[]), Frame::Null);
+    }
+
+    #[test]
+    fn test_randomkey_nonempty() {
+        let mut db = setup_db_with_key(b"only", b"val");
+        match randomkey(&mut db, &[]) {
+            Frame::BulkString(k) => assert_eq!(k.as_ref(), b"only"),
+            _ => panic!("Expected BulkString"),
+        }
+    }
+
+    #[test]
+    fn test_touch() {
+        let mut db = setup_db_with_key(b"a", b"1");
+        db.set(
+            Bytes::from_static(b"b"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
+        let result = touch(&mut db, &[bs(b"a"), bs(b"b"), bs(b"missing")]);
+        assert_eq!(result, Frame::Integer(2));
+    }
+
+    #[test]
+    fn test_time() {
+        match time() {
+            Frame::Array(ref arr) => {
+                assert_eq!(arr.len(), 2);
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn test_flushdb() {
+        let mut db = setup_db_with_key(b"a", b"1");
+        db.set(
+            Bytes::from_static(b"b"),
+            Entry::new_string(Bytes::from_static(b"2")),
+        );
+        assert_eq!(db.len(), 2);
+        let result = flushdb(&mut db, &[]);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert_eq!(db.len(), 0);
     }
 }

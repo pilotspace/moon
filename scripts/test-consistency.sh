@@ -527,6 +527,22 @@ assert_both "GEODIST km" GEODIST edge:geo Palermo Catania km
 assert_both "GEOHASH" GEOHASH edge:geo Palermo
 assert_both "GEOADD count" GEOADD edge:geo 2.349014 48.864716 Paris
 
+# EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
+both SET edge:eat "val"
+assert_both "EXPIREAT" EXPIREAT edge:eat 9999999999
+assert_both "EXPIRETIME" EXPIRETIME edge:eat
+assert_both "PEXPIRETIME" PEXPIRETIME edge:eat
+assert_both "EXPIRETIME missing" EXPIRETIME edge:nokey
+assert_both "PEXPIRETIME missing" PEXPIRETIME edge:nokey
+
+# TOUCH
+both SET edge:touch "val"
+assert_both "TOUCH" TOUCH edge:touch
+assert_both "TOUCH missing" TOUCH edge:nomiss
+
+# FLUSHDB (run last — clears all keys)
+assert_both "FLUSHDB" FLUSHDB
+
 # ===========================================================================
 # Summary
 # ===========================================================================
