@@ -27,7 +27,7 @@ pub use cross_shard::{
     DEFAULT_CROSS_SHARD_DEPTH_LIMIT, TraversalShardResult, graph_has_hash_tag,
     handle_graph_traverse, parse_traverse_response,
 };
-pub use csr::CsrSegment;
+pub use csr::{CsrSegment, CsrStorage, MmapCsrSegment};
 pub use cypher::{CypherError, CypherQuery, is_read_only, parse_cypher};
 pub use hybrid::{
     FilterStrategy, GraphFilteredSearch, HybridError, HybridResult, VectorGuidedWalk,
