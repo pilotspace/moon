@@ -132,6 +132,53 @@ impl ShardDatabases {
         }
     }
 
+    /// Replay graph WAL commands into graph stores for all shards.
+    ///
+    /// Called after `recover_graph_stores` during startup. Reads per-shard
+    /// WAL files, filters graph commands via `GraphReplayCollector`, and
+    /// applies them to each shard's `GraphStore`.
+    #[cfg(feature = "graph")]
+    pub fn replay_graph_wal(&self, persistence_dir: &std::path::Path) {
+        use crate::persistence::replay::DispatchReplayEngine;
+        use crate::persistence::wal;
+
+        for shard_id in 0..self.num_shards {
+            let wal_file = wal::wal_path(persistence_dir, shard_id);
+            if !wal_file.exists() {
+                continue;
+            }
+            // Create a temporary engine to collect graph commands from the WAL.
+            let engine = DispatchReplayEngine::new();
+            // We need dummy databases for the KV replay path (graph commands
+            // are intercepted before KV dispatch, so these are unused).
+            let mut dummy_dbs: Vec<Database> = (0..self.db_count)
+                .map(|_| Database::new())
+                .collect();
+            match wal::replay_wal(&mut dummy_dbs, &wal_file, &engine) {
+                Ok(_) => {
+                    let graph_count = engine.graph_command_count();
+                    if graph_count > 0 {
+                        let mut gs = self.graph_stores[shard_id].write();
+                        let applied = engine.replay_graph_commands(&mut gs);
+                        tracing::info!(
+                            "Shard {}: replayed {} graph WAL commands ({} applied)",
+                            shard_id,
+                            graph_count,
+                            applied,
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Shard {}: graph WAL replay failed: {}",
+                        shard_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     /// Acquire a shared read lock on a specific database.
     #[inline]
     pub fn read_db(&self, shard_id: usize, db_index: usize) -> RwLockReadGuard<'_, Database> {
