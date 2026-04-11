@@ -103,6 +103,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         ctx.runtime_config.read().acllog_max_len,
         migrated_state,
     );
+    conn.refresh_acl_cache(&ctx.acl_table);
     let db_count = ctx.shard_databases.db_count();
 
     // Register in global client registry for CLIENT LIST/INFO/KILL.
@@ -453,6 +454,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // are inlined; remote keys fall through to normal cross-shard dispatch.
         // Skip inline dispatch when not conn.authenticated — AUTH must go through normal path.
         if conn.authenticated {
+            // Inline writes are safe when the user is unrestricted (ACL
+            // already cached), not inside MULTI, and tracking is off.
+            let can_inline_writes =
+                conn.cached_acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled;
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -462,6 +467,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &ctx.aof_tx,
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
+                can_inline_writes,
+                &ctx.runtime_config,
             );
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
@@ -534,6 +541,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if let Some(uname) = opt_user {
                             conn.authenticated = true;
                             conn.current_user = uname;
+                            conn.refresh_acl_cache(&ctx.acl_table);
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                 crate::auth_ratelimit::record_success(addr.ip());
                             }
@@ -572,6 +580,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                         if let Some(ref uname) = opt_user {
                             conn.current_user = uname.clone();
+                            conn.refresh_acl_cache(&ctx.acl_table);
                         }
                         // HELLO AUTH rate limiting
                         if matches!(&response, Frame::Error(_)) {
@@ -761,6 +770,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                 if let Some(uname) = opt_user {
                     conn.current_user = uname;
+                    conn.refresh_acl_cache(&ctx.acl_table);
                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                         crate::auth_ratelimit::record_success(addr.ip());
                     }
@@ -788,6 +798,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 if let Some(ref uname) = opt_user {
                     conn.current_user = uname.clone();
+                    conn.refresh_acl_cache(&ctx.acl_table);
                 }
                 if matches!(&response, Frame::Error(_)) {
                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
@@ -1258,7 +1269,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // === ACL permission check (NOPERM gate) ===
             // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
-            {
+            // Fast path: skip RwLock + HashMap probe for unrestricted users
+            // (default `on nopass ~* &* +@all`). Cached per-connection and
+            // re-resolved on AUTH/HELLO.
+            if !conn.cached_acl_unrestricted {
                 #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                 let acl_guard = ctx.acl_table.read().unwrap();
                 if let Some(deny_reason) =
@@ -1301,7 +1315,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                     continue;
                 }
-            }
+            } // !cached_acl_unrestricted
 
             // --- CLIENT admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE) ---
             // Placed AFTER ACL check so restricted users cannot access admin ops.

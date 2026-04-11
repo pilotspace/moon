@@ -49,8 +49,53 @@ impl Group {
         BitMask(_mm_movemask_epi8(cmp) as u16)
     }
 
-    /// Scalar fallback for non-x86_64 platforms (aarch64, etc.).
-    #[cfg(not(target_arch = "x86_64"))]
+    /// NEON path for aarch64: 16-way parallel byte comparison.
+    ///
+    /// Uses `vceqq_u8` for 16-way parallel comparison, then extracts a 16-bit
+    /// mask via the standard power-of-2 weight + horizontal add pattern.
+    ///
+    /// NEON is mandatory on all AArch64 CPUs (ARMv8-A baseline).
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn match_h2(&self, h2: u8) -> BitMask {
+        // SAFETY: NEON is mandatory on AArch64; Group is 16-byte aligned.
+        unsafe {
+            use core::arch::aarch64::vdupq_n_u8;
+            Self::neon_match_eq(self.0.as_ptr(), vdupq_n_u8(h2))
+        }
+    }
+
+    /// Shared NEON helper: given a comparison result vector (0xFF where matched,
+    /// 0x00 where not), extract a 16-bit mask with one bit per lane.
+    ///
+    /// Technique: AND the comparison result with power-of-2 weights
+    /// `[1,2,4,8,16,32,64,128]` for each 8-byte half, then horizontal-add each
+    /// half into a single byte.  The two bytes form the 16-bit mask.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn neon_match_eq(ptr: *const u8, needle: core::arch::aarch64::uint8x16_t) -> BitMask {
+        use core::arch::aarch64::*;
+        let ctrl = vld1q_u8(ptr);
+        let cmp = vceqq_u8(ctrl, needle); // 0xFF per matching byte
+        Self::neon_bitmask_from_cmp(cmp)
+    }
+
+    /// Convert a NEON comparison result (0xFF / 0x00 per byte) to a 16-bit mask.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn neon_bitmask_from_cmp(cmp: core::arch::aarch64::uint8x16_t) -> BitMask {
+        use core::arch::aarch64::*;
+        // Power-of-2 weights: bit i within each 8-byte half
+        const POWERS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let powers = vld1q_u8(POWERS.as_ptr());
+        let masked = vandq_u8(cmp, powers);
+        let lo = vaddv_u8(vget_low_u8(masked)) as u16;
+        let hi = vaddv_u8(vget_high_u8(masked)) as u16;
+        BitMask(lo | (hi << 8))
+    }
+
+    /// Scalar fallback for platforms without SIMD (neither x86_64 nor aarch64).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn match_h2(&self, h2: u8) -> BitMask {
         let mut mask = 0u16;
@@ -93,8 +138,26 @@ impl Group {
         BitMask(_mm_movemask_epi8(ctrl) as u16)
     }
 
+    /// NEON path: find empty or deleted slots (bit 7 set).
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn match_empty_or_deleted(&self) -> BitMask {
+        // SAFETY: NEON is mandatory on AArch64; Group is 16-byte aligned.
+        unsafe {
+            use core::arch::aarch64::*;
+            let ctrl = vld1q_u8(self.0.as_ptr());
+            // Shift right by 7: EMPTY (0xFF) and DELETED (0x80) both have bit 7
+            // set, so after >>7 they become 0x01. FULL (0x00..0x7F) becomes 0x00.
+            // Then compare with 1 to get 0xFF for matches.
+            let shifted = vshrq_n_u8(ctrl, 7);
+            let ones = vdupq_n_u8(1);
+            let cmp = vceqq_u8(shifted, ones);
+            Self::neon_bitmask_from_cmp(cmp)
+        }
+    }
+
     /// Scalar fallback: find empty or deleted slots.
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn match_empty_or_deleted(&self) -> BitMask {
         let mut mask = 0u16;

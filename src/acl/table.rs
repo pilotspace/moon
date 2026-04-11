@@ -312,6 +312,15 @@ impl AclTable {
         }
     }
 
+    /// Return `true` if the named user exists and has no restrictions at all
+    /// (enabled + AllAllowed + `~*` rw + `&*`). Used by the connection handler
+    /// to cache the unrestricted flag per-connection, avoiding the RwLock +
+    /// HashMap probe on every command for the common case (default user).
+    #[inline]
+    pub fn is_user_unrestricted(&self, username: &str) -> bool {
+        self.users.get(username).is_some_and(|u| u.unrestricted())
+    }
+
     /// Check if the command is allowed for the user.
     /// Returns None if allowed, Some(reason) if denied.
     pub fn check_command_permission(

@@ -158,6 +158,12 @@ pub(crate) struct ConnectionState {
     pub asking: bool,
     pub acl_log: AclLog,
 
+    /// Cached per-connection: true when the current user has no ACL
+    /// restrictions at all (default `on nopass ~* &* +@all`).  Checked on
+    /// the command hot-path to skip the RwLock + HashMap probe on
+    /// `AclTable` for unrestricted users.  Re-resolved on AUTH / HELLO.
+    pub cached_acl_unrestricted: bool,
+
     // Pub/Sub
     pub subscription_count: usize,
     pub subscriber_id: u64,
@@ -221,7 +227,19 @@ impl ConnectionState {
                 None
             },
             migration_target: None,
+            cached_acl_unrestricted: false,
         }
+    }
+
+    /// Resolve and cache the unrestricted flag from the AclTable.
+    /// Called once on connection init and after AUTH / HELLO.
+    #[inline]
+    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+    pub fn refresh_acl_cache(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
+        self.cached_acl_unrestricted = acl_table
+            .read()
+            .unwrap()
+            .is_user_unrestricted(&self.current_user);
     }
 }
 
