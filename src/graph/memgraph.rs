@@ -176,6 +176,11 @@ impl MemGraph {
         self.nodes.get(key)
     }
 
+    /// O(1) mutable node lookup by key.
+    pub fn get_node_mut(&mut self, key: NodeKey) -> Option<&mut MutableNode> {
+        self.nodes.get_mut(key)
+    }
+
     /// O(1) edge lookup by key.
     pub fn get_edge(&self, key: EdgeKey) -> Option<&MutableEdge> {
         self.edges.get(key)

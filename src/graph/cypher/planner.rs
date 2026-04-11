@@ -63,6 +63,12 @@ pub enum PhysicalOp {
     },
     /// Unwind a list into rows.
     Unwind { expr: Expr, alias: String },
+    /// MERGE: match-or-create pattern with conditional SET.
+    Merge {
+        pattern: Pattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+    },
 }
 
 /// Error during plan compilation.
@@ -279,10 +285,12 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                     items: s.items.clone(),
                 });
             }
-            Clause::Merge(_) => {
-                // MERGE is complex: pattern match + conditional create.
-                // For now, emit a basic pattern.
-                return Err(PlanError::Unsupported("MERGE not yet compiled".to_string()));
+            Clause::Merge(m) => {
+                ops.push(PhysicalOp::Merge {
+                    pattern: m.pattern.clone(),
+                    on_create: m.on_create.clone(),
+                    on_match: m.on_match.clone(),
+                });
             }
             Clause::With(w) => {
                 ops.push(PhysicalOp::Project {
@@ -449,6 +457,20 @@ mod tests {
             plan.operators
                 .iter()
                 .any(|op| matches!(op, PhysicalOp::ProcedureCall { .. }))
+        );
+    }
+
+    #[test]
+    fn test_compile_merge() {
+        let query =
+            parse_cypher(b"MERGE (n:Person {name: 'Alice'}) RETURN n").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Merge { .. })),
+            "expected Merge operator in plan, got: {:?}",
+            plan.operators
         );
     }
 
