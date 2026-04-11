@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Graph Engine Integration (v0.1.4, 2026-04-11)
+
+- **Property graph engine** (`src/graph/`, feature-gated under `graph`): segment-aligned CSR storage with SlotMap generational indices, ArcSwap lock-free reads, Roaring validity bitmaps, and Rabbit Order compaction for cache locality. 8,500+ LOC, 319 tests.
+- **12 GRAPH.\* commands**: CREATE, ADDNODE, ADDEDGE, NEIGHBORS, QUERY, RO_QUERY, EXPLAIN, VSEARCH, HYBRID, INFO, LIST, DELETE — all with RESP3 Map responses and ACL annotations.
+- **Cypher subset parser**: hand-rolled recursive descent with logos lexer, 12 clauses (MATCH/WHERE/RETURN/CREATE/DELETE/SET/MERGE/WITH/UNWIND/CALL/ORDER/LIMIT), parameterized queries ($param), nesting depth limit (64), plan caching.
+- **Hybrid graph+vector queries**: graph-filtered vector search, vector-to-graph expansion, vector-guided walk with automatic strategy selection.
+- **Traversal engine**: BFS/DFS/Dijkstra with bounded frontiers (100K cap), temporal decay + distance scoring, segment merge reader across mutable + immutable segments.
+- **Graph indexes**: per-label/type Roaring bitmaps, boomphf minimal perfect hash (~3 bits/key), property B-tree for range queries.
+- **Cross-shard traversal**: scatter-gather via SPSC mesh, graph hash tags for shard co-location, snapshot-LSN forwarding, configurable depth limit.
+- **Graph MVCC**: extends existing TransactionManager with graph write intents, snapshot-isolated multi-hop traversal, bounded epoch hold (30s).
+- **Graph WAL durability**: RESP-encoded graph commands in per-shard WAL, two-pass replay (nodes before edges), CRC32-validated CSR segment persistence.
+- **Cost-based planner**: GraphStats with incremental degree tracking, graph-first vs vector-first strategy selection, P99 hub detection.
+- **Criterion benchmarks**: CSR 1-hop 923ps, edge insert 44ns, 2-hop BFS 7.15µs, CSR freeze 5.23ms.
+- **New dependencies**: `slotmap` 1.x (generational indices), `boomphf` 0.6 (MPH), `logos` 0.14 (Cypher lexer, optional).
+
 ### Fixed — Wave 0-4 Gap Closure (2026-04-09)
 
 - **ZREVRANGEBYSCORE/ZREVRANGEBYLEX correctness bug:** Fixed double-swap of min/max bounds in `zrange_by_score` and `zrange_by_lex` that caused empty results for finite score ranges (e.g., `ZREVRANGEBYSCORE key 3 1`). Added finite-range test to `test-commands.sh`.
