@@ -58,11 +58,8 @@ impl Group {
     #[cfg(target_arch = "aarch64")]
     #[inline]
     pub fn match_h2(&self, h2: u8) -> BitMask {
-        // SAFETY: `self.0.as_ptr()` is valid for 16 bytes (Group is [u8; 16]).
-        // `vdupq_n_u8` and all downstream NEON intrinsics are safe to invoke
-        // on AArch64 (NEON is mandatory in ARMv8-A); they require `unsafe` in
-        // Rust only because `core::arch` intrinsics are unconditionally unsafe.
-        // `vld1q_u8` has no alignment requirement (unlike SSE2 _mm_load_si128).
+        // SAFETY: `self.0.as_ptr()` valid for 16 bytes; NEON mandatory on AArch64;
+        // `vld1q_u8` has no alignment requirement (unlike SSE2 `_mm_load_si128`).
         unsafe {
             use core::arch::aarch64::*;
             let ctrl = vld1q_u8(self.0.as_ptr());
@@ -80,10 +77,8 @@ impl Group {
     #[cfg(target_arch = "aarch64")]
     #[inline]
     fn neon_bitmask_from_cmp(cmp: core::arch::aarch64::uint8x16_t) -> BitMask {
-        // SAFETY: All NEON intrinsics here operate on register-width vector
-        // types (no pointers, no memory access).  POWERS is a const array
-        // whose `.as_ptr()` is valid for 16 bytes for the lifetime of this
-        // function.  NEON is mandatory on AArch64.
+        // SAFETY: NEON intrinsics on register-width vectors (no raw ptrs);
+        // POWERS `.as_ptr()` valid for 16 bytes; NEON mandatory on AArch64.
         unsafe {
             use core::arch::aarch64::*;
             const POWERS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
@@ -147,10 +142,8 @@ impl Group {
     #[cfg(target_arch = "aarch64")]
     #[inline]
     pub fn match_empty_or_deleted(&self) -> BitMask {
-        // SAFETY: `self.0.as_ptr()` is valid for 16 bytes (Group is [u8; 16]).
-        // `vld1q_u8` has no alignment requirement.  All NEON intrinsics are
-        // safe on AArch64 (mandatory in ARMv8-A); `unsafe` is only required
-        // because `core::arch` marks them unconditionally unsafe.
+        // SAFETY: `self.0.as_ptr()` valid for 16 bytes; `vld1q_u8` no alignment
+        // requirement; NEON mandatory on AArch64 (ARMv8-A baseline).
         unsafe {
             use core::arch::aarch64::*;
             let ctrl = vld1q_u8(self.0.as_ptr());
