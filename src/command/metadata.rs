@@ -399,6 +399,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "GRAPH.EXPLAIN" => CommandMeta { name: "GRAPH.EXPLAIN", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.VSEARCH" => CommandMeta { name: "GRAPH.VSEARCH", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
     "GRAPH.HYBRID" => CommandMeta { name: "GRAPH.HYBRID", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
+    "GRAPH.PROFILE" => CommandMeta { name: "GRAPH.PROFILE", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
 };
 
 // ---------------------------------------------------------------------------

@@ -410,6 +410,89 @@ pub fn graph_explain(store: &GraphStore, args: &[Frame]) -> Frame {
     Frame::BulkString(Bytes::from(output))
 }
 
+/// GRAPH.PROFILE <graph> <cypher_string>
+///
+/// Execute query with per-operator timing. Returns `[results, operator_profiles]`.
+pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'GRAPH.PROFILE' command",
+        ));
+    }
+
+    let graph_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+    };
+
+    let graph = match store.get_graph(graph_name) {
+        Some(g) => g,
+        None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+    };
+
+    let cypher_bytes = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+    };
+
+    let query = match cypher::parse_cypher(cypher_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let msg = format!("ERR Cypher parse error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let plan = match cypher::planner::compile(&query) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("ERR Cypher plan error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    let params = std::collections::HashMap::new();
+    let profile = match cypher::executor::execute_profile(graph, &plan, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("ERR Cypher execution error: {e}");
+            return Frame::Error(Bytes::from(msg));
+        }
+    };
+
+    profile_result_to_frame(&profile)
+}
+
+/// Convert a `ProfileResult` to a RESP3 Frame.
+///
+/// Format: Array [
+///   exec_result_frame,       // same format as GRAPH.QUERY
+///   Array [                  // per-operator profiles
+///     Array [name, row_count, duration_us],
+///     ...
+///   ]
+/// ]
+fn profile_result_to_frame(profile: &cypher::executor::ProfileResult) -> Frame {
+    let result_frame = exec_result_to_frame(&profile.exec_result);
+
+    let op_frames: Vec<Frame> = profile
+        .operator_profiles
+        .iter()
+        .map(|op| {
+            Frame::Array(
+                vec![
+                    Frame::BulkString(Bytes::from(op.name)),
+                    Frame::Integer(op.row_count as i64),
+                    Frame::Integer(op.duration_us as i64),
+                ]
+                .into(),
+            )
+        })
+        .collect();
+
+    Frame::Array(vec![result_frame, Frame::Array(op_frames.into())].into())
+}
+
 /// Convert an `ExecResult` to a RESP3 Frame.
 ///
 /// Format: Array [
@@ -691,6 +774,7 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
 ///   FILTER <start_id> <hops> <k> <vector> — graph-filtered vector search (HYB-01)
 ///   EXPAND <k> <expansion_hops> <vector> — vector-to-graph expansion (HYB-02)
 ///   WALK <start_id> <max_depth> <beam_width> <min_sim> <vector> — vector-guided walk (HYB-03)
+///   RERANK <ref_node_id> <max_hops> <alpha> <k> <vector> — graph-constrained re-ranking (HYB-04)
 pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
@@ -785,9 +869,44 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
+    } else if mode.eq_ignore_ascii_case(b"RERANK") {
+        // GRAPH.HYBRID g RERANK <ref_node_id> <max_hops> <alpha> <k> <vector>
+        if args.len() < 7 {
+            return Frame::Error(Bytes::from_static(
+                b"ERR RERANK requires: ref_node_id max_hops alpha k vector",
+            ));
+        }
+        let ref_id = match parse_u64(&args[2]) {
+            Some(id) => id,
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid ref node ID")),
+        };
+        let max_hops = match parse_u32(&args[3]) {
+            Some(h) if h > 0 && h <= 10 => h,
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid max_hops (1..10)")),
+        };
+        let alpha = match parse_f64(&args[4]) {
+            Some(a) => a.clamp(0.0, 1.0),
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid alpha")),
+        };
+        let k = match parse_u32(&args[5]) {
+            Some(k) if k > 0 => k as usize,
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid k")),
+        };
+        let query_vector = match extract_f32_vector(&args[6]) {
+            Some(v) if !v.is_empty() => v,
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid vector")),
+        };
+
+        let node_key = super::graph_write::external_id_to_node_key(ref_id);
+        let reranker =
+            crate::graph::hybrid::GraphConstrainedReRanker::new(node_key, max_hops, alpha, query_vector, k);
+        match reranker.execute(memgraph, lsn) {
+            Ok(results) => hybrid_results_to_frame(&results),
+            Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
+        }
     } else {
         Frame::Error(Bytes::from_static(
-            b"ERR unknown GRAPH.HYBRID mode (supported: FILTER, WALK)",
+            b"ERR unknown GRAPH.HYBRID mode (supported: FILTER, WALK, RERANK)",
         ))
     }
 }
