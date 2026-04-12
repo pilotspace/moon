@@ -95,6 +95,11 @@ impl ConsoleGateway {
         }
     }
 
+    /// Number of shards this gateway fans out to.
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+
     /// Execute a command by name and arguments.
     ///
     /// Builds a RESP Frame, determines the target shard from the first key argument
