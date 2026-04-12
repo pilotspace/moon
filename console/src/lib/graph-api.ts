@@ -1,9 +1,20 @@
 import { execCommand } from "@/lib/api";
 import type { GraphInfo, GraphData, GraphNode, GraphEdge } from "@/types/graph";
 
+/** Get the list of available graph names */
+export async function fetchGraphList(): Promise<string[]> {
+  const result = await execCommand("GRAPH.LIST", []);
+  if (Array.isArray(result)) return result.map(String);
+  return [];
+}
+
 /** Fetch graph metadata via GRAPH.INFO */
 export async function fetchGraphInfo(): Promise<GraphInfo> {
-  const result = await execCommand("GRAPH.INFO", []);
+  // Auto-detect graph name from GRAPH.LIST
+  const graphs = await fetchGraphList();
+  const graphName = graphs[0];
+  if (!graphName) return { nodeCount: 0, edgeCount: 0, labelCounts: {}, relTypeCounts: {} };
+  const result = await execCommand("GRAPH.INFO", [graphName]);
   // GRAPH.INFO returns flat key-value pairs
   const map = new Map<string, unknown>();
   if (Array.isArray(result)) {
@@ -37,7 +48,10 @@ function parseCounts(raw: unknown): Record<string, number> {
 
 /** Execute a Cypher query and parse results into GraphData */
 export async function queryGraph(cypher: string): Promise<GraphData> {
-  const result = await execCommand("GRAPH.QUERY", [cypher]);
+  // Auto-detect graph name from GRAPH.LIST
+  const graphs = await fetchGraphList();
+  const graphName = graphs[0] ?? "default";
+  const result = await execCommand("GRAPH.QUERY", [graphName, cypher]);
   return parseGraphResult(result);
 }
 
@@ -54,14 +68,37 @@ function parseGraphResult(result: unknown): GraphData {
   if (!Array.isArray(result) || result.length < 2)
     return { nodes: [], edges: [] };
 
-  // Skip headers (result[0]) and stats (last element)
-  const rows = result.slice(1, -1);
+  // Skip headers (result[0]) and stats (last element which is a string).
+  // Moon returns: [headers, [[row1], [row2], ...], stats_string]
+  // Each row is an array of cells (strings, arrays, or objects).
+  const body = result.slice(1, -1);
 
-  for (const row of rows) {
-    if (!Array.isArray(row)) continue;
-    for (const cell of row) {
-      if (!Array.isArray(cell) && typeof cell !== "object") continue;
-      parseCell(cell, nodeMap, edgeMap);
+  for (const rowsOrRow of body) {
+    if (!Array.isArray(rowsOrRow)) continue;
+    // Check if this is a nested array of rows or a single row
+    const rows = Array.isArray(rowsOrRow[0]) ? rowsOrRow : [rowsOrRow];
+    for (const row of rows) {
+      if (!Array.isArray(row)) continue;
+      for (const cell of row) {
+        parseCell(cell, nodeMap, edgeMap);
+      }
+      // If row has 3 cells like [node, edge/null, node], create an edge
+      if (row.length === 3) {
+        const srcId = typeof row[0] === "string" ? row[0] : null;
+        const dstId = typeof row[2] === "string" ? row[2] : null;
+        if (srcId?.startsWith("node:") && dstId?.startsWith("node:")) {
+          const edgeId = `${srcId}->${dstId}`;
+          if (!edgeMap.has(edgeId)) {
+            edgeMap.set(edgeId, {
+              id: edgeId,
+              source: srcId,
+              target: dstId,
+              type: row[1] != null ? String(row[1]) : "RELATES_TO",
+              properties: {},
+            });
+          }
+        }
+      }
     }
   }
 
@@ -76,6 +113,19 @@ function parseCell(
   nodeMap: Map<string, GraphNode>,
   edgeMap: Map<string, GraphEdge>,
 ): void {
+  // Moon returns node references as "node:XXX" strings. Extract as node.
+  if (typeof cell === "string" && cell.startsWith("node:")) {
+    const id = cell;
+    if (!nodeMap.has(id)) {
+      nodeMap.set(id, {
+        id,
+        labels: [],
+        properties: { id: cell.replace("node:", "") },
+        x: 0, y: 0, z: 0,
+      });
+    }
+    return;
+  }
   if (!cell || typeof cell !== "object") return;
 
   // Array-encoded node: [id, labels[], properties{}]

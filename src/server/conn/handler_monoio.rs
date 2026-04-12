@@ -1740,6 +1740,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         responses.push(response);
                         continue;
                     }
+                    if cmd.eq_ignore_ascii_case(b"FT._LIST") {
+                        let response = {
+                            let vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                            crate::command::vector_search::ft_list(&vs)
+                        };
+                        responses.push(response);
+                        continue;
+                    }
                     if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                         let response = {
                             let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
@@ -1764,6 +1772,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::command::vector_search::ft_dropindex(&mut vs, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                             crate::command::vector_search::ft_info(&vs, cmd_args)
+                        } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
+                            crate::command::vector_search::ft_list(&vs)
                         } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                             crate::command::vector_search::ft_compact(&mut vs, cmd_args)
                         } else {

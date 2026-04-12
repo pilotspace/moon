@@ -9,7 +9,7 @@ use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use smallvec::SmallVec;
 
-use crate::protocol::Frame;
+use crate::protocol::{Frame, FrameVec};
 use crate::vector::filter::FilterExpr;
 use crate::vector::store::{IndexMeta, VectorStore};
 use crate::vector::turbo_quant::collection::QuantizationConfig;
@@ -293,6 +293,19 @@ pub fn ft_compact(store: &mut VectorStore, args: &[Frame]) -> Frame {
     // leaving all vectors in brute-force mutable segment (O(n) search instead of HNSW O(log n)).
     idx.force_compact();
     Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// FT._LIST
+///
+/// Returns an array of all index names. Compatible with the Redis
+/// `FT._LIST` internal command used by tools and the Moon Console.
+pub fn ft_list(store: &VectorStore) -> Frame {
+    let names = store.index_names();
+    let elements: Vec<Frame> = names
+        .into_iter()
+        .map(|n| Frame::BulkString(n.clone()))
+        .collect();
+    Frame::Array(FrameVec::from_vec(elements))
 }
 
 /// FT.INFO index_name

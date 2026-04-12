@@ -211,6 +211,31 @@ pub(crate) fn handle_shard_message_shared(
                     }
                 };
 
+                // FT.* commands route to VectorStore, not the KV Database.
+                // Intercept before cmd_dispatch so the console gateway's
+                // ShardMessage::Execute path reaches the vector handlers.
+                if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
+                    let frame = dispatch_vector_command(vector_store, &command);
+                    let _ = reply_tx.send(frame);
+                    return;
+                }
+
+                // GRAPH.* commands route to GraphStore.
+                #[cfg(feature = "graph")]
+                if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
+                    let (frame, wal_records) = {
+                        let mut gs = shard_databases.graph_store_write(shard_id);
+                        let resp = crate::command::graph::dispatch_graph_command(&mut gs, &command);
+                        let records = gs.drain_wal();
+                        (resp, records)
+                    };
+                    for record in wal_records {
+                        shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
+                    }
+                    let _ = reply_tx.send(frame);
+                    return;
+                }
+
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
                 if is_write {
@@ -942,6 +967,8 @@ pub(crate) fn dispatch_vector_command(
         vector_search::ft_dropindex(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
         vector_search::ft_info(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
+        vector_search::ft_list(vector_store)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
         vector_search::ft_compact(vector_store, args)
     } else {

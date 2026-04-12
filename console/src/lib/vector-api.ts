@@ -18,13 +18,16 @@ export async function fetchIndexInfo(
       map.set(String(result[i]).toLowerCase(), result[i + 1]);
     }
   }
+  // Server key is "dimension" (singular), not "dimensions".
+  const efRaw = map.get("ef_runtime");
+  const efValue = efRaw === "auto" || efRaw == null ? 0 : Number(efRaw);
   return {
     name: indexName,
-    dimensions: Number(map.get("dimensions") ?? 0),
+    dimensions: Number(map.get("dimension") ?? map.get("dimensions") ?? 0),
     metric: String(map.get("distance_metric") ?? "COSINE"),
     num_docs: Number(map.get("num_docs") ?? 0),
     segments: parseSegments(map.get("segments")),
-    ef_runtime: Number(map.get("ef_runtime") ?? 200),
+    ef_runtime: Number.isNaN(efValue) ? 0 : efValue,
     compact_threshold: Number(map.get("compact_threshold") ?? 10000),
   };
 }
