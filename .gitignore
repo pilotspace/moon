@@ -82,3 +82,5 @@ libnull.rlib
 fuzz
 shard-*/
 .serena/
+console/tsconfig.app.tsbuildinfo
+console/tsconfig.node.tsbuildinfo

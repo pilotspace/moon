@@ -75,6 +75,11 @@ async fn start_server() -> (u16, CancellationToken) {
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     tokio::spawn(async move {
@@ -147,6 +152,11 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     tokio::spawn(async move {
@@ -1291,6 +1301,11 @@ async fn start_server_with_persistence(
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     tokio::spawn(async move {
@@ -2147,6 +2162,11 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     tokio::spawn(async move {
@@ -2530,6 +2550,11 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     let cancel = token.clone();
@@ -3682,6 +3707,11 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     std::thread::spawn(move || {
@@ -4316,6 +4346,11 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
+        console_auth_required: false,
+        console_auth_secret: String::new(),
+        console_cors_origin: vec![],
+        console_rate_limit: 1000.0,
+        console_rate_burst: 2000.0,
     };
 
     tokio::spawn(async move {

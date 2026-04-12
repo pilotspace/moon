@@ -6,23 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — Connection counter double-decrement (2026-04-12)
+## [0.1.5] — 2026-04-12
 
-- **monoio handler: `maxclients reached` after first disconnect.** `handle_connection_sharded_monoio` called `record_connection_closed()` unconditionally at its exit, while the caller (`conn_accept.rs`) also called it in the non-migration branch. The `AtomicU64` counter wrapped to `u64::MAX` on the second `fetch_sub`, causing every subsequent `try_accept_connection` to reject against `maxclients`. Removed the handler-level decrement to restore symmetry with the `try_accept_connection` increment owned by the caller. Verified: 10 sequential SETs now succeed; `redis-benchmark SET p=16 c=50` reports real throughput (1.25M+ req/s) instead of rejection errors.
+### Added — Moon Console (Interactive Data Client)
 
-### Performance — PR #43 Recovery (2026-04-12)
+- **HTTP/WebSocket gateway** (`src/admin/`): REST endpoints (`/api/v1/info`, `/api/v1/command`, `/api/v1/keys`, `/api/v1/key/*`, `/api/v1/memory/treemap`, `/api/v1/hnsw/trace`), WebSocket-to-RESP3 bridge at `/ws/console`, SSE metrics stream at `/sse/metrics` (1 Hz), CORS allowlist, per-IP token-bucket rate limit, HMAC-SHA256 Bearer auth, HTTP/2 support, static file serving via `rust-embed`.
+- **React 19 console** (`console/`): 7-view SPA (Dashboard, Browser, Console, Vector Explorer, Graph Explorer, Memory, Help) served at `/ui/`. 50.9 KB gzipped initial bundle (6× under 300 KB target) via Vite 8 + manual chunk splitting (Three.js/Monaco/Recharts lazy).
+- **Real-time Dashboard**: 7 widgets (QPS, latency P50/P99, memory, clients, ops by type, keyspace) driven by SSE stream.
+- **KV Data Browser**: namespace tree, virtual-scrolled key list (TanStack Virtual), type-specific editors for Strings/Hashes/Lists/Sets/Sorted Sets/Streams, TTL display + edit, bulk delete with toasts.
+- **Query Console**: Monaco editor with RESP + Cypher Monarch syntax, 233-command auto-complete, multi-tab, history, Cmd+Enter (current line) / Cmd+Shift+Enter (whole buffer), line-by-line execution for paste safety.
+- **Vector 3D Explorer**: UMAP projection in a web worker, HNSW layer overlay, KNN search with distance rings, lasso selection, Three.js r183 + React Three Fiber.
+- **Graph 3D Explorer**: force-directed layout (d3-force-3d worker), Cypher editor, node/edge property inspector, hybrid query integration.
+- **Memory view**: keyspace treemap (server-aggregated `/api/v1/memory/treemap`), slowlog table, command stats.
+- **Built-in Help guide**: 427-line Getting Started tutorial with seed examples.
+- **Core admin commands** (`src/command/server_admin.rs`): FLUSHALL, FLUSHDB, DBSIZE, DEBUG OBJECT/SLEEP/JMAP, MEMORY USAGE — closing pre-existing dispatch gaps.
+- **Multi-shard SCAN fan-out** (`src/admin/scan_fanout.rs`): composite cursor `{shard_id}:{cursor}` so Browser sees unified keyspace.
+- **Frontend test infrastructure**: 56 Vitest unit tests + 9 Playwright E2E specs. New `scripts/test-integration.sh` harness and `.github/workflows/console-integration.yml`.
+- **Admin-port hardening** (`src/admin/{auth,cors,rate_limit,middleware}.rs`): Bearer auth, CORS allowlist, per-IP rate limit.
 
-Measured on aarch64 Linux (OrbStack moon-dev, 1 shard, 50 clients, `redis-benchmark` 8.0.2):
+### Fixed
 
-- **SET p=16: +34.4% avg, +48% peak** (2.34M → 3.15M rps) — primary target hit
-- **SET p=1: -2.5% median** (within run-to-run noise)
-- **GET p=16: +4.0%** — NEON SIMD bonus on reads
+- **WebSocket request ID echo**: errors now echo back the client's `id`, preventing client-side promise timeouts on malformed input.
+- **Console type badges**: `execCommand` response was returning the full `{result, type}` envelope; now unwraps `.result` correctly.
+- **Multi-line paste in Console**: Cmd+Enter now executes the current line only (redis-cli paste behavior). Cmd+Shift+Enter executes the whole buffer line-by-line.
 
-Three optimisation tracks:
+### Validation
 
-- **ACL caching**: per-connection `cached_acl_unrestricted` flag skips RwLock + HashMap SipHash probe on every command for unrestricted users.
-- **Inline SET dispatch**: extend `try_inline_dispatch` to handle plain `SET key value` from raw RESP bytes, bypassing Frame construction/drop. Handles eviction + AOF. Zero-copy key/value via `read_buf.split_to(consumed).freeze() + slice()`.
-- **NEON SIMD for DashTable**: AArch64 NEON path for `Group::match_h2` (1.39× scalar) and `match_empty_or_deleted` (7.68× scalar). Microbench: `cargo bench --bench simd_probe`.
+- 101+ Rust unit/integration tests pass on both `runtime-tokio` and `runtime-monoio`.
+- 56 Vitest tests + 9 Playwright specs pass.
+- Zero clippy warnings (default + `runtime-tokio,jemalloc` feature sets).
+- `cargo fmt --check` clean.
+- 8 fuzz targets in CI.
+
+## [0.1.4] — 2026-04-11
 
 ### Added — Graph Engine Integration (v0.1.4, 2026-04-11)
 

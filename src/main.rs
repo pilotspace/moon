@@ -126,8 +126,66 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // ── Admin/console hardening (HARD-01/02/03, Phase 137) ──────────
+    // Build the auth + CORS policies BEFORE the admin listener binds so
+    // misconfiguration (wildcard CORS + auth required, empty secret) fails
+    // fast and never opens a port that would satisfy probes while silently
+    // accepting unauthenticated requests.
+    //
+    // The rate limiter is constructed inside the admin runtime (its
+    // cleanup task needs `tokio::spawn`); we thread the raw rps/burst
+    // through to `spawn_admin_server`.
+    #[cfg(feature = "console")]
+    let (console_auth, console_cors) = {
+        let auth_policy = if config.console_auth_required {
+            let secret = if config.console_auth_secret.is_empty() {
+                // Operator did not supply a secret: generate an ephemeral
+                // 32-byte secret and warn that issued tokens won't survive
+                // restart.
+                let bytes: [u8; 32] = rand::random();
+                use base64::Engine;
+                let s = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+                tracing::warn!(
+                    "--console-auth-required set without --console-auth-secret; \
+                     generated ephemeral secret (tokens will not survive restart). \
+                     Set --console-auth-secret=... for reproducible deploys."
+                );
+                s
+            } else {
+                config.console_auth_secret.clone()
+            };
+            match moon::admin::auth::AuthPolicy::enabled(secret.as_bytes()) {
+                Ok(p) => std::sync::Arc::new(p),
+                Err(e) => return Err(anyhow::anyhow!("--console-auth-secret: {}", e)),
+            }
+        } else {
+            std::sync::Arc::new(moon::admin::auth::AuthPolicy::disabled())
+        };
+
+        let cors_policy = match moon::admin::cors::CorsPolicy::new(
+            &config.console_cors_origin,
+            config.console_auth_required,
+        ) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        };
+
+        (auth_policy, cors_policy)
+    };
+
     // Initialize Prometheus metrics exporter (if admin_port > 0)
-    let readiness_flag = moon::admin::metrics_setup::init_metrics(config.admin_port, &config.bind);
+    let readiness_flag = moon::admin::metrics_setup::init_metrics(
+        config.admin_port,
+        &config.bind,
+        #[cfg(feature = "console")]
+        console_auth,
+        #[cfg(feature = "console")]
+        console_cors,
+        #[cfg(feature = "console")]
+        config.console_rate_limit,
+        #[cfg(feature = "console")]
+        config.console_rate_burst,
+    );
 
     // Initialize global slowlog with user-configured thresholds
     moon::admin::metrics_setup::init_global_slowlog(
@@ -244,6 +302,25 @@ fn main() -> anyhow::Result<()> {
 
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
+
+    // Create admin SPSC channels for the console gateway (one per shard).
+    #[cfg(feature = "console")]
+    let mut admin_consumers = {
+        let (admin_producers, admin_consumers) =
+            moon::shard::mesh::create_admin_channels(num_shards, CHANNEL_BUFFER_SIZE);
+        let gateway = std::sync::Arc::new(moon::admin::console_gateway::ConsoleGateway::new(
+            admin_producers,
+            all_notifiers.clone(),
+        ));
+        if moon::admin::console_gateway::set_global_gateway(gateway).is_err() {
+            panic!("console gateway initialized twice — bootstrap bug");
+        }
+        tracing::info!(
+            "Console gateway initialized with {} shard channels",
+            num_shards
+        );
+        admin_consumers
+    };
 
     // Pre-create shared pubsub registries for cross-shard introspection reads.
     let all_pubsub_registries: Vec<
@@ -423,7 +500,17 @@ fn main() -> anyhow::Result<()> {
     let config_port = config.port;
     for (id, mut shard) in shards.into_iter().enumerate() {
         let producers = mesh.take_producers(id);
-        let consumers = mesh.take_consumers(id);
+        #[allow(unused_mut)]
+        let mut consumers = mesh.take_consumers(id);
+        // Append admin consumer for this shard (console gateway -> shard SPSC).
+        #[cfg(feature = "console")]
+        {
+            let admin_cons = std::mem::replace(&mut admin_consumers[id], {
+                use ringbuf::traits::Split;
+                ringbuf::HeapRb::new(1).split().1
+            });
+            consumers.push(admin_cons);
+        }
         let conn_rx = mesh.take_conn_rx(id);
         let shard_cancel = cancel_token.clone();
         let shard_aof_tx = aof_tx.clone();

@@ -115,12 +115,16 @@ jobs:
       - name: Generate SBOMs
         run: |
           # Per-variant SBOMs so each binary has an accurate dependency graph.
+          # cargo-cyclonedx writes to <override-filename>.cdx.json in the manifest dir.
           cargo cyclonedx --format json --no-default-features --features runtime-tokio,jemalloc \
-            --output-file artifacts/moon-sbom-tokio.json
+            --override-filename moon-sbom-tokio
           cargo cyclonedx --format json --no-default-features --features runtime-monoio,jemalloc \
-            --output-file artifacts/moon-sbom-monoio.json
+            --override-filename moon-sbom-monoio
           # Combined superset SBOM for convenience (covers all variants).
-          cargo cyclonedx --format json --output-file artifacts/moon-sbom.json
+          cargo cyclonedx --format json --override-filename moon-sbom
+          mv moon-sbom-tokio.cdx.json artifacts/moon-sbom-tokio.json
+          mv moon-sbom-monoio.cdx.json artifacts/moon-sbom-monoio.json
+          mv moon-sbom.cdx.json artifacts/moon-sbom.json
 
       - name: Generate checksums
         run: |

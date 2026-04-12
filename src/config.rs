@@ -18,6 +18,40 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 0)]
     pub admin_port: u16,
 
+    // ── Admin/console hardening (HARD-01/02/03, Phase 137) ──────────
+    /// Require Bearer/HMAC auth on the admin/console HTTP port.
+    /// When set, `/api/v1/*` rejects unauthenticated requests with 401.
+    /// `/healthz`, `/readyz`, `/metrics`, and CORS preflight bypass auth.
+    #[arg(long = "console-auth-required", default_value_t = false)]
+    pub console_auth_required: bool,
+
+    /// HMAC-SHA256 secret for --console-auth-required token verification.
+    /// When auth is required and this is empty, an ephemeral 32-byte secret
+    /// is generated at startup and logged once (tokens will not survive
+    /// restart). Operators SHOULD set this for reproducible deploys.
+    #[arg(long = "console-auth-secret", default_value = "")]
+    pub console_auth_secret: String,
+
+    /// CORS origin allowlist for the admin port (repeatable).
+    /// Default: http://localhost:5173 and http://127.0.0.1:5173 (Vite dev).
+    /// Wildcard "*" is only permitted when --console-auth-required is false.
+    #[arg(
+        long = "console-cors-origin",
+        value_parser = clap::value_parser!(String),
+        action = clap::ArgAction::Append,
+    )]
+    pub console_cors_origin: Vec<String>,
+
+    /// Per-IP rate limit for the admin HTTP port in requests per second.
+    /// 0 disables rate limiting entirely.
+    #[arg(long = "console-rate-limit", default_value_t = 1000.0)]
+    pub console_rate_limit: f64,
+
+    /// Token-bucket burst capacity for the admin rate limiter.
+    /// Default: 2x --console-rate-limit.
+    #[arg(long = "console-rate-burst", default_value_t = 2000.0)]
+    pub console_rate_burst: f64,
+
     /// Slowlog threshold in microseconds (commands slower than this are logged)
     #[arg(long = "slowlog-log-slower-than", default_value_t = 10000)]
     pub slowlog_log_slower_than: u64,

@@ -1,0 +1,35 @@
+name: Console Integration
+on:
+  pull_request:
+    paths:
+      - "console/**"
+      - "src/admin/**"
+      - "src/vector/**"
+      - "scripts/test-integration.sh"
+      - "scripts/seed-console-fixtures.py"
+      - ".github/workflows/console-integration.yml"
+  workflow_dispatch: {}
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    env:
+      MOON_NO_URING: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install python deps
+        run: python -m pip install --upgrade pip numpy redis
+      - name: Run integration harness
+        run: bash scripts/test-integration.sh

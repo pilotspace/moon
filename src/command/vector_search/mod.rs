@@ -462,13 +462,29 @@ pub fn search_local_filtered(
     };
 
     let dim = idx.meta.dimension as usize;
-    if query_blob.len() != dim * 4 {
+    // Primary path: binary little-endian f32 blob (RediSearch-compatible).
+    // Fallback: comma-separated floats in a UTF-8 string. This supports the
+    // Moon Console REST/WS bridge which transmits args as JSON strings and
+    // cannot carry raw binary blobs.
+    let query_f32 = if query_blob.len() == dim * 4 {
+        let mut v = Vec::with_capacity(dim);
+        for chunk in query_blob.chunks_exact(4) {
+            v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        v
+    } else if let Ok(text) = std::str::from_utf8(query_blob) {
+        let parsed: Vec<f32> = text
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.trim().parse::<f32>().ok())
+            .collect();
+        if parsed.len() != dim {
+            return Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch"));
+        }
+        parsed
+    } else {
         return Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch"));
-    }
-    let mut query_f32 = Vec::with_capacity(dim);
-    for chunk in query_blob.chunks_exact(4) {
-        query_f32.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
+    };
 
     // Auto-compact mutable → HNSW if threshold reached (lazy, first search only).
     idx.try_compact();
