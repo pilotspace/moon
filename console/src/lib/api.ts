@@ -1,6 +1,7 @@
 import type { ServerInfo, SlowlogEntry } from "@/types/metrics";
 import type { ScanResult, KeyType } from "@/types/browser";
 import type { CommandStat, MemoryNode } from "@/types/memory";
+import { toastSuccess, toastError } from "./toast";
 
 const API_BASE = "/api/v1";
 
@@ -60,7 +61,16 @@ export async function getKeyTtl(key: string): Promise<number> {
 
 /** Set key TTL. ttl=-1 to persist (remove TTL). */
 export async function setKeyTtl(key: string, ttl: number): Promise<void> {
-  await apiPost(`/key/${encodeURIComponent(key)}/ttl`, { ttl });
+  try {
+    await apiPost(`/key/${encodeURIComponent(key)}/ttl`, { ttl });
+    toastSuccess(
+      ttl < 0 ? `TTL removed from "${key}"` : `TTL on "${key}" set to ${ttl}s`,
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    toastError(`Failed to set TTL on "${key}": ${msg}`);
+    throw e;
+  }
 }
 
 /** Get key value with type detection */
@@ -68,24 +78,62 @@ export async function getKeyValue(key: string): Promise<{ type: string; value: u
   return apiGet<{ type: string; value: unknown }>(`/key/${encodeURIComponent(key)}`);
 }
 
-/** Set string key value */
+/** Set string key value. Emits a toast on completion (UX-04). */
 export async function setKeyValue(key: string, value: string): Promise<void> {
-  await fetch(`${API_BASE}/key/${encodeURIComponent(key)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ value }),
-  });
+  try {
+    const res = await fetch(`${API_BASE}/key/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      const msg = body.error ?? res.statusText;
+      toastError(`Failed to set "${key}": ${msg}`);
+      throw new Error(msg);
+    }
+    toastSuccess(`Key "${key}" updated`);
+  } catch (e) {
+    if (!(e instanceof Error && e.message.startsWith("Failed to set"))) {
+      toastError(`Network error setting "${key}"`);
+    }
+    throw e;
+  }
 }
 
-/** Delete one or more keys */
+/** Delete one or more keys. Emits a single success/error toast (UX-04). */
 export async function deleteKeys(keys: string[]): Promise<number> {
   let total = 0;
+  const failed: string[] = [];
   for (const key of keys) {
-    const res = await fetch(`${API_BASE}/key/${encodeURIComponent(key)}`, { method: "DELETE" });
-    if (res.ok) {
-      const data = await res.json();
-      total += (data as { deleted: number }).deleted;
+    try {
+      const res = await fetch(`${API_BASE}/key/${encodeURIComponent(key)}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        total += (data as { deleted: number }).deleted;
+      } else {
+        failed.push(key);
+      }
+    } catch {
+      failed.push(key);
     }
+  }
+  if (failed.length === 0) {
+    if (keys.length === 1) {
+      toastSuccess(`Key "${keys[0]}" deleted`);
+    } else {
+      toastSuccess(`${total} key${total === 1 ? "" : "s"} deleted`);
+    }
+  } else if (total > 0) {
+    toastError(
+      `Deleted ${total}/${keys.length}; failed: ${failed.slice(0, 3).join(", ")}${failed.length > 3 ? "…" : ""}`,
+    );
+  } else {
+    toastError(
+      `Delete failed for ${failed.slice(0, 3).join(", ")}${failed.length > 3 ? "…" : ""}`,
+    );
   }
   return total;
 }
