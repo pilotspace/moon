@@ -13,6 +13,8 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
     "test:e2e:install": "playwright install --with-deps chromium",
+    "test:integration": "playwright test tests/e2e/integration.spec.ts",
+    "test:benchmarks": "playwright test tests/e2e/benchmarks.spec.ts",
     "ci:test": "pnpm test && pnpm test:e2e"
   },
   "dependencies": {

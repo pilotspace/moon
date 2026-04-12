@@ -132,6 +132,10 @@ export const useVectorStore = create<VectorState>((set, get) => ({
           projectedPositions: msg.positions,
           umapProgress: null,
         });
+        // INT-04: benchmark perf budget marker (consumed by benchmarks.spec.ts).
+        if (typeof performance !== "undefined") {
+          performance.mark("umap:done");
+        }
         if (umapWorker) {
           umapWorker.terminate();
           umapWorker = null;

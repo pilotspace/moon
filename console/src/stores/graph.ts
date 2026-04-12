@@ -134,6 +134,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         set({ positions: msg.positions, layoutProgress: { alpha: msg.alpha } });
       } else if (msg.type === "complete") {
         set({ positions: msg.positions, layoutProgress: null });
+        // INT-04: benchmark perf budget marker (consumed by benchmarks.spec.ts).
+        if (typeof performance !== "undefined") {
+          performance.mark("graph:stable");
+        }
         if (forceWorker) {
           forceWorker.terminate();
           forceWorker = null;
