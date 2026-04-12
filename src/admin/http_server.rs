@@ -5,7 +5,7 @@
 //! for command execution, key CRUD, and server introspection.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +21,16 @@ use metrics_exporter_prometheus::PrometheusHandle;
 struct AdminState {
     prometheus_handle: PrometheusHandle,
     ready: Arc<AtomicBool>,
+    // Hardening policies (HARD-01/02/03, Phase 137). Built under the
+    // `console` feature because the admin REST API only ships there; the
+    // basic /healthz,/readyz,/metrics triplet in non-console builds has no
+    // attack surface to harden.
+    #[cfg(feature = "console")]
+    auth: Arc<crate::admin::auth::AuthPolicy>,
+    #[cfg(feature = "console")]
+    cors: Arc<crate::admin::cors::CorsPolicy>,
+    #[cfg(feature = "console")]
+    rate: Arc<crate::admin::rate_limit::RateLimiter>,
 }
 
 /// Wrap `Full<Bytes>` into a `BoxBody` for unified response types.
@@ -47,9 +57,7 @@ fn response(status: StatusCode, body: &'static str) -> Response<BoxBody<Bytes, I
 // them without duplicating code.
 
 #[cfg(feature = "console")]
-use crate::admin::http_server_support::{
-    add_cors_headers, json_response, parse_query_params, percent_decode,
-};
+use crate::admin::http_server_support::{json_response, parse_query_params, percent_decode};
 
 #[cfg(feature = "console")]
 async fn read_body(req: Request<Incoming>) -> Result<Bytes, Response<BoxBody<Bytes, Infallible>>> {
@@ -78,14 +86,56 @@ fn extract_key_from_ttl_path(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Route incoming requests to the appropriate handler.
+///
+/// When the `console` feature is enabled, this function runs the
+/// HARD-01/02/03 middleware chain (CORS preflight -> Auth -> Rate limit)
+/// before dispatching to per-route handlers. `/healthz`, `/readyz`, and
+/// `/metrics` bypass auth so probes keep working when operators enable
+/// `--console-auth-required`.
 #[allow(unused_mut)] // `req` is mutated only when `console` feature is enabled (WebSocket upgrade)
+#[allow(unused_variables)] // `remote_ip` is only consumed under `console`
 async fn handle_request(
     mut req: Request<Incoming>,
     state: Arc<AdminState>,
+    remote_ip: IpAddr,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-    #[cfg(feature = "console")]
-    let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    // ── Middleware chain (console feature only) ────────────────────
+    // Order is deliberate: CORS preflight MUST complete even when auth is
+    // required; rate limit runs after auth so anonymous flooding doesn't
+    // DoS the auth-compute path.
+    #[cfg(feature = "console")]
+    {
+        use crate::admin::middleware::{self, MiddlewareOutcome};
+
+        // 1) CORS preflight short-circuit.
+        if let MiddlewareOutcome::Respond(r) =
+            middleware::handle_preflight(&req, &state.cors)
+        {
+            return Ok(r);
+        }
+        // 2) Auth (liveness/readiness/metrics are exempt).
+        if !middleware::is_auth_exempt(&path) {
+            if let MiddlewareOutcome::Respond(r) = middleware::check_auth(&req, &state.auth) {
+                return Ok(r);
+            }
+        }
+        // 3) Rate limit (always on; disabled limiter is a cheap no-op).
+        if let MiddlewareOutcome::Respond(r) =
+            middleware::check_rate_limit(remote_ip, &state.rate)
+        {
+            return Ok(r);
+        }
+    }
+
+    // Capture request Origin for CORS header attachment on the response.
+    #[cfg(feature = "console")]
+    let request_origin: Option<String> = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     let resp = match path.as_str() {
         "/healthz" => response(StatusCode::OK, "OK"),
@@ -172,15 +222,11 @@ async fn handle_request(
             }
         }
 
-        #[cfg(feature = "console")]
-        _ if method == hyper::Method::OPTIONS => {
-            let mut resp = Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(full_body(Bytes::new()))
-                .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
-            add_cors_headers(&mut resp);
-            resp
-        }
+        // OPTIONS is handled by the middleware preflight stage above; if a
+        // non-OPTIONS request somehow reaches this fallback branch under the
+        // `console` feature we fall through to static file serving (SPA
+        // fallback). Any stray OPTIONS that misses the preflight handler is
+        // answered with the SPA 404 which is semantically harmless.
 
         // Static file serving with SPA fallback (console feature only).
         #[cfg(feature = "console")]
@@ -193,6 +239,17 @@ async fn handle_request(
         #[cfg(not(feature = "console"))]
         _ => response(StatusCode::NOT_FOUND, "Not Found"),
     };
+
+    // Attach CORS headers per policy to the final response. `insert`
+    // overwrites any stale header set by a handler.
+    #[cfg(feature = "console")]
+    let mut resp = resp;
+    #[cfg(feature = "console")]
+    crate::admin::middleware::attach_cors_headers(
+        &mut resp,
+        request_origin.as_deref(),
+        &state.cors,
+    );
     Ok(resp)
 }
 
@@ -357,42 +414,57 @@ fn frame_type_name(frame: &crate::protocol::Frame) -> &'static str {
     }
 }
 
-/// GET /api/v1/keys?pattern=*&cursor=0&count=100 -- SCAN keys.
+/// GET /api/v1/keys?pattern=*&cursor=0&count=100 -- SCAN keys across all shards.
+///
+/// Fans out SCAN to every shard via a composite cursor of the form
+/// `"<shard_id>:<per_shard_cursor>"`. Returns the unified cursor to the caller;
+/// consumers paginate until `cursor == "0"`. See `crate::admin::scan_fanout`.
 #[cfg(feature = "console")]
 async fn handle_scan_keys(
     query: &str,
     gw: &crate::admin::console_gateway::ConsoleGateway,
 ) -> Response<BoxBody<Bytes, Infallible>> {
+    use crate::admin::scan_fanout::{Cursor, scan_all_shards};
+
     let params = parse_query_params(query);
     let pattern = params.get("pattern").map(|s| s.as_str()).unwrap_or("*");
-    let cursor = params.get("cursor").map(|s| s.as_str()).unwrap_or("0");
-    let count = params.get("count").map(|s| s.as_str()).unwrap_or("100");
+    let cursor_str = params.get("cursor").map(|s| s.as_str()).unwrap_or("0");
+    let count: u64 = params
+        .get("count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
 
-    let args = vec![
-        Bytes::from(cursor.to_string()),
-        Bytes::from_static(b"MATCH"),
-        Bytes::from(pattern.to_string()),
-        Bytes::from_static(b"COUNT"),
-        Bytes::from(count.to_string()),
-    ];
+    let cursor = match Cursor::parse(cursor_str, gw.num_shards()) {
+        Ok(c) => c,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid cursor: {}", e)}),
+            );
+        }
+    };
 
-    match gw.execute_command(0, "SCAN", &args).await {
-        Ok(frame) => {
-            // SCAN returns [cursor, [key1, key2, ...]]
-            let json = crate::admin::console_gateway::ConsoleGateway::frame_to_json(&frame);
-            if let serde_json::Value::Array(ref arr) = json {
-                if arr.len() == 2 {
-                    return json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({
-                            "cursor": arr[0],
-                            "keys": arr[1],
-                        }),
-                    );
-                }
-            }
-            // Fallback: return raw result
-            json_response(StatusCode::OK, &serde_json::json!({"result": json}))
+    match scan_all_shards(gw, 0, cursor, pattern, count).await {
+        Ok((next, keys)) => {
+            let key_vals: Vec<serde_json::Value> = keys
+                .iter()
+                .map(|b| match std::str::from_utf8(b) {
+                    Ok(s) => serde_json::Value::String(s.to_string()),
+                    Err(_) => {
+                        use base64::Engine;
+                        let enc =
+                            base64::engine::general_purpose::STANDARD.encode(b.as_ref());
+                        serde_json::json!({ "base64": enc })
+                    }
+                })
+                .collect();
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "cursor": next.encode(),
+                    "keys": key_vals,
+                }),
+            )
         }
         Err(e) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -662,16 +734,19 @@ async fn handle_info(
 ///
 /// The server uses a single-threaded tokio runtime so it works regardless of
 /// which async runtime (monoio / tokio) the main server uses.
+///
+/// When the `console` feature is enabled, the auth + CORS policies are
+/// passed in by the caller. The rate limiter is constructed inside the
+/// spawned admin runtime (its cleanup task needs `tokio::spawn`).
 pub fn spawn_admin_server(
     addr: SocketAddr,
     prometheus_handle: PrometheusHandle,
     ready: Arc<AtomicBool>,
+    #[cfg(feature = "console")] auth: Arc<crate::admin::auth::AuthPolicy>,
+    #[cfg(feature = "console")] cors: Arc<crate::admin::cors::CorsPolicy>,
+    #[cfg(feature = "console")] rate_limit_rps: f64,
+    #[cfg(feature = "console")] rate_limit_burst: f64,
 ) {
-    let state = Arc::new(AdminState {
-        prometheus_handle,
-        ready,
-    });
-
     if let Err(e) = std::thread::Builder::new()
         .name("admin-http".to_string())
         .spawn(move || {
@@ -687,6 +762,24 @@ pub fn spawn_admin_server(
             };
 
             rt.block_on(async move {
+                // Build state after the admin runtime exists so the
+                // RateLimiter can spawn its cleanup task (HARD-03).
+                #[cfg(feature = "console")]
+                let rate = crate::admin::rate_limit::RateLimiter::new(
+                    rate_limit_rps,
+                    rate_limit_burst,
+                );
+                let state = Arc::new(AdminState {
+                    prometheus_handle,
+                    ready,
+                    #[cfg(feature = "console")]
+                    auth,
+                    #[cfg(feature = "console")]
+                    cors,
+                    #[cfg(feature = "console")]
+                    rate,
+                });
+
                 let listener = match tokio::net::TcpListener::bind(addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -703,7 +796,7 @@ pub fn spawn_admin_server(
                 }
 
                 loop {
-                    let (stream, _) = match listener.accept().await {
+                    let (stream, peer) = match listener.accept().await {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::warn!("Admin HTTP accept error: {}", e);
@@ -712,6 +805,7 @@ pub fn spawn_admin_server(
                     };
 
                     let state = state.clone();
+                    let peer_ip: IpAddr = peer.ip();
                     let io = hyper_util::rt::TokioIo::new(stream);
 
                     tokio::spawn(async move {
@@ -722,7 +816,7 @@ pub fn spawn_admin_server(
                             io,
                             service_fn(move |req| {
                                 let state = state.clone();
-                                handle_request(req, state)
+                                handle_request(req, state, peer_ip)
                             }),
                         );
                         if let Err(e) = conn.await {
@@ -784,11 +878,12 @@ mod tests {
 
     #[cfg(feature = "console")]
     #[test]
-    fn test_json_response_has_cors() {
+    fn test_json_response_no_hardcoded_cors() {
+        // Post-Phase-137 (HARD-02): CORS is policy-driven. `json_response`
+        // no longer emits wildcard headers — middleware decides.
         let resp = json_response(StatusCode::OK, &serde_json::json!({"test": true}));
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().contains_key("access-control-allow-origin"));
-        assert!(resp.headers().contains_key("access-control-allow-methods"));
+        assert!(!resp.headers().contains_key("access-control-allow-origin"));
     }
 
     #[cfg(feature = "console")]

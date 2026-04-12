@@ -34,7 +34,18 @@ static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 ///
 /// Returns an `Arc<AtomicBool>` readiness flag. Set it to `true` once all
 /// shards have finished persistence recovery to make `/readyz` return 200.
-pub fn init_metrics(admin_port: u16, bind: &str) -> Option<std::sync::Arc<AtomicBool>> {
+///
+/// When the `console` feature is enabled, the three hardening policies
+/// (`auth`, `cors`, `rate`) are threaded into the server via the extra
+/// arguments. Callers build the policies from `ServerConfig` in `main.rs`.
+pub fn init_metrics(
+    admin_port: u16,
+    bind: &str,
+    #[cfg(feature = "console")] auth: std::sync::Arc<crate::admin::auth::AuthPolicy>,
+    #[cfg(feature = "console")] cors: std::sync::Arc<crate::admin::cors::CorsPolicy>,
+    #[cfg(feature = "console")] rate_limit_rps: f64,
+    #[cfg(feature = "console")] rate_limit_burst: f64,
+) -> Option<std::sync::Arc<AtomicBool>> {
     if admin_port == 0 {
         return None;
     }
@@ -64,7 +75,19 @@ pub fn init_metrics(admin_port: u16, bind: &str) -> Option<std::sync::Arc<Atomic
         }
 
         let ready = std::sync::Arc::new(AtomicBool::new(false));
-        crate::admin::http_server::spawn_admin_server(addr, prometheus_handle, ready.clone());
+        crate::admin::http_server::spawn_admin_server(
+            addr,
+            prometheus_handle,
+            ready.clone(),
+            #[cfg(feature = "console")]
+            auth,
+            #[cfg(feature = "console")]
+            cors,
+            #[cfg(feature = "console")]
+            rate_limit_rps,
+            #[cfg(feature = "console")]
+            rate_limit_burst,
+        );
         Some(ready)
     } else {
         None

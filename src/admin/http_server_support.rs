@@ -28,29 +28,18 @@ pub(crate) fn full_body(data: Bytes) -> BoxBody<Bytes, Infallible> {
 // ---------------------------------------------------------------------------
 // CORS
 // ---------------------------------------------------------------------------
-
-/// Attach permissive CORS headers to a response.
-///
-/// Shared across every JSON/API endpoint so the console (served from the
-/// same admin port but possibly different origin during dev) can call it.
-pub(crate) fn add_cors_headers<B>(resp: &mut Response<B>) {
-    let h = resp.headers_mut();
-    h.insert(
-        "access-control-allow-origin",
-        hyper::header::HeaderValue::from_static("*"),
-    );
-    h.insert(
-        "access-control-allow-methods",
-        hyper::header::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
-    );
-    h.insert(
-        "access-control-allow-headers",
-        hyper::header::HeaderValue::from_static("content-type, authorization"),
-    );
-    h.insert(
-        "access-control-max-age",
-        hyper::header::HeaderValue::from_static("86400"),
-    );
+//
+// As of Phase 137 (HARD-02) CORS is policy-driven. Per-handler code no longer
+// attaches wildcard headers; instead the admin middleware calls
+// `crate::admin::middleware::attach_cors_headers` on the final response so
+// the policy decides whether the browser is allowed to read the body.
+//
+// `add_cors_headers` is retained as a no-op shim so any stray callers (or
+// non-`console` builds that may keep CORS-free helpers) compile without
+// changes. The shim intentionally does not emit `Access-Control-Allow-Origin: *`.
+#[allow(dead_code)]
+pub(crate) fn add_cors_headers<B>(_resp: &mut Response<B>) {
+    // intentionally empty — see comment above
 }
 
 // ---------------------------------------------------------------------------
@@ -176,11 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn json_response_sets_cors_headers() {
+    fn json_response_returns_application_json() {
+        // Post-Phase-137: json_response no longer emits wildcard CORS
+        // headers. The middleware layer attaches policy-driven headers
+        // instead (see `crate::admin::middleware::attach_cors_headers`).
         let resp = json_response(StatusCode::OK, &serde_json::json!({"ok": true}));
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().contains_key("access-control-allow-origin"));
-        assert!(resp.headers().contains_key("access-control-allow-methods"));
+        assert!(!resp.headers().contains_key("access-control-allow-origin"));
         assert_eq!(
             resp.headers()
                 .get("content-type")
