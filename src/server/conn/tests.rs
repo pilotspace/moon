@@ -132,8 +132,14 @@ fn test_inline_set_executes_when_writes_enabled() {
 
     // Verify the key was actually set
     let guard = dbs.read_db(0, 0);
+    // Test assertion: SET was just issued with a live TTL, so the key must
+    // exist and hold a string-typed value; an absent or wrong-typed value
+    // would indicate the inline SET path regressed.
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
     let entry = guard.get_if_alive(b"foo", 0).expect("key should exist");
-    assert_eq!(entry.value.as_bytes().unwrap(), b"bar");
+    #[allow(clippy::unwrap_used)]
+    let value_bytes = entry.value.as_bytes().unwrap();
+    assert_eq!(value_bytes, b"bar");
 }
 
 #[test]

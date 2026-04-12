@@ -958,8 +958,10 @@ pub async fn handle_connection(
 
                         // === ACL permission check (NOPERM gate) ===
                         // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled via continue above.
-                        // Fast path: skip RwLock + HashMap for unrestricted users.
-                        if !conn.cached_acl_unrestricted {
+                        // Fast path: skip RwLock + HashMap for unrestricted users
+                        // whose cache is still fresh.  Stale caches (after ACL
+                        // SETUSER / DELUSER / LOAD) fall through to the full check.
+                        if !conn.acl_skip_allowed() {
                             #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
                                 &conn.current_user, cmd, cmd_args,

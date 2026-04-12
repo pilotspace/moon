@@ -454,10 +454,34 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // are inlined; remote keys fall through to normal cross-shard dispatch.
         // Skip inline dispatch when not conn.authenticated — AUTH must go through normal path.
         if conn.authenticated {
-            // Inline writes are safe when the user is unrestricted (ACL
-            // already cached), not inside MULTI, and tracking is off.
-            let can_inline_writes =
-                conn.cached_acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled;
+            // Inline writes are only safe when every side-effect handled by
+            // the normal dispatch path is either covered by the inline path
+            // or provably unnecessary:
+            //   - `cached_acl_unrestricted`: ACL check can be skipped
+            //   - `!in_multi`: writes must be queued into the transaction
+            //   - `!tracking_enabled`: CLIENT TRACKING invalidation required
+            //   - `!is_replica`: replica rejects writes with READONLY
+            //   - `spill_sender.is_none()`: tiered storage needs async spill
+            //     eviction, not the synchronous delete path.
+            //
+            // The replica check does a non-blocking `try_read` on the shared
+            // `RwLock<ReplicationState>`. If the lock is momentarily held for
+            // write (role change in progress), fail safe by disabling inline
+            // writes for this batch — the normal dispatch path will do the
+            // full check next iteration.
+            let is_replica = ctx.repl_state.as_ref().is_some_and(|rs| {
+                rs.try_read().is_ok_and(|g| {
+                    matches!(
+                        g.role,
+                        crate::replication::state::ReplicationRole::Replica { .. }
+                    )
+                })
+            });
+            let can_inline_writes = conn.acl_skip_allowed()
+                && !conn.in_multi
+                && !conn.tracking_state.enabled
+                && !is_replica
+                && ctx.spill_sender.is_none();
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -1270,9 +1294,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // === ACL permission check (NOPERM gate) ===
             // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
             // Fast path: skip RwLock + HashMap probe for unrestricted users
-            // (default `on nopass ~* &* +@all`). Cached per-connection and
-            // re-resolved on AUTH/HELLO.
-            if !conn.cached_acl_unrestricted {
+            // whose per-connection cache is still fresh (no ACL mutation has
+            // occurred since the cache was populated).  A stale cache MUST
+            // NOT bypass this check — see `ConnectionState::acl_skip_allowed`.
+            if !conn.acl_skip_allowed() {
                 #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                 let acl_guard = ctx.acl_table.read().unwrap();
                 if let Some(deny_reason) =

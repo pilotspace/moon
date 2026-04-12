@@ -79,6 +79,7 @@ fn bench_match_h2(c: &mut Criterion) {
 
     simd_group.bench_function("simd_hit_one", |b| {
         b.iter(|| {
+            // SAFETY: SSE2 is baseline on x86_64; NEON is mandatory on AArch64.
             #[cfg(target_arch = "x86_64")]
             let r = unsafe { black_box(&hit_one).match_h2(black_box(0x42)) };
             #[cfg(not(target_arch = "x86_64"))]
@@ -89,6 +90,7 @@ fn bench_match_h2(c: &mut Criterion) {
 
     simd_group.bench_function("simd_hit_many", |b| {
         b.iter(|| {
+            // SAFETY: SSE2 is baseline on x86_64; NEON is mandatory on AArch64.
             #[cfg(target_arch = "x86_64")]
             let r = unsafe { black_box(&hit_many).match_h2(black_box(0x42)) };
             #[cfg(not(target_arch = "x86_64"))]

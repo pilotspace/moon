@@ -1185,7 +1185,12 @@ pub(crate) fn try_inline_dispatch(
         if d < b'0' || d > b'9' {
             return 0;
         }
-        key_len = key_len * 10 + (d - b'0') as usize;
+        // Saturating arithmetic defends against a malicious client sending
+        // a huge digit run. On overflow `key_len` clamps to `usize::MAX`,
+        // which trips the subsequent bounds check (`key_end + 2 > len`).
+        key_len = key_len
+            .saturating_mul(10)
+            .saturating_add((d - b'0') as usize);
         pos += 1;
     }
     if pos + 1 >= len || buf[pos] != b'\r' || buf[pos + 1] != b'\n' {
@@ -1193,7 +1198,12 @@ pub(crate) fn try_inline_dispatch(
     }
     pos += 2;
     let key_start = pos;
-    let key_end = key_start + key_len;
+    // `checked_add` catches the `key_len = usize::MAX` saturation case above:
+    // plain `key_start + key_len` would wrap to a small value and falsely
+    // satisfy the subsequent `key_end + 2 > len` bounds check.
+    let Some(key_end) = key_start.checked_add(key_len) else {
+        return 0;
+    };
     if key_end + 2 > len || buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
         return 0;
     }
@@ -1269,7 +1279,10 @@ pub(crate) fn try_inline_dispatch(
         if d < b'0' || d > b'9' {
             return 0;
         }
-        val_len = val_len * 10 + (d - b'0') as usize;
+        // See saturating_mul rationale on the matching key_len parse above.
+        val_len = val_len
+            .saturating_mul(10)
+            .saturating_add((d - b'0') as usize);
         pos += 1;
     }
     if pos + 1 >= len || buf[pos] != b'\r' || buf[pos + 1] != b'\n' {
@@ -1277,7 +1290,10 @@ pub(crate) fn try_inline_dispatch(
     }
     pos += 2;
     let val_start = pos;
-    let val_end = val_start + val_len;
+    // See key_end checked_add above — defends against saturated val_len.
+    let Some(val_end) = val_start.checked_add(val_len) else {
+        return 0;
+    };
     if val_end + 2 > len || buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
         return 0;
     }

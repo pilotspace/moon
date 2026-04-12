@@ -825,8 +825,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // === ACL permission check ===
                     // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
                     // so that low-privilege users cannot reach admin commands.
-                    // Fast path: skip RwLock + HashMap for unrestricted users.
-                    if !conn.cached_acl_unrestricted {
+                    // Fast path: skip RwLock + HashMap for unrestricted users
+                    // with a fresh cache.  Stale caches (after ACL SETUSER /
+                    // DELUSER / LOAD) fall through to the full check.
+                    if !conn.acl_skip_allowed() {
                         #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                         let acl_guard = ctx.acl_table.read().unwrap();
                         if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {

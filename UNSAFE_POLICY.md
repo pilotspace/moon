@@ -80,6 +80,12 @@ SAFETY comment:
 - `slice::from_raw_parts(self.ptr, self.len)` where `self` owns the
   allocation and `len` is a struct invariant.
 - `is_x86_feature_detected!`-gated SIMD intrinsics.
+- AArch64 NEON intrinsics from `core::arch::aarch64` under a
+  `#[cfg(target_arch = "aarch64")]` gate. NEON is mandatory in ARMv8-A,
+  so no runtime detection is needed; the `unsafe` wrapper is a Rust
+  formality. The SAFETY comment must still justify pointer validity,
+  alignment requirements (note `vld1q_u8` has none, unlike SSE2's
+  `_mm_load_si128`), and any shift-by-constant assumptions.
 - `MmapOptions::new().map(&file)` over a sealed-after-rename file with a
   refcount-protected directory handle (see
   `vector::persistence::warm_segment::WarmSegmentFiles` for the canonical
