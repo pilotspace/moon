@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/version-v0.1.0-blue" alt="Version"></a>
+  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.5"><img src="https://img.shields.io/badge/version-v0.1.5-blue" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
   <img src="https://img.shields.io/badge/rust-edition%202024-orange" alt="Rust">
@@ -28,7 +28,7 @@
 
 ---
 
-Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. It runs on a thread-per-core, shared-nothing architecture with optional `io_uring` I/O, per-shard WAL, tiered disk offload, and an in-process vector search engine. Any Redis client connects out of the box.
+Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. It runs on a thread-per-core, shared-nothing architecture with optional `io_uring` I/O, per-shard WAL, tiered disk offload, an in-process vector search engine, a property graph engine with Cypher subset, and an embedded web console. Any Redis client connects out of the box.
 
 ## Why Moon
 
@@ -38,6 +38,8 @@ Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. 
 - **Tiered disk offload.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through. 100% crash recovery across all tiers.
 - **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
 - **In-process vector search.** `FT.CREATE` / `FT.SEARCH` with HNSW + TurboQuant 4-bit quantization. **2.56× Qdrant QPS** at higher recall on real MiniLM embeddings.
+- **Property graph engine.** 14 `GRAPH.*` commands with Cypher subset, hybrid graph+vector queries, SIMD-accelerated traversal, and memory-mapped CSR segments. **15× FalkorDB insert throughput.**
+- **Embedded web console.** 7-view React UI (Dashboard, Browser, Console, Vectors, Graph, Memory) served at `/ui/` — zero deployment, one binary. REST + WebSocket + SSE gateway with Bearer auth and rate limiting.
 
 <p align="center">
   <img src="assets/architecture-comparison.png" alt="Moon vs Redis Architecture" width="100%">
@@ -123,6 +125,81 @@ docker run -d -p 6379:6379 -v moon-data:/data moon \
 
 See [docs/quickstart.mdx](docs/quickstart.mdx) for alternative build configs, TLS setup, and Docker Compose.
 
+## Moon Console (Web UI)
+
+Moon ships an embedded web console at `http://localhost:9100/ui/` — no separate install needed.
+
+```bash
+# Start Moon with the admin port enabled
+./target/release/moon --port 6379 --admin-port 9100 --shards 4
+```
+
+Open `http://localhost:9100/ui/` in your browser. The console has 7 views:
+
+| View | What it does |
+|---|---|
+| **Dashboard** | Real-time QPS, latency P50/P99, memory, clients, keyspace — driven by SSE at 1 Hz |
+| **Browser** | Namespace tree, virtual-scrolled key list, type-specific editors for all 6 data types |
+| **Console** | Monaco editor with RESP + Cypher syntax, 233-command autocomplete, multi-tab, history |
+| **Vectors** | 3D UMAP projection of vector indexes, HNSW layer overlay, KNN search with distance rings |
+| **Graph** | Force-directed 3D layout of graph data, Cypher query editor, node/edge inspector |
+| **Memory** | Keyspace treemap, slowlog table, command stats |
+| **Help** | Getting Started guide with seed examples |
+
+### Seed data to explore all views
+
+Use the built-in seed script to populate KV, vector, and graph data:
+
+```bash
+# Install Python deps (one-time)
+pip install redis numpy
+
+# Seed 2000 KV keys, 50K vectors (384d), 10K graph nodes + 30K edges
+python3 scripts/seed-console-fixtures.py \
+  --resp-port 6379 \
+  --admin-port 9100 \
+  --kv-count 2000 \
+  --vector-count 50000 \
+  --graph-nodes 10000 \
+  --graph-edges 30000
+```
+
+Or seed manually via the Console view (Cmd+Enter to execute):
+
+```
+# KV data with namespaces
+SET user:1:name "Alice"
+SET user:1:email "alice@example.com"
+HSET session:1 user_id 1 created_at 1712345678 ttl 3600
+LPUSH queue:emails "welcome-alice" "verify-alice"
+SADD tags:user:1 "admin" "early-adopter" "beta"
+ZADD leaderboard 9500 "alice" 8200 "bob" 7100 "charlie"
+
+# Vector index (auto-indexed on HSET)
+FT.CREATE embeddings ON HASH PREFIX 1 doc: SCHEMA v VECTOR HNSW 6 DIM 384 TYPE FLOAT32 DISTANCE_METRIC COSINE
+
+# Graph data
+GRAPH.CREATE social
+GRAPH.ADDNODE social alice Person '{"name":"Alice","age":30}'
+GRAPH.ADDNODE social bob Person '{"name":"Bob","age":25}'
+GRAPH.ADDEDGE social alice bob FOLLOWS '{"since":"2024"}'
+GRAPH.QUERY social "MATCH (a:Person)-[:FOLLOWS]->(b) RETURN a.name, b.name"
+```
+
+### Auth and CORS (production)
+
+```bash
+# Enable Bearer auth + CORS allowlist
+./target/release/moon \
+  --port 6379 \
+  --admin-port 9100 \
+  --console-auth-required \
+  --console-auth-secret "your-secret-key" \
+  --console-cors-origin "https://your-domain.com" \
+  --console-rate-limit 100 \
+  --console-rate-burst 200
+```
+
 ## Features at a glance
 
 | Category | Highlights |
@@ -133,7 +210,9 @@ See [docs/quickstart.mdx](docs/quickstart.mdx) for alternative build configs, TL
 | **Clustering** | 16,384 hash slots, gossip, MOVED/ASK, live slot migration, PSYNC2 replication, majority-vote failover |
 | **Scripting & security** | Lua 5.4 (EVAL/EVALSHA), ACL users/keys/channels/commands, protected mode |
 | **Vector search** | `FT.CREATE`/`FT.SEARCH`, HNSW + TurboQuant 4-bit, auto-indexing on `HSET` |
-| **Observability** | `INFO`, `SLOWLOG`, `COMMAND DOCS`, `OBJECT`, `DEBUG`, structured `tracing` logs |
+| **Graph engine** | 14 `GRAPH.*` commands, Cypher subset (MATCH/WHERE/RETURN/CREATE/DELETE/SET/MERGE), hybrid graph+vector queries, CSR segments, SIMD cosine |
+| **Web console** | Dashboard, Browser, Console, Vector Explorer, Graph Explorer, Memory view — embedded in binary, served at `/ui/` |
+| **Observability** | `INFO`, `SLOWLOG`, `COMMAND DOCS`, `OBJECT`, `DEBUG`, `MEMORY`, structured `tracing` logs |
 
 Full command list: [docs/commands.mdx](docs/commands.mdx). Configuration flags: [docs/configuration.mdx](docs/configuration.mdx). Architecture deep-dive: [docs/architecture.mdx](docs/architecture.mdx).
 
@@ -165,6 +244,8 @@ Moon is pre-1.0 and **experimental**. Current focus:
 - Correctness parity with Redis 8.x across the full command surface
 - Tiered disk offload (RAM → NVMe) with crash recovery
 - In-process vector search (HNSW + TurboQuant) with `FT.*` API compatibility
+- Property graph engine with Cypher subset for GraphRAG workloads
+- Web console for interactive data exploration and administration
 - Thread-per-core dispatch hot-path optimization (see [CHANGELOG.md](CHANGELOG.md))
 
 Production readiness is **not** a v0.1 goal. Storage formats, APIs, and config flags may change between releases.
