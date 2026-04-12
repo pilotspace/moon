@@ -163,3 +163,7 @@ required-features = ["graph"]
 name = "graph_traversal"
 harness = false
 required-features = ["graph"]
+
+[[bench]]
+name = "simd_probe"
+harness = false
