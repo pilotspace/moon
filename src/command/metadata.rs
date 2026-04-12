@@ -739,6 +739,10 @@ mod tests {
             b"ZRANGESTORE",
             b"ZMPOP",
             b"SELECT",
+            // v0.1.5 admin commands (CMD-01..02) — persisted so that
+            // replaying the AOF preserves deliberate wipes.
+            b"FLUSHALL",
+            b"FLUSHDB",
         ];
         for cmd in aof_write_cmds {
             assert!(
