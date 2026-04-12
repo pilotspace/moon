@@ -25,9 +25,13 @@ export async function fetchServerInfo(): Promise<ServerInfo> {
   return apiGet<ServerInfo>("/info");
 }
 
-/** Execute a RESP command via REST API */
+/** Execute a RESP command via REST API. Returns the unwrapped result value. */
 export async function execCommand(cmd: string, args: string[] = []): Promise<unknown> {
-  return apiPost("/command", { cmd, args });
+  const resp = await apiPost<{ result?: unknown; error?: string; type?: string }>("/command", { cmd, args });
+  if (resp && typeof resp === "object" && "error" in resp && resp.error) {
+    throw new Error(String(resp.error));
+  }
+  return resp && typeof resp === "object" && "result" in resp ? resp.result : resp;
 }
 
 /** SCAN keys with optional pattern, count, and type filter */
