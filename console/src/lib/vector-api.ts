@@ -86,59 +86,100 @@ export async function searchKnn(
   return results;
 }
 
-/** Fetch up to `limit` vectors from an index via FT.SEARCH */
+/** Decode a base64-encoded binary blob into a Float32Array. */
+function decodeBase64Vector(b64: string): Float32Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Float32Array(bytes.buffer);
+}
+
+/** Fetch up to `limit` vectors from an index via SCAN + HGETALL.
+ *
+ * Moon's FT.SEARCH is KNN-only (no `"*"` match-all). So we SCAN for
+ * keys matching the index prefix and HGETALL each one. Binary vector
+ * blobs are returned as `{"base64": "..."}` by the JSON bridge —
+ * decoded client-side to Float32Array.
+ */
 export async function fetchVectorData(
   indexName: string,
   limit: number = 10000,
 ): Promise<VectorPoint[]> {
-  // FT.SEARCH idx "*" LIMIT 0 <limit> returns [count, key1, [field, val, ...], key2, ...]
-  const result = await execCommand("FT.SEARCH", [
-    indexName,
-    "*",
-    "LIMIT",
-    "0",
-    String(limit),
-  ]);
-  if (!Array.isArray(result) || result.length < 1) return [];
-
-  const points: VectorPoint[] = [];
-  // result[0] = total count, then pairs of (key, fields[])
-  for (let i = 1; i < result.length; i += 2) {
-    const key = String(result[i]);
-    const fields = result[i + 1];
-    if (!Array.isArray(fields)) continue;
-
-    const fieldMap = new Map<string, string>();
-    for (let j = 0; j < fields.length - 1; j += 2) {
-      fieldMap.set(String(fields[j]), String(fields[j + 1]));
-    }
-
-    // Find the vector field (typically "__vector" or "vector")
-    let vector = new Float32Array(0);
-    for (const [k, v] of fieldMap) {
-      if (k.includes("vector") || k.startsWith("__")) {
-        const nums = v
-          .split(",")
-          .map(Number)
-          .filter((n) => !isNaN(n));
-        if (nums.length > 1) {
-          vector = new Float32Array(nums);
-          fieldMap.delete(k);
-          break;
+  // Get the index prefix from FT.INFO
+  const info = await execCommand("FT.INFO", [indexName]);
+  let prefix = "doc:"; // default
+  if (Array.isArray(info)) {
+    for (let i = 0; i < info.length - 1; i += 2) {
+      if (String(info[i]).toLowerCase() === "index_definition") {
+        const def = info[i + 1];
+        if (Array.isArray(def)) {
+          for (let j = 0; j < def.length - 1; j += 2) {
+            if (String(def[j]).toLowerCase() === "prefix" || String(def[j]).toLowerCase() === "prefixes") {
+              prefix = String(def[j + 1]);
+              break;
+            }
+          }
         }
       }
     }
-
-    const payload: Record<string, string> = {};
-    for (const [k, v] of fieldMap) payload[k] = v;
-
-    points.push({
-      id: `${points.length}`,
-      key,
-      vector,
-      payload,
-      segment: "mutable",
-    });
   }
+
+  // SCAN for keys matching the prefix
+  const points: VectorPoint[] = [];
+  let cursor = "0";
+  do {
+    const scanResult = await execCommand("SCAN", [cursor, "MATCH", `${prefix}*`, "COUNT", "200"]);
+    if (!Array.isArray(scanResult) || scanResult.length < 2) break;
+    cursor = String(scanResult[0]);
+    const keys = scanResult[1] as string[];
+
+    for (const key of keys) {
+      if (points.length >= limit) { cursor = "0"; break; }
+      const hgetall = await execCommand("HGETALL", [String(key)]);
+      if (!Array.isArray(hgetall)) continue;
+
+      const fieldMap = new Map<string, unknown>();
+      for (let j = 0; j < hgetall.length - 1; j += 2) {
+        fieldMap.set(String(hgetall[j]), hgetall[j + 1]);
+      }
+
+      // Find vector field — check for base64 blob or CSV string
+      let vector = new Float32Array(0);
+      const vectorFieldNames = ["v", "vector", "embedding", "emb", "__vector"];
+      for (const fname of vectorFieldNames) {
+        const val = fieldMap.get(fname);
+        if (!val) continue;
+
+        if (typeof val === "object" && val !== null && "base64" in val) {
+          // Binary blob encoded as base64 by the JSON bridge
+          vector = decodeBase64Vector((val as { base64: string }).base64);
+          fieldMap.delete(fname);
+          break;
+        } else if (typeof val === "string" && val.includes(",")) {
+          // CSV float string
+          const nums = val.split(",").map(Number).filter((n) => !isNaN(n));
+          if (nums.length > 1) {
+            vector = new Float32Array(nums);
+            fieldMap.delete(fname);
+            break;
+          }
+        }
+      }
+
+      const payload: Record<string, string> = {};
+      for (const [k, v] of fieldMap) {
+        payload[k] = typeof v === "string" ? v : JSON.stringify(v);
+      }
+
+      points.push({
+        id: `${points.length}`,
+        key: String(key),
+        vector,
+        payload,
+        segment: "mutable",
+      });
+    }
+  } while (cursor !== "0");
+
   return points;
 }

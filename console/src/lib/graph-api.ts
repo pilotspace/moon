@@ -15,21 +15,32 @@ export async function fetchGraphInfo(): Promise<GraphInfo> {
   const graphName = graphs[0];
   if (!graphName) return { nodeCount: 0, edgeCount: 0, labelCounts: {}, relTypeCounts: {} };
   const result = await execCommand("GRAPH.INFO", [graphName]);
-  // GRAPH.INFO returns flat key-value pairs
-  const map = new Map<string, unknown>();
-  if (Array.isArray(result)) {
+  // GRAPH.INFO may return a Map (JSON object) or flat key-value array.
+  let nodeCount = 0;
+  let edgeCount = 0;
+  let labelCounts: Record<string, number> = {};
+  let relTypeCounts: Record<string, number> = {};
+
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    // Map/object response (Moon returns RESP3 Map → JSON object)
+    const obj = result as Record<string, unknown>;
+    nodeCount = Number(obj.node_count ?? obj.nodes ?? 0);
+    edgeCount = Number(obj.edge_count ?? obj.edges ?? 0);
+    labelCounts = parseCounts(obj.label_counts ?? obj.labels);
+    relTypeCounts = parseCounts(obj.rel_type_counts ?? obj.relationship_types);
+  } else if (Array.isArray(result)) {
+    // Flat key-value pairs
+    const map = new Map<string, unknown>();
     for (let i = 0; i < result.length - 1; i += 2) {
       map.set(String(result[i]).toLowerCase(), result[i + 1]);
     }
+    nodeCount = Number(map.get("node_count") ?? map.get("nodes") ?? 0);
+    edgeCount = Number(map.get("edge_count") ?? map.get("edges") ?? 0);
+    labelCounts = parseCounts(map.get("label_counts") ?? map.get("labels"));
+    relTypeCounts = parseCounts(map.get("rel_type_counts") ?? map.get("relationship_types"));
   }
-  return {
-    nodeCount: Number(map.get("node_count") ?? map.get("nodes") ?? 0),
-    edgeCount: Number(map.get("edge_count") ?? map.get("edges") ?? 0),
-    labelCounts: parseCounts(map.get("label_counts") ?? map.get("labels")),
-    relTypeCounts: parseCounts(
-      map.get("rel_type_counts") ?? map.get("relationship_types"),
-    ),
-  };
+
+  return { nodeCount, edgeCount, labelCounts, relTypeCounts };
 }
 
 function parseCounts(raw: unknown): Record<string, number> {
