@@ -765,6 +765,12 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     Some(&state),
                 )
                 .await;
+                // Migrated connection: the source shard's wrapper skipped the
+                // decrement (because `_migrated == true`), so this target-shard
+                // spawn site owns the balancing decrement.  Without this the
+                // AtomicU64 `CONNECTED_CLIENTS` counter would leak upward on
+                // every migration and eventually trip `maxclients`.
+                crate::admin::metrics_setup::record_connection_closed();
             });
         }
         Err(e) => {
