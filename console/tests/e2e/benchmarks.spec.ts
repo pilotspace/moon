@@ -5,7 +5,7 @@ import { test, expect, gotoView } from "./fixtures";
 test.setTimeout(60_000);
 
 test("50K-point UMAP projects within 10s", async ({ page }) => {
-  await gotoView(page, "/vectors");
+  await gotoView(page, "vectors");
   await page.evaluate(() => performance.mark("umap:start"));
   // Trigger projection via UI button labelled "Project" or "Run UMAP".
   // Fallback: wait for console's "umap:done" PerformanceEntry emitted by worker.
@@ -26,7 +26,7 @@ test("50K-point UMAP projects within 10s", async ({ page }) => {
 });
 
 test("10K-node force layout stabilises within 15s", async ({ page }) => {
-  await gotoView(page, "/graph");
+  await gotoView(page, "graph");
   await page.evaluate(() => performance.mark("graph:start"));
   await page.waitForFunction(
     () => performance.getEntriesByName("graph:stable", "mark").length > 0,

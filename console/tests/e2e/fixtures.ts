@@ -8,9 +8,20 @@ export async function expectNoPlaceholder(page: Page): Promise<void> {
   await expect(body).not.toContainText(/lorem ipsum/i);
 }
 
-/** Navigate to a /ui/<path> route and wait for the page to settle. */
+/**
+ * Navigate to a baseURL-relative path and wait for the page to settle.
+ *
+ * NOTE: The Playwright `baseURL` is `http://localhost:9100/ui/` (see
+ * `playwright.config.ts`). A leading `/` makes Playwright treat the path as
+ * absolute and strips the `/ui/` prefix, which is exactly the UX-03 bug.
+ * We defensively normalize by trimming any leading slashes so call sites
+ * written in either style both work.
+ */
 export async function gotoView(page: Page, path: string): Promise<void> {
-  await page.goto(path, { waitUntil: "domcontentloaded" });
+  // Strip leading slashes so baseURL ("http://host/ui/") is honored.
+  // Empty string -> baseURL itself, which is the `/` integration-test case.
+  const relative = path.replace(/^\/+/, "");
+  await page.goto(relative, { waitUntil: "domcontentloaded" });
   // Give lazy-loaded routes (Console, Vectors, Graph, Memory) time to hydrate.
   // networkidle can fail on long-lived SSE connections; fall through on timeout.
   await page
