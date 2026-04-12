@@ -46,6 +46,43 @@ function parseSegments(raw: unknown): VectorIndex["segments"] {
   });
 }
 
+export interface KnnResult {
+  key: string;
+  score: number;
+  pointIndex: number;
+}
+
+export async function searchKnn(
+  indexName: string,
+  queryVector: number[],
+  k: number = 10,
+): Promise<KnnResult[]> {
+  const vectorStr = queryVector.join(",");
+  const result = await execCommand("FT.SEARCH", [
+    indexName,
+    `*=>[KNN ${k} @vector $BLOB]`,
+    "PARAMS", "2", "BLOB", vectorStr,
+    "SORTBY", "__vector_score",
+    "LIMIT", "0", String(k),
+  ]);
+  if (!Array.isArray(result) || result.length < 2) return [];
+  const results: KnnResult[] = [];
+  for (let i = 1; i < result.length; i += 2) {
+    const key = String(result[i]);
+    const fields = result[i + 1];
+    let score = 0;
+    if (Array.isArray(fields)) {
+      for (let j = 0; j < fields.length - 1; j += 2) {
+        if (String(fields[j]) === "__vector_score") {
+          score = Number(fields[j + 1]);
+        }
+      }
+    }
+    results.push({ key, score, pointIndex: -1 });
+  }
+  return results;
+}
+
 /** Fetch up to `limit` vectors from an index via FT.SEARCH */
 export async function fetchVectorData(
   indexName: string,
