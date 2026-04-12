@@ -176,25 +176,21 @@ impl ConsoleGateway {
     /// - PreSerialized produces `{"raw": true}` (should not appear in console)
     pub fn frame_to_json(frame: &Frame) -> serde_json::Value {
         match frame {
-            Frame::SimpleString(b) | Frame::BulkString(b) => {
-                match std::str::from_utf8(b) {
-                    Ok(s) => serde_json::Value::String(s.to_string()),
-                    Err(_) => {
-                        use base64::Engine;
-                        let encoded =
-                            base64::engine::general_purpose::STANDARD.encode(b.as_ref());
-                        serde_json::json!({ "base64": encoded })
-                    }
+            Frame::SimpleString(b) | Frame::BulkString(b) => match std::str::from_utf8(b) {
+                Ok(s) => serde_json::Value::String(s.to_string()),
+                Err(_) => {
+                    use base64::Engine;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(b.as_ref());
+                    serde_json::json!({ "base64": encoded })
                 }
-            }
+            },
             Frame::Error(b) => {
                 let msg = String::from_utf8_lossy(b);
                 serde_json::json!({ "error": msg })
             }
             Frame::Integer(i) => serde_json::Value::Number((*i).into()),
             Frame::Array(v) => {
-                let items: Vec<serde_json::Value> =
-                    v.iter().map(Self::frame_to_json).collect();
+                let items: Vec<serde_json::Value> = v.iter().map(Self::frame_to_json).collect();
                 serde_json::Value::Array(items)
             }
             Frame::Null => serde_json::Value::Null,
@@ -214,34 +210,27 @@ impl ConsoleGateway {
                 serde_json::Value::Object(obj)
             }
             Frame::Set(v) => {
-                let items: Vec<serde_json::Value> =
-                    v.iter().map(Self::frame_to_json).collect();
+                let items: Vec<serde_json::Value> = v.iter().map(Self::frame_to_json).collect();
                 serde_json::Value::Array(items)
             }
-            Frame::Double(f) => {
-                serde_json::Number::from_f64(*f)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            }
+            Frame::Double(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
             Frame::Boolean(b) => serde_json::Value::Bool(*b),
-            Frame::VerbatimString { data, .. } => {
-                match std::str::from_utf8(data) {
-                    Ok(s) => serde_json::Value::String(s.to_string()),
-                    Err(_) => {
-                        use base64::Engine;
-                        let encoded =
-                            base64::engine::general_purpose::STANDARD.encode(data.as_ref());
-                        serde_json::json!({ "base64": encoded })
-                    }
+            Frame::VerbatimString { data, .. } => match std::str::from_utf8(data) {
+                Ok(s) => serde_json::Value::String(s.to_string()),
+                Err(_) => {
+                    use base64::Engine;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(data.as_ref());
+                    serde_json::json!({ "base64": encoded })
                 }
-            }
+            },
             Frame::BigNumber(b) => {
                 let s = String::from_utf8_lossy(b);
                 serde_json::Value::String(s.to_string())
             }
             Frame::Push(v) => {
-                let items: Vec<serde_json::Value> =
-                    v.iter().map(Self::frame_to_json).collect();
+                let items: Vec<serde_json::Value> = v.iter().map(Self::frame_to_json).collect();
                 serde_json::Value::Array(items)
             }
             Frame::PreSerialized(_) => serde_json::json!({ "raw": true }),
@@ -313,12 +302,10 @@ mod tests {
 
     #[test]
     fn test_frame_to_json_map() {
-        let frame = Frame::Map(vec![
-            (
-                Frame::BulkString(Bytes::from_static(b"key")),
-                Frame::BulkString(Bytes::from_static(b"value")),
-            ),
-        ]);
+        let frame = Frame::Map(vec![(
+            Frame::BulkString(Bytes::from_static(b"key")),
+            Frame::BulkString(Bytes::from_static(b"value")),
+        )]);
         let json = ConsoleGateway::frame_to_json(&frame);
         assert_eq!(json["key"], "value");
     }
@@ -379,8 +366,7 @@ mod tests {
 
     #[test]
     fn test_build_frame() {
-        let frame =
-            ConsoleGateway::build_frame("GET", &[Bytes::from_static(b"mykey")]);
+        let frame = ConsoleGateway::build_frame("GET", &[Bytes::from_static(b"mykey")]);
         match frame {
             Frame::Array(v) => {
                 assert_eq!(v.len(), 2);

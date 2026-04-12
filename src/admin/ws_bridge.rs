@@ -28,10 +28,7 @@ const MAX_SEND_QUEUE: usize = 256;
 /// The `id` field is optional -- if present, echoed back for request correlation.
 /// The `db` field is optional -- if omitted, uses the session's current database.
 /// `SELECT` is handled locally (changes session db for subsequent commands).
-pub async fn handle_ws_connection(
-    ws_stream: HyperWebsocketStream,
-    gateway: Arc<ConsoleGateway>,
-) {
+pub async fn handle_ws_connection(ws_stream: HyperWebsocketStream, gateway: Arc<ConsoleGateway>) {
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut selected_db: usize = 0;
     let mut send_queue_depth: usize = 0;

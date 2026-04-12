@@ -57,9 +57,7 @@ pub fn serve_static_file(path: &str) -> Response<Full<Bytes>> {
                     .status(StatusCode::NOT_FOUND)
                     .header("content-type", "text/plain")
                     .body(Full::new(Bytes::from_static(b"Console not available")))
-                    .unwrap_or_else(|_| {
-                        Response::new(Full::new(Bytes::from_static(b"Not Found")))
-                    }),
+                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"Not Found")))),
             }
         }
     }

@@ -250,11 +250,15 @@ fn main() -> anyhow::Result<()> {
     let mut admin_consumers = {
         let (admin_producers, admin_consumers) =
             moon::shard::mesh::create_admin_channels(num_shards, CHANNEL_BUFFER_SIZE);
-        let gateway = std::sync::Arc::new(
-            moon::admin::console_gateway::ConsoleGateway::new(admin_producers, all_notifiers.clone()),
-        );
+        let gateway = std::sync::Arc::new(moon::admin::console_gateway::ConsoleGateway::new(
+            admin_producers,
+            all_notifiers.clone(),
+        ));
         moon::admin::console_gateway::set_global_gateway(gateway);
-        tracing::info!("Console gateway initialized with {} shard channels", num_shards);
+        tracing::info!(
+            "Console gateway initialized with {} shard channels",
+            num_shards
+        );
         admin_consumers
     };
 
@@ -441,13 +445,10 @@ fn main() -> anyhow::Result<()> {
         // Append admin consumer for this shard (console gateway -> shard SPSC).
         #[cfg(feature = "console")]
         {
-            let admin_cons = std::mem::replace(
-                &mut admin_consumers[id],
-                {
-                    use ringbuf::traits::Split;
-                    ringbuf::HeapRb::new(1).split().1
-                },
-            );
+            let admin_cons = std::mem::replace(&mut admin_consumers[id], {
+                use ringbuf::traits::Split;
+                ringbuf::HeapRb::new(1).split().1
+            });
             consumers.push(admin_cons);
         }
         let conn_rx = mesh.take_conn_rx(id);

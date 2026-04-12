@@ -10,11 +10,11 @@ use std::sync::OnceLock;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
-use hyper::body::Frame as HttpFrame;
 use hyper::Response;
+use hyper::body::Frame as HttpFrame;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 /// Metric event sent to SSE clients.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -60,8 +60,8 @@ pub fn handle_sse_stream() -> Response<BoxBody<Bytes, Infallible>> {
             rx
         });
 
-    let stream =
-        BroadcastStream::new(rx).filter_map(|result| -> Option<Result<HttpFrame<Bytes>, Infallible>> {
+    let stream = BroadcastStream::new(rx).filter_map(
+        |result| -> Option<Result<HttpFrame<Bytes>, Infallible>> {
             match result {
                 Ok(event) => {
                     let json = serde_json::to_string(&event).ok()?;
@@ -73,7 +73,8 @@ pub fn handle_sse_stream() -> Response<BoxBody<Bytes, Infallible>> {
                     None
                 }
             }
-        });
+        },
+    );
 
     Response::builder()
         .status(200)
