@@ -1,5 +1,6 @@
 import type { ServerInfo, SlowlogEntry } from "@/types/metrics";
 import type { ScanResult, KeyType } from "@/types/browser";
+import type { CommandStat, MemoryNode } from "@/types/memory";
 
 const API_BASE = "/api/v1";
 
@@ -117,4 +118,96 @@ export async function fetchSlowlog(count = 25): Promise<SlowlogEntry[]> {
     command: String((entry[3] as string[])?.[0] ?? ""),
     args: ((entry[3] as string[])?.slice(1) ?? []).map(String),
   }));
+}
+
+/** Fetch INFO commandstats and parse into CommandStat[] */
+export async function fetchCommandStats(): Promise<CommandStat[]> {
+  const result = await execCommand("INFO", ["commandstats"]);
+  const text = String(result);
+  const stats: CommandStat[] = [];
+  for (const line of text.split("\n")) {
+    const match = line.match(
+      /^cmdstat_(\w+):calls=(\d+),usec=(\d+),usec_per_call=([\d.]+),rejected_calls=(\d+),failed_calls=(\d+)/,
+    );
+    if (match) {
+      stats.push({
+        command: match[1],
+        calls: Number(match[2]),
+        usec: Number(match[3]),
+        usec_per_call: Number(match[4]),
+        rejected_calls: Number(match[5]),
+        failed_calls: Number(match[6]),
+      });
+    }
+  }
+  return stats.sort((a, b) => b.usec - a.usec);
+}
+
+/** Build a MemoryNode tree from a flat list of keys with type and size */
+function buildTreemapFromKeys(
+  keys: { key: string; type: string; bytes: number }[],
+): MemoryNode {
+  const root: MemoryNode = { name: "keyspace", size: 0, type: "namespace", children: [] };
+
+  for (const { key, type, bytes } of keys) {
+    const parts = key.split(":");
+    let current = root;
+
+    for (let i = 0; i < parts.length - 1; i++) {
+      const segment = parts[i];
+      let child = current.children?.find((c) => c.name === segment && c.type === "namespace");
+      if (!child) {
+        child = { name: segment, size: 0, type: "namespace", children: [] };
+        current.children ??= [];
+        current.children.push(child);
+      }
+      current = child;
+    }
+
+    // Leaf node
+    current.children ??= [];
+    current.children.push({
+      name: parts[parts.length - 1],
+      size: bytes,
+      type,
+      fullKey: key,
+    });
+  }
+
+  // Compute sizes bottom-up
+  function computeSize(node: MemoryNode): number {
+    if (!node.children || node.children.length === 0) return node.size;
+    node.size = node.children.reduce((sum, c) => sum + computeSize(c), 0);
+    return node.size;
+  }
+  computeSize(root);
+
+  return root;
+}
+
+/** Fetch memory treemap data by scanning keys and getting their memory usage */
+export async function fetchMemoryTreemap(maxKeys = 5000): Promise<MemoryNode> {
+  const keys: { key: string; type: string; bytes: number }[] = [];
+  let cursor = "0";
+  do {
+    const result = await scanKeys(cursor, "*", 500);
+    cursor = result.cursor;
+    for (const key of result.keys) {
+      if (keys.length >= maxKeys) {
+        cursor = "0";
+        break;
+      }
+      const [typeResult, memResult] = await Promise.all([
+        execCommand("TYPE", [key]),
+        execCommand("MEMORY", ["USAGE", key]),
+      ]);
+      keys.push({
+        key,
+        type: String(typeResult).toLowerCase(),
+        bytes: typeof memResult === "number" ? memResult : 0,
+      });
+    }
+  } while (cursor !== "0");
+
+  return buildTreemapFromKeys(keys);
 }
