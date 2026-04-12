@@ -12,6 +12,7 @@ pub mod key;
 pub mod list;
 pub mod metadata;
 pub mod persistence;
+pub mod server_admin;
 pub mod set;
 pub mod sorted_set;
 pub mod stream;
@@ -232,6 +233,12 @@ fn dispatch_inner(
             }
         }
         // 5-letter commands
+        (5, b'd') => {
+            // DEBUG
+            if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                return resp(server_admin::debug(db, args));
+            }
+        }
         (5, b'g') => {
             // GETEX
             if cmd.eq_ignore_ascii_case(b"GETEX") {
@@ -411,6 +418,12 @@ fn dispatch_inner(
                 return resp(list::lpushx(db, args));
             }
         }
+        (6, b'm') => {
+            // MEMORY
+            if cmd.eq_ignore_ascii_case(b"MEMORY") {
+                return resp(server_admin::memory(db, args));
+            }
+        }
         (6, b'o') => {
             // OBJECT
             if cmd.eq_ignore_ascii_case(b"OBJECT") {
@@ -508,6 +521,12 @@ fn dispatch_inner(
                 return resp(connection::command(args));
             }
         }
+        (7, b'f') => {
+            // FLUSHDB
+            if cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                return resp(server_admin::flushdb(db, args));
+            }
+        }
         (7, b'h') => {
             // HEALTHZ HGETALL HEXISTS HINCRBY
             if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
@@ -569,6 +588,12 @@ fn dispatch_inner(
             }
         }
         // 8-letter commands
+        (8, b'f') => {
+            // FLUSHALL
+            if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                return resp(server_admin::flushall(db, args));
+            }
+        }
         (8, b'g') => {
             // GETRANGE
             if cmd.eq_ignore_ascii_case(b"GETRANGE") {
