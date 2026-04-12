@@ -38,45 +38,18 @@ fn response(status: StatusCode, body: &'static str) -> Response<BoxBody<Bytes, I
 }
 
 // ---------------------------------------------------------------------------
-// CORS helpers (console feature only)
+// Console HTTP helpers
 // ---------------------------------------------------------------------------
+//
+// Shared helpers (`json_response`, `add_cors_headers`, `percent_decode`,
+// `parse_query_params`) now live in `crate::admin::http_server_support` so
+// per-endpoint handler modules (`memory_treemap`, `hnsw_trace`) can reuse
+// them without duplicating code.
 
 #[cfg(feature = "console")]
-fn add_cors_headers<B>(resp: &mut Response<B>) {
-    let h = resp.headers_mut();
-    h.insert(
-        "access-control-allow-origin",
-        hyper::header::HeaderValue::from_static("*"),
-    );
-    h.insert(
-        "access-control-allow-methods",
-        hyper::header::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
-    );
-    h.insert(
-        "access-control-allow-headers",
-        hyper::header::HeaderValue::from_static("content-type, authorization"),
-    );
-    h.insert(
-        "access-control-max-age",
-        hyper::header::HeaderValue::from_static("86400"),
-    );
-}
-
-#[cfg(feature = "console")]
-fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<BoxBody<Bytes, Infallible>> {
-    let body = serde_json::to_vec(value).unwrap_or_default();
-    let mut resp = Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(full_body(Bytes::from(body)))
-        .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b"{}"))));
-    add_cors_headers(&mut resp);
-    resp
-}
-
-// ---------------------------------------------------------------------------
-// Request body and URL helpers (console feature only)
-// ---------------------------------------------------------------------------
+use crate::admin::http_server_support::{
+    add_cors_headers, json_response, parse_query_params, percent_decode,
+};
 
 #[cfg(feature = "console")]
 async fn read_body(req: Request<Incoming>) -> Result<Bytes, Response<BoxBody<Bytes, Infallible>>> {
@@ -86,39 +59,6 @@ async fn read_body(req: Request<Incoming>) -> Result<Bytes, Response<BoxBody<Byt
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"error": "Failed to read request body"}),
         )),
-    }
-}
-
-/// Minimal percent-decode for URL-encoded key names.
-/// Handles %XX sequences (e.g. %20 for space, %3A for colon).
-#[cfg(feature = "console")]
-fn percent_decode(input: &str) -> String {
-    let mut out = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = hex_val(bytes[i + 1]);
-            let lo = hex_val(bytes[i + 2]);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).to_string())
-}
-
-#[cfg(feature = "console")]
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -202,15 +142,14 @@ async fn handle_request(
                                             .await;
                                         }
                                         Err(e) => {
-                                            tracing::debug!(
-                                                "WebSocket upgrade failed: {}",
-                                                e
-                                            );
+                                            tracing::debug!("WebSocket upgrade failed: {}", e);
                                         }
                                     }
                                 });
                                 // Return 101 Switching Protocols to complete the upgrade.
-                                return Ok(ws_response.map(|b| b.map_err(|never| match never {}).boxed()));
+                                return Ok(
+                                    ws_response.map(|b| b.map_err(|never| match never {}).boxed())
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!("WebSocket upgrade error: {}", e);
@@ -218,9 +157,7 @@ async fn handle_request(
                             }
                         }
                     }
-                    None => {
-                        response(StatusCode::SERVICE_UNAVAILABLE, "Console not initialized")
-                    }
+                    None => response(StatusCode::SERVICE_UNAVAILABLE, "Console not initialized"),
                 }
             } else {
                 response(StatusCode::BAD_REQUEST, "Expected WebSocket upgrade")
@@ -314,6 +251,16 @@ async fn handle_api_request(
 
         // GET /api/v1/info -- server info
         (&Method::GET, "/api/v1/info") => handle_info(gw).await,
+
+        // GET /api/v1/memory/treemap?prefix=&limit=N -- server-side memory tree (INT-01)
+        (&Method::GET, "/api/v1/memory/treemap") => {
+            crate::admin::memory_treemap::handle_memory_treemap(&query, gw).await
+        }
+
+        // GET /api/v1/hnsw/trace?index=...&query=<b64>&k=N&ef_search=N -- HNSW trace (INT-02)
+        (&Method::GET, "/api/v1/hnsw/trace") => {
+            crate::admin::hnsw_trace::handle_hnsw_trace(&query, gw).await
+        }
 
         _ => json_response(
             StatusCode::NOT_FOUND,
@@ -572,10 +519,7 @@ async fn handle_set_key(
     let key_bytes = Bytes::from(key.to_string());
     let val_bytes = Bytes::from(value.to_string());
 
-    match gw
-        .execute_command(0, "SET", &[key_bytes, val_bytes])
-        .await
-    {
+    match gw.execute_command(0, "SET", &[key_bytes, val_bytes]).await {
         Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"ok": true})),
         Err(e) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -598,10 +542,7 @@ async fn handle_delete_key(
                 crate::protocol::Frame::Integer(n) => *n,
                 _ => 0,
             };
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({"deleted": deleted}),
-            )
+            json_response(StatusCode::OK, &serde_json::json!({"deleted": deleted}))
         }
         Err(e) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -698,12 +639,9 @@ async fn handle_info(
     match gw.execute_command(0, "INFO", &[]).await {
         Ok(frame) => {
             let info_str = match &frame {
-                crate::protocol::Frame::BulkString(b) => {
-                    String::from_utf8_lossy(b).to_string()
-                }
+                crate::protocol::Frame::BulkString(b) => String::from_utf8_lossy(b).to_string(),
                 other => {
-                    let json =
-                        crate::admin::console_gateway::ConsoleGateway::frame_to_json(other);
+                    let json = crate::admin::console_gateway::ConsoleGateway::frame_to_json(other);
                     json.to_string()
                 }
             };
@@ -714,21 +652,6 @@ async fn handle_info(
             &serde_json::json!({"error": e}),
         ),
     }
-}
-
-/// Parse query string into key-value pairs.
-#[cfg(feature = "console")]
-fn parse_query_params(query: &str) -> std::collections::HashMap<String, String> {
-    query
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?;
-            let value = parts.next().unwrap_or("");
-            Some((key.to_string(), percent_decode(value)))
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -843,10 +766,7 @@ mod tests {
     #[cfg(feature = "console")]
     #[test]
     fn test_extract_key_from_ttl_path() {
-        assert_eq!(
-            extract_key_from_ttl_path("/api/v1/key/mykey/ttl"),
-            "mykey"
-        );
+        assert_eq!(extract_key_from_ttl_path("/api/v1/key/mykey/ttl"), "mykey");
         assert_eq!(
             extract_key_from_ttl_path("/api/v1/key/my%20key/ttl"),
             "my key"
