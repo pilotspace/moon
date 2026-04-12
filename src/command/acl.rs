@@ -322,7 +322,12 @@ pub fn handle_acl(
                         let Ok(mut table) = acl_table.write() else {
                             return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
                         };
-                        *table = new_table;
+                        // Preserve the Arc<AtomicU64> version handle that
+                        // existing connections hold references to — if we
+                        // replaced via `*table = new_table`, their handles
+                        // would observe the old (now unreachable) counter and
+                        // never invalidate their caches.
+                        table.replace_with(new_table);
                         Frame::SimpleString(Bytes::from_static(b"OK"))
                     }
                 },

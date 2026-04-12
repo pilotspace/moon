@@ -158,6 +158,31 @@ pub(crate) struct ConnectionState {
     pub asking: bool,
     pub acl_log: AclLog,
 
+    /// Cached per-connection: true when the current user has no ACL
+    /// restrictions at all (default `on nopass ~* &* +@all`).  Checked on
+    /// the command hot-path to skip the RwLock + HashMap probe on
+    /// `AclTable` for unrestricted users.
+    ///
+    /// The cache is valid only when `cached_acl_version` matches the
+    /// current `AclTable::version()`.  Runtime ACL mutations (ACL SETUSER /
+    /// DELUSER / LOAD) bump the shared atomic, invalidating this flag on
+    /// the next command.  Without that staleness check the cache would let
+    /// an in-flight connection keep bypassing permission checks after its
+    /// user's privileges were revoked.
+    pub cached_acl_unrestricted: bool,
+
+    /// Snapshot of `AclTable::version()` at the time the unrestricted flag
+    /// above was computed.  Compared against
+    /// `acl_version_handle.load(Acquire)` in the hot path to detect
+    /// runtime ACL mutations that invalidate the cache.
+    pub cached_acl_version: u64,
+
+    /// Shared handle to `AclTable`'s atomic version counter.  Cloned from
+    /// `AclTable::version_handle()` during `refresh_acl_cache`; the
+    /// pointer stays stable across ACL LOAD because the table uses
+    /// `replace_with` to preserve the counter's identity.
+    pub acl_version_handle: Arc<std::sync::atomic::AtomicU64>,
+
     // Pub/Sub
     pub subscription_count: usize,
     pub subscriber_id: u64,
@@ -221,7 +246,63 @@ impl ConnectionState {
                 None
             },
             migration_target: None,
+            cached_acl_unrestricted: false,
+            cached_acl_version: 0,
+            // Placeholder handle — `refresh_acl_cache` replaces this with
+            // the authoritative `Arc<AtomicU64>` on first call (which is
+            // invoked unconditionally at connection accept time).  The
+            // initial counter is 0 so a missed refresh would compare equal
+            // to the placeholder and bypass the lock-free staleness check;
+            // the first `refresh_acl_cache()` call eliminates that window.
+            acl_version_handle: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Resolve and cache the unrestricted flag from the AclTable.
+    /// Called once on connection init and after AUTH / HELLO.
+    ///
+    /// The lock-free staleness-check path in the handlers relies on
+    /// `acl_version_handle` pointing at the table's real counter, so this
+    /// function always refreshes the handle (cheap Arc clone).  Reading
+    /// the handle and the user data in the same critical section ensures
+    /// the snapshot stays consistent: any mutator bumps the version only
+    /// after releasing the write lock via Drop, so we cannot observe a
+    /// post-mutation version with pre-mutation user data.
+    #[inline]
+    pub fn refresh_acl_cache(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
+        // std RwLock: poison = prior panic = unrecoverable. Same convention
+        // used throughout the server for the acl_table lock.
+        #[allow(clippy::unwrap_used)]
+        let guard = acl_table.read().unwrap();
+        self.acl_version_handle = guard.version_handle();
+        self.cached_acl_unrestricted = guard.is_user_unrestricted(&self.current_user);
+        self.cached_acl_version = guard.version();
+    }
+
+    /// Lock-free check: is the cached unrestricted flag still valid?
+    ///
+    /// Returns true iff the ACL table has NOT mutated since the last
+    /// `refresh_acl_cache`.  Readers combine this with
+    /// `cached_acl_unrestricted` via [`Self::acl_skip_allowed`] to decide
+    /// whether they may skip the normal ACL permission check.
+    #[inline]
+    pub fn acl_cache_fresh(&self) -> bool {
+        self.acl_version_handle
+            .load(std::sync::atomic::Ordering::Acquire)
+            == self.cached_acl_version
+    }
+
+    /// Hot-path gate: returns `true` when this connection's current user
+    /// is provably unrestricted AND no ACL mutation has occurred since the
+    /// cache was populated.  Callers may skip the command/key permission
+    /// check when this returns `true`.
+    ///
+    /// Both conditions are required — a stale cache saying "unrestricted"
+    /// would be a privilege-escalation bug if ACL SETUSER has since
+    /// revoked the user's permissions.
+    #[inline]
+    pub fn acl_skip_allowed(&self) -> bool {
+        self.cached_acl_unrestricted && self.acl_cache_fresh()
     }
 }
 

@@ -88,6 +88,7 @@ pub async fn handle_connection(
         runtime_config.read().acllog_max_len,
         None, // no migrated state
     );
+    conn.refresh_acl_cache(&acl_table);
 
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.
@@ -241,6 +242,7 @@ pub async fn handle_connection(
                                         }
                                         if let Some(uname) = opt_user {
                                             conn.current_user = uname;
+                                            conn.refresh_acl_cache(&acl_table);
                                         }
                                         let _ = framed.send(response).await;
                                     }
@@ -337,6 +339,7 @@ pub async fn handle_connection(
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
                                     conn.current_user = uname;
+                                    conn.refresh_acl_cache(&acl_table);
                                 } else {
                                     // Log failed auth attempt
                                     conn.acl_log.push(crate::acl::AclLogEntry {
@@ -371,6 +374,7 @@ pub async fn handle_connection(
                                 }
                                 if let Some(uname) = opt_user {
                                     conn.current_user = uname;
+                                    conn.refresh_acl_cache(&acl_table);
                                 }
                                 responses.push(response);
                                 continue;
@@ -396,6 +400,7 @@ pub async fn handle_connection(
                             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
                             if let Some(uname) = opt_user {
                                 conn.current_user = uname;
+                                conn.refresh_acl_cache(&acl_table);
                             }
                             responses.push(response);
                             continue;
@@ -418,6 +423,7 @@ pub async fn handle_connection(
                             }
                             if let Some(uname) = opt_user {
                                 conn.current_user = uname;
+                                conn.refresh_acl_cache(&acl_table);
                             }
                             responses.push(response);
                             continue;
@@ -952,29 +958,31 @@ pub async fn handle_connection(
 
                         // === ACL permission check (NOPERM gate) ===
                         // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled via continue above.
-                        // All remaining commands must pass through the permission gate.
-                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                        if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
-                            &conn.current_user, cmd, cmd_args,
-                        ) {
-                            conn.acl_log.push(crate::acl::AclLogEntry {
-                                reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                                username: conn.current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64,
-                            });
-                            responses.push(Frame::Error(Bytes::from(format!(
-                                "NOPERM {}", deny_reason
-                            ))));
-                            continue;
-                        }
+                        // Fast path: skip RwLock + HashMap for unrestricted users
+                        // whose cache is still fresh.  Stale caches (after ACL
+                        // SETUSER / DELUSER / LOAD) fall through to the full check.
+                        if !conn.acl_skip_allowed() {
+                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+                            if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
+                                &conn.current_user, cmd, cmd_args,
+                            ) {
+                                conn.acl_log.push(crate::acl::AclLogEntry {
+                                    reason: "command".to_string(),
+                                    object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                    username: conn.current_user.clone(),
+                                    client_addr: peer_addr.clone(),
+                                    timestamp_ms: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                });
+                                responses.push(Frame::Error(Bytes::from(format!(
+                                    "NOPERM {}", deny_reason
+                                ))));
+                                continue;
+                            }
 
-                        // === ACL key pattern check ===
-                        {
+                            // === ACL key pattern check ===
                             let is_write = metadata::is_write(cmd);
                             #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                             if let Some(deny_reason) = acl_table.read().unwrap().check_key_permission(

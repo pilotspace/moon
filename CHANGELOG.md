@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **monoio handler: `maxclients reached` after first disconnect.** `handle_connection_sharded_monoio` called `record_connection_closed()` unconditionally at its exit, while the caller (`conn_accept.rs`) also called it in the non-migration branch. The `AtomicU64` counter wrapped to `u64::MAX` on the second `fetch_sub`, causing every subsequent `try_accept_connection` to reject against `maxclients`. Removed the handler-level decrement to restore symmetry with the `try_accept_connection` increment owned by the caller. Verified: 10 sequential SETs now succeed; `redis-benchmark SET p=16 c=50` reports real throughput (1.25M+ req/s) instead of rejection errors.
 
+### Performance — PR #43 Recovery (2026-04-12)
+
+Measured on aarch64 Linux (OrbStack moon-dev, 1 shard, 50 clients, `redis-benchmark` 8.0.2):
+
+- **SET p=16: +34.4% avg, +48% peak** (2.34M → 3.15M rps) — primary target hit
+- **SET p=1: -2.5% median** (within run-to-run noise)
+- **GET p=16: +4.0%** — NEON SIMD bonus on reads
+
+Three optimisation tracks:
+
+- **ACL caching**: per-connection `cached_acl_unrestricted` flag skips RwLock + HashMap SipHash probe on every command for unrestricted users.
+- **Inline SET dispatch**: extend `try_inline_dispatch` to handle plain `SET key value` from raw RESP bytes, bypassing Frame construction/drop. Handles eviction + AOF. Zero-copy key/value via `read_buf.split_to(consumed).freeze() + slice()`.
+- **NEON SIMD for DashTable**: AArch64 NEON path for `Group::match_h2` (1.39× scalar) and `match_empty_or_deleted` (7.68× scalar). Microbench: `cargo bench --bench simd_probe`.
+
 ### Added — Graph Engine Integration (v0.1.4, 2026-04-11)
 
 - **Property graph engine** (`src/graph/`, feature-gated under `graph`): segment-aligned CSR storage with SlotMap generational indices, ArcSwap lock-free reads, Roaring validity bitmaps, and Rabbit Order compaction for cache locality. 8,500+ LOC, 319 tests.

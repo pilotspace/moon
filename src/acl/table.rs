@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::ServerConfig;
 use crate::protocol::Frame;
@@ -235,12 +237,25 @@ impl AclUser {
 
 pub struct AclTable {
     users: HashMap<String, AclUser>,
+    /// Monotonic version counter bumped on every mutation (set/del/apply).
+    /// Readers outside the `RwLock<AclTable>` can subscribe to this counter
+    /// via [`Self::version_handle`] and detect stale per-connection caches
+    /// without acquiring the lock: when `load(Acquire)` differs from their
+    /// cached snapshot, the cache must be re-resolved.
+    ///
+    /// `Arc<AtomicU64>` rather than a plain `AtomicU64` so the handle can
+    /// be cloned into `ConnectionContext` / `ConnectionState` at connection
+    /// accept time and survive ACL LOAD (which calls
+    /// [`Self::replace_with`] to swap the user set while preserving the
+    /// counter's identity).
+    version: Arc<AtomicU64>,
 }
 
 impl AclTable {
     pub fn new() -> Self {
         AclTable {
             users: HashMap::new(),
+            version: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -248,7 +263,40 @@ impl AclTable {
     pub fn new_empty() -> Self {
         AclTable {
             users: HashMap::new(),
+            version: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Return a clone of the version-counter handle for lock-free staleness
+    /// checks by cached consumers (e.g. `ConnectionState::cached_acl_*`).
+    #[inline]
+    pub fn version_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.version)
+    }
+
+    /// Read the current version — caller must already hold the RwLock read
+    /// guard for a consistent snapshot with any user-data read in the same
+    /// critical section.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Bump the version counter. Must be called under a write lock on self
+    /// (i.e. via `&mut self`) so that readers see the underlying user-data
+    /// change before the version increment is observable.
+    #[inline]
+    fn bump_version(&self) {
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Replace the user-set in place while preserving the same `Arc<AtomicU64>`
+    /// version handle.  Used by ACL LOAD so existing per-connection handles
+    /// (`version_handle()` clones distributed at accept time) remain valid
+    /// and the counter is strictly monotonic across reloads.
+    pub fn replace_with(&mut self, new: AclTable) {
+        self.users = new.users;
+        self.bump_version();
     }
 
     /// Bootstrap from ServerConfig. Loads aclfile if configured, otherwise creates
@@ -264,15 +312,23 @@ impl AclTable {
     }
 
     pub fn get_user_mut(&mut self, username: &str) -> Option<&mut AclUser> {
+        // Callers that mutate via this handle must call bump_version() after
+        // their mutation is complete (or go through set_user / apply_setuser
+        // which bump automatically).  See src/command/acl.rs for call sites.
         self.users.get_mut(username)
     }
 
     pub fn set_user(&mut self, username: String, user: AclUser) {
         self.users.insert(username, user);
+        self.bump_version();
     }
 
     pub fn del_user(&mut self, username: &str) -> bool {
-        self.users.remove(username).is_some()
+        let removed = self.users.remove(username).is_some();
+        if removed {
+            self.bump_version();
+        }
+        removed
     }
 
     pub fn list_users(&self) -> Vec<&AclUser> {
@@ -294,6 +350,7 @@ impl AclTable {
         for rule in rules {
             apply_rule(user, rule);
         }
+        self.bump_version();
     }
 
     /// Authenticate username+password. Returns Some(username) on success, None on failure.
@@ -310,6 +367,15 @@ impl AclTable {
         } else {
             None
         }
+    }
+
+    /// Return `true` if the named user exists and has no restrictions at all
+    /// (enabled + AllAllowed + `~*` rw + `&*`). Used by the connection handler
+    /// to cache the unrestricted flag per-connection, avoiding the RwLock +
+    /// HashMap probe on every command for the common case (default user).
+    #[inline]
+    pub fn is_user_unrestricted(&self, username: &str) -> bool {
+        self.users.get(username).is_some_and(|u| u.unrestricted())
     }
 
     /// Check if the command is allowed for the user.
@@ -794,5 +860,62 @@ mod tests {
                 .check_key_permission("alice", b"GET", &args_w, false)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn version_bumps_on_set_del_apply() {
+        // Every mutation entry point must advance the shared version
+        // counter so cached consumers (per-connection unrestricted flag)
+        // can detect staleness via the Arc<AtomicU64> handle without
+        // needing to re-acquire the RwLock.
+        let mut table = AclTable::new();
+        let v0 = table.version();
+        let handle = table.version_handle();
+
+        table.apply_setuser("alice", &["on", "nopass", ">pw"]);
+        let v1 = table.version();
+        assert!(v1 > v0, "apply_setuser must bump version");
+        assert_eq!(v1, handle.load(Ordering::Acquire));
+
+        table.set_user("bob".to_string(), AclUser::default_deny("bob".to_string()));
+        let v2 = table.version();
+        assert!(v2 > v1, "set_user must bump version");
+
+        assert!(table.del_user("bob"));
+        let v3 = table.version();
+        assert!(v3 > v2, "del_user must bump version");
+
+        // del_user returning false (no such user) MUST NOT bump — otherwise
+        // callers can spam DELUSER to inflate the counter.
+        assert!(!table.del_user("nonexistent"));
+        assert_eq!(table.version(), v3, "no-op del_user must not bump");
+    }
+
+    #[test]
+    fn version_handle_survives_replace_with() {
+        // ACL LOAD swaps the user set in place via `replace_with` instead of
+        // `*table = new_table` precisely so cached connection handles remain
+        // valid.  Verify the Arc stays identity-equal and the counter
+        // advances monotonically across the swap.
+        let mut table = AclTable::new();
+        table.apply_setuser("alice", &["on", "nopass"]);
+        let pre_handle = table.version_handle();
+        let v_pre = pre_handle.load(Ordering::Acquire);
+
+        let mut new_table = AclTable::new_empty();
+        new_table.set_user("bob".to_string(), AclUser::default_deny("bob".to_string()));
+        table.replace_with(new_table);
+
+        let post_handle = table.version_handle();
+        assert!(
+            Arc::ptr_eq(&pre_handle, &post_handle),
+            "replace_with must preserve the Arc<AtomicU64> identity"
+        );
+        assert!(
+            pre_handle.load(Ordering::Acquire) > v_pre,
+            "replace_with must bump the shared counter"
+        );
+        assert!(table.get_user("bob").is_some());
+        assert!(table.get_user("alice").is_none());
     }
 }

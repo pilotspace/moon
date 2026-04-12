@@ -1096,11 +1096,29 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
     }
 }
 
-/// Inline dispatch: attempt to process a single GET or SET command directly from
-/// the raw RESP bytes in `read_buf`, bypassing Frame construction and the dispatch
-/// table entirely.  Only active when `num_shards == 1` (all keys are local).
+/// Inline dispatch: attempt to process a single GET or plain SET command directly
+/// from raw RESP bytes in `read_buf`, bypassing Frame construction and the dispatch
+/// table entirely.
 ///
-/// Returns the number of bytes consumed from `read_buf` (0 if no command was inlined).
+/// **GET:** read-only, no side-effects.  Handles cold storage fallback.
+///
+/// **SET:** plain `SET key value` only (exactly `*3` args, no NX/XX/EX/PX options).
+///   Side-effects handled by this path:
+///   - maxmemory eviction (`try_evict_if_needed`)
+///   - AOF append (raw RESP bytes, zero re-serialization)
+///
+///   Side-effects intentionally skipped (caller gates via `can_inline_writes`):
+///   - ACL permission check (caller sets `can_inline_writes = false` unless
+///     `cached_acl_unrestricted`)
+///   - CLIENT TRACKING invalidation (guarded by `!tracking_state.enabled`)
+///   - MULTI transaction queue (guarded by `!in_multi`)
+///   - Metrics / slowlog recording (matches existing inline GET behaviour)
+///
+///   Side-effects not applicable to plain SET:
+///   - Blocking-waiter wakeup (only for LPUSH/RPUSH/ZADD, not SET)
+///   - Vector auto-index (only for HSET, not SET)
+///
+/// Returns the number of commands inlined (0 if none, 1 on success).
 /// On success the serialized response is appended to `write_buf`.
 #[cfg(feature = "runtime-monoio")]
 pub(crate) fn try_inline_dispatch(
@@ -1112,109 +1130,105 @@ pub(crate) fn try_inline_dispatch(
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
     now_ms: u64,
     num_shards: usize,
+    can_inline_writes: bool,
+    runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
     let buf = &read_buf[..];
     let len = buf.len();
 
     // Minimum valid command: *2\r\n$3\r\nGET\r\n$1\r\nX\r\n = 20 bytes
-    // (*2\r\n=4) + ($3\r\n=4) + (GET\r\n=5) + ($1\r\n=4) + (X\r\n=3) = 20
-    if len < 20 {
+    if len < 20 || buf[0] != b'*' {
         return 0;
     }
 
-    // Must start with RESP array marker
-    if buf[0] != b'*' {
+    // Parse array count: only *2 (GET) and *3 (SET plain) are inlined.
+    let argc = buf[1];
+    if buf[2] != b'\r' || buf[3] != b'\n' {
+        return 0;
+    }
+    let is_get = argc == b'2';
+    let is_set = argc == b'3' && can_inline_writes;
+    if !is_get && !is_set {
         return 0;
     }
 
-    // --- Detect *2\r\n (GET) ONLY ---
-    //
-    // The inline fast-path is intentionally restricted to read-only,
-    // side-effect-free commands. Write commands (SET, etc.) must go through
-    // the normal dispatcher so that replica READONLY enforcement, ACL checks,
-    // maxmemory eviction, client-side tracking invalidation, keyspace
-    // notifications, replication propagation, and blocking-waiter wakeups
-    // all run. See PR #43 review: inlining SET here bypasses all of those.
-    let is_get = buf[1] == b'2' && buf[2] == b'\r' && buf[3] == b'\n';
-    if !is_get {
-        return 0;
-    }
-
-    // After "*N\r\n" expect "$3\r\n" for 3-letter command name
-    // Position 4: must be '$', pos 5: '3', pos 6-7: \r\n
+    // Expect $3\r\n for 3-letter command name (GET or SET)
     if buf[4] != b'$' || buf[5] != b'3' || buf[6] != b'\r' || buf[7] != b'\n' {
         return 0;
     }
 
-    // Positions 8,9,10 = command name (case-insensitive)
+    // Command name at positions 8,9,10
     let cmd_upper = [
         buf[8].to_ascii_uppercase(),
         buf[9].to_ascii_uppercase(),
         buf[10].to_ascii_uppercase(),
     ];
-
-    if cmd_upper != [b'G', b'E', b'T'] {
-        return 0;
-    }
-
-    // After command: \r\n at positions 11,12
     if buf[11] != b'\r' || buf[12] != b'\n' {
         return 0;
     }
 
-    // Now parse first argument (the key): "$<keylen>\r\n<key>\r\n"
-    // Position 13 must be '$'
+    // Validate command matches argc
+    match (&cmd_upper, is_get) {
+        ([b'G', b'E', b'T'], true) => {}
+        ([b'S', b'E', b'T'], false) => {}
+        _ => return 0,
+    }
+
+    // --- Parse first bulk-string argument (the key) ---
     if len <= 13 || buf[13] != b'$' {
         return 0;
     }
-
-    // Parse key length digits starting at position 14
     let mut pos = 14usize;
     let mut key_len: usize = 0;
     while pos < len && buf[pos] != b'\r' {
         let d = buf[pos];
         if d < b'0' || d > b'9' {
-            return 0; // non-digit in length field
+            return 0;
         }
-        key_len = key_len * 10 + (d - b'0') as usize;
+        // Saturating arithmetic defends against a malicious client sending
+        // a huge digit run. On overflow `key_len` clamps to `usize::MAX`,
+        // which trips the subsequent bounds check (`key_end + 2 > len`).
+        key_len = key_len
+            .saturating_mul(10)
+            .saturating_add((d - b'0') as usize);
         pos += 1;
     }
-    // Need \r\n after key length
     if pos + 1 >= len || buf[pos] != b'\r' || buf[pos + 1] != b'\n' {
         return 0;
     }
-    pos += 2; // skip \r\n
-
-    // Need key_len bytes + \r\n
+    pos += 2;
     let key_start = pos;
-    let key_end = key_start + key_len;
-    if key_end + 2 > len {
-        return 0; // partial key data
-    }
-    if buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
+    // `checked_add` catches the `key_len = usize::MAX` saturation case above:
+    // plain `key_start + key_len` would wrap to a small value and falsely
+    // satisfy the subsequent `key_end + 2 > len` bounds check.  Same for
+    // `key_end + 2` — on overflow it could wrap below `len` and slip past
+    // the guard, then panic on the out-of-bounds `buf[key_end]` index.
+    let Some(key_end) = key_start.checked_add(key_len) else {
+        return 0;
+    };
+    let Some(key_end_crlf) = key_end.checked_add(2) else {
+        return 0;
+    };
+    if key_end_crlf > len || buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
         return 0;
     }
 
-    // Multi-shard: bail if key routes to a remote shard (fall through to normal dispatch)
-    if num_shards > 1 {
-        let key_bytes = &buf[key_start..key_end];
-        if key_to_shard(key_bytes, num_shards) != shard_id {
-            return 0;
-        }
+    // Multi-shard: bail if key routes to a remote shard
+    if num_shards > 1 && key_to_shard(&buf[key_start..key_end], num_shards) != shard_id {
+        return 0;
     }
 
-    // GET: done parsing -- total consumed = key_end + 2
-    let _ = aof_tx; // AOF unused on the read-only inline path
-    let consumed = key_end + 2;
-    let key_bytes = &buf[key_start..key_end];
-
-    // Read path: shared lock + single DashTable lookup via get_if_alive
-    let guard = shard_databases.read_db(shard_id, selected_db);
-    match guard.get_if_alive(key_bytes, now_ms) {
-        Some(entry) => {
-            match entry.value.as_bytes() {
+    if is_get {
+        // ---- GET path (read-only) ----
+        // `key_end_crlf` above already validated `key_end + 2 <= len` via
+        // checked_add, so reusing it avoids re-deriving a value that was
+        // proven safe just above.
+        let consumed = key_end_crlf;
+        let key_bytes = &buf[key_start..key_end];
+        let guard = shard_databases.read_db(shard_id, selected_db);
+        match guard.get_if_alive(key_bytes, now_ms) {
+            Some(entry) => match entry.value.as_bytes() {
                 Some(val) => {
-                    // $<len>\r\n<val>\r\n
                     write_buf.extend_from_slice(b"$");
                     let mut itoa_buf = itoa::Buffer::new();
                     write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
@@ -1223,45 +1237,112 @@ pub(crate) fn try_inline_dispatch(
                     write_buf.extend_from_slice(b"\r\n");
                 }
                 None => {
-                    // Wrong type
                     write_buf.extend_from_slice(
                         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
                     );
                 }
+            },
+            None => {
+                // Cold storage fallback
+                let cold_loc = guard.cold_lookup_location(key_bytes);
+                drop(guard);
+                let cold = cold_loc.and_then(|(loc, shard_dir)| {
+                    crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
+                });
+                if let Some((value, _ttl)) = cold {
+                    if let crate::storage::entry::RedisValue::String(v) = value {
+                        write_buf.extend_from_slice(b"$");
+                        let mut itoa_buf2 = itoa::Buffer::new();
+                        write_buf.extend_from_slice(itoa_buf2.format(v.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(&v);
+                        write_buf.extend_from_slice(b"\r\n");
+                    } else {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                    }
+                } else {
+                    write_buf.extend_from_slice(b"$-1\r\n");
+                }
+                let _ = read_buf.split_to(consumed);
+                return 1;
             }
         }
-        None => {
-            // Cold storage fallback: key may have been evicted to NVMe.
-            // CRITICAL: do the in-memory index lookup under the guard,
-            // then DROP the guard before doing the synchronous disk read,
-            // so concurrent ops on this shard are not blocked on I/O.
-            let cold_loc = guard.cold_lookup_location(key_bytes);
-            drop(guard);
-            let cold = cold_loc.and_then(|(loc, shard_dir)| {
-                crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
-            });
-            if let Some((value, _ttl)) = cold {
-                if let crate::storage::entry::RedisValue::String(v) = value {
-                    write_buf.extend_from_slice(b"$");
-                    let mut itoa_buf2 = itoa::Buffer::new();
-                    write_buf.extend_from_slice(itoa_buf2.format(v.len()).as_bytes());
-                    write_buf.extend_from_slice(b"\r\n");
-                    write_buf.extend_from_slice(&v);
-                    write_buf.extend_from_slice(b"\r\n");
-                } else {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
-                }
-            } else {
-                write_buf.extend_from_slice(b"$-1\r\n");
-            }
-            let _ = read_buf.split_to(consumed);
+        drop(guard);
+        let _ = read_buf.split_to(consumed);
+        return 1;
+    }
+
+    // ---- SET path (write, plain *3 only) ----
+    // Parse second bulk-string argument (the value)
+    pos = key_end + 2;
+    if pos >= len || buf[pos] != b'$' {
+        return 0;
+    }
+    pos += 1;
+    let mut val_len: usize = 0;
+    while pos < len && buf[pos] != b'\r' {
+        let d = buf[pos];
+        if d < b'0' || d > b'9' {
+            return 0;
+        }
+        // See saturating_mul rationale on the matching key_len parse above.
+        val_len = val_len
+            .saturating_mul(10)
+            .saturating_add((d - b'0') as usize);
+        pos += 1;
+    }
+    if pos + 1 >= len || buf[pos] != b'\r' || buf[pos + 1] != b'\n' {
+        return 0;
+    }
+    pos += 2;
+    let val_start = pos;
+    // See key_end checked_add above — defends against saturated val_len.
+    let Some(val_end) = val_start.checked_add(val_len) else {
+        return 0;
+    };
+    let Some(consumed) = val_end.checked_add(2) else {
+        return 0;
+    };
+    if consumed > len || buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
+        return 0;
+    }
+
+    // Freeze the consumed prefix of `read_buf` into an Arc-backed `Bytes`.
+    // This replaces the BytesMut prefix with a refcounted view over the SAME
+    // allocation, so `key`, `value`, and the AOF record can all be extracted
+    // with `slice()` (Arc refcount bump, no malloc + memcpy).
+    //
+    // NOTE: this releases the earlier `&read_buf[..]` borrow (held as `buf`).
+    // We must not index into `buf` after this point — use `frozen` instead.
+    let frozen = read_buf.split_to(consumed).freeze();
+
+    // Eviction check + write under exclusive lock
+    {
+        let rt = runtime_config.read();
+        let mut guard = shard_databases.write_db(shard_id, selected_db);
+        if crate::storage::eviction::try_evict_if_needed(&mut guard, &rt).is_err() {
+            write_buf
+                .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'\r\n");
             return 1;
         }
+        drop(rt);
+
+        let key = frozen.slice(key_start..key_end);
+        let value = frozen.slice(val_start..val_end);
+        let mut entry = crate::storage::entry::Entry::new_string(value);
+        entry.set_last_access(guard.now());
+        entry.set_access_counter(5);
+        guard.set(key, entry);
     }
-    drop(guard);
-    let _ = read_buf.split_to(consumed);
+
+    // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
+    if let Some(tx) = aof_tx {
+        let _ = tx.try_send(crate::persistence::aof::AofMessage::Append(frozen));
+    }
+
+    write_buf.extend_from_slice(b"+OK\r\n");
     1
 }
 
@@ -1277,6 +1358,8 @@ pub(crate) fn try_inline_dispatch_loop(
     aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
     now_ms: u64,
     num_shards: usize,
+    can_inline_writes: bool,
+    runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
 ) -> usize {
     let mut total = 0;
     loop {
@@ -1289,6 +1372,8 @@ pub(crate) fn try_inline_dispatch_loop(
             aof_tx,
             now_ms,
             num_shards,
+            can_inline_writes,
+            runtime_config,
         );
         if n == 0 {
             break;

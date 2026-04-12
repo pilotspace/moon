@@ -221,6 +221,7 @@ pub(crate) async fn handle_connection_sharded_inner<
         ctx.runtime_config.read().acllog_max_len,
         migrated_state,
     );
+    conn.refresh_acl_cache(&ctx.acl_table);
 
     // Register in global client registry for CLIENT LIST/INFO/KILL.
     // RegistryGuard ensures deregister on all exit paths (including early returns).
@@ -536,6 +537,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(uname) = opt_user {
                                     conn.authenticated = true;
                                     conn.current_user = uname;
+                                    conn.refresh_acl_cache(&ctx.acl_table);
                                     if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                         crate::auth_ratelimit::record_success(addr.ip());
                                     }
@@ -573,6 +575,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
                                 if let Some(ref uname) = opt_user {
                                     conn.current_user = uname.clone();
+                                    conn.refresh_acl_cache(&ctx.acl_table);
                                 }
                                 // HELLO AUTH rate limiting (same as AUTH gate)
                                 if matches!(&response, Frame::Error(_)) {
@@ -732,6 +735,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
                         if let Some(uname) = opt_user {
                             conn.current_user = uname;
+                            conn.refresh_acl_cache(&ctx.acl_table);
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                 crate::auth_ratelimit::record_success(addr.ip());
                             }
@@ -749,7 +753,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                         );
                         if !matches!(&response, Frame::Error(_)) { conn.protocol_version = new_proto; }
                         if let Some(name) = new_name { conn.client_name = Some(name); }
-                        if let Some(ref uname) = opt_user { conn.current_user = uname.clone(); }
+                        if let Some(ref uname) = opt_user {
+                            conn.current_user = uname.clone();
+                            conn.refresh_acl_cache(&ctx.acl_table);
+                        }
                         if matches!(&response, Frame::Error(_)) {
                             if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
                                 auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
@@ -818,7 +825,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // === ACL permission check ===
                     // Must run before any command-specific handlers (CONFIG, REPLICAOF, etc.)
                     // so that low-privilege users cannot reach admin commands.
-                    {
+                    // Fast path: skip RwLock + HashMap for unrestricted users
+                    // with a fresh cache.  Stale caches (after ACL SETUSER /
+                    // DELUSER / LOAD) fall through to the full check.
+                    if !conn.acl_skip_allowed() {
                         #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
                         let acl_guard = ctx.acl_table.read().unwrap();
                         if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
