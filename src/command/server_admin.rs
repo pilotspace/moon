@@ -82,36 +82,71 @@ fn check_flush_args(args: &[Frame]) -> bool {
 /// * `SLEEP <seconds>` — blocking sleep on the current shard (0..=30s).
 /// * `HELP` — list subcommands.
 pub fn debug(db: &mut Database, args: &[Frame]) -> Frame {
+    match classify_debug(args) {
+        Ok(DebugCall::Object(rest)) => debug_object(db, rest),
+        Ok(DebugCall::Sleep(rest)) => debug_sleep(rest),
+        Ok(DebugCall::Help) => debug_help(),
+        Err(e) => e,
+    }
+}
+
+/// Read-only variant used by `dispatch_read()` on the shared-read path.
+///
+/// DEBUG is flagged as ADMIN (not WRITE and not READONLY) which steers the
+/// connection handler into the read-dispatch branch. None of the supported
+/// subcommands mutate `Database`, so exposing a `&Database` overload here
+/// keeps the command working without forcing a WRITE reclassification
+/// (which would incorrectly AOF-log DEBUG SLEEP).
+pub fn debug_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    match classify_debug(args) {
+        Ok(DebugCall::Object(rest)) => debug_object_readonly(db, rest, now_ms),
+        Ok(DebugCall::Sleep(rest)) => debug_sleep(rest),
+        Ok(DebugCall::Help) => debug_help(),
+        Err(e) => e,
+    }
+}
+
+enum DebugCall<'a> {
+    Object(&'a [Frame]),
+    Sleep(&'a [Frame]),
+    Help,
+}
+
+fn classify_debug(args: &[Frame]) -> Result<DebugCall<'_>, Frame> {
     if args.is_empty() {
-        return err_wrong_args("DEBUG");
+        return Err(err_wrong_args("DEBUG"));
     }
     let sub = match extract_bytes(&args[0]) {
         Some(s) => s,
-        None => return err_wrong_args("DEBUG"),
+        None => return Err(err_wrong_args("DEBUG")),
     };
     if sub.eq_ignore_ascii_case(b"OBJECT") {
-        debug_object(db, &args[1..])
+        Ok(DebugCall::Object(&args[1..]))
     } else if sub.eq_ignore_ascii_case(b"SLEEP") {
-        debug_sleep(&args[1..])
+        Ok(DebugCall::Sleep(&args[1..]))
     } else if sub.eq_ignore_ascii_case(b"HELP") {
-        Frame::Array(framevec![
-            Frame::BulkString(Bytes::from_static(b"DEBUG OBJECT <key>")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Show low-level info about a key's object.",
-            )),
-            Frame::BulkString(Bytes::from_static(b"DEBUG SLEEP <seconds>")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Stall this shard for <seconds> (float, capped at 30).",
-            )),
-            Frame::BulkString(Bytes::from_static(b"DEBUG HELP")),
-            Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
-        ])
+        Ok(DebugCall::Help)
     } else {
-        Frame::Error(Bytes::from(format!(
+        Err(Frame::Error(Bytes::from(format!(
             "ERR DEBUG subcommand '{}' not supported",
             String::from_utf8_lossy(sub),
-        )))
+        ))))
     }
+}
+
+fn debug_help() -> Frame {
+    Frame::Array(framevec![
+        Frame::BulkString(Bytes::from_static(b"DEBUG OBJECT <key>")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Show low-level info about a key's object.",
+        )),
+        Frame::BulkString(Bytes::from_static(b"DEBUG SLEEP <seconds>")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Stall this shard for <seconds> (float, capped at 30).",
+        )),
+        Frame::BulkString(Bytes::from_static(b"DEBUG HELP")),
+        Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
+    ])
 }
 
 fn debug_object(db: &mut Database, args: &[Frame]) -> Frame {
@@ -123,19 +158,35 @@ fn debug_object(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("DEBUG OBJECT"),
     };
     match db.get(key.as_ref()) {
-        Some(entry) => {
-            let encoding = entry.as_redis_value().encoding_name();
-            let slen = estimate_serialized_length(entry);
-            // Redis format: Value at:0x<addr> refcount:N encoding:X serializedlength:N lru:N lru_seconds_idle:N
-            // Tools parse the key/value pairs; the exact address is not meaningful.
-            let body = format!(
-                "Value at:0x0000000000000000 refcount:1 encoding:{} serializedlength:{} lru:0 lru_seconds_idle:0",
-                encoding, slen,
-            );
-            Frame::SimpleString(Bytes::from(body))
-        }
+        Some(entry) => debug_object_reply(entry),
         None => Frame::Error(Bytes::from_static(b"ERR no such key")),
     }
+}
+
+fn debug_object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("DEBUG OBJECT");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("DEBUG OBJECT"),
+    };
+    match db.get_if_alive(key.as_ref(), now_ms) {
+        Some(entry) => debug_object_reply(entry),
+        None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+    }
+}
+
+fn debug_object_reply(entry: &Entry) -> Frame {
+    let encoding = entry.as_redis_value().encoding_name();
+    let slen = estimate_serialized_length(entry);
+    // Redis format: Value at:0x<addr> refcount:N encoding:X serializedlength:N lru:N lru_seconds_idle:N
+    // Tools parse the key/value pairs; the exact address is not meaningful.
+    let body = format!(
+        "Value at:0x0000000000000000 refcount:1 encoding:{} serializedlength:{} lru:0 lru_seconds_idle:0",
+        encoding, slen,
+    );
+    Frame::SimpleString(Bytes::from(body))
 }
 
 fn debug_sleep(args: &[Frame]) -> Frame {
@@ -192,60 +243,123 @@ fn estimate_serialized_length(entry: &Entry) -> usize {
 
 /// `MEMORY <subcommand> [args...]`
 pub fn memory(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("MEMORY");
-    }
-    let sub = match extract_bytes(&args[0]) {
-        Some(s) => s,
-        None => return err_wrong_args("MEMORY"),
-    };
-    if sub.eq_ignore_ascii_case(b"USAGE") {
-        memory_usage(db, &args[1..])
-    } else if sub.eq_ignore_ascii_case(b"STATS") {
-        Frame::Map(vec![(
-            Frame::BulkString(Bytes::from_static(b"peak.allocated")),
-            Frame::Integer(db.estimated_memory() as i64),
-        )])
-    } else if sub.eq_ignore_ascii_case(b"DOCTOR") {
-        Frame::BulkString(Bytes::from_static(
-            b"Sam, I detected no issues in this Moon instance. Keep calm and carry on.\n",
-        ))
-    } else if sub.eq_ignore_ascii_case(b"HELP") {
-        Frame::Array(framevec![
-            Frame::BulkString(Bytes::from_static(b"MEMORY USAGE <key> [SAMPLES <count>]",)),
-            Frame::BulkString(Bytes::from_static(
-                b"  Estimate memory usage of the key in bytes.",
-            )),
-            Frame::BulkString(Bytes::from_static(b"MEMORY STATS")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Return a map of memory usage counters.",
-            )),
-            Frame::BulkString(Bytes::from_static(b"MEMORY DOCTOR")),
-            Frame::BulkString(Bytes::from_static(b"  Memory health report.")),
-            Frame::BulkString(Bytes::from_static(b"MEMORY HELP")),
-            Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
-        ])
-    } else {
-        Frame::Error(Bytes::from(format!(
-            "ERR MEMORY subcommand '{}' not supported",
-            String::from_utf8_lossy(sub),
-        )))
+    match classify_memory(args) {
+        Ok(MemoryCall::Usage(rest)) => memory_usage(db, rest),
+        Ok(MemoryCall::Stats) => memory_stats(db.estimated_memory()),
+        Ok(MemoryCall::Doctor) => memory_doctor(),
+        Ok(MemoryCall::Help) => memory_help(),
+        Err(e) => e,
     }
 }
 
-fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
+/// Read-only variant routed from `dispatch_read()`.
+pub fn memory_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    match classify_memory(args) {
+        Ok(MemoryCall::Usage(rest)) => memory_usage_readonly(db, rest, now_ms),
+        Ok(MemoryCall::Stats) => memory_stats(db.estimated_memory()),
+        Ok(MemoryCall::Doctor) => memory_doctor(),
+        Ok(MemoryCall::Help) => memory_help(),
+        Err(e) => e,
+    }
+}
+
+enum MemoryCall<'a> {
+    Usage(&'a [Frame]),
+    Stats,
+    Doctor,
+    Help,
+}
+
+fn classify_memory(args: &[Frame]) -> Result<MemoryCall<'_>, Frame> {
     if args.is_empty() {
-        return err_wrong_args("MEMORY USAGE");
+        return Err(err_wrong_args("MEMORY"));
+    }
+    let sub = match extract_bytes(&args[0]) {
+        Some(s) => s,
+        None => return Err(err_wrong_args("MEMORY")),
+    };
+    if sub.eq_ignore_ascii_case(b"USAGE") {
+        Ok(MemoryCall::Usage(&args[1..]))
+    } else if sub.eq_ignore_ascii_case(b"STATS") {
+        Ok(MemoryCall::Stats)
+    } else if sub.eq_ignore_ascii_case(b"DOCTOR") {
+        Ok(MemoryCall::Doctor)
+    } else if sub.eq_ignore_ascii_case(b"HELP") {
+        Ok(MemoryCall::Help)
+    } else {
+        Err(Frame::Error(Bytes::from(format!(
+            "ERR MEMORY subcommand '{}' not supported",
+            String::from_utf8_lossy(sub),
+        ))))
+    }
+}
+
+fn memory_stats(used: usize) -> Frame {
+    Frame::Map(vec![(
+        Frame::BulkString(Bytes::from_static(b"peak.allocated")),
+        Frame::Integer(used as i64),
+    )])
+}
+
+fn memory_doctor() -> Frame {
+    Frame::BulkString(Bytes::from_static(
+        b"Sam, I detected no issues in this Moon instance. Keep calm and carry on.\n",
+    ))
+}
+
+fn memory_help() -> Frame {
+    Frame::Array(framevec![
+        Frame::BulkString(Bytes::from_static(b"MEMORY USAGE <key> [SAMPLES <count>]")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Estimate memory usage of the key in bytes.",
+        )),
+        Frame::BulkString(Bytes::from_static(b"MEMORY STATS")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Return a map of memory usage counters.",
+        )),
+        Frame::BulkString(Bytes::from_static(b"MEMORY DOCTOR")),
+        Frame::BulkString(Bytes::from_static(b"  Memory health report.")),
+        Frame::BulkString(Bytes::from_static(b"MEMORY HELP")),
+        Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
+    ])
+}
+
+fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
+    let key = match parse_memory_usage_args(args) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    match db.get(key.as_ref()) {
+        Some(entry) => memory_usage_reply(key.as_ref(), entry),
+        None => Frame::Null,
+    }
+}
+
+fn memory_usage_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    let key = match parse_memory_usage_args(args) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    match db.get_if_alive(key.as_ref(), now_ms) {
+        Some(entry) => memory_usage_reply(key.as_ref(), entry),
+        None => Frame::Null,
+    }
+}
+
+/// Validate the `MEMORY USAGE key [SAMPLES n]` argument list and return the
+/// key bytes on success, or an error frame on failure.
+fn parse_memory_usage_args(args: &[Frame]) -> Result<Bytes, Frame> {
+    if args.is_empty() {
+        return Err(err_wrong_args("MEMORY USAGE"));
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("MEMORY USAGE"),
+        Some(k) => k.clone(),
+        None => return Err(err_wrong_args("MEMORY USAGE")),
     };
-
     // Accept (and ignore) SAMPLES <n> — Moon always visits every entry.
     if args.len() > 1 {
         if args.len() != 3 {
-            return err_wrong_args("MEMORY USAGE");
+            return Err(err_wrong_args("MEMORY USAGE"));
         }
         match extract_bytes(&args[1]) {
             Some(flag) if flag.eq_ignore_ascii_case(b"SAMPLES") => {
@@ -254,26 +368,24 @@ fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
                     .and_then(|s| s.parse::<u64>().ok())
                     .is_none()
                 {
-                    return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+                    return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
                 }
             }
-            _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            _ => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
         }
     }
+    Ok(key)
+}
 
-    match db.get(key.as_ref()) {
-        Some(entry) => {
-            // Entry header + compact key bytes + payload estimate.
-            // `48` models the DashTable entry metadata + CompactKey inline
-            // bytes for the common case (Moon's SSO caps at 23 bytes; the
-            // constant is intentionally conservative — Redis's numbers
-            // include jemalloc fragmentation that we do not).
-            let payload = estimate_serialized_length(entry);
-            let total = 48usize.saturating_add(key.len()).saturating_add(payload);
-            Frame::Integer(total as i64)
-        }
-        None => Frame::Null,
-    }
+fn memory_usage_reply(key: &[u8], entry: &Entry) -> Frame {
+    // Entry header + compact key bytes + payload estimate.
+    // `48` models the DashTable entry metadata + CompactKey inline
+    // bytes for the common case (Moon's SSO caps at 23 bytes; the
+    // constant is intentionally conservative — Redis's numbers
+    // include jemalloc fragmentation that we do not).
+    let payload = estimate_serialized_length(entry);
+    let total = 48usize.saturating_add(key.len()).saturating_add(payload);
+    Frame::Integer(total as i64)
 }
 
 // ---------------------------------------------------------------------------

@@ -2,9 +2,9 @@ use bytes::Bytes;
 
 use crate::framevec;
 use crate::protocol::Frame;
-use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::current_time_ms;
+use crate::storage::Database;
 
 use super::helpers::err_wrong_args;
 
@@ -393,6 +393,16 @@ fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
 ///
 /// Returns the number of keys in the currently selected database.
 pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
+    Frame::Integer(db.len() as i64)
+}
+
+/// DBSIZE — read-only variant for `dispatch_read()`.
+///
+/// DBSIZE is flagged as READONLY (`RF`) in the metadata registry, which
+/// routes it through the shared-read dispatch path. This handler takes an
+/// immutable `&Database` and returns the current key count, matching the
+/// mutable `dbsize` semantics exactly (neither variant lazily expires).
+pub fn dbsize_readonly(db: &Database, _args: &[Frame]) -> Frame {
     Frame::Integer(db.len() as i64)
 }
 
@@ -881,7 +891,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::{Entry, current_time_ms};
+    use crate::storage::entry::{current_time_ms, Entry};
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))

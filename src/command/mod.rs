@@ -787,11 +787,14 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (4, b'p')  // PTTL, PING
         | (4, b's')  // SCAN
         | (4, b't')  // TYPE
+        | (5, b'd')  // DEBUG (OBJECT/SLEEP/HELP — read-only on the data plane)
         | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
         | (5, b's')  // SCARD, SDIFF, SSCAN
         | (5, b'z')  // ZCARD, ZRANK, ZSCAN
+        | (6, b'd')  // DBSIZE
         | (6, b'e')  // EXISTS
         | (6, b'l')  // LRANGE, LINDEX
+        | (6, b'm')  // MEMORY
         | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
@@ -910,6 +913,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(key::type_cmd_readonly(db, args, now_ms));
             }
         }
+        (5, b'd') => {
+            // DEBUG (OBJECT / SLEEP / HELP — none mutate)
+            if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                return resp(server_admin::debug_readonly(db, args, now_ms));
+            }
+        }
         (5, b'h') => {
             // HMGET HKEYS HVALS HSCAN
             if cmd.eq_ignore_ascii_case(b"HMGET") {
@@ -949,6 +958,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(sorted_set::zscan_readonly(db, args, now_ms));
             }
         }
+        (6, b'd') => {
+            // DBSIZE
+            if cmd.eq_ignore_ascii_case(b"DBSIZE") {
+                return resp(key::dbsize_readonly(db, args));
+            }
+        }
         (6, b'e') => {
             // EXISTS
             if cmd.eq_ignore_ascii_case(b"EXISTS") {
@@ -962,6 +977,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
             if cmd.eq_ignore_ascii_case(b"LINDEX") {
                 return resp(list::lindex_readonly(db, args, now_ms));
+            }
+        }
+        (6, b'm') => {
+            // MEMORY (USAGE / STATS / DOCTOR / HELP — all read-only)
+            if cmd.eq_ignore_ascii_case(b"MEMORY") {
+                return resp(server_admin::memory_readonly(db, args, now_ms));
             }
         }
         (6, b's') => {
