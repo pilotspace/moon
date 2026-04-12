@@ -13,6 +13,10 @@ const VectorExplorer = lazy(() =>
   import("@/views/VectorExplorer").then((m) => ({ default: m.VectorExplorer })),
 );
 
+const GraphExplorer = lazy(() =>
+  import("@/views/GraphExplorer").then((m) => ({ default: m.GraphExplorer })),
+);
+
 export default function App() {
   useEffect(() => {
     connectSSE();
@@ -36,7 +40,11 @@ export default function App() {
               <VectorExplorer />
             </Suspense>
           } />
-          <Route path="/graph" element={<div className="text-muted-foreground p-8">Graph Explorer — Phase 133</div>} />
+          <Route path="/graph" element={
+            <Suspense fallback={<div className="text-muted-foreground p-8">Loading Graph Explorer...</div>}>
+              <GraphExplorer />
+            </Suspense>
+          } />
           <Route path="/memory" element={<div className="text-muted-foreground p-8">Memory — Phase 134</div>} />
         </Routes>
       </AppShell>
