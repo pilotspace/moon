@@ -627,6 +627,16 @@ pub fn dbsize(db: &mut Database, _args: &[Frame]) -> Frame {
     Frame::Integer(db.len() as i64)
 }
 
+/// DBSIZE — read-only variant for `dispatch_read()`.
+///
+/// DBSIZE is flagged as READONLY (`RF`) in the metadata registry, which
+/// routes it through the shared-read dispatch path. This handler takes an
+/// immutable `&Database` and returns the current key count, matching the
+/// mutable `dbsize` semantics exactly (neither variant lazily expires).
+pub fn dbsize_readonly(db: &Database, _args: &[Frame]) -> Frame {
+    Frame::Integer(db.len() as i64)
+}
+
 /// KEYS pattern
 ///
 /// Returns all keys matching the given glob-style pattern.

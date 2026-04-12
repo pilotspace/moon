@@ -13,7 +13,7 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 .
 # =============================================================================
 
-ARG RUST_VERSION=1.88
+ARG RUST_VERSION=1.94
 ARG DEBIAN_VERSION=bookworm
 
 # =============================================================================

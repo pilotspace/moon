@@ -14,6 +14,7 @@ pub mod key_extra;
 pub mod list;
 pub mod metadata;
 pub mod persistence;
+pub mod server_admin;
 pub mod set;
 pub mod sorted_set;
 pub mod stream;
@@ -258,6 +259,12 @@ fn dispatch_inner(
                 return resp(string::bitop(db, args));
             }
         }
+        (5, b'd') => {
+            // DEBUG
+            if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                return resp(server_admin::debug(db, args));
+            }
+        }
         (5, b'g') => {
             // GETEX
             if cmd.eq_ignore_ascii_case(b"GETEX") {
@@ -462,24 +469,9 @@ fn dispatch_inner(
             }
         }
         (6, b'm') => {
-            // MEMORY
+            // MEMORY (USAGE, STATS, DOCTOR, HELP)
             if cmd.eq_ignore_ascii_case(b"MEMORY") {
-                if let Some(sub) = args.first() {
-                    if let Some(sub_bytes) = crate::command::helpers::extract_bytes(sub) {
-                        if sub_bytes.eq_ignore_ascii_case(b"USAGE") {
-                            return resp(key_extra::memory_usage(db, &args[1..]));
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"DOCTOR") {
-                            return resp(key_extra::memory_doctor());
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"HELP") {
-                            return resp(key_extra::memory_help());
-                        }
-                    }
-                }
-                return resp(Frame::Error(Bytes::from_static(
-                    b"ERR unknown subcommand. Try MEMORY USAGE, MEMORY DOCTOR, MEMORY HELP.",
-                )));
+                return resp(server_admin::memory(db, args));
             }
         }
         (6, b'o') => {
@@ -587,10 +579,16 @@ fn dispatch_inner(
             }
         }
         // 7-letter commands
+        (7, b'c') => {
+            // COMMAND
+            if cmd.eq_ignore_ascii_case(b"COMMAND") {
+                return resp(connection::command(args));
+            }
+        }
         (7, b'f') => {
             // FLUSHDB
             if cmd.eq_ignore_ascii_case(b"FLUSHDB") {
-                return resp(key::flushdb(db, args));
+                return resp(server_admin::flushdb(db, args));
             }
         }
         (7, b'g') => {
@@ -600,12 +598,6 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"GEOHASH") {
                 return resp(geo::geohash(db, args));
-            }
-        }
-        (7, b'c') => {
-            // COMMAND
-            if cmd.eq_ignore_ascii_case(b"COMMAND") {
-                return resp(connection::command(args));
             }
         }
         (7, b'h') => {
@@ -676,9 +668,9 @@ fn dispatch_inner(
             }
         }
         (8, b'f') => {
-            // FLUSHALL — clears current DB (per-shard, not cross-shard)
+            // FLUSHALL
             if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-                return resp(key::flushdb(db, args));
+                return resp(server_admin::flushall(db, args));
             }
         }
         (8, b'g') => {
@@ -936,13 +928,16 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (4, b'p')  // PTTL, PING
         | (4, b's')  // SCAN
         | (4, b't')  // TYPE
+        | (5, b'd')  // DEBUG (OBJECT/SLEEP/HELP — read-only on the data plane)
         | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
         | (5, b's')  // SCARD, SDIFF, SSCAN
         | (5, b'z')  // ZCARD, ZRANK, ZSCAN
         | (6, b'b')  // BITPOS
+        | (6, b'd')  // DBSIZE
         | (6, b'e')  // EXISTS
         | (6, b'g')  // GETBIT
         | (6, b'l')  // LRANGE, LINDEX
+        | (6, b'm')  // MEMORY
         | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
@@ -1062,6 +1057,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(key::type_cmd_readonly(db, args, now_ms));
             }
         }
+        (5, b'd') => {
+            // DEBUG (OBJECT / SLEEP / HELP — none mutate)
+            if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                return resp(server_admin::debug_readonly(db, args, now_ms));
+            }
+        }
         (5, b'h') => {
             // HMGET HKEYS HVALS HSCAN
             if cmd.eq_ignore_ascii_case(b"HMGET") {
@@ -1107,6 +1108,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(string::bitpos_readonly(db, args, now_ms));
             }
         }
+        (6, b'd') => {
+            // DBSIZE
+            if cmd.eq_ignore_ascii_case(b"DBSIZE") {
+                return resp(key::dbsize_readonly(db, args));
+            }
+        }
         (6, b'e') => {
             // EXISTS
             if cmd.eq_ignore_ascii_case(b"EXISTS") {
@@ -1126,6 +1133,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
             if cmd.eq_ignore_ascii_case(b"LINDEX") {
                 return resp(list::lindex_readonly(db, args, now_ms));
+            }
+        }
+        (6, b'm') => {
+            // MEMORY (USAGE / STATS / DOCTOR / HELP — all read-only)
+            if cmd.eq_ignore_ascii_case(b"MEMORY") {
+                return resp(server_admin::memory_readonly(db, args, now_ms));
             }
         }
         (6, b's') => {
