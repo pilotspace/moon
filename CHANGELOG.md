@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Connection counter double-decrement (2026-04-12)
+
+- **monoio handler: `maxclients reached` after first disconnect.** `handle_connection_sharded_monoio` called `record_connection_closed()` unconditionally at its exit, while the caller (`conn_accept.rs`) also called it in the non-migration branch. The `AtomicU64` counter wrapped to `u64::MAX` on the second `fetch_sub`, causing every subsequent `try_accept_connection` to reject against `maxclients`. Removed the handler-level decrement to restore symmetry with the `try_accept_connection` increment owned by the caller. Verified: 10 sequential SETs now succeed; `redis-benchmark SET p=16 c=50` reports real throughput (1.25M+ req/s) instead of rejection errors.
+
 ### Added — Graph Engine Integration (v0.1.4, 2026-04-11)
 
 - **Property graph engine** (`src/graph/`, feature-gated under `graph`): segment-aligned CSR storage with SlotMap generational indices, ArcSwap lock-free reads, Roaring validity bitmaps, and Rabbit Order compaction for cache locality. 8,500+ LOC, 319 tests.

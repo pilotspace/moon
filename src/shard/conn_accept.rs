@@ -700,6 +700,11 @@ pub(crate) fn spawn_migrated_monoio_connection(
             fd,
             e
         );
+        // Source shard's `try_accept_connection` already counted this
+        // client; its wrapper skipped the decrement because the migration
+        // succeeded from the source's perspective.  Since we cannot hand
+        // ownership to the handler, we own the balancing decrement here.
+        crate::admin::metrics_setup::record_connection_closed();
         return; // std_stream Drop closes FD
     }
     match monoio::net::TcpStream::from_std(std_stream) {
@@ -765,6 +770,12 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     Some(&state),
                 )
                 .await;
+                // Migrated connection: the source shard's wrapper skipped the
+                // decrement (because `_migrated == true`), so this target-shard
+                // spawn site owns the balancing decrement.  Without this the
+                // AtomicU64 `CONNECTED_CLIENTS` counter would leak upward on
+                // every migration and eventually trip `maxclients`.
+                crate::admin::metrics_setup::record_connection_closed();
             });
         }
         Err(e) => {
@@ -773,6 +784,10 @@ pub(crate) fn spawn_migrated_monoio_connection(
                 shard_id,
                 e
             );
+            // Same rationale as the set_nonblocking failure above:
+            // the source-side increment stands but no handler will run,
+            // so we own the balancing decrement.
+            crate::admin::metrics_setup::record_connection_closed();
         }
     }
 }

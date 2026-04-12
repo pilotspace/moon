@@ -2327,6 +2327,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
     }
 
-    crate::admin::metrics_setup::record_connection_closed();
+    // NOTE: connection close is recorded by the caller (conn_accept.rs) to
+    // preserve symmetry with `try_accept_connection`, which owns the
+    // increment.  Decrementing here too produces a double-decrement on the
+    // AtomicU64 counter — it wraps to u64::MAX on the second subtraction
+    // and all subsequent `try_accept_connection` comparisons against
+    // `maxclients` reject new connections.
     (MonoioHandlerResult::Done, None)
 }
