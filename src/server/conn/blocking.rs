@@ -1283,6 +1283,15 @@ pub(crate) fn try_inline_dispatch(
     }
     let consumed = val_end + 2;
 
+    // Freeze the consumed prefix of `read_buf` into an Arc-backed `Bytes`.
+    // This replaces the BytesMut prefix with a refcounted view over the SAME
+    // allocation, so `key`, `value`, and the AOF record can all be extracted
+    // with `slice()` (Arc refcount bump, no malloc + memcpy).
+    //
+    // NOTE: this releases the earlier `&read_buf[..]` borrow (held as `buf`).
+    // We must not index into `buf` after this point — use `frozen` instead.
+    let frozen = read_buf.split_to(consumed).freeze();
+
     // Eviction check + write under exclusive lock
     {
         let rt = runtime_config.read();
@@ -1290,27 +1299,24 @@ pub(crate) fn try_inline_dispatch(
         if crate::storage::eviction::try_evict_if_needed(&mut guard, &rt).is_err() {
             write_buf
                 .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'\r\n");
-            let _ = read_buf.split_to(consumed);
             return 1;
         }
         drop(rt);
 
-        let key = Bytes::copy_from_slice(&buf[key_start..key_end]);
-        let value = Bytes::copy_from_slice(&buf[val_start..val_end]);
+        let key = frozen.slice(key_start..key_end);
+        let value = frozen.slice(val_start..val_end);
         let mut entry = crate::storage::entry::Entry::new_string(value);
         entry.set_last_access(guard.now());
         entry.set_access_counter(5);
         guard.set(key, entry);
     }
 
-    // AOF: send raw RESP bytes (already in wire format, no re-serialization)
+    // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
     if let Some(tx) = aof_tx {
-        let serialized = Bytes::copy_from_slice(&buf[..consumed]);
-        let _ = tx.try_send(crate::persistence::aof::AofMessage::Append(serialized));
+        let _ = tx.try_send(crate::persistence::aof::AofMessage::Append(frozen));
     }
 
     write_buf.extend_from_slice(b"+OK\r\n");
-    let _ = read_buf.split_to(consumed);
     1
 }
 
