@@ -17,6 +17,10 @@ const GraphExplorer = lazy(() =>
   import("@/views/GraphExplorer").then((m) => ({ default: m.GraphExplorer })),
 );
 
+const MemoryView = lazy(() =>
+  import("@/views/MemoryView").then((m) => ({ default: m.MemoryView })),
+);
+
 export default function App() {
   useEffect(() => {
     connectSSE();
@@ -45,7 +49,11 @@ export default function App() {
               <GraphExplorer />
             </Suspense>
           } />
-          <Route path="/memory" element={<div className="text-muted-foreground p-8">Memory — Phase 134</div>} />
+          <Route path="/memory" element={
+            <Suspense fallback={<div className="text-muted-foreground p-8">Loading Memory view...</div>}>
+              <MemoryView />
+            </Suspense>
+          } />
         </Routes>
       </AppShell>
     </BrowserRouter>
