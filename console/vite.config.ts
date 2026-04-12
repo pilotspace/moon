@@ -18,6 +18,7 @@ export default defineConfig({
     proxy: {
       "/api": "http://localhost:9100",
       "/events": "http://localhost:9100",
+      "/ws": { target: "ws://localhost:9100", ws: true },
     },
   },
 });
