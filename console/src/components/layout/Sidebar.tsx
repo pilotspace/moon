@@ -6,6 +6,7 @@ import {
   Hexagon,
   GitFork,
   MemoryStick,
+  BookOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useMetricsStore } from "@/stores/metrics";
@@ -17,6 +18,7 @@ const navItems = [
   { to: "/vectors", icon: Hexagon, label: "Vectors" },
   { to: "/graph", icon: GitFork, label: "Graph" },
   { to: "/memory", icon: MemoryStick, label: "Memory" },
+  { to: "/help", icon: BookOpen, label: "Help" },
 ];
 
 export function Sidebar() {

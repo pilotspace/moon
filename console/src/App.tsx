@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppShell } from "@/components/layout/AppShell";
 import { Dashboard } from "@/views/Dashboard";
 import { Browser } from "@/views/Browser";
+import { Help } from "@/views/Help";
 import { connectSSE, disconnectSSE } from "@/lib/sse";
 
 const Console = lazy(() =>
@@ -54,6 +55,7 @@ export default function App() {
               <MemoryView />
             </Suspense>
           } />
+          <Route path="/help" element={<Help />} />
         </Routes>
       </AppShell>
     </BrowserRouter>
