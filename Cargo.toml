@@ -76,6 +76,8 @@ rust-embed = { version = "8", features = ["compression"], optional = true }
 mime_guess = { version = "2", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 base64 = { version = "0.22", optional = true }
+hmac = { version = "0.13", optional = true }
+subtle = { version = "2.5", optional = true }
 
 [features]
 # Platform-aware defaults:
@@ -96,7 +98,7 @@ simd-avx512 = []
 # When wired, will gate tracing-opentelemetry + opentelemetry-otlp dependencies.
 otel = []
 graph = ["dep:logos"]
-console = ["dep:hyper-tungstenite", "dep:rust-embed", "dep:mime_guess", "dep:tokio-stream", "dep:base64", "hyper/http2"]
+console = ["dep:hyper-tungstenite", "dep:rust-embed", "dep:mime_guess", "dep:tokio-stream", "dep:base64", "dep:hmac", "dep:subtle", "hyper/http2"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -108,6 +110,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 redis = { version = "1.1", features = ["tokio-comp"] }
 tempfile = "3"
 loom = "0.7"
+ureq = "2"
+hmac = "0.13"
 
 [profile.release]
 debug = false         # No debug symbols for smaller/faster binary

@@ -9,6 +9,8 @@ pub mod slowlog;
 
 #[cfg(feature = "console")]
 pub mod console_gateway;
+#[cfg(feature = "console")]
+pub mod scan_fanout;
 
 #[cfg(feature = "console")]
 pub mod sse_stream;
