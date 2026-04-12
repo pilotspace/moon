@@ -168,7 +168,8 @@ redis-cli -p 6399 ZADD leaderboard 100 alice 85 bob`}
           <ShortcutGroup
             title="Console"
             rows={[
-              [<><Kbd>Cmd</Kbd>+<Kbd>Enter</Kbd></>, "Run current query"],
+              [<><Kbd>Cmd</Kbd>+<Kbd>Enter</Kbd></>, "Run current line (or selection)"],
+              [<><Kbd>Cmd</Kbd>+<Kbd>Shift</Kbd>+<Kbd>Enter</Kbd></>, "Run all lines (batch)"],
               [<><Kbd>Cmd</Kbd>+<Kbd>T</Kbd></>, "New tab"],
               [<><Kbd>Cmd</Kbd>+<Kbd>W</Kbd></>, "Close tab"],
               [<><Kbd>Cmd</Kbd>+<Kbd>↑</Kbd></>, "Previous history entry"],

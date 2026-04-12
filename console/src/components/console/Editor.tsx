@@ -3,7 +3,7 @@ import { useConsoleStore } from "@/stores/console";
 import { respLanguageId, respLanguage, respThemeRules } from "@/lib/monarch-resp";
 import { cypherLanguageId, cypherLanguage, cypherThemeRules } from "@/lib/monarch-cypher";
 import { createCompletionProvider } from "@/lib/completions";
-import { sendCommand } from "@/lib/ws";
+import { sendCommand, sendSingleCommand } from "@/lib/ws";
 import type { editor as EditorTypes } from "monaco-editor";
 
 const MonacoEditor = lazy(() => import("@monaco-editor/react"));
@@ -58,25 +58,71 @@ export function Editor() {
     (editor: EditorTypes.IStandaloneCodeEditor, monaco: typeof import("monaco-editor")) => {
       editorRef.current = editor;
 
-      // Cmd/Ctrl+Enter to execute
+      // Cmd/Ctrl+Enter to execute.
+      //
+      // Selection → execute just the selected text.
+      // Cypher tab → execute entire content as a single multi-line query.
+      // RESP tab, no selection → execute the current line only (redis-cli style).
+      // Cmd/Ctrl+Shift+Enter → execute ALL lines sequentially (batch mode).
+      const runQuery = async (input: string, multiLine: boolean) => {
+        const store = useConsoleStore.getState();
+        const tab = store.tabs.find((t) => t.id === store.activeTabId);
+        if (!tab || tab.executing || !input.trim()) return;
+
+        store.setExecuting(tab.id, true);
+        const result =
+          multiLine || tab.language === "cypher"
+            ? await sendCommand(input)
+            : await sendSingleCommand(input);
+        store.setResult(tab.id, result);
+        store.addToHistory(tab.id, {
+          query: input,
+          language: tab.language,
+          result,
+          timestamp: Date.now(),
+        });
+      };
+
       editor.addAction({
         id: "moon-execute",
-        label: "Execute Query",
+        label: "Execute Current Line or Selection",
         keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
-        run: async () => {
-          const store = useConsoleStore.getState();
-          const tab = store.tabs.find((t) => t.id === store.activeTabId);
-          if (!tab || tab.executing || !tab.content.trim()) return;
+        run: async (ed) => {
+          const selection = ed.getSelection();
+          const model = ed.getModel();
+          if (!model) return;
 
-          store.setExecuting(tab.id, true);
-          const result = await sendCommand(tab.content);
-          store.setResult(tab.id, result);
-          store.addToHistory(tab.id, {
-            query: tab.content,
-            language: tab.language,
-            result,
-            timestamp: Date.now(),
-          });
+          const hasSelection =
+            selection &&
+            (selection.startLineNumber !== selection.endLineNumber ||
+              selection.startColumn !== selection.endColumn);
+
+          let text: string;
+          let multiLine: boolean;
+          if (hasSelection) {
+            text = model.getValueInRange(selection);
+            multiLine = text.includes("\n");
+          } else {
+            // Execute the current line only
+            const lineNumber = selection?.positionLineNumber ?? 1;
+            text = model.getLineContent(lineNumber);
+            multiLine = false;
+          }
+
+          await runQuery(text, multiLine);
+        },
+      });
+
+      editor.addAction({
+        id: "moon-execute-all",
+        label: "Execute All Lines",
+        keybindings: [
+          monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter,
+        ],
+        run: async (ed) => {
+          const model = ed.getModel();
+          if (!model) return;
+          await runQuery(model.getValue(), true);
         },
       });
 

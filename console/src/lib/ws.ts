@@ -82,8 +82,52 @@ export function connectWS(): void {
 }
 
 /**
- * Send a raw command string. Uses WebSocket if connected, falls back to REST.
- * The raw string is split: first word = command, rest = args.
+ * Parse a raw command line into cmd + args.
+ * Splits on whitespace, but respects double-quoted strings so values with
+ * spaces can be sent (e.g. `SET k "hello world"`).
+ */
+function parseCommandLine(raw: string): { cmd: string; args: string[] } {
+  const tokens: string[] = [];
+  let buf = "";
+  let inQuote = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inQuote) {
+      if (c === "\"") {
+        inQuote = false;
+      } else if (c === "\\" && i + 1 < raw.length) {
+        buf += raw[++i];
+      } else {
+        buf += c;
+      }
+      continue;
+    }
+    if (c === "\"") {
+      inQuote = true;
+      continue;
+    }
+    if (/\s/.test(c)) {
+      if (buf.length) {
+        tokens.push(buf);
+        buf = "";
+      }
+      continue;
+    }
+    buf += c;
+  }
+  if (buf.length) tokens.push(buf);
+  const [cmd = "", ...args] = tokens;
+  return { cmd, args };
+}
+
+/**
+ * Send a raw command string. If the input contains multiple non-empty,
+ * non-comment lines (comment = `#` or `//`), each line is sent as a separate
+ * command and the collected results are returned. This matches redis-cli
+ * multi-line paste behavior.
+ *
+ * If you need to execute a single multi-line query (e.g. a Cypher statement),
+ * use sendSingleCommand() instead.
  */
 export async function sendCommand(raw: string): Promise<QueryResult> {
   const trimmed = raw.trim();
@@ -91,13 +135,73 @@ export async function sendCommand(raw: string): Promise<QueryResult> {
     return { data: null, raw: "", elapsed_ms: 0, error: "Empty command" };
   }
 
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#") && !l.startsWith("//"));
+
+  if (lines.length === 0) {
+    return { data: null, raw: "", elapsed_ms: 0, error: "Empty command" };
+  }
+
+  if (lines.length === 1) {
+    return sendSingleCommand(lines[0]);
+  }
+
+  // Multi-line: execute sequentially, collect results
+  const start = performance.now();
+  const results: Array<{ line: string; result: QueryResult }> = [];
+  let firstError: string | undefined;
+  for (const line of lines) {
+    const r = await sendSingleCommand(line);
+    results.push({ line, result: r });
+    if (r.error && !firstError) firstError = `${line} → ${r.error}`;
+  }
+  const elapsed_ms = performance.now() - start;
+
+  // Collate into one displayable result
+  const collated = results.map(({ line, result }) => ({
+    command: line,
+    result: result.error ? `ERROR: ${result.error}` : result.data,
+    elapsed_ms: Math.round(result.elapsed_ms * 100) / 100,
+  }));
+
+  return {
+    data: collated,
+    raw: collated
+      .map((r) => `> ${r.command}\n${JSON.stringify(r.result, null, 2)}`)
+      .join("\n\n"),
+    elapsed_ms,
+    error: firstError,
+  };
+}
+
+/**
+ * Send a single command. Use this for Cypher or any query that may legally
+ * span multiple lines.
+ */
+export async function sendSingleCommand(raw: string): Promise<QueryResult> {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { data: null, raw: "", elapsed_ms: 0, error: "Empty command" };
+  }
+
+  const { cmd, args } = parseCommandLine(trimmed);
+  if (!cmd) {
+    return { data: null, raw: "", elapsed_ms: 0, error: "Empty command" };
+  }
+
   // If WS is connected, send over WebSocket
   if (ws && ws.readyState === WebSocket.OPEN) {
     const id = ++requestId;
+    const start = performance.now();
     return new Promise<QueryResult>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      ws!.send(JSON.stringify({ id, command: trimmed }));
-      // Timeout after 30s
+      pending.set(id, {
+        resolve: (r) => resolve({ ...r, elapsed_ms: r.elapsed_ms || performance.now() - start }),
+        reject,
+      });
+      // Protocol: { id, cmd, args } — matches src/admin/ws_bridge.rs expectations
+      ws!.send(JSON.stringify({ id, cmd, args }));
       setTimeout(() => {
         if (pending.has(id)) {
           pending.delete(id);
@@ -108,9 +212,6 @@ export async function sendCommand(raw: string): Promise<QueryResult> {
   }
 
   // Fallback to REST API
-  const parts = trimmed.split(/\s+/);
-  const cmd = parts[0];
-  const args = parts.slice(1);
   const start = performance.now();
   try {
     const data = await execCommand(cmd, args);

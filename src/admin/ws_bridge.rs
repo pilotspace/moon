@@ -117,16 +117,23 @@ async fn process_ws_message(
         }
     };
 
+    // Extract request_id FIRST so error responses can echo it back and
+    // clients can correlate them to pending promises (preventing timeouts
+    // on malformed input).
+    let request_id = parsed.get("id").cloned();
+
     let cmd = match parsed.get("cmd").and_then(|v| v.as_str()) {
         Some(c) => c.to_uppercase(),
         None => {
-            return serde_json::json!({
+            let mut resp = serde_json::json!({
                 "error": "Missing 'cmd' field"
             });
+            if let Some(id) = request_id {
+                resp["id"] = id;
+            }
+            return resp;
         }
     };
-
-    let request_id = parsed.get("id").cloned();
 
     // Handle SELECT locally (changes session db).
     if cmd == "SELECT" {
