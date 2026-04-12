@@ -12,9 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance — PR #43 Recovery (2026-04-12)
 
-- **ACL caching**: per-connection `cached_acl_unrestricted` flag skips RwLock + HashMap SipHash probe on every command for unrestricted users (~2.3% CPU saved).
-- **Inline SET dispatch**: extend `try_inline_dispatch` to handle plain `SET key value` from raw RESP bytes, bypassing Frame construction/drop. Handles eviction + AOF (~8% CPU saved).
-- **NEON SIMD for DashTable**: AArch64 NEON path for `Group::match_h2` and `match_empty_or_deleted`, replacing scalar 16-iteration loop with ~4-instruction SIMD sequence (~14% CPU target on aarch64).
+Measured on aarch64 Linux (OrbStack moon-dev, 1 shard, 50 clients, `redis-benchmark` 8.0.2):
+
+- **SET p=16: +30.4%** (2.26M → 2.94M rps) — primary target hit
+- **SET p=1: -7.6%** (256K → 237K rps) — acceptable regression at low pipelining
+- **GET p=16: ±0%** (3.32M → 3.32M rps) — within noise
+
+Three optimisation tracks:
+
+- **ACL caching**: per-connection `cached_acl_unrestricted` flag skips RwLock + HashMap SipHash probe on every command for unrestricted users.
+- **Inline SET dispatch**: extend `try_inline_dispatch` to handle plain `SET key value` from raw RESP bytes, bypassing Frame construction/drop. Handles eviction + AOF.
+- **NEON SIMD for DashTable**: AArch64 NEON path for `Group::match_h2` (1.39× scalar) and `match_empty_or_deleted` (7.68× scalar). Microbench: `cargo bench --bench simd_probe`.
 
 ### Added — Graph Engine Integration (v0.1.4, 2026-04-11)
 
