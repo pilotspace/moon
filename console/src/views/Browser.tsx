@@ -1,6 +1,7 @@
 import { KeyList } from "@/components/browser/KeyList";
 import { NamespaceTree } from "@/components/browser/NamespaceTree";
 import { KeyToolbar } from "@/components/browser/KeyToolbar";
+import { ValuePanel } from "@/components/browser/ValuePanel";
 import { useBrowserStore } from "@/stores/browser";
 import { Card } from "@/components/ui/card";
 
@@ -23,15 +24,10 @@ export function Browser() {
           <KeyList />
         </Card>
 
-        {/* Right: Value editor panel (placeholder for Plan 02) */}
+        {/* Right: Value editor panel */}
         {selectedKey && (
           <Card className="w-[420px] shrink-0 flex flex-col overflow-hidden">
-            <div className="px-4 py-3 border-b border-border">
-              <h2 className="text-sm font-medium text-zinc-100 truncate">{selectedKey}</h2>
-            </div>
-            <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
-              Value editor - Phase 130 Plan 02
-            </div>
+            <ValuePanel keyName={selectedKey} />
           </Card>
         )}
       </div>
