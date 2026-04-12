@@ -134,11 +134,10 @@ mod tests {
 
     #[test]
     fn origins_view_returns_configured_list() {
-        let p = CorsPolicy::new(
-            &["https://a".to_string(), "https://b".to_string()],
-            true,
-        )
-        .unwrap();
-        assert_eq!(p.origins(), &["https://a".to_string(), "https://b".to_string()]);
+        let p = CorsPolicy::new(&["https://a".to_string(), "https://b".to_string()], true).unwrap();
+        assert_eq!(
+            p.origins(),
+            &["https://a".to_string(), "https://b".to_string()]
+        );
     }
 }

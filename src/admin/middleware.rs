@@ -40,10 +40,7 @@ fn full_body(data: Bytes) -> BoxBody<Bytes, Infallible> {
     Full::new(data).map_err(|never| match never {}).boxed()
 }
 
-fn status_text(
-    status: StatusCode,
-    body: &'static str,
-) -> Response<BoxBody<Bytes, Infallible>> {
+fn status_text(status: StatusCode, body: &'static str) -> Response<BoxBody<Bytes, Infallible>> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
@@ -77,17 +74,11 @@ pub fn is_auth_exempt(path: &str) -> bool {
 ///
 /// Per the CORS spec, preflight MUST complete even when credentials are
 /// required, so this stage never invokes auth or rate-limit logic.
-pub fn handle_preflight(
-    req: &Request<Incoming>,
-    cors: &CorsPolicy,
-) -> MiddlewareOutcome {
+pub fn handle_preflight(req: &Request<Incoming>, cors: &CorsPolicy) -> MiddlewareOutcome {
     if req.method() != Method::OPTIONS {
         return MiddlewareOutcome::Continue;
     }
-    let origin = req
-        .headers()
-        .get("origin")
-        .and_then(|v| v.to_str().ok());
+    let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
 
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(allowed) = cors.allowed_header(origin) {
@@ -167,10 +158,8 @@ pub fn attach_cors_headers(
                 "access-control-allow-credentials",
                 hyper::header::HeaderValue::from_static("true"),
             );
-            resp.headers_mut().insert(
-                "vary",
-                hyper::header::HeaderValue::from_static("origin"),
-            );
+            resp.headers_mut()
+                .insert("vary", hyper::header::HeaderValue::from_static("origin"));
         }
     }
 }
@@ -212,8 +201,7 @@ mod tests {
     #[test]
     fn attach_cors_adds_origin_for_allowed() {
         let cors = CorsPolicy::new(&["https://ok.example".to_string()], true).unwrap();
-        let mut resp: Response<BoxBody<Bytes, Infallible>> =
-            Response::new(full_body(Bytes::new()));
+        let mut resp: Response<BoxBody<Bytes, Infallible>> = Response::new(full_body(Bytes::new()));
         attach_cors_headers(&mut resp, Some("https://ok.example"), &cors);
         assert_eq!(
             resp.headers()
@@ -232,8 +220,7 @@ mod tests {
     #[test]
     fn attach_cors_elides_header_for_disallowed() {
         let cors = CorsPolicy::new(&["https://ok.example".to_string()], true).unwrap();
-        let mut resp: Response<BoxBody<Bytes, Infallible>> =
-            Response::new(full_body(Bytes::new()));
+        let mut resp: Response<BoxBody<Bytes, Infallible>> = Response::new(full_body(Bytes::new()));
         attach_cors_headers(&mut resp, Some("https://evil.example"), &cors);
         assert!(resp.headers().get("access-control-allow-origin").is_none());
         assert!(
@@ -246,8 +233,7 @@ mod tests {
     #[test]
     fn attach_cors_wildcard_no_credentials() {
         let cors = CorsPolicy::new(&["*".to_string()], false).unwrap();
-        let mut resp: Response<BoxBody<Bytes, Infallible>> =
-            Response::new(full_body(Bytes::new()));
+        let mut resp: Response<BoxBody<Bytes, Infallible>> = Response::new(full_body(Bytes::new()));
         attach_cors_headers(&mut resp, Some("https://any.example"), &cors);
         assert_eq!(
             resp.headers()

@@ -94,7 +94,11 @@ fn scan_fanout_returns_all_keys_across_shards() {
             ADMIN_PORT, cursor
         );
         let (status, body) = curl_get(&url);
-        assert_eq!(status, 200, "SCAN call failed: status={} body={}", status, body);
+        assert_eq!(
+            status, 200,
+            "SCAN call failed: status={} body={}",
+            status, body
+        );
         let json: serde_json::Value = serde_json::from_str(&body)
             .unwrap_or_else(|e| panic!("invalid JSON from SCAN: {} body={}", e, body));
         let next_cursor = json["cursor"]

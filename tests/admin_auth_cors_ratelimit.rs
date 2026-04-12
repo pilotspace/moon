@@ -102,8 +102,8 @@ fn sign_token(secret: &[u8], user: &str) -> String {
     use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret)
-        .expect("hmac key init");
+    let mut mac =
+        <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret).expect("hmac key init");
     mac.update(user.as_bytes());
     let sig = mac.finalize().into_bytes();
     format!(
@@ -152,11 +152,7 @@ fn hard01_auth_required_rejects_anon_and_accepts_bearer() {
 
 #[test]
 fn hard01_tampered_signature_rejected() {
-    let Some(m) = spawn_moon(&[
-        "--console-auth-required",
-        "--console-auth-secret",
-        "s",
-    ]) else {
+    let Some(m) = spawn_moon(&["--console-auth-required", "--console-auth-secret", "s"]) else {
         return;
     };
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
@@ -178,10 +174,7 @@ fn hard01_tampered_signature_rejected() {
 
 #[test]
 fn hard02_cors_allowlist_only_echoes_allowed_origin() {
-    let Some(m) = spawn_moon(&[
-        "--console-cors-origin",
-        "https://allowed.example",
-    ]) else {
+    let Some(m) = spawn_moon(&["--console-cors-origin", "https://allowed.example"]) else {
         return;
     };
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
@@ -253,12 +246,7 @@ fn hard02_wildcard_with_auth_rejected_at_startup() {
 fn hard03_rate_limit_returns_429_with_retry_after() {
     // Very low burst so we can drain the bucket with a handful of requests
     // without making the test slow.
-    let Some(m) = spawn_moon(&[
-        "--console-rate-limit",
-        "5",
-        "--console-rate-burst",
-        "5",
-    ]) else {
+    let Some(m) = spawn_moon(&["--console-rate-limit", "5", "--console-rate-burst", "5"]) else {
         return;
     };
     let url = format!("http://127.0.0.1:{}/api/v1/info", m.admin);
@@ -313,11 +301,7 @@ fn preflight_bypasses_auth() {
 
 #[test]
 fn healthz_and_readyz_bypass_auth() {
-    let Some(m) = spawn_moon(&[
-        "--console-auth-required",
-        "--console-auth-secret",
-        "s",
-    ]) else {
+    let Some(m) = spawn_moon(&["--console-auth-required", "--console-auth-secret", "s"]) else {
         return;
     };
     for path in ["/healthz", "/readyz", "/metrics"] {

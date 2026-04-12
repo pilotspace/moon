@@ -110,9 +110,7 @@ async fn handle_request(
         use crate::admin::middleware::{self, MiddlewareOutcome};
 
         // 1) CORS preflight short-circuit.
-        if let MiddlewareOutcome::Respond(r) =
-            middleware::handle_preflight(&req, &state.cors)
-        {
+        if let MiddlewareOutcome::Respond(r) = middleware::handle_preflight(&req, &state.cors) {
             return Ok(r);
         }
         // 2) Auth (liveness/readiness/metrics are exempt).
@@ -122,8 +120,7 @@ async fn handle_request(
             }
         }
         // 3) Rate limit (always on; disabled limiter is a cheap no-op).
-        if let MiddlewareOutcome::Respond(r) =
-            middleware::check_rate_limit(remote_ip, &state.rate)
+        if let MiddlewareOutcome::Respond(r) = middleware::check_rate_limit(remote_ip, &state.rate)
         {
             return Ok(r);
         }
@@ -452,8 +449,7 @@ async fn handle_scan_keys(
                     Ok(s) => serde_json::Value::String(s.to_string()),
                     Err(_) => {
                         use base64::Engine;
-                        let enc =
-                            base64::engine::general_purpose::STANDARD.encode(b.as_ref());
+                        let enc = base64::engine::general_purpose::STANDARD.encode(b.as_ref());
                         serde_json::json!({ "base64": enc })
                     }
                 })
@@ -765,10 +761,8 @@ pub fn spawn_admin_server(
                 // Build state after the admin runtime exists so the
                 // RateLimiter can spawn its cleanup task (HARD-03).
                 #[cfg(feature = "console")]
-                let rate = crate::admin::rate_limit::RateLimiter::new(
-                    rate_limit_rps,
-                    rate_limit_burst,
-                );
+                let rate =
+                    crate::admin::rate_limit::RateLimiter::new(rate_limit_rps, rate_limit_burst);
                 let state = Arc::new(AdminState {
                     prometheus_handle,
                     ready,

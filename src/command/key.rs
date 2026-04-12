@@ -2,9 +2,9 @@ use bytes::Bytes;
 
 use crate::framevec;
 use crate::protocol::Frame;
+use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::entry::current_time_ms;
-use crate::storage::Database;
 
 use super::helpers::err_wrong_args;
 
@@ -891,7 +891,7 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::entry::{current_time_ms, Entry};
+    use crate::storage::entry::{Entry, current_time_ms};
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))

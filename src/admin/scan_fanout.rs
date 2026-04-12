@@ -121,10 +121,7 @@ pub async fn scan_all_shards(
             };
 
             let ks: Vec<Bytes> = match keys_frame {
-                Frame::Array(ks) => ks
-                    .iter()
-                    .filter_map(|k| as_bytes(k).cloned())
-                    .collect(),
+                Frame::Array(ks) => ks.iter().filter_map(|k| as_bytes(k).cloned()).collect(),
                 _ => Vec::new(),
             };
             (c, ks)

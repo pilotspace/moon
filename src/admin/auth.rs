@@ -153,10 +153,7 @@ mod tests {
     fn enabled_rejects_bad_signature() {
         let p = AuthPolicy::enabled(b"secret").unwrap();
         // Valid base64url but wrong signature.
-        assert!(
-            p.verify_header(Some("Bearer alice.QUJDREVGRw"))
-                .is_err()
-        );
+        assert!(p.verify_header(Some("Bearer alice.QUJDREVGRw")).is_err());
     }
 
     #[test]
