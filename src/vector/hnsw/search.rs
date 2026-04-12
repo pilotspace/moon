@@ -751,6 +751,132 @@ pub fn hnsw_search_filtered(
     collected
 }
 
+// ---------------------------------------------------------------------------
+// Console-only: debug HNSW trace (INT-02)
+// ---------------------------------------------------------------------------
+//
+// Exposes a per-layer visited/selected counter so the console can animate
+// the HNSW descent. Deliberately scoped: it does NOT instrument the beam
+// search itself (that would slow the hot path even when disabled). Instead
+// it calls the existing `hnsw_search` once and then derives per-layer
+// counts from the graph's neighbour list along the greedy-descent path
+// used by the search (entry point → nearest neighbour per layer).
+//
+// This is an approximation — good enough for a "bar chart per layer" UI
+// animation, not rich enough to reconstruct the full beam path. Full-
+// fidelity traces require per-query trace buffers threaded into the beam
+// loop and are deferred to a future plan.
+
+/// Per-layer counters produced by `hnsw_search_with_trace`. Serialised
+/// straight to JSON by the console handler.
+#[cfg(feature = "console")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HnswTraceLayer {
+    /// Layer index (0 = base, `max_level` at the top).
+    pub layer: u32,
+    /// Entry point node used for this layer's neighbour scan (BFS-reordered
+    /// for layer 0, original ID for upper layers — matches HNSW internals).
+    pub entry_id: u64,
+    /// Number of neighbours visited at this layer (fan-out from entry).
+    pub visited: u64,
+    /// Number of neighbours that would be retained after pruning, capped at
+    /// `ef_search` for upper layers / `k` for layer 0.
+    pub selected: u64,
+}
+
+/// Combined trace + result set returned by `hnsw_search_with_trace`.
+///
+/// `layers` is directly `Serialize`-able; `results` is kept in its native
+/// `SmallVec<SearchResult>` form so callers can remap ids / distances
+/// before serialisation. The HTTP handler projects `results` into the
+/// wire format itself.
+#[cfg(feature = "console")]
+#[derive(Debug, Clone)]
+pub struct HnswSearchTrace {
+    /// Per-layer counters, top-down (highest layer first, layer 0 last).
+    pub layers: Vec<HnswTraceLayer>,
+    /// Actual search results (identical to what `hnsw_search` would return).
+    pub results: SmallVec<[SearchResult; 32]>,
+}
+
+/// Run an HNSW search and collect a minimal layer-level trace alongside
+/// the result set.
+///
+/// # Semantics
+///
+/// - Empty graph (`num_nodes == 0`) returns `{ layers: [], results: [] }`.
+/// - Non-empty graphs run the normal `hnsw_search`, then walk the graph's
+///   upper-layer neighbour lists top-down. At each layer:
+///     - `visited` = number of neighbours of the current entry at that layer
+///     - `selected` = `min(visited, cap)` where cap is `ef_search` (upper)
+///       or `k` (base layer)
+///     - next layer's entry = first neighbour (greedy descent)
+///
+/// This is a debug approximation. It does NOT re-run the beam and does NOT
+/// expose full candidate paths. Callers are warned in the HTTP handler
+/// that this endpoint is debug-only.
+#[cfg(feature = "console")]
+pub fn hnsw_search_with_trace(
+    graph: &HnswGraph,
+    vectors_tq: &[u8],
+    query: &[f32],
+    collection: &crate::vector::turbo_quant::collection::CollectionMetadata,
+    k: usize,
+    ef_search: usize,
+    scratch: &mut SearchScratch,
+) -> HnswSearchTrace {
+    let num_nodes = graph.num_nodes();
+    if num_nodes == 0 {
+        return HnswSearchTrace {
+            layers: Vec::new(),
+            results: SmallVec::new(),
+        };
+    }
+
+    // Run the real search — this is the source of truth for `top_k_ids`.
+    let results = hnsw_search(graph, vectors_tq, query, collection, k, ef_search, scratch);
+
+    // Derive per-layer counters. Starts from the graph's entry point and
+    // walks down to layer 0, using the nearest neighbour as the entry for
+    // the layer below (mirrors the greedy descent in the real search).
+    let entry = graph.entry_point();
+    let max_level = graph.max_level() as usize;
+    let k_cap = k as u64;
+    let ef_cap = ef_search.max(k) as u64;
+
+    let mut layers = Vec::with_capacity(max_level + 1);
+    let mut current_entry: u32 = entry;
+
+    // Walk upper layers top-down (max_level..=1). Upper layers are indexed
+    // by ORIGINAL node id and use `neighbors_upper`.
+    for layer in (1..=max_level).rev() {
+        let neighbors = graph.neighbors_upper(current_entry, layer);
+        let visited = neighbors.len() as u64;
+        layers.push(HnswTraceLayer {
+            layer: layer as u32,
+            entry_id: current_entry as u64,
+            visited,
+            selected: visited.min(ef_cap),
+        });
+        if let Some(&next) = neighbors.first() {
+            current_entry = next;
+        }
+    }
+
+    // Layer 0 uses BFS-ordered storage; convert entry to BFS position.
+    let bfs_pos = graph.to_bfs(current_entry);
+    let l0_neighbors = graph.neighbors_l0(bfs_pos);
+    let l0_visited = l0_neighbors.len() as u64;
+    layers.push(HnswTraceLayer {
+        layer: 0,
+        entry_id: bfs_pos as u64,
+        visited: l0_visited,
+        selected: l0_visited.min(k_cap.max(ef_cap)),
+    });
+
+    HnswSearchTrace { layers, results }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,5 +1404,97 @@ mod tests {
             words_len,
             "visited words grew between searches"
         );
+    }
+
+    // ── Trace tests (console feature) ────────────────────────────────
+
+    #[cfg(feature = "console")]
+    #[test]
+    fn trace_empty_graph_returns_empty() {
+        distance::init();
+        let collection = CollectionMetadata::new(
+            1,
+            64,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        );
+        let graph =
+            HnswBuilder::new(16, 200, 42).build((collection.padded_dimension / 2 + 4) as u32);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(0, padded);
+        let query = vec![0.0f32; 64];
+
+        let trace = hnsw_search_with_trace(&graph, &[], &query, &collection, 5, 16, &mut scratch);
+        assert!(trace.layers.is_empty(), "empty graph must have no layers");
+        assert!(trace.results.is_empty(), "empty graph must have no results");
+    }
+
+    #[cfg(feature = "console")]
+    #[test]
+    fn trace_non_empty_graph_has_at_least_base_layer() {
+        let n = 100;
+        let dim = 64;
+        let k = 5;
+        let ef = 32;
+        let (_vectors, graph, tq_buf, collection) = build_test_index(n, dim, 16, 200);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        let mut query = lcg_f32(dim, 12345);
+        normalize(&mut query);
+
+        let trace =
+            hnsw_search_with_trace(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+
+        assert!(
+            !trace.layers.is_empty(),
+            "non-empty graph must produce at least one layer"
+        );
+        // Results respect k.
+        assert!(
+            trace.results.len() <= k,
+            "trace.results.len()={} must be <= k={}",
+            trace.results.len(),
+            k
+        );
+        // Base layer is always the final entry.
+        let base = trace
+            .layers
+            .last()
+            .expect("at least one layer for non-empty graph");
+        assert_eq!(base.layer, 0);
+        // Base layer should have fanned out to at least one neighbour
+        // (the graph connects all nodes at layer 0).
+        assert!(
+            base.visited > 0,
+            "base-layer visited count should be > 0 for a 100-node graph"
+        );
+    }
+
+    #[cfg(feature = "console")]
+    #[test]
+    fn trace_is_deterministic_across_runs() {
+        let n = 80;
+        let dim = 64;
+        let k = 5;
+        let ef = 32;
+        let (_vectors, graph, tq_buf, collection) = build_test_index(n, dim, 16, 200);
+        let padded = collection.padded_dimension;
+        let mut scratch = SearchScratch::new(n as u32, padded);
+
+        let mut query = lcg_f32(dim, 77);
+        normalize(&mut query);
+
+        let t1 = hnsw_search_with_trace(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+        let t2 = hnsw_search_with_trace(&graph, &tq_buf, &query, &collection, k, ef, &mut scratch);
+
+        assert_eq!(t1.layers.len(), t2.layers.len(), "layer count differs");
+        for (a, b) in t1.layers.iter().zip(t2.layers.iter()) {
+            assert_eq!(a.layer, b.layer);
+            assert_eq!(a.entry_id, b.entry_id);
+            assert_eq!(a.visited, b.visited);
+            assert_eq!(a.selected, b.selected);
+        }
     }
 }
