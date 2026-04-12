@@ -25,3 +25,15 @@ pub(crate) mod hnsw_trace;
 pub(crate) mod http_server_support;
 #[cfg(feature = "console")]
 pub(crate) mod memory_treemap;
+
+// HARD-01/02/03 (Phase 137): optional Bearer auth, CORS allowlist, per-IP
+// rate limit. Feature-gated behind `console`; default builds (no console)
+// do not compile or link this code.
+#[cfg(feature = "console")]
+pub mod auth;
+#[cfg(feature = "console")]
+pub mod cors;
+#[cfg(feature = "console")]
+pub mod middleware;
+#[cfg(feature = "console")]
+pub mod rate_limit;
