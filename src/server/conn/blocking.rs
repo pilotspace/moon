@@ -1200,11 +1200,16 @@ pub(crate) fn try_inline_dispatch(
     let key_start = pos;
     // `checked_add` catches the `key_len = usize::MAX` saturation case above:
     // plain `key_start + key_len` would wrap to a small value and falsely
-    // satisfy the subsequent `key_end + 2 > len` bounds check.
+    // satisfy the subsequent `key_end + 2 > len` bounds check.  Same for
+    // `key_end + 2` — on overflow it could wrap below `len` and slip past
+    // the guard, then panic on the out-of-bounds `buf[key_end]` index.
     let Some(key_end) = key_start.checked_add(key_len) else {
         return 0;
     };
-    if key_end + 2 > len || buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
+    let Some(key_end_crlf) = key_end.checked_add(2) else {
+        return 0;
+    };
+    if key_end_crlf > len || buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
         return 0;
     }
 
@@ -1215,7 +1220,10 @@ pub(crate) fn try_inline_dispatch(
 
     if is_get {
         // ---- GET path (read-only) ----
-        let consumed = key_end + 2;
+        // `key_end_crlf` above already validated `key_end + 2 <= len` via
+        // checked_add, so reusing it avoids re-deriving a value that was
+        // proven safe just above.
+        let consumed = key_end_crlf;
         let key_bytes = &buf[key_start..key_end];
         let guard = shard_databases.read_db(shard_id, selected_db);
         match guard.get_if_alive(key_bytes, now_ms) {
@@ -1294,10 +1302,12 @@ pub(crate) fn try_inline_dispatch(
     let Some(val_end) = val_start.checked_add(val_len) else {
         return 0;
     };
-    if val_end + 2 > len || buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
+    let Some(consumed) = val_end.checked_add(2) else {
+        return 0;
+    };
+    if consumed > len || buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
         return 0;
     }
-    let consumed = val_end + 2;
 
     // Freeze the consumed prefix of `read_buf` into an Arc-backed `Bytes`.
     // This replaces the BytesMut prefix with a refcounted view over the SAME
