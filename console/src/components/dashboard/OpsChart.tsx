@@ -31,34 +31,34 @@ export function OpsChart() {
             <AreaChart data={history} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="opsGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="oklch(0.7 0.15 250)" stopOpacity={0.3} />
-                  <stop offset="100%" stopColor="oklch(0.7 0.15 250)" stopOpacity={0} />
+                  <stop offset="0%" stopColor="oklch(0.72 0.12 250)" stopOpacity={0.3} />
+                  <stop offset="100%" stopColor="oklch(0.72 0.12 250)" stopOpacity={0} />
                 </linearGradient>
               </defs>
               <XAxis
                 dataKey="time"
                 tickFormatter={formatTime}
-                tick={{ fill: "#71717a", fontSize: 11 }}
+                tick={{ fill: "#a1a1aa", fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
                 minTickGap={40}
               />
               <YAxis
                 tickFormatter={formatOps}
-                tick={{ fill: "#71717a", fontSize: 11 }}
+                tick={{ fill: "#a1a1aa", fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
                 width={50}
               />
               <Tooltip
-                contentStyle={{ backgroundColor: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }}
+                contentStyle={{ backgroundColor: "#1E1E28", border: "1px solid #393944", borderRadius: 8 }}
                 labelFormatter={formatTime}
                 formatter={(v: number) => [formatOps(v), "ops/s"]}
               />
               <Area
                 type="monotone"
                 dataKey="ops_per_sec"
-                stroke="oklch(0.7 0.15 250)"
+                stroke="oklch(0.72 0.12 250)"
                 fill="url(#opsGrad)"
                 strokeWidth={2}
                 dot={false}

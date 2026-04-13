@@ -5,20 +5,20 @@ import * as THREE from "three";
 import { useVectorStore } from "@/stores/vector";
 import { HnswOverlay } from "./HnswOverlay";
 
-// Categorical palette for segments/labels (8 distinct colors)
+// Unified desaturated palette — readable on #06060a
 const PALETTE = [
-  new THREE.Color(0x6366f1), // indigo
-  new THREE.Color(0xf97316), // orange
-  new THREE.Color(0x22c55e), // green
-  new THREE.Color(0xef4444), // red
-  new THREE.Color(0x06b6d4), // cyan
-  new THREE.Color(0xa855f7), // purple
-  new THREE.Color(0xeab308), // yellow
-  new THREE.Color(0xec4899), // pink
+  new THREE.Color(0x6b93d4), // blue
+  new THREE.Color(0xcc8a5b), // orange
+  new THREE.Color(0x62b87a), // green
+  new THREE.Color(0xd4807a), // rose
+  new THREE.Color(0x5bbdad), // teal
+  new THREE.Color(0xa88bd4), // violet
+  new THREE.Color(0xc4a55a), // amber
+  new THREE.Color(0x8e92d4), // lavender
 ];
 
-const CYAN = new THREE.Color(0x22d3ee);
-const HIGHLIGHT = new THREE.Color(0xfbbf24);
+const CYAN = new THREE.Color(0x5bbdad);
+const HIGHLIGHT = new THREE.Color(0xd4b96e);
 
 const vertexShader = /* glsl */ `
   attribute vec3 aColor;

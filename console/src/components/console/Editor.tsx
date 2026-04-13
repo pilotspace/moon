@@ -126,6 +126,30 @@ export function Editor() {
         },
       });
 
+      // Add placeholder watermark when editor is empty
+      const updatePlaceholder = () => {
+        const model = editor.getModel();
+        const container = editor.getDomNode();
+        if (!model || !container) return;
+        let placeholder = container.querySelector(".moon-placeholder") as HTMLDivElement | null;
+        if (model.getValue().trim() === "") {
+          if (!placeholder) {
+            placeholder = document.createElement("div");
+            placeholder.className = "moon-placeholder";
+            placeholder.style.cssText =
+              "position:absolute;top:12px;left:64px;color:#52525b;font-size:14px;pointer-events:none;z-index:1;font-family:inherit;";
+            placeholder.textContent = "Type PING and press \u2318+Enter";
+            container.style.position = "relative";
+            container.appendChild(placeholder);
+          }
+          placeholder.style.display = "";
+        } else if (placeholder) {
+          placeholder.style.display = "none";
+        }
+      };
+      updatePlaceholder();
+      editor.onDidChangeModelContent(updatePlaceholder);
+
       editor.focus();
     },
     [],

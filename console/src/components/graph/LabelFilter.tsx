@@ -1,14 +1,8 @@
 import { useGraphStore } from "@/stores/graph";
 
 const PALETTE = [
-  "#6366f1",
-  "#f97316",
-  "#22c55e",
-  "#ef4444",
-  "#06b6d4",
-  "#a855f7",
-  "#eab308",
-  "#ec4899",
+  "#6B93D4", "#5BBDAD", "#A88BD4", "#CC8A5B",
+  "#D4807A", "#C4A55A", "#62B87A", "#8E92D4",
 ];
 
 export function LabelFilter() {
@@ -24,51 +18,37 @@ export function LabelFilter() {
 
   const labelEntries = Object.entries(graphInfo.labelCounts);
   const relEntries = Object.entries(graphInfo.relTypeCounts);
-
   if (labelEntries.length === 0 && relEntries.length === 0) return null;
 
   return (
     <section>
-      {/* Node Labels */}
       {labelEntries.length > 0 && (
         <div>
           <div className="mb-1 flex items-center justify-between">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
-              Node Labels
-            </h3>
-            <span className="flex gap-2">
-              <button
-                className="text-[10px] text-indigo-400 hover:text-indigo-300"
-                onClick={() => setAllLabelsVisible(true)}
-              >
-                All
-              </button>
-              <button
-                className="text-[10px] text-indigo-400 hover:text-indigo-300"
-                onClick={() => setAllLabelsVisible(false)}
-              >
-                None
-              </button>
+            <h3 className="text-[11px] font-medium text-zinc-500">Filter Labels</h3>
+            <span className="flex gap-1.5">
+              <MiniBtn onClick={() => setAllLabelsVisible(true)}>all</MiniBtn>
+              <MiniBtn onClick={() => setAllLabelsVisible(false)}>none</MiniBtn>
             </span>
           </div>
-          <div className="space-y-0.5">
+          <div className="space-y-px">
             {labelEntries.map(([label, count], i) => (
               <label
                 key={label}
-                className="flex cursor-pointer items-center gap-2 py-0.5 text-xs"
+                className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 text-xs hover:bg-zinc-800/40"
               >
                 <input
                   type="checkbox"
-                  className="accent-indigo-500"
+                  className="accent-sky-500"
                   checked={visibleLabels.has(label)}
                   onChange={() => toggleLabel(label)}
                 />
                 <span
-                  className="inline-block h-2 w-2 rounded-full"
+                  className="inline-block h-1.5 w-1.5 rounded-full"
                   style={{ backgroundColor: PALETTE[i % PALETTE.length] }}
                 />
                 <span className="flex-1 text-zinc-300">{label}</span>
-                <span className="font-mono text-[10px] text-zinc-500">
+                <span className="font-mono text-[10px] text-zinc-400">
                   {count.toLocaleString()}
                 </span>
               </label>
@@ -77,42 +57,29 @@ export function LabelFilter() {
         </div>
       )}
 
-      {/* Edge Types */}
       {relEntries.length > 0 && (
         <div className="mt-3">
           <div className="mb-1 flex items-center justify-between">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
-              Edge Types
-            </h3>
-            <span className="flex gap-2">
-              <button
-                className="text-[10px] text-indigo-400 hover:text-indigo-300"
-                onClick={() => setAllRelTypesVisible(true)}
-              >
-                All
-              </button>
-              <button
-                className="text-[10px] text-indigo-400 hover:text-indigo-300"
-                onClick={() => setAllRelTypesVisible(false)}
-              >
-                None
-              </button>
+            <h3 className="text-[11px] font-medium text-zinc-500">Filter Edges</h3>
+            <span className="flex gap-1.5">
+              <MiniBtn onClick={() => setAllRelTypesVisible(true)}>all</MiniBtn>
+              <MiniBtn onClick={() => setAllRelTypesVisible(false)}>none</MiniBtn>
             </span>
           </div>
-          <div className="space-y-0.5">
+          <div className="space-y-px">
             {relEntries.map(([relType, count]) => (
               <label
                 key={relType}
-                className="flex cursor-pointer items-center gap-2 py-0.5 text-xs"
+                className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 text-xs hover:bg-zinc-800/40"
               >
                 <input
                   type="checkbox"
-                  className="accent-indigo-500"
+                  className="accent-sky-500"
                   checked={visibleRelTypes.has(relType)}
                   onChange={() => toggleRelType(relType)}
                 />
                 <span className="flex-1 text-zinc-300">{relType}</span>
-                <span className="font-mono text-[10px] text-zinc-500">
+                <span className="font-mono text-[10px] text-zinc-400">
                   {count.toLocaleString()}
                 </span>
               </label>
@@ -121,5 +88,13 @@ export function LabelFilter() {
         </div>
       )}
     </section>
+  );
+}
+
+function MiniBtn({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button className="text-[10px] text-zinc-400 hover:text-zinc-400" onClick={onClick}>
+      {children}
+    </button>
   );
 }

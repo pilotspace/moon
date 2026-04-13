@@ -6,13 +6,13 @@ import { Badge } from "@/components/ui/badge";
 import type { MemoryNode } from "@/types/memory";
 
 const TYPE_COLORS: Record<string, string> = {
-  string: "#3b82f6",
-  hash: "#22c55e",
-  list: "#f97316",
-  set: "#a855f7",
-  zset: "#ef4444",
-  stream: "#14b8a6",
-  namespace: "#6b7280",
+  string: "#6B93D4",
+  hash: "#5BBDAD",
+  list: "#C4A55A",
+  set: "#A88BD4",
+  zset: "#8E92D4",
+  stream: "#62B87A",
+  namespace: "#6B6B78",
 };
 
 function formatBytes(bytes: number): string {
@@ -37,8 +37,11 @@ function CustomContent(props: TreemapContentProps) {
   if (width < 4 || height < 4) return null;
 
   const color = TYPE_COLORS[type ?? "namespace"] ?? TYPE_COLORS.namespace;
-  const showLabel = width > 50 && height > 30;
-  const showSize = width > 70 && height > 44;
+  const showLabel = width > 36 && height > 20;
+  const showSize = width > 60 && height > 36;
+  const maxChars = Math.max(1, Math.floor((width - 12) / 7));
+  const fontSize = width < 60 ? 10 : 12;
+  const truncated = name && name.length > maxChars ? name.slice(0, maxChars - 1) + "\u2026" : name;
 
   return (
     <g>
@@ -56,20 +59,20 @@ function CustomContent(props: TreemapContentProps) {
       />
       {showLabel && (
         <text
-          x={x + 6}
-          y={y + 16}
+          x={x + 4}
+          y={y + (fontSize === 10 ? 13 : 16)}
           fill="#fff"
-          fontSize={12}
+          fontSize={fontSize}
           fontWeight={500}
           style={{ pointerEvents: "none" }}
         >
-          {name && name.length > Math.floor(width / 7) ? name.slice(0, Math.floor(width / 7)) + "..." : name}
+          {truncated}
         </text>
       )}
       {showSize && size != null && (
         <text
-          x={x + 6}
-          y={y + 32}
+          x={x + 4}
+          y={y + (fontSize === 10 ? 24 : 32)}
           fill="rgba(255,255,255,0.7)"
           fontSize={10}
           style={{ pointerEvents: "none" }}

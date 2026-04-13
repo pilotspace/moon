@@ -7,15 +7,14 @@ export function ColorByControls() {
   const setColorBy = useVectorStore((s) => s.setColorBy);
 
   return (
-    <div className="flex items-center gap-1">
-      <span className="mr-1 text-[10px] text-zinc-500">Color:</span>
+    <div className="flex items-center gap-0.5 rounded-md bg-zinc-900 p-0.5">
       {MODES.map((mode) => (
         <button
           key={mode}
-          className={`rounded px-2 py-1 text-[10px] capitalize ${
+          className={`rounded-md px-2 py-1 text-xs capitalize transition-colors ${
             colorBy === mode
-              ? "border border-indigo-500 bg-indigo-600/20 text-indigo-300"
-              : "border border-zinc-700 bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+              ? "bg-zinc-700 text-zinc-100"
+              : "text-zinc-500 hover:text-zinc-300"
           }`}
           onClick={() => setColorBy(mode)}
         >

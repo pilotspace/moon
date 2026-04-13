@@ -66,6 +66,12 @@ export async function queryGraph(cypher: string): Promise<GraphData> {
   return parseGraphResult(result);
 }
 
+/** Execute a Cypher query on a specific named graph */
+export async function queryGraphNamed(graphName: string, cypher: string): Promise<GraphData> {
+  const result = await execCommand("GRAPH.QUERY", [graphName, cypher]);
+  return parseGraphResult(result);
+}
+
 /**
  * Parse GRAPH.QUERY result into nodes and edges.
  * GRAPH.QUERY returns: [headers[], row1[], row2[], ..., stats[]]

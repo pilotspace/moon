@@ -4,12 +4,12 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 const TYPE_COLORS: string[] = [
-  "oklch(0.7 0.15 250)",   // blue
-  "oklch(0.7 0.18 155)",   // green
-  "oklch(0.75 0.15 75)",   // amber
-  "oklch(0.7 0.15 320)",   // purple
-  "oklch(0.6 0.2 25)",     // red
-  "oklch(0.7 0.12 200)",   // teal
+  "#6B93D4",   // blue
+  "#5BBDAD",   // teal
+  "#C4A55A",   // amber
+  "#A88BD4",   // violet
+  "#D4807A",   // rose
+  "#62B87A",   // green
 ];
 
 export function KeyspaceCard() {
@@ -18,13 +18,22 @@ export function KeyspaceCard() {
 
   const data = useMemo(() => {
     const keyspace = serverInfo?.keyspace ?? {};
-    // Parse keyspace info: db0: keys=100,expires=10,avg_ttl=1000
-    const entries = Object.entries(keyspace).map(([db, info]) => {
-      const keys = Number(info.match(/keys=(\d+)/)?.[1] ?? 0);
-      return { name: db, keys };
-    });
+    // Parse keyspace info: "db0": "keys=100,expires=10,avg_ttl=1000"
+    // Moon may also return plain numeric values or "keys=N" without other fields
+    const entries = Object.entries(keyspace)
+      .filter(([db]) => db.startsWith("db"))
+      .map(([db, info]) => {
+        // Try "keys=N" format first
+        const match = info.match(/keys=(\d+)/);
+        if (match) return { name: db, keys: Number(match[1]) };
+        // Fallback: value might be a plain number
+        const num = Number(info);
+        if (!isNaN(num) && num > 0) return { name: db, keys: num };
+        return { name: db, keys: 0 };
+      })
+      .filter((e) => e.keys > 0);
     if (entries.length === 0 && latest) {
-      return [{ name: "total", keys: latest.total_keys }];
+      return [{ name: "db0", keys: latest.total_keys }];
     }
     return entries;
   }, [serverInfo, latest]);
@@ -44,18 +53,18 @@ export function KeyspaceCard() {
               <BarChart data={data} margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
                 <XAxis
                   dataKey="name"
-                  tick={{ fill: "#71717a", fontSize: 11 }}
+                  tick={{ fill: "#a1a1aa", fontSize: 11 }}
                   axisLine={false}
                   tickLine={false}
                 />
                 <YAxis
-                  tick={{ fill: "#71717a", fontSize: 11 }}
+                  tick={{ fill: "#a1a1aa", fontSize: 11 }}
                   axisLine={false}
                   tickLine={false}
                   width={40}
                 />
                 <Tooltip
-                  contentStyle={{ backgroundColor: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }}
+                  contentStyle={{ backgroundColor: "#1E1E28", border: "1px solid #393944", borderRadius: 8 }}
                 />
                 <Bar dataKey="keys" radius={[4, 4, 0, 0]}>
                   {data.map((entry, i) => (

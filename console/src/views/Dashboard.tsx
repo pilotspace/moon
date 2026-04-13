@@ -7,6 +7,7 @@ import { MemoryChart } from "@/components/dashboard/MemoryChart";
 import { ClientsCard } from "@/components/dashboard/ClientsCard";
 import { HitRatioCard } from "@/components/dashboard/HitRatioCard";
 import { KeyspaceCard } from "@/components/dashboard/KeyspaceCard";
+import { ServerInfoCard } from "@/components/dashboard/ServerInfoCard";
 import { SlowlogTable } from "@/components/dashboard/SlowlogTable";
 
 const REFRESH_INTERVAL_MS = 10_000; // Refresh INFO + slowlog every 10s
@@ -38,7 +39,8 @@ export function Dashboard() {
       </div>
 
       {/* Metric cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <ServerInfoCard />
         <ClientsCard />
         <HitRatioCard />
         <KeyspaceCard />

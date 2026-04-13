@@ -33,36 +33,33 @@ export function KnnSearchPanel() {
 
   return (
     <section>
-      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+      <h3 className="mb-1.5 text-[11px] font-medium text-zinc-500">
         KNN Search
       </h3>
 
       <div className="space-y-2">
-        {/* K input */}
         <div className="flex items-center gap-2">
-          <label className="text-xs text-zinc-500">K:</label>
+          <label className="text-xs text-zinc-500">k</label>
           <input
             type="number"
             min={1}
             max={100}
             value={k}
             onChange={(e) => setK(Math.max(1, Math.min(100, Number(e.target.value))))}
-            className="w-16 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200 focus:border-indigo-500 focus:outline-none"
+            className="w-14 rounded-md border border-zinc-700/50 bg-zinc-900 px-2 py-1 text-xs text-zinc-200 focus:border-indigo-500 focus:outline-none"
           />
         </div>
 
-        {/* Search from selected point */}
         <button
           disabled={!hoveredPointId}
-          className="w-full rounded bg-cyan-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-40"
+          className="w-full rounded-md bg-indigo-600/80 px-2 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-30"
           onClick={handleSearchFromSelected}
         >
           Search from selected point
         </button>
 
-        {/* Manual vector input toggle */}
         <button
-          className="text-[10px] text-zinc-500 hover:text-zinc-300"
+          className="text-[10px] text-zinc-600 hover:text-zinc-400"
           onClick={() => setShowManual(!showManual)}
         >
           {showManual ? "Hide" : "Show"} manual query
@@ -71,13 +68,13 @@ export function KnnSearchPanel() {
         {showManual && (
           <div className="space-y-1">
             <textarea
-              className="h-16 w-full resize-none rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-[10px] text-zinc-200 focus:border-indigo-500 focus:outline-none"
+              className="h-14 w-full resize-none rounded-md border border-zinc-700/50 bg-zinc-900 px-2 py-1 font-mono text-[10px] text-zinc-200 placeholder:text-zinc-700 focus:border-indigo-500 focus:outline-none"
               placeholder="0.1, 0.2, 0.3, ..."
               value={manualVector}
               onChange={(e) => setManualVector(e.target.value)}
             />
             <button
-              className="w-full rounded bg-indigo-600 px-2 py-1 text-xs font-medium text-white hover:bg-indigo-500"
+              className="w-full rounded-md bg-zinc-800 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-700"
               onClick={handleManualSearch}
             >
               Search
@@ -85,30 +82,29 @@ export function KnnSearchPanel() {
           </div>
         )}
 
-        {/* Results */}
         {knnResults.length > 0 && (
-          <div className="mt-2 border-t border-zinc-800 pt-2">
+          <div className="border-t border-zinc-800/60 pt-2">
             <div className="mb-1 flex items-center justify-between">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              <span className="text-[11px] font-medium text-zinc-500">
                 Results ({knnResults.length})
               </span>
               <button
-                className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                className="text-[10px] text-zinc-600 hover:text-zinc-400"
                 onClick={clearKnnResults}
               >
                 Clear
               </button>
             </div>
             {knnQueryPointId && (
-              <div className="mb-1 text-[10px] text-cyan-400">
-                Query: {points.find((p) => p.id === knnQueryPointId)?.key ?? knnQueryPointId}
+              <div className="mb-1 truncate text-[10px] text-indigo-400">
+                {points.find((p) => p.id === knnQueryPointId)?.key ?? knnQueryPointId}
               </div>
             )}
-            <div className="max-h-48 space-y-0.5 overflow-y-auto">
+            <div className="max-h-40 space-y-px overflow-y-auto">
               {knnResults.map((r, i) => (
                 <button
                   key={r.key}
-                  className="flex w-full items-center justify-between rounded px-1.5 py-1 text-left text-xs hover:bg-zinc-800"
+                  className="flex w-full items-center justify-between rounded-md px-1.5 py-0.5 text-left text-xs hover:bg-zinc-800/60"
                   onClick={() => {
                     const pt = points.find((p) => p.key === r.key);
                     if (pt) setHovered(pt.id);

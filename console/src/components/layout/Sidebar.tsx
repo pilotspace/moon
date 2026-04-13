@@ -12,13 +12,13 @@ import { cn } from "@/lib/utils";
 import { useMetricsStore } from "@/stores/metrics";
 
 const navItems = [
-  { to: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
-  { to: "/browser", icon: Database, label: "Browser" },
-  { to: "/console", icon: Terminal, label: "Console" },
-  { to: "/vectors", icon: Hexagon, label: "Vectors" },
-  { to: "/graph", icon: GitFork, label: "Graph" },
-  { to: "/memory", icon: MemoryStick, label: "Memory" },
-  { to: "/help", icon: BookOpen, label: "Help" },
+  { to: "/dashboard", icon: LayoutDashboard, label: "Dashboard", accent: "text-[#6B93D4]" },
+  { to: "/browser", icon: Database, label: "Browser", accent: "text-[#6BC4A0]" },
+  { to: "/console", icon: Terminal, label: "Console", accent: "text-[#C8A86B]" },
+  { to: "/vectors", icon: Hexagon, label: "Vectors", accent: "text-[#9B8FD4]" },
+  { to: "/graph", icon: GitFork, label: "Graph", accent: "text-[#6BB8C8]" },
+  { to: "/memory", icon: MemoryStick, label: "Memory", accent: "text-[#D48B8B]" },
+  { to: "/help", icon: BookOpen, label: "Help", accent: "text-zinc-400" },
 ];
 
 export function Sidebar() {
@@ -36,7 +36,7 @@ export function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 space-y-1 px-2 py-3">
-        {navItems.map(({ to, icon: Icon, label }) => (
+        {navItems.map(({ to, icon: Icon, label, accent }) => (
           <NavLink
             key={to}
             to={to}
@@ -49,8 +49,12 @@ export function Sidebar() {
               )
             }
           >
-            <Icon className="h-4 w-4" />
-            {label}
+            {({ isActive }) => (
+              <>
+                <Icon className={cn("h-4 w-4", isActive && accent)} />
+                {label}
+              </>
+            )}
           </NavLink>
         ))}
       </nav>

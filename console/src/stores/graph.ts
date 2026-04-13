@@ -5,11 +5,13 @@ import type {
   GraphInfo,
   ForceWorkerResponse,
 } from "@/types/graph";
-import { fetchGraphInfo, queryGraph } from "@/lib/graph-api";
+import { fetchGraphInfo, fetchGraphList, queryGraphNamed } from "@/lib/graph-api";
 
 interface GraphState {
   // Metadata
   graphInfo: GraphInfo | null;
+  graphNames: string[];
+  selectedGraph: string | null;
 
   // Graph data
   nodes: GraphNode[];
@@ -36,6 +38,7 @@ interface GraphState {
 
   // Actions
   loadGraphInfo: () => Promise<void>;
+  selectGraph: (name: string) => void;
   runQuery: (cypher: string) => Promise<void>;
   runForceLayout: (nodes: GraphNode[], edges: GraphEdge[]) => void;
   setCypherInput: (input: string) => void;
@@ -51,6 +54,8 @@ let forceWorker: Worker | null = null;
 
 export const useGraphStore = create<GraphState>((set, get) => ({
   graphInfo: null,
+  graphNames: [],
+  selectedGraph: null,
   nodes: [],
   edges: [],
   positions: null,
@@ -60,11 +65,15 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   hoveredNodeId: null,
   visibleLabels: new Set<string>(),
   visibleRelTypes: new Set<string>(),
-  cypherInput: "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 200",
+  cypherInput: "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 500",
   cypherError: null,
 
   loadGraphInfo: async () => {
     try {
+      const names = await fetchGraphList();
+      const selected = get().selectedGraph ?? names[0] ?? null;
+      set({ graphNames: names, selectedGraph: selected });
+      if (!selected) { set({ graphInfo: null }); return; }
       const info = await fetchGraphInfo();
       set({
         graphInfo: info,
@@ -76,6 +85,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     }
   },
 
+  selectGraph: (name: string) => {
+    set({ selectedGraph: name, nodes: [], edges: [], positions: null, graphInfo: null });
+    get().loadGraphInfo();
+  },
+
   runQuery: async (cypher: string) => {
     set({
       loading: true,
@@ -84,7 +98,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       positions: null,
     });
     try {
-      const data = await queryGraph(cypher);
+      const graphName = get().selectedGraph ?? "default";
+      const data = await queryGraphNamed(graphName, cypher);
       if (data.nodes.length === 0) {
         set({
           nodes: [],
@@ -95,10 +110,15 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         return;
       }
 
-      // Collect all labels and rel types from results
+      // Collect all labels and rel types from results.
+      // Assign a default "Node" label to any node that has no labels
+      // (Moon returns node refs as "node:XXX" strings without label data).
       const labels = new Set<string>();
       const relTypes = new Set<string>();
-      for (const n of data.nodes) n.labels.forEach((l) => labels.add(l));
+      for (const n of data.nodes) {
+        if (n.labels.length === 0) n.labels.push("Node");
+        n.labels.forEach((l) => labels.add(l));
+      }
       for (const e of data.edges) relTypes.add(e.type);
 
       set({

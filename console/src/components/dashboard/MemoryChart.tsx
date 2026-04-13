@@ -32,34 +32,34 @@ export function MemoryChart() {
             <AreaChart data={history} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="memGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="oklch(0.7 0.18 155)" stopOpacity={0.3} />
-                  <stop offset="100%" stopColor="oklch(0.7 0.18 155)" stopOpacity={0} />
+                  <stop offset="0%" stopColor="oklch(0.72 0.14 155)" stopOpacity={0.3} />
+                  <stop offset="100%" stopColor="oklch(0.72 0.14 155)" stopOpacity={0} />
                 </linearGradient>
               </defs>
               <XAxis
                 dataKey="time"
                 tickFormatter={formatTime}
-                tick={{ fill: "#71717a", fontSize: 11 }}
+                tick={{ fill: "#a1a1aa", fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
                 minTickGap={40}
               />
               <YAxis
                 tickFormatter={formatBytes}
-                tick={{ fill: "#71717a", fontSize: 11 }}
+                tick={{ fill: "#a1a1aa", fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
                 width={60}
               />
               <Tooltip
-                contentStyle={{ backgroundColor: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }}
+                contentStyle={{ backgroundColor: "#1E1E28", border: "1px solid #393944", borderRadius: 8 }}
                 labelFormatter={formatTime}
                 formatter={(v: number) => [formatBytes(v), "memory"]}
               />
               <Area
                 type="monotone"
                 dataKey="total_memory"
-                stroke="oklch(0.7 0.18 155)"
+                stroke="oklch(0.72 0.14 155)"
                 fill="url(#memGrad)"
                 strokeWidth={2}
                 dot={false}

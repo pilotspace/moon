@@ -182,6 +182,53 @@ export const useBrowserStore = create<BrowserState>((set, get) => ({
     }
 
     set({ treeRoot: root });
+
+    // Discover all prefixes asynchronously by scanning the full keyspace
+    (async () => {
+      try {
+        const seen = new Set(keys.map((k) => k.name));
+        let cursor = "0";
+        let rounds = 0;
+        do {
+          const result = await scanKeys(cursor, "*", 500);
+          cursor = result.cursor;
+          let changed = false;
+          for (const name of result.keys) {
+            if (seen.has(name)) continue;
+            seen.add(name);
+            const parts = name.split(":");
+            if (parts.length <= 1) continue;
+            let current = root;
+            let prefix = "";
+            for (let i = 0; i < parts.length - 1; i++) {
+              prefix += (i > 0 ? ":" : "") + parts[i];
+              const childPrefix = prefix + ":";
+              if (!current.children.has(parts[i])) {
+                current.children.set(parts[i], {
+                  name: parts[i],
+                  fullPrefix: childPrefix,
+                  children: new Map(),
+                  keyCount: 0,
+                  expanded: false,
+                  loading: false,
+                });
+                changed = true;
+              }
+              const child = current.children.get(parts[i])!;
+              child.keyCount++;
+              current = child;
+            }
+          }
+          if (changed) {
+            root.keyCount = seen.size;
+            set({ treeRoot: { ...root } });
+          }
+          rounds++;
+        } while (cursor !== "0" && rounds < 20);
+      } catch {
+        // Silently ignore — namespace discovery is best-effort
+      }
+    })();
   },
 
   deleteSelected: async () => {
