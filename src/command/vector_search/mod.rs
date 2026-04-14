@@ -680,6 +680,16 @@ pub fn ft_search(
     // Parse optional SESSION clause
     let session_key = parse_session_clause(args);
 
+    // Parse optional RANGE threshold for distance filtering (AGNT-05)
+    let range_threshold = parse_range_clause(args);
+
+    // Look up metric for range filtering (cheap immutable borrow before search paths)
+    let range_metric = if range_threshold.is_some() {
+        store.get_index(index_name.as_ref()).map(|idx| idx.meta.default_field().metric)
+    } else {
+        None
+    };
+
     // Determine k from KNN or default to 10 for sparse-only
     let (k, field_name, dense_param) = match &knn_parsed {
         Some((k, fname, pname)) => (*k, fname.clone(), Some(pname.clone())),
@@ -752,8 +762,15 @@ pub fn ft_search(
         };
 
         // RRF fusion
-        let (fused, dense_count, sparse_count) =
+        let (mut fused, dense_count, sparse_count) =
             crate::vector::fusion::rrf_fuse(&dense_results, &sparse_results, k);
+
+        // Apply RANGE threshold filter to fused results (AGNT-05)
+        if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+            let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
+            apply_range_filter(&mut sv, threshold, metric);
+            fused = sv.into_vec();
+        }
 
         crate::vector::metrics::increment_search();
         return build_hybrid_response(
@@ -780,7 +797,15 @@ pub fn ft_search(
         let sparse_count = sparse_results.len();
 
         // Convert to SmallVec for build_hybrid_response
-        let fused: Vec<SearchResult> = sparse_results;
+        let mut fused: Vec<SearchResult> = sparse_results;
+
+        // Apply RANGE threshold filter (AGNT-05)
+        if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+            let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
+            apply_range_filter(&mut sv, threshold, metric);
+            fused = sv.into_vec();
+        }
+
         crate::vector::metrics::increment_search();
         return build_hybrid_response(
             &fused,
@@ -824,6 +849,11 @@ pub fn ft_search(
                     &key_hash_to_key,
                 );
 
+                // Apply RANGE threshold filter (AGNT-05)
+                if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+                    apply_range_filter(&mut results, threshold, metric);
+                }
+
                 // Build response from filtered results
                 let response = build_search_response(&results, &key_hash_to_key, limit_offset, limit_count);
 
@@ -840,18 +870,39 @@ pub fn ft_search(
     }
 
     // Standard dense-only path (no session)
-    let result = search_local_filtered(
-        store,
-        &index_name,
-        &blob,
-        k,
-        filter_expr.as_ref(),
-        limit_offset,
-        limit_count,
-        field_name.as_ref(),
-    );
-    crate::vector::metrics::increment_search();
-    result
+    // When RANGE is set, use raw search + range filter + response build.
+    // Otherwise, use the fused search_local_filtered for backward compat.
+    if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+        let raw = search_local_raw(
+            store,
+            &index_name,
+            &blob,
+            k,
+            filter_expr.as_ref(),
+            field_name.as_ref(),
+        );
+        crate::vector::metrics::increment_search();
+        match raw {
+            SearchRawResult::Error(frame) => frame,
+            SearchRawResult::Ok { mut results, key_hash_to_key } => {
+                apply_range_filter(&mut results, threshold, metric);
+                build_search_response(&results, &key_hash_to_key, limit_offset, limit_count)
+            }
+        }
+    } else {
+        let result = search_local_filtered(
+            store,
+            &index_name,
+            &blob,
+            k,
+            filter_expr.as_ref(),
+            limit_offset,
+            limit_count,
+            field_name.as_ref(),
+        );
+        crate::vector::metrics::increment_search();
+        result
+    }
 }
 
 /// FT.SEARCH with optional EXPAND GRAPH support.
@@ -2064,6 +2115,37 @@ pub(crate) fn parse_sparse_clause(args: &[Frame]) -> Option<(Bytes, Bytes)> {
         i += 1;
     }
     None
+}
+
+/// Parse optional RANGE threshold from args.
+/// Returns `Some(f32)` if RANGE keyword found with a valid float value.
+/// Used by FT.SEARCH to post-filter results by distance/similarity threshold.
+pub(crate) fn parse_range_clause(args: &[Frame]) -> Option<f32> {
+    for i in 0..args.len().saturating_sub(1) {
+        if matches_keyword(&args[i], b"RANGE") {
+            if let Some(val_bytes) = extract_bulk(&args[i + 1]) {
+                return std::str::from_utf8(&val_bytes).ok()?.parse::<f32>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Maximum results from a RANGE query to prevent memory explosion.
+const RANGE_HARD_CAP: usize = 10_000;
+
+/// Apply range threshold filtering to search results based on distance metric.
+///
+/// - L2: lower distance = more similar, keep `distance <= threshold`
+/// - Cosine/IP: higher score = more similar, keep `distance >= threshold`
+///
+/// Truncates to `RANGE_HARD_CAP` after filtering.
+fn apply_range_filter(results: &mut SmallVec<[SearchResult; 32]>, threshold: f32, metric: DistanceMetric) {
+    results.retain(|r| match metric {
+        DistanceMetric::L2 => r.distance <= threshold,
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct => r.distance >= threshold,
+    });
+    results.truncate(RANGE_HARD_CAP);
 }
 
 /// Parse a sparse query blob: alternating u32 (LE dim_id) + f32 (LE weight) pairs.
