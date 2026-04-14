@@ -1151,3 +1151,233 @@ fn test_ft_config_autocompact_accepts_variants() {
     let result = ft_config(&mut store, &set_args);
     assert!(matches!(result, Frame::Error(_)));
 }
+
+// -- EXPAND GRAPH clause parsing tests --
+
+#[cfg(feature = "graph")]
+mod graph_expand_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_expand_clause_depth_colon() {
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 10 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            bulk(b"blob"),
+            bulk(b"EXPAND"),
+            bulk(b"GRAPH"),
+            bulk(b"depth:3"),
+        ];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, Some(3));
+    }
+
+    #[test]
+    fn test_parse_expand_clause_bare_int() {
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"EXPAND"),
+            bulk(b"GRAPH"),
+            bulk(b"2"),
+        ];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn test_parse_expand_clause_absent() {
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"q"),
+            bulk(b"data"),
+        ];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_expand_clause_depth_large() {
+        // Parser accepts any u32 value; clamping happens in expand_results_via_graph
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"query"),
+            bulk(b"EXPAND"),
+            bulk(b"GRAPH"),
+            bulk(b"depth:100"),
+        ];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, Some(100));
+    }
+
+    #[test]
+    fn test_parse_expand_clause_missing_depth_arg() {
+        // EXPAND GRAPH without depth argument
+        let args = vec![bulk(b"myidx"), bulk(b"query"), bulk(b"EXPAND"), bulk(b"GRAPH")];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_expand_clause_expand_without_graph() {
+        // EXPAND without GRAPH keyword should not match
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"query"),
+            bulk(b"EXPAND"),
+            bulk(b"3"),
+        ];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_expand_clause_case_insensitive() {
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"query"),
+            bulk(b"expand"),
+            bulk(b"graph"),
+            bulk(b"depth:2"),
+        ];
+        let result = parse_expand_clause(&args);
+        assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn test_extract_seeds_from_empty_response() {
+        let resp = Frame::Array(vec![Frame::Integer(0)].into());
+        let seeds = extract_seeds_from_response(&resp);
+        assert!(seeds.is_empty());
+    }
+
+    #[test]
+    fn test_extract_seeds_from_response_with_results() {
+        let resp = Frame::Array(
+            vec![
+                Frame::Integer(2),
+                Frame::BulkString(Bytes::from_static(b"doc:1")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.5")),
+                    ]
+                    .into(),
+                ),
+                Frame::BulkString(Bytes::from_static(b"doc:2")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.8")),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+        let seeds = extract_seeds_from_response(&resp);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(&seeds[0].0[..], b"doc:1");
+        assert!((seeds[0].1 - 0.5).abs() < f32::EPSILON);
+        assert_eq!(&seeds[1].0[..], b"doc:2");
+        assert!((seeds[1].1 - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_build_combined_response_empty_expanded() {
+        use crate::command::vector_search::graph_expand::ExpandedResult;
+
+        let knn = Frame::Array(
+            vec![
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"doc:1")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.5")),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+        let expanded: Vec<ExpandedResult> = vec![];
+        let result = build_combined_response(&knn, &expanded);
+        // Should have total=1 (just the KNN result with __graph_hops added)
+        if let Frame::Array(items) = &result {
+            assert_eq!(items[0], Frame::Integer(1));
+            // doc:1 key
+            assert_eq!(items[1], Frame::BulkString(Bytes::from_static(b"doc:1")));
+            // fields should include __graph_hops = "0"
+            if let Frame::Array(fields) = &items[2] {
+                assert!(fields.iter().any(|f| matches!(f,
+                    Frame::BulkString(b) if b.as_ref() == b"__graph_hops"
+                )));
+            } else {
+                panic!("expected fields array");
+            }
+        } else {
+            panic!("expected array response");
+        }
+    }
+
+    #[test]
+    fn test_build_combined_response_with_expanded() {
+        use crate::command::vector_search::graph_expand::ExpandedResult;
+
+        let knn = Frame::Array(
+            vec![
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"doc:1")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.3")),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+        let expanded = vec![ExpandedResult {
+            key: Bytes::from_static(b"doc:neighbor"),
+            vec_score: 0.0,
+            graph_hops: 2,
+        }];
+        let result = build_combined_response(&knn, &expanded);
+        if let Frame::Array(items) = &result {
+            // total = 1 knn + 1 expanded = 2
+            assert_eq!(items[0], Frame::Integer(2));
+            // items[1] = doc:1, items[2] = fields, items[3] = doc:neighbor, items[4] = fields
+            assert_eq!(items.len(), 5);
+            assert_eq!(
+                items[3],
+                Frame::BulkString(Bytes::from_static(b"doc:neighbor"))
+            );
+            if let Frame::Array(fields) = &items[4] {
+                // Should have __vec_score, "0", __graph_hops, "2"
+                assert_eq!(fields.len(), 4);
+                assert_eq!(
+                    fields[0],
+                    Frame::BulkString(Bytes::from_static(b"__vec_score"))
+                );
+                assert_eq!(
+                    fields[2],
+                    Frame::BulkString(Bytes::from_static(b"__graph_hops"))
+                );
+                // graph_hops should be "2"
+                if let Frame::BulkString(b) = &fields[3] {
+                    assert_eq!(b.as_ref(), b"2");
+                }
+            }
+        } else {
+            panic!("expected array response");
+        }
+    }
+}
