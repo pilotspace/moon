@@ -1089,21 +1089,39 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
             Some(i) => i,
             None => continue,
         };
-        let source_field = idx.meta.source_field.clone();
-        let dim = idx.meta.dimension as usize;
         let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
 
-        // Check if the vector source field is present in HSET args
-        let has_vector = find_vector_blob(args, &source_field, dim).is_some();
+        // Iterate ALL vector fields defined in the index.
+        // For single-field indexes, this is exactly one iteration (backward compatible).
+        let field_count = idx.meta.vector_fields.len();
+        let mut any_vector_inserted = false;
 
-        if has_vector {
-            // Vector-present path: insert vector + populate payload index
-            handle_vector_insert(idx, key, args, &source_field, dim, key_hash);
-        } else if let Some(&global_id) = idx.key_hash_to_global_id.get(&key_hash) {
-            // Metadata-only path: update payload index for existing vector
-            update_metadata_only(idx, args, &source_field, global_id);
+        for field_idx in 0..field_count {
+            let field_name = idx.meta.vector_fields[field_idx].field_name.clone();
+            let dim = idx.meta.vector_fields[field_idx].dimension as usize;
+
+            let has_vector = find_vector_blob(args, &field_name, dim).is_some();
+            if !has_vector {
+                continue;
+            }
+
+            if field_idx == 0 {
+                // Default field: use existing top-level segments
+                handle_vector_insert(idx, key, args, &field_name, dim, key_hash);
+            } else {
+                // Additional field: use field_segments
+                handle_vector_insert_field(idx, &field_name, key, args, dim, key_hash);
+            }
+            any_vector_inserted = true;
         }
-        // If key not found in any segment, silently skip (per CONTEXT.md)
+
+        // Metadata-only path: if no vector was inserted but key already exists
+        if !any_vector_inserted {
+            if let Some(&global_id) = idx.key_hash_to_global_id.get(&key_hash) {
+                let source_field = idx.meta.source_field.clone();
+                update_metadata_only(idx, args, &source_field, global_id);
+            }
+        }
     }
 }
 
@@ -1185,6 +1203,51 @@ fn handle_vector_insert(
         }
         j += 2;
     }
+}
+
+/// Vector-present path for ADDITIONAL (non-default) fields.
+/// Mirrors `handle_vector_insert` but targets `idx.field_segments[field_name]`.
+/// Does NOT populate payload_index (payload is shared, handled by default field insert
+/// or by the metadata-only path).
+fn handle_vector_insert_field(
+    idx: &mut crate::vector::store::VectorIndex,
+    field_name: &bytes::Bytes,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+    dim: usize,
+    key_hash: u64,
+) {
+    let blob = match find_vector_blob(args, field_name, dim) {
+        Some(b) => b.clone(),
+        None => return,
+    };
+
+    // Decode f32 from blob
+    let mut f32_vec = Vec::with_capacity(dim);
+    for chunk in blob.chunks_exact(4) {
+        f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    // SQ quantize
+    let mut sq_vec = vec![0i8; dim];
+    vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
+    // Compute norm
+    let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    // Record original Redis key (shared across all fields)
+    idx.key_hash_to_key
+        .entry(key_hash)
+        .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
+
+    // Look up the additional field's SegmentHolder
+    let fs = match idx.field_segments.get(field_name.as_ref()) {
+        Some(fs) => fs,
+        None => return, // field not found (should not happen with valid schema)
+    };
+    let snap = fs.segments.load();
+    let _internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+    crate::vector::metrics::add_vectors(1);
+    // Note: global_id and payload_index are NOT updated here.
+    // Payload is shared and managed by the default field's insert path.
 }
 
 /// Metadata-only path: update payload index for an existing vector.
