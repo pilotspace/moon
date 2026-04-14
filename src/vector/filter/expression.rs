@@ -22,6 +22,17 @@ pub enum FilterExpr {
     And(Box<FilterExpr>, Box<FilterExpr>),
     /// Logical OR
     Or(Box<FilterExpr>, Box<FilterExpr>),
+    /// Boolean equality: @field:{true} or @field:{false}
+    /// Stored as tag with "true"/"false" strings, matched via tag_indexes.
+    BoolEq { field: Bytes, value: bool },
+    /// Geo-radius: @field:[lon lat radius_km]
+    /// Evaluates using dual BTreeMap (__lat/__lon) + Haversine post-filter.
+    GeoRadius {
+        field: Bytes,
+        lon: f64,
+        lat: f64,
+        radius_km: f64,
+    },
     /// Logical NOT (complement against universe)
     Not(Box<FilterExpr>),
 }

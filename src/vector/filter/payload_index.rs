@@ -46,6 +46,18 @@ impl PayloadIndex {
             .insert(internal_id);
     }
 
+    /// Insert geo coordinates for the given internal vector ID.
+    ///
+    /// Stores lat/lon as two separate numeric sub-fields (`{field}__lat` and `{field}__lon`)
+    /// so that range queries can produce candidate bitmaps before Haversine post-filter.
+    pub fn insert_geo(&mut self, field: &Bytes, lat: f64, lon: f64, internal_id: u32) {
+        let field_str = std::str::from_utf8(field).unwrap_or("");
+        let lat_field = Bytes::from(format!("{field_str}__lat"));
+        let lon_field = Bytes::from(format!("{field_str}__lon"));
+        self.insert_numeric(&lat_field, lat, internal_id);
+        self.insert_numeric(&lon_field, lon, internal_id);
+    }
+
     /// Remove an internal ID from ALL bitmaps (for vector deletion).
     ///
     /// O(fields * values) -- acceptable because DEL is rare relative to search.
@@ -92,6 +104,84 @@ impl PayloadIndex {
                 result
             }
 
+            FilterExpr::BoolEq { field, value } => {
+                let tag_val = if *value {
+                    Bytes::from_static(b"true")
+                } else {
+                    Bytes::from_static(b"false")
+                };
+                self.tag_indexes
+                    .get(field)
+                    .and_then(|m| m.get(&tag_val))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+
+            FilterExpr::GeoRadius {
+                field,
+                lon,
+                lat,
+                radius_km,
+            } => {
+                let field_str = std::str::from_utf8(field).unwrap_or("");
+                let lat_field = Bytes::from(format!("{field_str}__lat"));
+                let lon_field = Bytes::from(format!("{field_str}__lon"));
+
+                // Bounding-box pre-filter (cheap BTreeMap range queries)
+                let delta_lat = radius_km / 111.0;
+                let cos_lat = lat.to_radians().cos();
+                let delta_lon = if cos_lat.abs() < 1e-10 {
+                    180.0 // near poles, use full longitude range
+                } else {
+                    radius_km / (111.0 * cos_lat)
+                };
+
+                let lat_min = OrderedFloat(*lat - delta_lat);
+                let lat_max = OrderedFloat(*lat + delta_lat);
+                let lon_min = OrderedFloat(*lon - delta_lon);
+                let lon_max = OrderedFloat(*lon + delta_lon);
+
+                let lat_bm = self
+                    .numeric_indexes
+                    .get(&lat_field)
+                    .map(|btree| {
+                        let mut bm = RoaringBitmap::new();
+                        for (_k, b) in btree.range(lat_min..=lat_max) {
+                            bm |= b;
+                        }
+                        bm
+                    })
+                    .unwrap_or_default();
+
+                let lon_bm = self
+                    .numeric_indexes
+                    .get(&lon_field)
+                    .map(|btree| {
+                        let mut bm = RoaringBitmap::new();
+                        for (_k, b) in btree.range(lon_min..=lon_max) {
+                            bm |= b;
+                        }
+                        bm
+                    })
+                    .unwrap_or_default();
+
+                let candidates = lat_bm & lon_bm;
+
+                // Haversine post-filter for exact distance
+                let mut result = RoaringBitmap::new();
+                for id in candidates.iter() {
+                    if let (Some(c_lat), Some(c_lon)) = (
+                        self.lookup_numeric_value(&lat_field, id),
+                        self.lookup_numeric_value(&lon_field, id),
+                    ) {
+                        if haversine_km(*lat, *lon, c_lat, c_lon) <= *radius_km {
+                            result.insert(id);
+                        }
+                    }
+                }
+                result
+            }
+
             FilterExpr::And(left, right) => {
                 let left_bm = self.evaluate_bitmap(left, total_vectors);
                 let right_bm = self.evaluate_bitmap(right, total_vectors);
@@ -114,6 +204,34 @@ impl PayloadIndex {
             }
         }
     }
+    /// Look up the numeric value stored for a specific internal_id in a given field.
+    ///
+    /// Iterates the BTreeMap entries for `field` to find one whose bitmap contains `internal_id`.
+    /// Returns the first matching value (each internal_id typically has exactly one value per field).
+    fn lookup_numeric_value(&self, field: &Bytes, internal_id: u32) -> Option<f64> {
+        let btree = self.numeric_indexes.get(field)?;
+        for (val, bm) in btree {
+            if bm.contains(internal_id) {
+                return Some(val.0);
+            }
+        }
+        None
+    }
+}
+
+/// Haversine distance between two points in kilometers.
+///
+/// Formula: a = sin^2(dlat/2) + cos(lat1)*cos(lat2)*sin^2(dlon/2)
+///          d = 2 * R * asin(sqrt(a))
+/// where R = 6371.0 km (Earth mean radius).
+fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6371.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let lat1_r = lat1.to_radians();
+    let lat2_r = lat2.to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + lat1_r.cos() * lat2_r.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * R * a.sqrt().asin()
 }
 
 #[cfg(test)]
@@ -274,5 +392,99 @@ mod tests {
         let bm = idx.evaluate_bitmap(&num_expr, 2);
         assert_eq!(bm.len(), 1);
         assert!(bm.contains(1));
+    }
+
+    #[test]
+    fn test_bool_eq_true() {
+        let mut idx = PayloadIndex::new();
+        idx.insert_tag(&field("active"), &Bytes::from_static(b"true"), 0);
+        idx.insert_tag(&field("active"), &Bytes::from_static(b"false"), 1);
+        idx.insert_tag(&field("active"), &Bytes::from_static(b"true"), 2);
+
+        let expr = FilterExpr::BoolEq {
+            field: field("active"),
+            value: true,
+        };
+        let bm = idx.evaluate_bitmap(&expr, 3);
+        assert_eq!(bm.len(), 2);
+        assert!(bm.contains(0));
+        assert!(!bm.contains(1));
+        assert!(bm.contains(2));
+    }
+
+    #[test]
+    fn test_bool_eq_false() {
+        let mut idx = PayloadIndex::new();
+        idx.insert_tag(&field("active"), &Bytes::from_static(b"true"), 0);
+        idx.insert_tag(&field("active"), &Bytes::from_static(b"false"), 1);
+        idx.insert_tag(&field("active"), &Bytes::from_static(b"false"), 2);
+
+        let expr = FilterExpr::BoolEq {
+            field: field("active"),
+            value: false,
+        };
+        let bm = idx.evaluate_bitmap(&expr, 3);
+        assert_eq!(bm.len(), 2);
+        assert!(!bm.contains(0));
+        assert!(bm.contains(1));
+        assert!(bm.contains(2));
+    }
+
+    #[test]
+    fn test_geo_radius_basic() {
+        let mut idx = PayloadIndex::new();
+        let loc = field("location");
+        // SF: 37.78, -122.42
+        idx.insert_geo(&loc, 37.78, -122.42, 0);
+        // NYC: 40.71, -74.01
+        idx.insert_geo(&loc, 40.71, -74.01, 1);
+        // LA: 34.05, -118.24
+        idx.insert_geo(&loc, 34.05, -118.24, 2);
+
+        // Search: center=SF, radius=600km — should match LA (~559km) but not NYC (~4130km)
+        let expr = FilterExpr::GeoRadius {
+            field: loc,
+            lon: -122.42,
+            lat: 37.78,
+            radius_km: 600.0,
+        };
+        let bm = idx.evaluate_bitmap(&expr, 3);
+        assert!(bm.contains(0), "SF should match (center)");
+        assert!(!bm.contains(1), "NYC should NOT match (~4130km)");
+        assert!(bm.contains(2), "LA should match (~559km)");
+    }
+
+    #[test]
+    fn test_geo_radius_empty() {
+        let idx = PayloadIndex::new();
+        let expr = FilterExpr::GeoRadius {
+            field: field("location"),
+            lon: -122.42,
+            lat: 37.78,
+            radius_km: 100.0,
+        };
+        let bm = idx.evaluate_bitmap(&expr, 0);
+        assert!(bm.is_empty());
+    }
+
+    #[test]
+    fn test_haversine() {
+        // SF to LA: approximately 559 km
+        let d = super::haversine_km(37.78, -122.42, 34.05, -118.24);
+        assert!(
+            (d - 559.0).abs() < 10.0,
+            "SF-LA distance should be ~559km, got {d}"
+        );
+    }
+
+    #[test]
+    fn test_bool_eq_empty_index() {
+        let idx = PayloadIndex::new();
+        let expr = FilterExpr::BoolEq {
+            field: field("active"),
+            value: true,
+        };
+        let bm = idx.evaluate_bitmap(&expr, 10);
+        assert!(bm.is_empty());
     }
 }
