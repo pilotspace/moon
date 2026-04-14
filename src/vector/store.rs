@@ -137,6 +137,9 @@ pub struct VectorIndex {
     /// Additional named vector fields (beyond the default field).
     /// Empty for single-field indexes. Keyed by field_name from VectorFieldMeta.
     pub field_segments: HashMap<Bytes, FieldSegments>,
+    /// Sparse vector stores, keyed by field name.
+    /// Populated when FT.CREATE includes SPARSE field declarations.
+    pub sparse_stores: HashMap<Bytes, crate::vector::sparse::store::SparseStore>,
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -663,6 +666,7 @@ impl VectorStore {
                 key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
                 field_segments: extra_fields,
+                sparse_stores: HashMap::new(),
             },
         );
 
