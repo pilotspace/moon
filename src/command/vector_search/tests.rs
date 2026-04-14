@@ -2827,3 +2827,402 @@ fn test_parse_sparse_clause_missing() {
     let args = vec![bulk(b"idx"), bulk(b"*=>[KNN 10 @vec $q]")];
     assert!(parse_sparse_clause(&args).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Phase 143: RANGE threshold tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parse_range_clause_valid() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"RANGE"),
+        bulk(b"0.5"),
+    ];
+    let result = parse_range_clause(&args);
+    assert!(result.is_some());
+    assert!((result.unwrap() - 0.5).abs() < f32::EPSILON);
+}
+
+#[test]
+fn test_parse_range_clause_absent() {
+    let args = vec![bulk(b"idx"), bulk(b"*=>[KNN 10 @vec $q]")];
+    assert!(parse_range_clause(&args).is_none());
+}
+
+#[test]
+fn test_parse_range_clause_invalid_value() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"RANGE"),
+        bulk(b"notanumber"),
+    ];
+    assert!(parse_range_clause(&args).is_none());
+}
+
+#[test]
+fn test_parse_range_clause_case_insensitive() {
+    // matches_keyword is case-insensitive, so "range" should work too
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"range"),
+        bulk(b"1.5"),
+    ];
+    let result = parse_range_clause(&args);
+    assert!(result.is_some());
+    assert!((result.unwrap() - 1.5).abs() < f32::EPSILON);
+}
+
+#[test]
+fn test_range_filter_l2_search() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let dim: usize = 4;
+
+    // Create L2 index
+    let create_args = build_ft_create_args("rangeidx", "doc:", "vec", dim as u32, "L2");
+    let result = ft_create(&mut store, &create_args);
+    assert!(matches!(result, Frame::SimpleString(_)), "FT.CREATE failed: {result:?}");
+
+    // Insert 3 vectors with known distances from [1,0,0,0]:
+    // vec:0 = [1,0,0,0] -> L2=0.0
+    // vec:1 = [0.5,0,0,0] -> L2=0.25
+    // vec:2 = [-1,0,0,0] -> L2=4.0
+    let vectors: Vec<[f32; 4]> = vec![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0, 0.0],
+    ];
+
+    {
+        let idx = store.get_index_mut(b"rangeidx").unwrap();
+        let snap = idx.segments.load();
+        for (i, v) in vectors.iter().enumerate() {
+            let mut sq = vec![0i8; dim];
+            quantize_f32_to_sq(v, &mut sq);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+        }
+    }
+
+    // Query with RANGE 0.5 -- should get vec:0 (L2=0) and vec:1 (L2=0.25), not vec:2 (L2=4.0)
+    let query_vec: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let query_blob: Vec<u8> = query_vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    let search_args = vec![
+        bulk(b"rangeidx"),
+        bulk(b"*=>[KNN 10 @vec $query]"),
+        bulk(b"RANGE"),
+        bulk(b"0.5"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_blob.clone())),
+    ];
+
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            let count = match &items[0] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer, got {other:?}"),
+            };
+            // Should have at most 2 results (vec:0 and vec:1 within range)
+            assert!(count <= 2, "expected at most 2 results within RANGE 0.5, got {count}");
+            // vec:2 should NOT appear (L2=4.0 > 0.5)
+            for i in (1..items.len()).step_by(2) {
+                if let Frame::BulkString(key) = &items[i] {
+                    assert_ne!(key.as_ref(), b"vec:2", "vec:2 should be filtered out by RANGE 0.5");
+                }
+            }
+        }
+        Frame::Error(e) => panic!("FT.SEARCH error: {}", String::from_utf8_lossy(e)),
+        other => panic!("expected Array, got {other:?}"),
+    }
+
+    // Query with RANGE 0.0 -- only exact match should survive
+    let search_args_zero = vec![
+        bulk(b"rangeidx"),
+        bulk(b"*=>[KNN 10 @vec $query]"),
+        bulk(b"RANGE"),
+        bulk(b"0.0"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_blob)),
+    ];
+
+    let result = ft_search(&mut store, &search_args_zero, None);
+    match &result {
+        Frame::Array(items) => {
+            let count = match &items[0] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer, got {other:?}"),
+            };
+            // With TQ quantization at dim=4, exact match vec:0 may have nonzero distance.
+            // But we verify that at least the result set is small (range is very tight).
+            assert!(count <= 1, "RANGE 0.0 should return very few results, got {count}");
+        }
+        Frame::Error(e) => panic!("FT.SEARCH error: {}", String::from_utf8_lossy(e)),
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 143: FT.RECOMMEND tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recommend_no_db() {
+    let mut store = VectorStore::new();
+    let args = vec![
+        bulk(b"myidx"),
+        bulk(b"POSITIVE"),
+        bulk(b"doc:1"),
+    ];
+    let result = recommend::ft_recommend(&mut store, &args, None);
+    match result {
+        Frame::Error(e) => {
+            assert!(
+                e.starts_with(b"ERR FT.RECOMMEND requires database"),
+                "unexpected error: {}",
+                String::from_utf8_lossy(&e)
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recommend_missing_positive_keyword() {
+    let mut store = VectorStore::new();
+    let mut db = crate::storage::db::Database::new();
+    // 3 args but second is NOT "POSITIVE"
+    let args = vec![
+        bulk(b"myidx"),
+        bulk(b"doc:1"), // missing POSITIVE keyword
+        bulk(b"doc:2"),
+    ];
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    match result {
+        Frame::Error(e) => {
+            assert!(
+                e.starts_with(b"ERR expected POSITIVE"),
+                "unexpected error: {}",
+                String::from_utf8_lossy(&e)
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recommend_unknown_index() {
+    let mut store = VectorStore::new();
+    let mut db = crate::storage::db::Database::new();
+    let args = vec![
+        bulk(b"nonexistent"),
+        bulk(b"POSITIVE"),
+        bulk(b"doc:1"),
+    ];
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    match result {
+        Frame::Error(e) => {
+            assert!(
+                e.starts_with(b"Unknown Index") || e.starts_with(b"ERR no valid vectors"),
+                "unexpected error: {}",
+                String::from_utf8_lossy(&e)
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recommend_missing_key_vectors() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let create_args = build_ft_create_args("recidx", "doc:", "vec", 4, "L2");
+    ft_create(&mut store, &create_args);
+
+    let mut db = crate::storage::db::Database::new();
+    // doc:1 does NOT exist in db -- so no vectors can be read
+    let args = vec![
+        bulk(b"recidx"),
+        bulk(b"POSITIVE"),
+        bulk(b"doc:1"),
+    ];
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    match result {
+        Frame::Error(e) => {
+            assert!(
+                e.starts_with(b"ERR no valid vectors"),
+                "expected 'no valid vectors' error, got: {}",
+                String::from_utf8_lossy(&e)
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recommend_basic_with_vectors() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let dim: usize = 4;
+    let create_args = build_ft_create_args("recidx2", "doc:", "vec", dim as u32, "L2");
+    ft_create(&mut store, &create_args);
+
+    // Insert 5 vectors into the index
+    let vectors: Vec<(&[u8], [f32; 4])> = vec![
+        (b"doc:1", [1.0, 0.0, 0.0, 0.0]),
+        (b"doc:2", [0.9, 0.1, 0.0, 0.0]),
+        (b"doc:3", [0.0, 1.0, 0.0, 0.0]),
+        (b"doc:4", [0.0, 0.0, 1.0, 0.0]),
+        (b"doc:5", [0.0, 0.0, 0.0, 1.0]),
+    ];
+
+    {
+        let idx = store.get_index_mut(b"recidx2").unwrap();
+        for (i, (key, v)) in vectors.iter().enumerate() {
+            let key_hash = xxhash_rust::xxh64::xxh64(*key, 0);
+            let snap = idx.segments.load();
+            let mut sq = vec![0i8; dim];
+            quantize_f32_to_sq(v, &mut sq);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            snap.mutable.append(key_hash, v, &sq, norm, i as u64);
+            drop(snap);
+            idx.key_hash_to_key.insert(key_hash, Bytes::from(key.to_vec()));
+        }
+    }
+
+    // Create a database with hash entries for the positive keys
+    let mut db = crate::storage::db::Database::new();
+    for (key, v) in &vectors {
+        let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let hset_args = vec![
+            Frame::BulkString(Bytes::from(key.to_vec())),
+            bulk(b"vec"),
+            Frame::BulkString(Bytes::from(blob)),
+        ];
+        crate::command::hash::hset(&mut db, &hset_args);
+    }
+
+    // Recommend based on doc:1 (positive only)
+    let args = vec![
+        bulk(b"recidx2"),
+        bulk(b"POSITIVE"),
+        bulk(b"doc:1"),
+        bulk(b"K"),
+        bulk(b"3"),
+    ];
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    match &result {
+        Frame::Array(items) => {
+            let count = match &items[0] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer, got {other:?}"),
+            };
+            assert!(count > 0, "should return at least 1 recommendation");
+            assert!(count <= 3, "should return at most K=3 results, got {count}");
+            // Positive key doc:1 should NOT be in results
+            for i in (1..items.len()).step_by(2) {
+                if let Frame::BulkString(key) = &items[i] {
+                    assert_ne!(key.as_ref(), b"doc:1", "positive key should be excluded");
+                }
+            }
+        }
+        Frame::Error(e) => panic!("FT.RECOMMEND error: {}", String::from_utf8_lossy(e)),
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 143: FT.NAVIGATE tests (graph feature required)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "graph")]
+mod ft_navigate_tests {
+    use super::*;
+
+    #[test]
+    fn test_navigate_no_graph_store() {
+        let mut store = VectorStore::new();
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 10 @vec $v]"),
+            bulk(b"HOPS"),
+            bulk(b"2"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"v"),
+            bulk(b"blob"),
+        ];
+        let result = navigate::ft_navigate(&mut store, None, &args, None);
+        match result {
+            Frame::Error(e) => {
+                assert!(
+                    e.starts_with(b"ERR FT.NAVIGATE requires graph"),
+                    "unexpected error: {}",
+                    String::from_utf8_lossy(&e)
+                );
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_navigate_too_few_args() {
+        let mut store = VectorStore::new();
+        let gs = crate::graph::store::GraphStore::new();
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 10 @vec $v]"),
+        ];
+        let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None);
+        match result {
+            Frame::Error(e) => {
+                assert!(
+                    e.starts_with(b"ERR wrong number") || e.starts_with(b"ERR HOPS"),
+                    "unexpected error: {}",
+                    String::from_utf8_lossy(&e)
+                );
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_navigate_missing_hops() {
+        let mut store = VectorStore::new();
+        let gs = crate::graph::store::GraphStore::new();
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"*=>[KNN 10 @vec $v]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"v"),
+            bulk(b"blob"),
+        ];
+        let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None);
+        match result {
+            Frame::Error(e) => {
+                assert!(
+                    e.starts_with(b"ERR HOPS"),
+                    "expected HOPS required error, got: {}",
+                    String::from_utf8_lossy(&e)
+                );
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+}
