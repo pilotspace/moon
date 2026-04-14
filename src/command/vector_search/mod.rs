@@ -5,6 +5,9 @@
 //! Instead, the shard event loop intercepts FT.* commands and calls
 //! these handlers directly with the per-shard VectorStore.
 
+#[cfg(feature = "graph")]
+pub mod graph_expand;
+
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use smallvec::SmallVec;

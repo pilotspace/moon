@@ -486,7 +486,7 @@ impl GraphReplayCollector {
                         // Track _key properties for registration after memgraph is returned.
                         for (prop_id, prop_val) in properties {
                             if *prop_id == key_prop_id {
-                                if let PropertyValue::String(ref s) = prop_val {
+                                if let PropertyValue::String(s) = prop_val {
                                     key_registrations.push((s.clone(), nk));
                                 }
                             }

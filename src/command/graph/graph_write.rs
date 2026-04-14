@@ -147,16 +147,18 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         let ext_id = node_key.data().as_ffi();
 
         // Update graph stats from stored node (avoid needing moved labels).
+        // Collect _key registration outside the immutable borrow of write_buf.
+        let mut pending_key_reg: Option<Bytes> = None;
         if let Some(node) = graph.write_buf.get_node(node_key) {
             graph.stats.on_node_insert(&node.labels);
 
             // Update PropertyIndex for numeric properties.
             let key_prop_id = label_to_id(b"_key");
             for (prop_id, prop_val) in &node.properties {
-                // Register _key property for graph expansion Redis key lookup.
+                // Track _key property for graph expansion Redis key lookup.
                 if *prop_id == key_prop_id {
-                    if let crate::graph::types::PropertyValue::String(ref s) = prop_val {
-                        graph.register_key(s.clone(), node_key);
+                    if let crate::graph::types::PropertyValue::String(s) = prop_val {
+                        pending_key_reg = Some(s.clone());
                     }
                 }
                 let val = match prop_val {
@@ -172,6 +174,10 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
                         .insert(v, ext_id as u32);
                 }
             }
+        }
+        // Register _key→NodeKey mapping after releasing the write_buf borrow.
+        if let Some(redis_key) = pending_key_reg {
+            graph.register_key(redis_key, node_key);
         }
 
         ext_id
