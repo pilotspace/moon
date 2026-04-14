@@ -217,11 +217,25 @@ pub(crate) fn handle_shard_message_shared(
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
                     #[cfg(feature = "graph")]
                     let graph_guard = shard_databases.graph_store_read(shard_id);
+
+                    // SESSION clause needs Database access for sorted set storage.
+                    // Only acquire write lock when SESSION keyword is present.
+                    let has_session = cmd.eq_ignore_ascii_case(b"FT.SEARCH")
+                        && has_session_keyword(&command);
+                    let mut db_guard;
+                    let db_opt = if has_session {
+                        db_guard = shard_databases.write_db(shard_id, 0);
+                        Some(&mut *db_guard)
+                    } else {
+                        None
+                    };
+
                     let frame = dispatch_vector_command(
                         vector_store,
                         #[cfg(feature = "graph")]
                         Some(&graph_guard),
                         &command,
+                        db_opt,
                     );
                     let _ = reply_tx.send(frame);
                     return;
@@ -887,11 +901,23 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::VectorCommand { command, reply_tx } => {
             #[cfg(feature = "graph")]
             let graph_guard = shard_databases.graph_store_read(shard_id);
+
+            // SESSION clause needs Database access for sorted set storage.
+            let has_session = has_session_keyword(&command);
+            let mut db_guard;
+            let db_opt = if has_session {
+                db_guard = shard_databases.write_db(shard_id, 0);
+                Some(&mut *db_guard)
+            } else {
+                None
+            };
+
             let response = dispatch_vector_command(
                 vector_store,
                 #[cfg(feature = "graph")]
                 Some(&graph_guard),
                 &command,
+                db_opt,
             );
             let _ = reply_tx.send(response);
         }
@@ -967,6 +993,7 @@ pub(crate) fn dispatch_vector_command(
     vector_store: &mut VectorStore,
     #[cfg(feature = "graph")] graph_store: Option<&crate::graph::store::GraphStore>,
     command: &crate::protocol::Frame,
+    db: Option<&mut crate::storage::db::Database>,
 ) -> crate::protocol::Frame {
     let (cmd, args) = match extract_command_static(command) {
         Some(pair) => pair,
@@ -982,11 +1009,11 @@ pub(crate) fn dispatch_vector_command(
     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
         #[cfg(feature = "graph")]
         {
-            vector_search::ft_search_with_graph(vector_store, graph_store, args, None)
+            vector_search::ft_search_with_graph(vector_store, graph_store, args, db)
         }
         #[cfg(not(feature = "graph"))]
         {
-            vector_search::ft_search(vector_store, args, None)
+            vector_search::ft_search(vector_store, args, db)
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
         vector_search::ft_dropindex(vector_store, args)
@@ -998,6 +1025,8 @@ pub(crate) fn dispatch_vector_command(
         vector_search::ft_compact(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
         vector_search::ft_config(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
+        vector_search::cache_search::ft_cachesearch(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
         #[cfg(feature = "graph")]
         {
@@ -1022,6 +1051,21 @@ pub(crate) fn dispatch_vector_command(
 /// After a successful HSET, check if the key matches any vector index prefix.
 /// If so, extract the vector field value, SQ-quantize, and append to mutable segment.
 ///
+/// Check if a Frame (array command) contains the SESSION keyword.
+/// Used to determine whether we need Database access for sorted set storage.
+fn has_session_keyword(frame: &crate::protocol::Frame) -> bool {
+    if let crate::protocol::Frame::Array(items) = frame {
+        for item in items {
+            if let crate::protocol::Frame::BulkString(b) = item {
+                if b.eq_ignore_ascii_case(b"SESSION") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// NOTE: Vec allocations here are acceptable because auto-indexing only fires when
 /// a key matches an index prefix (rare per-operation), and f32 decode + SQ encode
 /// is inherently O(dim) work. This is post-dispatch processing, not hot-path.

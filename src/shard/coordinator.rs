@@ -847,6 +847,7 @@ pub async fn broadcast_vector_command(
             #[cfg(feature = "graph")]
             Some(&graph_guard),
             &command,
+            None,
         )
     };
     local_result

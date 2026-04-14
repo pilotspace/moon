@@ -1756,6 +1756,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         responses.push(response);
                         continue;
                     }
+                    if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
+                        let response = {
+                            let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                            crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
+                        };
+                        responses.push(response);
+                        continue;
+                    }
                     responses.push(Frame::Error(Bytes::from_static(b"ERR unknown FT command")));
                     continue;
                 } else {
@@ -1776,6 +1784,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::command::vector_search::ft_list(&vs)
                         } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                             crate::command::vector_search::ft_compact(&mut vs, cmd_args)
+                        } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
+                            crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
                         } else {
                             Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
                         }
