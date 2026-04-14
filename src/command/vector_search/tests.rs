@@ -682,3 +682,114 @@ fn test_vector_metrics_increment_decrement() {
         "FT.DROPINDEX should decrement VECTOR_INDEXES"
     );
 }
+
+#[test]
+fn test_parse_filter_bool_true() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@active:{true}"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some(), "should parse @active:{{true}}");
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::BoolEq { field, value } => {
+            assert_eq!(&field[..], b"active");
+            assert!(value);
+        }
+        other => panic!("expected BoolEq, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_filter_bool_false() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@active:{false}"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some(), "should parse @active:{{false}}");
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::BoolEq { field, value } => {
+            assert_eq!(&field[..], b"active");
+            assert!(!value);
+        }
+        other => panic!("expected BoolEq, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_filter_bool_case_insensitive() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@flag:{TRUE}"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some());
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::BoolEq { field, value } => {
+            assert_eq!(&field[..], b"flag");
+            assert!(value);
+        }
+        other => panic!("expected BoolEq, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_filter_geo() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@location:[-122.42 37.78 100.0]"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some(), "should parse geo filter");
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::GeoRadius {
+            field,
+            lon,
+            lat,
+            radius_km,
+        } => {
+            assert_eq!(&field[..], b"location");
+            assert!((lon - (-122.42)).abs() < 0.001);
+            assert!((lat - 37.78).abs() < 0.001);
+            assert!((radius_km - 100.0).abs() < 0.001);
+        }
+        other => panic!("expected GeoRadius, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_filter_combined_bool_and_numeric() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@active:{true} @price:[10 50]"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some());
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::And(left, right) => {
+            assert!(
+                matches!(*left, crate::vector::filter::FilterExpr::BoolEq { .. }),
+                "left should be BoolEq, got {left:?}"
+            );
+            assert!(
+                matches!(
+                    *right,
+                    crate::vector::filter::FilterExpr::NumRange { .. }
+                ),
+                "right should be NumRange, got {right:?}"
+            );
+        }
+        other => panic!("expected And, got {other:?}"),
+    }
+}

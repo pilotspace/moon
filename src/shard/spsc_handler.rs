@@ -1051,15 +1051,25 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                                 {
                                     // Skip the vector field itself
                                     if !f_name.eq_ignore_ascii_case(&source_field) {
-                                        // Try parsing as numeric, otherwise store as tag
-                                        if let Ok(num) = std::str::from_utf8(f_val)
-                                            .ok()
-                                            .and_then(|s| s.parse::<f64>().ok())
-                                            .ok_or(())
-                                        {
-                                            idx.payload_index
-                                                .insert_numeric(f_name, num, global_id);
+                                        if let Ok(val_str) = std::str::from_utf8(f_val) {
+                                            // Geo detection: "lon,lat" pattern (two floats separated by comma)
+                                            if let Some((lon, lat)) = parse_geo_value(val_str) {
+                                                idx.payload_index
+                                                    .insert_geo(f_name, lat, lon, global_id);
+                                                // Also store raw value as tag for display
+                                                idx.payload_index
+                                                    .insert_tag(f_name, f_val, global_id);
+                                            } else if let Ok(num) = val_str.parse::<f64>() {
+                                                // Numeric value
+                                                idx.payload_index
+                                                    .insert_numeric(f_name, num, global_id);
+                                            } else {
+                                                // Tag value (includes "true"/"false" for BoolEq)
+                                                idx.payload_index
+                                                    .insert_tag(f_name, f_val, global_id);
+                                            }
                                         } else {
+                                            // Non-UTF8 binary: store as tag
                                             idx.payload_index.insert_tag(f_name, f_val, global_id);
                                         }
                                     }
@@ -1074,6 +1084,23 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
             i += 2;
         }
     }
+}
+
+/// Parse a "lon,lat" geo value string. Returns `Some((lon, lat))` if the value
+/// contains exactly one comma and both parts parse as valid f64 coordinates.
+fn parse_geo_value(s: &str) -> Option<(f64, f64)> {
+    let comma_pos = s.find(',')?;
+    // Ensure exactly one comma
+    if s[comma_pos + 1..].contains(',') {
+        return None;
+    }
+    let lon: f64 = s[..comma_pos].trim().parse().ok()?;
+    let lat: f64 = s[comma_pos + 1..].trim().parse().ok()?;
+    // Basic coordinate validation
+    if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+        return None;
+    }
+    Some((lon, lat))
 }
 
 /// COW intercept: capture old value for a key being written if its segment is pending.

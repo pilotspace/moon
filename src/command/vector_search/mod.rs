@@ -803,8 +803,9 @@ fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
     None
 }
 
-/// Parse filter string like "@field:{value}" or "@field:[min max]"
+/// Parse filter string like "@field:{value}" or "@field:[min max]" or "@field:[lon lat radius_km]"
 /// Multiple conditions are implicitly ANDed.
+/// Datetime filtering: epoch seconds use NumRange — no special handling needed (FNDN-02).
 fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
     let s = std::str::from_utf8(s).ok()?;
     let mut exprs: Vec<FilterExpr> = Vec::new();
@@ -844,11 +845,22 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
             while pos < s.len() && s.as_bytes()[pos] != b'}' {
                 pos += 1;
             }
-            let value = Bytes::from(s[val_start..pos].to_owned());
+            let val_str = &s[val_start..pos];
             if pos < s.len() {
                 pos += 1; // skip }
             }
-            exprs.push(FilterExpr::TagEq { field, value });
+            // Boolean detection: "true"/"false" (case-insensitive) → BoolEq
+            if val_str.eq_ignore_ascii_case("true") {
+                exprs.push(FilterExpr::BoolEq { field, value: true });
+            } else if val_str.eq_ignore_ascii_case("false") {
+                exprs.push(FilterExpr::BoolEq {
+                    field,
+                    value: false,
+                });
+            } else {
+                let value = Bytes::from(val_str.to_owned());
+                exprs.push(FilterExpr::TagEq { field, value });
+            }
         } else if pos < s.len() && s.as_bytes()[pos] == b'[' {
             // Numeric range: @field:[min max]
             pos += 1;
@@ -861,22 +873,34 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
                 pos += 1; // skip ]
             }
             let parts: Vec<&str> = range_str.split_whitespace().collect();
-            if parts.len() != 2 {
-                return None;
-            }
-            let min: f64 = parts[0].parse().ok()?;
-            let max: f64 = parts[1].parse().ok()?;
-            if (min - max).abs() < f64::EPSILON {
-                exprs.push(FilterExpr::NumEq {
+            if parts.len() == 3 {
+                // Geo radius: @field:[lon lat radius_km]
+                let lon: f64 = parts[0].parse().ok()?;
+                let lat: f64 = parts[1].parse().ok()?;
+                let radius_km: f64 = parts[2].parse().ok()?;
+                exprs.push(FilterExpr::GeoRadius {
                     field,
-                    value: OrderedFloat(min),
+                    lon,
+                    lat,
+                    radius_km,
                 });
+            } else if parts.len() == 2 {
+                let min: f64 = parts[0].parse().ok()?;
+                let max: f64 = parts[1].parse().ok()?;
+                if (min - max).abs() < f64::EPSILON {
+                    exprs.push(FilterExpr::NumEq {
+                        field,
+                        value: OrderedFloat(min),
+                    });
+                } else {
+                    exprs.push(FilterExpr::NumRange {
+                        field,
+                        min: OrderedFloat(min),
+                        max: OrderedFloat(max),
+                    });
+                }
             } else {
-                exprs.push(FilterExpr::NumRange {
-                    field,
-                    min: OrderedFloat(min),
-                    max: OrderedFloat(max),
-                });
+                return None;
             }
         } else {
             return None;
