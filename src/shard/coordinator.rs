@@ -729,7 +729,7 @@ pub async fn scatter_vector_search(
         }
     }
 
-    crate::command::vector_search::merge_search_results(&shard_responses, k)
+    crate::command::vector_search::merge_search_results(&shard_responses, k, 0, usize::MAX)
 }
 
 /// Scatter FT.SEARCH to all shards via SPSC (no local vector_store needed).
@@ -788,7 +788,7 @@ pub async fn scatter_vector_search_remote(
         }
     }
 
-    crate::command::vector_search::merge_search_results(&shard_responses, k)
+    crate::command::vector_search::merge_search_results(&shard_responses, k, 0, usize::MAX)
 }
 
 /// Broadcast an FT.* command (FT.CREATE, FT.DROPINDEX) to ALL shards.

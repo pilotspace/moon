@@ -442,32 +442,52 @@ pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
 
     // Parse optional FILTER clause
     let filter_expr = parse_filter_clause(args);
-    let result = search_local_filtered(store, &index_name, &query_blob, k, filter_expr.as_ref());
+
+    // Parse optional LIMIT offset count
+    let (limit_offset, limit_count) = parse_limit_clause(args);
+
+    let result = search_local_filtered(
+        store,
+        &index_name,
+        &query_blob,
+        k,
+        filter_expr.as_ref(),
+        limit_offset,
+        limit_count,
+    );
     crate::vector::metrics::increment_search();
     result
 }
 
 /// Direct local search for cross-shard VectorSearch messages.
 /// Skips FT.SEARCH parsing -- the coordinator already extracted index_name, blob, k.
+///
+/// Returns all results (no pagination) -- the coordinator applies LIMIT after merge.
 pub fn search_local(
     store: &mut VectorStore,
     index_name: &[u8],
     query_blob: &[u8],
     k: usize,
 ) -> Frame {
-    search_local_filtered(store, index_name, query_blob, k, None)
+    search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX)
 }
 
-/// Local search with optional filter expression.
+/// Local search with optional filter expression and pagination.
 ///
 /// Evaluates filter against PayloadIndex to produce bitmap, then dispatches
 /// to search_filtered which selects optimal strategy (brute-force/HNSW/post-filter).
+///
+/// `offset` and `count` control pagination of the result set. The total match count
+/// is always returned as the first element; only the paginated slice of documents
+/// is included in the response.
 pub fn search_local_filtered(
     store: &mut VectorStore,
     index_name: &[u8],
     query_blob: &[u8],
     k: usize,
     filter: Option<&FilterExpr>,
+    offset: usize,
+    count: usize,
 ) -> Frame {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
@@ -542,7 +562,7 @@ pub fn search_local_filtered(
         filter_bitmap.as_ref(),
         &mvcc_ctx,
     );
-    build_search_response(&results, &idx.key_hash_to_key)
+    build_search_response(&results, &idx.key_hash_to_key, offset, count)
 }
 
 /// Parse "*=>[KNN <k> @<field> $<param>]" query string.
@@ -607,8 +627,12 @@ fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
     None
 }
 
-/// Build FT.SEARCH response array.
-/// Format: [num_results, "doc:0", ["__vec_score", "0.5"], "doc:1", ["__vec_score", "0.8"], ...]
+/// Build FT.SEARCH response array with pagination.
+/// Format: [total_matches, "doc:0", ["__vec_score", "0.5"], "doc:1", ["__vec_score", "0.8"], ...]
+///
+/// `total` (first element) is always the full number of matching results (before pagination).
+/// Only the slice `results[offset..offset+count]` is included as document entries.
+/// LIMIT 0 0 returns `[total]` with no documents (count-only mode).
 ///
 /// Looks up the original Redis key via `key_hash_to_key` map (populated at insert time
 /// in `auto_index_hset`). Falls back to `vec:<internal_id>` only if the mapping is missing
@@ -616,14 +640,17 @@ fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
 fn build_search_response(
     results: &SmallVec<[SearchResult; 32]>,
     key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+    offset: usize,
+    count: usize,
 ) -> Frame {
     let total = results.len() as i64;
     // NOTE: Vec/format! usage here is acceptable -- this is response building at end
     // of command path, not hot-path dispatch.
-    let mut items = Vec::with_capacity(1 + results.len() * 2);
+    let page: SmallVec<[&SearchResult; 32]> = results.iter().skip(offset).take(count).collect();
+    let mut items = Vec::with_capacity(1 + page.len() * 2);
     items.push(Frame::Integer(total));
 
-    for r in results {
+    for r in page {
         // Try to resolve original Redis key from key_hash; fallback to vec:<id>
         let doc_id = if r.key_hash != 0 {
             if let Some(orig_key) = key_hash_to_key.get(&r.key_hash) {
@@ -661,12 +688,21 @@ fn build_search_response(
     Frame::Array(items.into())
 }
 
-/// Merge multiple per-shard FT.SEARCH responses into a global top-K result.
+/// Merge multiple per-shard FT.SEARCH responses into a global result with pagination.
 ///
 /// Each shard response is: [num_results, doc_id, [score_fields], doc_id, [score_fields], ...]
 /// This function extracts all (doc_id, score) pairs, sorts by score ascending (lower
-/// distance = better), takes top-K, and rebuilds the response frame.
-pub fn merge_search_results(shard_responses: &[Frame], k: usize) -> Frame {
+/// distance = better), takes top-K, then applies LIMIT pagination (offset, count).
+///
+/// Cross-shard strategy: each shard returns up to k results. The coordinator merges
+/// all shard results, sorts globally, truncates to k, then applies offset+count slice.
+/// `total` in the response = total merged results before pagination (capped at k).
+pub fn merge_search_results(
+    shard_responses: &[Frame],
+    k: usize,
+    offset: usize,
+    count: usize,
+) -> Frame {
     // Collect all (score, doc_id, fields_frame) triples
     let mut all_results: Vec<(f32, Bytes, Frame)> = Vec::new();
 
@@ -700,13 +736,17 @@ pub fn merge_search_results(shard_responses: &[Frame], k: usize) -> Frame {
     all_results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     all_results.truncate(k);
 
-    // Rebuild response
+    // Total = all merged results (before pagination, after k-truncation)
     let total = all_results.len() as i64;
-    let mut items = Vec::with_capacity(1 + all_results.len() * 2);
+
+    // Apply LIMIT pagination: skip offset, take count
+    let page: Vec<&(f32, Bytes, Frame)> = all_results.iter().skip(offset).take(count).collect();
+
+    let mut items = Vec::with_capacity(1 + page.len() * 2);
     items.push(Frame::Integer(total));
-    for (_, doc_id, fields) in all_results {
-        items.push(Frame::BulkString(doc_id));
-        items.push(fields);
+    for (_, doc_id, fields) in page {
+        items.push(Frame::BulkString(doc_id.clone()));
+        items.push(fields.clone());
     }
     Frame::Array(items.into())
 }
@@ -731,14 +771,18 @@ fn extract_score_from_fields(fields: &Frame) -> f32 {
     f32::MAX
 }
 
-/// Parse FT.SEARCH arguments into (index_name, query_blob, k, filter).
+/// Parse FT.SEARCH arguments into (index_name, query_blob, k, filter, offset, count).
 ///
 /// Used by connection handlers to extract search parameters before dispatching
 /// to the coordinator's scatter_vector_search_remote. Returns Err(Frame::Error)
 /// if args are malformed.
+///
+/// The last two tuple elements are LIMIT offset and count:
+/// - Default (no LIMIT): offset=0, count=usize::MAX (return all results)
+/// - LIMIT 0 0: count-only mode (returns total but no documents)
 pub fn parse_ft_search_args(
     args: &[Frame],
-) -> Result<(Bytes, Bytes, usize, Option<FilterExpr>), Frame> {
+) -> Result<(Bytes, Bytes, usize, Option<FilterExpr>, usize, usize), Frame> {
     if args.len() < 2 {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.SEARCH' command",
@@ -774,7 +818,48 @@ pub fn parse_ft_search_args(
     };
 
     let filter = parse_filter_clause(args);
-    Ok((index_name, query_blob, k, filter))
+    let (limit_offset, limit_count) = parse_limit_clause(args);
+    Ok((index_name, query_blob, k, filter, limit_offset, limit_count))
+}
+
+// -- LIMIT parsing --
+
+/// Parse LIMIT clause from FT.SEARCH args.
+/// Scans args (starting after index_name and query) for "LIMIT" keyword,
+/// then reads the next two args as offset and count (both usize).
+///
+/// Default: (0, usize::MAX) — return all results (backward compatible).
+/// LIMIT 0 0 is valid: returns total count only (no document entries).
+fn parse_limit_clause(args: &[Frame]) -> (usize, usize) {
+    let mut i = 2;
+    while i < args.len() {
+        if matches_keyword(&args[i], b"LIMIT") {
+            i += 1;
+            let offset = if i < args.len() {
+                parse_usize(&args[i]).unwrap_or(0)
+            } else {
+                return (0, usize::MAX);
+            };
+            i += 1;
+            let count = if i < args.len() {
+                parse_usize(&args[i]).unwrap_or(usize::MAX)
+            } else {
+                return (offset, usize::MAX);
+            };
+            return (offset, count);
+        }
+        i += 1;
+    }
+    (0, usize::MAX)
+}
+
+/// Parse a frame as usize. Similar to parse_u32 but returns usize for pagination.
+fn parse_usize(frame: &Frame) -> Option<usize> {
+    match frame {
+        Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse().ok(),
+        Frame::Integer(n) => usize::try_from(*n).ok(),
+        _ => None,
+    }
 }
 
 // -- Filter parsing --
@@ -915,6 +1000,98 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
         result = FilterExpr::And(Box::new(result), Box::new(expr));
     }
     Some(result)
+}
+
+/// FT.CONFIG SET index_name AUTOCOMPACT ON|OFF
+/// FT.CONFIG GET index_name AUTOCOMPACT
+///
+/// Per-index configuration. Currently supports AUTOCOMPACT only.
+/// args[0] = SET|GET, args[1] = index_name, args[2] = param_name, args[3] = value (SET only)
+pub fn ft_config(store: &mut VectorStore, args: &[Frame]) -> Frame {
+    if args.len() < 3 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.CONFIG' command",
+        ));
+    }
+    let subcommand = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid subcommand")),
+    };
+    let index_name = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
+    };
+    let param_name = match extract_bulk(&args[2]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid parameter name")),
+    };
+
+    if subcommand.eq_ignore_ascii_case(b"SET") {
+        if args.len() < 4 {
+            return Frame::Error(Bytes::from_static(b"ERR SET requires a value"));
+        }
+        let value = match extract_bulk(&args[3]) {
+            Some(b) => b,
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid value")),
+        };
+        ft_config_set(store, &index_name, &param_name, &value)
+    } else if subcommand.eq_ignore_ascii_case(b"GET") {
+        ft_config_get(store, &index_name, &param_name)
+    } else {
+        Frame::Error(Bytes::from_static(
+            b"ERR FT.CONFIG subcommand must be SET or GET",
+        ))
+    }
+}
+
+fn ft_config_set(
+    store: &mut VectorStore,
+    index_name: &[u8],
+    param: &[u8],
+    value: &[u8],
+) -> Frame {
+    let idx = match store.get_index_mut(index_name) {
+        Some(i) => i,
+        None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+    };
+    if param.eq_ignore_ascii_case(b"AUTOCOMPACT") {
+        if value.eq_ignore_ascii_case(b"ON")
+            || value == b"1"
+            || value.eq_ignore_ascii_case(b"TRUE")
+        {
+            idx.autocompact_enabled = true;
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        } else if value.eq_ignore_ascii_case(b"OFF")
+            || value == b"0"
+            || value.eq_ignore_ascii_case(b"FALSE")
+        {
+            idx.autocompact_enabled = false;
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        } else {
+            Frame::Error(Bytes::from_static(
+                b"ERR AUTOCOMPACT value must be ON or OFF",
+            ))
+        }
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
+    }
+}
+
+fn ft_config_get(store: &mut VectorStore, index_name: &[u8], param: &[u8]) -> Frame {
+    let idx = match store.get_index_mut(index_name) {
+        Some(i) => i,
+        None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+    };
+    if param.eq_ignore_ascii_case(b"AUTOCOMPACT") {
+        let val = if idx.autocompact_enabled {
+            "ON"
+        } else {
+            "OFF"
+        };
+        Frame::BulkString(Bytes::from(val))
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
+    }
 }
 
 // -- Helpers (private) --

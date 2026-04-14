@@ -191,7 +191,7 @@ fn test_merge_search_results_combines_shards() {
         .into(),
     );
 
-    let result = merge_search_results(&[shard0, shard1], 2);
+    let result = merge_search_results(&[shard0, shard1], 2, 0, usize::MAX);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(2));
@@ -215,7 +215,7 @@ fn test_merge_search_results_handles_errors() {
         .into(),
     );
 
-    let result = merge_search_results(&[shard0, shard1], 5);
+    let result = merge_search_results(&[shard0, shard1], 5, 0, usize::MAX);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(1));
@@ -231,7 +231,7 @@ fn test_merge_search_results_empty() {
     let shard0 = Frame::Array(vec![Frame::Integer(0)].into());
     let shard1 = Frame::Array(vec![Frame::Integer(0)].into());
 
-    let result = merge_search_results(&[shard0, shard1], 10);
+    let result = merge_search_results(&[shard0, shard1], 10, 0, usize::MAX);
     match result {
         Frame::Array(items) => {
             assert_eq!(items.len(), 1);
@@ -792,4 +792,362 @@ fn test_parse_filter_combined_bool_and_numeric() {
         }
         other => panic!("expected And, got {other:?}"),
     }
+}
+
+// -- LIMIT parsing tests --
+
+#[test]
+fn test_parse_limit() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"LIMIT"),
+        bulk(b"10"),
+        bulk(b"5"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"q"),
+        bulk(b"blob"),
+    ];
+    let (offset, count) = parse_limit_clause(&args);
+    assert_eq!(offset, 10);
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn test_parse_limit_default() {
+    // No LIMIT keyword -> returns (0, usize::MAX)
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"q"),
+        bulk(b"blob"),
+    ];
+    let (offset, count) = parse_limit_clause(&args);
+    assert_eq!(offset, 0);
+    assert_eq!(count, usize::MAX);
+}
+
+#[test]
+fn test_parse_limit_zero() {
+    // LIMIT 0 0 -> count-only mode
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"LIMIT"),
+        bulk(b"0"),
+        bulk(b"0"),
+    ];
+    let (offset, count) = parse_limit_clause(&args);
+    assert_eq!(offset, 0);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_build_search_response_paginated() {
+    use crate::vector::types::{SearchResult, VectorId};
+    use std::collections::HashMap;
+
+    // Create 10 fake results
+    let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
+    let mut key_map = HashMap::new();
+    for i in 0u32..10 {
+        results.push(SearchResult {
+            id: VectorId(i),
+            distance: i as f32 * 0.1,
+            key_hash: i as u64 + 1,
+        });
+        key_map.insert(
+            i as u64 + 1,
+            Bytes::from(format!("doc:{i}")),
+        );
+    }
+
+    // Paginate: offset=2, count=3 -> should return total=10 but only 3 docs
+    let response = build_search_response(&results, &key_map, 2, 3);
+    match response {
+        Frame::Array(items) => {
+            // First element: total = 10
+            assert_eq!(items[0], Frame::Integer(10));
+            // 3 doc entries * 2 frames each (doc_id + fields) = 6 + 1 (total) = 7
+            assert_eq!(items.len(), 7, "expected 1 + 3*2 = 7 items, got {}", items.len());
+            // First doc should be doc:2 (offset=2)
+            assert_eq!(items[1], Frame::BulkString(Bytes::from("doc:2")));
+            assert_eq!(items[3], Frame::BulkString(Bytes::from("doc:3")));
+            assert_eq!(items[5], Frame::BulkString(Bytes::from("doc:4")));
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_build_search_response_limit_zero_zero() {
+    use crate::vector::types::{SearchResult, VectorId};
+    use std::collections::HashMap;
+
+    let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
+    for i in 0u32..5 {
+        results.push(SearchResult {
+            id: VectorId(i),
+            distance: i as f32,
+            key_hash: 0,
+        });
+    }
+    let key_map = HashMap::new();
+
+    // LIMIT 0 0 -> count only, no docs
+    let response = build_search_response(&results, &key_map, 0, 0);
+    match response {
+        Frame::Array(items) => {
+            assert_eq!(items[0], Frame::Integer(5));
+            assert_eq!(items.len(), 1, "LIMIT 0 0 should return only the count");
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_merge_search_results_with_pagination() {
+    // 4 total results across 2 shards, LIMIT offset=1 count=2
+    let shard0 = Frame::Array(
+        vec![
+            Frame::Integer(2),
+            bulk(b"vec:0"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.1")].into()),
+            bulk(b"vec:1"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.5")].into()),
+        ]
+        .into(),
+    );
+    let shard1 = Frame::Array(
+        vec![
+            Frame::Integer(2),
+            bulk(b"vec:10"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.3")].into()),
+            bulk(b"vec:11"),
+            Frame::Array(vec![bulk(b"__vec_score"), bulk(b"0.9")].into()),
+        ]
+        .into(),
+    );
+
+    // k=10, offset=1, count=2 -> global sorted: [0.1, 0.3, 0.5, 0.9], skip 1, take 2 -> [0.3, 0.5]
+    let result = merge_search_results(&[shard0, shard1], 10, 1, 2);
+    match result {
+        Frame::Array(items) => {
+            assert_eq!(items[0], Frame::Integer(4)); // total = 4
+            // 2 paginated results * 2 frames = 4 + 1 = 5 items
+            assert_eq!(items.len(), 5);
+            assert_eq!(items[1], Frame::BulkString(Bytes::from("vec:10"))); // score 0.3
+            assert_eq!(items[3], Frame::BulkString(Bytes::from("vec:1")));  // score 0.5
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ft_search_args_with_limit() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $query]"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        bulk(b"blobdata"),
+        bulk(b"LIMIT"),
+        bulk(b"5"),
+        bulk(b"20"),
+    ];
+    let (_, _, k, _, offset, count) = parse_ft_search_args(&args).unwrap();
+    assert_eq!(k, 10);
+    assert_eq!(offset, 5);
+    assert_eq!(count, 20);
+}
+
+#[test]
+fn test_parse_ft_search_args_without_limit() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 10 @vec $query]"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        bulk(b"blobdata"),
+    ];
+    let (_, _, _, _, offset, count) = parse_ft_search_args(&args).unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(count, usize::MAX);
+}
+
+// -- FT.CONFIG tests --
+
+#[test]
+fn test_ft_config_autocompact_on_off() {
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &args);
+
+    // Default should be ON
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"AUTOCOMPACT")];
+    let result = ft_config(&mut store, &get_args);
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
+        other => panic!("expected BulkString ON, got {other:?}"),
+    }
+
+    // SET OFF
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"OFF"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(matches!(result, Frame::SimpleString(_)));
+
+    // GET should return OFF
+    let result = ft_config(&mut store, &get_args);
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"OFF"),
+        other => panic!("expected BulkString OFF, got {other:?}"),
+    }
+
+    // SET ON
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"ON"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(matches!(result, Frame::SimpleString(_)));
+
+    // GET should return ON
+    let result = ft_config(&mut store, &get_args);
+    match &result {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
+        other => panic!("expected BulkString ON, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ft_config_unknown_param() {
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &args);
+
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"NOSUCHPARAM")];
+    let result = ft_config(&mut store, &get_args);
+    assert!(
+        matches!(result, Frame::Error(_)),
+        "should error on unknown param"
+    );
+
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"NOSUCHPARAM"),
+        bulk(b"foo"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(
+        matches!(result, Frame::Error(_)),
+        "should error on unknown param"
+    );
+}
+
+#[test]
+fn test_ft_config_unknown_index() {
+    let mut store = VectorStore::new();
+
+    let get_args = vec![bulk(b"GET"), bulk(b"nonexistent"), bulk(b"AUTOCOMPACT")];
+    let result = ft_config(&mut store, &get_args);
+    assert!(
+        matches!(result, Frame::Error(_)),
+        "should error on unknown index"
+    );
+}
+
+#[test]
+fn test_ft_config_autocompact_guards_try_compact() {
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &args);
+
+    // Disable autocompact
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"OFF"),
+    ];
+    ft_config(&mut store, &set_args);
+
+    // Verify the flag is set correctly on the index
+    let idx = store.get_index(b"myidx").unwrap();
+    assert!(!idx.autocompact_enabled, "autocompact should be disabled");
+
+    // Re-enable
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"ON"),
+    ];
+    ft_config(&mut store, &set_args);
+    let idx = store.get_index(b"myidx").unwrap();
+    assert!(idx.autocompact_enabled, "autocompact should be enabled");
+}
+
+#[test]
+fn test_ft_config_autocompact_accepts_variants() {
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &args);
+
+    // Test "0" and "1"
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"0"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(matches!(result, Frame::SimpleString(_)));
+    let idx = store.get_index(b"myidx").unwrap();
+    assert!(!idx.autocompact_enabled);
+
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"1"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(matches!(result, Frame::SimpleString(_)));
+    let idx = store.get_index(b"myidx").unwrap();
+    assert!(idx.autocompact_enabled);
+
+    // Test "TRUE" and "FALSE"
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"FALSE"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(matches!(result, Frame::SimpleString(_)));
+    let idx = store.get_index(b"myidx").unwrap();
+    assert!(!idx.autocompact_enabled);
+
+    // Invalid value
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"AUTOCOMPACT"),
+        bulk(b"MAYBE"),
+    ];
+    let result = ft_config(&mut store, &set_args);
+    assert!(matches!(result, Frame::Error(_)));
 }

@@ -1456,7 +1456,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // Multi-shard: dispatch via SPSC
                             if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                 let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
-                                    Ok((index_name, query_blob, k, filter)) => {
+                                    Ok((index_name, query_blob, k, filter, _offset, _count)) => {
                                         if filter.is_some() {
                                             Frame::Error(Bytes::from_static(
                                                 b"ERR FILTER not supported in multi-shard mode yet",
