@@ -151,7 +151,14 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
             graph.stats.on_node_insert(&node.labels);
 
             // Update PropertyIndex for numeric properties.
+            let key_prop_id = label_to_id(b"_key");
             for (prop_id, prop_val) in &node.properties {
+                // Register _key property for graph expansion Redis key lookup.
+                if *prop_id == key_prop_id {
+                    if let crate::graph::types::PropertyValue::String(ref s) = prop_val {
+                        graph.register_key(s.clone(), node_key);
+                    }
+                }
                 let val = match prop_val {
                     crate::graph::types::PropertyValue::Float(f) => Some(*f),
                     crate::graph::types::PropertyValue::Int(i) => Some(*i as f64),

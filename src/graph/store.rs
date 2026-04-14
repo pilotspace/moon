@@ -47,6 +47,9 @@ pub struct NamedGraph {
     /// Cypher plan cache: xxhash64 of query string → compiled PhysicalPlan.
     /// Wrapped in Mutex for interior mutability (reads insert cache misses).
     pub plan_cache: parking_lot::Mutex<crate::graph::cypher::planner::PlanCache>,
+    /// Redis key → NodeKey mapping for O(1) lookup during graph expansion.
+    /// Populated when a node has a `_key` property linking it to a Redis HASH key.
+    pub key_to_node: HashMap<Bytes, crate::graph::types::NodeKey>,
 }
 
 impl NamedGraph {
@@ -54,6 +57,21 @@ impl NamedGraph {
     /// and should be frozen + compacted into an immutable CSR segment.
     pub fn should_compact(&self) -> bool {
         self.write_buf.should_freeze()
+    }
+
+    /// Register a Redis key → NodeKey mapping for graph expansion lookup.
+    pub fn register_key(&mut self, key: Bytes, node: crate::graph::types::NodeKey) {
+        self.key_to_node.insert(key, node);
+    }
+
+    /// Look up a NodeKey by Redis key. Returns `None` if no mapping exists.
+    pub fn lookup_node_by_key(&self, key: &[u8]) -> Option<crate::graph::types::NodeKey> {
+        self.key_to_node.get(key).copied()
+    }
+
+    /// Remove a Redis key mapping (e.g. when a node is deleted).
+    pub fn unregister_key(&mut self, key: &[u8]) {
+        self.key_to_node.remove(key);
     }
 
     /// Freeze the current MemGraph, convert to CSR, and push the new immutable
@@ -144,6 +162,7 @@ impl GraphStore {
                 plan_cache: parking_lot::Mutex::new(crate::graph::cypher::planner::PlanCache::new(
                     1024,
                 )),
+                key_to_node: HashMap::new(),
             },
         );
         Ok(())

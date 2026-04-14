@@ -468,6 +468,9 @@ impl GraphReplayCollector {
                 }
 
                 // Insert nodes.
+                // Precompute _key property ID for graph expansion mapping.
+                let key_prop_id = crate::command::graph::graph_write::label_to_id(b"_key");
+                let mut key_registrations: Vec<(Bytes, crate::graph::types::NodeKey)> = Vec::new();
                 for &idx in &epoch.node_indices {
                     if let GraphCommand::AddNode {
                         node_id,
@@ -480,6 +483,14 @@ impl GraphReplayCollector {
                         let nk =
                             mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
                         node_map.insert(*node_id, nk);
+                        // Track _key properties for registration after memgraph is returned.
+                        for (prop_id, prop_val) in properties {
+                            if *prop_id == key_prop_id {
+                                if let PropertyValue::String(ref s) = prop_val {
+                                    key_registrations.push((s.clone(), nk));
+                                }
+                            }
+                        }
                         *replayed += 1;
                     }
                 }
@@ -541,6 +552,11 @@ impl GraphReplayCollector {
                 }
 
                 put_memgraph(graph, mg, immutable);
+
+                // Register _key→NodeKey mappings on the NamedGraph (survives restart).
+                for (redis_key, node_key) in key_registrations {
+                    graph.register_key(redis_key, node_key);
+                }
             }
 
             // 3. Drop graph if this epoch ends with a Drop command.
