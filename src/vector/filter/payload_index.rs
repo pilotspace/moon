@@ -58,6 +58,38 @@ impl PayloadIndex {
         self.insert_numeric(&lon_field, lon, internal_id);
     }
 
+    /// Remove an internal ID from a specific field's bitmaps only (for metadata updates).
+    ///
+    /// Removes `internal_id` from both tag and numeric indexes for the given `field`,
+    /// and from geo sub-fields (`{field}__lat`, `{field}__lon`) if present.
+    /// O(values_per_field) -- acceptable because metadata updates are rare relative to search.
+    pub fn remove_field(&mut self, field: &Bytes, internal_id: u32) {
+        if let Some(tag_map) = self.tag_indexes.get_mut(field) {
+            for bitmap in tag_map.values_mut() {
+                bitmap.remove(internal_id);
+            }
+        }
+        if let Some(num_map) = self.numeric_indexes.get_mut(field) {
+            for bitmap in num_map.values_mut() {
+                bitmap.remove(internal_id);
+            }
+        }
+        // Also clean up geo sub-fields if this is a geo field
+        let field_str = std::str::from_utf8(field).unwrap_or("");
+        let lat_field = Bytes::from(format!("{field_str}__lat"));
+        let lon_field = Bytes::from(format!("{field_str}__lon"));
+        if let Some(num_map) = self.numeric_indexes.get_mut(&lat_field) {
+            for bitmap in num_map.values_mut() {
+                bitmap.remove(internal_id);
+            }
+        }
+        if let Some(num_map) = self.numeric_indexes.get_mut(&lon_field) {
+            for bitmap in num_map.values_mut() {
+                bitmap.remove(internal_id);
+            }
+        }
+    }
+
     /// Remove an internal ID from ALL bitmaps (for vector deletion).
     ///
     /// O(fields * values) -- acceptable because DEL is rare relative to search.
@@ -486,5 +518,88 @@ mod tests {
         };
         let bm = idx.evaluate_bitmap(&expr, 10);
         assert!(bm.is_empty());
+    }
+
+    #[test]
+    fn test_remove_field_tag() {
+        let mut idx = PayloadIndex::new();
+        idx.insert_tag(&field("color"), &field("red"), 0);
+        idx.insert_tag(&field("color"), &field("red"), 1);
+        idx.insert_tag(&field("size"), &field("large"), 0);
+
+        // Remove only "color" for id 0
+        idx.remove_field(&field("color"), 0);
+
+        let color_expr = FilterExpr::TagEq {
+            field: field("color"),
+            value: field("red"),
+        };
+        let bm = idx.evaluate_bitmap(&color_expr, 2);
+        assert_eq!(bm.len(), 1);
+        assert!(bm.contains(1)); // id 1 still has "red"
+        assert!(!bm.contains(0)); // id 0 removed from "color"
+
+        // "size" should be untouched for id 0
+        let size_expr = FilterExpr::TagEq {
+            field: field("size"),
+            value: field("large"),
+        };
+        let bm = idx.evaluate_bitmap(&size_expr, 2);
+        assert!(bm.contains(0), "size should still contain id 0");
+    }
+
+    #[test]
+    fn test_remove_field_numeric() {
+        let mut idx = PayloadIndex::new();
+        idx.insert_numeric(&field("price"), 10.0, 0);
+        idx.insert_numeric(&field("price"), 10.0, 1);
+        idx.insert_numeric(&field("qty"), 5.0, 0);
+
+        // Remove only "price" for id 0
+        idx.remove_field(&field("price"), 0);
+
+        let price_expr = FilterExpr::NumEq {
+            field: field("price"),
+            value: OrderedFloat(10.0),
+        };
+        let bm = idx.evaluate_bitmap(&price_expr, 2);
+        assert_eq!(bm.len(), 1);
+        assert!(bm.contains(1));
+
+        // "qty" untouched
+        let qty_expr = FilterExpr::NumEq {
+            field: field("qty"),
+            value: OrderedFloat(5.0),
+        };
+        let bm = idx.evaluate_bitmap(&qty_expr, 2);
+        assert!(bm.contains(0));
+    }
+
+    #[test]
+    fn test_remove_field_geo() {
+        let mut idx = PayloadIndex::new();
+        let loc = field("location");
+        idx.insert_geo(&loc, 37.78, -122.42, 0);
+        idx.insert_tag(&field("type"), &field("office"), 0);
+
+        // Remove "location" for id 0 — should also clear __lat/__lon
+        idx.remove_field(&loc, 0);
+
+        let geo_expr = FilterExpr::GeoRadius {
+            field: loc,
+            lon: -122.42,
+            lat: 37.78,
+            radius_km: 10.0,
+        };
+        let bm = idx.evaluate_bitmap(&geo_expr, 1);
+        assert!(bm.is_empty(), "geo filter should find nothing after remove_field");
+
+        // "type" tag untouched
+        let type_expr = FilterExpr::TagEq {
+            field: field("type"),
+            value: field("office"),
+        };
+        let bm = idx.evaluate_bitmap(&type_expr, 1);
+        assert!(bm.contains(0));
     }
 }

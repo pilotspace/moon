@@ -63,6 +63,12 @@ pub struct VectorIndex {
     /// `vec:<internal_id>` form. Survives compaction and segment merging because
     /// it's keyed by the stable `key_hash`, not the volatile internal ID.
     pub key_hash_to_key: std::collections::HashMap<u64, Bytes>,
+    /// Maps `key_hash` → `global_id` for metadata-only updates.
+    ///
+    /// When `HSET doc:1 category "science"` is called without a vector blob,
+    /// the auto-indexer looks up the existing `global_id` here to update the
+    /// PayloadIndex for that vector without re-inserting it.
+    pub key_hash_to_global_id: std::collections::HashMap<u64, u32>,
     /// Whether auto-compaction is enabled. Default: true.
     /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
     /// Manual FT.COMPACT always works regardless of this flag.
@@ -471,6 +477,7 @@ impl VectorStore {
                 collection,
                 payload_index: PayloadIndex::new(),
                 key_hash_to_key: std::collections::HashMap::new(),
+                key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
             },
         );

@@ -1006,85 +1006,156 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
         };
         let source_field = idx.meta.source_field.clone();
         let dim = idx.meta.dimension as usize;
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
 
-        // Find the source field in HSET args: args[0]=key, args[1]=field1, args[2]=val1, ...
-        let mut i = 1;
-        while i + 1 < args.len() {
-            if let crate::protocol::Frame::BulkString(field) = &args[i] {
-                if field.eq_ignore_ascii_case(&source_field) {
-                    if let crate::protocol::Frame::BulkString(blob) = &args[i + 1] {
-                        if blob.len() == dim * 4 {
-                            // Decode f32 from blob
-                            let mut f32_vec = Vec::with_capacity(dim);
-                            for chunk in blob.chunks_exact(4) {
-                                f32_vec.push(f32::from_le_bytes([
-                                    chunk[0], chunk[1], chunk[2], chunk[3],
-                                ]));
-                            }
-                            // SQ quantize
-                            let mut sq_vec = vec![0i8; dim];
-                            vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
-                            // Compute norm
-                            let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-                            // Key hash for the entry
-                            let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
-                            // Record original Redis key for FT.SEARCH response.
-                            // Without this mapping, FT.SEARCH returns "vec:<internal_id>"
-                            // instead of "doc:<id>", breaking client recall measurement.
-                            idx.key_hash_to_key
-                                .entry(key_hash)
-                                .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
-                            // Append to mutable segment
-                            let snap = idx.segments.load();
-                            let internal_id =
-                                snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
-                            // Use global_id for payload index so filter bitmaps match
-                            // search results after compaction advances global_id_base.
-                            let global_id = snap.mutable.global_id_base() + internal_id;
-                            crate::vector::metrics::add_vectors(1);
+        // Check if the vector source field is present in HSET args
+        let has_vector = find_vector_blob(args, &source_field, dim).is_some();
 
-                            // Populate payload index with all HASH fields (for filtered search)
-                            let mut j = 1;
-                            while j + 1 < args.len() {
-                                if let (
-                                    crate::protocol::Frame::BulkString(f_name),
-                                    crate::protocol::Frame::BulkString(f_val),
-                                ) = (&args[j], &args[j + 1])
-                                {
-                                    // Skip the vector field itself
-                                    if !f_name.eq_ignore_ascii_case(&source_field) {
-                                        if let Ok(val_str) = std::str::from_utf8(f_val) {
-                                            // Geo detection: "lon,lat" pattern (two floats separated by comma)
-                                            if let Some((lon, lat)) = parse_geo_value(val_str) {
-                                                idx.payload_index
-                                                    .insert_geo(f_name, lat, lon, global_id);
-                                                // Also store raw value as tag for display
-                                                idx.payload_index
-                                                    .insert_tag(f_name, f_val, global_id);
-                                            } else if let Ok(num) = val_str.parse::<f64>() {
-                                                // Numeric value
-                                                idx.payload_index
-                                                    .insert_numeric(f_name, num, global_id);
-                                            } else {
-                                                // Tag value (includes "true"/"false" for BoolEq)
-                                                idx.payload_index
-                                                    .insert_tag(f_name, f_val, global_id);
-                                            }
-                                        } else {
-                                            // Non-UTF8 binary: store as tag
-                                            idx.payload_index.insert_tag(f_name, f_val, global_id);
-                                        }
-                                    }
-                                }
-                                j += 2;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-            i += 2;
+        if has_vector {
+            // Vector-present path: insert vector + populate payload index
+            handle_vector_insert(idx, key, args, &source_field, dim, key_hash);
+        } else if let Some(&global_id) = idx.key_hash_to_global_id.get(&key_hash) {
+            // Metadata-only path: update payload index for existing vector
+            update_metadata_only(idx, args, &source_field, global_id);
         }
+        // If key not found in any segment, silently skip (per CONTEXT.md)
+    }
+}
+
+/// Find the vector blob in HSET args for the given source_field.
+/// Returns Some(blob) if found with correct dimension, None otherwise.
+fn find_vector_blob<'a>(
+    args: &'a [crate::protocol::Frame],
+    source_field: &[u8],
+    dim: usize,
+) -> Option<&'a bytes::Bytes> {
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let crate::protocol::Frame::BulkString(field) = &args[i] {
+            if field.eq_ignore_ascii_case(source_field) {
+                if let crate::protocol::Frame::BulkString(blob) = &args[i + 1] {
+                    if blob.len() == dim * 4 {
+                        return Some(blob);
+                    }
+                }
+                return None;
+            }
+        }
+        i += 2;
+    }
+    None
+}
+
+/// Vector-present path: decode vector, SQ-quantize, append to mutable segment,
+/// populate payload index for all HASH fields.
+fn handle_vector_insert(
+    idx: &mut crate::vector::store::VectorIndex,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+    source_field: &bytes::Bytes,
+    dim: usize,
+    key_hash: u64,
+) {
+    let blob = match find_vector_blob(args, source_field, dim) {
+        Some(b) => b.clone(),
+        None => return,
+    };
+
+    // Decode f32 from blob
+    let mut f32_vec = Vec::with_capacity(dim);
+    for chunk in blob.chunks_exact(4) {
+        f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    // SQ quantize
+    let mut sq_vec = vec![0i8; dim];
+    vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
+    // Compute norm
+    let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    // Record original Redis key for FT.SEARCH response.
+    idx.key_hash_to_key
+        .entry(key_hash)
+        .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
+    // Append to mutable segment
+    let snap = idx.segments.load();
+    let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+    // Use global_id for payload index so filter bitmaps match
+    // search results after compaction advances global_id_base.
+    let global_id = snap.mutable.global_id_base() + internal_id;
+    crate::vector::metrics::add_vectors(1);
+
+    // Record key_hash → global_id mapping for future metadata-only updates
+    idx.key_hash_to_global_id.insert(key_hash, global_id);
+
+    // Populate payload index with all HASH fields (for filtered search)
+    let mut j = 1;
+    while j + 1 < args.len() {
+        if let (
+            crate::protocol::Frame::BulkString(f_name),
+            crate::protocol::Frame::BulkString(f_val),
+        ) = (&args[j], &args[j + 1])
+        {
+            if !f_name.eq_ignore_ascii_case(source_field) {
+                index_payload_field(&mut idx.payload_index, f_name, f_val, global_id);
+            }
+        }
+        j += 2;
+    }
+}
+
+/// Metadata-only path: update payload index for an existing vector.
+///
+/// For each field in the HSET args (skipping the vector source field), removes
+/// the old index entries for that specific field and re-inserts the new value.
+/// This is per-field remove+reinsert, NOT a blanket remove of all fields.
+fn update_metadata_only(
+    idx: &mut crate::vector::store::VectorIndex,
+    args: &[crate::protocol::Frame],
+    source_field: &bytes::Bytes,
+    global_id: u32,
+) {
+    let mut j = 1;
+    while j + 1 < args.len() {
+        if let (
+            crate::protocol::Frame::BulkString(f_name),
+            crate::protocol::Frame::BulkString(f_val),
+        ) = (&args[j], &args[j + 1])
+        {
+            if !f_name.eq_ignore_ascii_case(source_field) {
+                // Remove old entries for this field only, then re-insert
+                idx.payload_index.remove_field(f_name, global_id);
+                index_payload_field(&mut idx.payload_index, f_name, f_val, global_id);
+            }
+        }
+        j += 2;
+    }
+}
+
+/// Classify and insert a payload field into the PayloadIndex.
+///
+/// Shared by both vector-present and metadata-only paths. Detects geo
+/// coordinates ("lon,lat"), numeric values, and tag values (including booleans).
+fn index_payload_field(
+    payload_index: &mut crate::vector::filter::PayloadIndex,
+    field: &bytes::Bytes,
+    value: &bytes::Bytes,
+    global_id: u32,
+) {
+    if let Ok(val_str) = std::str::from_utf8(value) {
+        // Geo detection: "lon,lat" pattern (two floats separated by comma)
+        if let Some((lon, lat)) = parse_geo_value(val_str) {
+            payload_index.insert_geo(field, lat, lon, global_id);
+            // Also store raw value as tag for display
+            payload_index.insert_tag(field, value, global_id);
+        } else if let Ok(num) = val_str.parse::<f64>() {
+            // Numeric value
+            payload_index.insert_numeric(field, num, global_id);
+        } else {
+            // Tag value (includes "true"/"false" for BoolEq)
+            payload_index.insert_tag(field, value, global_id);
+        }
+    } else {
+        // Non-UTF8 binary: store as tag
+        payload_index.insert_tag(field, value, global_id);
     }
 }
 
