@@ -239,6 +239,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         key_prefixes: prefixes,
         quantization,
         build_mode,
+        vector_fields: Vec::new(), // populated by create_index from top-level fields
     };
 
     match store.create_index(meta) {

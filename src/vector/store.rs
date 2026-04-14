@@ -13,9 +13,30 @@ use crate::vector::hnsw::search::SearchScratch;
 use crate::vector::mvcc::manager::TransactionManager;
 use crate::vector::segment::compaction;
 use crate::vector::segment::{SegmentHolder, SegmentList};
-use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+use crate::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::types::DistanceMetric;
+
+/// Maximum number of named vector fields per index.
+pub const MAX_VECTOR_FIELDS: usize = 8;
+
+/// Per-field vector configuration for multi-vector indexes.
+/// Each named vector field has independent dimension, metric, quantization.
+#[derive(Clone, Debug)]
+pub struct VectorFieldMeta {
+    /// Field name in the HASH (e.g., "title_vec", "body_vec").
+    pub field_name: Bytes,
+    /// Original (unpadded) dimension.
+    pub dimension: u32,
+    /// Padded dimension (next power of 2).
+    pub padded_dimension: u32,
+    /// Distance metric for this field.
+    pub metric: DistanceMetric,
+    /// Quantization config for this field.
+    pub quantization: QuantizationConfig,
+    /// Build mode for this field.
+    pub build_mode: BuildMode,
+}
 
 /// Metadata describing a vector index (from FT.CREATE).
 #[derive(Clone)]
@@ -47,6 +68,30 @@ pub struct IndexMeta {
     pub quantization: QuantizationConfig,
     /// Build mode: Light (fast, less memory) or Exact (higher recall).
     pub build_mode: crate::vector::turbo_quant::collection::BuildMode,
+    /// Per-field vector configurations. For single-field indexes (backward compat),
+    /// this contains exactly one entry matching the top-level fields.
+    /// For multi-vector indexes, each entry describes one named vector field.
+    pub vector_fields: Vec<VectorFieldMeta>,
+}
+
+impl IndexMeta {
+    /// Returns the default (first) vector field.
+    /// All indexes have at least one field; single-field indexes use this exclusively.
+    pub fn default_field(&self) -> &VectorFieldMeta {
+        &self.vector_fields[0]
+    }
+
+    /// Case-insensitive lookup of a vector field by name.
+    pub fn find_field(&self, name: &[u8]) -> Option<&VectorFieldMeta> {
+        self.vector_fields
+            .iter()
+            .find(|f| f.field_name.eq_ignore_ascii_case(name))
+    }
+
+    /// Returns true if this index has more than one vector field.
+    pub fn is_multi_field(&self) -> bool {
+        self.vector_fields.len() > 1
+    }
 }
 
 /// A single vector index: meta + segments + scratch + collection config.
@@ -448,9 +493,21 @@ impl VectorStore {
     }
 
     /// Create a new index. Returns Err(&str) if index already exists.
-    pub fn create_index(&mut self, meta: IndexMeta) -> Result<(), &'static str> {
+    pub fn create_index(&mut self, mut meta: IndexMeta) -> Result<(), &'static str> {
         if self.indexes.contains_key(&meta.name) {
             return Err("Index already exists");
+        }
+
+        // Backward compatibility: if vector_fields is empty, populate from top-level fields.
+        if meta.vector_fields.is_empty() {
+            meta.vector_fields = vec![VectorFieldMeta {
+                field_name: meta.source_field.clone(),
+                dimension: meta.dimension,
+                padded_dimension: padded_dimension(meta.dimension),
+                metric: meta.metric,
+                quantization: meta.quantization,
+                build_mode: meta.build_mode,
+            }];
         }
         let collection_id = self.next_collection_id;
         self.next_collection_id += 1;
@@ -770,6 +827,7 @@ mod tests {
                 .collect(),
             quantization: QuantizationConfig::TurboQuant4,
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
+            vector_fields: Vec::new(), // populated by create_index
         }
     }
 
@@ -787,6 +845,7 @@ mod tests {
             key_prefixes: vec![Bytes::from_static(b"doc:")],
             quantization: quant,
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
+            vector_fields: Vec::new(), // populated by create_index
         }
     }
 
