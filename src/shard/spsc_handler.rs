@@ -215,7 +215,14 @@ pub(crate) fn handle_shard_message_shared(
                 // Intercept before cmd_dispatch so the console gateway's
                 // ShardMessage::Execute path reaches the vector handlers.
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
-                    let frame = dispatch_vector_command(vector_store, &command);
+                    #[cfg(feature = "graph")]
+                    let graph_guard = shard_databases.graph_store_read(shard_id);
+                    let frame = dispatch_vector_command(
+                        vector_store,
+                        #[cfg(feature = "graph")]
+                        Some(&graph_guard),
+                        &command,
+                    );
                     let _ = reply_tx.send(frame);
                     return;
                 }
@@ -878,7 +885,14 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(response);
         }
         ShardMessage::VectorCommand { command, reply_tx } => {
-            let response = dispatch_vector_command(vector_store, &command);
+            #[cfg(feature = "graph")]
+            let graph_guard = shard_databases.graph_store_read(shard_id);
+            let response = dispatch_vector_command(
+                vector_store,
+                #[cfg(feature = "graph")]
+                Some(&graph_guard),
+                &command,
+            );
             let _ = reply_tx.send(response);
         }
         #[cfg(feature = "graph")]
@@ -946,8 +960,12 @@ pub(crate) fn handle_shard_message_shared(
 ///
 /// Public within crate so coordinator can call it directly for local-shard execution
 /// (avoiding SPSC self-send).
+///
+/// When `graph_store` is `Some`, FT.SEARCH will check for `EXPAND GRAPH` clause
+/// and perform graph-expanded search if requested (GraphRAG).
 pub(crate) fn dispatch_vector_command(
     vector_store: &mut VectorStore,
+    #[cfg(feature = "graph")] graph_store: Option<&crate::graph::store::GraphStore>,
     command: &crate::protocol::Frame,
 ) -> crate::protocol::Frame {
     let (cmd, args) = match extract_command_static(command) {
@@ -962,7 +980,14 @@ pub(crate) fn dispatch_vector_command(
     if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
         vector_search::ft_create(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-        vector_search::ft_search(vector_store, args)
+        #[cfg(feature = "graph")]
+        {
+            vector_search::ft_search_with_graph(vector_store, graph_store, args)
+        }
+        #[cfg(not(feature = "graph"))]
+        {
+            vector_search::ft_search(vector_store, args)
+        }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
         vector_search::ft_dropindex(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
@@ -973,6 +998,22 @@ pub(crate) fn dispatch_vector_command(
         vector_search::ft_compact(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
         vector_search::ft_config(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
+        #[cfg(feature = "graph")]
+        {
+            match graph_store {
+                Some(gs) => vector_search::ft_expand(gs, args),
+                None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                    b"ERR graph feature not available",
+                )),
+            }
+        }
+        #[cfg(not(feature = "graph"))]
+        {
+            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR FT.EXPAND requires graph feature",
+            ))
+        }
     } else {
         crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT command"))
     }

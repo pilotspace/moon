@@ -462,6 +462,181 @@ pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
     result
 }
 
+/// FT.SEARCH with optional EXPAND GRAPH support.
+///
+/// Takes both VectorStore and an optional GraphStore reference. If the query
+/// contains `EXPAND GRAPH depth:N` (or `EXPAND GRAPH N`), runs the normal
+/// KNN search first, then expands results through graph topology, merging
+/// both sets into a combined response with `__vec_score` and `__graph_hops`.
+///
+/// If no EXPAND clause is present or no graph_store is provided, delegates
+/// to the standard `ft_search` (backward compatible).
+#[cfg(feature = "graph")]
+pub fn ft_search_with_graph(
+    store: &mut VectorStore,
+    graph_store: Option<&crate::graph::store::GraphStore>,
+    args: &[Frame],
+) -> Frame {
+    let expand_depth = parse_expand_clause(args);
+
+    // No expansion requested or no graph store — fall back to standard search.
+    if expand_depth.is_none() || graph_store.is_none() {
+        return ft_search(store, args);
+    }
+
+    let depth = expand_depth.unwrap_or(1);
+    let gs = graph_store.unwrap();
+
+    // Run the standard KNN search first.
+    let knn_result = ft_search(store, args);
+
+    // Extract (key, score) pairs from the KNN response for seeding graph expansion.
+    let seed_keys = extract_seeds_from_response(&knn_result);
+    if seed_keys.is_empty() {
+        return knn_result; // no KNN hits to expand
+    }
+
+    // Find the first graph that contains any of the seed keys.
+    let graph_names = gs.list_graphs();
+    let mut target_graph: Option<&crate::graph::store::NamedGraph> = None;
+    'outer: for gname in &graph_names {
+        if let Some(g) = gs.get_graph(gname) {
+            for (key, _) in &seed_keys {
+                if g.lookup_node_by_key(key).is_some() {
+                    target_graph = Some(g);
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let Some(graph) = target_graph else {
+        return knn_result; // no graph has these keys
+    };
+
+    // Expand via BFS through graph topology.
+    let expanded = graph_expand::expand_results_via_graph(graph, &seed_keys, depth);
+
+    // Build combined response: original KNN results + expanded graph results.
+    build_combined_response(&knn_result, &expanded)
+}
+
+/// Extract (redis_key, vec_score) pairs from an FT.SEARCH response Frame.
+///
+/// Response format: [total, key1, [__vec_score, "0.5"], key2, [__vec_score, "0.8"], ...]
+#[cfg(feature = "graph")]
+fn extract_seeds_from_response(response: &Frame) -> Vec<(Bytes, f32)> {
+    let items = match response {
+        Frame::Array(items) => items,
+        _ => return Vec::new(),
+    };
+    if items.len() < 3 {
+        return Vec::new();
+    }
+    let mut seeds = Vec::new();
+    let mut i = 1;
+    while i + 1 < items.len() {
+        let key = match &items[i] {
+            Frame::BulkString(b) => b.clone(),
+            _ => {
+                i += 2;
+                continue;
+            }
+        };
+        let score = extract_score_from_fields(&items[i + 1]);
+        seeds.push((key, score));
+        i += 2;
+    }
+    seeds
+}
+
+/// Build combined FT.SEARCH response with both KNN and graph-expanded results.
+///
+/// Original KNN results get `__graph_hops` = "0".
+/// Expanded graph results get `__vec_score` = "0" and `__graph_hops` = hop distance.
+/// The total count includes both KNN and expanded results.
+#[cfg(feature = "graph")]
+fn build_combined_response(
+    knn_response: &Frame,
+    expanded: &[graph_expand::ExpandedResult],
+) -> Frame {
+    let knn_items = match knn_response {
+        Frame::Array(items) => items,
+        _ => return knn_response.clone(),
+    };
+    if knn_items.is_empty() {
+        return knn_response.clone();
+    }
+
+    // Count original KNN results (pairs after the first Integer element).
+    let knn_count = (knn_items.len().saturating_sub(1)) / 2;
+    let total = (knn_count + expanded.len()) as i64;
+
+    let mut items = Vec::with_capacity(1 + (knn_count + expanded.len()) * 2);
+    items.push(Frame::Integer(total));
+
+    // Re-emit KNN results with __graph_hops = "0" added.
+    let mut i = 1;
+    while i + 1 < knn_items.len() {
+        items.push(knn_items[i].clone()); // doc key
+        // Augment existing fields with __graph_hops
+        let mut fields = match &knn_items[i + 1] {
+            Frame::Array(f) => f.to_vec(),
+            _ => Vec::new(),
+        };
+        fields.push(Frame::BulkString(Bytes::from_static(b"__graph_hops")));
+        fields.push(Frame::BulkString(Bytes::from_static(b"0")));
+        items.push(Frame::Array(fields.into()));
+        i += 2;
+    }
+
+    // Append expanded graph results.
+    for er in expanded {
+        items.push(Frame::BulkString(er.key.clone()));
+        let mut hop_buf = itoa::Buffer::new();
+        let hop_str = hop_buf.format(er.graph_hops);
+        let mut score_buf = String::with_capacity(8);
+        use std::fmt::Write;
+        let _ = write!(score_buf, "{}", er.vec_score);
+        let fields = vec![
+            Frame::BulkString(Bytes::from_static(b"__vec_score")),
+            Frame::BulkString(Bytes::from(score_buf)),
+            Frame::BulkString(Bytes::from_static(b"__graph_hops")),
+            Frame::BulkString(Bytes::from(hop_str.to_owned())),
+        ];
+        items.push(Frame::Array(fields.into()));
+    }
+
+    Frame::Array(items.into())
+}
+
+/// Parse optional `EXPAND GRAPH depth:N` clause from FT.SEARCH args.
+///
+/// Returns `None` if no EXPAND clause, `Some(depth)` if present.
+/// Accepts both `EXPAND GRAPH depth:N` and `EXPAND GRAPH N` syntax.
+#[cfg(feature = "graph")]
+fn parse_expand_clause(args: &[Frame]) -> Option<u32> {
+    for i in 0..args.len() {
+        if matches_keyword(&args[i], b"EXPAND") {
+            if i + 1 < args.len() && matches_keyword(&args[i + 1], b"GRAPH") {
+                if i + 2 < args.len() {
+                    // Parse "depth:N" syntax
+                    if let Some(depth_arg) = extract_bulk(&args[i + 2]) {
+                        if let Some(stripped) = depth_arg.strip_prefix(b"depth:") {
+                            if let Ok(s) = std::str::from_utf8(stripped) {
+                                return s.parse::<u32>().ok();
+                            }
+                        }
+                        // Also accept bare integer
+                        return parse_u32(&args[i + 2]);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Direct local search for cross-shard VectorSearch messages.
 /// Skips FT.SEARCH parsing -- the coordinator already extracted index_name, blob, k.
 ///
@@ -1095,6 +1270,153 @@ fn ft_config_get(store: &mut VectorStore, index_name: &[u8], param: &[u8]) -> Fr
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }
+}
+
+// -- FT.EXPAND (GraphRAG standalone expansion) --
+
+/// FT.EXPAND idx key1 key2 ... DEPTH N [GRAPH graph_name]
+///
+/// Standalone graph expansion from explicit Redis keys. Returns graph neighbors
+/// up to N hops with `__graph_hops` metadata per discovered node.
+///
+/// If `GRAPH graph_name` is specified, uses that named graph. Otherwise,
+/// auto-detects by checking which graph has the first seed key registered.
+///
+/// Shard-local: only expands within the graph data on this shard (GRAF-05).
+#[cfg(feature = "graph")]
+pub fn ft_expand(
+    graph_store: &crate::graph::store::GraphStore,
+    args: &[Frame],
+) -> Frame {
+    // args[0] = index name (reserved for consistency), then keys, then DEPTH N, optionally GRAPH name
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.EXPAND' command",
+        ));
+    }
+
+    // args[0] = index name (reserved, validate present)
+    let _index_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
+    };
+
+    // Scan for DEPTH keyword to find boundary between keys and options.
+    let mut depth_pos = None;
+    for i in 1..args.len() {
+        if matches_keyword(&args[i], b"DEPTH") {
+            depth_pos = Some(i);
+            break;
+        }
+    }
+
+    let depth_pos = match depth_pos {
+        Some(p) => p,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR syntax error: expected DEPTH N",
+            ));
+        }
+    };
+
+    // Keys are args[1..depth_pos]
+    if depth_pos <= 1 {
+        return Frame::Error(Bytes::from_static(b"ERR no keys specified"));
+    }
+
+    let key_args = &args[1..depth_pos];
+
+    // Parse DEPTH value
+    if depth_pos + 1 >= args.len() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR syntax error: DEPTH requires a value",
+        ));
+    }
+    let depth = match parse_u32(&args[depth_pos + 1]) {
+        Some(d) => d,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid DEPTH value")),
+    };
+
+    // Parse optional GRAPH graph_name after DEPTH N
+    let mut graph_name: Option<Bytes> = None;
+    let mut pos = depth_pos + 2;
+    while pos < args.len() {
+        if matches_keyword(&args[pos], b"GRAPH") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR syntax error: GRAPH requires a name",
+                ));
+            }
+            graph_name = extract_bulk(&args[pos]);
+            pos += 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Build seed keys as (Bytes, f32) with vec_score = 0.0
+    let seed_keys: SmallVec<[(Bytes, f32); 16]> = key_args
+        .iter()
+        .filter_map(|f| extract_bulk(f).map(|b| (b, 0.0f32)))
+        .collect();
+
+    if seed_keys.is_empty() {
+        return Frame::Error(Bytes::from_static(b"ERR no keys specified"));
+    }
+
+    // Find the graph to use.
+    let graph = if let Some(ref name) = graph_name {
+        graph_store.get_graph(name)
+    } else {
+        // Auto-detect: find a graph that has the first seed key registered.
+        let first_key = &seed_keys[0].0;
+        let mut found = None;
+        for gname in graph_store.list_graphs() {
+            if let Some(g) = graph_store.get_graph(gname) {
+                if g.lookup_node_by_key(first_key).is_some() {
+                    found = Some(g);
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    let graph = match graph {
+        Some(g) => g,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR no graph contains the specified keys",
+            ));
+        }
+    };
+
+    // Perform graph expansion.
+    let results = graph_expand::expand_results_via_graph(graph, &seed_keys, depth);
+
+    // Format as RESP array: count, then for each result: key + field array.
+    // Field array contains: __graph_hops, hops_value, __vec_score, "0"
+    let total = results.len();
+    let mut frames: Vec<Frame> = Vec::with_capacity(1 + total * 2);
+    frames.push(Frame::Integer(total as i64));
+
+    for r in &results {
+        frames.push(Frame::BulkString(r.key.clone()));
+        // Field array: [__graph_hops, N, __vec_score, "0"]
+        let mut hop_buf = itoa::Buffer::new();
+        let hop_str = hop_buf.format(r.graph_hops);
+        let fields: FrameVec = vec![
+            Frame::BulkString(Bytes::from_static(b"__graph_hops")),
+            Frame::BulkString(Bytes::copy_from_slice(hop_str.as_bytes())),
+            Frame::BulkString(Bytes::from_static(b"__vec_score")),
+            Frame::BulkString(Bytes::from_static(b"0")),
+        ]
+        .into();
+        frames.push(Frame::Array(fields));
+    }
+
+    Frame::Array(frames.into())
 }
 
 // -- Helpers (private) --
