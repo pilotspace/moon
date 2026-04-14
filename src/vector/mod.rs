@@ -4,6 +4,7 @@ pub mod aligned_buffer;
 pub mod diskann;
 pub mod distance;
 pub mod filter;
+pub mod fusion;
 pub mod hnsw;
 pub mod index_persist;
 pub mod metrics;

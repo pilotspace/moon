@@ -15,6 +15,9 @@ pub struct PayloadIndex {
     tag_indexes: HashMap<Bytes, HashMap<Bytes, RoaringBitmap>>,
     /// field_name -> { numeric_value -> bitmap of internal_ids }
     numeric_indexes: HashMap<Bytes, BTreeMap<OrderedFloat<f64>, RoaringBitmap>>,
+    /// Full-text indexes (feature-gated behind `text-index`)
+    #[cfg(feature = "text-index")]
+    text_indexes: crate::vector::filter::text_index::TextIndex,
 }
 
 impl PayloadIndex {
@@ -23,6 +26,8 @@ impl PayloadIndex {
         Self {
             tag_indexes: HashMap::new(),
             numeric_indexes: HashMap::new(),
+            #[cfg(feature = "text-index")]
+            text_indexes: crate::vector::filter::text_index::TextIndex::new(),
         }
     }
 
@@ -58,6 +63,20 @@ impl PayloadIndex {
         self.insert_numeric(&lon_field, lon, internal_id);
     }
 
+    /// Insert a text value into the full-text index for the given field and internal vector ID.
+    ///
+    /// Feature-gated: no-op when `text-index` feature is disabled.
+    #[cfg(feature = "text-index")]
+    pub fn insert_text(&mut self, field: &Bytes, text: &[u8], internal_id: u32) {
+        self.text_indexes.insert(field, text, internal_id);
+    }
+
+    /// Insert a text value into the full-text index (stub when feature disabled).
+    #[cfg(not(feature = "text-index"))]
+    pub fn insert_text(&mut self, _field: &Bytes, _text: &[u8], _internal_id: u32) {
+        // No-op: text-index feature not enabled
+    }
+
     /// Remove an internal ID from a specific field's bitmaps only (for metadata updates).
     ///
     /// Removes `internal_id` from both tag and numeric indexes for the given `field`,
@@ -88,6 +107,8 @@ impl PayloadIndex {
                 bitmap.remove(internal_id);
             }
         }
+        #[cfg(feature = "text-index")]
+        self.text_indexes.remove_field(field, internal_id);
     }
 
     /// Remove an internal ID from ALL bitmaps (for vector deletion).
@@ -104,6 +125,8 @@ impl PayloadIndex {
                 bitmap.remove(internal_id);
             }
         }
+        #[cfg(feature = "text-index")]
+        self.text_indexes.remove(internal_id);
     }
 
     /// Evaluate a filter expression and return the bitmap of matching internal IDs.
@@ -233,6 +256,28 @@ impl PayloadIndex {
                     universe.insert_range(0..total_vectors);
                 }
                 universe - inner_bm
+            }
+
+            FilterExpr::TextMatch { field, terms } => {
+                #[cfg(feature = "text-index")]
+                {
+                    // Tokenize/stem each query term through the same pipeline
+                    let stemmed: Vec<String> = terms
+                        .iter()
+                        .flat_map(|t| {
+                            crate::vector::filter::text_index::TextIndex::tokenize(
+                                std::str::from_utf8(t).unwrap_or(""),
+                            )
+                        })
+                        .collect();
+                    self.text_indexes.search(field, &stemmed)
+                }
+                #[cfg(not(feature = "text-index"))]
+                {
+                    let _ = (field, terms);
+                    // Text matching disabled — return empty bitmap
+                    RoaringBitmap::new()
+                }
             }
         }
     }
