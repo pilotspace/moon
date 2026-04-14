@@ -8,6 +8,237 @@ fn bulk(s: &[u8]) -> Frame {
     Frame::BulkString(Bytes::from(s.to_vec()))
 }
 
+// ---------------------------------------------------------------------------
+// FT.EXPAND tests (graph feature required)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "graph")]
+mod ft_expand_tests {
+    use super::*;
+    use crate::graph::store::GraphStore;
+    use smallvec::smallvec;
+
+    /// Helper: create a GraphStore with a graph "kg" containing a linear chain
+    /// A -> B -> C, with keys "doc:a", "doc:b", "doc:c" registered.
+    fn setup_graph_store() -> GraphStore {
+        let mut gs = GraphStore::new();
+        let lsn = gs.allocate_lsn();
+        gs.create_graph(Bytes::from_static(b"kg"), 1000, lsn)
+            .unwrap();
+        let g = gs.get_graph_mut(b"kg").unwrap();
+
+        let node_a = g.write_buf.add_node(smallvec![0], smallvec![], None, 1);
+        let node_b = g.write_buf.add_node(smallvec![0], smallvec![], None, 2);
+        let node_c = g.write_buf.add_node(smallvec![0], smallvec![], None, 3);
+
+        // A -> B -> C
+        g.write_buf.add_edge(node_a, node_b, 0, 1.0, None, 4).unwrap();
+        g.write_buf.add_edge(node_b, node_c, 0, 1.0, None, 5).unwrap();
+
+        // Register Redis key mappings
+        g.register_key(Bytes::from_static(b"doc:a"), node_a);
+        g.register_key(Bytes::from_static(b"doc:b"), node_b);
+        g.register_key(Bytes::from_static(b"doc:c"), node_c);
+
+        gs
+    }
+
+    #[test]
+    fn test_ft_expand_no_args() {
+        let gs = GraphStore::new();
+        let args: Vec<Frame> = vec![];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"ERR wrong number"), "{:?}", e),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_no_keys() {
+        let gs = GraphStore::new();
+        // FT.EXPAND myidx DEPTH 2  (no keys between idx and DEPTH)
+        let args = vec![bulk(b"myidx"), bulk(b"DEPTH"), bulk(b"2")];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"ERR no keys"), "{:?}", e),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_missing_depth() {
+        let gs = GraphStore::new();
+        // FT.EXPAND myidx doc:a  (no DEPTH keyword)
+        let args = vec![bulk(b"myidx"), bulk(b"doc:a")];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"ERR syntax error: expected DEPTH"), "{:?}", e),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_depth_zero() {
+        let gs = setup_graph_store();
+        // FT.EXPAND myidx doc:a DEPTH 0
+        let args = vec![bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"0"), bulk(b"GRAPH"), bulk(b"kg")];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Array(frames) => {
+                // First element is count = 0
+                assert_eq!(frames.len(), 1);
+                match &frames[0] {
+                    Frame::Integer(0) => {}
+                    other => panic!("expected Integer(0), got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_basic_one_hop() {
+        let gs = setup_graph_store();
+        // FT.EXPAND myidx doc:a DEPTH 1 GRAPH kg
+        let args = vec![
+            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1"),
+            bulk(b"GRAPH"), bulk(b"kg"),
+        ];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Array(ref frames) => {
+                // First element is count
+                let count = match &frames[0] {
+                    Frame::Integer(n) => *n,
+                    other => panic!("expected Integer, got {other:?}"),
+                };
+                assert_eq!(count, 1, "expected 1 neighbor at depth 1");
+                // The neighbor should be "doc:b" at hop 1
+                match &frames[1] {
+                    Frame::BulkString(k) => assert_eq!(&k[..], b"doc:b"),
+                    other => panic!("expected BulkString key, got {other:?}"),
+                }
+                // Check __graph_hops field
+                match &frames[2] {
+                    Frame::Array(fields) => {
+                        match &fields[0] {
+                            Frame::BulkString(f) => assert_eq!(&f[..], b"__graph_hops"),
+                            other => panic!("expected __graph_hops field, got {other:?}"),
+                        }
+                        match &fields[1] {
+                            Frame::BulkString(v) => assert_eq!(&v[..], b"1"),
+                            other => panic!("expected hop value '1', got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Array for fields, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_two_hops() {
+        let gs = setup_graph_store();
+        // FT.EXPAND myidx doc:a DEPTH 2 GRAPH kg
+        let args = vec![
+            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"2"),
+            bulk(b"GRAPH"), bulk(b"kg"),
+        ];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Array(ref frames) => {
+                let count = match &frames[0] {
+                    Frame::Integer(n) => *n,
+                    other => panic!("expected Integer, got {other:?}"),
+                };
+                assert_eq!(count, 2, "expected 2 neighbors at depth 2 (B + C)");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_unknown_keys_skipped() {
+        let gs = setup_graph_store();
+        // FT.EXPAND myidx doc:nonexistent DEPTH 2 GRAPH kg
+        // Keys not in graph produce empty result (not error) per GRAF-05
+        let args = vec![
+            bulk(b"myidx"), bulk(b"doc:nonexistent"), bulk(b"DEPTH"), bulk(b"2"),
+            bulk(b"GRAPH"), bulk(b"kg"),
+        ];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Array(ref frames) => {
+                let count = match &frames[0] {
+                    Frame::Integer(n) => *n,
+                    other => panic!("expected Integer, got {other:?}"),
+                };
+                assert_eq!(count, 0, "unknown keys should produce empty result");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_auto_detect_graph() {
+        let gs = setup_graph_store();
+        // FT.EXPAND myidx doc:a DEPTH 1 (no GRAPH specified — auto-detect)
+        let args = vec![
+            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1"),
+        ];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Array(ref frames) => {
+                let count = match &frames[0] {
+                    Frame::Integer(n) => *n,
+                    other => panic!("expected Integer, got {other:?}"),
+                };
+                // Auto-detected "kg" graph, found doc:b at 1 hop
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_no_graph_found() {
+        let gs = GraphStore::new(); // no graphs at all
+        let args = vec![
+            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1"),
+        ];
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"ERR no graph"), "{:?}", e),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_expand_depth_clamped() {
+        // Verify that depth > MAX_EXPAND_DEPTH is clamped (doesn't error).
+        let gs = setup_graph_store();
+        let args = vec![
+            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"100"),
+            bulk(b"GRAPH"), bulk(b"kg"),
+        ];
+        // Should succeed (depth clamped to MAX_EXPAND_DEPTH=5 internally)
+        let result = ft_expand(&gs, &args);
+        match result {
+            Frame::Array(ref frames) => {
+                let count = match &frames[0] {
+                    Frame::Integer(n) => *n,
+                    other => panic!("expected Integer, got {other:?}"),
+                };
+                // Chain is only 3 nodes: A->B->C, so max 2 neighbors regardless of depth
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+}
+
 /// Build a valid FT.CREATE argument list.
 fn ft_create_args() -> Vec<Frame> {
     vec![
