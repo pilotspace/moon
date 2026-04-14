@@ -2539,3 +2539,291 @@ fn test_text_filter_without_feature_returns_empty() {
     let bm = idx.evaluate_bitmap(&expr, 10);
     assert!(bm.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Hybrid dense+sparse search tests (RRF fusion)
+// ---------------------------------------------------------------------------
+
+/// Build FT.CREATE args for an index with both VECTOR and SPARSE fields.
+fn ft_create_hybrid_args() -> Vec<Frame> {
+    vec![
+        bulk(b"hybridx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"doc:"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+        bulk(b"sparse_vec"),
+        bulk(b"SPARSE"),
+        bulk(b"DIM"),
+        bulk(b"100"),
+    ]
+}
+
+/// Helper: encode a sparse vector as alternating u32+f32 LE bytes.
+fn encode_sparse_blob(pairs: &[(u32, f32)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(pairs.len() * 8);
+    for &(dim, weight) in pairs {
+        buf.extend_from_slice(&dim.to_le_bytes());
+        buf.extend_from_slice(&weight.to_le_bytes());
+    }
+    buf
+}
+
+/// Insert a document into the hybrid index (both dense vector and sparse vector).
+/// Uses direct mutable segment append (same pattern as test_end_to_end_create_insert_search).
+fn insert_hybrid_doc(
+    store: &mut VectorStore,
+    key: &[u8],
+    dense_vec: &[f32],
+    sparse_pairs: &[(u32, f32)],
+) {
+    let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+    let dim = dense_vec.len();
+
+    let idx = store.get_index_mut(b"hybridx").unwrap();
+
+    // Insert dense vector into mutable segment
+    let snap = idx.segments.load();
+    let mut sq = vec![0i8; dim];
+    quantize_f32_to_sq(dense_vec, &mut sq);
+    let norm = dense_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    snap.mutable.append(key_hash, dense_vec, &sq, norm, 0);
+    drop(snap);
+
+    // Record key mapping
+    idx.key_hash_to_key
+        .insert(key_hash, Bytes::from(key.to_vec()));
+
+    // Insert sparse vector
+    if let Some(ss) = idx.sparse_stores.get_mut(b"sparse_vec".as_ref()) {
+        let _ = ss.insert(key_hash, sparse_pairs);
+    }
+}
+
+#[test]
+fn test_hybrid_search_basic() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let args = ft_create_hybrid_args();
+    let result = ft_create(&mut store, &args);
+    assert!(matches!(result, Frame::SimpleString(_)), "create failed: {result:?}");
+
+    // Insert 3 docs with both dense and sparse vectors
+    insert_hybrid_doc(&mut store, b"doc:1", &[1.0, 0.0, 0.0, 0.0], &[(0, 1.0), (5, 0.5)]);
+    insert_hybrid_doc(&mut store, b"doc:2", &[0.0, 1.0, 0.0, 0.0], &[(0, 0.8), (10, 0.3)]);
+    insert_hybrid_doc(&mut store, b"doc:3", &[0.0, 0.0, 1.0, 0.0], &[(5, 0.9), (10, 0.1)]);
+
+    // Dense query close to doc:1, sparse query has high weight on dim 0 (matches doc:1 and doc:2)
+    let dense_query: Vec<u8> = [0.9_f32, 0.1, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let sparse_query = encode_sparse_blob(&[(0, 1.0)]);
+
+    let search_args = vec![
+        bulk(b"hybridx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"SPARSE"),
+        bulk(b"@sparse_vec"),
+        bulk(b"$sq"),
+        bulk(b"PARAMS"),
+        bulk(b"4"),
+        bulk(b"q"),
+        Frame::BulkString(Bytes::from(dense_query)),
+        bulk(b"sq"),
+        Frame::BulkString(Bytes::from(sparse_query)),
+    ];
+
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            let total = match &items[0] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer, got {other:?}"),
+            };
+            assert!(total > 0, "expected at least 1 fused result");
+
+            // Check for dense_hits and sparse_hits metadata at end
+            let len = items.len();
+            assert!(len >= 5, "response too short for metadata: {len}");
+            let dense_hits_label = &items[len - 4];
+            let sparse_hits_label = &items[len - 2];
+            assert_eq!(*dense_hits_label, Frame::BulkString(Bytes::from_static(b"dense_hits")));
+            assert_eq!(*sparse_hits_label, Frame::BulkString(Bytes::from_static(b"sparse_hits")));
+        }
+        Frame::Error(e) => panic!("search failed: {}", String::from_utf8_lossy(e)),
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_hybrid_search_sparse_only() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let args = ft_create_hybrid_args();
+    ft_create(&mut store, &args);
+
+    insert_hybrid_doc(&mut store, b"doc:1", &[1.0, 0.0, 0.0, 0.0], &[(0, 1.0)]);
+    insert_hybrid_doc(&mut store, b"doc:2", &[0.0, 1.0, 0.0, 0.0], &[(0, 0.5)]);
+
+    let sparse_query = encode_sparse_blob(&[(0, 1.0)]);
+
+    // Sparse-only: query string is "*" (no KNN), but SPARSE clause present
+    let search_args = vec![
+        bulk(b"hybridx"),
+        bulk(b"*"),
+        bulk(b"SPARSE"),
+        bulk(b"@sparse_vec"),
+        bulk(b"$sq"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"sq"),
+        Frame::BulkString(Bytes::from(sparse_query)),
+    ];
+
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            let total = match &items[0] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer, got {other:?}"),
+            };
+            assert_eq!(total, 2, "expected 2 sparse-only results");
+
+            // Verify dense_hits=0 in metadata
+            let len = items.len();
+            let dense_hits_val = &items[len - 3];
+            assert_eq!(*dense_hits_val, Frame::Integer(0), "dense_hits should be 0");
+        }
+        Frame::Error(e) => panic!("search failed: {}", String::from_utf8_lossy(e)),
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_hybrid_search_dense_only_backward_compat() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let args = ft_create_args(); // standard index, no SPARSE field
+    ft_create(&mut store, &args);
+
+    // Standard dense-only search (no SPARSE clause) -- should work as before
+    let query_vec: Vec<u8> = vec![0u8; 128 * 4];
+    let search_args = vec![
+        bulk(b"myidx"),
+        bulk(b"*=>[KNN 5 @vec $query]"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_vec)),
+    ];
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            assert_eq!(items[0], Frame::Integer(0)); // empty index
+            // No dense_hits/sparse_hits metadata (backward compat)
+            assert_eq!(items.len(), 1, "dense-only should have no metadata trailer");
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_hybrid_search_hit_counts() {
+    let _lock = METRICS_LOCK.lock().unwrap();
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let args = ft_create_hybrid_args();
+    ft_create(&mut store, &args);
+
+    // Insert 5 docs
+    for i in 0..5u32 {
+        let key = format!("doc:{i}");
+        let dense = [i as f32, 0.0, 0.0, 0.0];
+        let sparse = vec![(i, 1.0_f32)];
+        insert_hybrid_doc(&mut store, key.as_bytes(), &dense, &sparse);
+    }
+
+    // Dense query matches all 5, sparse query matches only dims 0 and 1
+    let dense_query: Vec<u8> = [1.0_f32, 0.0, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let sparse_query = encode_sparse_blob(&[(0, 1.0), (1, 0.5)]);
+
+    let search_args = vec![
+        bulk(b"hybridx"),
+        bulk(b"*=>[KNN 10 @vec $q]"),
+        bulk(b"SPARSE"),
+        bulk(b"@sparse_vec"),
+        bulk(b"$sq"),
+        bulk(b"PARAMS"),
+        bulk(b"4"),
+        bulk(b"q"),
+        Frame::BulkString(Bytes::from(dense_query)),
+        bulk(b"sq"),
+        Frame::BulkString(Bytes::from(sparse_query)),
+    ];
+
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            let len = items.len();
+            // Check metadata
+            let dense_hits_val = match &items[len - 3] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer for dense_hits, got {other:?}"),
+            };
+            let sparse_hits_val = match &items[len - 1] {
+                Frame::Integer(n) => *n,
+                other => panic!("expected Integer for sparse_hits, got {other:?}"),
+            };
+            assert!(dense_hits_val > 0, "dense_hits should be > 0, got {dense_hits_val}");
+            assert!(sparse_hits_val > 0, "sparse_hits should be > 0, got {sparse_hits_val}");
+        }
+        Frame::Error(e) => panic!("search failed: {}", String::from_utf8_lossy(e)),
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_sparse_clause() {
+    // Valid SPARSE clause
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*"),
+        bulk(b"SPARSE"),
+        bulk(b"@my_sparse"),
+        bulk(b"$sq"),
+    ];
+    let result = parse_sparse_clause(&args);
+    assert!(result.is_some());
+    let (field, param) = result.unwrap();
+    assert_eq!(field.as_ref(), b"my_sparse");
+    assert_eq!(param.as_ref(), b"sq");
+}
+
+#[test]
+fn test_parse_sparse_clause_missing() {
+    let args = vec![bulk(b"idx"), bulk(b"*=>[KNN 10 @vec $q]")];
+    assert!(parse_sparse_clause(&args).is_none());
+}

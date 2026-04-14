@@ -71,6 +71,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
     pos += 1;
 
     let mut vector_fields: Vec<VectorFieldMeta> = Vec::new();
+    let mut sparse_field_defs: Vec<(Bytes, u32)> = Vec::new();
     // Index-level HNSW params from the first field (backward compat)
     let mut first_hnsw_m: u32 = 16;
     let mut first_hnsw_ef_construction: u32 = 200;
@@ -85,8 +86,31 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         };
         pos += 1;
 
+        // Check for SPARSE field type
+        if pos < args.len() && matches_keyword(&args[pos], b"SPARSE") {
+            pos += 1;
+            // Parse optional DIM parameter for sparse field
+            let mut sparse_dim: u32 = 30000; // default SPLADE vocab size
+            if pos + 1 < args.len() && matches_keyword(&args[pos], b"DIM") {
+                pos += 1;
+                sparse_dim = match parse_u32(&args[pos]) {
+                    Some(d) if d > 0 => d,
+                    _ => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR invalid SPARSE DIM value",
+                        ));
+                    }
+                };
+                pos += 1;
+            }
+            // Store sparse field info for post-create wiring
+            // We'll wire it up after the index is created
+            sparse_field_defs.push((field_name, sparse_dim));
+            continue;
+        }
+
         if pos >= args.len() || !matches_keyword(&args[pos], b"VECTOR") {
-            return Frame::Error(Bytes::from_static(b"ERR expected VECTOR after field name"));
+            return Frame::Error(Bytes::from_static(b"ERR expected VECTOR or SPARSE after field name"));
         }
         pos += 1;
 
@@ -145,9 +169,15 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         }
     }
 
+    if vector_fields.is_empty() && sparse_field_defs.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR at least one VECTOR or SPARSE field is required in SCHEMA",
+        ));
+    }
+    // If only SPARSE fields, we still need a dummy VECTOR field for the index structure
     if vector_fields.is_empty() {
         return Frame::Error(Bytes::from_static(
-            b"ERR at least one VECTOR field is required in SCHEMA",
+            b"ERR at least one VECTOR field is required in SCHEMA (SPARSE fields are supplementary)",
         ));
     }
 
@@ -169,8 +199,20 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         vector_fields,
     };
 
+    let index_name_clone = meta.name.clone();
     match store.create_index(meta) {
         Ok(()) => {
+            // Wire up sparse field stores after index creation
+            if !sparse_field_defs.is_empty() {
+                if let Some(idx) = store.get_index_mut(index_name_clone.as_ref()) {
+                    for (field_name, max_dim) in sparse_field_defs {
+                        idx.sparse_stores.insert(
+                            field_name,
+                            crate::vector::sparse::store::SparseStore::new(max_dim),
+                        );
+                    }
+                }
+            }
             crate::vector::metrics::increment_indexes();
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
