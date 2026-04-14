@@ -8,6 +8,9 @@
 pub mod cache_search;
 #[cfg(feature = "graph")]
 pub mod graph_expand;
+#[cfg(feature = "graph")]
+pub mod navigate;
+pub mod recommend;
 pub mod session;
 
 use bytes::Bytes;
@@ -915,7 +918,7 @@ pub fn ft_search_with_graph(
 ///
 /// Response format: [total, key1, [__vec_score, "0.5"], key2, [__vec_score, "0.8"], ...]
 #[cfg(feature = "graph")]
-fn extract_seeds_from_response(response: &Frame) -> Vec<(Bytes, f32)> {
+pub(crate) fn extract_seeds_from_response(response: &Frame) -> Vec<(Bytes, f32)> {
     let items = match response {
         Frame::Array(items) => items,
         _ => return Vec::new(),

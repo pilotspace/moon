@@ -220,7 +220,9 @@ pub(crate) fn handle_shard_message_shared(
 
                     // SESSION clause needs Database access for sorted set storage.
                     // Only acquire write lock when SESSION keyword is present.
-                    let has_session = cmd.eq_ignore_ascii_case(b"FT.SEARCH")
+                    // FT.NAVIGATE internally calls ft_search which may use SESSION.
+                    let has_session = (cmd.eq_ignore_ascii_case(b"FT.SEARCH")
+                        || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
                         && has_session_keyword(&command);
                     let mut db_guard;
                     let db_opt = if has_session {
@@ -1041,6 +1043,17 @@ pub(crate) fn dispatch_vector_command(
         {
             crate::protocol::Frame::Error(bytes::Bytes::from_static(
                 b"ERR FT.EXPAND requires graph feature",
+            ))
+        }
+    } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
+        #[cfg(feature = "graph")]
+        {
+            vector_search::navigate::ft_navigate(vector_store, graph_store, args, db)
+        }
+        #[cfg(not(feature = "graph"))]
+        {
+            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR FT.NAVIGATE requires graph feature",
             ))
         }
     } else {
