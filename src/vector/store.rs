@@ -94,11 +94,27 @@ impl IndexMeta {
     }
 }
 
-/// A single vector index: meta + segments + scratch + collection config.
-pub struct VectorIndex {
-    pub meta: IndexMeta,
+/// Per-field segment storage. Each named vector field has independent
+/// segments, scratch space, and collection metadata.
+pub struct FieldSegments {
     pub segments: SegmentHolder,
     pub scratch: SearchScratch,
+    pub collection: Arc<CollectionMetadata>,
+}
+
+/// A single vector index: meta + segments + scratch + collection config.
+///
+/// The top-level `segments`, `scratch`, `collection` are the DEFAULT field
+/// (always `vector_fields[0]`). `field_segments` stores ADDITIONAL named
+/// fields (empty for single-field indexes). This pragmatic approach avoids
+/// a massive caller migration while supporting multi-field indexes.
+pub struct VectorIndex {
+    pub meta: IndexMeta,
+    /// Default field segments (vector_fields[0]).
+    pub segments: SegmentHolder,
+    /// Default field scratch space.
+    pub scratch: SearchScratch,
+    /// Default field collection metadata.
     pub collection: Arc<CollectionMetadata>,
     pub payload_index: PayloadIndex,
     /// Maps `key_hash` (xxh64 of original Redis hash key) → original key bytes.
@@ -118,6 +134,9 @@ pub struct VectorIndex {
     /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
     /// Manual FT.COMPACT always works regardless of this flag.
     pub autocompact_enabled: bool,
+    /// Additional named vector fields (beyond the default field).
+    /// Empty for single-field indexes. Keyed by field_name from VectorFieldMeta.
+    pub field_segments: HashMap<Bytes, FieldSegments>,
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -125,6 +144,45 @@ pub struct VectorIndex {
 const DEFAULT_COMPACT_THRESHOLD: usize = 1000;
 
 impl VectorIndex {
+    /// Returns all vector field names (default + additional).
+    pub fn all_field_names(&self) -> Vec<&Bytes> {
+        let mut names = vec![&self.meta.vector_fields[0].field_name];
+        for name in self.field_segments.keys() {
+            names.push(name);
+        }
+        names
+    }
+
+    /// Look up segment holder, scratch, and collection for a named field.
+    /// Returns the default field's data if `name` matches `vector_fields[0]`,
+    /// otherwise looks up `field_segments`.
+    pub fn field_segment_holder(
+        &self,
+        name: &[u8],
+    ) -> Option<(&SegmentHolder, &SearchScratch, &Arc<CollectionMetadata>)> {
+        let default_name = &self.meta.vector_fields[0].field_name;
+        if default_name.eq_ignore_ascii_case(name) {
+            return Some((&self.segments, &self.scratch, &self.collection));
+        }
+        self.field_segments
+            .get(name)
+            .map(|fs| (&fs.segments, &fs.scratch, &fs.collection))
+    }
+
+    /// Mutable version of `field_segment_holder`.
+    pub fn field_segment_holder_mut(
+        &mut self,
+        name: &[u8],
+    ) -> Option<(&mut SegmentHolder, &mut SearchScratch, &Arc<CollectionMetadata>)> {
+        let default_name = &self.meta.vector_fields[0].field_name;
+        if default_name.eq_ignore_ascii_case(name) {
+            return Some((&mut self.segments, &mut self.scratch, &self.collection));
+        }
+        self.field_segments
+            .get_mut(name)
+            .map(|fs| (&mut fs.segments, &mut fs.scratch, &fs.collection))
+    }
+
     /// Compact the mutable segment into an immutable HNSW segment if beneficial.
     ///
     /// Triggered lazily on first search when the mutable segment exceeds the
@@ -148,10 +206,27 @@ impl VectorIndex {
         } else {
             DEFAULT_COMPACT_THRESHOLD
         };
-        if mutable_len < threshold {
-            return;
+        if mutable_len >= threshold {
+            Self::compact_segments(
+                &mut self.segments,
+                &mut self.scratch,
+                &self.collection,
+                self.meta.dimension,
+            );
         }
-        self.force_compact();
+        // Also try compact additional fields with the same threshold
+        for (_, fs) in &mut self.field_segments {
+            let fs_len = fs.segments.load().mutable.len();
+            if fs_len >= threshold {
+                let dim = fs.collection.dimension;
+                Self::compact_segments(
+                    &mut fs.segments,
+                    &mut fs.scratch,
+                    &fs.collection,
+                    dim,
+                );
+            }
+        }
     }
 
     /// Unconditionally compact the mutable segment into an immutable HNSW segment.
@@ -173,30 +248,55 @@ impl VectorIndex {
     /// silently no-ops, leaving all vectors in brute-force mutable segment
     /// (O(n) search instead of HNSW O(log n)).
     pub fn force_compact(&mut self) {
-        let mutable_len = self.segments.load().mutable.len();
+        // Compact default field
+        Self::compact_segments(
+            &mut self.segments,
+            &mut self.scratch,
+            &self.collection,
+            self.meta.dimension,
+        );
+        // Compact additional fields
+        for (_, fs) in &mut self.field_segments {
+            let dim = fs.collection.dimension;
+            Self::compact_segments(
+                &mut fs.segments,
+                &mut fs.scratch,
+                &fs.collection,
+                dim,
+            );
+        }
+    }
+
+    /// Compact a single field's mutable segment into an immutable HNSW segment.
+    fn compact_segments(
+        segments: &mut SegmentHolder,
+        scratch: &mut SearchScratch,
+        collection: &Arc<CollectionMetadata>,
+        dimension: u32,
+    ) {
+        let mutable_len = segments.load().mutable.len();
         if mutable_len == 0 {
             return;
         }
 
-        let frozen = self.segments.load().mutable.freeze();
-        let seed = self
-            .collection
+        let frozen = segments.load().mutable.freeze();
+        let seed = collection
             .collection_id
             .wrapping_mul(6364136223846793005);
 
-        match compaction::compact(&frozen, &self.collection, seed, None) {
+        match compaction::compact(&frozen, collection, seed, None) {
             Ok(immutable) => {
                 let num_nodes = immutable.graph().num_nodes();
-                let padded = self.collection.padded_dimension;
-                self.scratch = SearchScratch::new(num_nodes, padded);
+                let padded = collection.padded_dimension;
+                *scratch = SearchScratch::new(num_nodes, padded);
 
-                let old = self.segments.load();
+                let old = segments.load();
                 let next_global = old.mutable.next_global_id();
                 let mut imm_list = old.immutable.clone();
                 imm_list.push(Arc::new(immutable));
                 let new_mutable = Arc::new(crate::vector::segment::mutable::MutableSegment::new(
-                    self.meta.dimension,
-                    self.collection.clone(),
+                    dimension,
+                    collection.clone(),
                 ));
                 new_mutable.set_global_id_base(next_global);
                 let new_list = SegmentList {
@@ -206,7 +306,7 @@ impl VectorIndex {
                     warm: old.warm.clone(),
                     cold: old.cold.clone(),
                 };
-                self.segments.swap(new_list);
+                segments.swap(new_list);
             }
             Err(_e) => {
                 // Compaction failed (recall too low, etc.) — fall back to brute force
@@ -524,6 +624,32 @@ impl VectorStore {
         let segments = SegmentHolder::new(meta.dimension, collection.clone());
         let scratch = SearchScratch::new(0, padded);
 
+        // Create additional field segments for multi-field indexes.
+        let mut extra_fields = HashMap::new();
+        for field_meta in meta.vector_fields.iter().skip(1) {
+            let field_cid = self.next_collection_id;
+            self.next_collection_id += 1;
+            let field_padded = padded_dimension(field_meta.dimension);
+            let field_collection = Arc::new(CollectionMetadata::with_build_mode(
+                field_cid,
+                field_meta.dimension,
+                field_meta.metric,
+                field_meta.quantization,
+                field_cid,
+                field_meta.build_mode,
+            ));
+            let field_segments = SegmentHolder::new(field_meta.dimension, field_collection.clone());
+            let field_scratch = SearchScratch::new(0, field_padded);
+            extra_fields.insert(
+                field_meta.field_name.clone(),
+                FieldSegments {
+                    segments: field_segments,
+                    scratch: field_scratch,
+                    collection: field_collection,
+                },
+            );
+        }
+
         let name = meta.name.clone();
         self.indexes.insert(
             name.clone(),
@@ -536,6 +662,7 @@ impl VectorStore {
                 key_hash_to_key: std::collections::HashMap::new(),
                 key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
+                field_segments: extra_fields,
             },
         );
 
