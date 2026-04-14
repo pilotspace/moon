@@ -1492,7 +1492,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                     crate::command::vector_search::ft_create(&mut vs, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                    crate::command::vector_search::ft_search(&mut vs, cmd_args)
+                                    crate::command::vector_search::ft_search(&mut vs, cmd_args, None)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                     crate::command::vector_search::ft_dropindex(&mut vs, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {

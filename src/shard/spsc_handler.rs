@@ -982,11 +982,11 @@ pub(crate) fn dispatch_vector_command(
     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
         #[cfg(feature = "graph")]
         {
-            vector_search::ft_search_with_graph(vector_store, graph_store, args)
+            vector_search::ft_search_with_graph(vector_store, graph_store, args, None)
         }
         #[cfg(not(feature = "graph"))]
         {
-            vector_search::ft_search(vector_store, args)
+            vector_search::ft_search(vector_store, args, None)
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
         vector_search::ft_dropindex(vector_store, args)

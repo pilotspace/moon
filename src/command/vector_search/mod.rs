@@ -5,8 +5,10 @@
 //! Instead, the shard event loop intercepts FT.* commands and calls
 //! these handlers directly with the per-shard VectorStore.
 
+pub mod cache_search;
 #[cfg(feature = "graph")]
 pub mod graph_expand;
+pub mod session;
 
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
@@ -409,7 +411,14 @@ pub fn quantize_f32_to_sq(input: &[f32], output: &mut [i8]) {
 /// For cross-shard, the coordinator calls this on each shard and merges.
 ///
 /// Returns: Array [num_results, doc_id, [field_values], ...]
-pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
+///
+/// `db` is an optional mutable Database reference for SESSION clause support.
+/// When `None`, SESSION clause is silently ignored (backward compatible).
+pub fn ft_search(
+    store: &mut VectorStore,
+    args: &[Frame],
+    db: Option<&mut crate::storage::db::Database>,
+) -> Frame {
     // args[0] = index_name, args[1] = query_string, args[2..] = PARAMS ...
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
@@ -449,6 +458,53 @@ pub fn ft_search(store: &mut VectorStore, args: &[Frame]) -> Frame {
     // Parse optional LIMIT offset count
     let (limit_offset, limit_count) = parse_limit_clause(args);
 
+    // Parse optional SESSION clause
+    let session_key = parse_session_clause(args);
+
+    // If SESSION clause present and db available, use session-aware path
+    if let (Some(ref sess_key), Some(db)) = (session_key, db) {
+        let result = search_local_raw(
+            store,
+            &index_name,
+            &query_blob,
+            k,
+            filter_expr.as_ref(),
+        );
+        crate::vector::metrics::increment_search();
+        return match result {
+            SearchRawResult::Error(frame) => frame,
+            SearchRawResult::Ok { mut results, key_hash_to_key } => {
+                // Read session sorted set for filtering
+                let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
+                    match db.get_sorted_set(sess_key) {
+                        Ok(Some((members, _tree))) => members.clone(),
+                        Ok(None) => std::collections::HashMap::new(),
+                        Err(_) => std::collections::HashMap::new(),
+                    };
+
+                // Filter out previously returned results
+                results = session::filter_session_results(
+                    &results,
+                    &session_members_snapshot,
+                    &key_hash_to_key,
+                );
+
+                // Build response from filtered results
+                let response = build_search_response(&results, &key_hash_to_key, limit_offset, limit_count);
+
+                // Record new results in the session sorted set
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                session::record_session_results(&results, db, sess_key, &key_hash_to_key, timestamp);
+
+                response
+            }
+        };
+    }
+
+    // Standard path (no session)
     let result = search_local_filtered(
         store,
         &index_name,
@@ -476,19 +532,20 @@ pub fn ft_search_with_graph(
     store: &mut VectorStore,
     graph_store: Option<&crate::graph::store::GraphStore>,
     args: &[Frame],
+    db: Option<&mut crate::storage::db::Database>,
 ) -> Frame {
     let expand_depth = parse_expand_clause(args);
 
     // No expansion requested or no graph store — fall back to standard search.
     if expand_depth.is_none() || graph_store.is_none() {
-        return ft_search(store, args);
+        return ft_search(store, args, db);
     }
 
     let depth = expand_depth.unwrap_or(1);
     let gs = graph_store.unwrap();
 
-    // Run the standard KNN search first.
-    let knn_result = ft_search(store, args);
+    // Run the standard KNN search first (session filtering happens inside ft_search).
+    let knn_result = ft_search(store, args, db);
 
     // Extract (key, score) pairs from the KNN response for seeding graph expansion.
     let seed_keys = extract_seeds_from_response(&knn_result);
@@ -637,6 +694,92 @@ fn parse_expand_clause(args: &[Frame]) -> Option<u32> {
     None
 }
 
+/// Result of search_local_raw — either raw results or an error Frame.
+enum SearchRawResult {
+    Ok {
+        results: SmallVec<[SearchResult; 32]>,
+        key_hash_to_key: std::collections::HashMap<u64, Bytes>,
+    },
+    Error(Frame),
+}
+
+/// Search returning raw results (not yet built into a Frame response).
+/// Used by session-aware ft_search to filter results before response building.
+fn search_local_raw(
+    store: &mut VectorStore,
+    index_name: &[u8],
+    query_blob: &[u8],
+    k: usize,
+    filter: Option<&FilterExpr>,
+) -> SearchRawResult {
+    let idx = match store.get_index_mut(index_name) {
+        Some(i) => i,
+        None => return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"Unknown Index name"))),
+    };
+
+    let dim = idx.meta.dimension as usize;
+    let query_f32 = if query_blob.len() == dim * 4 {
+        let mut v = Vec::with_capacity(dim);
+        for chunk in query_blob.chunks_exact(4) {
+            v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        v
+    } else if let Ok(text) = std::str::from_utf8(query_blob) {
+        let parsed: Vec<f32> = text
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.trim().parse::<f32>().ok())
+            .collect();
+        if parsed.len() != dim {
+            return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch")));
+        }
+        parsed
+    } else {
+        return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch")));
+    };
+
+    idx.try_compact();
+
+    let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
+        idx.meta.hnsw_ef_runtime as usize
+    } else {
+        let base = (k * 20).max(200);
+        let dim_factor = if idx.meta.dimension >= 768 {
+            2
+        } else if idx.meta.dimension >= 384 {
+            3
+        } else {
+            2
+        };
+        (base * dim_factor / 2).clamp(200, 1000)
+    };
+
+    let filter_bitmap = filter.map(|f| {
+        let total = idx.segments.total_vectors();
+        idx.payload_index.evaluate_bitmap(f, total)
+    });
+
+    let empty_committed = roaring::RoaringBitmap::new();
+    let mvcc_ctx = crate::vector::segment::holder::MvccContext {
+        snapshot_lsn: 0,
+        my_txn_id: 0,
+        committed: &empty_committed,
+        dirty_set: &[],
+        dimension: idx.meta.dimension,
+    };
+
+    let results = idx.segments.search_mvcc(
+        &query_f32,
+        k,
+        ef_search,
+        &mut idx.scratch,
+        filter_bitmap.as_ref(),
+        &mvcc_ctx,
+    );
+    let key_hash_to_key = idx.key_hash_to_key.clone();
+    SearchRawResult::Ok { results, key_hash_to_key }
+}
+
 /// Direct local search for cross-shard VectorSearch messages.
 /// Skips FT.SEARCH parsing -- the coordinator already extracted index_name, blob, k.
 ///
@@ -745,7 +888,7 @@ pub fn search_local_filtered(
 
 /// Parse "*=>[KNN <k> @<field> $<param>]" query string.
 /// Returns (k, param_name) on success.
-fn parse_knn_query(query: &[u8]) -> Option<(usize, Bytes)> {
+pub(crate) fn parse_knn_query(query: &[u8]) -> Option<(usize, Bytes)> {
     let s = std::str::from_utf8(query).ok()?;
     let knn_start = s.find("KNN ")?;
     let after_knn = &s[knn_start + 4..];
@@ -774,7 +917,7 @@ fn parse_knn_query(query: &[u8]) -> Option<(usize, Bytes)> {
 
 /// Extract a named parameter blob from PARAMS section.
 /// Format: ... PARAMS <count> <name1> <blob1> <name2> <blob2> ...
-fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
+pub(crate) fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
     // Find PARAMS keyword starting after index_name and query
     let mut i = 2;
     while i < args.len() {
@@ -815,7 +958,7 @@ fn extract_param_blob(args: &[Frame], param_name: &[u8]) -> Option<Bytes> {
 /// Looks up the original Redis key via `key_hash_to_key` map (populated at insert time
 /// in `auto_index_hset`). Falls back to `vec:<internal_id>` only if the mapping is missing
 /// (e.g., legacy data restored from a snapshot without the key map).
-fn build_search_response(
+pub(crate) fn build_search_response(
     results: &SmallVec<[SearchResult; 32]>,
     key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
     offset: usize,
@@ -1008,7 +1151,7 @@ pub fn parse_ft_search_args(
 ///
 /// Default: (0, usize::MAX) — return all results (backward compatible).
 /// LIMIT 0 0 is valid: returns total count only (no document entries).
-fn parse_limit_clause(args: &[Frame]) -> (usize, usize) {
+pub(crate) fn parse_limit_clause(args: &[Frame]) -> (usize, usize) {
     let mut i = 2;
     while i < args.len() {
         if matches_keyword(&args[i], b"LIMIT") {
@@ -1032,7 +1175,7 @@ fn parse_limit_clause(args: &[Frame]) -> (usize, usize) {
 }
 
 /// Parse a frame as usize. Similar to parse_u32 but returns usize for pagination.
-fn parse_usize(frame: &Frame) -> Option<usize> {
+pub(crate) fn parse_usize(frame: &Frame) -> Option<usize> {
     match frame {
         Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse().ok(),
         Frame::Integer(n) => usize::try_from(*n).ok(),
@@ -1049,7 +1192,7 @@ fn parse_usize(frame: &Frame) -> Option<usize> {
 ///   @field:{value}              -- tag equality
 ///   @field:[min max]            -- numeric range
 ///   @field:{value} @field2:[a b] -- implicit AND of multiple conditions
-fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
+pub(crate) fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
     // Find FILTER keyword in args (after index_name and query)
     let mut i = 2;
     while i < args.len() {
@@ -1060,6 +1203,25 @@ fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
             }
             let filter_str = extract_bulk(&args[i])?;
             return parse_filter_string(&filter_str);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse SESSION clause from FT.SEARCH args.
+/// Looks for "SESSION" keyword after the query string, returns the session key.
+///
+/// Syntax: FT.SEARCH idx query ... SESSION sess:conv1
+pub fn parse_session_clause(args: &[Frame]) -> Option<Bytes> {
+    let mut i = 2;
+    while i < args.len() {
+        if matches_keyword(&args[i], b"SESSION") {
+            i += 1;
+            if i >= args.len() {
+                return None;
+            }
+            return extract_bulk(&args[i]);
         }
         i += 1;
     }
@@ -1421,21 +1583,21 @@ pub fn ft_expand(
 
 // -- Helpers (private) --
 
-fn extract_bulk(frame: &Frame) -> Option<Bytes> {
+pub(crate) fn extract_bulk(frame: &Frame) -> Option<Bytes> {
     match frame {
         Frame::BulkString(b) => Some(b.clone()),
         _ => None,
     }
 }
 
-fn matches_keyword(frame: &Frame, keyword: &[u8]) -> bool {
+pub(crate) fn matches_keyword(frame: &Frame, keyword: &[u8]) -> bool {
     match frame {
         Frame::BulkString(b) => b.eq_ignore_ascii_case(keyword),
         _ => false,
     }
 }
 
-fn parse_u32(frame: &Frame) -> Option<u32> {
+pub(crate) fn parse_u32(frame: &Frame) -> Option<u32> {
     match frame {
         Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse().ok(),
         Frame::Integer(n) => u32::try_from(*n).ok(),

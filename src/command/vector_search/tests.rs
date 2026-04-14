@@ -487,7 +487,7 @@ fn test_ft_search_dimension_mismatch() {
         bulk(b"query"),
         bulk(b"tooshort"),
     ];
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR query vector dimension"),
@@ -515,7 +515,7 @@ fn test_ft_search_empty_index() {
         Frame::BulkString(Bytes::from(query_vec)),
     ];
     crate::vector::distance::init();
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0)); // no results
@@ -637,7 +637,7 @@ fn test_end_to_end_create_insert_search() {
         Frame::BulkString(Bytes::from(query_blob)),
     ];
 
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     match &result {
         Frame::Array(items) => {
             // First element is count
@@ -718,7 +718,7 @@ fn test_ft_search_unknown_index() {
         Frame::BulkString(Bytes::from_static(b"query")),
         Frame::BulkString(Bytes::from(vec![0u8; 16])),
     ];
-    let result = ft_search(&mut store, &args);
+    let result = ft_search(&mut store, &args, None);
     assert!(
         matches!(result, Frame::Error(_)),
         "Should error on unknown index, got {result:?}"
@@ -848,7 +848,7 @@ fn test_ft_search_with_filter_no_regression() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0));
@@ -897,7 +897,7 @@ fn test_vector_metrics_increment_decrement() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    ft_search(&mut store, &search_args);
+    ft_search(&mut store, &search_args, None);
     let after_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
     assert!(
         after_search > before_search,
@@ -1611,4 +1611,369 @@ mod graph_expand_tests {
             panic!("expected array response");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FT.CACHESEARCH tests
+// ---------------------------------------------------------------------------
+
+mod cache_search_tests {
+    use super::*;
+    use crate::command::vector_search::cache_search;
+
+    fn make_valid_cachesearch_args() -> Vec<Frame> {
+        let query_blob = vec![0u8; 128 * 4]; // 128-dim zero vector
+        vec![
+            bulk(b"myidx"),
+            bulk(b"cache:query:"),
+            bulk(b"*=>[KNN 5 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            Frame::BulkString(Bytes::from(query_blob)),
+            bulk(b"THRESHOLD"),
+            bulk(b"0.95"),
+            bulk(b"FALLBACK"),
+            bulk(b"KNN"),
+            bulk(b"10"),
+        ]
+    }
+
+    #[test]
+    fn test_parse_cachesearch_args_valid() {
+        let args = make_valid_cachesearch_args();
+        let parsed = cache_search::parse_cachesearch_args_for_test(&args);
+        assert!(parsed.is_ok(), "expected Ok, got {:?}", parsed);
+    }
+
+    #[test]
+    fn test_parse_cachesearch_missing_threshold() {
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"cache:query:"),
+            bulk(b"*=>[KNN 5 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            Frame::BulkString(Bytes::from(vec![0u8; 128 * 4])),
+            // No THRESHOLD
+            bulk(b"FALLBACK"),
+            bulk(b"KNN"),
+            bulk(b"10"),
+        ];
+        let result = cache_search::parse_cachesearch_args_for_test(&args);
+        assert!(result.is_err(), "expected Err for missing THRESHOLD");
+    }
+
+    #[test]
+    fn test_parse_cachesearch_missing_fallback() {
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"cache:query:"),
+            bulk(b"*=>[KNN 5 @vec $query]"),
+            bulk(b"PARAMS"),
+            bulk(b"2"),
+            bulk(b"query"),
+            Frame::BulkString(Bytes::from(vec![0u8; 128 * 4])),
+            bulk(b"THRESHOLD"),
+            bulk(b"0.95"),
+            // No FALLBACK
+        ];
+        let result = cache_search::parse_cachesearch_args_for_test(&args);
+        assert!(result.is_err(), "expected Err for missing FALLBACK");
+    }
+
+    #[test]
+    fn test_is_cache_hit_l2_within() {
+        // L2: lower distance = more similar. Threshold 0.5 means distance <= 0.5 is a hit.
+        assert!(cache_search::is_within_threshold_for_test(
+            0.3,
+            0.5,
+            DistanceMetric::L2
+        ));
+        assert!(cache_search::is_within_threshold_for_test(
+            0.5,
+            0.5,
+            DistanceMetric::L2
+        ));
+    }
+
+    #[test]
+    fn test_is_cache_hit_l2_outside() {
+        assert!(!cache_search::is_within_threshold_for_test(
+            0.6,
+            0.5,
+            DistanceMetric::L2
+        ));
+    }
+
+    #[test]
+    fn test_is_cache_hit_cosine_within() {
+        // Cosine: higher = more similar. Threshold 0.95 means distance >= 0.95 is a hit.
+        assert!(cache_search::is_within_threshold_for_test(
+            0.97,
+            0.95,
+            DistanceMetric::Cosine
+        ));
+        assert!(cache_search::is_within_threshold_for_test(
+            0.95,
+            0.95,
+            DistanceMetric::Cosine
+        ));
+    }
+
+    #[test]
+    fn test_is_cache_hit_cosine_outside() {
+        assert!(!cache_search::is_within_threshold_for_test(
+            0.90,
+            0.95,
+            DistanceMetric::Cosine
+        ));
+    }
+
+    #[test]
+    fn test_is_cache_hit_ip_within() {
+        // InnerProduct: higher = more similar.
+        assert!(cache_search::is_within_threshold_for_test(
+            0.99,
+            0.9,
+            DistanceMetric::InnerProduct
+        ));
+    }
+
+    #[test]
+    fn test_is_cache_hit_no_candidates() {
+        // No candidates means no hit, regardless of threshold.
+        assert!(!cache_search::is_within_threshold_for_test(
+            f32::MAX,
+            0.5,
+            DistanceMetric::L2
+        ));
+    }
+
+    #[test]
+    fn test_ft_cachesearch_miss_on_empty_store() {
+        let mut store = VectorStore::new();
+        let create_args = ft_create_args();
+        ft_create(&mut store, &create_args);
+
+        let args = make_valid_cachesearch_args();
+        let result = cache_search::ft_cachesearch(&mut store, &args);
+
+        // Should return cache miss with cache_hit: "false" (empty results)
+        match &result {
+            Frame::Array(items) => {
+                // First element is total count (Integer)
+                if let Frame::Integer(total) = &items[0] {
+                    assert_eq!(*total, 0, "expected 0 results on empty store");
+                }
+            }
+            Frame::Error(e) => {
+                // Dimension mismatch or other parse error is also acceptable
+                let _ = e;
+            }
+            other => panic!("expected Array or Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ft_cachesearch_unknown_index() {
+        let mut store = VectorStore::new();
+        // Don't create any index
+        let args = make_valid_cachesearch_args();
+        let result = cache_search::ft_cachesearch(&mut store, &args);
+        match &result {
+            Frame::Error(e) => assert!(
+                e.starts_with(b"Unknown Index") || e.starts_with(b"ERR"),
+                "expected unknown index error, got {:?}",
+                std::str::from_utf8(e)
+            ),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_augment_with_cache_metadata_miss() {
+        // Build a mock FT.SEARCH response
+        let response = Frame::Array(
+            vec![
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"doc:1")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.5")),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+
+        let augmented = cache_search::augment_with_cache_metadata_for_test(response, false);
+        match &augmented {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 3);
+                // Check fields array has cache_hit added
+                if let Frame::Array(fields) = &items[2] {
+                    assert_eq!(fields.len(), 4); // __vec_score, value, cache_hit, false
+                    assert_eq!(
+                        fields[2],
+                        Frame::BulkString(Bytes::from_static(b"cache_hit"))
+                    );
+                    assert_eq!(
+                        fields[3],
+                        Frame::BulkString(Bytes::from_static(b"false"))
+                    );
+                } else {
+                    panic!("expected fields array");
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_augment_with_cache_metadata_hit() {
+        let response = Frame::Array(
+            vec![
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"cache:query:abc")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.97")),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+
+        let augmented = cache_search::augment_with_cache_metadata_for_test(response, true);
+        match &augmented {
+            Frame::Array(items) => {
+                if let Frame::Array(fields) = &items[2] {
+                    assert_eq!(
+                        fields[3],
+                        Frame::BulkString(Bytes::from_static(b"true"))
+                    );
+                } else {
+                    panic!("expected fields array");
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_parse_session_clause_present() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"SESSION"),
+        bulk(b"sess:conv1"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"q"),
+        bulk(b"blob"),
+    ];
+    let result = parse_session_clause(&args);
+    assert_eq!(result, Some(Bytes::from_static(b"sess:conv1")));
+}
+
+#[test]
+fn test_session_parse_session_clause_absent() {
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"q"),
+        bulk(b"blob"),
+    ];
+    let result = parse_session_clause(&args);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_session_parse_session_clause_no_key() {
+    // SESSION keyword present but no key argument after it
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"SESSION"),
+    ];
+    let result = parse_session_clause(&args);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_session_filter_results_empty_session() {
+    use crate::vector::types::{SearchResult, VectorId};
+    use std::collections::HashMap;
+
+    let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
+        SearchResult { id: VectorId(0), distance: 0.1, key_hash: 100 },
+        SearchResult { id: VectorId(1), distance: 0.2, key_hash: 200 },
+    ];
+    let session_members: HashMap<Bytes, f64> = HashMap::new();
+    let mut key_hash_to_key = HashMap::new();
+    key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
+    key_hash_to_key.insert(200u64, Bytes::from_static(b"doc:b"));
+
+    let filtered = session::filter_session_results(&results, &session_members, &key_hash_to_key);
+    assert_eq!(filtered.len(), 2, "empty session should return all results");
+}
+
+#[test]
+fn test_session_filter_results_removes_seen() {
+    use crate::vector::types::{SearchResult, VectorId};
+    use std::collections::HashMap;
+
+    let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
+        SearchResult { id: VectorId(0), distance: 0.1, key_hash: 100 },
+        SearchResult { id: VectorId(1), distance: 0.2, key_hash: 200 },
+        SearchResult { id: VectorId(2), distance: 0.3, key_hash: 300 },
+    ];
+    let mut session_members: HashMap<Bytes, f64> = HashMap::new();
+    session_members.insert(Bytes::from_static(b"doc:a"), 1000.0);
+
+    let mut key_hash_to_key = HashMap::new();
+    key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
+    key_hash_to_key.insert(200u64, Bytes::from_static(b"doc:b"));
+    key_hash_to_key.insert(300u64, Bytes::from_static(b"doc:c"));
+
+    let filtered = session::filter_session_results(&results, &session_members, &key_hash_to_key);
+    assert_eq!(filtered.len(), 2, "doc:a should be filtered out");
+    assert_eq!(filtered[0].key_hash, 200);
+    assert_eq!(filtered[1].key_hash, 300);
+}
+
+#[test]
+fn test_session_record_results() {
+    use crate::vector::types::{SearchResult, VectorId};
+    use std::collections::HashMap;
+
+    let mut db = crate::storage::db::Database::new();
+    let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
+        SearchResult { id: VectorId(0), distance: 0.1, key_hash: 100 },
+        SearchResult { id: VectorId(1), distance: 0.2, key_hash: 200 },
+    ];
+    let mut key_hash_to_key = HashMap::new();
+    key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
+    key_hash_to_key.insert(200u64, Bytes::from_static(b"doc:b"));
+
+    session::record_session_results(&results, &mut db, b"sess:conv1", &key_hash_to_key, 1000.0);
+
+    // Verify the session sorted set was created and populated
+    let (members, _tree) = db.get_sorted_set(b"sess:conv1").unwrap().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members.get(&Bytes::from_static(b"doc:a")), Some(&1000.0));
+    assert_eq!(members.get(&Bytes::from_static(b"doc:b")), Some(&1000.0));
 }

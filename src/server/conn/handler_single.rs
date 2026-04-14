@@ -1066,7 +1066,7 @@ pub async fn handle_connection(
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                         crate::command::vector_search::ft_create(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                        crate::command::vector_search::ft_search(&mut *store, cmd_args)
+                                        crate::command::vector_search::ft_search(&mut *store, cmd_args, None)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                         crate::command::vector_search::ft_dropindex(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
@@ -1187,7 +1187,7 @@ pub async fn handle_connection(
                                     if let Some(ref vs) = vector_store {
                                         let mut store = vs.lock();
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                            crate::command::vector_search::ft_search(&mut *store, d_args)
+                                            crate::command::vector_search::ft_search(&mut *store, d_args, None)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
@@ -1266,7 +1266,7 @@ pub async fn handle_connection(
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                             crate::command::vector_search::ft_create(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                            crate::command::vector_search::ft_search(&mut *store, d_args)
+                                            crate::command::vector_search::ft_search(&mut *store, d_args, None)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                             crate::command::vector_search::ft_dropindex(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
