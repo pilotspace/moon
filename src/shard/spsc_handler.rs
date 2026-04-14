@@ -971,6 +971,8 @@ pub(crate) fn dispatch_vector_command(
         vector_search::ft_list(vector_store)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
         vector_search::ft_compact(vector_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+        vector_search::ft_config(vector_store, args)
     } else {
         crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT command"))
     }
