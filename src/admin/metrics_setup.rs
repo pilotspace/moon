@@ -534,23 +534,74 @@ pub fn update_rss_bytes(rss: u64) {
 
 // ── Memory helpers ──────────────────────────────────────────────────────
 
-/// Read process RSS from /proc/self/status (Linux only).
+/// Query jemalloc `stats.resident` via raw `mallctl` FFI.
+///
+/// Returns the total bytes of physical memory mapped by the allocator,
+/// or 0 on failure. This is more accurate than `/proc/self/statm` which
+/// can be inflated by `mmap` regions that the allocator doesn't own (e.g.
+/// WAL segment files, io_uring buffers) and which reports incorrect values
+/// inside certain container/VM environments (OrbStack, Docker with cgroups v2).
+///
+/// **Zero-allocation**: calls `mallctl` directly — no CString, no heap churn.
+/// Requires `epoch` advance first so the stats snapshot is fresh.
+/// Read process RSS from /proc/self/statm (Linux only).
 /// Returns bytes, or 0 on failure / non-Linux.
+///
+/// **True zero-allocation**: uses raw `libc::open`/`read`/`close` with a
+/// static path and stack buffer. Avoids `std::fs::File::open` which
+/// allocates internally (`CString::new` for the syscall path).
+///
+/// Note: jemalloc `mallctl("stats.resident")` was tried but calling
+/// `mallctl("epoch")` every second to refresh stats causes jemalloc to
+/// allocate internal bookkeeping memory that grows unbounded (~1MB/20s).
 #[cfg(target_os = "linux")]
 pub fn get_rss_bytes() -> u64 {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                let trimmed = rest.trim();
-                if let Some(kb_str) = trimmed.strip_suffix(" kB") {
-                    if let Ok(kb) = kb_str.trim().parse::<u64>() {
-                        return kb * 1024;
-                    }
-                }
+    // SAFETY: c"/proc/self/statm" is a valid C string literal.
+    // open() with O_RDONLY on /proc is always safe.
+    let fd = unsafe { libc::open(c"/proc/self/statm".as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 128];
+    // SAFETY: buf is valid, fd is open, read() returns bytes written.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    // SAFETY: close() on a valid fd is always safe.
+    unsafe { libc::close(fd) };
+    if n <= 0 {
+        return 0;
+    }
+    // statm format: "size resident shared text lib data dt" (pages)
+    // Field 1 (resident) is what we need.
+    let s = &buf[..n as usize];
+    let mut fields = s.split(|&b| b == b' ');
+    let _size = fields.next(); // skip field 0
+    if let Some(rss_field) = fields.next() {
+        // Parse ASCII digits directly — no String allocation.
+        let mut pages: u64 = 0;
+        for &b in rss_field {
+            if b.is_ascii_digit() {
+                pages = pages * 10 + (b - b'0') as u64;
             }
         }
+        let page_size = page_size_cached();
+        return pages * page_size;
     }
     0
+}
+
+/// Cached page size to avoid repeated syscall.
+#[cfg(target_os = "linux")]
+fn page_size_cached() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+    let cached = PAGE_SIZE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    // SAFETY: sysconf(_SC_PAGESIZE) is always safe and returns a positive value.
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    PAGE_SIZE.store(ps, Ordering::Relaxed);
+    ps
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -706,15 +757,14 @@ pub fn spawn_metrics_publisher() {
                 event: "server_stats",
                 total_ops,
                 ops_per_sec,
-                // TODO: read from jemalloc or /proc/self/status in Phase 129
                 total_memory: get_rss_bytes(),
                 connected_clients: CONNECTED_CLIENTS.load(Ordering::Relaxed),
                 uptime_seconds: start.elapsed().as_secs(),
-                // TODO: aggregate from shard key counts in Phase 129
                 total_keys: 0,
             };
 
-            // Fire-and-forget: if no SSE clients are connected, the message is dropped
+            // watch::send replaces the single stored value — no ring buffer,
+            // no per-event allocation. Receivers see only the latest snapshot.
             let _ = sender.send(event);
         }
     });

@@ -803,9 +803,13 @@ pub fn spawn_admin_server(
                     let io = hyper_util::rt::TokioIo::new(stream);
 
                     tokio::spawn(async move {
-                        let builder = hyper_util::server::conn::auto::Builder::new(
+                        let mut builder = hyper_util::server::conn::auto::Builder::new(
                             hyper_util::rt::TokioExecutor::new(),
                         );
+                        // Cap request header buffer to limit RSS from stray
+                        // browser cookies (localhost shares cookies across
+                        // ports — Supabase tokens alone add ~6KB/request).
+                        builder.http1().max_buf_size(32 * 1024);
                         let conn = builder.serve_connection_with_upgrades(
                             io,
                             service_fn(move |req| {

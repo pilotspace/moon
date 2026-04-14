@@ -16,7 +16,7 @@ use super::traits::{
 pub struct TokioTimer;
 
 /// Wrapper around tokio::time::Interval implementing RuntimeInterval.
-pub struct TokioInterval(tokio::time::Interval);
+pub struct TokioInterval(pub(crate) tokio::time::Interval);
 
 impl RuntimeTimer for TokioTimer {
     type Interval = TokioInterval;

@@ -88,12 +88,23 @@ export const useBrowserStore = create<BrowserState>((set, get) => ({
         selected: false,
       }));
 
-      set((s) => ({
-        keys: reset ? newEntries : [...s.keys, ...newEntries],
+      const merged = reset ? newEntries : [...get().keys, ...newEntries];
+      const moreAvailable = result.cursor !== "0";
+
+      set({
+        keys: merged,
         cursor: result.cursor,
-        hasMore: result.cursor !== "0",
+        hasMore: moreAvailable,
         loading: false,
-      }));
+      });
+
+      // Multi-shard SCAN returns one shard per call. If the
+      // accumulated key list is still smaller than a full page and
+      // more shards remain, auto-fetch the next page so the UI
+      // isn't stuck with a partially-filled list that can't scroll.
+      if (merged.length < BATCH_SIZE && moreAvailable) {
+        get().loadKeys();
+      }
     } catch {
       set({ loading: false });
     }

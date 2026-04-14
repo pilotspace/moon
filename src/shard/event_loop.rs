@@ -26,7 +26,7 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::runtime::{
     TimerImpl,
-    traits::{RuntimeInterval, RuntimeTimer},
+    traits::RuntimeTimer,
 };
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
@@ -576,15 +576,23 @@ impl super::Shard {
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
 
+        // Sub-timer intervals: tokio uses separate select! branches for each.
+        // monoio uses counter-based dispatch from a single periodic tick to avoid
+        // monoio::select! memory leak (~100 bytes/re-entry at 1000Hz = ~100 KB/s/shard).
+        #[cfg(feature = "runtime-tokio")]
         let mut expiry_interval = TimerImpl::interval(Duration::from_millis(100));
+        #[cfg(feature = "runtime-tokio")]
         let mut eviction_interval = TimerImpl::interval(Duration::from_millis(100));
         let mut periodic_interval = TimerImpl::interval(Duration::from_millis(1));
+        #[cfg(feature = "runtime-tokio")]
         let mut block_timeout_interval = TimerImpl::interval(Duration::from_millis(10));
+        #[cfg(feature = "runtime-tokio")]
         let mut wal_sync_interval = TimerImpl::interval(Duration::from_secs(1));
         // Warm check interval adapts to segment_warm_after for fast testing:
         // default 10s, but if warm_after < 10s, poll at warm_after frequency.
         let warm_poll_ms =
             (server_config.segment_warm_after * 1000).clamp(1000, timers::WARM_CHECK_INTERVAL_MS);
+        #[cfg(feature = "runtime-tokio")]
         let mut warm_check_interval = TimerImpl::interval(Duration::from_millis(warm_poll_ms));
         // Cold tier transition check: poll at min(60s, segment_cold_after) so the
         // timer fires within one cold-age window (default 60s; short for testing).
@@ -593,8 +601,17 @@ impl super::Shard {
         } else {
             60
         };
+        #[cfg(feature = "runtime-tokio")]
         let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
+
+        // monoio: counter-based sub-timer dispatch from 1ms periodic tick.
+        // Each sub-timer fires at its native interval via modular arithmetic.
+        #[cfg(feature = "runtime-monoio")]
+        let mut monoio_tick_counter: u64 = 0;
+        // Used by tokio select! for event-driven SPSC drain; monoio drains in periodic tick.
         let spsc_notify_local = spsc_notify;
+        #[cfg(feature = "runtime-monoio")]
+        let _ = &spsc_notify_local;
 
         // Per-shard cached clock: updated once per 1ms tick.
         let cached_clock = CachedClock::new();
@@ -903,7 +920,7 @@ impl super::Shard {
                     }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
-                _ = periodic_interval.tick() => {
+                _ = periodic_interval.0.tick() => {
                     cached_clock.update();
                     // Sync file ID from shared Cell (handlers may have incremented it)
                     next_file_id = next_file_id.max(spill_file_id.get());
@@ -1041,12 +1058,12 @@ impl super::Shard {
                     }
                 }
                 // WAL fsync on 1-second interval
-                _ = wal_sync_interval.tick() => {
+                _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
                 }
                 // Warm tier transition check (10s interval, disk-offload only)
-                _ = warm_check_interval.tick() => {
+                _ = warm_check_interval.0.tick() => {
                     if server_config.disk_offload_enabled() {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
@@ -1064,7 +1081,7 @@ impl super::Shard {
                     }
                 }
                 // Cold tier transition check (60s, disk-offload only)
-                _ = cold_check_interval.tick() => {
+                _ = cold_check_interval.0.tick() => {
                     if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
@@ -1081,15 +1098,15 @@ impl super::Shard {
                     }
                 }
                 // Expire timed-out blocked clients every 10ms
-                _ = block_timeout_interval.tick() => {
+                _ = block_timeout_interval.0.tick() => {
                     timers::expire_blocked_clients(&blocking_rc);
                 }
                 // Cooperative active expiry
-                _ = expiry_interval.tick() => {
+                _ = expiry_interval.0.tick() => {
                     timers::run_active_expiry(&shard_databases, shard_id);
                 }
                 // Background eviction timer + memory pressure cascade
-                _ = eviction_interval.tick() => {
+                _ = eviction_interval.0.tick() => {
                     persistence_tick::run_eviction_tick(
                         spill_thread.as_ref(),
                         &mut shard_manifest,
@@ -1233,227 +1250,176 @@ impl super::Shard {
                 waker.wake();
             }
 
-            // Monoio runtime: full event loop.
-            // Per-shard accept is handled by the dedicated monoio::spawn task above,
-            // drained via local_accept_rx.try_recv() before entering select!.
+            // Monoio runtime: direct-await on 1ms periodic tick.
+            // AVOID monoio::select! — it leaks ~100 bytes per re-entry (internal future
+            // state re-allocation). At 1000 Hz this causes ~100 KB/s/shard RSS growth.
+            // Instead: await the single timer, drain connections + SPSC non-blocking,
+            // and dispatch sub-timers via counter-based modular arithmetic.
             #[cfg(feature = "runtime-monoio")]
-            monoio::select! {
-                // Accept new connections from listener (MPSC fallback, always active for TLS/non-Linux)
-                stream = conn_rx.recv_async() => {
-                    match stream {
-                        Ok((std_tcp_stream, is_tls)) => {
-                            conn_accept::spawn_monoio_connection(
-                                std_tcp_stream, is_tls, &tls_config,
-                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                                &acl_table, &runtime_config, &server_config, &all_notifiers,
-                                &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                                &all_remote_sub_maps,
-                                &affinity_tracker,
-                                shard_id, num_shards, config_port,
-                                &pending_wakers,
-                                &spill_sender, &spill_file_id, &disk_offload_dir,
-                            );
-                        }
-                        Err(_) => {
-                            info!("Shard {} connection channel closed", self.id);
-                            break;
-                        }
-                    }
-                }
-                // SPSC notify -- event-driven cross-shard message drain
-                _ = spsc_notify_local.notified() => {
-                    tracing::trace!("Shard {}: SPSC notify fired", shard_id);
-                    let mut pending_snapshot = None;
-                    spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
-                        &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
-                    );
-                    // Wake connection tasks waiting for cross-shard write responses.
-                    // They'll try_recv() — if the response arrived, proceed; otherwise re-register.
-                    for waker in pending_wakers.borrow_mut().drain(..) {
-                        waker.wake();
-                    }
-                    persistence_tick::handle_pending_snapshot(
-                        pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, disk_offload_base.as_deref(), shard_id,
-                    );
-                    for (fd, state) in pending_migrations.drain(..) {
-                        tracing::info!(
-                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                            shard_id, fd, state.client_id, state.peer_addr
-                        );
-                        #[cfg(feature = "runtime-tokio")]
-                        {
-                            conn_accept::spawn_migrated_tokio_connection(
-                                fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                                &acl_table, &runtime_config, &server_config, &all_notifiers,
-                                &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                                &all_remote_sub_maps, &affinity_tracker,
-                                shard_id, num_shards, config_port,
-                            );
-                        }
-                        #[cfg(feature = "runtime-monoio")]
-                        {
-                            conn_accept::spawn_migrated_monoio_connection(
-                                fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                                &acl_table, &runtime_config, &server_config, &all_notifiers,
-                                &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                                &all_remote_sub_maps, &affinity_tracker,
-                                shard_id, num_shards, config_port,
-                                &pending_wakers,
-                                &spill_sender, &spill_file_id, &disk_offload_dir,
-                            );
-                        }
-                    }
-                }
-                // Periodic 1ms timer for WAL flush, snapshot advance, SPSC safety net
-                _ = periodic_interval.tick() => {
-                    tracing::trace!("Shard {}: periodic tick", shard_id);
-                    cached_clock.update();
-                    // Sync file ID from shared Cell (handlers may have incremented it)
-                    next_file_id = next_file_id.max(spill_file_id.get());
-
-                    let mut pending_snapshot = None;
-                    spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
-                        &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                        &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
-                    );
-                    // Wake connection tasks waiting for cross-shard write responses.
-                    for waker in pending_wakers.borrow_mut().drain(..) {
-                        waker.wake();
-                    }
-                    persistence_tick::handle_pending_snapshot(
-                        pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                        &shard_databases, disk_offload_base.as_deref(), shard_id,
-                    );
-                    for (fd, state) in pending_migrations.drain(..) {
-                        tracing::info!(
-                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                            shard_id, fd, state.client_id, state.peer_addr
-                        );
-                        #[cfg(feature = "runtime-tokio")]
-                        {
-                            conn_accept::spawn_migrated_tokio_connection(
-                                fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                                &acl_table, &runtime_config, &server_config, &all_notifiers,
-                                &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                                &all_remote_sub_maps, &affinity_tracker,
-                                shard_id, num_shards, config_port,
-                            );
-                        }
-                        #[cfg(feature = "runtime-monoio")]
-                        {
-                            conn_accept::spawn_migrated_monoio_connection(
-                                fd, state,
-                                &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                                &acl_table, &runtime_config, &server_config, &all_notifiers,
-                                &snapshot_trigger_tx, &repl_state, &cluster_state,
-                                &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                                &all_remote_sub_maps, &affinity_tracker,
-                                shard_id, num_shards, config_port,
-                                &pending_wakers,
-                                &spill_sender, &spill_file_id, &disk_offload_dir,
-                            );
-                        }
-                    }
-
-                    persistence_tick::check_auto_save_trigger(
-                        &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                        &mut snapshot_state, &shard_databases, &persistence_dir,
-                        disk_offload_base.as_deref(), shard_id,
-                    );
-
-                    // Advance snapshot one segment per tick (cooperative)
-                    if persistence_tick::advance_snapshot_segment(
-                        &mut snapshot_state,
+            {
+                // Check shutdown before awaiting (non-blocking)
+                if shutdown.is_cancelled() {
+                    info!("Shard {} shutting down (monoio)", self.id);
+                    persistence_tick::drain_and_shutdown_spill(
+                        &mut spill_thread,
+                        &mut shard_manifest,
                         &shard_databases,
                         shard_id,
-                    ) {
-                        if let Some(snap) = snapshot_state.as_mut() {
-                            if let Err(e) = snap.finalize_async().await {
-                                persistence_tick::finalize_snapshot_error(
-                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
-                                    &e.to_string(),
-                                );
-                                crate::command::persistence::bgsave_shard_done(false);
-                            } else {
-                                persistence_tick::finalize_snapshot_success(
-                                    &mut snapshot_state, &mut snapshot_reply_tx,
-                                    &mut wal_writer, shard_id,
-                                );
-                                crate::command::persistence::bgsave_shard_done(true);
-                                bgsave_checkpoint_requested = true;
-                            }
-                        }
-                    }
-
-                    // Drain local-write WAL channel (connection handler inline writes)
-                    while let Ok(data) = wal_append_rx.try_recv() {
-                        if let Some(ref mut wal) = wal_writer {
-                            wal.append(&data);
-                        }
-                        if let Some(ref mut wal) = wal_v3_writer {
-                            wal.append(
-                                crate::persistence::wal_v3::record::WalRecordType::Command,
-                                &data,
-                            );
-                        }
-                    }
-
-                    persistence_tick::flush_wal_if_needed(&mut wal_writer);
-                    persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
-
-                    // appendfsync=always: fsync WAL v3 after every SPSC drain batch
-                    if server_config.appendfsync == "always" {
-                        if let Some(ref mut wal) = wal_v3_writer {
-                            if let Err(e) = wal.flush_sync() {
-                                tracing::error!("WAL v3 appendfsync=always failed: {}", e);
-                            }
-                        }
-                    }
-
-                    // Checkpoint protocol tick (disk-offload only)
+                    );
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
-                        // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
-                        if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
-                            let lsn = wal_v3.current_lsn();
-                            let dirty = page_cache_inst.dirty_page_count();
-                            ckpt_mgr.force_begin(lsn, dirty);
-                            bgsave_checkpoint_requested = false;
-                        }
-                        persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
-                        if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
-                            wal_bytes_since_checkpoint = 0;
+                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
+                    }
+                    if let Some(ref mut wal) = wal_writer {
+                        let _ = wal.shutdown();
+                    }
+                    if let Some(ref mut wal_v3) = wal_v3_writer {
+                        let _ = wal_v3.flush_sync();
+                    }
+                    break;
+                }
+
+                // Single await point — no select!, no per-iteration allocation.
+                // .0.tick() bypasses the RuntimeInterval trait's Box::pin() wrapper.
+                periodic_interval.0.tick().await;
+                monoio_tick_counter = monoio_tick_counter.wrapping_add(1);
+
+                // --- Periodic tick body (same as tokio periodic_interval branch) ---
+                cached_clock.update();
+                next_file_id = next_file_id.max(spill_file_id.get());
+
+                let mut pending_snapshot = None;
+                spsc_handler::drain_spsc_shared(
+                    &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                    &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                    &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
+                    &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                    &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
+                );
+                for waker in pending_wakers.borrow_mut().drain(..) {
+                    waker.wake();
+                }
+                persistence_tick::handle_pending_snapshot(
+                    pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
+                    &shard_databases, disk_offload_base.as_deref(), shard_id,
+                );
+                for (fd, state) in pending_migrations.drain(..) {
+                    tracing::info!(
+                        "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                        shard_id, fd, state.client_id, state.peer_addr
+                    );
+                    conn_accept::spawn_migrated_monoio_connection(
+                        fd, state,
+                        &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
+                        &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                        &acl_table, &runtime_config, &server_config, &all_notifiers,
+                        &snapshot_trigger_tx, &repl_state, &cluster_state,
+                        &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
+                        &all_remote_sub_maps, &affinity_tracker,
+                        shard_id, num_shards, config_port,
+                        &pending_wakers,
+                        &spill_sender, &spill_file_id, &disk_offload_dir,
+                    );
+                }
+
+                persistence_tick::check_auto_save_trigger(
+                    &snapshot_trigger_rx, &mut last_snapshot_epoch,
+                    &mut snapshot_state, &shard_databases, &persistence_dir,
+                    disk_offload_base.as_deref(), shard_id,
+                );
+
+                if persistence_tick::advance_snapshot_segment(
+                    &mut snapshot_state,
+                    &shard_databases,
+                    shard_id,
+                ) {
+                    if let Some(snap) = snapshot_state.as_mut() {
+                        if let Err(e) = snap.finalize_async().await {
+                            persistence_tick::finalize_snapshot_error(
+                                &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
+                                &e.to_string(),
+                            );
+                            crate::command::persistence::bgsave_shard_done(false);
+                        } else {
+                            persistence_tick::finalize_snapshot_success(
+                                &mut snapshot_state, &mut snapshot_reply_tx,
+                                &mut wal_writer, shard_id,
+                            );
+                            crate::command::persistence::bgsave_shard_done(true);
+                            bgsave_checkpoint_requested = true;
                         }
                     }
                 }
-                // WAL fsync on 1-second interval
-                _ = wal_sync_interval.tick() => {
+
+                // Drain local-write WAL channel
+                while let Ok(data) = wal_append_rx.try_recv() {
+                    if let Some(ref mut wal) = wal_writer {
+                        wal.append(&data);
+                    }
+                    if let Some(ref mut wal) = wal_v3_writer {
+                        wal.append(
+                            crate::persistence::wal_v3::record::WalRecordType::Command,
+                            &data,
+                        );
+                    }
+                }
+
+                persistence_tick::flush_wal_if_needed(&mut wal_writer);
+                persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                if server_config.appendfsync == "always" {
+                    if let Some(ref mut wal) = wal_v3_writer {
+                        if let Err(e) = wal.flush_sync() {
+                            tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                        }
+                    }
+                }
+
+                // Checkpoint protocol tick (disk-offload only)
+                if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                    (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                {
+                    if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
+                        let lsn = wal_v3.current_lsn();
+                        let dirty = page_cache_inst.dirty_page_count();
+                        ckpt_mgr.force_begin(lsn, dirty);
+                        bgsave_checkpoint_requested = false;
+                    }
+                    persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
+                    if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
+                        wal_bytes_since_checkpoint = 0;
+                    }
+                }
+
+                // --- Counter-based sub-timer dispatch ---
+                // block_timeout: every 10ms (10 ticks)
+                if monoio_tick_counter % 10 == 0 {
+                    timers::expire_blocked_clients(&blocking_rc);
+                }
+                // expiry + eviction: every 100ms (100 ticks)
+                if monoio_tick_counter % 100 == 0 {
+                    timers::run_active_expiry(&shard_databases, shard_id);
+                    persistence_tick::run_eviction_tick(
+                        spill_thread.as_ref(),
+                        &mut shard_manifest,
+                        &shard_databases,
+                        shard_id,
+                        &server_config,
+                        &runtime_config,
+                        &page_cache,
+                        &mut next_file_id,
+                        &mut wal_v3_writer,
+                        &spill_file_id,
+                    );
+                }
+                // WAL fsync: every 1s (1000 ticks)
+                if monoio_tick_counter % 1000 == 0 {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
                 }
-                // Warm tier transition check (10s interval, disk-offload only)
-                _ = warm_check_interval.tick() => {
+                // Warm tier check: every warm_poll_ms ticks
+                if monoio_tick_counter % (warm_poll_ms as u64) == 0 {
                     if server_config.disk_offload_enabled() {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
@@ -1470,8 +1436,8 @@ impl super::Shard {
                         }
                     }
                 }
-                // Cold tier transition check (60s, disk-offload only)
-                _ = cold_check_interval.tick() => {
+                // Cold tier check: every cold_poll_secs * 1000 ticks
+                if monoio_tick_counter % (cold_poll_secs as u64 * 1000) == 0 {
                     if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
@@ -1486,59 +1452,6 @@ impl super::Shard {
                             );
                         }
                     }
-                }
-                // Expire timed-out blocked clients every 10ms
-                _ = block_timeout_interval.tick() => {
-                    timers::expire_blocked_clients(&blocking_rc);
-                }
-                // Cooperative active expiry every 100ms
-                _ = expiry_interval.tick() => {
-                    timers::run_active_expiry(&shard_databases, shard_id);
-                }
-                // Background eviction timer + memory pressure cascade
-                _ = eviction_interval.tick() => {
-                    persistence_tick::run_eviction_tick(
-                        spill_thread.as_ref(),
-                        &mut shard_manifest,
-                        &shard_databases,
-                        shard_id,
-                        &server_config,
-                        &runtime_config,
-                        &page_cache,
-                        &mut next_file_id,
-                        &mut wal_v3_writer,
-                        &spill_file_id,
-                    );
-
-                    // Reap idle io_uring connections every ~5s (50 ticks × 100ms).
-                    // Cleans up CLOSE_WAIT connections where the multishot recv
-                    // ended without producing a 0-byte CQE (client FIN + MORE=0).
-                    // Note: idle connection reaping for CLOSE_WAIT cleanup is handled
-                    // by the UringDriver in the tokio+io_uring path. The monoio path
-                    // relies on monoio's internal connection lifecycle management.
-                }
-                // Shutdown
-                _ = shutdown.cancelled() => {
-                    info!("Shard {} shutting down (monoio)", self.id);
-                    persistence_tick::drain_and_shutdown_spill(
-                        &mut spill_thread,
-                        &mut shard_manifest,
-                        &shard_databases,
-                        shard_id,
-                    );
-                    // Trigger final checkpoint before shutdown (design S9)
-                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
-                    {
-                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
-                    }
-                    if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.shutdown();
-                    }
-                    if let Some(ref mut wal_v3) = wal_v3_writer {
-                        let _ = wal_v3.flush_sync();
-                    }
-                    break;
                 }
             }
         }

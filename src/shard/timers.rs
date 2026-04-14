@@ -21,11 +21,17 @@ pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id:
         let mut guard = shard_databases.write_db(shard_id, i);
         crate::server::expiration::expire_cycle_direct(&mut guard);
     }
-    // Update RSS gauge on shard 0 only — cheap /proc read, avoids cross-shard contention
+    // Update RSS gauge on shard 0 only, once per second (not every 100ms tick).
+    // Gated by a simple counter to reduce /proc/self/statm open/read/close churn.
     if shard_id == 0 {
-        let rss = crate::admin::metrics_setup::get_rss_bytes();
-        if rss > 0 {
-            crate::admin::metrics_setup::update_rss_bytes(rss);
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static RSS_TICK: AtomicU8 = AtomicU8::new(0);
+        let tick = RSS_TICK.fetch_add(1, Ordering::Relaxed);
+        if tick.is_multiple_of(10) {
+            let rss = crate::admin::metrics_setup::get_rss_bytes();
+            if rss > 0 {
+                crate::admin::metrics_setup::update_rss_bytes(rss);
+            }
         }
     }
 }

@@ -17,7 +17,7 @@ use super::traits::{
 pub struct MonoioTimer;
 
 /// Wrapper around monoio::time::Interval implementing RuntimeInterval.
-pub struct MonoioInterval(monoio::time::Interval);
+pub struct MonoioInterval(pub(crate) monoio::time::Interval);
 
 impl RuntimeTimer for MonoioTimer {
     type Interval = MonoioInterval;

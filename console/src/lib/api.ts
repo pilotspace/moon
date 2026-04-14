@@ -21,9 +21,35 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Parse a Redis INFO bulk string into sectioned key-value maps */
+function parseInfoString(raw: string): ServerInfo {
+  const info: ServerInfo = {
+    server: {}, memory: {}, clients: {}, stats: {},
+    keyspace: {}, persistence: {}, replication: {}, cpu: {},
+  };
+  let current: Record<string, string> | null = null;
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("# ")) {
+      const section = trimmed.slice(2).toLowerCase();
+      current = (info as unknown as Record<string, Record<string, string>>)[section] ?? null;
+      continue;
+    }
+    if (current === null) continue;
+    const idx = trimmed.indexOf(":");
+    if (idx > 0) {
+      current[trimmed.slice(0, idx)] = trimmed.slice(idx + 1);
+    }
+  }
+  return info;
+}
+
 /** Fetch full server INFO */
 export async function fetchServerInfo(): Promise<ServerInfo> {
-  return apiGet<ServerInfo>("/info");
+  const resp = await apiGet<{ info: string }>("/info");
+  return parseInfoString(resp.info);
 }
 
 /** Execute a RESP command via REST API. Returns the unwrapped result value. */

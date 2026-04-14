@@ -1,8 +1,9 @@
 //! Server-Sent Events (SSE) streaming for real-time metric delivery.
 //!
-//! Uses `tokio::sync::broadcast` for fan-out to multiple SSE clients.
-//! Slow consumers receive `RecvError::Lagged` and skip to current data
-//! rather than causing backpressure.
+//! Uses `tokio::sync::watch` to hold only the latest metric snapshot.
+//! Each SSE client polls the watch channel at ~1 Hz. No ring buffer,
+//! no per-event Arc allocation — eliminates the ~33 KB/sec RSS growth
+//! caused by `tokio::sync::broadcast`'s internal slot bookkeeping.
 
 use std::convert::Infallible;
 use std::sync::OnceLock;
@@ -12,9 +13,9 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::Response;
 use hyper::body::Frame as HttpFrame;
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::WatchStream;
 
 /// Metric event sent to SSE clients.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -28,57 +29,61 @@ pub struct MetricEvent {
     pub total_keys: u64,
 }
 
-/// Global broadcast sender for metric events.
-static METRICS_BROADCAST: OnceLock<broadcast::Sender<MetricEvent>> = OnceLock::new();
+impl Default for MetricEvent {
+    fn default() -> Self {
+        Self {
+            event: "server_stats",
+            total_ops: 0,
+            ops_per_sec: 0,
+            total_memory: 0,
+            connected_clients: 0,
+            uptime_seconds: 0,
+            total_keys: 0,
+        }
+    }
+}
 
-/// Initialize the metrics broadcast channel.
-/// Returns the sender (for the metrics publisher task).
-pub fn init_metrics_broadcast() -> broadcast::Sender<MetricEvent> {
-    let (tx, _) = broadcast::channel(1024);
-    let _ = METRICS_BROADCAST.set(tx.clone());
+/// Global watch sender for metric events.
+static METRICS_WATCH: OnceLock<watch::Sender<MetricEvent>> = OnceLock::new();
+
+/// Initialize the metrics watch channel.
+pub fn init_metrics_broadcast() -> watch::Sender<MetricEvent> {
+    let (tx, _) = watch::channel(MetricEvent::default());
+    let _ = METRICS_WATCH.set(tx.clone());
     tx
 }
 
-/// Get the broadcast sender (for publishing from metrics collection).
-pub fn get_metrics_sender() -> Option<&'static broadcast::Sender<MetricEvent>> {
-    METRICS_BROADCAST.get()
+/// Get the watch sender (for publishing from metrics collection).
+pub fn get_metrics_sender() -> Option<&'static watch::Sender<MetricEvent>> {
+    METRICS_WATCH.get()
 }
 
 /// Handle an SSE connection: returns a streaming HTTP response.
 ///
-/// Response uses `text/event-stream` content type with `data:` framing.
-/// Multiple clients each get their own broadcast receiver. Slow clients
-/// that fall behind the 1024-event buffer get `Lagged` errors and skip
-/// to current data.
+/// Each client gets a `WatchStream` that yields only when the value changes.
+/// Since the publisher writes at ~1 Hz and the value always changes (uptime
+/// increments), each client receives ~1 event/sec with zero buffering.
 pub fn handle_sse_stream() -> Response<BoxBody<Bytes, Infallible>> {
-    let rx = METRICS_BROADCAST
+    let rx = METRICS_WATCH
         .get()
         .map(|tx| tx.subscribe())
         .unwrap_or_else(|| {
-            // No broadcast initialized yet -- create a dummy channel
-            let (_tx, rx) = broadcast::channel(1);
+            let (_tx, rx) = watch::channel(MetricEvent::default());
             rx
         });
 
-    let stream = BroadcastStream::new(rx).filter_map(
-        |result| -> Option<Result<HttpFrame<Bytes>, Infallible>> {
-            match result {
-                Ok(event) => {
-                    let json = serde_json::to_string(&event).ok()?;
-                    let sse_data = format!("data: {json}\n\n");
-                    Some(Ok(HttpFrame::data(Bytes::from(sse_data))))
-                }
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    tracing::debug!("SSE client lagged by {} events", n);
-                    None
-                }
-            }
+    let stream = WatchStream::new(rx).map(
+        |event| -> Result<HttpFrame<Bytes>, Infallible> {
+            // Pre-size buffer: "data: " (6) + JSON (~150) + "\n\n" (2) ≈ 160 bytes.
+            let mut buf = String::with_capacity(192);
+            buf.push_str("data: ");
+            // serde_json::to_writer avoids an intermediate String allocation.
+            let _ = serde_json::to_writer(unsafe { buf.as_mut_vec() }, &event);
+            buf.push_str("\n\n");
+            Ok(HttpFrame::data(Bytes::from(buf)))
         },
     );
 
-    // CORS headers are applied by the middleware chain (attach_cors_headers)
-    // using the policy-driven allowlist. Do NOT hardcode `*` here — that
-    // would leak SSE data to disallowed origins.
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
