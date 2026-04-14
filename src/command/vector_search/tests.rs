@@ -1979,3 +1979,385 @@ fn test_session_record_results() {
     assert_eq!(members.get(&Bytes::from_static(b"doc:a")), Some(&1000.0));
     assert_eq!(members.get(&Bytes::from_static(b"doc:b")), Some(&1000.0));
 }
+
+// ---------------------------------------------------------------------------
+// Multi-field vector index tests (MVEC-02, MVEC-05)
+// ---------------------------------------------------------------------------
+
+/// Build FT.CREATE args with two VECTOR fields.
+fn ft_create_multi_field_args() -> Vec<Frame> {
+    vec![
+        bulk(b"multiidx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"doc:"),
+        bulk(b"SCHEMA"),
+        // First field: title_vec DIM 4 COSINE
+        bulk(b"title_vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"COSINE"),
+        // Second field: body_vec DIM 8 L2
+        bulk(b"body_vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"8"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ]
+}
+
+#[test]
+fn test_ft_create_multi_field() {
+    let mut store = VectorStore::new();
+    let args = ft_create_multi_field_args();
+    let result = ft_create(&mut store, &args);
+    match &result {
+        Frame::SimpleString(s) => assert_eq!(&s[..], b"OK"),
+        other => panic!("expected OK, got {other:?}"),
+    }
+    let idx = store.get_index(b"multiidx").unwrap();
+    assert_eq!(idx.meta.vector_fields.len(), 2);
+    assert_eq!(&idx.meta.vector_fields[0].field_name[..], b"title_vec");
+    assert_eq!(idx.meta.vector_fields[0].dimension, 4);
+    assert_eq!(idx.meta.vector_fields[0].metric, DistanceMetric::Cosine);
+    assert_eq!(&idx.meta.vector_fields[1].field_name[..], b"body_vec");
+    assert_eq!(idx.meta.vector_fields[1].dimension, 8);
+    assert_eq!(idx.meta.vector_fields[1].metric, DistanceMetric::L2);
+    // Default field is the first one
+    assert_eq!(idx.meta.dimension, 4);
+    assert_eq!(idx.meta.metric, DistanceMetric::Cosine);
+    assert!(idx.meta.is_multi_field());
+    // Additional field segments should exist for body_vec
+    assert!(idx.field_segments.contains_key(b"body_vec".as_slice()));
+}
+
+#[test]
+fn test_ft_create_duplicate_field_rejected() {
+    let mut store = VectorStore::new();
+    let args = vec![
+        bulk(b"dupidx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"doc:"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+        // Duplicate field name
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"8"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"COSINE"),
+    ];
+    let result = ft_create(&mut store, &args);
+    match &result {
+        Frame::Error(e) => assert!(
+            e.starts_with(b"ERR duplicate"),
+            "expected duplicate error, got {:?}",
+            std::str::from_utf8(e)
+        ),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ft_create_exceeds_max_fields() {
+    let mut store = VectorStore::new();
+    let mut args = vec![
+        bulk(b"toomanyidx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"doc:"),
+        bulk(b"SCHEMA"),
+    ];
+    // Add 9 VECTOR fields (> MAX_VECTOR_FIELDS=8)
+    for i in 0..9 {
+        let name = format!("vec{i}");
+        args.push(Frame::BulkString(Bytes::from(name)));
+        args.push(bulk(b"VECTOR"));
+        args.push(bulk(b"HNSW"));
+        args.push(bulk(b"6"));
+        args.push(bulk(b"TYPE"));
+        args.push(bulk(b"FLOAT32"));
+        args.push(bulk(b"DIM"));
+        args.push(bulk(b"4"));
+        args.push(bulk(b"DISTANCE_METRIC"));
+        args.push(bulk(b"L2"));
+    }
+    let result = ft_create(&mut store, &args);
+    match &result {
+        Frame::Error(e) => assert!(
+            e.starts_with(b"ERR too many"),
+            "expected too-many error, got {:?}",
+            std::str::from_utf8(e)
+        ),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ft_info_multi_field() {
+    let mut store = VectorStore::new();
+    let args = ft_create_multi_field_args();
+    ft_create(&mut store, &args);
+
+    let result = ft_info(&store, &[bulk(b"multiidx")]);
+    match result {
+        Frame::Array(items) => {
+            // Find the vector_fields key
+            let mut vf_idx = None;
+            for (i, item) in items.iter().enumerate() {
+                if let Frame::BulkString(key) = item {
+                    if key.as_ref() == b"vector_fields" {
+                        vf_idx = Some(i + 1);
+                        break;
+                    }
+                }
+            }
+            let vf_idx = vf_idx.expect("vector_fields key not found in FT.INFO");
+            let fields = match &items[vf_idx] {
+                Frame::Array(f) => f,
+                other => panic!("expected Array for vector_fields, got {other:?}"),
+            };
+            assert_eq!(fields.len(), 2, "should have 2 vector fields");
+
+            // Verify first field: title_vec
+            let f0 = match &fields[0] {
+                Frame::Array(f) => f,
+                other => panic!("expected Array for field entry, got {other:?}"),
+            };
+            // field_name, title_vec, dimension, 4, distance_metric, COSINE, ...
+            assert_eq!(f0[0], Frame::BulkString(Bytes::from_static(b"field_name")));
+            assert_eq!(f0[1], Frame::BulkString(Bytes::from("title_vec")));
+            assert_eq!(f0[2], Frame::BulkString(Bytes::from_static(b"dimension")));
+            assert_eq!(f0[3], Frame::Integer(4));
+            assert_eq!(f0[4], Frame::BulkString(Bytes::from_static(b"distance_metric")));
+            assert_eq!(f0[5], Frame::BulkString(Bytes::from_static(b"COSINE")));
+
+            // Verify second field: body_vec
+            let f1 = match &fields[1] {
+                Frame::Array(f) => f,
+                other => panic!("expected Array for field entry, got {other:?}"),
+            };
+            assert_eq!(f1[1], Frame::BulkString(Bytes::from("body_vec")));
+            assert_eq!(f1[3], Frame::Integer(8));
+            assert_eq!(f1[5], Frame::BulkString(Bytes::from_static(b"L2")));
+
+            // Top-level backward compat: dimension = 4 (default field)
+            assert_eq!(items[7], Frame::Integer(4));
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ft_search_field_targeting() {
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    let args = ft_create_multi_field_args();
+    ft_create(&mut store, &args);
+
+    // Insert vectors into the default (title_vec) field (dim=4)
+    let idx = store.get_index_mut(b"multiidx").unwrap();
+    let title_vecs: Vec<[f32; 4]> = vec![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+    ];
+    let snap = idx.segments.load();
+    for (i, v) in title_vecs.iter().enumerate() {
+        let mut sq = vec![0i8; 4];
+        quantize_f32_to_sq(v, &mut sq);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+    }
+    drop(snap);
+
+    // Insert vectors into body_vec field (dim=8)
+    let body_vecs: Vec<[f32; 8]> = vec![
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+    ];
+    if let Some(fs) = idx.field_segments.get(b"body_vec".as_slice()) {
+        let snap = fs.segments.load();
+        for (i, v) in body_vecs.iter().enumerate() {
+            let mut sq = vec![0i8; 8];
+            quantize_f32_to_sq(v, &mut sq);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+        }
+    }
+
+    // Search @title_vec (dim=4)
+    let query_vec_4: Vec<u8> = [1.0f32, 0.0, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let search_args = vec![
+        bulk(b"multiidx"),
+        Frame::BulkString(Bytes::from_static(b"*=>[KNN 2 @title_vec $query]")),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_vec_4)),
+    ];
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            assert!(
+                matches!(&items[0], Frame::Integer(n) if *n >= 1),
+                "title_vec search should find at least 1 result, got {result:?}"
+            );
+        }
+        Frame::Error(e) => panic!("title_vec search error: {:?}", std::str::from_utf8(e)),
+        _ => panic!("expected Array, got {result:?}"),
+    }
+
+    // Search @body_vec (dim=8)
+    let query_vec_8: Vec<u8> = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let search_args = vec![
+        bulk(b"multiidx"),
+        Frame::BulkString(Bytes::from_static(b"*=>[KNN 2 @body_vec $query]")),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_vec_8)),
+    ];
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            assert!(
+                matches!(&items[0], Frame::Integer(n) if *n >= 1),
+                "body_vec search should find at least 1 result, got {result:?}"
+            );
+        }
+        Frame::Error(e) => panic!("body_vec search error: {:?}", std::str::from_utf8(e)),
+        _ => panic!("expected Array, got {result:?}"),
+    }
+
+    // Search @body_vec with wrong dimension (4 bytes) should error
+    let wrong_dim: Vec<u8> = [1.0f32, 0.0, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let search_args = vec![
+        bulk(b"multiidx"),
+        Frame::BulkString(Bytes::from_static(b"*=>[KNN 2 @body_vec $query]")),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(wrong_dim)),
+    ];
+    let result = ft_search(&mut store, &search_args, None);
+    assert!(
+        matches!(&result, Frame::Error(_)),
+        "expected dimension mismatch error for body_vec, got {result:?}"
+    );
+}
+
+#[test]
+fn test_ft_search_default_field_compat() {
+    crate::vector::distance::init();
+
+    let mut store = VectorStore::new();
+    // Single-field index
+    let args = build_ft_create_args("singleidx", "doc:", "vec", 4, "L2");
+    ft_create(&mut store, &args);
+
+    let idx = store.get_index_mut(b"singleidx").unwrap();
+    let vectors: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0]];
+    let snap = idx.segments.load();
+    for (i, v) in vectors.iter().enumerate() {
+        let mut sq = vec![0i8; 4];
+        quantize_f32_to_sq(v, &mut sq);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+    }
+    drop(snap);
+
+    // Search without @field_name -- should use default field (backward compat)
+    // Note: parse_knn_query still extracts @vec but it matches default field
+    let query_vec: Vec<u8> = [1.0f32, 0.0, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let search_args = vec![
+        bulk(b"singleidx"),
+        Frame::BulkString(Bytes::from_static(b"*=>[KNN 1 @vec $query]")),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_vec)),
+    ];
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Array(items) => {
+            assert!(
+                matches!(&items[0], Frame::Integer(1)),
+                "default field search should find 1 result, got {result:?}"
+            );
+        }
+        Frame::Error(e) => panic!("default field search error: {:?}", std::str::from_utf8(e)),
+        _ => panic!("expected Array, got {result:?}"),
+    }
+}
+
+#[test]
+fn test_ft_search_unknown_field_error() {
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(&mut store, &args);
+
+    let query_vec: Vec<u8> = vec![0u8; 128 * 4];
+    let search_args = vec![
+        bulk(b"myidx"),
+        Frame::BulkString(Bytes::from_static(b"*=>[KNN 5 @nonexistent_field $query]")),
+        bulk(b"PARAMS"),
+        bulk(b"2"),
+        bulk(b"query"),
+        Frame::BulkString(Bytes::from(query_vec)),
+    ];
+    crate::vector::distance::init();
+    let result = ft_search(&mut store, &search_args, None);
+    match &result {
+        Frame::Error(e) => assert!(
+            e.starts_with(b"ERR unknown vector field"),
+            "expected unknown field error, got {:?}",
+            std::str::from_utf8(e)
+        ),
+        other => panic!("expected error, got {other:?}"),
+    }
+}

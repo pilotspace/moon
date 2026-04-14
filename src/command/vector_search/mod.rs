@@ -440,6 +440,8 @@ pub fn ft_list(store: &VectorStore) -> Frame {
 /// FT.INFO index_name
 ///
 /// Returns an array of key-value pairs describing the index.
+/// Includes backward-compatible top-level fields (from default field) plus
+/// a `vector_fields` nested array with per-field stats.
 pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
@@ -455,16 +457,14 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
 
-    // Return flat array: [key, value, key, value, ...]
+    // Count default field docs across mutable + immutable segments.
     let snap = idx.segments.load();
-    // Sum live counts across mutable + immutable segments.
-    // Previously this only counted the mutable segment, showing num_docs=0 after FT.COMPACT.
     let mut num_docs = snap.mutable.len();
     for imm in snap.immutable.iter() {
         num_docs += imm.live_count() as usize;
     }
 
-    // Use itoa for numeric formatting — no format!() on hot path.
+    // Use itoa for numeric formatting -- no format!() on hot path.
     let ef_rt_bytes: Bytes = if idx.meta.hnsw_ef_runtime > 0 {
         let mut buf = itoa::Buffer::new();
         Bytes::copy_from_slice(buf.format(idx.meta.hnsw_ef_runtime).as_bytes())
@@ -477,17 +477,10 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
     } else {
         Bytes::from_static(b"1000")
     };
-    let quant_bytes: Bytes = match idx.meta.quantization {
-        QuantizationConfig::Sq8 => Bytes::from_static(b"SQ8"),
-        QuantizationConfig::TurboQuant4 => Bytes::from_static(b"TurboQuant4"),
-        QuantizationConfig::TurboQuantProd4 => Bytes::from_static(b"TurboQuantProd4"),
-        QuantizationConfig::TurboQuant1 => Bytes::from_static(b"TurboQuant1"),
-        QuantizationConfig::TurboQuant2 => Bytes::from_static(b"TurboQuant2"),
-        QuantizationConfig::TurboQuant3 => Bytes::from_static(b"TurboQuant3"),
-        QuantizationConfig::TurboQuant4A2 => Bytes::from_static(b"TurboQuant4A2"),
-    };
+    let quant_bytes: Bytes = quantization_to_bytes(idx.meta.quantization);
 
-    let items = vec![
+    // Backward-compatible top-level fields (from default field)
+    let mut items = vec![
         Frame::BulkString(Bytes::from_static(b"index_name")),
         Frame::BulkString(idx.meta.name.clone()),
         Frame::BulkString(Bytes::from_static(b"index_definition")),
@@ -515,7 +508,69 @@ pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
         Frame::BulkString(Bytes::from_static(b"QUANTIZATION")),
         Frame::BulkString(quant_bytes),
     ];
+
+    // Per-field stats: vector_fields array
+    let mut field_entries: Vec<Frame> = Vec::with_capacity(idx.meta.vector_fields.len());
+    for (i, field_meta) in idx.meta.vector_fields.iter().enumerate() {
+        let (field_num_docs, field_mutable, field_immutable_count) = if i == 0 {
+            // Default field: use top-level segments
+            let s = idx.segments.load();
+            let mut docs = s.mutable.len();
+            let imm_count = s.immutable.len();
+            for imm in s.immutable.iter() {
+                docs += imm.live_count() as usize;
+            }
+            (docs, s.mutable.len(), imm_count)
+        } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
+            let s = fs.segments.load();
+            let mut docs = s.mutable.len();
+            let imm_count = s.immutable.len();
+            for imm in s.immutable.iter() {
+                docs += imm.live_count() as usize;
+            }
+            (docs, s.mutable.len(), imm_count)
+        } else {
+            (0, 0, 0)
+        };
+
+        let field_quant = quantization_to_bytes(field_meta.quantization);
+
+        let entry = vec![
+            Frame::BulkString(Bytes::from_static(b"field_name")),
+            Frame::BulkString(field_meta.field_name.clone()),
+            Frame::BulkString(Bytes::from_static(b"dimension")),
+            Frame::Integer(field_meta.dimension as i64),
+            Frame::BulkString(Bytes::from_static(b"distance_metric")),
+            Frame::BulkString(metric_to_bytes(field_meta.metric)),
+            Frame::BulkString(Bytes::from_static(b"num_docs")),
+            Frame::Integer(field_num_docs as i64),
+            Frame::BulkString(Bytes::from_static(b"QUANTIZATION")),
+            Frame::BulkString(field_quant),
+            Frame::BulkString(Bytes::from_static(b"mutable_vectors")),
+            Frame::Integer(field_mutable as i64),
+            Frame::BulkString(Bytes::from_static(b"immutable_segments")),
+            Frame::Integer(field_immutable_count as i64),
+        ];
+        field_entries.push(Frame::Array(entry.into()));
+    }
+
+    items.push(Frame::BulkString(Bytes::from_static(b"vector_fields")));
+    items.push(Frame::Array(field_entries.into()));
+
     Frame::Array(items.into())
+}
+
+/// Convert QuantizationConfig to display bytes.
+fn quantization_to_bytes(q: QuantizationConfig) -> Bytes {
+    match q {
+        QuantizationConfig::Sq8 => Bytes::from_static(b"SQ8"),
+        QuantizationConfig::TurboQuant4 => Bytes::from_static(b"TurboQuant4"),
+        QuantizationConfig::TurboQuantProd4 => Bytes::from_static(b"TurboQuantProd4"),
+        QuantizationConfig::TurboQuant1 => Bytes::from_static(b"TurboQuant1"),
+        QuantizationConfig::TurboQuant2 => Bytes::from_static(b"TurboQuant2"),
+        QuantizationConfig::TurboQuant3 => Bytes::from_static(b"TurboQuant3"),
+        QuantizationConfig::TurboQuant4A2 => Bytes::from_static(b"TurboQuant4A2"),
+    }
 }
 
 /// Scalar-quantize f32 vector to i8 for mutable segment brute-force search.
