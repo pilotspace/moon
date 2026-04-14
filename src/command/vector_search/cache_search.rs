@@ -64,7 +64,7 @@ fn parse_cachesearch_args(args: &[Frame]) -> Result<CacheSearchArgs, Frame> {
 
     // Parse KNN from query string: "*=>[KNN <k> @<field> $<param_name>]"
     // We don't use k from the query string directly; FALLBACK KNN k overrides it.
-    let (_knn_k, param_name) = match parse_knn_query(&query_str) {
+    let (_knn_k, _field_name, param_name) = match parse_knn_query(&query_str) {
         Some(parsed) => parsed,
         None => {
             return Err(Frame::Error(Bytes::from_static(
@@ -215,7 +215,7 @@ fn cache_probe(
     let k = cache_count.saturating_mul(3).max(100).min(10_000);
     let _ = idx; // release immutable borrow before mutable search call
 
-    let response = search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX);
+    let response = search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None);
 
     // Parse the response to find the best cache hit.
     let items = match &response {
@@ -349,6 +349,7 @@ pub fn ft_cachesearch(store: &mut VectorStore, args: &[Frame]) -> Frame {
         parsed.filter.as_ref(),
         parsed.offset,
         parsed.count,
+        None, // cache search always uses default field
     );
 
     // Augment each result with cache_hit: "false" metadata.

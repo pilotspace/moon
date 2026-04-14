@@ -561,7 +561,7 @@ pub fn ft_search(
     };
 
     // Parse KNN from query string: "*=>[KNN <k> @<field> $<param_name>]"
-    let (k, param_name) = match parse_knn_query(&query_str) {
+    let (k, field_name, param_name) = match parse_knn_query(&query_str) {
         Some(parsed) => parsed,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax")),
     };
@@ -593,6 +593,7 @@ pub fn ft_search(
             &query_blob,
             k,
             filter_expr.as_ref(),
+            field_name.as_ref(),
         );
         crate::vector::metrics::increment_search();
         return match result {
@@ -637,6 +638,7 @@ pub fn ft_search(
         filter_expr.as_ref(),
         limit_offset,
         limit_count,
+        field_name.as_ref(),
     );
     crate::vector::metrics::increment_search();
     result
@@ -829,19 +831,36 @@ enum SearchRawResult {
 
 /// Search returning raw results (not yet built into a Frame response).
 /// Used by session-aware ft_search to filter results before response building.
+///
+/// `field_name` selects which named vector field to search. `None` uses the default
+/// (first) field. `Some(name)` dispatches to the named field's segments.
 fn search_local_raw(
     store: &mut VectorStore,
     index_name: &[u8],
     query_blob: &[u8],
     k: usize,
     filter: Option<&FilterExpr>,
+    field_name: Option<&Bytes>,
 ) -> SearchRawResult {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"Unknown Index name"))),
     };
 
-    let dim = idx.meta.dimension as usize;
+    // Resolve target field: determine dimension, segments, scratch, collection
+    let (dim, use_default_field) = if let Some(fname) = field_name {
+        if let Some(field_meta) = idx.meta.find_field(fname) {
+            let is_default = fname.eq_ignore_ascii_case(&idx.meta.default_field().field_name);
+            (field_meta.dimension as usize, is_default)
+        } else {
+            return SearchRawResult::Error(Frame::Error(Bytes::from(
+                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
+            )));
+        }
+    } else {
+        (idx.meta.dimension as usize, true)
+    };
+
     let query_f32 = if query_blob.len() == dim * 4 {
         let mut v = Vec::with_capacity(dim);
         for chunk in query_blob.chunks_exact(4) {
@@ -868,9 +887,9 @@ fn search_local_raw(
         idx.meta.hnsw_ef_runtime as usize
     } else {
         let base = (k * 20).max(200);
-        let dim_factor = if idx.meta.dimension >= 768 {
+        let dim_factor = if dim >= 768 {
             2
-        } else if idx.meta.dimension >= 384 {
+        } else if dim >= 384 {
             3
         } else {
             2
@@ -884,37 +903,66 @@ fn search_local_raw(
     });
 
     let empty_committed = roaring::RoaringBitmap::new();
-    let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-        snapshot_lsn: 0,
-        my_txn_id: 0,
-        committed: &empty_committed,
-        dirty_set: &[],
-        dimension: idx.meta.dimension,
-    };
 
-    let results = idx.segments.search_mvcc(
-        &query_f32,
-        k,
-        ef_search,
-        &mut idx.scratch,
-        filter_bitmap.as_ref(),
-        &mvcc_ctx,
-    );
-    let key_hash_to_key = idx.key_hash_to_key.clone();
-    SearchRawResult::Ok { results, key_hash_to_key }
+    // Dispatch to correct field's segments
+    if use_default_field {
+        let mvcc_ctx = crate::vector::segment::holder::MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &empty_committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+        };
+        let results = idx.segments.search_mvcc(
+            &query_f32,
+            k,
+            ef_search,
+            &mut idx.scratch,
+            filter_bitmap.as_ref(),
+            &mvcc_ctx,
+        );
+        let key_hash_to_key = idx.key_hash_to_key.clone();
+        SearchRawResult::Ok { results, key_hash_to_key }
+    } else {
+        let fname = field_name.unwrap();
+        if let Some(fs) = idx.field_segments.get_mut(fname.as_ref()) {
+            let mvcc_ctx = crate::vector::segment::holder::MvccContext {
+                snapshot_lsn: 0,
+                my_txn_id: 0,
+                committed: &empty_committed,
+                dirty_set: &[],
+                dimension: dim as u32,
+            };
+            let results = fs.segments.search_mvcc(
+                &query_f32,
+                k,
+                ef_search,
+                &mut fs.scratch,
+                filter_bitmap.as_ref(),
+                &mvcc_ctx,
+            );
+            let key_hash_to_key = idx.key_hash_to_key.clone();
+            SearchRawResult::Ok { results, key_hash_to_key }
+        } else {
+            SearchRawResult::Error(Frame::Error(Bytes::from(
+                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
+            )))
+        }
+    }
 }
 
 /// Direct local search for cross-shard VectorSearch messages.
 /// Skips FT.SEARCH parsing -- the coordinator already extracted index_name, blob, k.
 ///
 /// Returns all results (no pagination) -- the coordinator applies LIMIT after merge.
+/// Always searches the default field (cross-shard multi-field not in scope).
 pub fn search_local(
     store: &mut VectorStore,
     index_name: &[u8],
     query_blob: &[u8],
     k: usize,
 ) -> Frame {
-    search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX)
+    search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None)
 }
 
 /// Local search with optional filter expression and pagination.
@@ -925,6 +973,8 @@ pub fn search_local(
 /// `offset` and `count` control pagination of the result set. The total match count
 /// is always returned as the first element; only the paginated slice of documents
 /// is included in the response.
+///
+/// `field_name` selects which named vector field to search. `None` uses the default field.
 pub fn search_local_filtered(
     store: &mut VectorStore,
     index_name: &[u8],
@@ -933,13 +983,27 @@ pub fn search_local_filtered(
     filter: Option<&FilterExpr>,
     offset: usize,
     count: usize,
+    field_name: Option<&Bytes>,
 ) -> Frame {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
 
-    let dim = idx.meta.dimension as usize;
+    // Resolve target field dimension
+    let (dim, use_default_field) = if let Some(fname) = field_name {
+        if let Some(field_meta) = idx.meta.find_field(fname) {
+            let is_default = fname.eq_ignore_ascii_case(&idx.meta.default_field().field_name);
+            (field_meta.dimension as usize, is_default)
+        } else {
+            return Frame::Error(Bytes::from(
+                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
+            ));
+        }
+    } else {
+        (idx.meta.dimension as usize, true)
+    };
+
     // Primary path: binary little-endian f32 blob (RediSearch-compatible).
     // Fallback: comma-separated floats in a UTF-8 string. This supports the
     // Moon Console REST/WS bridge which transmits args as JSON strings and
@@ -975,9 +1039,9 @@ pub fn search_local_filtered(
     } else {
         let base = (k * 20).max(200);
         // Dimension boost: +50% at 384d+, +100% at 768d+
-        let dim_factor = if idx.meta.dimension >= 768 {
+        let dim_factor = if dim >= 768 {
             2
-        } else if idx.meta.dimension >= 384 {
+        } else if dim >= 384 {
             3
         } else {
             2
@@ -991,28 +1055,59 @@ pub fn search_local_filtered(
     });
 
     let empty_committed = roaring::RoaringBitmap::new();
-    let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-        snapshot_lsn: 0,
-        my_txn_id: 0,
-        committed: &empty_committed,
-        dirty_set: &[],
-        dimension: idx.meta.dimension,
-    };
 
-    let results = idx.segments.search_mvcc(
-        &query_f32,
-        k,
-        ef_search,
-        &mut idx.scratch,
-        filter_bitmap.as_ref(),
-        &mvcc_ctx,
-    );
-    build_search_response(&results, &idx.key_hash_to_key, offset, count)
+    // Dispatch to correct field's segments
+    if use_default_field {
+        let mvcc_ctx = crate::vector::segment::holder::MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &empty_committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+        };
+        let results = idx.segments.search_mvcc(
+            &query_f32,
+            k,
+            ef_search,
+            &mut idx.scratch,
+            filter_bitmap.as_ref(),
+            &mvcc_ctx,
+        );
+        build_search_response(&results, &idx.key_hash_to_key, offset, count)
+    } else {
+        let fname = field_name.unwrap();
+        if let Some(fs) = idx.field_segments.get_mut(fname.as_ref()) {
+            let mvcc_ctx = crate::vector::segment::holder::MvccContext {
+                snapshot_lsn: 0,
+                my_txn_id: 0,
+                committed: &empty_committed,
+                dirty_set: &[],
+                dimension: dim as u32,
+            };
+            let results = fs.segments.search_mvcc(
+                &query_f32,
+                k,
+                ef_search,
+                &mut fs.scratch,
+                filter_bitmap.as_ref(),
+                &mvcc_ctx,
+            );
+            build_search_response(&results, &idx.key_hash_to_key, offset, count)
+        } else {
+            Frame::Error(Bytes::from(
+                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
+            ))
+        }
+    }
 }
 
 /// Parse "*=>[KNN <k> @<field> $<param>]" query string.
-/// Returns (k, param_name) on success.
-pub(crate) fn parse_knn_query(query: &[u8]) -> Option<(usize, Bytes)> {
+/// Returns (k, field_name, param_name) on success.
+///
+/// `field_name` is `Some(name)` if the query contains `@field_name` (without the `@` prefix),
+/// or `None` if the token after k starts with `$` directly (backward compat for queries
+/// where @field is omitted or unrecognized).
+pub(crate) fn parse_knn_query(query: &[u8]) -> Option<(usize, Option<Bytes>, Bytes)> {
     let s = std::str::from_utf8(query).ok()?;
     let knn_start = s.find("KNN ")?;
     let after_knn = &s[knn_start + 4..];
@@ -1021,22 +1116,28 @@ pub(crate) fn parse_knn_query(query: &[u8]) -> Option<(usize, Bytes)> {
     let k_end = after_knn.find(' ')?;
     let k: usize = after_knn[..k_end].trim().parse().ok()?;
 
-    // Parse @field (skip it, we already know from index meta)
-    let after_k = &after_knn[k_end + 1..];
-    let field_end = after_k.find(' ').unwrap_or(after_k.len());
-    let after_field = if field_end < after_k.len() {
-        &after_k[field_end + 1..]
+    // Parse @field_name (optional — may be $param directly)
+    let after_k = after_knn[k_end + 1..].trim_start();
+    let (field_name, param_start) = if after_k.starts_with('@') {
+        let field_end = after_k.find(' ').unwrap_or(after_k.len());
+        let name = &after_k[1..field_end]; // strip @
+        let remaining = if field_end < after_k.len() {
+            after_k[field_end + 1..].trim_start()
+        } else {
+            ""
+        };
+        (Some(Bytes::from(name.to_owned())), remaining)
     } else {
-        ""
+        (None, after_k)
     };
 
     // Parse $param_name
-    let param_str = after_field.trim().trim_end_matches(']');
+    let param_str = param_start.trim().trim_end_matches(']');
     if !param_str.starts_with('$') {
         return None;
     }
     let param_name = &param_str[1..];
-    Some((k, Bytes::from(param_name.to_owned())))
+    Some((k, field_name, Bytes::from(param_name.to_owned())))
 }
 
 /// Extract a named parameter blob from PARAMS section.
@@ -1244,7 +1345,7 @@ pub fn parse_ft_search_args(
         None => return Err(Frame::Error(Bytes::from_static(b"ERR invalid query"))),
     };
 
-    let (k, param_name) = match parse_knn_query(&query_str) {
+    let (k, _field_name, param_name) = match parse_knn_query(&query_str) {
         Some(parsed) => parsed,
         None => {
             return Err(Frame::Error(Bytes::from_static(

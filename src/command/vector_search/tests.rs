@@ -341,16 +341,18 @@ fn test_ft_dropindex() {
 #[test]
 fn test_parse_knn_query() {
     let query = b"*=>[KNN 10 @vec $query]";
-    let (k, param) = parse_knn_query(query).unwrap();
+    let (k, field_name, param) = parse_knn_query(query).unwrap();
     assert_eq!(k, 10);
+    assert_eq!(field_name.as_deref(), Some(b"vec".as_slice()));
     assert_eq!(&param[..], b"query");
 }
 
 #[test]
 fn test_parse_knn_query_different_k() {
     let query = b"*=>[KNN 5 @embedding $blob]";
-    let (k, param) = parse_knn_query(query).unwrap();
+    let (k, field_name, param) = parse_knn_query(query).unwrap();
     assert_eq!(k, 5);
+    assert_eq!(field_name.as_deref(), Some(b"embedding".as_slice()));
     assert_eq!(&param[..], b"blob");
 }
 
