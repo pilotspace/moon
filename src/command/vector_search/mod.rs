@@ -615,21 +615,16 @@ pub fn ft_search(
         None => return Frame::Error(Bytes::from_static(b"ERR invalid query")),
     };
 
-    // Parse KNN from query string: "*=>[KNN <k> @<field> $<param_name>]"
-    let (k, field_name, param_name) = match parse_knn_query(&query_str) {
-        Some(parsed) => parsed,
-        None => return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax")),
-    };
+    // Parse KNN from query string (optional — may be absent for sparse-only search)
+    let knn_parsed = parse_knn_query(&query_str);
 
-    // Parse PARAMS section to extract the query vector blob
-    let query_blob = match extract_param_blob(args, &param_name) {
-        Some(blob) => blob,
-        None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR query vector parameter not found in PARAMS",
-            ));
-        }
-    };
+    // Parse optional SPARSE clause: SPARSE @field_name $param_name
+    let sparse_clause = parse_sparse_clause(args);
+
+    // Must have at least one retriever
+    if knn_parsed.is_none() && sparse_clause.is_none() {
+        return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax"));
+    }
 
     // Parse optional FILTER clause
     let filter_expr = parse_filter_clause(args);
@@ -640,12 +635,127 @@ pub fn ft_search(
     // Parse optional SESSION clause
     let session_key = parse_session_clause(args);
 
+    // Determine k from KNN or default to 10 for sparse-only
+    let (k, field_name, dense_param) = match &knn_parsed {
+        Some((k, fname, pname)) => (*k, fname.clone(), Some(pname.clone())),
+        None => (10, None, None),
+    };
+
+    // Extract dense query blob if KNN is present
+    let dense_blob = if let Some(ref pname) = dense_param {
+        match extract_param_blob(args, pname) {
+            Some(blob) => Some(blob),
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR query vector parameter not found in PARAMS",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Extract sparse query pairs if SPARSE clause is present
+    let sparse_query = if let Some((ref sparse_field, ref sparse_param)) = sparse_clause {
+        match extract_param_blob(args, sparse_param) {
+            Some(blob) => {
+                let pairs = parse_sparse_query_blob(&blob);
+                if pairs.is_empty() {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR invalid sparse query blob (must be pairs of u32+f32 LE)",
+                    ));
+                }
+                Some((sparse_field.clone(), pairs))
+            }
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR sparse query parameter not found in PARAMS",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // --- Hybrid path: both dense + sparse ---
+    if dense_blob.is_some() && sparse_query.is_some() {
+        let blob = dense_blob.as_ref().unwrap();
+        let (sparse_field, sparse_pairs) = sparse_query.as_ref().unwrap();
+
+        // Dense search
+        let dense_raw = search_local_raw(
+            store,
+            &index_name,
+            blob,
+            k,
+            filter_expr.as_ref(),
+            field_name.as_ref(),
+        );
+        let (dense_results, key_hash_to_key) = match dense_raw {
+            SearchRawResult::Ok { results, key_hash_to_key } => (results, key_hash_to_key),
+            SearchRawResult::Error(frame) => return frame,
+        };
+
+        // Sparse search
+        let idx = match store.get_index_mut(index_name.as_ref()) {
+            Some(i) => i,
+            None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+        };
+        let sparse_results = match idx.sparse_stores.get(sparse_field.as_ref()) {
+            Some(ss) => ss.search(sparse_pairs, k),
+            None => Vec::new(),
+        };
+
+        // RRF fusion
+        let (fused, dense_count, sparse_count) =
+            crate::vector::fusion::rrf_fuse(&dense_results, &sparse_results, k);
+
+        crate::vector::metrics::increment_search();
+        return build_hybrid_response(
+            &fused,
+            &key_hash_to_key,
+            dense_count,
+            sparse_count,
+            limit_offset,
+            limit_count,
+        );
+    }
+
+    // --- Sparse-only path ---
+    if let Some((sparse_field, sparse_pairs)) = sparse_query {
+        let idx = match store.get_index_mut(index_name.as_ref()) {
+            Some(i) => i,
+            None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+        };
+        let sparse_results = match idx.sparse_stores.get(sparse_field.as_ref()) {
+            Some(ss) => ss.search(&sparse_pairs, k),
+            None => Vec::new(),
+        };
+        let key_hash_to_key = idx.key_hash_to_key.clone();
+        let sparse_count = sparse_results.len();
+
+        // Convert to SmallVec for build_hybrid_response
+        let fused: Vec<SearchResult> = sparse_results;
+        crate::vector::metrics::increment_search();
+        return build_hybrid_response(
+            &fused,
+            &key_hash_to_key,
+            0,
+            sparse_count,
+            limit_offset,
+            limit_count,
+        );
+    }
+
+    // --- Dense-only path (original behavior, backward compat) ---
+    let blob = dense_blob.unwrap();
+
     // If SESSION clause present and db available, use session-aware path
     if let (Some(ref sess_key), Some(db)) = (session_key, db) {
         let result = search_local_raw(
             store,
             &index_name,
-            &query_blob,
+            &blob,
             k,
             filter_expr.as_ref(),
             field_name.as_ref(),
@@ -684,11 +794,11 @@ pub fn ft_search(
         };
     }
 
-    // Standard path (no session)
+    // Standard dense-only path (no session)
     let result = search_local_filtered(
         store,
         &index_name,
-        &query_blob,
+        &blob,
         k,
         filter_expr.as_ref(),
         limit_offset,
@@ -1562,6 +1672,13 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
                     field,
                     value: false,
                 });
+            } else if val_str.contains(' ') {
+                // Multi-word content → full-text match (AND semantics)
+                let terms: Vec<Bytes> = val_str
+                    .split_whitespace()
+                    .map(|t| Bytes::from(t.to_owned()))
+                    .collect();
+                exprs.push(FilterExpr::TextMatch { field, terms });
             } else {
                 let value = Bytes::from(val_str.to_owned());
                 exprs.push(FilterExpr::TagEq { field, value });
@@ -1859,6 +1976,129 @@ pub fn ft_expand(
     }
 
     Frame::Array(frames.into())
+}
+
+// -- SPARSE clause parsing --
+
+/// Parse SPARSE clause from FT.SEARCH args.
+///
+/// Syntax: `... SPARSE @field_name $param_name ...`
+///
+/// Returns `(field_name, param_name)` where field_name has the `@` stripped
+/// and param_name has the `$` stripped.
+pub(crate) fn parse_sparse_clause(args: &[Frame]) -> Option<(Bytes, Bytes)> {
+    let mut i = 2;
+    while i < args.len() {
+        if matches_keyword(&args[i], b"SPARSE") {
+            i += 1;
+            if i >= args.len() {
+                return None;
+            }
+            // Read @field_name
+            let field_raw = extract_bulk(&args[i])?;
+            let field_str = std::str::from_utf8(&field_raw).ok()?;
+            let field_name = if let Some(stripped) = field_str.strip_prefix('@') {
+                Bytes::from(stripped.to_owned())
+            } else {
+                field_raw
+            };
+            i += 1;
+            if i >= args.len() {
+                return None;
+            }
+            // Read $param_name
+            let param_raw = extract_bulk(&args[i])?;
+            let param_str = std::str::from_utf8(&param_raw).ok()?;
+            let param_name = if let Some(stripped) = param_str.strip_prefix('$') {
+                Bytes::from(stripped.to_owned())
+            } else {
+                param_raw
+            };
+            return Some((field_name, param_name));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a sparse query blob: alternating u32 (LE dim_id) + f32 (LE weight) pairs.
+/// Returns empty Vec on invalid input.
+fn parse_sparse_query_blob(blob: &[u8]) -> Vec<(u32, f32)> {
+    if blob.len() % 8 != 0 || blob.is_empty() {
+        return Vec::new();
+    }
+    let num_pairs = blob.len() / 8;
+    let mut pairs = Vec::with_capacity(num_pairs);
+    for i in 0..num_pairs {
+        let offset = i * 8;
+        let dim = u32::from_le_bytes([blob[offset], blob[offset + 1], blob[offset + 2], blob[offset + 3]]);
+        let weight = f32::from_le_bytes([blob[offset + 4], blob[offset + 5], blob[offset + 6], blob[offset + 7]]);
+        pairs.push((dim, weight));
+    }
+    pairs
+}
+
+/// Build FT.SEARCH hybrid response with dense_hits and sparse_hits metadata.
+///
+/// Format: `[total, doc_id, [score_fields], ..., "dense_hits", N, "sparse_hits", M]`
+///
+/// The metadata fields appear after all document entries so existing parsers
+/// that stop at `total` document pairs remain backward-compatible.
+pub(crate) fn build_hybrid_response(
+    results: &[SearchResult],
+    key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+    dense_count: usize,
+    sparse_count: usize,
+    offset: usize,
+    count: usize,
+) -> Frame {
+    let total = results.len() as i64;
+    let page: Vec<&SearchResult> = results.iter().skip(offset).take(count).collect();
+    // 1 (total) + page*2 (doc+fields) + 4 (metadata: dense_hits key, value, sparse_hits key, value)
+    let mut items = Vec::with_capacity(1 + page.len() * 2 + 4);
+    items.push(Frame::Integer(total));
+
+    for r in &page {
+        // Resolve doc key
+        let doc_id = if r.key_hash != 0 {
+            if let Some(orig_key) = key_hash_to_key.get(&r.key_hash) {
+                orig_key.clone()
+            } else {
+                let mut buf = itoa::Buffer::new();
+                let id_str = buf.format(r.id.0);
+                let mut v = Vec::with_capacity(4 + id_str.len());
+                v.extend_from_slice(b"vec:");
+                v.extend_from_slice(id_str.as_bytes());
+                Bytes::from(v)
+            }
+        } else {
+            let mut buf = itoa::Buffer::new();
+            let id_str = buf.format(r.id.0);
+            let mut v = Vec::with_capacity(4 + id_str.len());
+            v.extend_from_slice(b"vec:");
+            v.extend_from_slice(id_str.as_bytes());
+            Bytes::from(v)
+        };
+        items.push(Frame::BulkString(doc_id));
+
+        // Score field — use absolute value of RRF score for display
+        let mut score_buf = String::with_capacity(16);
+        use std::fmt::Write;
+        let _ = write!(score_buf, "{}", r.distance.abs());
+        let fields = vec![
+            Frame::BulkString(Bytes::from_static(b"__vec_score")),
+            Frame::BulkString(Bytes::from(score_buf)),
+        ];
+        items.push(Frame::Array(fields.into()));
+    }
+
+    // Append metadata: dense_hits and sparse_hits
+    items.push(Frame::BulkString(Bytes::from_static(b"dense_hits")));
+    items.push(Frame::Integer(dense_count as i64));
+    items.push(Frame::BulkString(Bytes::from_static(b"sparse_hits")));
+    items.push(Frame::Integer(sparse_count as i64));
+
+    Frame::Array(items.into())
 }
 
 // -- Helpers (private) --

@@ -35,4 +35,8 @@ pub enum FilterExpr {
     },
     /// Logical NOT (complement against universe)
     Not(Box<FilterExpr>),
+    /// Full-text match: @field:{term1 term2} — AND semantics.
+    /// Requires `text-index` feature for meaningful evaluation;
+    /// without it, evaluate_bitmap returns an empty bitmap.
+    TextMatch { field: Bytes, terms: Vec<Bytes> },
 }

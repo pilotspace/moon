@@ -1305,6 +1305,10 @@ fn index_payload_field(
         // Non-UTF8 binary: store as tag
         payload_index.insert_tag(field, value, global_id);
     }
+    // Also index into full-text TextIndex (if text-index feature enabled).
+    // All payload string fields are indexed; only fields queried via TextMatch
+    // will actually be searched at query time.
+    payload_index.insert_text(field, value, global_id);
 }
 
 /// Parse a "lon,lat" geo value string. Returns `Some((lon, lat))` if the value

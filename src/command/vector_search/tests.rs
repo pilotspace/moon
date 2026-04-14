@@ -2361,3 +2361,181 @@ fn test_ft_search_unknown_field_error() {
         other => panic!("expected error, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Full-text filter (TextMatch) tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parse_filter_text_match_multiword() {
+    // Multi-word value in {} should parse as TextMatch
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@description:{machine learning}"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some(), "should parse @description:{{machine learning}}");
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::TextMatch { field, terms } => {
+            assert_eq!(&field[..], b"description");
+            assert_eq!(terms.len(), 2);
+            assert_eq!(&terms[0][..], b"machine");
+            assert_eq!(&terms[1][..], b"learning");
+        }
+        other => panic!("expected TextMatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_filter_single_word_remains_tag() {
+    // Single-word value in {} should still be TagEq
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"*=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@category:{science}"),
+    ];
+    let filter = parse_filter_clause(&args);
+    assert!(filter.is_some());
+    match filter.unwrap() {
+        crate::vector::filter::FilterExpr::TagEq { field, value } => {
+            assert_eq!(&field[..], b"category");
+            assert_eq!(&value[..], b"science");
+        }
+        other => panic!("expected TagEq, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "text-index")]
+#[test]
+fn test_text_filter_basic_payload_index() {
+    // Test TextMatch evaluation through PayloadIndex
+    use crate::vector::filter::PayloadIndex;
+
+    let mut idx = PayloadIndex::new();
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"Machine learning models for natural language processing",
+        0,
+    );
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"Database indexing and query optimization",
+        1,
+    );
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"Deep learning neural network architectures",
+        2,
+    );
+
+    // Search for "machine learning" - should match doc 0 only (AND semantics)
+    let expr = crate::vector::filter::FilterExpr::TextMatch {
+        field: Bytes::from_static(b"desc"),
+        terms: vec![
+            Bytes::from_static(b"machine"),
+            Bytes::from_static(b"learning"),
+        ],
+    };
+    let bm = idx.evaluate_bitmap(&expr, 3);
+    assert!(bm.contains(0), "doc 0 should match 'machine learning'");
+    assert!(!bm.contains(1), "doc 1 should NOT match");
+    assert!(!bm.contains(2), "doc 2 has 'learning' but not 'machine'");
+}
+
+#[cfg(feature = "text-index")]
+#[test]
+fn test_text_filter_stemming_through_payload() {
+    use crate::vector::filter::PayloadIndex;
+
+    let mut idx = PayloadIndex::new();
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"The runners are running fast",
+        0,
+    );
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"She runs every morning",
+        1,
+    );
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"The cat sat on the mat",
+        2,
+    );
+
+    // "running" should match docs with "runners", "running", "runs" via stemming
+    let expr = crate::vector::filter::FilterExpr::TextMatch {
+        field: Bytes::from_static(b"desc"),
+        terms: vec![Bytes::from_static(b"running")],
+    };
+    let bm = idx.evaluate_bitmap(&expr, 3);
+    assert!(bm.contains(0), "doc 0 has 'runners'/'running'");
+    assert!(bm.contains(1), "doc 1 has 'runs'");
+    assert!(!bm.contains(2), "doc 2 has no run-related words");
+}
+
+#[cfg(feature = "text-index")]
+#[test]
+fn test_text_filter_combined_with_tag() {
+    use crate::vector::filter::PayloadIndex;
+
+    let mut idx = PayloadIndex::new();
+    // Doc 0: has "machine learning" text AND "science" tag
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"Machine learning models",
+        0,
+    );
+    idx.insert_tag(
+        &Bytes::from_static(b"category"),
+        &Bytes::from_static(b"science"),
+        0,
+    );
+    // Doc 1: has "machine learning" text but "sports" tag
+    idx.insert_text(
+        &Bytes::from_static(b"desc"),
+        b"Machine learning in sports analytics",
+        1,
+    );
+    idx.insert_tag(
+        &Bytes::from_static(b"category"),
+        &Bytes::from_static(b"sports"),
+        1,
+    );
+
+    // TextMatch AND TagEq
+    let expr = crate::vector::filter::FilterExpr::And(
+        Box::new(crate::vector::filter::FilterExpr::TextMatch {
+            field: Bytes::from_static(b"desc"),
+            terms: vec![
+                Bytes::from_static(b"machine"),
+                Bytes::from_static(b"learning"),
+            ],
+        }),
+        Box::new(crate::vector::filter::FilterExpr::TagEq {
+            field: Bytes::from_static(b"category"),
+            value: Bytes::from_static(b"science"),
+        }),
+    );
+    let bm = idx.evaluate_bitmap(&expr, 2);
+    assert!(bm.contains(0), "doc 0 matches both text AND tag");
+    assert!(!bm.contains(1), "doc 1 matches text but wrong tag");
+}
+
+#[test]
+fn test_text_filter_without_feature_returns_empty() {
+    // TextMatch should return empty bitmap when nothing indexed
+    use crate::vector::filter::PayloadIndex;
+
+    let idx = PayloadIndex::new();
+    let expr = crate::vector::filter::FilterExpr::TextMatch {
+        field: Bytes::from_static(b"desc"),
+        terms: vec![Bytes::from_static(b"hello")],
+    };
+    let bm = idx.evaluate_bitmap(&expr, 10);
+    assert!(bm.is_empty());
+}
