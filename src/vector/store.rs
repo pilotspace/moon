@@ -63,6 +63,10 @@ pub struct VectorIndex {
     /// `vec:<internal_id>` form. Survives compaction and segment merging because
     /// it's keyed by the stable `key_hash`, not the volatile internal ID.
     pub key_hash_to_key: std::collections::HashMap<u64, Bytes>,
+    /// Whether auto-compaction is enabled. Default: true.
+    /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
+    /// Manual FT.COMPACT always works regardless of this flag.
+    pub autocompact_enabled: bool,
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -79,6 +83,9 @@ impl VectorIndex {
     /// This is a blocking operation (builds HNSW graph). For production, this
     /// should be moved to a background task with async notification.
     pub fn try_compact(&mut self) {
+        if !self.autocompact_enabled {
+            return;
+        }
         let mutable_len;
         {
             let snapshot = self.segments.load();
@@ -464,6 +471,7 @@ impl VectorStore {
                 collection,
                 payload_index: PayloadIndex::new(),
                 key_hash_to_key: std::collections::HashMap::new(),
+                autocompact_enabled: true,
             },
         );
 
