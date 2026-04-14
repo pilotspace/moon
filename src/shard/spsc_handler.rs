@@ -221,11 +221,13 @@ pub(crate) fn handle_shard_message_shared(
                     // SESSION clause needs Database access for sorted set storage.
                     // Only acquire write lock when SESSION keyword is present.
                     // FT.NAVIGATE internally calls ft_search which may use SESSION.
-                    let has_session = (cmd.eq_ignore_ascii_case(b"FT.SEARCH")
-                        || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
-                        && has_session_keyword(&command);
+                    // FT.RECOMMEND always needs Database access (reads hash keys).
+                    let needs_db = cmd.eq_ignore_ascii_case(b"FT.RECOMMEND")
+                        || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
+                            || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
+                            && has_session_keyword(&command));
                     let mut db_guard;
-                    let db_opt = if has_session {
+                    let db_opt = if needs_db {
                         db_guard = shard_databases.write_db(shard_id, 0);
                         Some(&mut *db_guard)
                     } else {
@@ -1056,6 +1058,8 @@ pub(crate) fn dispatch_vector_command(
                 b"ERR FT.NAVIGATE requires graph feature",
             ))
         }
+    } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+        vector_search::recommend::ft_recommend(vector_store, args, db)
     } else {
         crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT command"))
     }

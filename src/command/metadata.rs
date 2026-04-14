@@ -392,6 +392,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "FT._LIST" => CommandMeta { name: "FT._LIST", arity: 1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.EXPAND" => CommandMeta { name: "FT.EXPAND", arity: -4, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
     "FT.NAVIGATE" => CommandMeta { name: "FT.NAVIGATE", arity: -6, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
+    "FT.RECOMMEND" => CommandMeta { name: "FT.RECOMMEND", arity: -4, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
 
     // ---- Graph commands ----
     "GRAPH.CREATE" => CommandMeta { name: "GRAPH.CREATE", arity: 2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: GRF },
