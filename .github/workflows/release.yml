@@ -86,7 +86,7 @@ jobs:
           cp "target/$TARGET/release/moon" "$BINARY"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v8
         with:
           name: ${{ matrix.binary }}
           path: ${{ matrix.binary }}
@@ -115,16 +115,16 @@ jobs:
       - name: Generate SBOMs
         run: |
           # Per-variant SBOMs so each binary has an accurate dependency graph.
-          # cargo-cyclonedx writes to <override-filename>.cdx.json in the manifest dir.
+          # cargo-cyclonedx v0.5+ writes to <override-filename>.json in the manifest dir.
           cargo cyclonedx --format json --no-default-features --features runtime-tokio,jemalloc \
             --override-filename moon-sbom-tokio
           cargo cyclonedx --format json --no-default-features --features runtime-monoio,jemalloc \
             --override-filename moon-sbom-monoio
           # Combined superset SBOM for convenience (covers all variants).
           cargo cyclonedx --format json --override-filename moon-sbom
-          mv moon-sbom-tokio.cdx.json artifacts/moon-sbom-tokio.json
-          mv moon-sbom-monoio.cdx.json artifacts/moon-sbom-monoio.json
-          mv moon-sbom.cdx.json artifacts/moon-sbom.json
+          mv moon-sbom-tokio.json artifacts/moon-sbom-tokio.json
+          mv moon-sbom-monoio.json artifacts/moon-sbom-monoio.json
+          mv moon-sbom.json artifacts/moon-sbom.json
 
       - name: Generate checksums
         run: |
@@ -232,8 +232,10 @@ jobs:
           chmod +x target/release/moon
 
       - name: Install nfpm
+        env:
+          NFPM_VERSION: "2.46.1"
         run: |
-          curl -sfL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_linux_amd64.tar.gz | tar xz -C /usr/local/bin nfpm
+          curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | tar xz -C /usr/local/bin nfpm
 
       - name: Build deb
         env:
