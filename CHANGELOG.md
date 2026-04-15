@@ -6,6 +6,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-04-15
+
+### Added — AI-Native Data Primitives
+
+- **Multi-field vector indexes** (`FT.CREATE`): multiple VECTOR fields per index, per-field segment storage, field-targeted `@field_name` syntax in `FT.SEARCH` KNN clause.
+- **Sparse vector module** (`src/vector/sparse/`): inverted index with `SparseStore`, enabling BM25-style sparse retrieval alongside dense HNSW.
+- **Hybrid dense+sparse search**: `SPARSE` clause in `FT.SEARCH` with Reciprocal Rank Fusion (RRF) for combining dense and sparse results.
+- **Text index** (`src/vector/text_index.rs`): Unicode tokenization pipeline with stemming and normalization, feature-gated under `text-index`.
+- **Boolean and geo filter expressions**: `BoolEq` and `GeoRadius` filter variants with evaluation logic in `FilterExpr`.
+- **FT.RECOMMEND**: centroid-based recommendation over vector indexes — computes centroid of seed vectors and returns nearest neighbors.
+- **FT.NAVIGATE**: multi-hop knowledge graph navigation from vector search results, bridging vector and graph queries.
+- **FT.EXPAND**: GraphRAG expansion command — traverses graph edges from vector search results to discover related entities, with configurable depth.
+- **FT.CACHESEARCH**: semantic cache-or-search command — returns cached results on similarity hit, falls back to full search on miss.
+- **FT.CONFIG SET/GET**: runtime configuration for per-index knobs (e.g., `AUTOCOMPACT` toggle).
+- **SESSION clause**: session-scoped filtering in `FT.SEARCH` for multi-tenant and agent memory isolation.
+- **RANGE threshold post-filter**: distance threshold filtering in `FT.SEARCH` results.
+- **LIMIT pagination**: `LIMIT offset count` support in `FT.SEARCH` with multi-segment merge.
+
+### Added — Production Infrastructure
+
+- **moondb Python SDK** (`python/moondb/`): high-level client with vector, graph, session, cache, and framework integrations (LangChain, LlamaIndex).
+- **5 quickstart examples**: RAG, semantic cache, GraphRAG, AI agent tools, memory engine — all using real MiniLM embeddings.
+- **Production deployment guide** (`docs/production-guide.md`): configuration reference, TLS setup, monitoring, ACL, tuning.
+- **Dockerfile improvements**: OCI labels, admin port exposure, production defaults.
+- **docker-compose.yml**: production configuration with resource limits, health checks, ulimits.
+- **Prometheus metrics**: counters and histograms for v0.1.6 commands (FT.RECOMMEND, FT.NAVIGATE, FT.EXPAND, FT.CACHESEARCH, FT.CONFIG).
+- **OpenTelemetry stubs**: `otel` feature flag with tracing infrastructure for future OTLP export.
+- **Benchmark script** (`scripts/bench-v0.1.6.sh`): automated benchmarks for new vector search features.
+
+### Added — Graph-Vector Integration
+
+- **EXPAND GRAPH clause** in `FT.SEARCH`: inline graph expansion during vector search with configurable depth.
+- **`graph_expand.rs` bridge module**: connects vector search results to graph traversal engine.
+- **`key_to_node` mapping** on `NamedGraph`: enables graph expansion from vector search key hashes.
+
+### Fixed — Critical Production Bugs
+
+- **Deadlock in cross-shard HSET auto-index**: `parking_lot::Mutex` re-entry in `PipelineBatch` and `PipelineBatchSlotted` handlers — `shard_databases.vector_store(shard_id)` attempted to re-lock a non-reentrant mutex already held by the caller. Fixed by using the passed-in reference.
+- **Auto-index HSET inside MULTI/EXEC**: vector auto-indexing now works correctly within transactions and pipeline batch paths.
+- **FT.RECOMMEND filter bug**: filter expressions were not applied correctly to recommendation results.
+- **FT.CONFIG/RECOMMEND/NAVIGATE/EXPAND routing**: commands now dispatched correctly in all connection handlers (monoio, tokio, single-threaded).
+- **Session deduplication**: fixed duplicate session entries in search results.
+- **Inline filter parsing**: corrected parsing of filter expressions in inline command mode.
+- **FT.COMPACT, FT.CONFIG, FT.CACHESEARCH metadata**: registered in phf command metadata table for ACL and COMMAND DOCS.
+
+### Fixed — CI/Release Pipeline
+
+- **nfpm download URL**: pinned v2.46.1 with correct `Linux_x86_64` asset name (old `nfpm_linux_amd64.tar.gz` returns 404).
+- **SBOM filenames**: `cargo-cyclonedx` v0.5+ writes `.json` not `.cdx.json`.
+- **Cosign keyless signing**: added `id-token: write` permission for Sigstore OIDC (was falling back to interactive device flow).
+- **Package job race condition**: deb/rpm upload now waits for GitHub release to be created first.
+- **upload-artifact**: upgraded v4 → v7 (Node.js 20 deprecation).
+- **Test compilation**: added tokio dev-dependency with `process` feature for `blocking_list_timeout.rs` under default (monoio) features.
+
+### Changed
+
+- **Graph enabled by default**: `graph` feature now included in default feature set.
+- **Vector index persistence**: v2 format with backward-compatible v1 migration.
+- **Memory engine example**: rewritten as 142-line script with real MiniLM embeddings (was 487-line complex agent loop).
+- **Clippy 1.94 compliance**: all warnings resolved for Rust 1.94 MSRV.
+
+### Validation
+
+- 2,613+ unit tests pass (release mode, default features).
+- 2,139 library tests pass under `runtime-tokio` feature set.
+- 184 unsafe blocks, all with SAFETY comments (audit pass).
+- 0 unannotated unwraps on hot paths (ratchet pass).
+- Zero clippy warnings (default + `runtime-tokio,jemalloc` feature sets).
+- `cargo fmt --check` clean.
+- 8 fuzz targets in CI.
+- Full release pipeline validated: 6 binary targets, Docker image, deb/rpm packages, SBOMs, cosign signatures.
+
 ## [0.1.5] — 2026-04-12
 
 ### Added — Moon Console (Interactive Data Client)
