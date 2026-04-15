@@ -905,6 +905,26 @@ pub async fn handle_connection(
                                     &conn.watched_keys,
                                     &mut conn.selected_db,
                                 );
+                                // Auto-index HSETs from the transaction
+                                if let Some(ref vs) = vector_store {
+                                    if let Frame::Array(ref txn_results) = result {
+                                        for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
+                                            if let Some((c, a)) = extract_command(cmd_frame) {
+                                                if c.eq_ignore_ascii_case(b"HSET")
+                                                    && i < txn_results.len()
+                                                    && !matches!(txn_results[i], Frame::Error(_))
+                                                {
+                                                    if let Some(Frame::BulkString(key_bytes)) = a.first() {
+                                                        let mut store = vs.lock();
+                                                        crate::shard::spsc_handler::auto_index_hset_public(
+                                                            &mut store, key_bytes, a,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 conn.command_queue.clear();
                                 conn.watched_keys.clear();
                                 responses.push(result);

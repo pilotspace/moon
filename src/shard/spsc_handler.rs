@@ -496,6 +496,16 @@ pub(crate) fn handle_shard_message_shared(
                     );
                 }
 
+                // Auto-index: if HSET succeeded, check for vector index match
+                if cmd.eq_ignore_ascii_case(b"HSET")
+                    && !matches!(frame, crate::protocol::Frame::Error(_))
+                {
+                    if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                        let mut vs = shard_databases.vector_store(shard_id);
+                        auto_index_hset(&mut vs, key_bytes, args);
+                    }
+                }
+
                 // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                 if !matches!(frame, crate::protocol::Frame::Error(_)) {
                     let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -764,6 +774,16 @@ pub(crate) fn handle_shard_message_shared(
                         repl_state,
                         shard_id,
                     );
+                }
+
+                // Auto-index: if HSET succeeded, check for vector index match
+                if cmd.eq_ignore_ascii_case(b"HSET")
+                    && !matches!(frame, crate::protocol::Frame::Error(_))
+                {
+                    if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                        let mut vs = shard_databases.vector_store(shard_id);
+                        auto_index_hset(&mut vs, key_bytes, args);
+                    }
                 }
 
                 if !matches!(frame, crate::protocol::Frame::Error(_)) {

@@ -172,6 +172,21 @@ pub(crate) fn execute_transaction_sharded(
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
         };
+
+        // Auto-index: if HSET succeeded, check for vector index match
+        if cmd.eq_ignore_ascii_case(b"HSET")
+            && !matches!(response, Frame::Error(_))
+        {
+            if let Some(Frame::BulkString(key_bytes)) = cmd_args.first() {
+                let mut vs = shard_databases.vector_store(shard_id);
+                crate::shard::spsc_handler::auto_index_hset_public(
+                    &mut vs,
+                    key_bytes,
+                    cmd_args,
+                );
+            }
+        }
+
         results.push(response);
     }
 
