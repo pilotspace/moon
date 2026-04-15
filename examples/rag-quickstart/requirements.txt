@@ -1,0 +1,5 @@
+moondb>=0.1.0
+# Optional: uncomment for real embeddings (requires ~500MB model download)
+# sentence-transformers>=2.2.0
+# Optional: uncomment for LLM answer generation
+# openai>=1.0.0
