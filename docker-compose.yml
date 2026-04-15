@@ -1,18 +1,17 @@
-# Moon - Docker Compose
+# Moon - Docker Compose (Production)
 #
 # Usage:
 #   docker compose up -d               # Start in background
-#   docker compose down                # Stop and remove containers
-#   docker compose logs -f             # Follow logs
+#   docker compose down                 # Stop and remove containers
+#   docker compose logs -f              # Follow logs
 #
 # Build with tokio runtime instead of monoio:
 #   docker compose build --build-arg FEATURES=runtime-tokio,jemalloc
 #
-# Enable AOF persistence: add to command below:
-#   --appendonly yes --appendfsync everysec
+# Multi-platform build:
+#   docker buildx bake --set "*.platform=linux/amd64,linux/arm64"
 #
-# Enable TLS: mount certs into /data and add to command:
-#   --tls-port 6443 --tls-cert-file /data/cert.pem --tls-key-file /data/key.pem
+# Enable TLS: mount certs and uncomment the tls-port flags below.
 
 services:
   moon:
@@ -23,27 +22,67 @@ services:
         # Override to use tokio runtime: runtime-tokio,jemalloc
         # NOTE: monoio and tokio are mutually exclusive
         FEATURES: runtime-monoio,jemalloc
+    image: moondb/moon:latest
     container_name: moon
     ports:
-      - "6379:6379"   # Redis protocol
-      - "6443:6443"   # TLS (only active when --tls-port is set)
+      - "${MOON_PORT:-6379}:6379"     # Redis protocol
+      - "${MOON_TLS_PORT:-6443}:6443" # TLS (only active when --tls-port is set)
+      - "${MOON_ADMIN_PORT:-9100}:9100" # Admin/console web UI
     volumes:
-      - moon-data:/data   # Named volume for AOF persistence files
+      - moon-data:/data               # Named volume for AOF/RDB persistence
+      # Uncomment to mount TLS certificates:
+      # - ./certs:/certs:ro
+      # Uncomment to mount ACL file:
+      # - ./users.acl:/etc/moon/users.acl:ro
     restart: unless-stopped
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=${RUST_LOG:-moon=info}
     # --shards 0 auto-detects CPU core count
-    command: ["moon", "--bind", "0.0.0.0", "--port", "6379", "--shards", "0", "--protected-mode", "no"]
+    # --admin-port 9100 enables web console and /metrics endpoint
+    # --dir /data writes persistence files to the mounted volume
+    command:
+      - moon
+      - --bind
+      - "0.0.0.0"
+      - --port
+      - "6379"
+      - --shards
+      - "${MOON_SHARDS:-0}"
+      - --admin-port
+      - "9100"
+      - --dir
+      - /data
+      - --appendonly
+      - "${MOON_APPENDONLY:-yes}"
+      - --appendfsync
+      - "${MOON_APPENDFSYNC:-everysec}"
+      - --maxmemory
+      - "${MOON_MAXMEMORY:-0}"
+      - --maxmemory-policy
+      - "${MOON_MAXMEMORY_POLICY:-noeviction}"
+      - --maxclients
+      - "${MOON_MAXCLIENTS:-10000}"
+      - --protected-mode
+      - "no"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/moon", "--help"]
+      test: ["CMD", "/usr/local/bin/moon", "--check-config"]
       interval: 30s
       timeout: 5s
+      start_period: 5s
       retries: 3
     deploy:
       resources:
         limits:
-          cpus: "4"
-          memory: 2G
+          cpus: "${MOON_CPU_LIMIT:-4}"
+          memory: ${MOON_MEMORY_LIMIT:-2G}
+    # Uncomment for io_uring SQPOLL (requires privileged or CAP_SYS_NICE):
+    # cap_add:
+    #   - SYS_NICE
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
 volumes:
   moon-data:
+    driver: local
