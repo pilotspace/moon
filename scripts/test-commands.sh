@@ -838,6 +838,61 @@ if should_run "benchmark" && [[ "$SKIP_BENCH" == "false" ]]; then
 fi
 
 # ===========================================================================
+# VECTOR SEARCH COMMANDS (v0.1.6)
+# ===========================================================================
+
+if should_run "vector"; then
+    echo ""
+    echo "=== VECTOR SEARCH COMMANDS ==="
+    flush_both
+
+    # Create a test index with 4-dimensional vectors
+    assert_moon_ok "FT.CREATE basic" FT.CREATE testidx ON HASH PREFIX 1 doc: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
+
+    # Insert test vectors (4-dimensional, little-endian f32 binary encoded via redis-cli hex)
+    # doc:1 = [1.0, 0.0, 0.0, 0.0]
+    mcli HSET doc:1 vec "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" category science title "quantum physics" >/dev/null 2>&1
+    # doc:2 = [0.0, 1.0, 0.0, 0.0]
+    mcli HSET doc:2 vec "$(printf '\x00\x00\x00\x00\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00')" category math title "linear algebra" >/dev/null 2>&1
+    # doc:3 = [0.9, 0.1, 0.0, 0.0]
+    mcli HSET doc:3 vec "$(printf '\x66\x66\x66\x3f\xcd\xcc\xcc\x3d\x00\x00\x00\x00\x00\x00\x00\x00')" category science title "particle physics" >/dev/null 2>&1
+    sleep 0.5
+
+    # FT.SEARCH basic KNN
+    assert_moon_contains "FT.SEARCH KNN" "doc:" FT.SEARCH testidx "*=>[KNN 2 @vec \$q]" PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')"
+
+    # FT.SEARCH with LIMIT
+    assert_moon_contains "FT.SEARCH LIMIT" "doc:" FT.SEARCH testidx "*=>[KNN 3 @vec \$q]" PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" LIMIT 0 1
+
+    # FT.INFO
+    assert_moon_contains "FT.INFO" "testidx" FT.INFO testidx
+
+    # FT._LIST
+    assert_moon_contains "FT._LIST" "testidx" FT._LIST
+
+    # FT.COMPACT (should succeed even if nothing to compact)
+    assert_moon_ok "FT.COMPACT" FT.COMPACT testidx
+
+    # FT.CONFIG SET/GET
+    assert_moon_ok "FT.CONFIG SET AUTOCOMPACT" FT.CONFIG SET testidx AUTOCOMPACT OFF
+    assert_moon_contains "FT.CONFIG GET AUTOCOMPACT" "OFF" FT.CONFIG GET testidx AUTOCOMPACT
+
+    # FT.RECOMMEND (with existing keys as positive examples)
+    assert_moon_contains "FT.RECOMMEND basic" "doc:" FT.RECOMMEND testidx POSITIVE doc:1 K 2
+
+    # Tag filter
+    assert_moon_contains "FT.SEARCH tag filter" "doc:" FT.SEARCH testidx "@category:{science}=>[KNN 3 @vec \$q]" PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')"
+
+    # FT.DROPINDEX
+    assert_moon_ok "FT.DROPINDEX" FT.DROPINDEX testidx
+
+    # Verify index is gone
+    assert_moon "FT._LIST empty" "" FT._LIST
+
+    echo "  vector: $PASS passed (of $TOTAL total)"
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 
