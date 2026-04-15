@@ -207,7 +207,7 @@ pub fn reload_tls_config(
 ///
 /// Works on both tokio and monoio runtimes — uses a plain OS thread with
 /// `sigwait()` to avoid async runtime dependencies.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn spawn_sighup_reload_thread(
     shared: SharedTlsConfig,
     cert_path: String,

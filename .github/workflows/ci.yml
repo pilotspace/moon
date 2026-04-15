@@ -81,6 +81,26 @@ jobs:
         run: "cargo test --no-default-features --features runtime-tokio,jemalloc,graph --lib graph::"
         timeout-minutes: 5
 
+  # ── macOS — clippy + test (tokio), clippy (monoio/kqueue) ───────────
+  check-macos:
+    name: Check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ hashFiles('Cargo.lock') }}
+      - name: Clippy (default monoio)
+        run: cargo clippy -- -D warnings
+      - name: Clippy (tokio)
+        run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
+      - name: Test (tokio)
+        run: cargo test --no-default-features --features runtime-tokio,jemalloc
+        timeout-minutes: 15
+
   # ── MSRV — minimal build, different cache key ───────────────────────
   msrv:
     name: MSRV (1.94)

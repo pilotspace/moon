@@ -211,12 +211,17 @@ impl super::Shard {
             Vec<uring_handler::InFlightSend>,
         > = std::collections::HashMap::new();
 
-        // Per-shard SO_REUSEPORT listener (Linux + tokio, non-uring path).
-        // When io_uring is active, multishot accept handles this already.
-        // When io_uring is NOT active (MOON_NO_URING or init failure), create a tokio TcpListener.
-        #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+        // Per-shard SO_REUSEPORT listener (unix + tokio, non-uring path).
+        // On Linux: only created when io_uring is NOT active (multishot accept handles it).
+        // On macOS: always created (no io_uring).
+        #[cfg(all(unix, feature = "runtime-tokio"))]
         let per_shard_listener: Option<tokio::net::TcpListener> = {
-            if uring_state.is_none() {
+            #[cfg(target_os = "linux")]
+            let uring_active = uring_state.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let uring_active = false;
+
+            if !uring_active {
                 if let Some(ref addr) = bind_addr {
                     match conn_accept::create_reuseport_socket(addr) {
                         Ok(std_listener) => match tokio::net::TcpListener::from_std(std_listener) {
@@ -253,9 +258,9 @@ impl super::Shard {
             }
         };
 
-        // Per-shard SO_REUSEPORT listener (Linux + monoio).
+        // Per-shard SO_REUSEPORT listener (unix + monoio).
         // Each shard creates its own listener; the kernel distributes connections via SO_REUSEPORT.
-        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        #[cfg(all(unix, feature = "runtime-monoio"))]
         let mut per_shard_monoio_listener: Option<monoio::net::TcpListener> = {
             if let Some(ref addr) = bind_addr {
                 match conn_accept::create_reuseport_socket(addr) {
@@ -292,7 +297,7 @@ impl super::Shard {
 
         // Dedicated monoio::spawn accept task: avoids io_uring cancel/resubmit race
         // that occurs when accept() is a branch in monoio::select!.
-        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        #[cfg(all(unix, feature = "runtime-monoio"))]
         let local_accept_rx: Option<flume::Receiver<std::net::TcpStream>> = {
             if let Some(listener) = per_shard_monoio_listener.take() {
                 let (tx, rx) = flume::bounded(256);
@@ -328,19 +333,19 @@ impl super::Shard {
             }
         };
 
-        #[cfg(all(feature = "runtime-monoio", not(target_os = "linux")))]
+        #[cfg(all(feature = "runtime-monoio", not(unix)))]
         let local_accept_rx: Option<flume::Receiver<std::net::TcpStream>> = None;
 
         #[cfg(not(any(
-            all(target_os = "linux", feature = "runtime-tokio"),
-            all(target_os = "linux", feature = "runtime-monoio"),
+            all(unix, feature = "runtime-tokio"),
+            all(unix, feature = "runtime-monoio"),
         )))]
         {
             let _ = &bind_addr; // Suppress unused warning when per-shard accept inactive
             info!("Shard {} started", self.id);
         }
 
-        #[cfg(all(target_os = "linux", feature = "runtime-monoio"))]
+        #[cfg(all(unix, feature = "runtime-monoio"))]
         if per_shard_monoio_listener.is_none() {
             info!("Shard {} started (monoio, conn_rx fallback)", self.id);
         }
@@ -788,13 +793,13 @@ impl super::Shard {
                         }
                     }
                 }
-                // Per-shard SO_REUSEPORT accept (Linux only, non-uring tokio path)
+                // Per-shard SO_REUSEPORT accept (unix, non-uring tokio path)
                 result = async {
-                    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+                    #[cfg(all(unix, feature = "runtime-tokio"))]
                     if let Some(ref listener) = per_shard_listener {
                         return listener.accept().await;
                     }
-                    // Never resolves on non-Linux or when per_shard_listener is None
+                    // Never resolves on non-unix or when per_shard_listener is None
                     std::future::pending::<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>().await
                 } => {
                     match result {

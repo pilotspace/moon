@@ -656,7 +656,50 @@ fn page_size_cached() -> u64 {
     ps
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Read process RSS on macOS via Mach `task_info` API.
+/// Returns bytes, or 0 on failure.
+#[cfg(target_os = "macos")]
+pub fn get_rss_bytes() -> u64 {
+    // Mach kernel API types and functions for querying task memory info.
+    // SAFETY: These are stable Mach kernel ABI functions available on all macOS versions.
+    unsafe extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(
+            target: u32,
+            flavor: u32,
+            info: *mut u8,
+            count: *mut u32,
+        ) -> i32;
+    }
+    // MACH_TASK_BASIC_INFO flavor returns mach_task_basic_info_data_t.
+    // Layout (aarch64/x86_64): policy(i32), pad(i32), virtual_size(u64),
+    //   resident_size(u64), ... Total size = 10 natural_t (40 bytes).
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    const MACH_TASK_BASIC_INFO_COUNT: u32 = 10;
+
+    let mut info = [0u8; 40]; // 10 × sizeof(natural_t) = 40 bytes
+    let mut count = MACH_TASK_BASIC_INFO_COUNT;
+    // SAFETY: mach_task_self() always returns the current task port.
+    // task_info writes at most `count` natural_t values into `info`.
+    // info is 40 bytes = exactly MACH_TASK_BASIC_INFO_COUNT × 4.
+    let kr = unsafe {
+        task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if kr == 0 {
+        // KERN_SUCCESS: resident_size is at byte offset 16 (u64).
+        // SAFETY: info is 40 bytes, reading 8 bytes at offset 16 is in bounds.
+        u64::from_ne_bytes(info[16..24].try_into().unwrap_or([0; 8]))
+    } else {
+        0
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn get_rss_bytes() -> u64 {
     0
 }
@@ -679,7 +722,7 @@ pub fn total_connections_received() -> u64 {
 ///
 /// Returns `(used_cpu_sys, used_cpu_user)` in seconds (f64).
 /// On non-Linux platforms returns `(0.0, 0.0)`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn get_cpu_usage() -> (f64, f64) {
     use std::mem::MaybeUninit;
     let mut usage = MaybeUninit::<libc::rusage>::uninit();
@@ -698,7 +741,7 @@ pub fn get_cpu_usage() -> (f64, f64) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn get_cpu_usage() -> (f64, f64) {
     (0.0, 0.0)
 }

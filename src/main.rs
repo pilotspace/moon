@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         let shared = moon::tls::make_shared(tls_cfg);
 
         // Spawn SIGHUP reload thread (Linux only)
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         moon::tls::spawn_sighup_reload_thread(
             shared.clone(),
             cert.clone(),

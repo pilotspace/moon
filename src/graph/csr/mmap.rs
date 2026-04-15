@@ -336,7 +336,7 @@ impl MmapCsrSegment {
     }
 
     /// Hint the OS about sequential access pattern for the mmap'd region.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn madvise_sequential(&self) {
         // SAFETY: _mmap points to a valid mapped region of len() bytes.
         unsafe {
@@ -349,7 +349,7 @@ impl MmapCsrSegment {
     }
 
     /// Hint the OS about random access pattern for the mmap'd region.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn madvise_random(&self) {
         // SAFETY: _mmap points to a valid mapped region of len() bytes.
         unsafe {
@@ -361,10 +361,10 @@ impl MmapCsrSegment {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     pub fn madvise_sequential(&self) {}
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     pub fn madvise_random(&self) {}
 }
 

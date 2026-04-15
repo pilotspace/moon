@@ -38,7 +38,7 @@ type StdRwLock<T> = std::sync::RwLock<T>;
 ///
 /// Each shard calls this with the same address; the kernel distributes
 /// incoming connections across all sockets bound with SO_REUSEPORT.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn create_reuseport_socket(addr: &str) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 

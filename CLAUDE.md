@@ -10,13 +10,16 @@ Rust **1.94** (edition 2024). Enforced in CI.
 
 ## Target Platform
 
-**Linux only** (aarch64 primary, x86_64 secondary). macOS support is deferred to a future milestone.
+**Linux** (aarch64 primary, x86_64 secondary) and **macOS** (aarch64 Apple Silicon, x86_64 Intel).
 
-All development, testing, and benchmarking MUST target Linux. On macOS hosts, use OrbStack (see below).
+- **Linux**: Full feature set — io_uring (monoio), SO_REUSEPORT per-shard, O_DIRECT, connection migration.
+- **macOS**: Full feature set minus io_uring — uses kqueue (monoio) or epoll (tokio), SO_REUSEPORT per-shard, no O_DIRECT (pread fallback), no connection migration.
+- **Production benchmarks** MUST target Linux (OrbStack or GCloud). macOS numbers are for development only.
+- Both `runtime-monoio` (default) and `runtime-tokio` are supported on macOS.
 
 ## OrbStack Development Environment
 
-Moon requires Linux for io_uring, O_DIRECT, and production benchmarks. On macOS, use the `moon-dev` OrbStack machine.
+OrbStack is used for Linux-parity builds, production benchmarks, and io_uring testing on macOS hosts.
 
 ### Machine: `moon-dev`
 
@@ -64,9 +67,9 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 
 ### OrbStack Rules for Claude Code
 
-- **Always build/test via `orb run -m moon-dev`** — never `cargo build` directly on macOS for final verification.
-- `cargo check` on macOS is acceptable for fast iteration (syntax/type errors only).
-- All benchmark numbers MUST come from the Linux VM.
+- **`cargo build`/`cargo test` on macOS is now fully supported** — macOS is a first-class target.
+- Use `orb run -m moon-dev` for Linux-specific testing (io_uring, O_DIRECT, connection migration).
+- All **benchmark numbers** MUST come from the Linux VM (or GCloud instances).
 - The VM path to the repo is the same as macOS: `/Users/tindang/workspaces/tind-repo/moon`.
 - Use `source ~/.cargo/env &&` prefix in every `orb run` command.
 
