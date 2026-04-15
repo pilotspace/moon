@@ -125,6 +125,31 @@ docker run -d -p 6379:6379 -v moon-data:/data moon \
 
 See [docs/quickstart.mdx](docs/quickstart.mdx) for alternative build configs, TLS setup, and Docker Compose.
 
+### Python SDK (10 lines to vector search)
+
+```bash
+pip install moondb
+```
+
+```python
+from moondb import MoonClient, encode_vector
+
+client = MoonClient(host="localhost", port=6379, decode_responses=True)
+
+# Create a vector index (HNSW, 384 dimensions, cosine similarity)
+client.vector.create_index("docs", dim=384, metric="COSINE", prefix="doc:")
+
+# Store a document -- auto-indexed on HSET
+client.hset("doc:1", mapping={"title": "Hello", "vec": encode_vector([0.1] * 384)})
+
+# Search by vector similarity
+results = client.vector.search("docs", [0.1] * 384, k=5)
+for r in results:
+    print(r.key, r.score, r.fields)
+```
+
+See [examples/](examples/) for complete tutorials: [RAG Quickstart](examples/rag-quickstart/), [Semantic Cache](examples/semantic-cache/), [GraphRAG](examples/graphrag/), [AI Agent Tools](examples/ai-agent-tools/).
+
 ## Moon Console (Web UI)
 
 Moon ships an embedded web console at `http://localhost:9100/ui/` — no separate install needed.
