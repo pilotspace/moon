@@ -2,104 +2,65 @@
 """
 Moon as a Memory Engine — RAG + GraphRAG + Semantic Cache
 
-Demonstrates Moon's Knowledge Navigation Engine: vector search, graph traversal,
-session-aware dedup, and semantic caching — all in one process, one RTT.
+Demonstrates Moon's Knowledge Navigation Engine using the moondb SDK:
+vector search, graph traversal, session-aware dedup, and semantic caching.
 
 Prerequisites:
-    pip install redis sentence-transformers
+    pip install moondb   # or: pip install -e sdk/python
     # Start Moon:  ./moon --port 6399 --shards 1
 
 Usage:
     python moon_memory_engine.py
 """
 
-import struct
+import sys
 import time
-import redis
+
+sys.path.insert(0, "sdk/python")  # Use local SDK if not installed
+from moondb import MoonClient, encode_vector
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MOON_HOST = "localhost"
 MOON_PORT = 6399
-DIM = 4  # Use 4-dim for demo (real: 384/768 from sentence-transformers)
+DIM = 4  # 4-dim for demo (real: 384/768 from sentence-transformers)
 INDEX = "knowledge"
 GRAPH = "kg"
-CACHE_PREFIX = "cache:sem:"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def vec(*vals: float) -> bytes:
-    """Pack floats into little-endian binary blob for Moon vector fields."""
-    return struct.pack(f"<{len(vals)}f", *vals)
+def vec(*vals: float) -> list[float]:
+    return list(vals)
 
-def knn_query(field: str, k: int, param: str = "q") -> str:
-    """Build RediSearch-compatible KNN query string."""
-    return f"*=>[KNN {k} @{field} ${param}]"
-
-def filter_knn(filter_expr: str, field: str, k: int, param: str = "q") -> str:
-    """Build filtered KNN query: @field:{value}=>[KNN k @vec $q]"""
-    return f"{filter_expr}=>[KNN {k} @{field} ${param}]"
-
-def print_results(label: str, result: list):
-    """Pretty-print FT.SEARCH / FT.RECOMMEND results."""
-    count = int(result[0])
-    print(f"\n  {label}: {count} result(s)")
-    i = 1
-    while i < len(result):
-        key = result[i].decode() if isinstance(result[i], bytes) else result[i]
-        i += 1
-        fields = {}
-        if i < len(result) and isinstance(result[i], list):
-            pairs = result[i]
-            for j in range(0, len(pairs), 2):
-                k = pairs[j].decode() if isinstance(pairs[j], bytes) else pairs[j]
-                v = pairs[j+1].decode() if isinstance(pairs[j+1], bytes) else pairs[j+1]
-                fields[k] = v
-            i += 1
-        elif i < len(result) and isinstance(result[i], bytes):
-            # Flat key-value pairs
-            while i < len(result) and isinstance(result[i], bytes):
-                k_name = result[i].decode()
-                if k_name.startswith("doc:") or k_name.startswith("cache:"):
-                    break
-                v_val = result[i+1].decode() if i+1 < len(result) and isinstance(result[i+1], bytes) else result[i+1]
-                fields[k_name] = v_val
-                i += 2
-        score = fields.get("__vec_score", "?")
-        title = fields.get("title", "")
-        hops = fields.get("__graph_hops", "")
-        hop_str = f" (hops={hops})" if hops else ""
-        print(f"    {key}  score={score}  {title}{hop_str}")
+def show(label: str, results, max_show: int = 5):
+    print(f"\n  {label}: {len(results)} result(s)")
+    for r in results[:max_show]:
+        title = r.fields.get("title", "")
+        hops = f" (hops={r.graph_hops})" if r.graph_hops is not None else ""
+        print(f"    {r.key:12s}  score={r.score:<12.6f}  {title[:55]}{hops}")
+    if len(results) > max_show:
+        print(f"    ... and {len(results) - max_show} more")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    r = redis.Redis(host=MOON_HOST, port=MOON_PORT, decode_responses=False)
-    r.ping()
-    print("Connected to Moon\n")
+    moon = MoonClient(host="localhost", port=MOON_PORT)
+    moon.ping()
+    print("Connected to Moon via MoonClient SDK\n")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 1: Create Vector Index                     ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 1: Create Vector Index ───────────────────────────────────────────
     print("=" * 60)
     print("Step 1: Create vector index")
     print("=" * 60)
 
     try:
-        r.execute_command("FT.DROPINDEX", INDEX)
+        moon.vector.drop_index(INDEX)
     except Exception:
         pass
 
-    r.execute_command(
-        "FT.CREATE", INDEX, "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA",
-        "vec", "VECTOR", "HNSW", "6", "DIM", str(DIM), "TYPE", "FLOAT32",
-        "DISTANCE_METRIC", "COSINE",
-    )
+    moon.vector.create_index(INDEX, prefix="doc:", dim=DIM, metric="COSINE")
     print("  Created index 'knowledge' (4-dim cosine)")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 2: Ingest Knowledge Documents              ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 2: Ingest Knowledge Documents ────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 2: Ingest knowledge documents")
     print("=" * 60)
@@ -118,36 +79,30 @@ def main():
     ]
 
     for key, vector, title, topic, category in docs:
-        r.hset(key, mapping={
-            "vec": vector, "title": title, "topic": topic, "category": category,
+        moon.hset(key, mapping={
+            "vec": encode_vector(vector), "title": title,
+            "topic": topic, "category": category,
         })
-    time.sleep(1)  # Let auto-indexing settle
+    time.sleep(1)
 
-    info = r.execute_command("FT.INFO", INDEX)
-    for i, v in enumerate(info):
-        if v == b"num_docs":
-            print(f"  Indexed {int(info[i+1])} documents")
-            break
+    info = moon.vector.index_info(INDEX)
+    print(f"  Indexed {info.num_docs} documents")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 3: Build Knowledge Graph                   ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 3: Build Knowledge Graph ─────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 3: Build knowledge graph (GraphRAG)")
     print("=" * 60)
 
     try:
-        r.execute_command("GRAPH.CREATE", GRAPH)
+        moon.graph.create(GRAPH)
     except Exception:
         pass
 
-    # Add nodes with _key property for vector↔graph bridge
     nodes = {}
     for key, _, title, _, _ in docs:
-        nid = int(r.execute_command("GRAPH.ADDNODE", GRAPH, "document", "_key", key, "title", title))
+        nid = moon.graph.add_node(GRAPH, "document", _key=key, title=title)
         nodes[key] = nid
 
-    # Build edges — knowledge relationships
     edges = [
         ("doc:ml_basics",    "doc:neural_nets",   "prerequisite"),
         ("doc:neural_nets",  "doc:transformers",   "prerequisite"),
@@ -161,223 +116,127 @@ def main():
         ("doc:fine_tuning",  "doc:transformers",   "applies_to"),
     ]
     for src, dst, rel in edges:
-        r.execute_command("GRAPH.ADDEDGE", GRAPH, str(nodes[src]), str(nodes[dst]), rel)
+        moon.graph.add_edge(GRAPH, nodes[src], nodes[dst], rel)
 
     print(f"  Created {len(nodes)} nodes, {len(edges)} edges")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 4: RAG — Vector Search                     ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 4: RAG — Vector Search ───────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 4: RAG — Vector similarity search")
     print("=" * 60)
 
-    # User asks: "How do neural networks work?"
-    user_query = vec(0.85, 0.15, 0.05, 0.0)  # Close to ML docs
+    query = vec(0.85, 0.15, 0.05, 0.0)  # Close to ML docs
+    results = moon.vector.search(INDEX, query, k=3)
+    show("RAG: 'How do neural networks work?'", results)
 
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, knn_query("vec", 3),
-        "PARAMS", "2", "q", user_query,
-    )
-    print_results("RAG search: 'How do neural networks work?'", result)
-
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 5: Filtered RAG — Topic-scoped search      ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 5: Filtered RAG ──────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("Step 5: Filtered RAG — search only 'engineering' docs")
+    print("Step 5: Filtered RAG — only 'engineering' docs")
     print("=" * 60)
 
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, filter_knn("@category:{engineering}", "vec", 3),
-        "PARAMS", "2", "q", user_query,
-    )
-    print_results("Filtered: category=engineering", result)
+    results = moon.vector.search(INDEX, query, k=3, filter_expr="@category:{engineering}")
+    show("Filtered: category=engineering", results)
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 6: GraphRAG — Expand via knowledge graph   ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 6: GraphRAG ──────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 6: GraphRAG — vector search + graph expansion")
     print("=" * 60)
 
-    # KNN finds nearest docs, then EXPAND GRAPH walks relationships
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, knn_query("vec", 2),
-        "PARAMS", "2", "q", user_query,
-        "EXPAND", "GRAPH", GRAPH, "DEPTH", "2",
-    )
-    print_results("GraphRAG: KNN→graph expand depth=2", result)
+    results = moon.vector.search(INDEX, query, k=2, expand_graph=GRAPH, expand_depth=2)
+    show("KNN + EXPAND GRAPH depth=2", results)
 
-    # Standalone graph expansion from a known document
-    try:
-        expand_result = r.execute_command(
-            "FT.EXPAND", INDEX, "doc:transformers", "DEPTH", "2", "GRAPH", GRAPH,
-        )
-        if isinstance(expand_result, list):
-            c = int(expand_result[0])
-            keys = [expand_result[i].decode() for i in range(1, len(expand_result), 2) if isinstance(expand_result[i], bytes)]
-            print(f"\n  FT.EXPAND from doc:transformers depth=2: {c} reachable nodes")
-            for k in keys:
-                print(f"    → {k}")
-    except Exception as e:
-        print(f"  FT.EXPAND: {e}")
+    expanded = moon.vector.expand(INDEX, ["doc:transformers"], depth=2, graph_name=GRAPH)
+    print(f"\n  FT.EXPAND from doc:transformers depth=2: {len(expanded)} reachable")
+    for r in expanded[:8]:
+        print(f"    -> {r.key}")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 7: FT.RECOMMEND — "More like this"         ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 7: FT.RECOMMEND ──────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("Step 7: FT.RECOMMEND — 'more like doc:transformers'")
+    print("Step 7: FT.RECOMMEND — 'more like transformers, unlike graph_db'")
     print("=" * 60)
 
-    result = r.execute_command(
-        "FT.RECOMMEND", INDEX,
-        "POSITIVE", "doc:transformers",
-        "NEGATIVE", "doc:graph_db",  # Push away from infra topics
-        "K", "3",
+    results = moon.vector.recommend(
+        INDEX,
+        positive_keys=["doc:transformers"],
+        negative_keys=["doc:graph_db"],
+        k=3,
     )
-    print_results("Recommend (like transformers, unlike graph_db)", result)
+    show("Recommend", results)
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 8: Session-Aware Retrieval (Conversation)  ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 8: Session-Aware Retrieval ───────────────────────────────────────
     print("\n" + "=" * 60)
-    print("Step 8: Session-aware retrieval (multi-turn conversation)")
+    print("Step 8: Session-aware retrieval (multi-turn)")
     print("=" * 60)
 
     session_key = "session:user42:conv1"
 
-    # Turn 1: User asks about ML
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, knn_query("vec", 3),
-        "PARAMS", "2", "q", user_query,
-        "SESSION", session_key,
-    )
-    c1 = int(result[0])
-    keys1 = [result[i].decode() for i in range(1, len(result), 2) if isinstance(result[i], bytes)]
-    print(f"\n  Turn 1: {c1} results — {keys1}")
+    r1 = moon.session.search(INDEX, session_key, query, k=3)
+    print(f"\n  Turn 1: {len(r1)} results — {[r.key for r in r1]}")
 
-    # Turn 2: Same query — previously returned docs are filtered out
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, knn_query("vec", 3),
-        "PARAMS", "2", "q", user_query,
-        "SESSION", session_key,
-    )
-    c2 = int(result[0])
-    keys2 = [result[i].decode() for i in range(1, len(result), 2) if isinstance(result[i], bytes)]
-    print(f"  Turn 2: {c2} results — {keys2}  (deduped!)")
+    r2 = moon.session.search(INDEX, session_key, query, k=3)
+    print(f"  Turn 2: {len(r2)} results — {[r.key for r in r2]}  (deduped!)")
 
-    # Turn 3: Broaden search to see remaining docs
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, knn_query("vec", 5),
-        "PARAMS", "2", "q", user_query,
-        "SESSION", session_key,
-    )
-    c3 = int(result[0])
-    keys3 = [result[i].decode() for i in range(1, len(result), 2) if isinstance(result[i], bytes)]
-    print(f"  Turn 3: {c3} results — {keys3}  (remaining unseen)")
+    r3 = moon.session.search(INDEX, session_key, query, k=5)
+    print(f"  Turn 3: {len(r3)} results — {[r.key for r in r3]}  (remaining unseen)")
 
-    # Show session state
-    stype = r.type(session_key)
-    if stype == b"zset":
-        members = r.zrange(session_key, 0, -1)
-        print(f"  Session tracks {len(members)} seen docs: {[m.decode() for m in members]}")
+    history = moon.session.history(session_key)
+    print(f"  Session history: {history}")
 
-    # Session supports TTL for conversation timeout
-    r.expire(session_key, 3600)
+    moon.session.set_ttl(session_key, 3600)
     print(f"  Session TTL set to 1 hour")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 9: Semantic Cache                          ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Step 9: Semantic Cache ────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("Step 9: Semantic cache — cache LLM responses by query similarity")
+    print("Step 9: Semantic cache")
     print("=" * 60)
 
-    # Simulate: store a cached LLM response for a previous query
-    cached_query_vec = vec(0.85, 0.15, 0.05, 0.0)  # Same as user_query
-    r.hset(f"{CACHE_PREFIX}q1", mapping={
-        "vec": cached_query_vec,
-        "response": "Neural networks are computing systems inspired by biological neurons...",
-        "model": "gpt-4",
-        "tokens": "150",
-    })
-    r.expire(f"{CACHE_PREFIX}q1", 3600)  # Cache entry expires in 1 hour
-
-    # FT.CACHESEARCH: check cache first, fallback to KNN
-    try:
-        cache_result = r.execute_command(
-            "FT.CACHESEARCH", INDEX, CACHE_PREFIX,
-            knn_query("vec", 3),
-            "PARAMS", "2", "q", user_query,
-            "THRESHOLD", "0.95",
-            "FALLBACK", "KNN", "3",
-        )
-        print(f"  FT.CACHESEARCH result: {cache_result}")
-    except Exception as e:
-        print(f"  FT.CACHESEARCH: {e}")
-
-    # Manual cache lookup pattern (always works)
-    print("\n  Manual cache pattern:")
-    result = r.execute_command(
-        "FT.SEARCH", INDEX, knn_query("vec", 1),
-        "PARAMS", "2", "q", user_query,
+    moon.cache.store(
+        "cache:sem:q1", query,
+        response="Neural networks are computing systems inspired by biological neurons...",
+        model="gpt-4", tokens="150",
+        ttl=3600,
     )
-    if int(result[0]) > 0:
-        best_key = result[1].decode()
-        # Check if it's a cache entry
-        if best_key.startswith(CACHE_PREFIX):
-            cached = r.hgetall(best_key)
-            print(f"  CACHE HIT: {cached.get(b'response', b'').decode()[:80]}...")
-        else:
-            print(f"  CACHE MISS — nearest doc: {best_key} (run LLM, then cache response)")
+    print("  Stored cache entry with 1h TTL")
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Step 10: FT.NAVIGATE — Multi-hop Knowledge Nav  ║
-    # ╚══════════════════════════════════════════════════╝
+    cr = moon.cache.lookup(INDEX, "cache:sem:", query, threshold=0.95)
+    print(f"  FT.CACHESEARCH: cache_hit={cr.cache_hit}, {len(cr.results)} results")
+
+    # ── Step 10: FT.NAVIGATE ──────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 10: FT.NAVIGATE — multi-hop knowledge navigation")
     print("=" * 60)
 
-    try:
-        nav_result = r.execute_command(
-            "FT.NAVIGATE", INDEX, knn_query("vec", 2),
-            "HOPS", "2",
-            "PARAMS", "2", "q", user_query,
-        )
-        print_results("NAVIGATE: KNN→graph→re-rank (2 hops)", nav_result)
-    except Exception as e:
-        print(f"  FT.NAVIGATE: {e}")
+    results = moon.vector.navigate(INDEX, query, k=2, hops=2)
+    show("NAVIGATE: KNN->graph->re-rank (2 hops)", results)
 
-    # ╔══════════════════════════════════════════════════╗
-    # ║  Summary                                         ║
-    # ╚══════════════════════════════════════════════════╝
+    # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("Moon Memory Engine — Feature Summary")
+    print("Moon Memory Engine — using moondb SDK")
     print("=" * 60)
     print("""
-  ┌─────────────────────────────────────────────────────┐
-  │ Feature              │ Command                      │
-  ├──────────────────────┼──────────────────────────────┤
-  │ Vector search (RAG)  │ FT.SEARCH ... KNN            │
-  │ Filtered search      │ FT.SEARCH @field:{val}=>KNN  │
-  │ GraphRAG expansion   │ FT.SEARCH ... EXPAND GRAPH   │
-  │ Graph traversal      │ FT.EXPAND                    │
-  │ Recommendation       │ FT.RECOMMEND POSITIVE/NEG    │
-  │ Session dedup        │ FT.SEARCH ... SESSION key    │
-  │ Semantic cache       │ FT.CACHESEARCH               │
-  │ Multi-hop navigation │ FT.NAVIGATE ... HOPS N       │
-  │ Range search         │ FT.SEARCH ... RANGE dist     │
-  │ Autocompact control  │ FT.CONFIG SET AUTOCOMPACT    │
-  └──────────────────────┴──────────────────────────────┘
+  from moondb import MoonClient
+  moon = MoonClient(port=6399)
 
-  One server. One connection. One RTT per operation.
-  No Pinecone. No Neo4j. No Redis Stack. Just Moon.
+  moon.vector.create_index(...)     # FT.CREATE
+  moon.vector.search(...)           # FT.SEARCH KNN
+  moon.vector.search(filter_expr=)  # Filtered search
+  moon.vector.search(expand_graph=) # GraphRAG
+  moon.vector.expand(...)           # FT.EXPAND
+  moon.vector.recommend(...)        # FT.RECOMMEND
+  moon.vector.navigate(...)         # FT.NAVIGATE
+  moon.session.search(...)          # Session-aware dedup
+  moon.cache.lookup(...)            # Semantic cache
+  moon.cache.store(...)             # Store LLM response
+  moon.graph.add_node(...)          # GRAPH.ADDNODE
+  moon.graph.add_edge(...)          # GRAPH.ADDEDGE
+
+  One server. One SDK. One RTT per operation.
     """)
 
     # Cleanup
-    r.execute_command("FT.DROPINDEX", INDEX)
-    r.delete(session_key)
+    moon.vector.drop_index(INDEX)
+    moon.session.reset(session_key)
+    moon.cache.invalidate("cache:sem:q1")
     print("  Cleanup done.\n")
 
 
