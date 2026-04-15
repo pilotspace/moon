@@ -671,8 +671,8 @@ pub fn ft_search(
         return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax"));
     }
 
-    // Parse optional FILTER clause
-    let filter_expr = parse_filter_clause(args);
+    // Parse optional FILTER clause: explicit FILTER keyword OR inline prefix in query string
+    let filter_expr = parse_filter_clause(args).or_else(|| parse_inline_filter(&query_str));
 
     // Parse optional LIMIT offset count
     let (limit_offset, limit_count) = parse_limit_clause(args);
@@ -1693,6 +1693,24 @@ pub(crate) fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
         i += 1;
     }
     None
+}
+
+/// Parse inline filter prefix from query string (RediSearch-compatible).
+///
+/// Extracts filter expressions from before the `=>` arrow in queries like:
+///   `@category:{science}=>[KNN 3 @vec $q]`
+///   `@ts:[1000 2000]=>[KNN 5 @vec $q]`
+///   `@active:{true} @topic:{ml}=>[KNN 3 @vec $q]`
+///
+/// Returns `None` if query starts with `*=>` (no filter prefix).
+fn parse_inline_filter(query: &[u8]) -> Option<FilterExpr> {
+    let s = std::str::from_utf8(query).ok()?;
+    let arrow_pos = s.find("=>")?;
+    let prefix = s[..arrow_pos].trim();
+    if prefix.is_empty() || prefix == "*" {
+        return None;
+    }
+    parse_filter_string(prefix.as_bytes())
 }
 
 /// Parse SESSION clause from FT.SEARCH args.

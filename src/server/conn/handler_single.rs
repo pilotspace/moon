@@ -1066,7 +1066,15 @@ pub async fn handle_connection(
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                         crate::command::vector_search::ft_create(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                        crate::command::vector_search::ft_search(&mut *store, cmd_args, None)
+                                        let has_session = cmd_args.iter().any(|a| {
+                                            if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
+                                        });
+                                        if has_session {
+                                            let mut db_guard = db[conn.selected_db].write();
+                                            crate::command::vector_search::ft_search(&mut *store, cmd_args, Some(&mut *db_guard))
+                                        } else {
+                                            crate::command::vector_search::ft_search(&mut *store, cmd_args, None)
+                                        }
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                         crate::command::vector_search::ft_dropindex(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
@@ -1077,6 +1085,41 @@ pub async fn handle_connection(
                                         crate::command::vector_search::ft_compact(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                         crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, cmd_args)
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+                                        crate::command::vector_search::ft_config(&mut *store, cmd_args)
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                                        let mut db_guard = db[conn.selected_db].write();
+                                        crate::command::vector_search::recommend::ft_recommend(&mut *store, cmd_args, Some(&mut *db_guard))
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
+                                        #[cfg(feature = "graph")]
+                                        {
+                                            let gs_frame = if let Some(ref gs) = graph_store {
+                                                let graph_guard = gs.lock();
+                                                crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), cmd_args, None)
+                                            } else {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph store"))
+                                            };
+                                            gs_frame
+                                        }
+                                        #[cfg(not(feature = "graph"))]
+                                        {
+                                            Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph feature"))
+                                        }
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
+                                        #[cfg(feature = "graph")]
+                                        {
+                                            let gs_frame = if let Some(ref gs) = graph_store {
+                                                let graph_guard = gs.lock();
+                                                crate::command::vector_search::ft_expand(&graph_guard, cmd_args)
+                                            } else {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph store"))
+                                            };
+                                            gs_frame
+                                        }
+                                        #[cfg(not(feature = "graph"))]
+                                        {
+                                            Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                                        }
                                     } else {
                                         Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                     };
@@ -1189,7 +1232,19 @@ pub async fn handle_connection(
                                     if let Some(ref vs) = vector_store {
                                         let mut store = vs.lock();
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                            crate::command::vector_search::ft_search(&mut *store, d_args, None)
+                                            let has_session = d_args.iter().any(|a| {
+                                                if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
+                                            });
+                                            if has_session {
+                                                drop(guard);
+                                                let mut db_guard = db[conn.selected_db].write();
+                                                let r = crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *db_guard));
+                                                drop(db_guard);
+                                                guard = db[conn.selected_db].read();
+                                                r
+                                            } else {
+                                                crate::command::vector_search::ft_search(&mut *store, d_args, None)
+                                            }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
@@ -1198,6 +1253,43 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_compact(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                             crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+                                            crate::command::vector_search::ft_config(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                                            drop(guard);
+                                            let mut db_guard = db[conn.selected_db].write();
+                                            let r = crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *db_guard));
+                                            drop(db_guard);
+                                            guard = db[conn.selected_db].read();
+                                            r
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
+                                            #[cfg(feature = "graph")]
+                                            {
+                                                if let Some(ref gs) = graph_store {
+                                                    let graph_guard = gs.lock();
+                                                    crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), d_args, None)
+                                                } else {
+                                                    Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph store"))
+                                                }
+                                            }
+                                            #[cfg(not(feature = "graph"))]
+                                            {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph feature"))
+                                            }
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
+                                            #[cfg(feature = "graph")]
+                                            {
+                                                if let Some(ref gs) = graph_store {
+                                                    let graph_guard = gs.lock();
+                                                    crate::command::vector_search::ft_expand(&graph_guard, d_args)
+                                                } else {
+                                                    Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph store"))
+                                                }
+                                            }
+                                            #[cfg(not(feature = "graph"))]
+                                            {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                                            }
                                         } else {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                         };
@@ -1270,7 +1362,8 @@ pub async fn handle_connection(
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                             crate::command::vector_search::ft_create(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                            crate::command::vector_search::ft_search(&mut *store, d_args, None)
+                                            // Write run: guard is already write-locked
+                                            crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard))
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                             crate::command::vector_search::ft_dropindex(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
@@ -1281,6 +1374,38 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_compact(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                             crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+                                            crate::command::vector_search::ft_config(&mut *store, d_args)
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                                            crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *guard))
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
+                                            #[cfg(feature = "graph")]
+                                            {
+                                                if let Some(ref gs) = graph_store {
+                                                    let graph_guard = gs.lock();
+                                                    crate::command::vector_search::navigate::ft_navigate(&mut *store, Some(&graph_guard), d_args, None)
+                                                } else {
+                                                    Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph store"))
+                                                }
+                                            }
+                                            #[cfg(not(feature = "graph"))]
+                                            {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.NAVIGATE requires graph feature"))
+                                            }
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
+                                            #[cfg(feature = "graph")]
+                                            {
+                                                if let Some(ref gs) = graph_store {
+                                                    let graph_guard = gs.lock();
+                                                    crate::command::vector_search::ft_expand(&graph_guard, d_args)
+                                                } else {
+                                                    Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph store"))
+                                                }
+                                            }
+                                            #[cfg(not(feature = "graph"))]
+                                            {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                                            }
                                         } else {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                         };
