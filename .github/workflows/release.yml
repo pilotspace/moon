@@ -86,7 +86,7 @@ jobs:
           cp "target/$TARGET/release/moon" "$BINARY"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.binary }}
           path: ${{ matrix.binary }}
