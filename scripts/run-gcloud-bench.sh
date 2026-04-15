@@ -113,7 +113,7 @@ sleep 1
 # --- Moon WAL everysec (1 shard) ---
 echo "--- Moon (WAL everysec, 1 shard) ---"
 rm -rf /tmp/moon-data/*
-$MOON --port 6399 --shards 1 --protected-mode no --aof-enabled --appendfsync everysec --data-dir /tmp/moon-data > /dev/null 2>&1 &
+$MOON --port 6399 --shards 1 --protected-mode no --appendonly yes --appendfsync everysec --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
@@ -127,7 +127,7 @@ sleep 1
 # --- Moon WAL everysec (4 shards) ---
 echo "--- Moon (WAL everysec, 4 shards) ---"
 rm -rf /tmp/moon-data/*
-$MOON --port 6399 --shards 4 --protected-mode no --aof-enabled --appendfsync everysec --data-dir /tmp/moon-data > /dev/null 2>&1 &
+$MOON --port 6399 --shards 4 --protected-mode no --appendonly yes --appendfsync everysec --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
@@ -141,7 +141,7 @@ sleep 1
 # --- Moon WAL always (1 shard) ---
 echo "--- Moon (WAL always, 1 shard) ---"
 rm -rf /tmp/moon-data/*
-$MOON --port 6399 --shards 1 --protected-mode no --aof-enabled --appendfsync always --data-dir /tmp/moon-data > /dev/null 2>&1 &
+$MOON --port 6399 --shards 1 --protected-mode no --appendonly yes --appendfsync always --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
@@ -155,7 +155,7 @@ sleep 1
 # --- Moon WAL always (4 shards) ---
 echo "--- Moon (WAL always, 4 shards) ---"
 rm -rf /tmp/moon-data/*
-$MOON --port 6399 --shards 4 --protected-mode no --aof-enabled --appendfsync always --data-dir /tmp/moon-data > /dev/null 2>&1 &
+$MOON --port 6399 --shards 4 --protected-mode no --appendonly yes --appendfsync always --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
@@ -220,7 +220,7 @@ $MOON --port 6399 --shards 1 --protected-mode no > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
-redis-cli -p 6399 FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA cat TEXT vec VECTOR HNSW 6 TYPE FLOAT32 DIM $DIM DISTANCE_METRIC COSINE 2>/dev/null
+redis-cli -p 6399 FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM $DIM DISTANCE_METRIC COSINE 2>/dev/null
 
 # Insert via pipeline
 MOON_T0=$(date +%s%3N)
@@ -239,98 +239,61 @@ MOON_INSERT_PID=$!
 # Actually this per-vector insert with python is too slow. Use a bulk approach.
 kill $MOON_INSERT_PID 2>/dev/null || true
 
-# Bulk insert with python
+# Bulk insert with redis-py pipeline (reliable, no raw socket issues)
 python3 -c "
-import socket, struct, random, time
+import struct, random, time, redis
 
 DIM=$DIM; NUM=$NUM
+BATCH=500
 random.seed(42)
 vectors = [[random.gauss(0,1) for _ in range(DIM)] for _ in range(NUM)]
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(('127.0.0.1', 6399))
+r = redis.Redis(host='127.0.0.1', port=6399, decode_responses=False)
 
 t0 = time.time()
-batch = b''
+pipe = r.pipeline(transaction=False)
 for i in range(NUM):
     blob = struct.pack(f'{DIM}f', *vectors[i])
-    cat_val = f'c{i%10}'
-    key = f'doc:{i}'
-    cmd = f'*6\r\n\$4\r\nHSET\r\n\${len(key)}\r\n{key}\r\n\$3\r\ncat\r\n\${len(cat_val)}\r\n{cat_val}\r\n\$3\r\nvec\r\n\${len(blob)}\r\n'.encode() + blob + b'\r\n'
-    batch += cmd
-    if len(batch) > 65536:
-        s.sendall(batch)
-        batch = b''
-        # Drain responses
-        try:
-            s.setblocking(False)
-            while True:
-                s.recv(65536)
-        except:
-            pass
-        s.setblocking(True)
-
-if batch:
-    s.sendall(batch)
-
-# Drain all remaining responses
-s.setblocking(True)
-s.settimeout(5)
-try:
-    while True:
-        data = s.recv(65536)
-        if not data:
-            break
-except:
-    pass
+    pipe.hset(f'doc:{i}', mapping={'cat': f'c{i%10}', 'vec': blob})
+    if (i + 1) % BATCH == 0:
+        pipe.execute()
+        pipe = r.pipeline(transaction=False)
+pipe.execute()
 
 t1 = time.time()
 print(f'moon_insert_sec={t1-t0:.2f}')
 print(f'moon_insert_rate={NUM/(t1-t0):.0f} vec/s')
-s.close()
+r.close()
 " 2>&1 | tee -a "$R/s3-vector.txt"
 
-# Search
+# Search via redis-py (reliable RESP parsing, avoids raw socket bugs)
 python3 -c "
-import socket, struct, random, time
+import struct, random, time, redis
 
 DIM=$DIM; NUM=$NUM
 random.seed(42)
 vectors = [[random.gauss(0,1) for _ in range(DIM)] for _ in range(NUM)]
-QUERIES = 100
+QUERIES = 200
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(('127.0.0.1', 6399))
-s.settimeout(10)
+r = redis.Redis(host='127.0.0.1', port=6399, decode_responses=False)
 
 t0 = time.time()
 hits = 0
 for i in range(QUERIES):
     qvec = vectors[random.randint(0, NUM-1)]
     blob = struct.pack(f'{DIM}f', *qvec)
-    # FT.SEARCH idx '*=>[KNN 10 @vec \$q AS score]' PARAMS 2 q <blob> LIMIT 0 10
-    query = b'*=>[KNN 10 @vec \$q AS score]'
-    params_key = b'q'
-    cmd = (
-        f'*9\r\n\$9\r\nFT.SEARCH\r\n\$3\r\nidx\r\n'
-        f'\${len(query)}\r\n'.encode() + query + b'\r\n'
-        f'\$6\r\nPARAMS\r\n\$1\r\n2\r\n'
-        f'\$1\r\nq\r\n'
-        f'\${len(blob)}\r\n'.encode() + blob + b'\r\n'
-        f'\$5\r\nLIMIT\r\n\$1\r\n0\r\n\$2\r\n10\r\n'.encode()
-    )
-    s.sendall(cmd)
-    resp = b''
-    while b'\r\n' in resp or len(resp) < 10:
-        try:
-            chunk = s.recv(65536)
-            if not chunk: break
-            resp += chunk
-            if resp.count(b'\r\n') > 5: break
-        except:
-            break
-    if b'doc:' in resp:
-        hits += 1
+    try:
+        result = r.execute_command(
+            'FT.SEARCH', 'idx',
+            '*=>[KNN 10 @vec \$q AS score]',
+            'PARAMS', '2', 'q', blob,
+            'LIMIT', '0', '10',
+        )
+        # result[0] is the count of matches
+        if isinstance(result, list) and result[0] > 0:
+            hits += 1
+    except Exception as e:
+        pass
 
 t1 = time.time()
 qps = QUERIES / (t1 - t0)
@@ -338,7 +301,7 @@ print(f'moon_search_queries={QUERIES}')
 print(f'moon_search_sec={t1-t0:.2f}')
 print(f'moon_search_qps={qps:.0f}')
 print(f'moon_search_hits={hits}/{QUERIES}')
-s.close()
+r.close()
 " 2>&1 | tee -a "$R/s3-vector.txt"
 
 redis-cli -p 6399 INFO memory 2>/dev/null | grep used_memory_human >> "$R/s3-vector.txt" || true
@@ -350,47 +313,34 @@ echo "--- Redis vector search ---"
 redis-server --port 6379 --save "" --appendonly no --protected-mode no --daemonize yes --loglevel warning --dir /tmp/redis-data
 wait_port 6379
 
-if redis-cli -p 6379 FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA cat TEXT vec VECTOR HNSW 6 TYPE FLOAT32 DIM $DIM DISTANCE_METRIC COSINE 2>&1 | grep -qi "unknown\|ERR"; then
+if redis-cli -p 6379 FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM $DIM DISTANCE_METRIC COSINE 2>&1 | grep -qi "unknown\|ERR"; then
     echo "redis_vector=NOT_AVAILABLE (no RediSearch module)" | tee -a "$R/s3-vector.txt"
 else
     echo "Redis FT module available - benchmarking..."
-    # Same bulk insert for Redis
     python3 -c "
-import socket, struct, random, time
+import struct, random, time, redis
 
 DIM=$DIM; NUM=$NUM
+BATCH=500
 random.seed(42)
 vectors = [[random.gauss(0,1) for _ in range(DIM)] for _ in range(NUM)]
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(('127.0.0.1', 6379))
+r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=False)
 
 t0 = time.time()
-batch = b''
+pipe = r.pipeline(transaction=False)
 for i in range(NUM):
     blob = struct.pack(f'{DIM}f', *vectors[i])
-    cat_val = f'c{i%10}'
-    key = f'doc:{i}'
-    cmd = f'*6\r\n\$4\r\nHSET\r\n\${len(key)}\r\n{key}\r\n\$3\r\ncat\r\n\${len(cat_val)}\r\n{cat_val}\r\n\$3\r\nvec\r\n\${len(blob)}\r\n'.encode() + blob + b'\r\n'
-    batch += cmd
-    if len(batch) > 65536:
-        s.sendall(batch)
-        batch = b''
-        try:
-            s.setblocking(False)
-            while True: s.recv(65536)
-        except: pass
-        s.setblocking(True)
-if batch: s.sendall(batch)
-s.setblocking(True); s.settimeout(5)
-try:
-    while True:
-        if not s.recv(65536): break
-except: pass
+    pipe.hset(f'doc:{i}', mapping={'cat': f'c{i%10}', 'vec': blob})
+    if (i + 1) % BATCH == 0:
+        pipe.execute()
+        pipe = r.pipeline(transaction=False)
+pipe.execute()
+
 t1 = time.time()
 print(f'redis_insert_sec={t1-t0:.2f}')
 print(f'redis_insert_rate={NUM/(t1-t0):.0f} vec/s')
-s.close()
+r.close()
 " 2>&1 | tee -a "$R/s3-vector.txt"
 fi
 redis-cli -p 6379 INFO memory 2>/dev/null | grep used_memory_human >> "$R/s3-vector.txt" || true
