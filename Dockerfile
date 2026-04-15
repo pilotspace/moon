@@ -110,20 +110,32 @@ RUN cargo build --release --no-default-features --features ${FEATURES}
 # =============================================================================
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
+# OCI image labels (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+LABEL org.opencontainers.image.title="Moon" \
+      org.opencontainers.image.description="High-performance Redis-compatible server with vector search and graph engine" \
+      org.opencontainers.image.url="https://github.com/pilotspace/moon" \
+      org.opencontainers.image.source="https://github.com/pilotspace/moon" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="Pilotspace"
+
 COPY --from=builder /app/target/release/moon /usr/local/bin/moon
 
-# /data is used for AOF persistence files
+# /data is used for AOF/RDB persistence files
 VOLUME ["/data"]
 WORKDIR /data
 
-# Plain Redis protocol port + TLS port
-EXPOSE 6379 6443
+# 6379 = Redis protocol, 6443 = TLS, 9100 = admin/console HTTP
+EXPOSE 6379 6443 9100
 
-# Exec-form healthcheck (no shell in distroless). Verifies binary executes.
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD ["/usr/local/bin/moon", "--help"]
+# Exec-form healthcheck. Uses --check-config as a liveness probe since
+# distroless has no shell or redis-cli. When --admin-port is set, operators
+# should override with a curl-based probe against /healthz.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/moon", "--check-config"]
 
 # Distroless :nonroot tag runs as uid 65534 by default.
 # --protected-mode no: Docker networking is non-loopback; protected mode
-# blocks all connections from forwarded ports.
-CMD ["moon", "--bind", "0.0.0.0", "--protected-mode", "no"]
+#   blocks all connections from forwarded ports.
+# --shards 0: auto-detect CPU cores.
+# --dir /data: persistence files go to the mounted volume.
+CMD ["moon", "--bind", "0.0.0.0", "--port", "6379", "--shards", "0", "--dir", "/data", "--protected-mode", "no"]
