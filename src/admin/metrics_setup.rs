@@ -322,6 +322,10 @@ fn sanitize_cmd_label(cmd: &str) -> &'static str {
         "ft.info" => "ft.info",
         "ft.search" => "ft.search",
         "ft.compact" => "ft.compact",
+        "ft.cachesearch" => "ft.cachesearch",
+        "ft.recommend" => "ft.recommend",
+        "ft.navigate" => "ft.navigate",
+        "ft.expand" => "ft.expand",
         // ACL
         "acl" => "acl",
         // Cluster
@@ -484,6 +488,54 @@ pub fn record_spsc_drain(shard_id: usize, count: u64) {
     }
     let shard = itoa::Buffer::new().format(shard_id).to_string();
     histogram!("moon_spsc_drain_batch_size", "shard" => shard).record(count as f64);
+}
+
+// ── Vector search metrics (v0.1.6) ─────────────────────────────────────
+
+/// Record a cache hit for FT.CACHESEARCH.
+#[inline]
+pub fn record_cache_hit() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_cache_hits_total").increment(1);
+}
+
+/// Record a cache miss for FT.CACHESEARCH.
+#[inline]
+pub fn record_cache_miss() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_cache_misses_total").increment(1);
+}
+
+/// Update the document count gauge for a vector index.
+/// Called after FT.CREATE, HSET auto-index, FT.DROPINDEX, and compaction.
+#[inline]
+pub fn update_vector_index_docs(index_name: &str, count: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Sanitize index name: only allow alphanumeric + underscore + hyphen, max 64 chars.
+    if index_name.len() > 64
+        || !index_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return;
+    }
+    let label = index_name.to_string();
+    gauge!("moon_vector_index_docs", "index" => label).set(count as f64);
+}
+
+/// Update total vector memory usage gauge (bytes across all indexes).
+#[inline]
+pub fn update_vector_memory_bytes(bytes: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_vector_memory_bytes").set(bytes as f64);
 }
 
 // ── Pub/Sub metrics ─────────────────────────────────────────────────────
