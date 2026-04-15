@@ -29,12 +29,14 @@ wait_port() {
     echo "TIMEOUT waiting for port $1" && return 1
 }
 
-# ============================
-# SCENARIO 1: No Persistence
-# ============================
-echo "========== SCENARIO 1: NO PERSISTENCE =========="
+# ======================================================================
+# SCENARIO 1: Raw Throughput (All persistence OFF)
+# Fair baseline — both servers with zero persistence overhead.
+# Redis:  --appendonly no --save ""
+# Moon:   --appendonly no --disk-offload disable
+# ======================================================================
+echo "========== SCENARIO 1: RAW THROUGHPUT (No Persistence) =========="
 
-# --- Redis no persist ---
 echo "--- Redis (no persist) ---"
 redis-server --port 6379 --save "" --appendonly no --protected-mode no --daemonize yes --loglevel warning --dir /tmp/redis-data
 wait_port 6379
@@ -48,9 +50,9 @@ redis-cli -p 6379 INFO memory | grep used_memory_human >> "$R/s1-redis-info.txt"
 redis-cli -p 6379 SHUTDOWN NOSAVE 2>/dev/null || true
 sleep 1
 
-# --- Moon no persist (1 shard) ---
 echo "--- Moon (no persist, 1 shard) ---"
-$MOON --port 6399 --shards 1 --protected-mode no > /dev/null 2>&1 &
+rm -rf /tmp/moon-data/*
+$MOON --port 6399 --shards 1 --protected-mode no --appendonly no --disk-offload disable --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
@@ -63,9 +65,9 @@ redis-cli -p 6399 INFO memory | grep used_memory_human >> "$R/s1-moon-s1-info.tx
 pkill -9 -f 'moon --port' 2>/dev/null || true
 sleep 1
 
-# --- Moon no persist (4 shards) ---
 echo "--- Moon (no persist, 4 shards) ---"
-$MOON --port 6399 --shards 4 --protected-mode no > /dev/null 2>&1 &
+rm -rf /tmp/moon-data/*
+$MOON --port 6399 --shards 4 --protected-mode no --appendonly no --disk-offload disable --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
@@ -78,40 +80,31 @@ redis-cli -p 6399 INFO memory | grep used_memory_human >> "$R/s1-moon-s4-info.tx
 pkill -9 -f 'moon --port' 2>/dev/null || true
 sleep 1
 
-# ============================
-# SCENARIO 2: Persistence
-# ============================
+# ======================================================================
+# SCENARIO 2: Production Defaults (Full features ON)
+# How each server performs out-of-the-box.
+# Redis:  --appendonly yes --appendfsync everysec (production default)
+# Moon:   defaults (disk-offload ON, WAL v3, checkpoint, PageCache, lz4)
+#         + --appendonly yes --appendfsync everysec for WAL v2
+# ======================================================================
 echo ""
-echo "========== SCENARIO 2: PERSISTENCE =========="
+echo "========== SCENARIO 2: PRODUCTION DEFAULTS =========="
 
-# --- Redis AOF everysec ---
-echo "--- Redis (AOF everysec) ---"
+echo "--- Redis (production: AOF everysec) ---"
 rm -rf /tmp/redis-data/*
 redis-server --port 6379 --save "" --appendonly yes --appendfsync everysec --protected-mode no --daemonize yes --loglevel warning --dir /tmp/redis-data
 wait_port 6379
 
 for p in 1 8 16 32 64; do
     echo "Pipeline=$p"
-    redis-benchmark -p 6379 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-redis-aof-everysec.csv"
+    redis-benchmark -p 6379 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-redis-production.csv"
 done
 redis-cli -p 6379 SHUTDOWN NOSAVE 2>/dev/null || true
 sleep 1
 
-# --- Redis AOF always ---
-echo "--- Redis (AOF always) ---"
-rm -rf /tmp/redis-data/*
-redis-server --port 6379 --save "" --appendonly yes --appendfsync always --protected-mode no --daemonize yes --loglevel warning --dir /tmp/redis-data
-wait_port 6379
-
-for p in 1 8 16 32 64; do
-    echo "Pipeline=$p"
-    redis-benchmark -p 6379 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-redis-aof-always.csv"
-done
-redis-cli -p 6379 SHUTDOWN NOSAVE 2>/dev/null || true
-sleep 1
-
-# --- Moon WAL everysec (1 shard) ---
-echo "--- Moon (WAL everysec, 1 shard) ---"
+# Moon production defaults: disk-offload=enable (WAL v3 + PageCache + checkpoint)
+# plus appendonly=yes (WAL v2) for full durability — this is the recommended config.
+echo "--- Moon (production defaults, 1 shard) ---"
 rm -rf /tmp/moon-data/*
 $MOON --port 6399 --shards 1 --protected-mode no --appendonly yes --appendfsync everysec --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
@@ -119,13 +112,12 @@ wait_port 6399
 
 for p in 1 8 16 32 64; do
     echo "Pipeline=$p"
-    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-moon-s1-wal-everysec.csv"
+    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-moon-s1-production.csv"
 done
 pkill -9 -f 'moon --port' 2>/dev/null || true
 sleep 1
 
-# --- Moon WAL everysec (4 shards) ---
-echo "--- Moon (WAL everysec, 4 shards) ---"
+echo "--- Moon (production defaults, 4 shards) ---"
 rm -rf /tmp/moon-data/*
 $MOON --port 6399 --shards 4 --protected-mode no --appendonly yes --appendfsync everysec --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
@@ -133,13 +125,32 @@ wait_port 6399
 
 for p in 1 8 16 32 64; do
     echo "Pipeline=$p"
-    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-moon-s4-wal-everysec.csv"
+    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-moon-s4-production.csv"
 done
 pkill -9 -f 'moon --port' 2>/dev/null || true
 sleep 1
 
-# --- Moon WAL always (1 shard) ---
-echo "--- Moon (WAL always, 1 shard) ---"
+# ======================================================================
+# SCENARIO 3: Max Durability (appendfsync always)
+# Redis:  --appendonly yes --appendfsync always
+# Moon:   full defaults + --appendonly yes --appendfsync always
+# ======================================================================
+echo ""
+echo "========== SCENARIO 3: MAX DURABILITY (fsync always) =========="
+
+echo "--- Redis (AOF always) ---"
+rm -rf /tmp/redis-data/*
+redis-server --port 6379 --save "" --appendonly yes --appendfsync always --protected-mode no --daemonize yes --loglevel warning --dir /tmp/redis-data
+wait_port 6379
+
+for p in 1 8 16 32 64; do
+    echo "Pipeline=$p"
+    redis-benchmark -p 6379 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s3-redis-always.csv"
+done
+redis-cli -p 6379 SHUTDOWN NOSAVE 2>/dev/null || true
+sleep 1
+
+echo "--- Moon (max durability, 1 shard) ---"
 rm -rf /tmp/moon-data/*
 $MOON --port 6399 --shards 1 --protected-mode no --appendonly yes --appendfsync always --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
@@ -147,13 +158,12 @@ wait_port 6399
 
 for p in 1 8 16 32 64; do
     echo "Pipeline=$p"
-    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-moon-s1-wal-always.csv"
+    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s3-moon-s1-always.csv"
 done
 pkill -9 -f 'moon --port' 2>/dev/null || true
 sleep 1
 
-# --- Moon WAL always (4 shards) ---
-echo "--- Moon (WAL always, 4 shards) ---"
+echo "--- Moon (max durability, 4 shards) ---"
 rm -rf /tmp/moon-data/*
 $MOON --port 6399 --shards 4 --protected-mode no --appendonly yes --appendfsync always --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
@@ -161,16 +171,17 @@ wait_port 6399
 
 for p in 1 8 16 32 64; do
     echo "Pipeline=$p"
-    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s2-moon-s4-wal-always.csv"
+    redis-benchmark -p 6399 -c 50 -n 500000 -P $p -t set,get -d 64 --csv -q 2>&1 | tee -a "$R/s3-moon-s4-always.csv"
 done
 pkill -9 -f 'moon --port' 2>/dev/null || true
 sleep 1
 
-# ============================
-# SCENARIO 3: Vector Search
-# ============================
+# ======================================================================
+# SCENARIO 4: Vector Search (Moon production defaults — full features)
+# Moon runs with all defaults: disk-offload, WAL v3, PageCache, checkpoint
+# ======================================================================
 echo ""
-echo "========== SCENARIO 3: VECTOR SEARCH =========="
+echo "========== SCENARIO 4: VECTOR SEARCH =========="
 
 DIM=384
 NUM=50000
@@ -213,10 +224,10 @@ for s in range(0, NUM, bs):
 print(f'Generated {NUM} vectors dim={DIM}')
 "
 
-# --- Moon vector ---
-echo "--- Moon vector search ---"
+# --- Moon vector (production defaults: disk-offload + WAL v3 + PageCache) ---
+echo "--- Moon vector search (production defaults) ---"
 rm -rf /tmp/moon-data/*
-$MOON --port 6399 --shards 1 --protected-mode no > /dev/null 2>&1 &
+$MOON --port 6399 --shards 1 --protected-mode no --appendonly yes --dir /tmp/moon-data > /dev/null 2>&1 &
 sleep 2
 wait_port 6399
 
