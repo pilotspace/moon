@@ -70,7 +70,7 @@ monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 cudarc = { version = "0.12", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
 slotmap = "1"
 boomphf = "0.6"
-logos = { version = "0.14", optional = true }
+logos = { version = "0.16", optional = true }
 hyper-tungstenite = { version = "0.19", optional = true }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 mime_guess = { version = "2", optional = true }
