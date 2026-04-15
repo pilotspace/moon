@@ -144,6 +144,7 @@ fn bench_full_insert_pipeline_128d() {
         key_prefixes: vec![bytes::Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
     };
     let _ = store.create_index(meta);
 
@@ -221,6 +222,7 @@ fn bench_full_insert_pipeline_768d() {
         key_prefixes: vec![bytes::Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
     };
     let _ = store.create_index(meta);
 

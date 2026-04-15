@@ -351,11 +351,11 @@ pub fn ft_recommend(
     };
 
     // Dispatch to correct field segments
-    let results = if parsed.field_name.is_none()
-        || parsed.field_name.as_ref().is_some_and(|f| {
-            f.eq_ignore_ascii_case(&idx.meta.default_field().field_name)
-        })
-    {
+    let use_default = match parsed.field_name.as_ref() {
+        None => true,
+        Some(f) => f.eq_ignore_ascii_case(&idx.meta.default_field().field_name),
+    };
+    let results = if use_default {
         idx.segments.search_mvcc(
             &centroid,
             search_k,
@@ -365,7 +365,7 @@ pub fn ft_recommend(
             &mvcc_ctx,
         )
     } else {
-        let fname = parsed.field_name.as_ref().unwrap();
+        let fname = parsed.field_name.as_ref().expect("checked above");
         match idx.field_segments.get_mut(fname.as_ref()) {
             Some(fs) => fs.segments.search_mvcc(
                 &centroid,
@@ -381,10 +381,10 @@ pub fn ft_recommend(
         }
     };
 
-    // Filter out positive and negative example keys
+    // Filter out positive/negative example keys and unmapped entries (key_hash=0)
     let filtered: SmallVec<[SearchResult; 32]> = results
         .into_iter()
-        .filter(|r| r.key_hash == 0 || !exclude.contains(&r.key_hash))
+        .filter(|r| r.key_hash != 0 && !exclude.contains(&r.key_hash))
         .take(parsed.k)
         .collect();
 

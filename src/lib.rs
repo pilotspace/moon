@@ -34,7 +34,8 @@
     clippy::filter_next,               // 1 site: filter().next() reads better than find() in context
     clippy::unwrap_or_default,         // 1 site: explicit unwrap_or(Vec::new()) for type inference
     clippy::mem_replace_with_default,  // 3 sites: tokio handler guard patterns
-    clippy::nonminimal_bool            // 1 site: tokio handler complex bool expression
+    clippy::nonminimal_bool,           // 1 site: tokio handler complex bool expression
+    clippy::manual_is_multiple_of     // 12 sites: `% == 0` patterns clearer than is_multiple_of in SIMD/tick code
 )]
 
 pub mod acl;

@@ -733,9 +733,9 @@ pub fn ft_search(
     };
 
     // --- Hybrid path: both dense + sparse ---
-    if dense_blob.is_some() && sparse_query.is_some() {
-        let blob = dense_blob.as_ref().unwrap();
-        let (sparse_field, sparse_pairs) = sparse_query.as_ref().unwrap();
+    if let (Some(blob), Some((sparse_field, sparse_pairs))) =
+        (dense_blob.as_ref(), sparse_query.as_ref())
+    {
 
         // Dense search
         let dense_raw = search_local_raw(
@@ -1082,6 +1082,7 @@ fn parse_expand_clause(args: &[Frame]) -> Option<u32> {
 }
 
 /// Result of search_local_raw — either raw results or an error Frame.
+#[allow(clippy::large_enum_variant)]
 enum SearchRawResult {
     Ok {
         results: SmallVec<[SearchResult; 32]>,

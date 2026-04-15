@@ -212,7 +212,7 @@ fn cache_probe(
     // correct. In practice, cache hits should be the closest vectors, so a modest k
     // that covers the cache population plus margin is sufficient.
     // Cap at 10000 to avoid pathological performance on huge indexes.
-    let k = cache_count.saturating_mul(3).max(100).min(10_000);
+    let k = cache_count.saturating_mul(3).clamp(100, 10_000);
     let _ = idx; // release immutable borrow before mutable search call
 
     let response = search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None);

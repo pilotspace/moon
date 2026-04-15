@@ -33,6 +33,7 @@ fn make_test_meta(name: &str, dim: u32, compact_threshold: u32) -> IndexMeta {
         key_prefixes: vec![Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
     }
 }
 

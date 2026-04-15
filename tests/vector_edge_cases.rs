@@ -39,6 +39,7 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         key_prefixes: vec![Bytes::from_static(b"doc:")],
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
     }
 }
 
@@ -321,7 +322,7 @@ fn test_ft_search_missing_query_vector() {
 
     // Only index name and query string, no PARAMS section
     let search_args = vec![bulk(b"search_idx"), bulk(b"*=>[KNN 10 @vec $query]")];
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     assert_is_error(&result, "ft_search without query vector");
 }
 
@@ -336,7 +337,7 @@ fn test_ft_search_nonexistent_index() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(vec![0u8; 128 * 4])),
     ];
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     assert_is_error(&result, "ft_search on nonexistent index");
 }
 
@@ -375,6 +376,6 @@ fn test_ft_search_dimension_mismatch_returns_error() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(vec![0u8; 4])),
     ];
-    let result = ft_search(&mut store, &search_args);
+    let result = ft_search(&mut store, &search_args, None);
     assert_is_error(&result, "ft_search with wrong dimension blob");
 }

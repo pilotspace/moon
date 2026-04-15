@@ -39,7 +39,7 @@ pub fn filter_session_results(
                 continue; // already returned in this session
             }
         }
-        filtered.push(r.clone());
+        filtered.push(*r);
     }
     filtered
 }
