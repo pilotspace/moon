@@ -79,7 +79,11 @@ impl SparseStore {
             .into_iter()
             .filter_map(|(doc_id, score)| {
                 let key_hash = *self.doc_to_key_hash.get(&doc_id)?;
-                Some(SearchResult::with_key_hash(score, VectorId(doc_id), key_hash))
+                Some(SearchResult::with_key_hash(
+                    score,
+                    VectorId(doc_id),
+                    key_hash,
+                ))
             })
             .collect()
     }

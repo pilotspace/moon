@@ -32,8 +32,12 @@ mod ft_expand_tests {
         let node_c = g.write_buf.add_node(smallvec![0], smallvec![], None, 3);
 
         // A -> B -> C
-        g.write_buf.add_edge(node_a, node_b, 0, 1.0, None, 4).unwrap();
-        g.write_buf.add_edge(node_b, node_c, 0, 1.0, None, 5).unwrap();
+        g.write_buf
+            .add_edge(node_a, node_b, 0, 1.0, None, 4)
+            .unwrap();
+        g.write_buf
+            .add_edge(node_b, node_c, 0, 1.0, None, 5)
+            .unwrap();
 
         // Register Redis key mappings
         g.register_key(Bytes::from_static(b"doc:a"), node_a);
@@ -73,7 +77,11 @@ mod ft_expand_tests {
         let args = vec![bulk(b"myidx"), bulk(b"doc:a")];
         let result = ft_expand(&gs, &args);
         match result {
-            Frame::Error(e) => assert!(e.starts_with(b"ERR syntax error: expected DEPTH"), "{:?}", e),
+            Frame::Error(e) => assert!(
+                e.starts_with(b"ERR syntax error: expected DEPTH"),
+                "{:?}",
+                e
+            ),
             other => panic!("expected error, got {other:?}"),
         }
     }
@@ -82,7 +90,14 @@ mod ft_expand_tests {
     fn test_ft_expand_depth_zero() {
         let gs = setup_graph_store();
         // FT.EXPAND myidx doc:a DEPTH 0
-        let args = vec![bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"0"), bulk(b"GRAPH"), bulk(b"kg")];
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"doc:a"),
+            bulk(b"DEPTH"),
+            bulk(b"0"),
+            bulk(b"GRAPH"),
+            bulk(b"kg"),
+        ];
         let result = ft_expand(&gs, &args);
         match result {
             Frame::Array(frames) => {
@@ -102,8 +117,12 @@ mod ft_expand_tests {
         let gs = setup_graph_store();
         // FT.EXPAND myidx doc:a DEPTH 1 GRAPH kg
         let args = vec![
-            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1"),
-            bulk(b"GRAPH"), bulk(b"kg"),
+            bulk(b"myidx"),
+            bulk(b"doc:a"),
+            bulk(b"DEPTH"),
+            bulk(b"1"),
+            bulk(b"GRAPH"),
+            bulk(b"kg"),
         ];
         let result = ft_expand(&gs, &args);
         match result {
@@ -143,8 +162,12 @@ mod ft_expand_tests {
         let gs = setup_graph_store();
         // FT.EXPAND myidx doc:a DEPTH 2 GRAPH kg
         let args = vec![
-            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"2"),
-            bulk(b"GRAPH"), bulk(b"kg"),
+            bulk(b"myidx"),
+            bulk(b"doc:a"),
+            bulk(b"DEPTH"),
+            bulk(b"2"),
+            bulk(b"GRAPH"),
+            bulk(b"kg"),
         ];
         let result = ft_expand(&gs, &args);
         match result {
@@ -165,8 +188,12 @@ mod ft_expand_tests {
         // FT.EXPAND myidx doc:nonexistent DEPTH 2 GRAPH kg
         // Keys not in graph produce empty result (not error) per GRAF-05
         let args = vec![
-            bulk(b"myidx"), bulk(b"doc:nonexistent"), bulk(b"DEPTH"), bulk(b"2"),
-            bulk(b"GRAPH"), bulk(b"kg"),
+            bulk(b"myidx"),
+            bulk(b"doc:nonexistent"),
+            bulk(b"DEPTH"),
+            bulk(b"2"),
+            bulk(b"GRAPH"),
+            bulk(b"kg"),
         ];
         let result = ft_expand(&gs, &args);
         match result {
@@ -185,9 +212,7 @@ mod ft_expand_tests {
     fn test_ft_expand_auto_detect_graph() {
         let gs = setup_graph_store();
         // FT.EXPAND myidx doc:a DEPTH 1 (no GRAPH specified — auto-detect)
-        let args = vec![
-            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1"),
-        ];
+        let args = vec![bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1")];
         let result = ft_expand(&gs, &args);
         match result {
             Frame::Array(ref frames) => {
@@ -205,9 +230,7 @@ mod ft_expand_tests {
     #[test]
     fn test_ft_expand_no_graph_found() {
         let gs = GraphStore::new(); // no graphs at all
-        let args = vec![
-            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1"),
-        ];
+        let args = vec![bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"1")];
         let result = ft_expand(&gs, &args);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"ERR no graph"), "{:?}", e),
@@ -220,8 +243,12 @@ mod ft_expand_tests {
         // Verify that depth > MAX_EXPAND_DEPTH is clamped (doesn't error).
         let gs = setup_graph_store();
         let args = vec![
-            bulk(b"myidx"), bulk(b"doc:a"), bulk(b"DEPTH"), bulk(b"100"),
-            bulk(b"GRAPH"), bulk(b"kg"),
+            bulk(b"myidx"),
+            bulk(b"doc:a"),
+            bulk(b"DEPTH"),
+            bulk(b"100"),
+            bulk(b"GRAPH"),
+            bulk(b"kg"),
         ];
         // Should succeed (depth clamped to MAX_EXPAND_DEPTH=5 internally)
         let result = ft_expand(&gs, &args);
@@ -1016,10 +1043,7 @@ fn test_parse_filter_combined_bool_and_numeric() {
                 "left should be BoolEq, got {left:?}"
             );
             assert!(
-                matches!(
-                    *right,
-                    crate::vector::filter::FilterExpr::NumRange { .. }
-                ),
+                matches!(*right, crate::vector::filter::FilterExpr::NumRange { .. }),
                 "right should be NumRange, got {right:?}"
             );
         }
@@ -1092,10 +1116,7 @@ fn test_build_search_response_paginated() {
             distance: i as f32 * 0.1,
             key_hash: i as u64 + 1,
         });
-        key_map.insert(
-            i as u64 + 1,
-            Bytes::from(format!("doc:{i}")),
-        );
+        key_map.insert(i as u64 + 1, Bytes::from(format!("doc:{i}")));
     }
 
     // Paginate: offset=2, count=3 -> should return total=10 but only 3 docs
@@ -1105,7 +1126,12 @@ fn test_build_search_response_paginated() {
             // First element: total = 10
             assert_eq!(items[0], Frame::Integer(10));
             // 3 doc entries * 2 frames each (doc_id + fields) = 6 + 1 (total) = 7
-            assert_eq!(items.len(), 7, "expected 1 + 3*2 = 7 items, got {}", items.len());
+            assert_eq!(
+                items.len(),
+                7,
+                "expected 1 + 3*2 = 7 items, got {}",
+                items.len()
+            );
             // First doc should be doc:2 (offset=2)
             assert_eq!(items[1], Frame::BulkString(Bytes::from("doc:2")));
             assert_eq!(items[3], Frame::BulkString(Bytes::from("doc:3")));
@@ -1173,7 +1199,7 @@ fn test_merge_search_results_with_pagination() {
             // 2 paginated results * 2 frames = 4 + 1 = 5 items
             assert_eq!(items.len(), 5);
             assert_eq!(items[1], Frame::BulkString(Bytes::from("vec:10"))); // score 0.3
-            assert_eq!(items[3], Frame::BulkString(Bytes::from("vec:1")));  // score 0.5
+            assert_eq!(items[3], Frame::BulkString(Bytes::from("vec:1"))); // score 0.5
         }
         other => panic!("expected Array, got {other:?}"),
     }
@@ -1452,7 +1478,12 @@ mod graph_expand_tests {
     #[test]
     fn test_parse_expand_clause_missing_depth_arg() {
         // EXPAND GRAPH without depth argument
-        let args = vec![bulk(b"myidx"), bulk(b"query"), bulk(b"EXPAND"), bulk(b"GRAPH")];
+        let args = vec![
+            bulk(b"myidx"),
+            bulk(b"query"),
+            bulk(b"EXPAND"),
+            bulk(b"GRAPH"),
+        ];
         let result = parse_expand_clause(&args);
         assert_eq!(result, None);
     }
@@ -1460,12 +1491,7 @@ mod graph_expand_tests {
     #[test]
     fn test_parse_expand_clause_expand_without_graph() {
         // EXPAND without GRAPH keyword should not match
-        let args = vec![
-            bulk(b"myidx"),
-            bulk(b"query"),
-            bulk(b"EXPAND"),
-            bulk(b"3"),
-        ];
+        let args = vec![bulk(b"myidx"), bulk(b"query"), bulk(b"EXPAND"), bulk(b"3")];
         let result = parse_expand_clause(&args);
         assert_eq!(result, None);
     }
@@ -1823,10 +1849,7 @@ mod cache_search_tests {
                         fields[2],
                         Frame::BulkString(Bytes::from_static(b"cache_hit"))
                     );
-                    assert_eq!(
-                        fields[3],
-                        Frame::BulkString(Bytes::from_static(b"false"))
-                    );
+                    assert_eq!(fields[3], Frame::BulkString(Bytes::from_static(b"false")));
                 } else {
                     panic!("expected fields array");
                 }
@@ -1856,10 +1879,7 @@ mod cache_search_tests {
         match &augmented {
             Frame::Array(items) => {
                 if let Frame::Array(fields) = &items[2] {
-                    assert_eq!(
-                        fields[3],
-                        Frame::BulkString(Bytes::from_static(b"true"))
-                    );
+                    assert_eq!(fields[3], Frame::BulkString(Bytes::from_static(b"true")));
                 } else {
                     panic!("expected fields array");
                 }
@@ -1906,11 +1926,7 @@ fn test_session_parse_session_clause_absent() {
 #[test]
 fn test_session_parse_session_clause_no_key() {
     // SESSION keyword present but no key argument after it
-    let args = vec![
-        bulk(b"idx"),
-        bulk(b"*=>[KNN 5 @vec $q]"),
-        bulk(b"SESSION"),
-    ];
+    let args = vec![bulk(b"idx"), bulk(b"*=>[KNN 5 @vec $q]"), bulk(b"SESSION")];
     let result = parse_session_clause(&args);
     assert!(result.is_none());
 }
@@ -1921,8 +1937,16 @@ fn test_session_filter_results_empty_session() {
     use std::collections::HashMap;
 
     let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
-        SearchResult { id: VectorId(0), distance: 0.1, key_hash: 100 },
-        SearchResult { id: VectorId(1), distance: 0.2, key_hash: 200 },
+        SearchResult {
+            id: VectorId(0),
+            distance: 0.1,
+            key_hash: 100
+        },
+        SearchResult {
+            id: VectorId(1),
+            distance: 0.2,
+            key_hash: 200
+        },
     ];
     let session_members: HashMap<Bytes, f64> = HashMap::new();
     let mut key_hash_to_key = HashMap::new();
@@ -1939,9 +1963,21 @@ fn test_session_filter_results_removes_seen() {
     use std::collections::HashMap;
 
     let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
-        SearchResult { id: VectorId(0), distance: 0.1, key_hash: 100 },
-        SearchResult { id: VectorId(1), distance: 0.2, key_hash: 200 },
-        SearchResult { id: VectorId(2), distance: 0.3, key_hash: 300 },
+        SearchResult {
+            id: VectorId(0),
+            distance: 0.1,
+            key_hash: 100
+        },
+        SearchResult {
+            id: VectorId(1),
+            distance: 0.2,
+            key_hash: 200
+        },
+        SearchResult {
+            id: VectorId(2),
+            distance: 0.3,
+            key_hash: 300
+        },
     ];
     let mut session_members: HashMap<Bytes, f64> = HashMap::new();
     session_members.insert(Bytes::from_static(b"doc:a"), 1000.0);
@@ -1964,8 +2000,16 @@ fn test_session_record_results() {
 
     let mut db = crate::storage::db::Database::new();
     let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
-        SearchResult { id: VectorId(0), distance: 0.1, key_hash: 100 },
-        SearchResult { id: VectorId(1), distance: 0.2, key_hash: 200 },
+        SearchResult {
+            id: VectorId(0),
+            distance: 0.1,
+            key_hash: 100
+        },
+        SearchResult {
+            id: VectorId(1),
+            distance: 0.2,
+            key_hash: 200
+        },
     ];
     let mut key_hash_to_key = HashMap::new();
     key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
@@ -2161,7 +2205,10 @@ fn test_ft_info_multi_field() {
             assert_eq!(f0[1], Frame::BulkString(Bytes::from("title_vec")));
             assert_eq!(f0[2], Frame::BulkString(Bytes::from_static(b"dimension")));
             assert_eq!(f0[3], Frame::Integer(4));
-            assert_eq!(f0[4], Frame::BulkString(Bytes::from_static(b"distance_metric")));
+            assert_eq!(
+                f0[4],
+                Frame::BulkString(Bytes::from_static(b"distance_metric"))
+            );
             assert_eq!(f0[5], Frame::BulkString(Bytes::from_static(b"COSINE")));
 
             // Verify second field: body_vec
@@ -2190,10 +2237,7 @@ fn test_ft_search_field_targeting() {
 
     // Insert vectors into the default (title_vec) field (dim=4)
     let idx = store.get_index_mut(b"multiidx").unwrap();
-    let title_vecs: Vec<[f32; 4]> = vec![
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-    ];
+    let title_vecs: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
     let snap = idx.segments.load();
     for (i, v) in title_vecs.iter().enumerate() {
         let mut sq = vec![0i8; 4];
@@ -2376,7 +2420,10 @@ fn test_parse_filter_text_match_multiword() {
         bulk(b"@description:{machine learning}"),
     ];
     let filter = parse_filter_clause(&args);
-    assert!(filter.is_some(), "should parse @description:{{machine learning}}");
+    assert!(
+        filter.is_some(),
+        "should parse @description:{{machine learning}}"
+    );
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::TextMatch { field, terms } => {
             assert_eq!(&field[..], b"description");
@@ -2456,16 +2503,8 @@ fn test_text_filter_stemming_through_payload() {
         b"The runners are running fast",
         0,
     );
-    idx.insert_text(
-        &Bytes::from_static(b"desc"),
-        b"She runs every morning",
-        1,
-    );
-    idx.insert_text(
-        &Bytes::from_static(b"desc"),
-        b"The cat sat on the mat",
-        2,
-    );
+    idx.insert_text(&Bytes::from_static(b"desc"), b"She runs every morning", 1);
+    idx.insert_text(&Bytes::from_static(b"desc"), b"The cat sat on the mat", 2);
 
     // "running" should match docs with "runners", "running", "runs" via stemming
     let expr = crate::vector::filter::FilterExpr::TextMatch {
@@ -2485,11 +2524,7 @@ fn test_text_filter_combined_with_tag() {
 
     let mut idx = PayloadIndex::new();
     // Doc 0: has "machine learning" text AND "science" tag
-    idx.insert_text(
-        &Bytes::from_static(b"desc"),
-        b"Machine learning models",
-        0,
-    );
+    idx.insert_text(&Bytes::from_static(b"desc"), b"Machine learning models", 0);
     idx.insert_tag(
         &Bytes::from_static(b"category"),
         &Bytes::from_static(b"science"),
@@ -2620,12 +2655,30 @@ fn test_hybrid_search_basic() {
     let mut store = VectorStore::new();
     let args = ft_create_hybrid_args();
     let result = ft_create(&mut store, &args);
-    assert!(matches!(result, Frame::SimpleString(_)), "create failed: {result:?}");
+    assert!(
+        matches!(result, Frame::SimpleString(_)),
+        "create failed: {result:?}"
+    );
 
     // Insert 3 docs with both dense and sparse vectors
-    insert_hybrid_doc(&mut store, b"doc:1", &[1.0, 0.0, 0.0, 0.0], &[(0, 1.0), (5, 0.5)]);
-    insert_hybrid_doc(&mut store, b"doc:2", &[0.0, 1.0, 0.0, 0.0], &[(0, 0.8), (10, 0.3)]);
-    insert_hybrid_doc(&mut store, b"doc:3", &[0.0, 0.0, 1.0, 0.0], &[(5, 0.9), (10, 0.1)]);
+    insert_hybrid_doc(
+        &mut store,
+        b"doc:1",
+        &[1.0, 0.0, 0.0, 0.0],
+        &[(0, 1.0), (5, 0.5)],
+    );
+    insert_hybrid_doc(
+        &mut store,
+        b"doc:2",
+        &[0.0, 1.0, 0.0, 0.0],
+        &[(0, 0.8), (10, 0.3)],
+    );
+    insert_hybrid_doc(
+        &mut store,
+        b"doc:3",
+        &[0.0, 0.0, 1.0, 0.0],
+        &[(5, 0.9), (10, 0.1)],
+    );
 
     // Dense query close to doc:1, sparse query has high weight on dim 0 (matches doc:1 and doc:2)
     let dense_query: Vec<u8> = [0.9_f32, 0.1, 0.0, 0.0]
@@ -2662,8 +2715,14 @@ fn test_hybrid_search_basic() {
             assert!(len >= 5, "response too short for metadata: {len}");
             let dense_hits_label = &items[len - 4];
             let sparse_hits_label = &items[len - 2];
-            assert_eq!(*dense_hits_label, Frame::BulkString(Bytes::from_static(b"dense_hits")));
-            assert_eq!(*sparse_hits_label, Frame::BulkString(Bytes::from_static(b"sparse_hits")));
+            assert_eq!(
+                *dense_hits_label,
+                Frame::BulkString(Bytes::from_static(b"dense_hits"))
+            );
+            assert_eq!(
+                *sparse_hits_label,
+                Frame::BulkString(Bytes::from_static(b"sparse_hits"))
+            );
         }
         Frame::Error(e) => panic!("search failed: {}", String::from_utf8_lossy(e)),
         other => panic!("expected Array, got {other:?}"),
@@ -2797,8 +2856,14 @@ fn test_hybrid_search_hit_counts() {
                 Frame::Integer(n) => *n,
                 other => panic!("expected Integer for sparse_hits, got {other:?}"),
             };
-            assert!(dense_hits_val > 0, "dense_hits should be > 0, got {dense_hits_val}");
-            assert!(sparse_hits_val > 0, "sparse_hits should be > 0, got {sparse_hits_val}");
+            assert!(
+                dense_hits_val > 0,
+                "dense_hits should be > 0, got {dense_hits_val}"
+            );
+            assert!(
+                sparse_hits_val > 0,
+                "sparse_hits should be > 0, got {sparse_hits_val}"
+            );
         }
         Frame::Error(e) => panic!("search failed: {}", String::from_utf8_lossy(e)),
         other => panic!("expected Array, got {other:?}"),
@@ -2887,7 +2952,10 @@ fn test_range_filter_l2_search() {
     // Create L2 index
     let create_args = build_ft_create_args("rangeidx", "doc:", "vec", dim as u32, "L2");
     let result = ft_create(&mut store, &create_args);
-    assert!(matches!(result, Frame::SimpleString(_)), "FT.CREATE failed: {result:?}");
+    assert!(
+        matches!(result, Frame::SimpleString(_)),
+        "FT.CREATE failed: {result:?}"
+    );
 
     // Insert 3 vectors with known distances from [1,0,0,0]:
     // vec:0 = [1,0,0,0] -> L2=0.0
@@ -2933,11 +3001,18 @@ fn test_range_filter_l2_search() {
                 other => panic!("expected Integer, got {other:?}"),
             };
             // Should have at most 2 results (vec:0 and vec:1 within range)
-            assert!(count <= 2, "expected at most 2 results within RANGE 0.5, got {count}");
+            assert!(
+                count <= 2,
+                "expected at most 2 results within RANGE 0.5, got {count}"
+            );
             // vec:2 should NOT appear (L2=4.0 > 0.5)
             for i in (1..items.len()).step_by(2) {
                 if let Frame::BulkString(key) = &items[i] {
-                    assert_ne!(key.as_ref(), b"vec:2", "vec:2 should be filtered out by RANGE 0.5");
+                    assert_ne!(
+                        key.as_ref(),
+                        b"vec:2",
+                        "vec:2 should be filtered out by RANGE 0.5"
+                    );
                 }
             }
         }
@@ -2966,7 +3041,10 @@ fn test_range_filter_l2_search() {
             };
             // With TQ quantization at dim=4, exact match vec:0 may have nonzero distance.
             // But we verify that at least the result set is small (range is very tight).
-            assert!(count <= 1, "RANGE 0.0 should return very few results, got {count}");
+            assert!(
+                count <= 1,
+                "RANGE 0.0 should return very few results, got {count}"
+            );
         }
         Frame::Error(e) => panic!("FT.SEARCH error: {}", String::from_utf8_lossy(e)),
         other => panic!("expected Array, got {other:?}"),
@@ -2980,11 +3058,7 @@ fn test_range_filter_l2_search() {
 #[test]
 fn test_recommend_no_db() {
     let mut store = VectorStore::new();
-    let args = vec![
-        bulk(b"myidx"),
-        bulk(b"POSITIVE"),
-        bulk(b"doc:1"),
-    ];
+    let args = vec![bulk(b"myidx"), bulk(b"POSITIVE"), bulk(b"doc:1")];
     let result = recommend::ft_recommend(&mut store, &args, None);
     match result {
         Frame::Error(e) => {
@@ -3025,11 +3099,7 @@ fn test_recommend_missing_positive_keyword() {
 fn test_recommend_unknown_index() {
     let mut store = VectorStore::new();
     let mut db = crate::storage::db::Database::new();
-    let args = vec![
-        bulk(b"nonexistent"),
-        bulk(b"POSITIVE"),
-        bulk(b"doc:1"),
-    ];
+    let args = vec![bulk(b"nonexistent"), bulk(b"POSITIVE"), bulk(b"doc:1")];
     let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
     match result {
         Frame::Error(e) => {
@@ -3054,11 +3124,7 @@ fn test_recommend_missing_key_vectors() {
 
     let mut db = crate::storage::db::Database::new();
     // doc:1 does NOT exist in db -- so no vectors can be read
-    let args = vec![
-        bulk(b"recidx"),
-        bulk(b"POSITIVE"),
-        bulk(b"doc:1"),
-    ];
+    let args = vec![bulk(b"recidx"), bulk(b"POSITIVE"), bulk(b"doc:1")];
     let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
     match result {
         Frame::Error(e) => {
@@ -3101,7 +3167,8 @@ fn test_recommend_basic_with_vectors() {
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             snap.mutable.append(key_hash, v, &sq, norm, i as u64);
             drop(snap);
-            idx.key_hash_to_key.insert(key_hash, Bytes::from(key.to_vec()));
+            idx.key_hash_to_key
+                .insert(key_hash, Bytes::from(key.to_vec()));
         }
     }
 
@@ -3184,10 +3251,7 @@ mod ft_navigate_tests {
     fn test_navigate_too_few_args() {
         let mut store = VectorStore::new();
         let gs = crate::graph::store::GraphStore::new();
-        let args = vec![
-            bulk(b"myidx"),
-            bulk(b"*=>[KNN 10 @vec $v]"),
-        ];
+        let args = vec![bulk(b"myidx"), bulk(b"*=>[KNN 10 @vec $v]")];
         let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None);
         match result {
             Frame::Error(e) => {

@@ -86,9 +86,7 @@ fn parse_recommend_args(args: &[Frame]) -> Result<RecommendArgs, Frame> {
             k = match parse_usize(&args[i]) {
                 Some(v) if v > 0 => v.min(MAX_K),
                 _ => {
-                    return Err(Frame::Error(Bytes::from_static(
-                        b"ERR invalid K value",
-                    )));
+                    return Err(Frame::Error(Bytes::from_static(b"ERR invalid K value")));
                 }
             };
             i += 1;
@@ -104,9 +102,7 @@ fn parse_recommend_args(args: &[Frame]) -> Result<RecommendArgs, Frame> {
             field_name = match extract_bulk(&args[i]) {
                 Some(b) => Some(b),
                 None => {
-                    return Err(Frame::Error(Bytes::from_static(
-                        b"ERR invalid FIELD value",
-                    )));
+                    return Err(Frame::Error(Bytes::from_static(b"ERR invalid FIELD value")));
                 }
             };
             i += 1;
@@ -225,11 +221,7 @@ fn key_hash(key: &[u8]) -> u64 {
 /// 4. Normalize if cosine metric
 /// 5. Run KNN search with centroid
 /// 6. Filter out example keys from results
-pub fn ft_recommend(
-    store: &mut VectorStore,
-    args: &[Frame],
-    db: Option<&mut Database>,
-) -> Frame {
+pub fn ft_recommend(store: &mut VectorStore, args: &[Frame], db: Option<&mut Database>) -> Frame {
     let db = match db {
         Some(d) => d,
         None => {
@@ -255,9 +247,7 @@ pub fn ft_recommend(
             match idx.meta.find_field(fname) {
                 Some(fm) => fm,
                 None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR unknown vector field",
-                    ));
+                    return Frame::Error(Bytes::from_static(b"ERR unknown vector field"));
                 }
             }
         } else {
@@ -307,10 +297,13 @@ pub fn ft_recommend(
     }
 
     // Build exclude set from positive + negative key hashes
-    let mut exclude: HashSet<u64> = HashSet::with_capacity(
-        parsed.positive_keys.len() + parsed.negative_keys.len(),
-    );
-    for key in parsed.positive_keys.iter().chain(parsed.negative_keys.iter()) {
+    let mut exclude: HashSet<u64> =
+        HashSet::with_capacity(parsed.positive_keys.len() + parsed.negative_keys.len());
+    for key in parsed
+        .positive_keys
+        .iter()
+        .chain(parsed.negative_keys.iter())
+    {
         exclude.insert(key_hash(key));
     }
 
@@ -365,7 +358,8 @@ pub fn ft_recommend(
             &mvcc_ctx,
         )
     } else {
-        let fname = parsed.field_name.as_ref().expect("checked above");
+        #[allow(clippy::unwrap_used)] // guarded: use_default is false only when field_name is Some
+        let fname = parsed.field_name.as_ref().unwrap();
         match idx.field_segments.get_mut(fname.as_ref()) {
             Some(fs) => fs.segments.search_mvcc(
                 &centroid,

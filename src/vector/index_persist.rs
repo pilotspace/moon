@@ -140,8 +140,15 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
     let mut metas = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let (meta_base, source_field, metric, quantization, build_mode, dimension, padded_dimension) =
-            read_v1_per_index(data, &mut cursor)?;
+        let (
+            meta_base,
+            source_field,
+            metric,
+            quantization,
+            build_mode,
+            dimension,
+            padded_dimension,
+        ) = read_v1_per_index(data, &mut cursor)?;
 
         let vector_fields = if version == VERSION_V2 {
             // Read v2 vector_fields extension
@@ -211,7 +218,7 @@ fn read_v1_per_index(
     cursor: &mut usize,
 ) -> io::Result<(
     (Bytes, u32, u32, u32, u32, Vec<Bytes>), // name, hnsw_m, ef_con, ef_run, compact, prefixes
-    Bytes,                                     // source_field
+    Bytes,                                   // source_field
     DistanceMetric,
     QuantizationConfig,
     BuildMode,
@@ -252,7 +259,14 @@ fn read_v1_per_index(
     let padded_dimension = crate::vector::turbo_quant::encoder::padded_dimension(dimension);
 
     Ok((
-        (name, hnsw_m, hnsw_ef_construction, hnsw_ef_runtime, compact_threshold, key_prefixes),
+        (
+            name,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_runtime,
+            compact_threshold,
+            key_prefixes,
+        ),
         source_field,
         metric,
         quantization,
@@ -274,7 +288,11 @@ fn decode_metric(v: u8) -> DistanceMetric {
 
 #[inline]
 fn decode_build_mode(v: u8) -> BuildMode {
-    if v == 1 { BuildMode::Exact } else { BuildMode::Light }
+    if v == 1 {
+        BuildMode::Exact
+    } else {
+        BuildMode::Light
+    }
 }
 
 /// Write all active index metadata to the sidecar file.
@@ -594,7 +612,10 @@ mod tests {
         assert_eq!(result[0].source_field, "vec_field");
         assert_eq!(result[0].metric, DistanceMetric::L2);
         // Top-level fields match vector_fields[0]
-        assert_eq!(result[0].vector_fields[0].field_name, result[0].source_field);
+        assert_eq!(
+            result[0].vector_fields[0].field_name,
+            result[0].source_field
+        );
         assert_eq!(result[0].vector_fields[0].dimension, result[0].dimension);
         assert_eq!(result[0].vector_fields[0].metric, result[0].metric);
     }

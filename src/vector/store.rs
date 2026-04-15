@@ -176,7 +176,11 @@ impl VectorIndex {
     pub fn field_segment_holder_mut(
         &mut self,
         name: &[u8],
-    ) -> Option<(&mut SegmentHolder, &mut SearchScratch, &Arc<CollectionMetadata>)> {
+    ) -> Option<(
+        &mut SegmentHolder,
+        &mut SearchScratch,
+        &Arc<CollectionMetadata>,
+    )> {
         let default_name = &self.meta.vector_fields[0].field_name;
         if default_name.eq_ignore_ascii_case(name) {
             return Some((&mut self.segments, &mut self.scratch, &self.collection));
@@ -222,12 +226,7 @@ impl VectorIndex {
             let fs_len = fs.segments.load().mutable.len();
             if fs_len >= threshold {
                 let dim = fs.collection.dimension;
-                Self::compact_segments(
-                    &mut fs.segments,
-                    &mut fs.scratch,
-                    &fs.collection,
-                    dim,
-                );
+                Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
             }
         }
     }
@@ -261,12 +260,7 @@ impl VectorIndex {
         // Compact additional fields
         for (_, fs) in &mut self.field_segments {
             let dim = fs.collection.dimension;
-            Self::compact_segments(
-                &mut fs.segments,
-                &mut fs.scratch,
-                &fs.collection,
-                dim,
-            );
+            Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
         }
     }
 
@@ -283,9 +277,7 @@ impl VectorIndex {
         }
 
         let frozen = segments.load().mutable.freeze();
-        let seed = collection
-            .collection_id
-            .wrapping_mul(6364136223846793005);
+        let seed = collection.collection_id.wrapping_mul(6364136223846793005);
 
         match compaction::compact(&frozen, collection, seed, None) {
             Ok(immutable) => {

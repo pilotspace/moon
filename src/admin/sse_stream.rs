@@ -72,17 +72,16 @@ pub fn handle_sse_stream() -> Response<BoxBody<Bytes, Infallible>> {
             rx
         });
 
-    let stream = WatchStream::new(rx).map(
-        |event| -> Result<HttpFrame<Bytes>, Infallible> {
-            // Pre-size buffer: "data: " (6) + JSON (~150) + "\n\n" (2) ≈ 160 bytes.
-            let mut buf = String::with_capacity(192);
-            buf.push_str("data: ");
-            // serde_json::to_writer avoids an intermediate String allocation.
-            let _ = serde_json::to_writer(unsafe { buf.as_mut_vec() }, &event);
-            buf.push_str("\n\n");
-            Ok(HttpFrame::data(Bytes::from(buf)))
-        },
-    );
+    let stream = WatchStream::new(rx).map(|event| -> Result<HttpFrame<Bytes>, Infallible> {
+        // Pre-size buffer: "data: " (6) + JSON (~150) + "\n\n" (2) ≈ 160 bytes.
+        let mut buf = String::with_capacity(192);
+        buf.push_str("data: ");
+        // serde_json::to_writer avoids an intermediate String allocation.
+        // SAFETY: serde_json only writes valid UTF-8, so the String invariant is preserved.
+        let _ = serde_json::to_writer(unsafe { buf.as_mut_vec() }, &event);
+        buf.push_str("\n\n");
+        Ok(HttpFrame::data(Bytes::from(buf)))
+    });
 
     Response::builder()
         .status(200)

@@ -1759,7 +1759,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                         let response = {
                             let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
+                            crate::command::vector_search::cache_search::ft_cachesearch(
+                                &mut vs, cmd_args,
+                            )
                         };
                         responses.push(response);
                         continue;
@@ -1782,16 +1784,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let mut vs = sdb.vector_store(ctx.shard_id);
                             if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                 let mut db_guard = sdb.write_db(ctx.shard_id, 0);
-                                crate::command::vector_search::recommend::ft_recommend(&mut vs, cmd_args, Some(&mut *db_guard))
+                                crate::command::vector_search::recommend::ft_recommend(
+                                    &mut vs,
+                                    cmd_args,
+                                    Some(&mut *db_guard),
+                                )
                             } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
                                 #[cfg(feature = "graph")]
                                 {
                                     let graph_guard = sdb.graph_store_read(ctx.shard_id);
-                                    crate::command::vector_search::navigate::ft_navigate(&mut vs, Some(&graph_guard), cmd_args, None)
+                                    crate::command::vector_search::navigate::ft_navigate(
+                                        &mut vs,
+                                        Some(&graph_guard),
+                                        cmd_args,
+                                        None,
+                                    )
                                 }
                                 #[cfg(not(feature = "graph"))]
                                 {
-                                    Frame::Error(Bytes::from_static(b"ERR FT.NAVIGATE requires graph feature"))
+                                    Frame::Error(Bytes::from_static(
+                                        b"ERR FT.NAVIGATE requires graph feature",
+                                    ))
                                 }
                             } else {
                                 // FT.EXPAND
@@ -1802,7 +1815,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                                 #[cfg(not(feature = "graph"))]
                                 {
-                                    Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                                    Frame::Error(Bytes::from_static(
+                                        b"ERR FT.EXPAND requires graph feature",
+                                    ))
                                 }
                             }
                         };
@@ -1822,11 +1837,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                             // Detect SESSION keyword to provide database access for sorted set tracking
                             let has_session = cmd_args.iter().any(|a| {
-                                if let Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
+                                if let Frame::BulkString(b) = a {
+                                    b.eq_ignore_ascii_case(b"SESSION")
+                                } else {
+                                    false
+                                }
                             });
                             if has_session {
                                 let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
-                                crate::command::vector_search::ft_search(&mut vs, cmd_args, Some(&mut *db_guard))
+                                crate::command::vector_search::ft_search(
+                                    &mut vs,
+                                    cmd_args,
+                                    Some(&mut *db_guard),
+                                )
                             } else {
                                 crate::command::vector_search::ft_search(&mut vs, cmd_args, None)
                             }
@@ -1839,31 +1862,48 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                             crate::command::vector_search::ft_compact(&mut vs, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-                            crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
+                            crate::command::vector_search::cache_search::ft_cachesearch(
+                                &mut vs, cmd_args,
+                            )
                         } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
                             crate::command::vector_search::ft_config(&mut vs, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                             let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
-                            crate::command::vector_search::recommend::ft_recommend(&mut vs, cmd_args, Some(&mut *db_guard))
+                            crate::command::vector_search::recommend::ft_recommend(
+                                &mut vs,
+                                cmd_args,
+                                Some(&mut *db_guard),
+                            )
                         } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
                             #[cfg(feature = "graph")]
                             {
-                                let graph_guard = shard_databases_ref.graph_store_read(ctx.shard_id);
-                                crate::command::vector_search::navigate::ft_navigate(&mut vs, Some(&graph_guard), cmd_args, None)
+                                let graph_guard =
+                                    shard_databases_ref.graph_store_read(ctx.shard_id);
+                                crate::command::vector_search::navigate::ft_navigate(
+                                    &mut vs,
+                                    Some(&graph_guard),
+                                    cmd_args,
+                                    None,
+                                )
                             }
                             #[cfg(not(feature = "graph"))]
                             {
-                                Frame::Error(Bytes::from_static(b"ERR FT.NAVIGATE requires graph feature"))
+                                Frame::Error(Bytes::from_static(
+                                    b"ERR FT.NAVIGATE requires graph feature",
+                                ))
                             }
                         } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
                             #[cfg(feature = "graph")]
                             {
-                                let graph_guard = shard_databases_ref.graph_store_read(ctx.shard_id);
+                                let graph_guard =
+                                    shard_databases_ref.graph_store_read(ctx.shard_id);
                                 crate::command::vector_search::ft_expand(&graph_guard, cmd_args)
                             }
                             #[cfg(not(feature = "graph"))]
                             {
-                                Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                                Frame::Error(Bytes::from_static(
+                                    b"ERR FT.EXPAND requires graph feature",
+                                ))
                             }
                         } else {
                             Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))

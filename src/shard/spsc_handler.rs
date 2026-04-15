@@ -501,8 +501,10 @@ pub(crate) fn handle_shard_message_shared(
                     && !matches!(frame, crate::protocol::Frame::Error(_))
                 {
                     if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                        let mut vs = shard_databases.vector_store(shard_id);
-                        auto_index_hset(&mut vs, key_bytes, args);
+                        // Use the `vector_store` parameter (already locked by caller),
+                        // NOT shard_databases.vector_store() which would deadlock
+                        // (parking_lot::Mutex is non-reentrant).
+                        auto_index_hset(vector_store, key_bytes, args);
                     }
                 }
 
@@ -781,8 +783,10 @@ pub(crate) fn handle_shard_message_shared(
                     && !matches!(frame, crate::protocol::Frame::Error(_))
                 {
                     if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                        let mut vs = shard_databases.vector_store(shard_id);
-                        auto_index_hset(&mut vs, key_bytes, args);
+                        // Use the `vector_store` parameter (already locked by caller),
+                        // NOT shard_databases.vector_store() which would deadlock
+                        // (parking_lot::Mutex is non-reentrant).
+                        auto_index_hset(vector_store, key_bytes, args);
                     }
                 }
 

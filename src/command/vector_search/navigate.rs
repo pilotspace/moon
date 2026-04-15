@@ -14,7 +14,7 @@ use std::fmt::Write;
 use crate::protocol::Frame;
 use crate::vector::store::VectorStore;
 
-use super::graph_expand::{expand_results_via_graph, ExpandedResult, MAX_EXPAND_DEPTH};
+use super::graph_expand::{ExpandedResult, MAX_EXPAND_DEPTH, expand_results_via_graph};
 use super::{extract_bulk, extract_seeds_from_response, matches_keyword, parse_u32};
 
 /// Default penalty applied per graph hop to bias results toward vector-similar hits.

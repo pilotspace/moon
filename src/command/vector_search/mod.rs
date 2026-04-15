@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 
 use crate::protocol::{Frame, FrameVec};
 use crate::vector::filter::FilterExpr;
-use crate::vector::store::{IndexMeta, VectorFieldMeta, VectorStore, MAX_VECTOR_FIELDS};
+use crate::vector::store::{IndexMeta, MAX_VECTOR_FIELDS, VectorFieldMeta, VectorStore};
 use crate::vector::turbo_quant::collection::QuantizationConfig;
 use crate::vector::types::{DistanceMetric, SearchResult};
 
@@ -99,9 +99,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 sparse_dim = match parse_u32(&args[pos]) {
                     Some(d) if d > 0 => d,
                     _ => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR invalid SPARSE DIM value",
-                        ));
+                        return Frame::Error(Bytes::from_static(b"ERR invalid SPARSE DIM value"));
                     }
                 };
                 pos += 1;
@@ -113,7 +111,9 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         }
 
         if pos >= args.len() || !matches_keyword(&args[pos], b"VECTOR") {
-            return Frame::Error(Bytes::from_static(b"ERR expected VECTOR or SPARSE after field name"));
+            return Frame::Error(Bytes::from_static(
+                b"ERR expected VECTOR or SPARSE after field name",
+            ));
         }
         pos += 1;
 
@@ -155,17 +155,14 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
                 vector_fields.push(VectorFieldMeta {
                     field_name,
                     dimension: dim,
-                    padded_dimension:
-                        crate::vector::turbo_quant::encoder::padded_dimension(dim),
+                    padded_dimension: crate::vector::turbo_quant::encoder::padded_dimension(dim),
                     metric: parsed.metric,
                     quantization: parsed.quantization,
                     build_mode: parsed.build_mode,
                 });
 
                 if vector_fields.len() > MAX_VECTOR_FIELDS {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR too many VECTOR fields (max 8)",
-                    ));
+                    return Frame::Error(Bytes::from_static(b"ERR too many VECTOR fields (max 8)"));
                 }
             }
             Err(frame) => return frame,
@@ -253,9 +250,7 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
     let num_params = match parse_u32(&args[*pos]) {
         Some(n) => n as usize,
         None => {
-            return Err(Frame::Error(Bytes::from_static(
-                b"ERR invalid param count",
-            )));
+            return Err(Frame::Error(Bytes::from_static(b"ERR invalid param count")));
         }
     };
     *pos += 1;
@@ -685,7 +680,9 @@ pub fn ft_search(
 
     // Look up metric for range filtering (cheap immutable borrow before search paths)
     let range_metric = if range_threshold.is_some() {
-        store.get_index(index_name.as_ref()).map(|idx| idx.meta.default_field().metric)
+        store
+            .get_index(index_name.as_ref())
+            .map(|idx| idx.meta.default_field().metric)
     } else {
         None
     };
@@ -736,7 +733,6 @@ pub fn ft_search(
     if let (Some(blob), Some((sparse_field, sparse_pairs))) =
         (dense_blob.as_ref(), sparse_query.as_ref())
     {
-
         // Dense search
         let dense_raw = search_local_raw(
             store,
@@ -747,7 +743,10 @@ pub fn ft_search(
             field_name.as_ref(),
         );
         let (dense_results, key_hash_to_key) = match dense_raw {
-            SearchRawResult::Ok { results, key_hash_to_key } => (results, key_hash_to_key),
+            SearchRawResult::Ok {
+                results,
+                key_hash_to_key,
+            } => (results, key_hash_to_key),
             SearchRawResult::Error(frame) => return frame,
         };
 
@@ -818,6 +817,8 @@ pub fn ft_search(
     }
 
     // --- Dense-only path (original behavior, backward compat) ---
+    // Hybrid and sparse-only paths returned above; dense_blob is guaranteed Some here.
+    #[allow(clippy::unwrap_used)] // guarded: hybrid and sparse-only paths returned above
     let blob = dense_blob.unwrap();
 
     // If SESSION clause present and db available, use session-aware path
@@ -833,7 +834,10 @@ pub fn ft_search(
         crate::vector::metrics::increment_search();
         return match result {
             SearchRawResult::Error(frame) => frame,
-            SearchRawResult::Ok { mut results, key_hash_to_key } => {
+            SearchRawResult::Ok {
+                mut results,
+                key_hash_to_key,
+            } => {
                 // Read session sorted set for filtering
                 let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
                     match db.get_sorted_set(sess_key) {
@@ -855,14 +859,21 @@ pub fn ft_search(
                 }
 
                 // Build response from filtered results
-                let response = build_search_response(&results, &key_hash_to_key, limit_offset, limit_count);
+                let response =
+                    build_search_response(&results, &key_hash_to_key, limit_offset, limit_count);
 
                 // Record new results in the session sorted set
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0);
-                session::record_session_results(&results, db, sess_key, &key_hash_to_key, timestamp);
+                session::record_session_results(
+                    &results,
+                    db,
+                    sess_key,
+                    &key_hash_to_key,
+                    timestamp,
+                );
 
                 response
             }
@@ -884,7 +895,10 @@ pub fn ft_search(
         crate::vector::metrics::increment_search();
         match raw {
             SearchRawResult::Error(frame) => frame,
-            SearchRawResult::Ok { mut results, key_hash_to_key } => {
+            SearchRawResult::Ok {
+                mut results,
+                key_hash_to_key,
+            } => {
                 apply_range_filter(&mut results, threshold, metric);
                 build_search_response(&results, &key_hash_to_key, limit_offset, limit_count)
             }
@@ -929,6 +943,7 @@ pub fn ft_search_with_graph(
     }
 
     let depth = expand_depth.unwrap_or(1);
+    #[allow(clippy::unwrap_used)] // guarded: is_none() check returns at line 939
     let gs = graph_store.unwrap();
 
     // Run the standard KNN search first (session filtering happens inside ft_search).
@@ -1106,7 +1121,9 @@ fn search_local_raw(
 ) -> SearchRawResult {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
-        None => return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"Unknown Index name"))),
+        None => {
+            return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"Unknown Index name")));
+        }
     };
 
     // Resolve target field: determine dimension, segments, scratch, collection
@@ -1115,9 +1132,10 @@ fn search_local_raw(
             let is_default = fname.eq_ignore_ascii_case(&idx.meta.default_field().field_name);
             (field_meta.dimension as usize, is_default)
         } else {
-            return SearchRawResult::Error(Frame::Error(Bytes::from(
-                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
-            )));
+            return SearchRawResult::Error(Frame::Error(Bytes::from(format!(
+                "ERR unknown vector field '@{}'",
+                String::from_utf8_lossy(fname)
+            ))));
         }
     } else {
         (idx.meta.dimension as usize, true)
@@ -1136,11 +1154,15 @@ fn search_local_raw(
             .filter_map(|s| s.trim().parse::<f32>().ok())
             .collect();
         if parsed.len() != dim {
-            return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch")));
+            return SearchRawResult::Error(Frame::Error(Bytes::from_static(
+                b"ERR query vector dimension mismatch",
+            )));
         }
         parsed
     } else {
-        return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"ERR query vector dimension mismatch")));
+        return SearchRawResult::Error(Frame::Error(Bytes::from_static(
+            b"ERR query vector dimension mismatch",
+        )));
     };
 
     idx.try_compact();
@@ -1184,8 +1206,13 @@ fn search_local_raw(
             &mvcc_ctx,
         );
         let key_hash_to_key = idx.key_hash_to_key.clone();
-        SearchRawResult::Ok { results, key_hash_to_key }
+        SearchRawResult::Ok {
+            results,
+            key_hash_to_key,
+        }
     } else {
+        #[allow(clippy::unwrap_used)]
+        // guarded: use_default_field is false only when field_name is Some
         let fname = field_name.unwrap();
         if let Some(fs) = idx.field_segments.get_mut(fname.as_ref()) {
             let mvcc_ctx = crate::vector::segment::holder::MvccContext {
@@ -1204,11 +1231,15 @@ fn search_local_raw(
                 &mvcc_ctx,
             );
             let key_hash_to_key = idx.key_hash_to_key.clone();
-            SearchRawResult::Ok { results, key_hash_to_key }
+            SearchRawResult::Ok {
+                results,
+                key_hash_to_key,
+            }
         } else {
-            SearchRawResult::Error(Frame::Error(Bytes::from(
-                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
-            )))
+            SearchRawResult::Error(Frame::Error(Bytes::from(format!(
+                "ERR unknown vector field '@{}'",
+                String::from_utf8_lossy(fname)
+            ))))
         }
     }
 }
@@ -1258,9 +1289,10 @@ pub fn search_local_filtered(
             let is_default = fname.eq_ignore_ascii_case(&idx.meta.default_field().field_name);
             (field_meta.dimension as usize, is_default)
         } else {
-            return Frame::Error(Bytes::from(
-                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
-            ));
+            return Frame::Error(Bytes::from(format!(
+                "ERR unknown vector field '@{}'",
+                String::from_utf8_lossy(fname)
+            )));
         }
     } else {
         (idx.meta.dimension as usize, true)
@@ -1337,6 +1369,8 @@ pub fn search_local_filtered(
         );
         build_search_response(&results, &idx.key_hash_to_key, offset, count)
     } else {
+        #[allow(clippy::unwrap_used)]
+        // guarded: use_default_field is false only when field_name is Some
         let fname = field_name.unwrap();
         if let Some(fs) = idx.field_segments.get_mut(fname.as_ref()) {
             let mvcc_ctx = crate::vector::segment::holder::MvccContext {
@@ -1356,9 +1390,10 @@ pub fn search_local_filtered(
             );
             build_search_response(&results, &idx.key_hash_to_key, offset, count)
         } else {
-            Frame::Error(Bytes::from(
-                format!("ERR unknown vector field '@{}'", String::from_utf8_lossy(fname))
-            ))
+            Frame::Error(Bytes::from(format!(
+                "ERR unknown vector field '@{}'",
+                String::from_utf8_lossy(fname)
+            )))
         }
     }
 }
@@ -1896,20 +1931,13 @@ pub fn ft_config(store: &mut VectorStore, args: &[Frame]) -> Frame {
     }
 }
 
-fn ft_config_set(
-    store: &mut VectorStore,
-    index_name: &[u8],
-    param: &[u8],
-    value: &[u8],
-) -> Frame {
+fn ft_config_set(store: &mut VectorStore, index_name: &[u8], param: &[u8], value: &[u8]) -> Frame {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
     if param.eq_ignore_ascii_case(b"AUTOCOMPACT") {
-        if value.eq_ignore_ascii_case(b"ON")
-            || value == b"1"
-            || value.eq_ignore_ascii_case(b"TRUE")
+        if value.eq_ignore_ascii_case(b"ON") || value == b"1" || value.eq_ignore_ascii_case(b"TRUE")
         {
             idx.autocompact_enabled = true;
             Frame::SimpleString(Bytes::from_static(b"OK"))
@@ -1935,11 +1963,7 @@ fn ft_config_get(store: &mut VectorStore, index_name: &[u8], param: &[u8]) -> Fr
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
     if param.eq_ignore_ascii_case(b"AUTOCOMPACT") {
-        let val = if idx.autocompact_enabled {
-            "ON"
-        } else {
-            "OFF"
-        };
+        let val = if idx.autocompact_enabled { "ON" } else { "OFF" };
         Frame::BulkString(Bytes::from(val))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
@@ -1958,10 +1982,7 @@ fn ft_config_get(store: &mut VectorStore, index_name: &[u8], param: &[u8]) -> Fr
 ///
 /// Shard-local: only expands within the graph data on this shard (GRAF-05).
 #[cfg(feature = "graph")]
-pub fn ft_expand(
-    graph_store: &crate::graph::store::GraphStore,
-    args: &[Frame],
-) -> Frame {
+pub fn ft_expand(graph_store: &crate::graph::store::GraphStore, args: &[Frame]) -> Frame {
     // args[0] = index name (reserved for consistency), then keys, then DEPTH N, optionally GRAPH name
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
@@ -1987,9 +2008,7 @@ pub fn ft_expand(
     let depth_pos = match depth_pos {
         Some(p) => p,
         None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR syntax error: expected DEPTH N",
-            ));
+            return Frame::Error(Bytes::from_static(b"ERR syntax error: expected DEPTH N"));
         }
     };
 
@@ -2159,7 +2178,11 @@ const RANGE_HARD_CAP: usize = 10_000;
 /// - Cosine/IP: higher score = more similar, keep `distance >= threshold`
 ///
 /// Truncates to `RANGE_HARD_CAP` after filtering.
-fn apply_range_filter(results: &mut SmallVec<[SearchResult; 32]>, threshold: f32, metric: DistanceMetric) {
+fn apply_range_filter(
+    results: &mut SmallVec<[SearchResult; 32]>,
+    threshold: f32,
+    metric: DistanceMetric,
+) {
     results.retain(|r| match metric {
         DistanceMetric::L2 => r.distance <= threshold,
         DistanceMetric::Cosine | DistanceMetric::InnerProduct => r.distance >= threshold,
@@ -2177,8 +2200,18 @@ fn parse_sparse_query_blob(blob: &[u8]) -> Vec<(u32, f32)> {
     let mut pairs = Vec::with_capacity(num_pairs);
     for i in 0..num_pairs {
         let offset = i * 8;
-        let dim = u32::from_le_bytes([blob[offset], blob[offset + 1], blob[offset + 2], blob[offset + 3]]);
-        let weight = f32::from_le_bytes([blob[offset + 4], blob[offset + 5], blob[offset + 6], blob[offset + 7]]);
+        let dim = u32::from_le_bytes([
+            blob[offset],
+            blob[offset + 1],
+            blob[offset + 2],
+            blob[offset + 3],
+        ]);
+        let weight = f32::from_le_bytes([
+            blob[offset + 4],
+            blob[offset + 5],
+            blob[offset + 6],
+            blob[offset + 7],
+        ]);
         pairs.push((dim, weight));
     }
     pairs

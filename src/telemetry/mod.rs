@@ -150,10 +150,7 @@ pub fn span_ft_navigate(_index: &str, _k: usize, _hops: u32) -> SpanGuard {
 #[cfg(feature = "otel")]
 #[inline]
 pub fn span_operation(name: &'static str) -> SpanGuard {
-    let span = tracing::info_span!(
-        "moon.operation",
-        otel.name = name,
-    );
+    let span = tracing::info_span!("moon.operation", otel.name = name,);
     SpanGuard {
         _span: span.entered(),
     }

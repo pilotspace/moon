@@ -24,10 +24,7 @@ use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
-use crate::runtime::{
-    TimerImpl,
-    traits::RuntimeTimer,
-};
+use crate::runtime::{TimerImpl, traits::RuntimeTimer};
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
 
@@ -1266,10 +1263,30 @@ impl super::Shard {
                         &shard_databases,
                         shard_id,
                     );
-                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
-                    {
-                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id);
+                    if let (
+                        Some(ckpt_mgr),
+                        Some(page_cache_inst),
+                        Some(wal_v3),
+                        Some(manifest),
+                        Some(ctrl),
+                        Some(ctrl_path),
+                    ) = (
+                        &mut checkpoint_manager,
+                        &page_cache,
+                        &mut wal_v3_writer,
+                        &mut shard_manifest,
+                        &mut control_file,
+                        &control_file_path,
+                    ) {
+                        persistence_tick::force_checkpoint(
+                            ckpt_mgr,
+                            page_cache_inst,
+                            wal_v3,
+                            manifest,
+                            ctrl,
+                            ctrl_path,
+                            shard_id,
+                        );
                     }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
@@ -1291,42 +1308,84 @@ impl super::Shard {
 
                 let mut pending_snapshot = None;
                 spsc_handler::drain_spsc_shared(
-                    &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                    &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                    &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
-                    &repl_state, shard_id, &script_cache_rc, &cached_clock,
-                    &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
+                    &shard_databases,
+                    &mut consumers,
+                    &mut *pubsub_arc.write(),
+                    &blocking_rc,
+                    &mut pending_snapshot,
+                    &mut snapshot_state,
+                    &mut wal_writer,
+                    &mut wal_v3_writer,
+                    &mut repl_backlog,
+                    &mut replica_txs,
+                    &repl_state,
+                    shard_id,
+                    &script_cache_rc,
+                    &cached_clock,
+                    &mut pending_migrations,
+                    &mut *shard_databases.vector_store(shard_id),
                 );
                 for waker in pending_wakers.borrow_mut().drain(..) {
                     waker.wake();
                 }
                 persistence_tick::handle_pending_snapshot(
-                    pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
-                    &shard_databases, disk_offload_base.as_deref(), shard_id,
+                    pending_snapshot,
+                    &mut snapshot_state,
+                    &mut snapshot_reply_tx,
+                    &shard_databases,
+                    disk_offload_base.as_deref(),
+                    shard_id,
                 );
                 for (fd, state) in pending_migrations.drain(..) {
                     tracing::info!(
                         "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                        shard_id, fd, state.client_id, state.peer_addr
+                        shard_id,
+                        fd,
+                        state.client_id,
+                        state.peer_addr
                     );
                     conn_accept::spawn_migrated_monoio_connection(
-                        fd, state,
-                        &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                        &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
-                        &acl_table, &runtime_config, &server_config, &all_notifiers,
-                        &snapshot_trigger_tx, &repl_state, &cluster_state,
-                        &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
-                        &all_remote_sub_maps, &affinity_tracker,
-                        shard_id, num_shards, config_port,
+                        fd,
+                        state,
+                        &shard_databases,
+                        &dispatch_tx,
+                        &pubsub_arc,
+                        &blocking_rc,
+                        &shutdown,
+                        &aof_tx,
+                        &tracking_rc,
+                        &lua_rc,
+                        &script_cache_rc,
+                        &acl_table,
+                        &runtime_config,
+                        &server_config,
+                        &all_notifiers,
+                        &snapshot_trigger_tx,
+                        &repl_state,
+                        &cluster_state,
+                        &cached_clock,
+                        &remote_sub_map_arc,
+                        &all_pubsub_registries,
+                        &all_remote_sub_maps,
+                        &affinity_tracker,
+                        shard_id,
+                        num_shards,
+                        config_port,
                         &pending_wakers,
-                        &spill_sender, &spill_file_id, &disk_offload_dir,
+                        &spill_sender,
+                        &spill_file_id,
+                        &disk_offload_dir,
                     );
                 }
 
                 persistence_tick::check_auto_save_trigger(
-                    &snapshot_trigger_rx, &mut last_snapshot_epoch,
-                    &mut snapshot_state, &shard_databases, &persistence_dir,
-                    disk_offload_base.as_deref(), shard_id,
+                    &snapshot_trigger_rx,
+                    &mut last_snapshot_epoch,
+                    &mut snapshot_state,
+                    &shard_databases,
+                    &persistence_dir,
+                    disk_offload_base.as_deref(),
+                    shard_id,
                 );
 
                 if persistence_tick::advance_snapshot_segment(
@@ -1337,14 +1396,18 @@ impl super::Shard {
                     if let Some(snap) = snapshot_state.as_mut() {
                         if let Err(e) = snap.finalize_async().await {
                             persistence_tick::finalize_snapshot_error(
-                                &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
+                                &mut snapshot_state,
+                                &mut snapshot_reply_tx,
+                                shard_id,
                                 &e.to_string(),
                             );
                             crate::command::persistence::bgsave_shard_done(false);
                         } else {
                             persistence_tick::finalize_snapshot_success(
-                                &mut snapshot_state, &mut snapshot_reply_tx,
-                                &mut wal_writer, shard_id,
+                                &mut snapshot_state,
+                                &mut snapshot_reply_tx,
+                                &mut wal_writer,
+                                shard_id,
                             );
                             crate::command::persistence::bgsave_shard_done(true);
                             bgsave_checkpoint_requested = true;
@@ -1377,17 +1440,41 @@ impl super::Shard {
                 }
 
                 // Checkpoint protocol tick (disk-offload only)
-                if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                    (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
-                {
+                if let (
+                    Some(ckpt_mgr),
+                    Some(page_cache_inst),
+                    Some(wal_v3),
+                    Some(manifest),
+                    Some(ctrl),
+                    Some(ctrl_path),
+                ) = (
+                    &mut checkpoint_manager,
+                    &page_cache,
+                    &mut wal_v3_writer,
+                    &mut shard_manifest,
+                    &mut control_file,
+                    &control_file_path,
+                ) {
                     if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
                         let lsn = wal_v3.current_lsn();
                         let dirty = page_cache_inst.dirty_page_count();
                         ckpt_mgr.force_begin(lsn, dirty);
                         bgsave_checkpoint_requested = false;
                     }
-                    persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
-                    if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path) {
+                    persistence_tick::maybe_begin_checkpoint(
+                        ckpt_mgr,
+                        wal_v3,
+                        page_cache_inst,
+                        wal_bytes_since_checkpoint,
+                    );
+                    if persistence_tick::handle_checkpoint_tick(
+                        ckpt_mgr,
+                        page_cache_inst,
+                        wal_v3,
+                        manifest,
+                        ctrl,
+                        ctrl_path,
+                    ) {
                         wal_bytes_since_checkpoint = 0;
                     }
                 }
@@ -1422,7 +1509,8 @@ impl super::Shard {
                 if monoio_tick_counter % (warm_poll_ms as u64) == 0 {
                     if server_config.disk_offload_enabled() {
                         if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config.effective_disk_offload_dir()
+                            let shard_dir = server_config
+                                .effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
                             persistence_tick::check_warm_transitions(
                                 &*shard_databases.vector_store(shard_id),
@@ -1438,9 +1526,11 @@ impl super::Shard {
                 }
                 // Cold tier check: every cold_poll_secs * 1000 ticks
                 if monoio_tick_counter % (cold_poll_secs as u64 * 1000) == 0 {
-                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0 {
+                    if server_config.disk_offload_enabled() && server_config.segment_cold_after > 0
+                    {
                         if let Some(ref mut manifest) = shard_manifest {
-                            let shard_dir = server_config.effective_disk_offload_dir()
+                            let shard_dir = server_config
+                                .effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
                             persistence_tick::check_cold_transitions(
                                 &*shard_databases.vector_store(shard_id),

@@ -637,7 +637,10 @@ mod tests {
             radius_km: 10.0,
         };
         let bm = idx.evaluate_bitmap(&geo_expr, 1);
-        assert!(bm.is_empty(), "geo filter should find nothing after remove_field");
+        assert!(
+            bm.is_empty(),
+            "geo filter should find nothing after remove_field"
+        );
 
         // "type" tag untouched
         let type_expr = FilterExpr::TagEq {

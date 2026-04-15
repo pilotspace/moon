@@ -54,7 +54,11 @@ fn parse_cachesearch_args(args: &[Frame]) -> Result<CacheSearchArgs, Frame> {
 
     let cache_prefix = match extract_bulk(&args[1]) {
         Some(b) => b,
-        None => return Err(Frame::Error(Bytes::from_static(b"ERR invalid cache prefix"))),
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR invalid cache prefix",
+            )));
+        }
     };
 
     let query_str = match extract_bulk(&args[2]) {
@@ -99,7 +103,9 @@ fn parse_cachesearch_args(args: &[Frame]) -> Result<CacheSearchArgs, Frame> {
                 )));
             }
             threshold = match extract_bulk(&args[i]) {
-                Some(b) => std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f32>().ok()),
+                Some(b) => std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok()),
                 None => None,
             };
             if threshold.is_none() {
@@ -215,7 +221,8 @@ fn cache_probe(
     let k = cache_count.saturating_mul(3).clamp(100, 10_000);
     let _ = idx; // release immutable borrow before mutable search call
 
-    let response = search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None);
+    let response =
+        search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None);
 
     // Parse the response to find the best cache hit.
     let items = match &response {
@@ -377,11 +384,7 @@ pub fn parse_cachesearch_args_for_test(
 
 /// Test wrapper for `is_within_threshold`.
 #[cfg(test)]
-pub fn is_within_threshold_for_test(
-    distance: f32,
-    threshold: f32,
-    metric: DistanceMetric,
-) -> bool {
+pub fn is_within_threshold_for_test(distance: f32, threshold: f32, metric: DistanceMetric) -> bool {
     is_within_threshold(distance, threshold, metric)
 }
 
