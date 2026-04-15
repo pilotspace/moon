@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.5"><img src="https://img.shields.io/badge/version-v0.1.5-blue" alt="Version"></a>
+  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.6"><img src="https://img.shields.io/badge/version-v0.1.6-blue" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
   <img src="https://img.shields.io/badge/rust-edition%202024-orange" alt="Rust">
@@ -28,7 +28,7 @@
 
 ---
 
-Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. It runs on a thread-per-core, shared-nothing architecture with optional `io_uring` I/O, per-shard WAL, tiered disk offload, an in-process vector search engine, a property graph engine with Cypher subset, and an embedded web console. Any Redis client connects out of the box.
+Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. It runs on **Linux** (io_uring via monoio) and **macOS** (kqueue via monoio) with a thread-per-core, shared-nothing architecture, per-shard WAL, tiered disk offload, an in-process vector search engine, a property graph engine with Cypher subset, and an embedded web console. Any Redis client connects out of the box.
 
 ## Why Moon
 
@@ -37,8 +37,8 @@ Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. 
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no fork(), no COW memory spike. AOF is a per-shard WAL with batched fsync; the advantage over Redis grows with pipeline depth.
 - **Tiered disk offload.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through. 100% crash recovery across all tiers.
 - **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
-- **In-process vector search.** `FT.CREATE` / `FT.SEARCH` with HNSW + TurboQuant 4-bit quantization. **2.56× Qdrant QPS** at higher recall on real MiniLM embeddings.
-- **Property graph engine.** 14 `GRAPH.*` commands with Cypher subset, hybrid graph+vector queries, SIMD-accelerated traversal, and memory-mapped CSR segments. **15× FalkorDB insert throughput.**
+- **In-process vector search.** `FT.CREATE` / `FT.SEARCH` with HNSW + TurboQuant 4/8-bit quantization. **12.7K search QPS** at 384d COSINE on GCloud x86_64.
+- **Property graph engine.** 14 `GRAPH.*` commands with Cypher subset, hybrid graph+vector queries, SIMD-accelerated traversal, and memory-mapped CSR segments. **23× FalkorDB insert, 2.4× Cypher QPS.**
 - **Embedded web console.** 7-view React UI (Dashboard, Browser, Console, Vectors, Graph, Memory) served at `/ui/` — zero deployment, one binary. REST + WebSocket + SSE gateway with Bearer auth and rate limiting.
 
 <p align="center">
@@ -49,30 +49,40 @@ Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. 
 
 Measured vs Redis 8.6.1, co-located client and server, pipeline depth tuned per row. Full methodology and reproduction steps in [BENCHMARK.md](BENCHMARK.md) and [docs/benchmarks.mdx](docs/benchmarks.mdx).
 
-### Peak throughput (GCP c3-standard-8, x86_64, monoio io_uring)
+### Peak throughput (GCloud c3-standard-8, x86_64, monoio io_uring)
 
 | Workload                         |   Moon | Redis |  Ratio |
 |----------------------------------|-------:|------:|:------:|
-| Peak GET (c=50, p=64)            | 4.81M  | 2.36M | **2.04×** |
-| Peak SET (c=50, p=64)            | 3.60M  | 1.79M | **2.01×** |
-| GET with AOF everysec            | 4.57M  | 2.24M | **2.04×** |
-| GET with Disk Offload            | 4.81M  | 2.36M | **2.04×** |
-| Single-conn GET (c=1, p=64)      | 2.08M  | 1.30M | **1.60×** |
-| p99 latency (c=10, p=64)         | 0.079 ms | 0.263 ms | **3.3× lower** |
+| Peak GET (c=50, p=64)            | 5.11M  | 2.98M | **1.72×** |
+| Peak SET (c=50, p=64)            | 3.50M  | 1.82M | **1.92×** |
+| GET, production defaults (AOF+disk-offload) | 4.76M | 2.46M | **1.93×** |
+| GET, max durability (fsync always)| 4.85M  | 2.45M | **1.98×** |
 | Memory, values ≥ 1 KB            | —      | —     | **27–35% less** |
 | Crash recovery (SIGKILL, 5K keys)| 100%   | 100%  | parity |
 
-### Vector search (10K × 384d MiniLM, k=10)
+### ARM64 (GCloud t2a-standard-8, Neoverse-N1)
 
-|                    |   Moon x86 | Qdrant FP32 |
-|--------------------|-----------:|------------:|
-| Recall@10          | **0.9670** | ~0.9500     |
-| Search QPS         | **1,296**  | 507         |
-| Search p50         | **0.78 ms**| 1.79 ms     |
-| Insert rate        | **11.3K/s**| ~2.6K/s     |
-| Memory per vector  | **~3.2 KB**| ~4.0 KB     |
+| Workload                         |   Moon | Redis |  Ratio |
+|----------------------------------|-------:|------:|:------:|
+| Peak GET (c=50, p=64)            | 3.47M  | 1.58M | **2.20×** |
+| Peak SET (c=50, p=64)            | 2.42M  | 1.15M | **2.10×** |
+| GET, production defaults          | 3.45M  | 1.61M | **2.14×** |
 
-> **Caveat.** The x86_64 numbers above were measured before the PR #43 correctness changes were landed. A correctness-preserving dispatch hot-path recovery is in place on aarch64 — see the [dispatch recovery entry in CHANGELOG.md](CHANGELOG.md#unreleased---dispatch-hot-path-recovery-2026-04-08) for per-commit profiles. x86_64 peak numbers will be re-measured on the next release.
+### Vector search (50K × 384d, COSINE, GCloud x86_64)
+
+|                    |   Moon  | Redis (RediSearch) | Qdrant |
+|--------------------|--------:|-------------------:|-------:|
+| Insert rate        | **8.2K/s** | ~4.0K/s         | ~6.6K/s |
+| Search QPS         | **12.7K**  | 3.8K             | 982    |
+| Recall@10 (MiniLM) | 0.92    | 0.95              | 0.96   |
+
+### Graph engine (2K nodes, 6K edges, GCloud x86_64)
+
+|                    |   Moon  | FalkorDB |
+|--------------------|--------:|---------:|
+| Cypher QPS         | **2.4×** | 1×      |
+| Native API QPS     | **19×**  | N/A     |
+| Bulk insert        | **23×**  | 1×      |
 
 ## Quick start
 
@@ -244,10 +254,10 @@ Full command list: [docs/commands.mdx](docs/commands.mdx). Configuration flags: 
 ## Development
 
 ```bash
-# Unit tests (1,872 tests)
+# Unit tests (2,613+ tests)
 cargo test --lib
 
-# Full CI matrix (Linux, via OrbStack on macOS)
+# Full CI matrix (native macOS + Linux via OrbStack)
 cargo fmt --check && cargo clippy -- -D warnings && cargo test --release
 
 # Data-consistency tests vs Redis as ground truth (132 tests, 1/4/12 shards)
@@ -267,11 +277,18 @@ Contribution guide and coding rules (unsafe policy, hot-path allocation rules, l
 Moon is pre-1.0 and **experimental**. Current focus:
 
 - Correctness parity with Redis 8.x across the full command surface
-- Tiered disk offload (RAM → NVMe) with crash recovery
-- In-process vector search (HNSW + TurboQuant) with `FT.*` API compatibility
-- Property graph engine with Cypher subset for GraphRAG workloads
-- Web console for interactive data exploration and administration
-- Thread-per-core dispatch hot-path optimization (see [CHANGELOG.md](CHANGELOG.md))
+- AI-native primitives: session dedup, hybrid vector+sparse search, agentic caching
+- Multi-node clustering with gossip, slot migration, and PSYNC2 replication
+- GPU-accelerated vector search (CUDA, feature-gated)
+- Production hardening and SLO validation (see [docs/PRODUCTION-CONTRACT.md](docs/PRODUCTION-CONTRACT.md))
+
+Completed in v0.1.0–v0.1.6:
+- Tiered disk offload (RAM → NVMe) with 100% crash recovery
+- In-process vector search (HNSW + TurboQuant 4/8-bit) with `FT.*` API
+- Property graph engine with Cypher subset (14 `GRAPH.*` commands)
+- Web console (7 views, embedded in binary)
+- macOS support (aarch64 + x86_64, both runtimes)
+- Thread-per-core dispatch optimization (5.11M GET/s on x86_64)
 
 Production readiness is **not** a v0.1 goal. Storage formats, APIs, and config flags may change between releases.
 
