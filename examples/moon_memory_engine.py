@@ -7,8 +7,14 @@ Moon Memory Engine — RAG + GraphRAG + Session Memory in 80 lines.
     python examples/moon_memory_engine.py
 """
 
-import sys, time
+import sys, time, os, logging
 sys.path.insert(0, "sdk/python")
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["SAFETENSORS_FAST_GPU"] = "0"
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 from sentence_transformers import SentenceTransformer
 from moondb import MoonClient, encode_vector
