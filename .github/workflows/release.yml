@@ -98,6 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -244,7 +245,7 @@ jobs:
         run: |
           export VERSION="${VERSION#v}"
           cd packaging
-          nfpm package --packager deb --target "../moon_${VERSION}_${ARCH}.deb"
+          nfpm package --packager deb --config nfpm.yml --target "../moon_${VERSION}_${ARCH}.deb"
 
       - name: Build rpm
         env:
@@ -253,7 +254,7 @@ jobs:
         run: |
           export VERSION="${VERSION#v}"
           cd packaging
-          nfpm package --packager rpm --target "../moon-${VERSION}-1.${ARCH}.rpm"
+          nfpm package --packager rpm --config nfpm.yml --target "../moon-${VERSION}-1.${ARCH}.rpm"
 
       - name: Upload packages to release
         env:
