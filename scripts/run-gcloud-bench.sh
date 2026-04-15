@@ -102,8 +102,8 @@ done
 redis-cli -p 6379 SHUTDOWN NOSAVE 2>/dev/null || true
 sleep 1
 
-# Moon production defaults: disk-offload=enable (WAL v3 + PageCache + checkpoint)
-# plus appendonly=yes (WAL v2) for full durability — this is the recommended config.
+# Moon production defaults: appendonly=yes, disk-offload=enable
+# (WAL v2 + WAL v3 + PageCache + checkpoint + lz4 compression)
 echo "--- Moon (production defaults, 1 shard) ---"
 rm -rf /tmp/moon-data/*
 $MOON --port 6399 --shards 1 --protected-mode no --appendonly yes --appendfsync everysec --dir /tmp/moon-data > /dev/null 2>&1 &

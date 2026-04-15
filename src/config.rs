@@ -73,7 +73,7 @@ pub struct ServerConfig {
     pub requirepass: Option<String>,
 
     /// Enable append-only file persistence (yes/no)
-    #[arg(long, default_value = "no")]
+    #[arg(long, default_value = "yes")]
     pub appendonly: String,
 
     /// AOF fsync policy (always/everysec/no)
@@ -397,7 +397,7 @@ impl Default for RuntimeConfig {
             lfu_log_factor: 10,
             lfu_decay_time: 1,
             save: None,
-            appendonly: "no".to_string(),
+            appendonly: "yes".to_string(),
             appendfsync: "everysec".to_string(),
             aclfile: None,
             dir: ".".to_string(),
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn test_persistence_defaults() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert_eq!(config.appendonly, "no");
+        assert_eq!(config.appendonly, "yes");
         assert_eq!(config.appendfsync, "everysec");
         assert_eq!(config.save, None);
         assert_eq!(config.dir, ".");
