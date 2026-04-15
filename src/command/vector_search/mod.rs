@@ -636,7 +636,7 @@ pub fn quantize_f32_to_sq(input: &[f32], output: &mut [i8]) {
 pub fn ft_search(
     store: &mut VectorStore,
     args: &[Frame],
-    db: Option<&mut crate::storage::db::Database>,
+    mut db: Option<&mut crate::storage::db::Database>,
 ) -> Frame {
     // args[0] = index_name, args[1] = query_string, args[2..] = PARAMS ...
     if args.len() < 2 {
@@ -771,6 +771,40 @@ pub fn ft_search(
             fused = sv.into_vec();
         }
 
+        // Session filtering for hybrid path (SESS-01, SESS-02)
+        if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
+            let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
+                match db.get_sorted_set(sess_key) {
+                    Ok(Some((members, _tree))) => members.clone(),
+                    Ok(None) => std::collections::HashMap::new(),
+                    Err(_) => std::collections::HashMap::new(),
+                };
+            let sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
+            let filtered =
+                session::filter_session_results(&sv, &session_members_snapshot, &key_hash_to_key);
+            fused = filtered.into_vec();
+
+            crate::vector::metrics::increment_search();
+            let response = build_hybrid_response(
+                &fused,
+                &key_hash_to_key,
+                dense_count,
+                sparse_count,
+                limit_offset,
+                limit_count,
+            );
+
+            // Record new results in the session sorted set
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let result_sv: SmallVec<[SearchResult; 32]> = fused.into_iter().collect();
+            session::record_session_results(&result_sv, db, sess_key, &key_hash_to_key, timestamp);
+
+            return response;
+        }
+
         crate::vector::metrics::increment_search();
         return build_hybrid_response(
             &fused,
@@ -803,6 +837,39 @@ pub fn ft_search(
             let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
             apply_range_filter(&mut sv, threshold, metric);
             fused = sv.into_vec();
+        }
+
+        // Session filtering for sparse-only path (SESS-01, SESS-02)
+        if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
+            let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
+                match db.get_sorted_set(sess_key) {
+                    Ok(Some((members, _tree))) => members.clone(),
+                    Ok(None) => std::collections::HashMap::new(),
+                    Err(_) => std::collections::HashMap::new(),
+                };
+            let sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
+            let filtered =
+                session::filter_session_results(&sv, &session_members_snapshot, &key_hash_to_key);
+            fused = filtered.into_vec();
+
+            crate::vector::metrics::increment_search();
+            let response = build_hybrid_response(
+                &fused,
+                &key_hash_to_key,
+                0,
+                sparse_count,
+                limit_offset,
+                limit_count,
+            );
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let result_sv: SmallVec<[SearchResult; 32]> = fused.into_iter().collect();
+            session::record_session_results(&result_sv, db, sess_key, &key_hash_to_key, timestamp);
+
+            return response;
         }
 
         crate::vector::metrics::increment_search();
