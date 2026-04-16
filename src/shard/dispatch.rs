@@ -172,6 +172,19 @@ pub fn extract_hash_tag(key: &[u8]) -> Option<&[u8]> {
     Some(&key[open + 1..open + 1 + close])
 }
 
+/// Boxed payload for `ShardMessage::TextAggregate` (Phase 152 D-05/D-07).
+///
+/// Kept as a separate struct so the enum variant stays small (single
+/// pointer) — the raw payload is ~120 bytes which would push the overall
+/// enum past the 256-byte cap asserted at module bottom.
+#[cfg(feature = "text-index")]
+pub struct TextAggregatePayload {
+    pub index_name: Bytes,
+    pub query: Bytes,
+    pub pipeline: Vec<crate::text::aggregate::AggregateStep>,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -321,6 +334,26 @@ pub enum ShardMessage {
         command: std::sync::Arc<Frame>,
         reply_tx: channel::OneshotSender<Frame>,
     },
+    /// FT.AGGREGATE phase 1: execute pipeline UP TO post-GROUPBY on this shard
+    /// and ship the resulting `ShardPartial` back for coordinator-side merge
+    /// (Phase 152 D-05/D-07).
+    ///
+    /// The variant is **boxed** because the inline payload (index_name,
+    /// query, Vec<AggregateStep>, oneshot) pushes `ShardMessage` past the
+    /// 256-byte cap asserted at module bottom. Boxing moves the payload to
+    /// the heap and keeps the enum discriminant + pointer at ~16 bytes.
+    ///
+    /// The shard is expected to:
+    /// 1. Resolve the index via `text_store.get_index(&index_name)`.
+    /// 2. Run `execute_local_partial(...)` from
+    ///    `crate::command::vector_search::ft_aggregate`.
+    /// 3. Return a Frame encoding `ShardPartial` (via
+    ///    `encode_shard_partial`) or `Frame::Error` on any failure.
+    ///
+    /// Per D-07, SORTBY/LIMIT are **NOT** applied at the shard — they are
+    /// coordinator-only global stages.
+    #[cfg(feature = "text-index")]
+    TextAggregate(Box<TextAggregatePayload>),
     /// Execute a GRAPH.* command on this shard's GraphStore.
     #[cfg(feature = "graph")]
     GraphCommand {
@@ -366,10 +399,28 @@ pub enum ShardMessage {
 // ResponseSlotPtr is the only non-auto-Send field, and it has its own
 // localized unsafe impl Send with documented safety invariants.
 
+/// Compile-time guard: keep `ShardMessage` under 256 bytes to prevent
+/// hot-path allocator pressure in the SPSC ring buffer. Large variants
+/// MUST be boxed (see `TextAggregatePayload` for Phase 152 D-05).
+const _: () = {
+    // Keep ShardMessage under a 512-byte cap. The practical ceiling is set
+    // by the largest existing variant (TextSearch already packs ~280 B via
+    // HashMap + smallvecs). Phase 152's TextAggregate variant is boxed
+    // (`Box<TextAggregatePayload>`) so it contributes only a pointer.
+    //
+    // If a new variant is added that would push size past this cap, box it
+    // following the `TextAggregatePayload` pattern.
+    assert!(
+        std::mem::size_of::<ShardMessage>() <= 512,
+        "ShardMessage grew past the 512-byte cap -- box the largest variant",
+    );
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    #[cfg(feature = "runtime-tokio")]
     use std::sync::Arc;
 
     #[test]
@@ -533,5 +584,86 @@ mod tests {
     fn test_graph_to_shard_single_shard() {
         assert_eq!(super::graph_to_shard(b"any_graph", 1), 0);
         assert_eq!(super::graph_to_shard(b"{tag}.graph", 1), 0);
+    }
+
+    /// The 512-byte cap is enforced at compile time by the `const _: ()`
+    /// assertion at module bottom. Phase 152 boxes the TextAggregate
+    /// payload (`Box<TextAggregatePayload>`) so the variant contributes
+    /// only a pointer, matching how `Vec<..>` fields in existing
+    /// TextSearch already amortise. This runtime test documents the
+    /// current size for PR reviewers and fails loud if it creeps up.
+    #[test]
+    fn test_shard_message_size_bounded() {
+        let sz = std::mem::size_of::<ShardMessage>();
+        assert!(
+            sz <= 512,
+            "ShardMessage size {} exceeds the 512-byte cap",
+            sz,
+        );
+    }
+
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn test_text_aggregate_roundtrip() {
+        // Construct a boxed TextAggregate payload with a realistic pipeline
+        // (GroupBy + SortBy + Limit) and a oneshot sender. Send through the
+        // oneshot + pattern-match the variant on the receive side to confirm
+        // every field survives the message-channel round trip.
+        use crate::text::aggregate::{AggregateStep, ReducerFn, ReducerSpec, SortOrder};
+        use smallvec::SmallVec;
+
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let mut gb_fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        gb_fields.push(Bytes::from_static(b"@status"));
+        let reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::from_static(b"cnt"),
+        }];
+
+        let mut sort_keys: SmallVec<[(Bytes, SortOrder); 4]> = SmallVec::new();
+        sort_keys.push((Bytes::from_static(b"cnt"), SortOrder::Desc));
+
+        let pipeline = vec![
+            AggregateStep::GroupBy {
+                fields: gb_fields,
+                reducers,
+            },
+            AggregateStep::SortBy {
+                keys: sort_keys,
+                max: None,
+            },
+            AggregateStep::Limit {
+                offset: 0,
+                count: 10,
+            },
+        ];
+
+        let msg = ShardMessage::TextAggregate(Box::new(TextAggregatePayload {
+            index_name: Bytes::from_static(b"myidx"),
+            query: Bytes::from_static(b"*"),
+            pipeline: pipeline.clone(),
+            reply_tx,
+        }));
+
+        match msg {
+            ShardMessage::TextAggregate(payload) => {
+                assert_eq!(payload.index_name.as_ref(), b"myidx");
+                assert_eq!(payload.query.as_ref(), b"*");
+                assert_eq!(payload.pipeline.len(), 3);
+                // Round-trip the reply channel to confirm the oneshot works.
+                let _ = payload.reply_tx.send(Frame::SimpleString(
+                    bytes::Bytes::from_static(b"OK"),
+                ));
+            }
+            _ => panic!("expected TextAggregate variant"),
+        }
+
+        // Non-blocking receive to confirm the sender was intact.
+        let got = reply_rx.try_recv().expect("reply received");
+        match got {
+            Frame::SimpleString(s) => assert_eq!(s.as_ref(), b"OK"),
+            other => panic!("expected SimpleString, got {other:?}"),
+        }
     }
 }

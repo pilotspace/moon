@@ -98,6 +98,10 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::TextSearch { .. } => {
                             execute_batch.push(msg);
                         }
+                        #[cfg(feature = "text-index")]
+                        ShardMessage::TextAggregate(_) => {
+                            execute_batch.push(msg);
+                        }
                         #[cfg(feature = "graph")]
                         ShardMessage::GraphCommand { .. } => {
                             execute_batch.push(msg);
@@ -1087,6 +1091,17 @@ pub(crate) fn handle_shard_message_shared(
                 snapshot_lsn,
             );
             let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "text-index")]
+        ShardMessage::TextAggregate(_payload) => {
+            // Implemented in Plan 03 Task 3. The variant is declared in
+            // Task 1 so the enum compiles; this arm is filled in when the
+            // execute_local_partial handler lands.
+            let _ = _payload.reply_tx.send(crate::protocol::Frame::Error(
+                bytes::Bytes::from_static(
+                    b"ERR FT.AGGREGATE multi-shard dispatch not yet wired",
+                ),
+            ));
         }
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
