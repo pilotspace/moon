@@ -12,6 +12,7 @@ pub mod ft_create;
 pub mod ft_info;
 pub mod ft_search;
 pub mod ft_text_search;
+pub mod hybrid;
 #[cfg(feature = "graph")]
 pub mod graph_expand;
 pub mod helpers;
@@ -38,6 +39,7 @@ pub use ft_text_search::{
     summarize_field,
 };
 pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
+pub use hybrid::{HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
 
 // Re-export pub(crate) items for sibling submodules (cache_search, navigate, recommend, session).
 #[cfg(feature = "graph")]
