@@ -590,6 +590,50 @@ impl CloneAsBytes for Option<&AggregateValue> {
 /// FT.AGGREGATE query.
 pub type ShardPartial = Vec<(GroupKey, SmallVec<[PartialReducerState; 4]>)>;
 
+// ---------------------------------------------------------------------------
+// Public wrappers for Plan 03 scatter-gather
+// ---------------------------------------------------------------------------
+
+/// Initialize per-reducer partial states for a fresh shard group.
+///
+/// Exposed publicly so the scatter-gather path (`ft_aggregate::build_shard_partial`)
+/// can allocate states identically to the local `apply_groupby` path without
+/// duplicating the match. Output shape is `SmallVec<[_; 4]>` (matches the
+/// `ShardPartial` wire type); the inline 4 covers ≤ 4 reducer clauses which
+/// is the overwhelmingly common case.
+pub fn init_shard_states(reducers: &[ReducerSpec]) -> SmallVec<[PartialReducerState; 4]> {
+    reducers
+        .iter()
+        .map(|s| match s.fn_name {
+            ReducerFn::Count => PartialReducerState::Count(0),
+            ReducerFn::Sum | ReducerFn::Avg => PartialReducerState::Sum { sum: 0.0, count: 0 },
+            ReducerFn::Min => PartialReducerState::Min(None),
+            ReducerFn::Max => PartialReducerState::Max(None),
+            ReducerFn::CountDistinct => PartialReducerState::CountDistinct(Hll::new_sparse()),
+        })
+        .collect()
+}
+
+/// Public wrapper around the private `update_reducers` — exposed for the
+/// Plan 03 scatter path which builds `ShardPartial` outside this module.
+pub fn update_reducers_public(
+    states: &mut [PartialReducerState],
+    row: &AggregateRow,
+    reducers: &[ReducerSpec],
+) {
+    update_reducers(states, row, reducers);
+}
+
+/// Public helper used by `build_shard_partial` to construct a `GroupKey` entry.
+///
+/// Normalises field values into `Bytes` using the same rules as the internal
+/// `CloneAsBytes` impl so cross-shard keys are identical for the same row
+/// (RESEARCH Pitfall 9). Null / missing fields collapse to an empty byte
+/// string.
+pub fn row_get_as_bytes(row: &AggregateRow, field: &Bytes) -> Bytes {
+    row_get(row, field).cloned_as_bytes()
+}
+
 /// Associatively merge partial reducer states from multiple shards into a
 /// finalized row set.
 ///

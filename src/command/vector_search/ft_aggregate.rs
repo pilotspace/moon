@@ -573,6 +573,329 @@ fn value_to_frame(v: &AggregateValue) -> Frame {
 }
 
 // ---------------------------------------------------------------------------
+// Plan 03 — multi-shard scatter-gather entry points
+// ---------------------------------------------------------------------------
+//
+// `execute_local_full` mirrors `ft_aggregate` but skips argument parsing
+// (the coordinator parsed args once and broadcasts the already-validated
+// pipeline). This is the single-shard fast path.
+//
+// `execute_local_partial` runs the pipeline UP TO post-GROUPBY and ships
+// the resulting `ShardPartial` back encoded as a `Frame::Array` via
+// `encode_shard_partial`. The coordinator decodes and calls
+// `merge_partial_states` (Plan 01) to associatively combine across shards,
+// then applies global SORTBY/LIMIT per D-07.
+
+use crate::storage::hll::Hll;
+use crate::text::aggregate::{
+    GROUPBY_CARDINALITY_LIMIT, GroupKey, PartialReducerState, ShardPartial, init_shard_states,
+    row_get_as_bytes, update_reducers_public,
+};
+
+/// Single-shard fast path. Executes the full pipeline locally and builds
+/// the final RESP response directly — no scatter, no encode/decode.
+///
+/// Caller must hold the `TextStore` and `Database` guards; this function
+/// performs no locking of its own.
+pub fn execute_local_full(
+    _vector_store: &mut VectorStore,
+    text_store: &TextStore,
+    index_name: &Bytes,
+    query: &Bytes,
+    pipeline: &[AggregateStep],
+    db: &Database,
+) -> Frame {
+    let text_index = match text_store.get_index(index_name) {
+        Some(ix) => ix,
+        None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
+    };
+    let rows = match materialize_rows(text_index, db, query, pipeline) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match execute_pipeline(rows, pipeline) {
+        Ok(final_rows) => build_aggregate_response(&final_rows),
+        Err(msg) => Frame::Error(msg),
+    }
+}
+
+/// Multi-shard PHASE 1 entry.
+///
+/// Executes the pipeline UP TO and including GROUPBY+REDUCE on the local
+/// shard and returns an encoded `ShardPartial` (`Frame::Array`) or
+/// `Frame::Error`. Per D-07, SORTBY and LIMIT are NOT applied here — the
+/// coordinator applies them globally after merging all shard partials.
+///
+/// A pipeline without a GROUPBY is explicitly rejected in multi-shard
+/// mode: every reducer merge assumes group-keyed state, and projecting raw
+/// rows across shards is out of scope for v1 (AGG-03 is facet aggregation).
+pub fn execute_local_partial(
+    text_store: &TextStore,
+    index_name: &Bytes,
+    query: &Bytes,
+    pipeline: &[AggregateStep],
+    db: &Database,
+) -> Frame {
+    let text_index = match text_store.get_index(index_name) {
+        Some(ix) => ix,
+        None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
+    };
+
+    // Find the (single) GroupBy step. v1 grammar allows at most one.
+    let gb = pipeline.iter().find_map(|s| match s {
+        AggregateStep::GroupBy { fields, reducers } => {
+            Some((fields.to_vec(), reducers.clone()))
+        }
+        _ => None,
+    });
+    let (gb_fields, gb_reducers) = match gb {
+        Some(g) => g,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR FT.AGGREGATE without GROUPBY is not supported in multi-shard mode",
+            ));
+        }
+    };
+
+    // Materialise candidate rows using the same path as single-shard so
+    // only referenced fields are read from the hash store.
+    let rows = match materialize_rows(text_index, db, query, pipeline) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    // Build per-shard partial groups. Applies FILTER if present (v1:
+    // FILTER is a NO-OP in the pipeline but kept for future wiring).
+    let filtered = apply_filter_stages(rows, pipeline);
+
+    let partial: ShardPartial = match build_shard_partial(filtered, &gb_fields, &gb_reducers) {
+        Ok(p) => p,
+        Err(msg) => return Frame::Error(msg),
+    };
+
+    encode_shard_partial(&partial)
+}
+
+/// Apply any FILTER stages found in the pipeline. In v1 `execute_pipeline`
+/// treats FILTER as a pass-through (see `text/aggregate.rs`), so this
+/// helper mirrors that contract — it exists to keep `execute_local_partial`
+/// symmetrical with `execute_local_full` and so the FILTER evaluator can
+/// drop in without touching the scatter path.
+fn apply_filter_stages(rows: Vec<AggregateRow>, _pipeline: &[AggregateStep]) -> Vec<AggregateRow> {
+    rows
+}
+
+/// Build per-shard `ShardPartial` from materialised rows.
+///
+/// Enforces the GROUPBY cardinality cap per shard (same `W5` pattern as
+/// `text::aggregate::apply_groupby`): the check fires **before** the
+/// HashMap insert so memory use is bounded at `GROUPBY_CARDINALITY_LIMIT`
+/// distinct keys — never N+1.
+fn build_shard_partial(
+    rows: Vec<AggregateRow>,
+    fields: &[Bytes],
+    reducers: &[ReducerSpec],
+) -> Result<ShardPartial, Bytes> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<GroupKey, SmallVec<[PartialReducerState; 4]>> = HashMap::new();
+    for row in rows {
+        let key: GroupKey = fields.iter().map(|f| row_get_as_bytes(&row, f)).collect();
+        if !groups.contains_key(&key) && groups.len() >= GROUPBY_CARDINALITY_LIMIT {
+            return Err(Bytes::from_static(
+                b"ERR GROUPBY cardinality limit exceeded",
+            ));
+        }
+        let states = groups
+            .entry(key)
+            .or_insert_with(|| init_shard_states(reducers));
+        update_reducers_public(states, &row, reducers);
+    }
+    Ok(groups.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------------
+// ShardPartial <-> Frame codec (hand-rolled, matches existing dispatch
+// patterns — Frame-based rather than bincode, per RESEARCH alternatives).
+// ---------------------------------------------------------------------------
+//
+// Wire layout (all top-level items in a Frame::Array):
+//
+//   [
+//     Integer(group_count),
+//     for each group:
+//       Integer(key_field_count),
+//       BulkString(key_field_1_bytes),
+//       ...
+//       BulkString(key_field_N_bytes),
+//       Integer(state_count),
+//       for each state: <tag BulkString> [<payload frames per tag>]
+//   ]
+//
+// State payload shapes:
+//   "COUNT"   Integer(n)
+//   "SUM"     BulkString(sum_as_ascii_f64)   Integer(count)
+//   "MIN"     BulkString(value_as_ascii_f64)
+//   "MIN_NONE"
+//   "MAX"     BulkString(value_as_ascii_f64)
+//   "MAX_NONE"
+//   "HLL"     BulkString(hll_wire_bytes)     // Redis HYLL format
+//
+// Chosen over bincode because it matches the existing DocFreq / TextSearch
+// `ShardMessage` reply shapes, keeps the codec visible to RESP-level
+// tooling, and avoids adding a serde derive to every state variant.
+
+/// Encode a `ShardPartial` as a single `Frame::Array`.
+pub fn encode_shard_partial(partial: &ShardPartial) -> Frame {
+    // Pre-allocate a generous capacity: 1 (group count) + per-group
+    // overhead (~4 frames) + per-state overhead (~3 frames).
+    let mut out: Vec<Frame> = Vec::with_capacity(1 + partial.len() * 6);
+    out.push(Frame::Integer(partial.len() as i64));
+    for (key, states) in partial {
+        out.push(Frame::Integer(key.len() as i64));
+        for field_val in key {
+            out.push(Frame::BulkString(field_val.clone()));
+        }
+        out.push(Frame::Integer(states.len() as i64));
+        for state in states {
+            encode_partial_state(state, &mut out);
+        }
+    }
+    Frame::Array(FrameVec::from(out))
+}
+
+fn encode_partial_state(state: &PartialReducerState, out: &mut Vec<Frame>) {
+    match state {
+        PartialReducerState::Count(n) => {
+            out.push(Frame::BulkString(Bytes::from_static(b"COUNT")));
+            out.push(Frame::Integer(*n as i64));
+        }
+        PartialReducerState::Sum { sum, count } => {
+            out.push(Frame::BulkString(Bytes::from_static(b"SUM")));
+            out.push(Frame::BulkString(Bytes::from(format!("{}", sum))));
+            out.push(Frame::Integer(*count as i64));
+        }
+        PartialReducerState::Min(Some(of)) => {
+            out.push(Frame::BulkString(Bytes::from_static(b"MIN")));
+            out.push(Frame::BulkString(Bytes::from(format!(
+                "{}",
+                of.into_inner()
+            ))));
+        }
+        PartialReducerState::Min(None) => {
+            out.push(Frame::BulkString(Bytes::from_static(b"MIN_NONE")));
+        }
+        PartialReducerState::Max(Some(of)) => {
+            out.push(Frame::BulkString(Bytes::from_static(b"MAX")));
+            out.push(Frame::BulkString(Bytes::from(format!(
+                "{}",
+                of.into_inner()
+            ))));
+        }
+        PartialReducerState::Max(None) => {
+            out.push(Frame::BulkString(Bytes::from_static(b"MAX_NONE")));
+        }
+        PartialReducerState::CountDistinct(hll) => {
+            out.push(Frame::BulkString(Bytes::from_static(b"HLL")));
+            out.push(Frame::BulkString(Bytes::copy_from_slice(hll.as_bytes())));
+        }
+    }
+}
+
+/// Decode a `ShardPartial` from a Frame produced by `encode_shard_partial`.
+///
+/// Returns `None` on any structural error. The coordinator maps `None` to
+/// `Frame::Error("ERR FT.AGGREGATE shard returned malformed partial state")`
+/// so malformed shard replies never panic the coordinator loop
+/// (T-152-03-02).
+pub fn decode_shard_partial(frame: &Frame) -> Option<ShardPartial> {
+    let items = match frame {
+        Frame::Array(a) => a,
+        _ => return None,
+    };
+    let items: &[Frame] = items;
+    let mut i = 0usize;
+    let group_count = as_i64(items.get(i)?)? as usize;
+    i += 1;
+    let mut partial: ShardPartial = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        let key_len = as_i64(items.get(i)?)? as usize;
+        i += 1;
+        let mut key: GroupKey = SmallVec::new();
+        for _ in 0..key_len {
+            key.push(as_bytes(items.get(i)?)?);
+            i += 1;
+        }
+        let state_count = as_i64(items.get(i)?)? as usize;
+        i += 1;
+        let mut states: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+        for _ in 0..state_count {
+            states.push(decode_partial_state(items, &mut i)?);
+        }
+        partial.push((key, states));
+    }
+    Some(partial)
+}
+
+fn decode_partial_state(items: &[Frame], i: &mut usize) -> Option<PartialReducerState> {
+    let tag = as_bytes(items.get(*i)?)?;
+    *i += 1;
+    match tag.as_ref() {
+        b"COUNT" => {
+            let n = as_i64(items.get(*i)?)?;
+            *i += 1;
+            Some(PartialReducerState::Count(n as u64))
+        }
+        b"SUM" => {
+            let sum_bytes = as_bytes(items.get(*i)?)?;
+            *i += 1;
+            let sum: f64 = std::str::from_utf8(&sum_bytes).ok()?.parse().ok()?;
+            let count = as_i64(items.get(*i)?)?;
+            *i += 1;
+            Some(PartialReducerState::Sum {
+                sum,
+                count: count as u64,
+            })
+        }
+        b"MIN" => {
+            let v_bytes = as_bytes(items.get(*i)?)?;
+            *i += 1;
+            let v: f64 = std::str::from_utf8(&v_bytes).ok()?.parse().ok()?;
+            Some(PartialReducerState::Min(Some(ordered_float::OrderedFloat(v))))
+        }
+        b"MIN_NONE" => Some(PartialReducerState::Min(None)),
+        b"MAX" => {
+            let v_bytes = as_bytes(items.get(*i)?)?;
+            *i += 1;
+            let v: f64 = std::str::from_utf8(&v_bytes).ok()?.parse().ok()?;
+            Some(PartialReducerState::Max(Some(ordered_float::OrderedFloat(v))))
+        }
+        b"MAX_NONE" => Some(PartialReducerState::Max(None)),
+        b"HLL" => {
+            let b = as_bytes(items.get(*i)?)?;
+            *i += 1;
+            Hll::from_bytes(b).ok().map(PartialReducerState::CountDistinct)
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn as_i64(f: &Frame) -> Option<i64> {
+    match f {
+        Frame::Integer(n) => Some(*n),
+        _ => None,
+    }
+}
+
+#[inline]
+fn as_bytes(f: &Frame) -> Option<Bytes> {
+    match f {
+        Frame::BulkString(b) => Some(b.clone()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1274,5 +1597,295 @@ mod tests {
             other => panic!("expected Array, got {other:?}"),
         };
         assert_eq!(items[0], int(2));
+    }
+
+    // ==================================================================
+    // Plan 03 — execute_local_full / execute_local_partial + codec
+    // ==================================================================
+
+    fn count_reducer_spec(alias: &[u8]) -> ReducerSpec {
+        ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::copy_from_slice(alias),
+        }
+    }
+
+    fn parse_args_ok(pieces: &[&[u8]]) -> AggregateArgs {
+        parse_aggregate_args(&args_from(pieces)).expect("parse ok")
+    }
+
+    #[test]
+    fn test_execute_local_full_matches_handler() {
+        let mut vs = VectorStore::new();
+        let mut ts = TextStore::new();
+        let mut db = Database::new();
+        let mut idx = make_status_priority_index();
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:1",
+            &[(b"title", b"a"), (b"status", b"open")],
+        );
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:2",
+            &[(b"title", b"b"), (b"status", b"open")],
+        );
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:3",
+            &[(b"title", b"c"), (b"status", b"closed")],
+        );
+        ts.create_index(Bytes::from_static(b"myidx"), idx).unwrap();
+
+        // Identical args route through parse + execute_local_full.
+        let raw_args = args_from(&[
+            b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
+            b"count",
+        ]);
+        let expected = ft_aggregate(&mut vs, &ts, &raw_args, &db);
+        let parsed = parse_aggregate_args(&raw_args).expect("parse ok");
+
+        let actual = execute_local_full(
+            &mut vs,
+            &ts,
+            &parsed.index_name,
+            &parsed.query,
+            &parsed.pipeline,
+            &db,
+        );
+
+        // Compare the two Frames by content, not raw formatted order —
+        // HashMap-backed GROUPBY iteration is non-deterministic, so both
+        // paths can produce the same groups in different orderings.
+        fn as_sorted_groups(f: &Frame) -> Vec<String> {
+            let items = match f {
+                Frame::Array(a) => a,
+                _ => panic!("expected Array"),
+            };
+            let mut out: Vec<String> = Vec::new();
+            for row in items.iter().skip(1) {
+                out.push(format!("{row:?}"));
+            }
+            out.sort();
+            out
+        }
+        assert_eq!(as_sorted_groups(&expected), as_sorted_groups(&actual));
+        // And the count integer at index 0 must match.
+        let (e0, a0) = match (&expected, &actual) {
+            (Frame::Array(e), Frame::Array(a)) => (&e[0], &a[0]),
+            _ => panic!("expected Arrays"),
+        };
+        assert_eq!(e0, a0);
+    }
+
+    #[test]
+    fn test_execute_local_partial_returns_encoded_partial() {
+        let mut ts = TextStore::new();
+        let mut db = Database::new();
+        let mut idx = make_status_priority_index();
+        // 3 open + 2 closed
+        for i in 0..3 {
+            let key = format!("doc:o{i}");
+            insert_doc(
+                &mut db,
+                &mut idx,
+                key.as_bytes(),
+                &[(b"title", b"t"), (b"status", b"open")],
+            );
+        }
+        for i in 0..2 {
+            let key = format!("doc:c{i}");
+            insert_doc(
+                &mut db,
+                &mut idx,
+                key.as_bytes(),
+                &[(b"title", b"t"), (b"status", b"closed")],
+            );
+        }
+        ts.create_index(Bytes::from_static(b"myidx"), idx).unwrap();
+
+        let parsed = parse_args_ok(&[
+            b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
+            b"count",
+        ]);
+
+        let frame = execute_local_partial(
+            &ts,
+            &parsed.index_name,
+            &parsed.query,
+            &parsed.pipeline,
+            &db,
+        );
+        let partial = decode_shard_partial(&frame).expect("decode ok");
+        assert_eq!(partial.len(), 2, "two groups expected (open + closed)");
+
+        // Find counts per status value.
+        let mut open_count: Option<u64> = None;
+        let mut closed_count: Option<u64> = None;
+        for (key, states) in &partial {
+            assert_eq!(key.len(), 1);
+            let status = key[0].clone();
+            assert_eq!(states.len(), 1);
+            let n = match &states[0] {
+                PartialReducerState::Count(n) => *n,
+                other => panic!("expected Count, got {other:?}"),
+            };
+            match status.as_ref() {
+                b"open" => open_count = Some(n),
+                b"closed" => closed_count = Some(n),
+                other => panic!("unexpected status {other:?}"),
+            }
+        }
+        assert_eq!(open_count, Some(3));
+        assert_eq!(closed_count, Some(2));
+    }
+
+    #[test]
+    fn test_execute_local_partial_rejects_pipeline_without_groupby() {
+        let mut ts = TextStore::new();
+        let mut db = Database::new();
+        let mut idx = make_status_priority_index();
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:1",
+            &[(b"title", b"a"), (b"status", b"open")],
+        );
+        ts.create_index(Bytes::from_static(b"myidx"), idx).unwrap();
+
+        // Pipeline with SORTBY only — no GROUPBY.
+        let parsed = parse_args_ok(&[b"myidx", b"*", b"SORTBY", b"1", b"@status"]);
+        let frame = execute_local_partial(
+            &ts,
+            &parsed.index_name,
+            &parsed.query,
+            &parsed.pipeline,
+            &db,
+        );
+        match frame {
+            Frame::Error(msg) => {
+                assert!(
+                    msg.starts_with(b"ERR FT.AGGREGATE without GROUPBY"),
+                    "got: {:?}",
+                    std::str::from_utf8(&msg).ok()
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shard_partial_roundtrip_count() {
+        let key: GroupKey = {
+            let mut k: GroupKey = SmallVec::new();
+            k.push(Bytes::from_static(b"open"));
+            k
+        };
+        let states: SmallVec<[PartialReducerState; 4]> = {
+            let mut s: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+            s.push(PartialReducerState::Count(5));
+            s
+        };
+        let partial: ShardPartial = vec![(key, states)];
+        let frame = encode_shard_partial(&partial);
+        let decoded = decode_shard_partial(&frame).expect("decode ok");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0[0].as_ref(), b"open");
+        match &decoded[0].1[0] {
+            PartialReducerState::Count(n) => assert_eq!(*n, 5),
+            other => panic!("expected Count(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shard_partial_roundtrip_sum() {
+        let key: GroupKey = {
+            let mut k: GroupKey = SmallVec::new();
+            k.push(Bytes::from_static(b"a"));
+            k
+        };
+        let states: SmallVec<[PartialReducerState; 4]> = {
+            let mut s: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+            s.push(PartialReducerState::Sum {
+                sum: 12.5,
+                count: 3,
+            });
+            s
+        };
+        let partial: ShardPartial = vec![(key, states)];
+        let frame = encode_shard_partial(&partial);
+        let decoded = decode_shard_partial(&frame).expect("decode ok");
+        match &decoded[0].1[0] {
+            PartialReducerState::Sum { sum, count } => {
+                assert!((*sum - 12.5).abs() < f64::EPSILON);
+                assert_eq!(*count, 3);
+            }
+            other => panic!("expected Sum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shard_partial_roundtrip_min_max_with_none() {
+        let mk_group = |state: PartialReducerState| -> (GroupKey, SmallVec<[PartialReducerState; 4]>) {
+            let mut k: GroupKey = SmallVec::new();
+            k.push(Bytes::from_static(b"k"));
+            let mut v: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+            v.push(state);
+            (k, v)
+        };
+
+        let cases = vec![
+            PartialReducerState::Min(None),
+            PartialReducerState::Max(None),
+            PartialReducerState::Min(Some(ordered_float::OrderedFloat(1.5))),
+            PartialReducerState::Max(Some(ordered_float::OrderedFloat(9.0))),
+        ];
+        for state in cases {
+            let partial: ShardPartial = vec![mk_group(state.clone())];
+            let frame = encode_shard_partial(&partial);
+            let decoded = decode_shard_partial(&frame).expect("decode ok");
+            assert_eq!(decoded.len(), 1);
+            let got = &decoded[0].1[0];
+            // Format comparison is sufficient — OrderedFloat variants use
+            // the same formatter on both sides.
+            assert_eq!(format!("{state:?}"), format!("{got:?}"));
+        }
+    }
+
+    #[test]
+    fn test_shard_partial_roundtrip_hll() {
+        let mut hll = Hll::new_sparse();
+        for i in 0..100u32 {
+            hll.add(&i.to_le_bytes());
+        }
+        let before_count = hll.count();
+
+        let mut k: GroupKey = SmallVec::new();
+        k.push(Bytes::from_static(b"g"));
+        let mut v: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+        v.push(PartialReducerState::CountDistinct(hll));
+        let partial: ShardPartial = vec![(k, v)];
+
+        let frame = encode_shard_partial(&partial);
+        let decoded = decode_shard_partial(&frame).expect("decode ok");
+        match &decoded[0].1[0] {
+            PartialReducerState::CountDistinct(h) => {
+                assert_eq!(h.count(), before_count);
+            }
+            other => panic!("expected CountDistinct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_shard_partial_malformed_returns_none() {
+        // A truncated / wrong-type frame must never panic.
+        let bad = Frame::Integer(42);
+        assert!(decode_shard_partial(&bad).is_none());
+        let bad2 = Frame::Array(FrameVec::from(vec![Frame::Integer(1)])); // missing group
+        assert!(decode_shard_partial(&bad2).is_none());
     }
 }
