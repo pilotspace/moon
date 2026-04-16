@@ -102,6 +102,10 @@ pub(crate) fn drain_spsc_shared(
                         ShardMessage::TextAggregate(_) => {
                             execute_batch.push(msg);
                         }
+                        #[cfg(feature = "text-index")]
+                        ShardMessage::FtHybrid(_) => {
+                            execute_batch.push(msg);
+                        }
                         #[cfg(feature = "graph")]
                         ShardMessage::GraphCommand { .. } => {
                             execute_batch.push(msg);
@@ -1116,6 +1120,51 @@ pub(crate) fn handle_shard_message_shared(
                     &db_guard,
                 )
                 // guards dropped here at end of block
+            };
+            let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "text-index")]
+        ShardMessage::FtHybrid(payload) => {
+            // Phase 152 Plan 05 (D-13): each shard computes BM25 (with
+            // coordinator-provided global IDF), dense KNN, and optional
+            // sparse, then returns three raw per-stream lists UNFUSED.
+            // The coordinator calls `rrf_fuse_three` exactly once on the
+            // unions. Guards are dropped before reply.
+            let crate::shard::dispatch::FtHybridPayload {
+                index_name,
+                query_terms,
+                dense_field,
+                dense_blob,
+                sparse_field,
+                sparse_blob,
+                weights,
+                k_per_stream,
+                top_k,
+                global_df,
+                global_n,
+                reply_tx,
+            } = *payload;
+            let response = {
+                let text_guard = shard_databases.text_store(shard_id);
+                let sparse_pair = match (sparse_field.as_ref(), sparse_blob.as_ref()) {
+                    (Some(f), Some(b)) => Some((f, b)),
+                    _ => None,
+                };
+                crate::command::vector_search::hybrid::execute_hybrid_search_local_raw_streams(
+                    vector_store,
+                    &text_guard,
+                    &index_name,
+                    &query_terms,
+                    &dense_field,
+                    &dense_blob,
+                    sparse_pair,
+                    weights,
+                    k_per_stream,
+                    top_k,
+                    &global_df,
+                    global_n,
+                )
+                // text_guard drops here (end of block)
             };
             let _ = reply_tx.send(response);
         }

@@ -185,6 +185,31 @@ pub struct TextAggregatePayload {
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 
+/// Boxed payload for `ShardMessage::FtHybrid` (Phase 152 Plan 05, D-13).
+///
+/// Carries a pre-computed global IDF (Phase 1 DFS aggregate) so the shard
+/// can score BM25 with multi-shard-correct ranking. The shard returns three
+/// separate raw per-stream lists (bm25, dense, sparse) UNFUSED — coordinator
+/// unions per stream and calls `rrf_fuse_three` exactly once on the unions.
+///
+/// Boxed to keep the enum discriminant + pointer at ~16 bytes, per the
+/// pattern established by `TextAggregatePayload`.
+#[cfg(feature = "text-index")]
+pub struct FtHybridPayload {
+    pub index_name: Bytes,
+    pub query_terms: Vec<crate::command::vector_search::ft_text_search::QueryTerm>,
+    pub dense_field: Bytes,
+    pub dense_blob: Bytes,
+    pub sparse_field: Option<Bytes>,
+    pub sparse_blob: Option<Bytes>,
+    pub weights: [f32; 3],
+    pub k_per_stream: usize,
+    pub top_k: usize,
+    pub global_df: std::collections::HashMap<String, u32>,
+    pub global_n: u32,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -354,6 +379,18 @@ pub enum ShardMessage {
     /// coordinator-only global stages.
     #[cfg(feature = "text-index")]
     TextAggregate(Box<TextAggregatePayload>),
+    /// Execute a hybrid FT.SEARCH on this shard with pre-computed global IDF (Phase 152 D-13).
+    ///
+    /// Each shard computes BM25 (with global IDF), dense KNN, and optional sparse in parallel,
+    /// then returns THREE separate raw per-stream lists (bm25, dense, sparse) UNFUSED.
+    /// The coordinator unions shard lists per stream and calls `rrf_fuse_three` exactly
+    /// once on the unions — preserving RRF math correctness (per D-13 + D-14).
+    ///
+    /// Boxed per the `TextAggregatePayload` pattern to keep the enum discriminant +
+    /// pointer at ~16 bytes; the raw payload carries a `HashMap<String, u32>` + Vec<QueryTerm>
+    /// + blob bytes which would otherwise push `ShardMessage` past the 512-byte cap.
+    #[cfg(feature = "text-index")]
+    FtHybrid(Box<FtHybridPayload>),
     /// Execute a GRAPH.* command on this shard's GraphStore.
     #[cfg(feature = "graph")]
     GraphCommand {
@@ -665,5 +702,26 @@ mod tests {
             Frame::SimpleString(s) => assert_eq!(s.as_ref(), b"OK"),
             other => panic!("expected SimpleString, got {other:?}"),
         }
+    }
+
+    /// Phase 152 Plan 05 Task 1: verify the boxed `FtHybrid` variant keeps the
+    /// overall enum within the 512-byte cap.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn test_ft_hybrid_variant_size_bounded() {
+        // Adding the boxed FtHybridPayload must not push ShardMessage past the cap.
+        // The boxed pattern keeps the variant at discriminant + pointer ~= 16 bytes.
+        let sz = std::mem::size_of::<ShardMessage>();
+        assert!(
+            sz <= 512,
+            "ShardMessage grew past the 512-byte cap after FtHybrid: {sz}",
+        );
+        // Sanity: the boxed payload itself can be large — only the outer enum
+        // needs to stay small.
+        let payload_sz = std::mem::size_of::<FtHybridPayload>();
+        assert!(
+            payload_sz > 0 && payload_sz < 4096,
+            "FtHybridPayload size sanity: {payload_sz}",
+        );
     }
 }
