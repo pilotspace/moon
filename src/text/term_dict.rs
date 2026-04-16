@@ -13,6 +13,10 @@ use std::collections::HashMap;
 pub struct TermDictionary {
     terms: HashMap<String, u32>,
     next_id: u32,
+    /// Term count at last FST build. Terms with id >= this value were added post-compaction.
+    /// Used by the dual-path expansion strategy (D-12): FST covers ids < fst_high_water_mark,
+    /// HashMap brute-force covers ids >= fst_high_water_mark.
+    pub fst_high_water_mark: u32,
 }
 
 impl TermDictionary {
@@ -21,6 +25,7 @@ impl TermDictionary {
         Self {
             terms: HashMap::new(),
             next_id: 0,
+            fst_high_water_mark: 0,
         }
     }
 
@@ -45,5 +50,17 @@ impl TermDictionary {
     /// Number of unique terms in the dictionary.
     pub fn term_count(&self) -> usize {
         self.terms.len()
+    }
+
+    /// Iterate all (term, id) pairs for FST construction.
+    ///
+    /// No ordering guarantee — callers MUST sort before building an FST.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &u32)> {
+        self.terms.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Current next_id value (number of terms ever assigned).
+    pub fn next_id(&self) -> u32 {
+        self.next_id
     }
 }

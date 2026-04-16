@@ -14,6 +14,7 @@
 /// - `store` — TextStore and TextIndex per-shard registry
 pub mod analyzer;
 pub mod bm25;
+pub mod fst_dict;
 pub mod index_persist;
 pub mod posting;
 pub mod store;

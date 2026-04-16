@@ -82,6 +82,8 @@ unicode-segmentation = { version = "1.12", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 rust-stemmers = { version = "1.2", optional = true }
 stop-words = { version = "0.10", optional = true }
+fst = { version = "0.4", features = ["levenshtein"], optional = true }
+levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional = true }
 
 [features]
 # Platform-aware defaults:
@@ -103,7 +105,14 @@ simd-avx512 = []
 otel = []
 graph = ["dep:logos"]
 console = ["dep:hyper-tungstenite", "dep:rust-embed", "dep:mime_guess", "dep:tokio-stream", "dep:base64", "dep:hmac", "dep:subtle", "hyper/http2"]
-text-index = ["dep:unicode-segmentation", "dep:unicode-normalization", "dep:rust-stemmers", "dep:stop-words"]
+text-index = [
+    "dep:unicode-segmentation",
+    "dep:unicode-normalization",
+    "dep:rust-stemmers",
+    "dep:stop-words",
+    "dep:fst",
+    "dep:levenshtein_automata",
+]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
