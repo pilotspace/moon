@@ -177,7 +177,8 @@ pub(crate) fn execute_transaction_sharded(
         if cmd.eq_ignore_ascii_case(b"HSET") && !matches!(response, Frame::Error(_)) {
             if let Some(Frame::BulkString(key_bytes)) = cmd_args.first() {
                 let mut vs = shard_databases.vector_store(shard_id);
-                crate::shard::spsc_handler::auto_index_hset_public(&mut vs, key_bytes, cmd_args);
+                let mut ts = shard_databases.text_store(shard_id);
+                crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, key_bytes, cmd_args);
             }
         }
 

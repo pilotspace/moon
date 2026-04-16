@@ -1668,7 +1668,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                                     let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                                    crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &key, cmd_args);
+                                    let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
+                                    crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, &key, cmd_args);
                                 }
                             }
                             // Auto-delete vectors on DEL/UNLINK (local write path)

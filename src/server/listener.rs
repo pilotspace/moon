@@ -189,6 +189,10 @@ pub async fn run_with_shutdown(
     let vector_store: Arc<Mutex<crate::vector::store::VectorStore>> =
         Arc::new(Mutex::new(crate::vector::store::VectorStore::new()));
 
+    // TextStore for single-shard FT.CREATE TEXT field support
+    let text_store: Arc<Mutex<crate::text::store::TextStore>> =
+        Arc::new(Mutex::new(crate::text::store::TextStore::new()));
+
     // GraphStore for single-shard GRAPH.* commands
     #[cfg(feature = "graph")]
     let graph_store: Arc<Mutex<crate::graph::store::GraphStore>> =
@@ -240,12 +244,14 @@ pub async fn run_with_shutdown(
                         let rs = repl_state.clone();
                         let acl = acl_table.clone();
                         let vs = vector_store.clone();
+                        let ts = text_store.clone();
                         #[cfg(feature = "graph")]
                         let gs = graph_store.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
                             aof_tx, change_counter, pubsub, rt_config,
                             tracking, cid, Some(rs), acl, Some(vs),
+                            Some(ts),
                             #[cfg(feature = "graph")]
                             Some(gs),
                         ));

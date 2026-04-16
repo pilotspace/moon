@@ -2046,12 +2046,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
-                    // Auto-index HSET into vector store (if key matches index prefix)
+                    // Auto-index HSET into vector/text stores (if key matches index prefix)
                     if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"HSET") {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                             let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                            let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
                             crate::shard::spsc_handler::auto_index_hset_public(
                                 &mut vs,
+                                &mut *ts,
                                 key.as_ref(),
                                 cmd_args,
                             );

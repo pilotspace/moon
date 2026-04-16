@@ -69,6 +69,7 @@ pub async fn handle_connection(
     repl_state: Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
     acl_table: Arc<RwLock<crate::acl::AclTable>>,
     vector_store: Option<Arc<Mutex<crate::vector::store::VectorStore>>>,
+    text_store: Option<Arc<Mutex<crate::text::store::TextStore>>>,
     #[cfg(feature = "graph")] graph_store: Option<Arc<Mutex<crate::graph::store::GraphStore>>>,
 ) {
     crate::admin::metrics_setup::record_connection_opened();
@@ -908,6 +909,7 @@ pub async fn handle_connection(
                                 // Auto-index HSETs from the transaction
                                 if let Some(ref vs) = vector_store {
                                     if let Frame::Array(ref txn_results) = result {
+                                        let mut fallback_ts = crate::text::store::TextStore::new();
                                         for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
                                             if let Some((c, a)) = extract_command(cmd_frame) {
                                                 if c.eq_ignore_ascii_case(b"HSET")
@@ -916,9 +918,16 @@ pub async fn handle_connection(
                                                 {
                                                     if let Some(Frame::BulkString(key_bytes)) = a.first() {
                                                         let mut store = vs.lock();
-                                                        crate::shard::spsc_handler::auto_index_hset_public(
-                                                            &mut store, key_bytes, a,
-                                                        );
+                                                        if let Some(ref ts) = text_store {
+                                                            let mut ts_guard = ts.lock();
+                                                            crate::shard::spsc_handler::auto_index_hset_public(
+                                                                &mut store, &mut *ts_guard, key_bytes, a,
+                                                            );
+                                                        } else {
+                                                            crate::shard::spsc_handler::auto_index_hset_public(
+                                                                &mut store, &mut fallback_ts, key_bytes, a,
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1083,14 +1092,14 @@ pub async fn handle_connection(
                             if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
                                 if let Some(ref vs) = vector_store {
                                     let mut store = vs.lock();
-                                    // Temporary dummy TextStore for handler_single path.
-                                    // Text indexes are dispatched via SPSC (spsc_handler) where
-                                    // the real per-shard TextStore is used. This handler path
-                                    // will be wired to SharedDatabases.text_store() when
-                                    // auto_index_hset integration is added.
-                                    let mut dummy_ts = crate::text::store::TextStore::new();
+                                    let mut fallback_ts = crate::text::store::TextStore::new();
+                                    let mut ts_guard = text_store.as_ref().map(|ts| ts.lock());
+                                    let ts_mut = match ts_guard {
+                                        Some(ref mut guard) => &mut **guard,
+                                        None => &mut fallback_ts,
+                                    };
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                                        crate::command::vector_search::ft_create(&mut *store, &mut dummy_ts, cmd_args)
+                                        crate::command::vector_search::ft_create(&mut *store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                         let has_session = cmd_args.iter().any(|a| {
                                             if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
@@ -1102,9 +1111,9 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_search(&mut *store, cmd_args, None)
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                        crate::command::vector_search::ft_dropindex(&mut *store, &mut dummy_ts, cmd_args)
+                                        crate::command::vector_search::ft_dropindex(&mut *store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                        crate::command::vector_search::ft_info(&*store, &dummy_ts, cmd_args)
+                                        crate::command::vector_search::ft_info(&*store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                         crate::command::vector_search::ft_list(&*store)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1112,7 +1121,7 @@ pub async fn handle_connection(
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                         crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                        crate::command::vector_search::ft_config(&mut *store, &mut dummy_ts, cmd_args)
+                                        crate::command::vector_search::ft_config(&mut *store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                         let mut db_guard = db[conn.selected_db].write();
                                         crate::command::vector_search::recommend::ft_recommend(&mut *store, cmd_args, Some(&mut *db_guard))
@@ -1257,6 +1266,9 @@ pub async fn handle_connection(
                                 if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {
                                     if let Some(ref vs) = vector_store {
                                         let mut store = vs.lock();
+                                        let mut fb_ts = crate::text::store::TextStore::new();
+                                        let mut ts_g2 = text_store.as_ref().map(|ts| ts.lock());
+                                        let ts_m2 = match ts_g2 { Some(ref mut g) => &mut **g, None => &mut fb_ts };
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                             let has_session = d_args.iter().any(|a| {
                                                 if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
@@ -1272,8 +1284,7 @@ pub async fn handle_connection(
                                                 crate::command::vector_search::ft_search(&mut *store, d_args, None)
                                             }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                            let dummy_ts = crate::text::store::TextStore::new();
-                                            crate::command::vector_search::ft_info(&*store, &dummy_ts, d_args)
+                                            crate::command::vector_search::ft_info(&*store, ts_m2, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                             crate::command::vector_search::ft_list(&*store)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1281,10 +1292,7 @@ pub async fn handle_connection(
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                             crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                            {
-                                                let mut dts = crate::text::store::TextStore::new();
-                                                crate::command::vector_search::ft_config(&mut *store, &mut dts, d_args)
-                                            }
+                                            crate::command::vector_search::ft_config(&mut *store, ts_m2, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                             drop(guard);
                                             let mut db_guard = db[conn.selected_db].write();
@@ -1389,17 +1397,18 @@ pub async fn handle_connection(
                                 if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {
                                     if let Some(ref vs) = vector_store {
                                         let mut store = vs.lock();
-                                        let mut dummy_ts = crate::text::store::TextStore::new();
+                                        let mut fb_ts3 = crate::text::store::TextStore::new();
+                                        let mut ts_g3 = text_store.as_ref().map(|ts| ts.lock());
+                                        let ts_m3 = match ts_g3 { Some(ref mut g) => &mut **g, None => &mut fb_ts3 };
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                                            crate::command::vector_search::ft_create(&mut *store, &mut dummy_ts, d_args)
+                                            crate::command::vector_search::ft_create(&mut *store, ts_m3, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                             // Write run: guard is already write-locked
                                             crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard))
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                            crate::command::vector_search::ft_dropindex(&mut *store, &mut dummy_ts, d_args)
+                                            crate::command::vector_search::ft_dropindex(&mut *store, ts_m3, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                            let dummy_ts = crate::text::store::TextStore::new();
-                                            crate::command::vector_search::ft_info(&*store, &dummy_ts, d_args)
+                                            crate::command::vector_search::ft_info(&*store, ts_m3, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                             crate::command::vector_search::ft_list(&*store)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1407,10 +1416,7 @@ pub async fn handle_connection(
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                             crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                            {
-                                                let mut dts = crate::text::store::TextStore::new();
-                                                crate::command::vector_search::ft_config(&mut *store, &mut dts, d_args)
-                                            }
+                                            crate::command::vector_search::ft_config(&mut *store, ts_m3, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                             crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *guard))
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
@@ -1474,12 +1480,18 @@ pub async fn handle_connection(
                                     DispatchResult::Quit(f) => (f, true),
                                 };
 
-                                // Auto-index vector on successful HSET
+                                // Auto-index vector/text on successful HSET
                                 if is_hset && !matches!(&response, Frame::Error(_)) {
                                     if let Some(ref vs) = vector_store {
                                         if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
                                             let mut store = vs.lock();
-                                            crate::shard::spsc_handler::auto_index_hset_public(&mut store, &key, d_args);
+                                            if let Some(ref ts) = text_store {
+                                                let mut ts_guard = ts.lock();
+                                                crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args);
+                                            } else {
+                                                let mut fallback_ts = crate::text::store::TextStore::new();
+                                                crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args);
+                                            }
                                         }
                                     }
                                 }

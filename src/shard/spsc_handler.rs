@@ -339,7 +339,8 @@ pub(crate) fn handle_shard_message_shared(
                     && !matches!(frame, crate::protocol::Frame::Error(_))
                 {
                     if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                        auto_index_hset(vector_store, key_bytes, args);
+                        let mut ts = shard_databases.text_store(shard_id);
+                        auto_index_hset(vector_store, &mut *ts, key_bytes, args);
                     }
                 }
 
@@ -506,7 +507,8 @@ pub(crate) fn handle_shard_message_shared(
                         // Use the `vector_store` parameter (already locked by caller),
                         // NOT shard_databases.vector_store() which would deadlock
                         // (parking_lot::Mutex is non-reentrant).
-                        auto_index_hset(vector_store, key_bytes, args);
+                        let mut ts = shard_databases.text_store(shard_id);
+                        auto_index_hset(vector_store, &mut *ts, key_bytes, args);
                     }
                 }
 
@@ -788,7 +790,8 @@ pub(crate) fn handle_shard_message_shared(
                         // Use the `vector_store` parameter (already locked by caller),
                         // NOT shard_databases.vector_store() which would deadlock
                         // (parking_lot::Mutex is non-reentrant).
-                        auto_index_hset(vector_store, key_bytes, args);
+                        let mut ts = shard_databases.text_store(shard_id);
+                        auto_index_hset(vector_store, &mut *ts, key_bytes, args);
                     }
                 }
 
@@ -1118,13 +1121,19 @@ fn has_session_keyword(frame: &crate::protocol::Frame) -> bool {
 /// Public wrapper for auto-indexing on HSET — called from single-shard handler.
 pub fn auto_index_hset_public(
     vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
     key: &[u8],
     args: &[crate::protocol::Frame],
 ) {
-    auto_index_hset(vector_store, key, args);
+    auto_index_hset(vector_store, text_store, key, args);
 }
 
-fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::protocol::Frame]) {
+fn auto_index_hset(
+    vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+) {
     let matching_names = vector_store.find_matching_index_names(key);
     if matching_names.is_empty() {
         return;
@@ -1167,6 +1176,15 @@ fn auto_index_hset(vector_store: &mut VectorStore, key: &[u8], args: &[crate::pr
                 let source_field = idx.meta.source_field.clone();
                 update_metadata_only(idx, args, &source_field, global_id);
             }
+        }
+    }
+
+    // TEXT field indexing: find matching text indexes and index document
+    let text_matching = text_store.find_matching_index_names(key);
+    for idx_name in text_matching {
+        if let Some(idx) = text_store.get_index_mut(&idx_name) {
+            let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+            idx.index_document(key_hash, key, args);
         }
     }
 }

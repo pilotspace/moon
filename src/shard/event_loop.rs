@@ -737,8 +737,9 @@ impl super::Shard {
 
                     if !matching.is_empty() {
                         let mut vs = shard_databases.vector_store(shard_id);
+                        let mut ts = shard_databases.text_store(shard_id);
                         for (key, args) in &matching {
-                            crate::shard::spsc_handler::auto_index_hset_public(&mut vs, key, args);
+                            crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, key, args);
                             reindexed += 1;
                         }
                     }
