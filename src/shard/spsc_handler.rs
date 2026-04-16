@@ -1043,6 +1043,17 @@ pub(crate) fn dispatch_vector_command(
     if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
         vector_search::ft_create(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+        // Check if this is a text query (no KNN/SPARSE markers) before
+        // dispatching to the vector search path. Text queries are handled
+        // by ft_text_search which reads from the TextStore (BM25 posting index).
+        let query_bytes = args.get(1).and_then(|f| match f {
+            crate::protocol::Frame::BulkString(b) => Some(b.as_ref()),
+            _ => None,
+        });
+        if query_bytes.map_or(false, vector_search::is_text_query) {
+            return vector_search::ft_text_search(text_store, args);
+        }
+        // Existing vector search path (KNN / SPARSE / hybrid).
         #[cfg(feature = "graph")]
         {
             vector_search::ft_search_with_graph(vector_store, graph_store, args, db)
