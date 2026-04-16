@@ -27,13 +27,16 @@ Example::
 
 from __future__ import annotations
 
-import hashlib
+import contextlib
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type
+from collections.abc import Iterable
+from typing import Any
 
 try:
+    from langchain_core.callbacks import CallbackManagerForRetrieverRun
     from langchain_core.documents import Document
     from langchain_core.embeddings import Embeddings
+    from langchain_core.retrievers import BaseRetriever
     from langchain_core.vectorstores import VectorStore
 except ImportError as e:
     raise ImportError(
@@ -42,7 +45,18 @@ except ImportError as e:
     ) from e
 
 from ..client import MoonClient
-from ..types import SearchResult, encode_vector
+from ..types import SearchResult, TextSearchHit, encode_vector
+
+# Valid search_type values accepted by MoonVectorStore.similarity_search /
+# MoonVectorStore.as_retriever. Listed here so the ValueError message stays in
+# sync with the dispatcher.
+_VALID_SEARCH_TYPES: tuple[str, ...] = ("similarity", "hybrid", "mmr")
+
+# Server-side per-stream score field markers (mirrors src/command/vector_search/hybrid.rs).
+_BM25_STREAM_FIELD = "__bm25_score__"
+_DENSE_STREAM_FIELD = "__dense_score__"
+_SPARSE_STREAM_FIELD = "__sparse_score__"
+_STREAM_FIELDS: tuple[str, ...] = (_BM25_STREAM_FIELD, _DENSE_STREAM_FIELD, _SPARSE_STREAM_FIELD)
 
 
 class MoonVectorStore(VectorStore):
@@ -83,14 +97,14 @@ class MoonVectorStore(VectorStore):
         embedding: Embeddings,
         *,
         moon_url: str = "redis://localhost:6379",
-        moon_client: Optional[MoonClient] = None,
+        moon_client: MoonClient | None = None,
         prefix: str = "doc:",
         vector_field: str = "vec",
         content_field: str = "content",
         metadata_field: str = "metadata_",
-        dim: Optional[int] = None,
+        dim: int | None = None,
         metric: str = "COSINE",
-        session_key: Optional[str] = None,
+        session_key: str | None = None,
         create_index: bool = True,
     ) -> None:
         self._index_name = index_name
@@ -118,7 +132,8 @@ class MoonVectorStore(VectorStore):
 
     def _ensure_index(self) -> None:
         """Create the vector index if it doesn't already exist."""
-        try:
+        # Index may already exist -- ignore the "already exists" error path.
+        with contextlib.suppress(Exception):
             self._client.vector.create_index(
                 self._index_name,
                 prefix=self._prefix,
@@ -127,9 +142,6 @@ class MoonVectorStore(VectorStore):
                 metric=self._metric,
                 extra_schema=[self._content_field, "TEXT"],
             )
-        except Exception:
-            # Index may already exist -- ignore
-            pass
 
     @property
     def embeddings(self) -> Embeddings:
@@ -139,11 +151,11 @@ class MoonVectorStore(VectorStore):
     def add_texts(
         self,
         texts: Iterable[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
+        metadatas: list[dict[str, Any]] | None = None,
         *,
-        ids: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> List[str]:
+        ids: list[str] | None = None,
+        **kwargs: Any,  # noqa: ANN401 -- LangChain VectorStore base contract
+    ) -> list[str]:
         """Add texts with embeddings to the vector store.
 
         Args:
@@ -170,11 +182,14 @@ class MoonVectorStore(VectorStore):
         if ids is None:
             ids = [f"{self._prefix}{uuid.uuid4().hex[:12]}" for _ in texts_list]
         else:
-            ids = [f"{self._prefix}{id_}" if not id_.startswith(self._prefix) else id_ for id_ in ids]
+            ids = [
+                id_ if id_.startswith(self._prefix) else f"{self._prefix}{id_}"
+                for id_ in ids
+            ]
 
         pipeline = self._client.pipeline(transaction=False)
         for doc_id, text, vector, meta in zip(ids, texts_list, vectors, metadatas):
-            mapping: Dict[str, Any] = {
+            mapping: dict[str, Any] = {
                 self._vector_field: encode_vector(vector),
                 self._content_field: text,
             }
@@ -190,13 +205,20 @@ class MoonVectorStore(VectorStore):
         self,
         query: str,
         k: int = 4,
-        **kwargs: Any,
-    ) -> List[Document]:
+        **kwargs: Any,  # noqa: ANN401 -- LangChain VectorStore base contract
+    ) -> list[Document]:
         """Search for documents similar to the query text.
 
         Args:
             query: Query text to embed and search.
             k: Number of results to return (default 4).
+            search_type: Optional retrieval mode. ``"similarity"`` (default —
+                dense KNN), ``"hybrid"`` (BM25 + dense fused via Moon's
+                server-side RRF — see :meth:`similarity_search_with_score`),
+                or ``"mmr"`` (delegates to similarity for now).
+            hybrid_weights: ``(bm25, dense, sparse)`` weights for hybrid mode
+                (default ``(1.0, 1.0, 0.0)``).
+            k_per_stream: Per-stream candidate cap for hybrid mode.
 
         Returns:
             List of LangChain Document objects.
@@ -206,6 +228,14 @@ class MoonVectorStore(VectorStore):
             docs = store.similarity_search("machine learning", k=3)
             for doc in docs:
                 print(doc.page_content)
+
+            # Hybrid BM25 + dense
+            docs = store.similarity_search(
+                "auth crash",
+                k=5,
+                search_type="hybrid",
+                hybrid_weights=(1.0, 1.5, 0.0),
+            )
         """
         results = self.similarity_search_with_score(query, k=k, **kwargs)
         return [doc for doc, _ in results]
@@ -214,23 +244,74 @@ class MoonVectorStore(VectorStore):
         self,
         query: str,
         k: int = 4,
-        **kwargs: Any,
-    ) -> List[Tuple[Document, float]]:
+        *,
+        search_type: str = "similarity",
+        hybrid_weights: tuple[float, float, float] = (1.0, 1.0, 0.0),
+        k_per_stream: int | None = None,
+        **kwargs: Any,  # noqa: ANN401 -- LangChain VectorStore base contract
+    ) -> list[tuple[Document, float]]:
         """Search with relevance scores.
 
         Args:
             query: Query text.
             k: Number of results.
+            search_type: ``"similarity"`` (dense KNN, default), ``"hybrid"``
+                (BM25 + dense fused via RRF, server-side), or ``"mmr"``
+                (currently delegates to similarity — kept for API parity).
+            hybrid_weights: ``(w_bm25, w_dense, w_sparse)`` RRF weights when
+                ``search_type="hybrid"``. Default ``(1.0, 1.0, 0.0)`` excludes
+                the sparse stream. Validation (finite, non-negative, at least
+                one positive) is delegated to :class:`moondb.text.TextCommands`.
+            k_per_stream: Optional per-stream top-K override for hybrid mode.
 
         Returns:
-            List of (Document, score) tuples. Lower score = more similar.
+            List of (Document, score) tuples. Lower score = more similar for
+            ``"similarity"``; higher RRF score = more relevant for ``"hybrid"``.
+
+        Raises:
+            ValueError: If ``search_type`` is not one of
+                ``"similarity"`` / ``"hybrid"`` / ``"mmr"``, or if
+                ``hybrid_weights`` is malformed (delegated to TextCommands).
 
         Example::
 
             results = store.similarity_search_with_score("AI", k=5)
             for doc, score in results:
                 print(f"{score:.4f} {doc.page_content}")
+
+            # Hybrid mode
+            results = store.similarity_search_with_score(
+                "AI",
+                k=5,
+                search_type="hybrid",
+                hybrid_weights=(1.0, 1.5, 0.0),
+            )
         """
+        del kwargs  # Reserved for future LangChain base-class kwargs (filter, etc.)
+
+        if search_type in ("similarity", "mmr"):
+            # NOTE: MoonVectorStore does not currently implement an MMR-specific
+            # path; "mmr" delegates to dense KNN to preserve API parity with the
+            # LangChain VectorStore contract. Future work: integrate maximal
+            # marginal relevance reranking on the returned hits.
+            return self._similarity_search_with_score(query, k)
+
+        if search_type == "hybrid":
+            return self._hybrid_search_with_score(query, k, hybrid_weights, k_per_stream)
+
+        raise ValueError(
+            f"Unsupported search_type: {search_type!r}. Valid: "
+            f"{', '.join(repr(s) for s in _VALID_SEARCH_TYPES)}"
+        )
+
+    # -- Internal dispatchers -------------------------------------------------
+
+    def _similarity_search_with_score(
+        self,
+        query: str,
+        k: int,
+    ) -> list[tuple[Document, float]]:
+        """Dense KNN path (existing behavior — preserved verbatim)."""
         vector = self._embedding.embed_query(query)
 
         search_results = self._client.vector.search(
@@ -241,32 +322,89 @@ class MoonVectorStore(VectorStore):
             session_key=self._session_key,
         )
 
-        docs_and_scores: List[Tuple[Document, float]] = []
-        for sr in search_results:
-            content = sr.fields.get(self._content_field, "")
-            metadata: Dict[str, Any] = {"key": sr.key, "score": sr.score}
+        return [(self._sr_to_document(sr), sr.score) for sr in search_results]
 
-            # Extract metadata fields
-            for field_key, field_val in sr.fields.items():
-                if field_key.startswith(self._metadata_field):
-                    clean_key = field_key[len(self._metadata_field):]
-                    metadata[clean_key] = field_val
-                elif field_key != self._content_field:
-                    metadata[field_key] = field_val
+    def _hybrid_search_with_score(
+        self,
+        query: str,
+        k: int,
+        hybrid_weights: tuple[float, float, float],
+        k_per_stream: int | None,
+    ) -> list[tuple[Document, float]]:
+        """BM25 + dense [+ sparse] hybrid fused server-side via RRF."""
+        vector = self._embedding.embed_query(query)
+        hits: list[TextSearchHit] = self._client.text.hybrid_search(
+            self._index_name,
+            query,
+            vector=vector,
+            vector_field=self._vector_field,
+            weights=hybrid_weights,
+            k_per_stream=k_per_stream,
+            limit=k,
+        )
+        return [(self._hit_to_document(h), h.score) for h in hits]
 
-            docs_and_scores.append((
-                Document(page_content=content, metadata=metadata),
-                sr.score,
-            ))
+    # -- Hit -> Document converters ------------------------------------------
 
-        return docs_and_scores
+    def _split_metadata(
+        self,
+        fields: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, float]]:
+        """Strip ``content``, ``metadata_*`` prefix, and per-stream score fields.
+
+        Returns a ``(content, metadata, stream_hits)`` triple where:
+        - ``content`` is the page-content string (empty string if absent).
+        - ``metadata`` keys have any ``metadata_`` prefix stripped.
+        - ``stream_hits`` is the per-stream RRF score breakdown (empty if the
+          server emitted no ``__bm25_score__``/``__dense_score__``/
+          ``__sparse_score__`` markers).
+        """
+        content = ""
+        metadata: dict[str, Any] = {}
+        stream_hits: dict[str, float] = {}
+
+        for raw_key, raw_val in fields.items():
+            if raw_key == self._content_field:
+                content = str(raw_val) if raw_val is not None else ""
+                continue
+            if raw_key in _STREAM_FIELDS:
+                # Defensive: server should always emit floats here, but
+                # malformed input must not crash the adapter.
+                with contextlib.suppress(TypeError, ValueError):
+                    stream_hits[raw_key.strip("_").replace("_score", "")] = float(raw_val)
+                continue
+            if raw_key.startswith(self._metadata_field):
+                clean_key = raw_key[len(self._metadata_field):]
+                metadata[clean_key] = raw_val
+            else:
+                metadata[raw_key] = raw_val
+
+        return content, metadata, stream_hits
+
+    def _sr_to_document(self, sr: SearchResult) -> Document:
+        """Convert a vector-KNN :class:`SearchResult` to a LangChain Document."""
+        content, metadata, stream_hits = self._split_metadata(sr.fields)
+        metadata["key"] = sr.key
+        metadata["score"] = sr.score
+        if stream_hits:
+            metadata["stream_hits"] = stream_hits
+        return Document(page_content=content, metadata=metadata)
+
+    def _hit_to_document(self, hit: TextSearchHit) -> Document:
+        """Convert a hybrid/text :class:`TextSearchHit` to a LangChain Document."""
+        content, metadata, stream_hits = self._split_metadata(hit.fields)
+        metadata["key"] = hit.id
+        metadata["score"] = hit.score
+        if stream_hits:
+            metadata["stream_hits"] = stream_hits
+        return Document(page_content=content, metadata=metadata)
 
     def similarity_search_by_vector(
         self,
-        embedding: List[float],
+        embedding: list[float],
         k: int = 4,
-        **kwargs: Any,
-    ) -> List[Document]:
+        **kwargs: Any,  # noqa: ANN401 -- LangChain VectorStore base contract
+    ) -> list[Document]:
         """Search by raw embedding vector.
 
         Args:
@@ -288,10 +426,10 @@ class MoonVectorStore(VectorStore):
             session_key=self._session_key,
         )
 
-        docs: List[Document] = []
+        docs: list[Document] = []
         for sr in search_results:
             content = sr.fields.get(self._content_field, "")
-            metadata: Dict[str, Any] = {"key": sr.key, "score": sr.score}
+            metadata: dict[str, Any] = {"key": sr.key, "score": sr.score}
             for field_key, field_val in sr.fields.items():
                 if field_key.startswith(self._metadata_field):
                     metadata[field_key[len(self._metadata_field):]] = field_val
@@ -301,7 +439,54 @@ class MoonVectorStore(VectorStore):
 
         return docs
 
-    def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
+    def as_retriever(self, **kwargs: Any) -> BaseRetriever:  # noqa: ANN401 -- LangChain base contract
+        """Return a LangChain retriever wrapping this vector store.
+
+        Adds first-class support for ``search_type="hybrid"`` (which the
+        upstream LangChain ``VectorStoreRetriever`` rejects in its allowed-list
+        validator). For ``"similarity"`` / ``"mmr"`` /
+        ``"similarity_score_threshold"`` the call is forwarded to the base
+        implementation verbatim, preserving every existing API contract.
+
+        Args:
+            search_type: Optional retrieval mode. ``"similarity"`` (default),
+                ``"hybrid"`` (BM25+dense RRF via Moon), ``"mmr"``, or
+                ``"similarity_score_threshold"`` (handled upstream).
+            search_kwargs: Dict forwarded to ``similarity_search`` on each
+                ``invoke()`` — common keys are ``k``, ``hybrid_weights``,
+                ``k_per_stream``.
+
+        Returns:
+            A LangChain :class:`BaseRetriever`. For hybrid mode this is a
+            dedicated :class:`MoonHybridRetriever` that re-dispatches through
+            ``similarity_search(search_type="hybrid", ...)``.
+
+        Example::
+
+            retriever = store.as_retriever(
+                search_type="hybrid",
+                search_kwargs={"k": 5, "hybrid_weights": (1.0, 1.5, 0.0)},
+            )
+            docs = retriever.invoke("auth crash on startup")
+        """
+        search_type = kwargs.get("search_type", "similarity")
+        if search_type == "hybrid":
+            search_kwargs = dict(kwargs.get("search_kwargs") or {})
+            return MoonHybridRetriever(vectorstore=self, search_kwargs=search_kwargs)
+
+        if search_type not in ("similarity", "mmr", "similarity_score_threshold"):
+            raise ValueError(
+                f"Unsupported search_type: {search_type!r}. Valid: "
+                f"'similarity', 'hybrid', 'mmr', 'similarity_score_threshold'"
+            )
+
+        return super().as_retriever(**kwargs)
+
+    def delete(
+        self,
+        ids: list[str] | None = None,
+        **kwargs: Any,  # noqa: ANN401 -- LangChain VectorStore base contract
+    ) -> bool | None:
         """Delete documents by ID.
 
         Args:
@@ -324,12 +509,12 @@ class MoonVectorStore(VectorStore):
 
     @classmethod
     def from_texts(
-        cls: Type["MoonVectorStore"],
-        texts: List[str],
+        cls: type[MoonVectorStore],
+        texts: list[str],
         embedding: Embeddings,
-        metadatas: Optional[List[Dict[str, Any]]] = None,
-        **kwargs: Any,
-    ) -> "MoonVectorStore":
+        metadatas: list[dict[str, Any]] | None = None,
+        **kwargs: Any,  # noqa: ANN401 -- LangChain VectorStore base contract
+    ) -> MoonVectorStore:
         """Create a MoonVectorStore from texts (class method).
 
         Args:
@@ -353,3 +538,54 @@ class MoonVectorStore(VectorStore):
         store = cls(index_name=index_name, embedding=embedding, **kwargs)
         store.add_texts(texts, metadatas=metadatas)
         return store
+
+
+class MoonHybridRetriever(BaseRetriever):
+    """LangChain retriever that dispatches through Moon's hybrid search.
+
+    Returned by :meth:`MoonVectorStore.as_retriever` when
+    ``search_type="hybrid"`` is requested. Wraps the vector store so the
+    standard LangChain ``invoke()`` / ``ainvoke()`` API surfaces fused BM25 +
+    dense results with no extra wiring on the caller side.
+
+    The class deliberately mirrors :class:`langchain_core.vectorstores.base.VectorStoreRetriever`
+    in shape (``vectorstore``, ``search_kwargs`` fields) so downstream code that
+    inspects the retriever (e.g. for chain composition) keeps working.
+
+    Attributes:
+        vectorstore: The underlying :class:`MoonVectorStore`.
+        search_kwargs: Dict forwarded to ``similarity_search`` on each call.
+            Common keys: ``k``, ``hybrid_weights``, ``k_per_stream``.
+
+    Example::
+
+        retriever = store.as_retriever(
+            search_type="hybrid",
+            search_kwargs={"k": 5, "hybrid_weights": (1.0, 1.5, 0.0)},
+        )
+        docs = retriever.invoke("auth crash")
+    """
+
+    vectorstore: MoonVectorStore
+    search_kwargs: dict[str, Any] = {}
+
+    # Pydantic v2 model config (replaces deprecated class-based Config) —
+    # MoonVectorStore is not a pydantic model, so allow arbitrary types.
+    model_config = {"arbitrary_types_allowed": True}
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun,
+    ) -> list[Document]:
+        """Synchronous retrieval — re-dispatches through hybrid path."""
+        del run_manager  # callbacks are handled by the BaseRetriever wrapper
+        kwargs = dict(self.search_kwargs)
+        k = kwargs.pop("k", 4)
+        return self.vectorstore.similarity_search(
+            query,
+            k=k,
+            search_type="hybrid",
+            **kwargs,
+        )
