@@ -35,7 +35,8 @@ dependencies = [
 langchain = ["langchain-core>=0.3"]
 llamaindex = ["llama-index-core>=0.11"]
 numpy = ["numpy>=1.24"]
-all = ["moondb[langchain]", "moondb[llamaindex]", "moondb[numpy]"]
+examples = ["numpy>=1.24"]
+all = ["moondb[langchain]", "moondb[llamaindex]", "moondb[numpy]", "moondb[examples]"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
