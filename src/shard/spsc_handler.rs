@@ -1093,15 +1093,31 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(response);
         }
         #[cfg(feature = "text-index")]
-        ShardMessage::TextAggregate(_payload) => {
-            // Implemented in Plan 03 Task 3. The variant is declared in
-            // Task 1 so the enum compiles; this arm is filled in when the
-            // execute_local_partial handler lands.
-            let _ = _payload.reply_tx.send(crate::protocol::Frame::Error(
-                bytes::Bytes::from_static(
-                    b"ERR FT.AGGREGATE multi-shard dispatch not yet wired",
-                ),
-            ));
+        ShardMessage::TextAggregate(payload) => {
+            // FT.AGGREGATE PHASE 1 (Plan 03 D-05/D-07): run pipeline UP
+            // TO post-GROUPBY on this shard; ship encoded ShardPartial.
+            // The boxed payload is destructured into locals so guards can
+            // be dropped before `reply_tx.send()` — mirrors DocFreq /
+            // TextSearch arms above.
+            let crate::shard::dispatch::TextAggregatePayload {
+                index_name,
+                query,
+                pipeline,
+                reply_tx,
+            } = *payload;
+            let response = {
+                let text_guard = shard_databases.text_store(shard_id);
+                let db_guard = shard_databases.read_db(shard_id, 0);
+                crate::command::vector_search::ft_aggregate::execute_local_partial(
+                    &text_guard,
+                    &index_name,
+                    &query,
+                    &pipeline,
+                    &db_guard,
+                )
+                // guards dropped here at end of block
+            };
+            let _ = reply_tx.send(response);
         }
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");

@@ -1603,14 +1603,6 @@ mod tests {
     // Plan 03 — execute_local_full / execute_local_partial + codec
     // ==================================================================
 
-    fn count_reducer_spec(alias: &[u8]) -> ReducerSpec {
-        ReducerSpec {
-            fn_name: ReducerFn::Count,
-            field: None,
-            alias: Bytes::copy_from_slice(alias),
-        }
-    }
-
     fn parse_args_ok(pieces: &[&[u8]]) -> AggregateArgs {
         parse_aggregate_args(&args_from(pieces)).expect("parse ok")
     }
@@ -1887,5 +1879,137 @@ mod tests {
         assert!(decode_shard_partial(&bad).is_none());
         let bad2 = Frame::Array(FrameVec::from(vec![Frame::Integer(1)])); // missing group
         assert!(decode_shard_partial(&bad2).is_none());
+    }
+
+    // ==================================================================
+    // Plan 03 — Task 3: SPSC handler routing simulation
+    //
+    // The real SPSC match arm in `shard::spsc_handler::handle_shard_message_shared`
+    // destructures `ShardMessage::TextAggregate(payload)` and delegates to
+    // `execute_local_partial(&text_guard, ..., &db_guard)` with guards held
+    // across a synchronous block. These tests drive the same call path
+    // the arm takes, exercising the code the SPSC handler relies on.
+    // ==================================================================
+
+    #[test]
+    fn test_spsc_handler_routes_text_aggregate() {
+        // Simulate what the SPSC arm does: build a payload, invoke
+        // execute_local_partial with the store + db, decode the result.
+        let mut ts = TextStore::new();
+        let mut db = Database::new();
+        let mut idx = make_status_priority_index();
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:1",
+            &[(b"title", b"a"), (b"status", b"open")],
+        );
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:2",
+            &[(b"title", b"b"), (b"status", b"open")],
+        );
+        insert_doc(
+            &mut db,
+            &mut idx,
+            b"doc:3",
+            &[(b"title", b"c"), (b"status", b"closed")],
+        );
+        ts.create_index(Bytes::from_static(b"myidx"), idx).unwrap();
+
+        let parsed = parse_args_ok(&[
+            b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
+            b"count",
+        ]);
+
+        // Exactly what ShardMessage::TextAggregate arm delegates to:
+        let response = execute_local_partial(
+            &ts,
+            &parsed.index_name,
+            &parsed.query,
+            &parsed.pipeline,
+            &db,
+        );
+        let partial =
+            decode_shard_partial(&response).expect("SPSC arm must return decodable partial");
+        assert_eq!(partial.len(), 2);
+
+        // Sanity-check the counts per group.
+        let mut open = 0u64;
+        let mut closed = 0u64;
+        for (key, states) in &partial {
+            let n = match &states[0] {
+                PartialReducerState::Count(n) => *n,
+                other => panic!("expected Count, got {other:?}"),
+            };
+            match key[0].as_ref() {
+                b"open" => open = n,
+                b"closed" => closed = n,
+                other => panic!("unexpected status {other:?}"),
+            }
+        }
+        assert_eq!(open, 2);
+        assert_eq!(closed, 1);
+
+        // And also confirm that wrapping the exact arguments in a
+        // ShardMessage::TextAggregate payload preserves them — the boxed
+        // payload is what crosses the SPSC channel.
+        let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+        let msg = crate::shard::dispatch::ShardMessage::TextAggregate(Box::new(
+            crate::shard::dispatch::TextAggregatePayload {
+                index_name: parsed.index_name.clone(),
+                query: parsed.query.clone(),
+                pipeline: parsed.pipeline.clone(),
+                reply_tx,
+            },
+        ));
+        // Destructure as the arm does.
+        match msg {
+            crate::shard::dispatch::ShardMessage::TextAggregate(payload) => {
+                assert_eq!(payload.index_name, parsed.index_name);
+                assert_eq!(payload.query, parsed.query);
+                let _ = payload.reply_tx.send(response);
+            }
+            _ => panic!("expected TextAggregate"),
+        }
+        // The arm replies with the encoded partial; receiver sees it.
+        let got = reply_rx.try_recv().expect("reply received");
+        assert!(decode_shard_partial(&got).is_some());
+    }
+
+    #[test]
+    fn test_spsc_handler_text_aggregate_unknown_index() {
+        // Unknown index path — the SPSC arm must propagate the error
+        // Frame unchanged (no encoded partial).
+        let ts = TextStore::new();
+        let db = Database::new();
+
+        let parsed = parse_args_ok(&[
+            b"no_such_idx",
+            b"*",
+            b"GROUPBY",
+            b"1",
+            b"@f",
+            b"REDUCE",
+            b"COUNT",
+            b"0",
+            b"AS",
+            b"c",
+        ]);
+        let response = execute_local_partial(
+            &ts,
+            &parsed.index_name,
+            &parsed.query,
+            &parsed.pipeline,
+            &db,
+        );
+        match response {
+            Frame::Error(msg) => {
+                let s = std::str::from_utf8(&msg).unwrap();
+                assert!(s.contains("unknown index"), "got: {s}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 }
