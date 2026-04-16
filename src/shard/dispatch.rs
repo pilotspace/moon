@@ -652,9 +652,9 @@ mod tests {
                 assert_eq!(payload.query.as_ref(), b"*");
                 assert_eq!(payload.pipeline.len(), 3);
                 // Round-trip the reply channel to confirm the oneshot works.
-                let _ = payload.reply_tx.send(Frame::SimpleString(
-                    bytes::Bytes::from_static(b"OK"),
-                ));
+                let _ = payload
+                    .reply_tx
+                    .send(Frame::SimpleString(bytes::Bytes::from_static(b"OK")));
             }
             _ => panic!("expected TextAggregate variant"),
         }

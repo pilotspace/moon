@@ -643,9 +643,7 @@ pub fn execute_local_partial(
 
     // Find the (single) GroupBy step. v1 grammar allows at most one.
     let gb = pipeline.iter().find_map(|s| match s {
-        AggregateStep::GroupBy { fields, reducers } => {
-            Some((fields.to_vec(), reducers.clone()))
-        }
+        AggregateStep::GroupBy { fields, reducers } => Some((fields.to_vec(), reducers.clone())),
         _ => None,
     });
     let (gb_fields, gb_reducers) = match gb {
@@ -860,20 +858,26 @@ fn decode_partial_state(items: &[Frame], i: &mut usize) -> Option<PartialReducer
             let v_bytes = as_bytes(items.get(*i)?)?;
             *i += 1;
             let v: f64 = std::str::from_utf8(&v_bytes).ok()?.parse().ok()?;
-            Some(PartialReducerState::Min(Some(ordered_float::OrderedFloat(v))))
+            Some(PartialReducerState::Min(Some(ordered_float::OrderedFloat(
+                v,
+            ))))
         }
         b"MIN_NONE" => Some(PartialReducerState::Min(None)),
         b"MAX" => {
             let v_bytes = as_bytes(items.get(*i)?)?;
             *i += 1;
             let v: f64 = std::str::from_utf8(&v_bytes).ok()?.parse().ok()?;
-            Some(PartialReducerState::Max(Some(ordered_float::OrderedFloat(v))))
+            Some(PartialReducerState::Max(Some(ordered_float::OrderedFloat(
+                v,
+            ))))
         }
         b"MAX_NONE" => Some(PartialReducerState::Max(None)),
         b"HLL" => {
             let b = as_bytes(items.get(*i)?)?;
             *i += 1;
-            Hll::from_bytes(b).ok().map(PartialReducerState::CountDistinct)
+            Hll::from_bytes(b)
+                .ok()
+                .map(PartialReducerState::CountDistinct)
         }
         _ => None,
     }
@@ -1822,13 +1826,14 @@ mod tests {
 
     #[test]
     fn test_shard_partial_roundtrip_min_max_with_none() {
-        let mk_group = |state: PartialReducerState| -> (GroupKey, SmallVec<[PartialReducerState; 4]>) {
-            let mut k: GroupKey = SmallVec::new();
-            k.push(Bytes::from_static(b"k"));
-            let mut v: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
-            v.push(state);
-            (k, v)
-        };
+        let mk_group =
+            |state: PartialReducerState| -> (GroupKey, SmallVec<[PartialReducerState; 4]>) {
+                let mut k: GroupKey = SmallVec::new();
+                k.push(Bytes::from_static(b"k"));
+                let mut v: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+                v.push(state);
+                (k, v)
+            };
 
         let cases = vec![
             PartialReducerState::Min(None),

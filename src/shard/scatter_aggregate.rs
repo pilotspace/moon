@@ -27,9 +27,7 @@ use crate::runtime::channel;
 use crate::shard::coordinator::spsc_send;
 use crate::shard::dispatch::{ShardMessage, TextAggregatePayload};
 use crate::shard::shared_databases::ShardDatabases;
-use crate::text::aggregate::{
-    AggregateStep, ShardPartial, execute_pipeline, merge_partial_states,
-};
+use crate::text::aggregate::{AggregateStep, ShardPartial, execute_pipeline, merge_partial_states};
 
 /// Entry point for multi-shard FT.AGGREGATE.
 ///
@@ -132,9 +130,7 @@ pub async fn scatter_text_aggregate(
 
     // ─── Phase 2: merge + global SORTBY/LIMIT per D-07 ────────────────────
     let (groupby_fields, reducers) = match pipeline.iter().find_map(|s| match s {
-        AggregateStep::GroupBy { fields, reducers } => {
-            Some((fields.to_vec(), reducers.clone()))
-        }
+        AggregateStep::GroupBy { fields, reducers } => Some((fields.to_vec(), reducers.clone())),
         _ => None,
     }) {
         Some(gb) => gb,
@@ -152,7 +148,12 @@ pub async fn scatter_text_aggregate(
     // APPLY is rejected at parse time so it never reaches here.
     let post_pipeline: Vec<AggregateStep> = pipeline
         .iter()
-        .filter(|s| matches!(s, AggregateStep::SortBy { .. } | AggregateStep::Limit { .. }))
+        .filter(|s| {
+            matches!(
+                s,
+                AggregateStep::SortBy { .. } | AggregateStep::Limit { .. }
+            )
+        })
         .cloned()
         .collect();
     let final_rows = match execute_pipeline(merged_rows, &post_pipeline) {
@@ -171,12 +172,13 @@ pub async fn scatter_text_aggregate(
 fn try_decode_partial_or_error(frame: &Frame) -> Result<ShardPartial, Frame> {
     match frame {
         Frame::Error(_) => Err(frame.clone()),
-        _ => crate::command::vector_search::ft_aggregate::decode_shard_partial(frame)
-            .ok_or_else(|| {
+        _ => crate::command::vector_search::ft_aggregate::decode_shard_partial(frame).ok_or_else(
+            || {
                 Frame::Error(Bytes::from_static(
                     b"ERR FT.AGGREGATE shard returned malformed partial state",
                 ))
-            }),
+            },
+        ),
     }
 }
 
@@ -186,9 +188,7 @@ mod tests {
 
     use smallvec::SmallVec;
 
-    use crate::command::vector_search::ft_aggregate::{
-        decode_shard_partial, encode_shard_partial,
-    };
+    use crate::command::vector_search::ft_aggregate::{decode_shard_partial, encode_shard_partial};
     #[cfg(feature = "runtime-tokio")]
     use crate::storage::Database;
     use crate::text::aggregate::{
@@ -367,11 +367,8 @@ mod tests {
             alias: Bytes::from_static(b"cnt"),
         }];
 
-        let merged = crate::text::aggregate::merge_partial_states(
-            vec![p0, p1],
-            &gb_fields_v,
-            &reducers,
-        );
+        let merged =
+            crate::text::aggregate::merge_partial_states(vec![p0, p1], &gb_fields_v, &reducers);
         assert_eq!(merged.len(), 2);
 
         let mut open = None;
