@@ -15,10 +15,11 @@ use super::{extract_bulk, matches_keyword, parse_u32};
 /// args[0] = index_name, args[1..] = ON HASH PREFIX ... SCHEMA ...
 pub fn ft_create(
     store: &mut VectorStore,
-    _text_store: &mut crate::text::store::TextStore,
+    text_store: &mut crate::text::store::TextStore,
     args: &[Frame],
 ) -> Frame {
-    if args.len() < 10 {
+    // Relaxed: TEXT-only indexes need fewer args (e.g., FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA title TEXT = 9 args)
+    if args.len() < 8 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.CREATE' command",
         ));
@@ -55,9 +56,44 @@ pub fn ft_create(
         }
     }
 
-    // Parse SCHEMA — supports multiple VECTOR field definitions:
-    //   field_name VECTOR HNSW num_params [key value ...]
-    //   field_name2 VECTOR HNSW num_params [key value ...]
+    // Parse optional BM25 parameters before SCHEMA keyword
+    let mut bm25_k1: f32 = 1.2;
+    let mut bm25_b: f32 = 0.75;
+    while pos < args.len() && !matches_keyword(&args[pos], b"SCHEMA") {
+        if matches_keyword(&args[pos], b"BM25_K1") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR BM25_K1 requires a value"));
+            }
+            bm25_k1 = match extract_bulk(&args[pos])
+                .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f32>().ok()))
+            {
+                Some(v) if v >= 0.0 => v,
+                _ => return Frame::Error(Bytes::from_static(b"ERR invalid BM25_K1 value")),
+            };
+            pos += 1;
+        } else if matches_keyword(&args[pos], b"BM25_B") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR BM25_B requires a value"));
+            }
+            bm25_b = match extract_bulk(&args[pos])
+                .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f32>().ok()))
+            {
+                Some(v) if (0.0..=1.0).contains(&v) => v,
+                _ => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR invalid BM25_B value (must be 0.0-1.0)",
+                    ));
+                }
+            };
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Parse SCHEMA — supports VECTOR, SPARSE, and TEXT field definitions
     if pos >= args.len() || !matches_keyword(&args[pos], b"SCHEMA") {
         return Frame::Error(Bytes::from_static(b"ERR expected SCHEMA"));
     }
@@ -65,6 +101,7 @@ pub fn ft_create(
 
     let mut vector_fields: Vec<VectorFieldMeta> = Vec::new();
     let mut sparse_field_defs: Vec<(Bytes, u32)> = Vec::new();
+    let mut text_field_defs: Vec<crate::text::types::TextFieldDef> = Vec::new();
     // Index-level HNSW params from the first field (backward compat)
     let mut first_hnsw_m: u32 = 16;
     let mut first_hnsw_ef_construction: u32 = 200;
@@ -100,9 +137,57 @@ pub fn ft_create(
             continue;
         }
 
+        // Check for TEXT field type (must come before VECTOR check)
+        if pos < args.len() && matches_keyword(&args[pos], b"TEXT") {
+            pos += 1;
+            let mut weight: f64 = 1.0;
+            let mut nostem = false;
+            let mut sortable = false;
+            let mut noindex = false;
+
+            // Parse optional TEXT modifiers: WEIGHT <val>, NOSTEM, SORTABLE, NOINDEX
+            while pos < args.len() {
+                if matches_keyword(&args[pos], b"WEIGHT") {
+                    pos += 1;
+                    if pos >= args.len() {
+                        return Frame::Error(Bytes::from_static(b"ERR WEIGHT requires a value"));
+                    }
+                    weight = match extract_bulk(&args[pos]).and_then(|b| {
+                        std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f64>().ok())
+                    }) {
+                        Some(w) if w > 0.0 => w,
+                        _ => {
+                            return Frame::Error(Bytes::from_static(b"ERR invalid WEIGHT value"));
+                        }
+                    };
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"NOSTEM") {
+                    nostem = true;
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"SORTABLE") {
+                    sortable = true;
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"NOINDEX") {
+                    noindex = true;
+                    pos += 1;
+                } else {
+                    break; // Next token is a new field name
+                }
+            }
+
+            text_field_defs.push(crate::text::types::TextFieldDef {
+                field_name,
+                weight,
+                nostem,
+                sortable,
+                noindex,
+            });
+            continue;
+        }
+
         if pos >= args.len() || !matches_keyword(&args[pos], b"VECTOR") {
             return Frame::Error(Bytes::from_static(
-                b"ERR expected VECTOR or SPARSE after field name",
+                b"ERR expected VECTOR, SPARSE, or TEXT after field name",
             ));
         }
         pos += 1;
@@ -159,16 +244,63 @@ pub fn ft_create(
         }
     }
 
-    if vector_fields.is_empty() && sparse_field_defs.is_empty() {
+    if vector_fields.is_empty() && sparse_field_defs.is_empty() && text_field_defs.is_empty() {
         return Frame::Error(Bytes::from_static(
-            b"ERR at least one VECTOR or SPARSE field is required in SCHEMA",
+            b"ERR at least one VECTOR, SPARSE, or TEXT field is required in SCHEMA",
         ));
     }
-    // If only SPARSE fields, we still need a dummy VECTOR field for the index structure
+
+    // TEXT-only index: create TextIndex without VectorIndex
+    if vector_fields.is_empty() && !text_field_defs.is_empty() {
+        #[cfg(feature = "text-index")]
+        {
+            let bm25_config = crate::text::types::BM25Config {
+                k1: bm25_k1,
+                b: bm25_b,
+            };
+            let text_index = crate::text::store::TextIndex::new(
+                index_name.clone(),
+                prefixes,
+                text_field_defs,
+                bm25_config,
+            );
+            if let Err(e) = text_store.create_index(index_name, text_index) {
+                let mut buf = Vec::with_capacity(4 + e.len());
+                buf.extend_from_slice(b"ERR ");
+                buf.extend_from_slice(e.as_bytes());
+                return Frame::Error(Bytes::from(buf));
+            }
+            return Frame::SimpleString(Bytes::from_static(b"OK"));
+        }
+        #[cfg(not(feature = "text-index"))]
+        {
+            let _ = (text_store, text_field_defs, bm25_k1, bm25_b, prefixes, index_name);
+            return Frame::Error(Bytes::from_static(
+                b"ERR TEXT fields require the text-index feature",
+            ));
+        }
+    }
+
+    // If only SPARSE fields (no VECTOR and no TEXT), we still need a VECTOR field
     if vector_fields.is_empty() {
         return Frame::Error(Bytes::from_static(
             b"ERR at least one VECTOR field is required in SCHEMA (SPARSE fields are supplementary)",
         ));
+    }
+
+    // Build schema_fields for mixed-type indexes (TEXT + VECTOR)
+    let mut schema_fields = Vec::new();
+    for vf in &vector_fields {
+        schema_fields.push(crate::vector::store::FieldType::Vector(vf.clone()));
+    }
+    for tf in &text_field_defs {
+        schema_fields.push(crate::vector::store::FieldType::Text {
+            field_name: tf.field_name.clone(),
+            weight: tf.weight,
+            nostem: tf.nostem,
+            sortable: tf.sortable,
+            noindex: tf.noindex,
+        });
     }
 
     // Build IndexMeta from the first (default) field for backward compatibility
@@ -183,11 +315,11 @@ pub fn ft_create(
         hnsw_ef_runtime: first_hnsw_ef_runtime,
         compact_threshold: first_compact_threshold,
         source_field: default_field.field_name.clone(),
-        key_prefixes: prefixes,
+        key_prefixes: prefixes.clone(),
         quantization: default_field.quantization,
         build_mode: default_field.build_mode,
         vector_fields,
-        schema_fields: Vec::new(),
+        schema_fields,
     };
 
     let index_name_clone = meta.name.clone();
@@ -202,6 +334,24 @@ pub fn ft_create(
                             crate::vector::sparse::store::SparseStore::new(max_dim),
                         );
                     }
+                }
+            }
+            // Create TextIndex for mixed TEXT+VECTOR indexes
+            #[cfg(feature = "text-index")]
+            if !text_field_defs.is_empty() {
+                let bm25_config = crate::text::types::BM25Config {
+                    k1: bm25_k1,
+                    b: bm25_b,
+                };
+                let text_index = crate::text::store::TextIndex::new(
+                    index_name_clone.clone(),
+                    prefixes,
+                    text_field_defs,
+                    bm25_config,
+                );
+                if let Err(e) = text_store.create_index(index_name_clone.clone(), text_index) {
+                    // Log but don't fail — vector index already created
+                    tracing::warn!("Failed to create text index: {}", e);
                 }
             }
             crate::vector::metrics::increment_indexes();

@@ -10,7 +10,7 @@ use super::extract_bulk;
 /// FT.DROPINDEX index_name
 pub fn ft_dropindex(
     store: &mut VectorStore,
-    _text_store: &mut crate::text::store::TextStore,
+    text_store: &mut crate::text::store::TextStore,
     args: &[Frame],
 ) -> Frame {
     if args.len() != 1 {
@@ -22,8 +22,12 @@ pub fn ft_dropindex(
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
     };
-    if store.drop_index(&name) {
+    let vector_dropped = store.drop_index(&name);
+    let text_dropped = text_store.drop_index(&name);
+    if vector_dropped {
         crate::vector::metrics::decrement_indexes();
+    }
+    if vector_dropped || text_dropped {
         Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
         Frame::Error(Bytes::from_static(b"Unknown Index name"))

@@ -14,7 +14,7 @@ use super::{extract_bulk, helpers::metric_to_bytes, helpers::quantization_to_byt
 /// a `vector_fields` nested array with per-field stats.
 pub fn ft_info(
     store: &VectorStore,
-    _text_store: &crate::text::store::TextStore,
+    text_store: &crate::text::store::TextStore,
     args: &[Frame],
 ) -> Frame {
     if args.len() != 1 {
@@ -28,7 +28,13 @@ pub fn ft_info(
     };
     let idx = match store.get_index(&name) {
         Some(i) => i,
-        None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+        None => {
+            // Check TextStore for TEXT-only indexes
+            if let Some(text_idx) = text_store.get_index(&name) {
+                return ft_info_text_only(text_idx);
+            }
+            return Frame::Error(Bytes::from_static(b"Unknown Index name"));
+        }
     };
 
     // Count default field docs across mutable + immutable segments.
@@ -129,6 +135,50 @@ pub fn ft_info(
     }
 
     items.push(Frame::BulkString(Bytes::from_static(b"vector_fields")));
+    items.push(Frame::Array(field_entries.into()));
+
+    Frame::Array(items.into())
+}
+
+/// Basic FT.INFO response for TEXT-only indexes.
+///
+/// Returns index_name, num_docs, num_terms, and text_fields schema.
+/// Full implementation with per-field stats is in Plan 03 (IDX-05).
+fn ft_info_text_only(idx: &crate::text::store::TextIndex) -> Frame {
+    let mut items = vec![
+        Frame::BulkString(Bytes::from_static(b"index_name")),
+        Frame::BulkString(idx.name.clone()),
+        Frame::BulkString(Bytes::from_static(b"index_definition")),
+        Frame::Array(
+            vec![
+                Frame::BulkString(Bytes::from_static(b"key_type")),
+                Frame::BulkString(Bytes::from_static(b"HASH")),
+            ]
+            .into(),
+        ),
+        Frame::BulkString(Bytes::from_static(b"num_docs")),
+        Frame::Integer(idx.num_docs() as i64),
+        Frame::BulkString(Bytes::from_static(b"num_terms")),
+        Frame::Integer(idx.num_terms() as i64),
+    ];
+
+    // Text fields schema
+    let mut field_entries: Vec<Frame> = Vec::with_capacity(idx.text_fields.len());
+    for tf in &idx.text_fields {
+        let mut score_buf = String::with_capacity(8);
+        use std::fmt::Write;
+        let _ = write!(score_buf, "{}", tf.weight);
+        let entry = vec![
+            Frame::BulkString(Bytes::from_static(b"field_name")),
+            Frame::BulkString(tf.field_name.clone()),
+            Frame::BulkString(Bytes::from_static(b"type")),
+            Frame::BulkString(Bytes::from_static(b"TEXT")),
+            Frame::BulkString(Bytes::from_static(b"WEIGHT")),
+            Frame::BulkString(Bytes::from(score_buf)),
+        ];
+        field_entries.push(Frame::Array(entry.into()));
+    }
+    items.push(Frame::BulkString(Bytes::from_static(b"text_fields")));
     items.push(Frame::Array(field_entries.into()));
 
     Frame::Array(items.into())

@@ -14,7 +14,7 @@ use super::extract_bulk;
 /// args[0] = SET|GET, args[1] = index_name, args[2] = param_name, args[3] = value (SET only)
 pub fn ft_config(
     store: &mut VectorStore,
-    _text_store: &mut crate::text::store::TextStore,
+    text_store: &mut crate::text::store::TextStore,
     args: &[Frame],
 ) -> Frame {
     if args.len() < 3 {
@@ -43,9 +43,9 @@ pub fn ft_config(
             Some(b) => b,
             None => return Frame::Error(Bytes::from_static(b"ERR invalid value")),
         };
-        ft_config_set(store, &index_name, &param_name, &value)
+        ft_config_set(store, text_store, &index_name, &param_name, &value)
     } else if subcommand.eq_ignore_ascii_case(b"GET") {
-        ft_config_get(store, &index_name, &param_name)
+        ft_config_get(store, text_store, &index_name, &param_name)
     } else {
         Frame::Error(Bytes::from_static(
             b"ERR FT.CONFIG subcommand must be SET or GET",
@@ -53,7 +53,41 @@ pub fn ft_config(
     }
 }
 
-fn ft_config_set(store: &mut VectorStore, index_name: &[u8], param: &[u8], value: &[u8]) -> Frame {
+fn ft_config_set(
+    store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    index_name: &[u8],
+    param: &[u8],
+    value: &[u8],
+) -> Frame {
+    // BM25 parameters route to TextStore
+    if param.eq_ignore_ascii_case(b"BM25_K1") || param.eq_ignore_ascii_case(b"BM25_B") {
+        let text_idx = match text_store.get_index_mut(index_name) {
+            Some(i) => i,
+            None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+        };
+        let parsed: f32 = match std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            Some(v) => v,
+            None => return Frame::Error(Bytes::from_static(b"ERR invalid numeric value")),
+        };
+        if param.eq_ignore_ascii_case(b"BM25_K1") {
+            if parsed < 0.0 {
+                return Frame::Error(Bytes::from_static(b"ERR BM25_K1 must be >= 0.0"));
+            }
+            text_idx.bm25_config.k1 = parsed;
+        } else {
+            if !(0.0..=1.0).contains(&parsed) {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR BM25_B must be between 0.0 and 1.0",
+                ));
+            }
+            text_idx.bm25_config.b = parsed;
+        }
+        return Frame::SimpleString(Bytes::from_static(b"OK"));
+    }
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
@@ -79,7 +113,28 @@ fn ft_config_set(store: &mut VectorStore, index_name: &[u8], param: &[u8], value
     }
 }
 
-fn ft_config_get(store: &mut VectorStore, index_name: &[u8], param: &[u8]) -> Frame {
+fn ft_config_get(
+    store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    index_name: &[u8],
+    param: &[u8],
+) -> Frame {
+    // BM25 parameters route to TextStore
+    if param.eq_ignore_ascii_case(b"BM25_K1") || param.eq_ignore_ascii_case(b"BM25_B") {
+        let text_idx = match text_store.get_index(index_name) {
+            Some(i) => i,
+            None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
+        };
+        let val = if param.eq_ignore_ascii_case(b"BM25_K1") {
+            text_idx.bm25_config.k1
+        } else {
+            text_idx.bm25_config.b
+        };
+        let mut buf = String::with_capacity(8);
+        use std::fmt::Write;
+        let _ = write!(buf, "{val}");
+        return Frame::BulkString(Bytes::from(buf));
+    }
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
