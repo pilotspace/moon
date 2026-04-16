@@ -1396,6 +1396,8 @@ mod tests {
             &shard_databases,
             &dispatch_tx,
             &notifiers,
+            None, // highlight_opts
+            None, // summarize_opts
         )
         .await;
 
