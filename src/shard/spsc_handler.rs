@@ -224,7 +224,10 @@ pub(crate) fn handle_shard_message_shared(
                     // Only acquire write lock when SESSION keyword is present.
                     // FT.NAVIGATE internally calls ft_search which may use SESSION.
                     // FT.RECOMMEND always needs Database access (reads hash keys).
+                    // FT.AGGREGATE materialises rows from the hash store (Phase 152,
+                    // Plan 02 — reads @field values per doc).
                     let needs_db = cmd.eq_ignore_ascii_case(b"FT.RECOMMEND")
+                        || cmd.eq_ignore_ascii_case(b"FT.AGGREGATE")
                         || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
                             || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
                             && has_session_keyword(&command));
@@ -1172,6 +1175,26 @@ pub(crate) fn dispatch_vector_command(
         vector_search::ft_list(vector_store)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
         vector_search::ft_compact(vector_store, text_store, args)
+    } else if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+        // FT.AGGREGATE (Phase 152, Plan 02) — linear else-if branch per W8.
+        // D-19's phf reference is superseded by the established FT.* dispatch
+        // pattern in RESEARCH §ARM. FT.AGGREGATE needs Database access to
+        // materialise rows from the hash store (see `needs_db` gate above).
+        #[cfg(feature = "text-index")]
+        {
+            match db.as_deref() {
+                Some(db_ref) => vector_search::ft_aggregate(vector_store, text_store, args, db_ref),
+                None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                    b"ERR FT.AGGREGATE requires Database access",
+                )),
+            }
+        }
+        #[cfg(not(feature = "text-index"))]
+        {
+            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR FT.AGGREGATE requires text-index feature",
+            ))
+        }
     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
         vector_search::ft_config(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {

@@ -25,6 +25,8 @@ pub mod session;
 
 // Re-export public APIs so callers can use `vector_search::ft_create(...)` etc.
 pub use ft_admin::{ft_compact, ft_dropindex, ft_list};
+#[cfg(feature = "text-index")]
+pub use ft_aggregate::ft_aggregate;
 pub use ft_config::ft_config;
 pub use ft_create::ft_create;
 pub use ft_info::ft_info;
