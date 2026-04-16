@@ -983,6 +983,10 @@ pub(crate) fn handle_shard_message_shared(
             // After scoring, apply HIGHLIGHT/SUMMARIZE post-processing if requested.
             // Each shard applies post-processing to its own results using its local hash store
             // (direct access — no cross-shard reads needed, no .await — safe to hold guards).
+            //
+            // query_terms is Vec<QueryTerm> — fuzzy/prefix terms use the OR-union expansion path.
+            // Extract plain strings for HIGHLIGHT/SUMMARIZE (needs analyzed term text only).
+            let term_strings: Vec<String> = query_terms.iter().map(|qt| qt.text.clone()).collect();
             let response = {
                 let text_guard = shard_databases.text_store(shard_id);
                 match text_guard.get_index(&index_name) {
@@ -1005,7 +1009,7 @@ pub(crate) fn handle_shard_message_shared(
                             let db_guard = shard_databases.read_db(shard_id, 0);
                             crate::command::vector_search::ft_text_search::apply_post_processing(
                                 &mut result,
-                                &query_terms,
+                                &term_strings,
                                 text_index,
                                 &*db_guard,
                                 highlight_opts.as_ref(),
@@ -1161,7 +1165,7 @@ pub(crate) fn dispatch_vector_command(
     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
         vector_search::ft_list(vector_store)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-        vector_search::ft_compact(vector_store, args)
+        vector_search::ft_compact(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
         vector_search::ft_config(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {

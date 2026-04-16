@@ -872,7 +872,7 @@ pub async fn broadcast_vector_command(
 /// **before** any `.await` point — required by RESEARCH Pitfall 2.
 pub async fn scatter_text_search(
     index_name: Bytes,
-    query_terms: Vec<String>,
+    query_terms: Vec<crate::command::vector_search::QueryTerm>,
     field_idx: Option<usize>,
     top_k: usize,
     offset: usize,
@@ -885,6 +885,9 @@ pub async fn scatter_text_search(
     highlight_opts: Option<crate::command::vector_search::HighlightOpts>,
     summarize_opts: Option<crate::command::vector_search::SummarizeOpts>,
 ) -> Frame {
+    // Extract plain term strings for DocFreq phase (only needs term text, not modifiers).
+    let term_strings: Vec<String> = query_terms.iter().map(|qt| qt.text.clone()).collect();
+
     // ── Single-shard fast path (per D-06) ────────────────────────────────────
     if num_shards == 1 {
         // Local IDF is globally accurate with one shard — skip DFS pre-pass.
@@ -906,7 +909,7 @@ pub async fn scatter_text_search(
                     let db_guard = shard_databases.read_db(my_shard, 0);
                     crate::command::vector_search::ft_text_search::apply_post_processing(
                         &mut r,
-                        &query_terms,
+                        &term_strings,
                         text_index,
                         &*db_guard,
                         highlight_opts.as_ref(),
@@ -922,7 +925,8 @@ pub async fn scatter_text_search(
 
     // ── Phase 1: scatter DocFreq to all shards ────────────────────────────────
     // Collect (term, df, N) from each shard to build global IDF weights.
-    let field_queries = vec![(field_idx, query_terms.clone())];
+    // DocFreq only needs term strings (not modifiers) for df lookup.
+    let field_queries = vec![(field_idx, term_strings.clone())];
     let mut doc_freq_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
     let mut local_doc_freq: Option<Frame> = None;
@@ -1011,7 +1015,7 @@ pub async fn scatter_text_search(
                             let db_guard = shard_databases.read_db(shard_id, 0);
                             crate::command::vector_search::ft_text_search::apply_post_processing(
                                 &mut r,
-                                &query_terms,
+                                &term_strings,
                                 text_index,
                                 &*db_guard,
                                 highlight_opts.as_ref(),
@@ -1030,6 +1034,7 @@ pub async fn scatter_text_search(
             let msg = ShardMessage::TextSearch {
                 index_name: index_name.clone(),
                 field_idx,
+                // Send full QueryTerm so remote shard applies the same expansion.
                 query_terms: query_terms.clone(),
                 global_df: global_df.clone(),
                 global_n,
@@ -1386,7 +1391,11 @@ mod tests {
 
         let result = scatter_text_search(
             Bytes::from_static(b"nonexistent_index"),
-            vec!["machine".to_owned()],
+            vec![crate::command::vector_search::QueryTerm {
+                text: "machine".to_owned(),
+                #[cfg(feature = "text-index")]
+                modifier: crate::text::store::TermModifier::Exact,
+            }],
             None, // cross-field
             10,
             0,

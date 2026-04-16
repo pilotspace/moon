@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::text::store::{TextIndex, TextSearchResult, TextStore};
+#[cfg(feature = "text-index")]
+use crate::text::store::TermModifier;
 
 use super::{extract_bulk, parse_limit_clause};
 
@@ -887,6 +889,27 @@ fn rebuild_fields_with_replacements(fields_frame: &mut Frame, replacements: &[(B
 
 // ─── Query clause ────────────────────────────────────────────────────────────
 
+/// A query term with its expansion modifier (per D-17).
+///
+/// Exact terms are fully analyzed (lowercase + NFKD + stem).
+/// Fuzzy/Prefix terms are only lowercased + NFKD (NO stemming, per D-06/D-07).
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone)]
+pub struct QueryTerm {
+    /// Analyzed (possibly stemmed) text.
+    pub text: String,
+    /// Expansion modifier (Exact, Fuzzy(distance), or Prefix).
+    pub modifier: TermModifier,
+}
+
+/// A query term used when the text-index feature is disabled.
+/// Falls back to a simple string wrapper so handlers compile without the feature.
+#[cfg(not(feature = "text-index"))]
+#[derive(Debug, Clone)]
+pub struct QueryTerm {
+    pub text: String,
+}
+
 /// Parsed text query: an optional field target + analyzed (stemmed) query terms.
 ///
 /// `field_name = None` means cross-field search (all non-NOINDEX TEXT fields).
@@ -895,8 +918,8 @@ fn rebuild_fields_with_replacements(fields_frame: &mut Frame, replacements: &[(B
 pub struct TextQueryClause {
     /// Target field name (from `@field:(terms)` syntax), or None for all fields.
     pub field_name: Option<Bytes>,
-    /// Analyzed (tokenized + stemmed + stop-word filtered) query terms.
-    pub terms: Vec<String>,
+    /// Analyzed query terms with per-term expansion modifiers.
+    pub terms: Vec<QueryTerm>,
 }
 
 // ─── Query detection ─────────────────────────────────────────────────────────
@@ -952,6 +975,89 @@ pub fn parse_text_query(
     }
 }
 
+/// Detect fuzzy (`%%term%%`) or prefix (`term*`) modifier BEFORE running analyzer.
+///
+/// Per D-16: strip modifiers, return (inner_text, modifier).
+/// Counting: 1 `%` on each side = distance 1, 2 = distance 2, 3 = distance 3 (max per D-03).
+/// A bare `*` (no prefix text) is not a prefix query — returned as Exact.
+/// Empty inner text after stripping is returned as Exact.
+#[cfg(feature = "text-index")]
+fn detect_modifier(token: &str) -> (&str, TermModifier) {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() {
+        return (token, TermModifier::Exact);
+    }
+    // Count leading '%'
+    let mut leading = 0usize;
+    while leading < bytes.len() && bytes[leading] == b'%' {
+        leading += 1;
+    }
+    // Count trailing '%'
+    let mut trailing = 0usize;
+    while trailing < bytes.len().saturating_sub(leading) && bytes[bytes.len() - 1 - trailing] == b'%' {
+        trailing += 1;
+    }
+    let dist = leading.min(trailing).min(3) as u8;
+    if dist > 0 && leading + trailing < bytes.len() {
+        let inner = &token[leading..token.len() - trailing];
+        if inner.is_empty() {
+            return (token, TermModifier::Exact);
+        }
+        return (inner, TermModifier::Fuzzy(dist));
+    }
+    // Check for prefix: trailing '*' with non-empty prefix text.
+    // A bare '*' (only character) is match-all, not prefix — return Exact.
+    if token.len() > 1 && token.ends_with('*') {
+        return (&token[..token.len() - 1], TermModifier::Prefix);
+    }
+    (token, TermModifier::Exact)
+}
+
+/// Tokenize query with modifier detection per D-16/D-17.
+///
+/// Split on whitespace, detect `%%` and `*` modifiers on each raw token,
+/// then analyze:
+/// - Exact tokens → full analyzer pipeline (lowercase + NFKD + stem + stop words)
+/// - Fuzzy/Prefix tokens → lowercase + NFKD only (NO stemming per D-06/D-07)
+#[cfg(feature = "text-index")]
+fn tokenize_with_modifiers(
+    text_str: &str,
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+) -> Vec<QueryTerm> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut result = Vec::new();
+    for raw_token in text_str.split_whitespace() {
+        let (inner, modifier) = detect_modifier(raw_token);
+        if inner.is_empty() {
+            continue;
+        }
+        match modifier {
+            TermModifier::Exact => {
+                // Full analyzer pipeline (lowercase + NFKD + stem + stop words)
+                let tokens = analyzer.tokenize_with_positions(inner);
+                for (term, _) in tokens {
+                    result.push(QueryTerm {
+                        text: term,
+                        modifier: TermModifier::Exact,
+                    });
+                }
+            }
+            TermModifier::Fuzzy(_) | TermModifier::Prefix => {
+                // Lowercase + NFKD only (NO stemming per D-06/D-07)
+                let lowered = inner.to_lowercase();
+                let normalized: String = lowered.nfkd().collect();
+                if !normalized.is_empty() {
+                    result.push(QueryTerm {
+                        text: normalized,
+                        modifier,
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Parse `@field:(terms)` or `@field:terms` syntax.
 fn parse_field_targeted_query(
     query: &[u8],
@@ -985,13 +1091,7 @@ fn parse_field_targeted_query(
         Err(_) => return Err("ERR invalid UTF-8 in query"),
     };
 
-    let tokens = analyzer.tokenize_with_positions(text_str);
-    if tokens.is_empty() {
-        return Err("ERR empty query after analysis");
-    }
-
-    let terms: Vec<String> = tokens.into_iter().map(|(term, _)| term).collect();
-
+    let terms = build_query_terms(text_str, analyzer)?;
     Ok(TextQueryClause {
         field_name: Some(field_name),
         terms,
@@ -1008,17 +1108,47 @@ fn parse_bare_terms_query(
         Err(_) => return Err("ERR invalid UTF-8 in query"),
     };
 
+    let terms = build_query_terms(text_str, analyzer)?;
+    Ok(TextQueryClause { field_name: None, terms })
+}
+
+/// Build query terms from a raw text string, dispatching to the correct analyzer path.
+///
+/// With `text-index` feature: uses `tokenize_with_modifiers` (supports fuzzy/prefix).
+/// Without feature: falls back to plain `tokenize_with_positions` (exact only).
+fn build_query_terms(
+    text_str: &str,
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+) -> Result<Vec<QueryTerm>, &'static str> {
+    build_query_terms_impl(text_str, analyzer)
+}
+
+#[cfg(feature = "text-index")]
+fn build_query_terms_impl(
+    text_str: &str,
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+) -> Result<Vec<QueryTerm>, &'static str> {
+    let terms = tokenize_with_modifiers(text_str, analyzer);
+    if terms.is_empty() {
+        return Err("ERR empty query after analysis");
+    }
+    Ok(terms)
+}
+
+#[cfg(not(feature = "text-index"))]
+fn build_query_terms_impl(
+    text_str: &str,
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+) -> Result<Vec<QueryTerm>, &'static str> {
     let tokens = analyzer.tokenize_with_positions(text_str);
     if tokens.is_empty() {
         return Err("ERR empty query after analysis");
     }
-
-    let terms: Vec<String> = tokens.into_iter().map(|(term, _)| term).collect();
-
-    Ok(TextQueryClause {
-        field_name: None,
-        terms,
-    })
+    let terms: Vec<QueryTerm> = tokens
+        .into_iter()
+        .map(|(term, _)| QueryTerm { text: term })
+        .collect();
+    Ok(terms)
 }
 
 /// Strip surrounding `"..."` from a byte slice.
@@ -1113,11 +1243,14 @@ pub fn ft_text_search(text_store: &TextStore, args: &[Frame]) -> Frame {
 ///
 /// Exported for the coordinator to call directly on the local shard when
 /// `num_shards == 1` (skips DFS pre-pass per D-06).
+///
+/// Accepts `&[QueryTerm]` — fuzzy/prefix queries are dispatched to `expand_terms` +
+/// `search_field_or`; exact queries use the unchanged `search_field` AND path.
 pub fn execute_text_search_local(
     text_store: &TextStore,
     index_name: &[u8],
     field_idx: Option<usize>,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     top_k: usize,
     offset: usize,
     count: usize,
@@ -1127,12 +1260,16 @@ pub fn execute_text_search_local(
         None => return Frame::Error(Bytes::from_static(b"ERR no such index")),
     };
 
-    let results = if let Some(fidx) = field_idx {
-        text_index.search_field(fidx, query_terms, None, None, top_k)
-    } else {
-        // Cross-field: accumulate across all non-NOINDEX fields.
-        accumulate_cross_field(text_index, query_terms, None, None, top_k)
+    let clause = TextQueryClause {
+        field_name: field_idx.and_then(|fidx| {
+            text_index
+                .text_fields
+                .get(fidx)
+                .map(|f| f.field_name.clone())
+        }),
+        terms: query_terms.to_vec(),
     };
+    let results = execute_query_on_index(text_index, &clause, None, None, top_k);
 
     build_text_response(&results, offset, count)
 }
@@ -1142,27 +1279,29 @@ pub fn execute_text_search_local(
 /// Called by the SPSC handler after the Phase 1 scatter has aggregated
 /// global IDF weights from all shards (per D-04). The `global_df` and `global_n`
 /// override the local field statistics for BM25 IDF computation.
+///
+/// Accepts `&[QueryTerm]` — fuzzy/prefix queries use the OR-union path.
 pub fn execute_text_search_with_global_idf(
     text_index: &TextIndex,
     field_idx: Option<usize>,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     global_df: &HashMap<String, u32>,
     global_n: u32,
     top_k: usize,
     offset: usize,
     count: usize,
 ) -> Frame {
-    let results = if let Some(fidx) = field_idx {
-        text_index.search_field(fidx, query_terms, Some(global_df), Some(global_n), top_k)
-    } else {
-        accumulate_cross_field(
-            text_index,
-            query_terms,
-            Some(global_df),
-            Some(global_n),
-            top_k,
-        )
+    let clause = TextQueryClause {
+        field_name: field_idx.and_then(|fidx| {
+            text_index
+                .text_fields
+                .get(fidx)
+                .map(|f| f.field_name.clone())
+        }),
+        terms: query_terms.to_vec(),
     };
+    let results =
+        execute_query_on_index(text_index, &clause, Some(global_df), Some(global_n), top_k);
 
     build_text_response(&results, offset, count)
 }
@@ -1221,6 +1360,10 @@ fn accumulate_cross_field(
 }
 
 /// Execute query on a TextIndex: dispatch to cross-field or field-targeted search.
+///
+/// When all query terms are Exact, uses the existing AND path (`search_field` /
+/// `accumulate_cross_field`). When any term is Fuzzy or Prefix, expands each term
+/// via `TextIndex::expand_terms` and uses the OR-union path (`search_field_or`).
 fn execute_query_on_index(
     text_index: &TextIndex,
     clause: &TextQueryClause,
@@ -1228,23 +1371,116 @@ fn execute_query_on_index(
     global_n: Option<u32>,
     top_k: usize,
 ) -> Vec<TextSearchResult> {
-    match &clause.field_name {
-        None => accumulate_cross_field(text_index, &clause.terms, global_df, global_n, top_k),
-        Some(field_name) => {
-            // Find the matching field index.
-            let field_idx = text_index.text_fields.iter().position(|f| {
-                f.field_name
-                    .as_ref()
-                    .eq_ignore_ascii_case(field_name.as_ref())
-            });
+    // Check whether any term requires fuzzy/prefix expansion (text-index feature only).
+    #[cfg(feature = "text-index")]
+    let has_fuzzy_or_prefix = clause
+        .terms
+        .iter()
+        .any(|t| !matches!(t.modifier, TermModifier::Exact));
 
-            match field_idx {
-                Some(fidx) => {
-                    text_index.search_field(fidx, &clause.terms, global_df, global_n, top_k)
+    #[cfg(not(feature = "text-index"))]
+    let has_fuzzy_or_prefix = false;
+
+    // ── Exact-only fast path (unchanged AND semantics) ────────────────────────
+    if !has_fuzzy_or_prefix {
+        let exact_terms: Vec<String> = clause.terms.iter().map(|t| t.text.clone()).collect();
+        return match &clause.field_name {
+            None => accumulate_cross_field(text_index, &exact_terms, global_df, global_n, top_k),
+            Some(field_name) => {
+                let field_idx = text_index.text_fields.iter().position(|f| {
+                    f.field_name
+                        .as_ref()
+                        .eq_ignore_ascii_case(field_name.as_ref())
+                });
+                match field_idx {
+                    Some(fidx) => {
+                        text_index.search_field(fidx, &exact_terms, global_df, global_n, top_k)
+                    }
+                    None => Vec::new(),
                 }
-                None => Vec::new(), // Unknown field -> empty result (not an error at this layer)
+            }
+        };
+    }
+
+    // ── Fuzzy/prefix OR-union path ────────────────────────────────────────────
+    #[cfg(feature = "text-index")]
+    {
+        match &clause.field_name {
+            None => {
+                // Cross-field: expand + OR on each non-NOINDEX field, accumulate.
+                let mut acc: HashMap<u32, (f32, Bytes)> = HashMap::new();
+                for (field_idx, field_def) in text_index.text_fields.iter().enumerate() {
+                    if field_def.noindex {
+                        continue;
+                    }
+                    let mut all_expanded: Vec<u32> = Vec::new();
+                    for qt in &clause.terms {
+                        let ids = text_index.expand_terms(field_idx, &qt.text, &qt.modifier);
+                        all_expanded.extend(ids);
+                    }
+                    all_expanded.sort_unstable();
+                    all_expanded.dedup();
+                    if all_expanded.is_empty() {
+                        continue;
+                    }
+                    let field_results = text_index.search_field_or(
+                        field_idx,
+                        &all_expanded,
+                        global_df,
+                        global_n,
+                        top_k,
+                    );
+                    for r in field_results {
+                        let entry = acc.entry(r.doc_id).or_insert((0.0, r.key.clone()));
+                        entry.0 += r.score;
+                    }
+                }
+                if acc.is_empty() {
+                    return Vec::new();
+                }
+                let mut results: Vec<TextSearchResult> = acc
+                    .into_iter()
+                    .map(|(doc_id, (score, key))| TextSearchResult { doc_id, key, score })
+                    .collect();
+                results.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                results.truncate(top_k);
+                results
+            }
+            Some(field_name) => {
+                let field_idx = text_index.text_fields.iter().position(|f| {
+                    f.field_name
+                        .as_ref()
+                        .eq_ignore_ascii_case(field_name.as_ref())
+                });
+                match field_idx {
+                    Some(fidx) => {
+                        let mut all_expanded: Vec<u32> = Vec::new();
+                        for qt in &clause.terms {
+                            let ids = text_index.expand_terms(fidx, &qt.text, &qt.modifier);
+                            all_expanded.extend(ids);
+                        }
+                        all_expanded.sort_unstable();
+                        all_expanded.dedup();
+                        if all_expanded.is_empty() {
+                            return Vec::new();
+                        }
+                        text_index.search_field_or(fidx, &all_expanded, global_df, global_n, top_k)
+                    }
+                    None => Vec::new(),
+                }
             }
         }
+    }
+
+    // Unreachable without text-index feature (has_fuzzy_or_prefix is always false above).
+    #[cfg(not(feature = "text-index"))]
+    {
+        let _ = (global_df, global_n, top_k); // suppress unused warnings
+        Vec::new()
     }
 }
 
@@ -1436,12 +1672,17 @@ mod tests {
         );
         // "machine" -> "machin", "learning" -> "learn" (English Snowball)
         assert!(
-            result.terms.contains(&"machin".to_string()),
+            result.terms.iter().any(|t| t.text == "machin"),
             "expected stemmed 'machin'"
         );
         assert!(
-            result.terms.contains(&"learn".to_string()),
+            result.terms.iter().any(|t| t.text == "learn"),
             "expected stemmed 'learn'"
+        );
+        // All terms should be Exact (no modifiers in bare query)
+        assert!(
+            result.terms.iter().all(|t| matches!(t.modifier, TermModifier::Exact)),
+            "bare terms must have Exact modifier"
         );
     }
 
@@ -1455,8 +1696,8 @@ mod tests {
             Some(b"title" as &[u8]),
             "field name should be 'title'"
         );
-        assert!(result.terms.contains(&"machin".to_string()));
-        assert!(result.terms.contains(&"learn".to_string()));
+        assert!(result.terms.iter().any(|t| t.text == "machin"));
+        assert!(result.terms.iter().any(|t| t.text == "learn"));
     }
 
     #[test]
@@ -1466,7 +1707,7 @@ mod tests {
         // Surrounding quotes are stripped; remaining terms analyzed normally
         let result = parse_text_query(b"\"machine learning\"", &analyzer).unwrap();
         assert!(result.field_name.is_none());
-        assert!(result.terms.contains(&"machin".to_string()));
+        assert!(result.terms.iter().any(|t| t.text == "machin"));
     }
 
     #[test]
@@ -1938,5 +2179,152 @@ mod tests {
             !result.contains("<b>"),
             "summarize without highlight has no tags, got: {result}"
         );
+    }
+
+    // ── detect_modifier ───────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_fuzzy_single() {
+        let (inner, modifier) = detect_modifier("%machine%");
+        assert_eq!(inner, "machine");
+        assert_eq!(modifier, TermModifier::Fuzzy(1));
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_fuzzy_double() {
+        let (inner, modifier) = detect_modifier("%%machne%%");
+        assert_eq!(inner, "machne");
+        assert_eq!(modifier, TermModifier::Fuzzy(2));
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_fuzzy_triple() {
+        let (inner, modifier) = detect_modifier("%%%m%%%");
+        assert_eq!(inner, "m");
+        assert_eq!(modifier, TermModifier::Fuzzy(3));
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_prefix() {
+        let (inner, modifier) = detect_modifier("mach*");
+        assert_eq!(inner, "mach");
+        assert_eq!(modifier, TermModifier::Prefix);
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_exact() {
+        let (inner, modifier) = detect_modifier("machine");
+        assert_eq!(inner, "machine");
+        assert_eq!(modifier, TermModifier::Exact);
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_bare_star() {
+        // A single '*' is match-all, not a prefix query
+        let (inner, modifier) = detect_modifier("*");
+        assert_eq!(inner, "*");
+        assert_eq!(modifier, TermModifier::Exact);
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_bare_percent() {
+        // '%%' with no inner text is returned as Exact (empty inner)
+        let (inner, modifier) = detect_modifier("%%");
+        assert_eq!(inner, "%%"); // returned as-is
+        assert_eq!(modifier, TermModifier::Exact);
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_detect_modifier_fuzzy_caps_at_3() {
+        // 4+ % on each side still caps distance at 3
+        let (inner, modifier) = detect_modifier("%%%%word%%%%");
+        assert_eq!(inner, "word");
+        assert_eq!(modifier, TermModifier::Fuzzy(3));
+    }
+
+    // ── tokenize_with_modifiers ───────────────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_tokenize_with_modifiers_exact_only() {
+        let analyzer = make_analyzer();
+        let terms = tokenize_with_modifiers("machine learning", &analyzer);
+        assert_eq!(terms.len(), 2);
+        assert!(terms.iter().any(|t| t.text == "machin" && matches!(t.modifier, TermModifier::Exact)));
+        assert!(terms.iter().any(|t| t.text == "learn" && matches!(t.modifier, TermModifier::Exact)));
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_tokenize_with_modifiers_mixed() {
+        let analyzer = make_analyzer();
+        // "%%machne%%" = fuzzy-2, "learning" = exact (stemmed to "learn"), "mach*" = prefix
+        let terms = tokenize_with_modifiers("%%machne%% learning mach*", &analyzer);
+        assert_eq!(terms.len(), 3, "expected 3 terms, got {:?}", terms.iter().map(|t| &t.text).collect::<Vec<_>>());
+        let fuzzy = terms.iter().find(|t| matches!(t.modifier, TermModifier::Fuzzy(2)));
+        assert!(fuzzy.is_some(), "expected Fuzzy(2) term");
+        assert_eq!(fuzzy.unwrap().text, "machne");
+        let exact = terms.iter().find(|t| matches!(t.modifier, TermModifier::Exact));
+        assert!(exact.is_some(), "expected Exact term");
+        assert_eq!(exact.unwrap().text, "learn");
+        let prefix = terms.iter().find(|t| matches!(t.modifier, TermModifier::Prefix));
+        assert!(prefix.is_some(), "expected Prefix term");
+        assert_eq!(prefix.unwrap().text, "mach");
+    }
+
+    // ── parse_text_query with fuzzy/prefix modifiers ─────────────────────────
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_parse_text_query_fuzzy() {
+        let analyzer = make_analyzer();
+        let result = parse_text_query(b"%%machne%%", &analyzer).unwrap();
+        assert!(result.field_name.is_none());
+        assert_eq!(result.terms.len(), 1);
+        assert_eq!(result.terms[0].text, "machne");
+        assert_eq!(result.terms[0].modifier, TermModifier::Fuzzy(2));
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_parse_text_query_prefix() {
+        let analyzer = make_analyzer();
+        let result = parse_text_query(b"mach*", &analyzer).unwrap();
+        assert!(result.field_name.is_none());
+        assert_eq!(result.terms.len(), 1);
+        assert_eq!(result.terms[0].text, "mach");
+        assert_eq!(result.terms[0].modifier, TermModifier::Prefix);
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_parse_text_query_field_targeted_fuzzy() {
+        let analyzer = make_analyzer();
+        let result = parse_text_query(b"@title:(%%machne%%)", &analyzer).unwrap();
+        assert_eq!(
+            result.field_name.as_ref().map(|b| b.as_ref()),
+            Some(b"title" as &[u8])
+        );
+        assert_eq!(result.terms.len(), 1);
+        assert_eq!(result.terms[0].text, "machne");
+        assert_eq!(result.terms[0].modifier, TermModifier::Fuzzy(2));
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_parse_text_query_fuzzy_distance1() {
+        let analyzer = make_analyzer();
+        let result = parse_text_query(b"%machin%", &analyzer).unwrap();
+        assert_eq!(result.terms.len(), 1);
+        assert_eq!(result.terms[0].modifier, TermModifier::Fuzzy(1));
+        assert_eq!(result.terms[0].text, "machin");
     }
 }

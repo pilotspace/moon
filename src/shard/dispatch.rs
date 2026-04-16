@@ -300,7 +300,9 @@ pub enum ShardMessage {
     TextSearch {
         index_name: Bytes,
         field_idx: Option<usize>,
-        query_terms: Vec<String>,
+        /// Query terms with per-term expansion modifiers (Exact/Fuzzy/Prefix).
+        /// Carries full QueryTerm so remote shards can apply the same OR-union expansion.
+        query_terms: Vec<crate::command::vector_search::ft_text_search::QueryTerm>,
         global_df: std::collections::HashMap<String, u32>,
         global_n: u32,
         top_k: usize,

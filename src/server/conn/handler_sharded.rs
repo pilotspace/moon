@@ -1476,7 +1476,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // Parse query and resolve field_idx inside a block scope so the
                                     // MutexGuard from text_store() is dropped BEFORE .await.
                                     // We use the TextIndex's own field_analyzers (same pipeline used at index time).
-                                    type ParseResult = Result<(Vec<String>, Option<usize>), String>;
+                                    type ParseResult = Result<(Vec<crate::command::vector_search::QueryTerm>, Option<usize>), String>;
                                     let parse_result: ParseResult = {
                                         let ts = ctx.shard_databases.text_store(ctx.shard_id);
                                         match ts.get_index(&index_name) {
@@ -1597,7 +1597,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                     crate::command::vector_search::ft_list(&vs)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-                                    crate::command::vector_search::ft_compact(&mut vs, cmd_args)
+                                    crate::command::vector_search::ft_compact(&mut vs, &mut ts, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                     crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
