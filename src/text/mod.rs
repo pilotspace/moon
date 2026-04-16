@@ -474,5 +474,71 @@ mod tests {
             let matches = store.find_matching_index_names(b"any:key");
             assert_eq!(matches.len(), 1, "empty prefix should match any key");
         }
+
+        #[test]
+        fn test_text_index_nostem_preserves_forms() {
+            // NOSTEM field should NOT stem terms — "running" stays "running"
+            let idx_stemmed = TextIndex::new(
+                Bytes::from_static(b"stemmed_idx"),
+                vec![],
+                vec![TextFieldDef::new(Bytes::from_static(b"content"))],
+                BM25Config::default(),
+            );
+            let idx_nostem = TextIndex::new(
+                Bytes::from_static(b"nostem_idx"),
+                vec![],
+                vec![TextFieldDef {
+                    field_name: Bytes::from_static(b"content"),
+                    weight: 1.0,
+                    nostem: true,
+                    sortable: false,
+                    noindex: false,
+                }],
+                BM25Config::default(),
+            );
+
+            let mut store = TextStore::new();
+            store.create_index(Bytes::from_static(b"stemmed_idx"), idx_stemmed).expect("create");
+            store.create_index(Bytes::from_static(b"nostem_idx"), idx_nostem).expect("create");
+
+            let args = hset_args(&[("content", "running runs")]);
+            let key_hash = xxhash_rust::xxh64::xxh64(b"doc:1", 0);
+
+            // Index same document in both indexes
+            store.get_index_mut(b"stemmed_idx").expect("idx").index_document(key_hash, b"doc:1", &args);
+            store.get_index_mut(b"nostem_idx").expect("idx").index_document(key_hash, b"doc:1", &args);
+
+            // Stemmed index: "running" and "runs" both become "run" -> 1 unique term
+            let stemmed = store.get_index(b"stemmed_idx").expect("idx");
+            // NOSTEM index: "running" and "runs" stay distinct -> 2 unique terms
+            let nostem = store.get_index(b"nostem_idx").expect("idx");
+            assert!(
+                nostem.num_terms() > stemmed.num_terms(),
+                "NOSTEM should have more unique terms ({}) than stemmed ({}) because 'running' and 'runs' stay distinct",
+                nostem.num_terms(), stemmed.num_terms()
+            );
+        }
+
+        #[test]
+        fn test_text_index_three_docs_stats() {
+            // Index 3 documents, verify num_docs==3, num_terms>0, avg_doc_len>0
+            let mut idx = make_title_body_index();
+            let docs = [
+                ("doc:1", "Machine Learning", "An introduction to ML techniques"),
+                ("doc:2", "Deep Learning", "Neural networks and deep architectures"),
+                ("doc:3", "Natural Language", "NLP processing with transformers"),
+            ];
+            for (key, title, body) in &docs {
+                let args = hset_args(&[("title", title), ("body", body)]);
+                let key_hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+                idx.index_document(key_hash, key.as_bytes(), &args);
+            }
+
+            assert_eq!(idx.num_docs(), 3, "should have 3 documents");
+            assert!(idx.num_terms() > 0, "should have indexed terms");
+            assert!(idx.field_stats[0].avg_doc_len() > 0.0, "title avg_doc_len should be > 0");
+            assert!(idx.field_stats[1].avg_doc_len() > 0.0, "body avg_doc_len should be > 0");
+            assert!(idx.total_posting_bytes() > 0, "posting bytes should be > 0");
+        }
     }
 }

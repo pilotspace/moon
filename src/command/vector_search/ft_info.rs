@@ -137,13 +137,48 @@ pub fn ft_info(
     items.push(Frame::BulkString(Bytes::from_static(b"vector_fields")));
     items.push(Frame::Array(field_entries.into()));
 
+    // Hybrid index: append text field stats if this index also has a TextIndex
+    if let Some(text_idx) = text_store.get_index(&name) {
+        let mut text_field_entries: Vec<Frame> = Vec::with_capacity(text_idx.text_fields.len());
+        for (i, field_def) in text_idx.text_fields.iter().enumerate() {
+            let stats = &text_idx.field_stats[i];
+            // NOTE: format!() acceptable — FT.INFO is diagnostic, not hot path
+            let mut weight_buf = String::with_capacity(8);
+            let mut avg_buf = String::with_capacity(8);
+            {
+                use std::fmt::Write;
+                let _ = write!(weight_buf, "{:.1}", field_def.weight);
+                let _ = write!(avg_buf, "{:.2}", stats.avg_doc_len());
+            }
+            text_field_entries.push(Frame::Array(
+                vec![
+                    Frame::BulkString(Bytes::from_static(b"field_name")),
+                    Frame::BulkString(field_def.field_name.clone()),
+                    Frame::BulkString(Bytes::from_static(b"weight")),
+                    Frame::BulkString(Bytes::from(weight_buf)),
+                    Frame::BulkString(Bytes::from_static(b"num_docs")),
+                    Frame::Integer(stats.num_docs as i64),
+                    Frame::BulkString(Bytes::from_static(b"avg_doc_len")),
+                    Frame::BulkString(Bytes::from(avg_buf)),
+                ]
+                .into(),
+            ));
+        }
+        items.push(Frame::BulkString(Bytes::from_static(b"text_fields")));
+        items.push(Frame::Array(text_field_entries.into()));
+        items.push(Frame::BulkString(Bytes::from_static(b"num_terms")));
+        items.push(Frame::Integer(text_idx.num_terms() as i64));
+        items.push(Frame::BulkString(Bytes::from_static(b"total_inverted_index_size")));
+        items.push(Frame::Integer(text_idx.total_posting_bytes() as i64));
+    }
+
     Frame::Array(items.into())
 }
 
-/// Basic FT.INFO response for TEXT-only indexes.
+/// Full FT.INFO response for TEXT-only indexes.
 ///
-/// Returns index_name, num_docs, num_terms, and text_fields schema.
-/// Full implementation with per-field stats is in Plan 03 (IDX-05).
+/// Returns index_name, num_docs, num_terms, per-field stats (num_docs,
+/// avg_doc_len, weight, nostem), BM25 config, and memory estimates.
 fn ft_info_text_only(idx: &crate::text::store::TextIndex) -> Frame {
     let mut items = vec![
         Frame::BulkString(Bytes::from_static(b"index_name")),
@@ -162,24 +197,63 @@ fn ft_info_text_only(idx: &crate::text::store::TextIndex) -> Frame {
         Frame::Integer(idx.num_terms() as i64),
     ];
 
-    // Text fields schema
+    // Per-field text stats (NOTE: format!() acceptable here — FT.INFO is diagnostic, not hot path)
     let mut field_entries: Vec<Frame> = Vec::with_capacity(idx.text_fields.len());
-    for tf in &idx.text_fields {
-        let mut score_buf = String::with_capacity(8);
+    for (i, tf) in idx.text_fields.iter().enumerate() {
+        let stats = &idx.field_stats[i];
+        let mut weight_buf = String::with_capacity(8);
         use std::fmt::Write;
-        let _ = write!(score_buf, "{}", tf.weight);
+        let _ = write!(weight_buf, "{:.1}", tf.weight);
+        let mut avg_buf = String::with_capacity(8);
+        let _ = write!(avg_buf, "{:.2}", stats.avg_doc_len());
         let entry = vec![
             Frame::BulkString(Bytes::from_static(b"field_name")),
             Frame::BulkString(tf.field_name.clone()),
             Frame::BulkString(Bytes::from_static(b"type")),
             Frame::BulkString(Bytes::from_static(b"TEXT")),
             Frame::BulkString(Bytes::from_static(b"WEIGHT")),
-            Frame::BulkString(Bytes::from(score_buf)),
+            Frame::BulkString(Bytes::from(weight_buf)),
+            Frame::BulkString(Bytes::from_static(b"nostem")),
+            Frame::BulkString(if tf.nostem {
+                Bytes::from_static(b"true")
+            } else {
+                Bytes::from_static(b"false")
+            }),
+            Frame::BulkString(Bytes::from_static(b"num_docs")),
+            Frame::Integer(stats.num_docs as i64),
+            Frame::BulkString(Bytes::from_static(b"avg_doc_len")),
+            Frame::BulkString(Bytes::from(avg_buf)),
         ];
         field_entries.push(Frame::Array(entry.into()));
     }
     items.push(Frame::BulkString(Bytes::from_static(b"text_fields")));
     items.push(Frame::Array(field_entries.into()));
+
+    // BM25 config
+    let mut k1_buf = String::with_capacity(8);
+    let mut b_buf = String::with_capacity(8);
+    {
+        use std::fmt::Write;
+        let _ = write!(k1_buf, "{:.1}", idx.bm25_config.k1);
+        let _ = write!(b_buf, "{:.2}", idx.bm25_config.b);
+    }
+    items.push(Frame::BulkString(Bytes::from_static(b"bm25_k1")));
+    items.push(Frame::BulkString(Bytes::from(k1_buf)));
+    items.push(Frame::BulkString(Bytes::from_static(b"bm25_b")));
+    items.push(Frame::BulkString(Bytes::from(b_buf)));
+
+    // Memory estimates
+    let total_postings = idx.total_posting_bytes();
+    let num_docs_val = idx.num_docs() as usize;
+    let bytes_per = if num_docs_val > 0 {
+        total_postings / num_docs_val
+    } else {
+        0
+    };
+    items.push(Frame::BulkString(Bytes::from_static(b"bytes_per_posting")));
+    items.push(Frame::Integer(bytes_per as i64));
+    items.push(Frame::BulkString(Bytes::from_static(b"total_inverted_index_size")));
+    items.push(Frame::Integer(total_postings as i64));
 
     Frame::Array(items.into())
 }

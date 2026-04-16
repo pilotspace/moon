@@ -893,6 +893,63 @@ if should_run "vector"; then
 fi
 
 # ===========================================================================
+# TEXT FIELD TESTS (v0.1.7 full-text search)
+# ===========================================================================
+
+if should_run "vector"; then
+    echo ""
+    echo "=== TEXT FIELD TESTS ==="
+    flush_both
+
+    # FT.CREATE with TEXT-only index
+    assert_moon_ok "FT.CREATE text-only index" FT.CREATE textidx ON HASH PREFIX 1 doc: SCHEMA title TEXT WEIGHT 2.0 body TEXT
+
+    # HSET to trigger text auto-indexing
+    assert_moon_ok "HSET doc with TEXT fields" HSET doc:t1 title "Hello world" body "This is a test document"
+    assert_moon_ok "HSET second doc" HSET doc:t2 title "Second document" body "Another test with more words"
+    assert_moon_ok "HSET third doc" HSET doc:t3 title "Third title" body "Final body text here"
+
+    # FT.INFO reports text stats
+    TOTAL=$((TOTAL + 1)); FT_TEXT_INFO=$(mcli FT.INFO textidx 2>&1)
+    if echo "$FT_TEXT_INFO" | grep -q "num_docs"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_docs"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text num_docs"; fi
+    TOTAL=$((TOTAL + 1))
+    if echo "$FT_TEXT_INFO" | grep -q "num_terms"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_terms"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text num_terms"; fi
+    TOTAL=$((TOTAL + 1))
+    if echo "$FT_TEXT_INFO" | grep -q "avg_doc_len"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text avg_doc_len"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text avg_doc_len"; fi
+    TOTAL=$((TOTAL + 1))
+    if echo "$FT_TEXT_INFO" | grep -q "bm25_k1"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text bm25_k1"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text bm25_k1"; fi
+    TOTAL=$((TOTAL + 1))
+    if echo "$FT_TEXT_INFO" | grep -q "bytes_per_posting"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text bytes_per_posting"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text bytes_per_posting"; fi
+
+    # FT.CREATE with TEXT + NOSTEM
+    assert_moon_ok "FT.CREATE NOSTEM index" FT.CREATE nostemidx ON HASH PREFIX 1 ns: SCHEMA content TEXT NOSTEM
+
+    # FT.CREATE with TEXT + NOINDEX
+    assert_moon_ok "FT.CREATE NOINDEX field" FT.CREATE noidxtest ON HASH PREFIX 1 ni: SCHEMA indexed TEXT meta TEXT NOINDEX
+
+    # FT.CREATE with BM25 parameters
+    assert_moon_ok "FT.CREATE with BM25 params" FT.CREATE bm25idx ON HASH PREFIX 1 bm: BM25_K1 1.5 BM25_B 0.8 SCHEMA content TEXT
+
+    # FT.CONFIG SET/GET BM25 parameters
+    assert_moon_ok "FT.CONFIG SET BM25_K1" FT.CONFIG SET bm25idx BM25_K1 1.8
+    assert_moon_contains "FT.CONFIG GET BM25_K1" "1.8" FT.CONFIG GET bm25idx BM25_K1
+
+    # FT.DROPINDEX removes text index
+    assert_moon_ok "FT.DROPINDEX text index" FT.DROPINDEX textidx
+
+    # FT.INFO after drop should error
+    TOTAL=$((TOTAL + 1)); FT_TEXT_AFTER=$(mcli FT.INFO textidx 2>&1)
+    if echo "$FT_TEXT_AFTER" | grep -qi "err\|not found\|unknown"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after text drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after text drop should error"; fi
+
+    # Cleanup remaining text indexes
+    mcli FT.DROPINDEX nostemidx >/dev/null 2>&1
+    mcli FT.DROPINDEX noidxtest >/dev/null 2>&1
+    mcli FT.DROPINDEX bm25idx >/dev/null 2>&1
+
+    echo "  text: $PASS passed (of $TOTAL total)"
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 
