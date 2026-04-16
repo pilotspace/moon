@@ -498,8 +498,28 @@ fn update_reducers(
 // ---------------------------------------------------------------------------
 
 fn row_get<'a>(row: &'a AggregateRow, field: &Bytes) -> Option<&'a AggregateValue> {
-    row.iter()
-        .find_map(|(f, v)| if f == field { Some(v) } else { None })
+    // RediSearch-compatible name lookup: SORTBY / pipeline references use
+    // `@foo` for field names while GROUPBY field names and REDUCE aliases are
+    // stored verbatim (may or may not carry the `@`). Normalise both sides
+    // by stripping one optional leading `@` before comparison, so
+    // `@count` matches the stored alias `count` and vice versa.
+    let needle = strip_at(field.as_ref());
+    row.iter().find_map(|(f, v)| {
+        if strip_at(f.as_ref()) == needle {
+            Some(v)
+        } else {
+            None
+        }
+    })
+}
+
+#[inline]
+fn strip_at(b: &[u8]) -> &[u8] {
+    if let Some(rest) = b.strip_prefix(b"@") {
+        rest
+    } else {
+        b
+    }
 }
 
 fn value_to_f64(v: Option<&AggregateValue>) -> Option<f64> {

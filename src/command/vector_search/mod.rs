@@ -7,15 +7,17 @@
 
 pub mod cache_search;
 pub mod ft_admin;
+#[cfg(feature = "text-index")]
+pub mod ft_aggregate;
 pub mod ft_config;
 pub mod ft_create;
 pub mod ft_info;
 pub mod ft_search;
 pub mod ft_text_search;
-pub mod hybrid;
 #[cfg(feature = "graph")]
 pub mod graph_expand;
 pub mod helpers;
+pub mod hybrid;
 #[cfg(feature = "graph")]
 pub mod navigate;
 pub mod recommend;
