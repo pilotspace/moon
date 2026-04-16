@@ -9,6 +9,8 @@ pub mod persistence_tick;
 pub mod remote_subscriber_map;
 #[cfg(feature = "text-index")]
 pub mod scatter_aggregate;
+#[cfg(feature = "text-index")]
+pub mod scatter_hybrid;
 pub mod shared_databases;
 pub mod spsc_handler;
 pub mod timers;
@@ -16,6 +18,8 @@ pub mod uring_handler;
 
 #[cfg(feature = "text-index")]
 pub use scatter_aggregate::scatter_text_aggregate;
+#[cfg(feature = "text-index")]
+pub use scatter_hybrid::scatter_hybrid_search;
 
 use tracing::info;
 

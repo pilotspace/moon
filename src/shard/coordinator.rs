@@ -1080,7 +1080,9 @@ pub async fn scatter_text_search(
 /// This function sums `df` per term across shards and sums `N` (total docs) across shards.
 ///
 /// Returns `(global_df: HashMap<String, u32>, global_n: u32)`.
-fn aggregate_doc_freq(responses: &[Frame]) -> (std::collections::HashMap<String, u32>, u32) {
+pub(crate) fn aggregate_doc_freq(
+    responses: &[Frame],
+) -> (std::collections::HashMap<String, u32>, u32) {
     let mut global_df: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut global_n: u32 = 0;
 

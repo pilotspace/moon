@@ -1488,6 +1488,66 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     crate::command::vector_search::is_text_query(q)
                                 });
 
+                                // ── HYBRID multi-shard path (Phase 152 Plan 05, D-13) ──────
+                                // If the args contain a HYBRID clause, route through
+                                // scatter_hybrid_search (three-phase DFS → fan-out → RRF
+                                // merge). Single-shard is handled inside the scatter entry
+                                // point itself (fast path to execute_hybrid_search_local).
+                                #[cfg(feature = "text-index")]
+                                {
+                                    match crate::command::vector_search::hybrid::parse_hybrid_modifier(cmd_args) {
+                                        Ok(Some(partial)) => {
+                                            let index_name = match cmd_args.first().and_then(|f| crate::command::vector_search::extract_bulk(f)) {
+                                                Some(b) => b,
+                                                None => {
+                                                    responses.push(Frame::Error(Bytes::from_static(b"ERR invalid index name")));
+                                                    continue;
+                                                }
+                                            };
+                                            let text_query = match query_bytes.clone() {
+                                                Some(q) => q,
+                                                None => {
+                                                    responses.push(Frame::Error(Bytes::from_static(b"ERR invalid query")));
+                                                    continue;
+                                                }
+                                            };
+                                            let (limit_offset, limit_count) = crate::command::vector_search::parse_limit_clause(cmd_args);
+                                            let top_k = if limit_count == usize::MAX {
+                                                limit_offset.saturating_add(10).max(1)
+                                            } else {
+                                                limit_offset.saturating_add(limit_count).max(1)
+                                            };
+                                            let hq = crate::command::vector_search::hybrid::HybridQuery {
+                                                index_name,
+                                                text_query,
+                                                dense_field: partial.dense_field,
+                                                dense_blob: partial.dense_blob,
+                                                sparse: partial.sparse,
+                                                weights: partial.weights,
+                                                k_per_stream: partial.k_per_stream,
+                                                top_k,
+                                                offset: limit_offset,
+                                                count: limit_count,
+                                            };
+                                            let response = crate::shard::scatter_hybrid::scatter_hybrid_search(
+                                                hq,
+                                                ctx.shard_id,
+                                                ctx.num_shards,
+                                                &ctx.shard_databases,
+                                                &ctx.dispatch_tx,
+                                                &ctx.spsc_notifiers,
+                                            ).await;
+                                            responses.push(response);
+                                            continue;
+                                        }
+                                        Ok(None) => { /* fall through to non-HYBRID paths */ }
+                                        Err(err_frame) => {
+                                            responses.push(err_frame);
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 if is_text {
                                     // ── Text FT.SEARCH: two-phase DFS scatter-gather ─────────────
                                     let index_name = match cmd_args.first().and_then(|f| crate::command::vector_search::extract_bulk(f)) {

@@ -1150,7 +1150,7 @@ pub(crate) fn handle_shard_message_shared(
                     (Some(f), Some(b)) => Some((f, b)),
                     _ => None,
                 };
-                crate::command::vector_search::hybrid::execute_hybrid_search_local_raw_streams(
+                crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                     vector_store,
                     &text_guard,
                     &index_name,

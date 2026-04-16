@@ -18,6 +18,8 @@ pub mod ft_text_search;
 pub mod graph_expand;
 pub mod helpers;
 pub mod hybrid;
+#[cfg(feature = "text-index")]
+pub mod hybrid_multi;
 #[cfg(feature = "graph")]
 pub mod navigate;
 pub mod recommend;
@@ -44,6 +46,11 @@ pub use ft_text_search::{
 };
 pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
 pub use hybrid::{HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
+#[cfg(feature = "text-index")]
+pub use hybrid_multi::{
+    KeyedResult, ShardHybridReply, decode_shard_hybrid_partial, encode_shard_hybrid_partial,
+    execute_hybrid_search_local_raw_streams,
+};
 
 // Re-export pub(crate) items for sibling submodules (cache_search, navigate, recommend, session).
 #[cfg(feature = "graph")]
