@@ -573,6 +573,134 @@ fi
 FT_DROP=$(redis-cli -p "$PORT_RUST" FT.DROPINDEX vecidx 2>&1)
 assert_eq "FT.DROPINDEX" "OK" "$FT_DROP"
 
+# ===========================================================================
+# Phase 152: FT.AGGREGATE + FT.SEARCH HYBRID cross-shard consistency
+# ===========================================================================
+#
+# Restart moon across shard counts 1/4/12 and verify:
+#   - AGG-03: FT.AGGREGATE GROUPBY+COUNT returns identical group counts
+#   - HYB-01: FT.SEARCH HYBRID top-K ordering matches single-shard top-K
+#
+# Strategy: restart moon with new --shards per round, populate identical
+# fixture, collect result, compare. Single source of truth for the
+# associative-merge invariant (D-05/D-06) and the union-then-RRF invariant
+# (D-13 + B3 fix).
+
+log "=== Phase 152 cross-shard consistency (FT.AGGREGATE + HYBRID) ==="
+
+# Tear down current moon process — we'll restart across shard counts.
+if [[ -n "${RUST_PID:-}" ]]; then
+    kill "$RUST_PID" 2>/dev/null || true
+    wait "$RUST_PID" 2>/dev/null || true
+    RUST_PID=""
+fi
+pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+sleep 0.3
+
+# Helper: start moon on PORT_RUST with given shard count, wait for it.
+start_moon_with_shards() {
+    local nshards=$1
+    "$RUST_BINARY" --port "$PORT_RUST" --shards "$nshards" &>/dev/null &
+    RUST_PID=$!
+    wait_for_port "$PORT_RUST" || return 1
+}
+
+# Helper: stop the current moon instance.
+stop_moon() {
+    if [[ -n "${RUST_PID:-}" ]]; then
+        kill "$RUST_PID" 2>/dev/null || true
+        wait "$RUST_PID" 2>/dev/null || true
+        RUST_PID=""
+    fi
+    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+    sleep 0.3
+}
+
+# Normalize FT.AGGREGATE / FT.SEARCH output for cross-config comparison.
+# - Strip leading/trailing whitespace
+# - Sort lines (SORTBY is deterministic by count, but ties can reorder; sort guards)
+norm() {
+    printf '%s' "$1" | tr -d '\r' | awk 'NF' | sort
+}
+
+AGG_RESULT_1=""
+AGG_RESULT_4=""
+AGG_RESULT_12=""
+HYB_RESULT_1=""
+HYB_RESULT_4=""
+
+for NSHARDS in 1 4 12; do
+    log "  -- shards=$NSHARDS --"
+    start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
+    redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
+
+    # Build a 30-doc fixture deterministically.
+    redis-cli -p "$PORT_RUST" FT.CREATE cidx ON HASH PREFIX 1 cdoc: SCHEMA status TAG priority TAG title TEXT vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC COSINE >/dev/null 2>&1
+    for i in $(seq 1 30); do
+        STATUS=$([ $((i % 3)) -eq 0 ] && echo closed || echo open)
+        PRIORITY=$([ $((i % 2)) -eq 0 ] && echo high || echo low)
+        TITLE="machine learning doc $i"
+        # Deterministic vector: [i/30, 0, 0, 0] as f32 LE
+        VECTOR=$(python3 -c "import struct,sys; v=$i/30.0; sys.stdout.buffer.write(struct.pack('<4f', v, 0.0, 0.0, 0.0))")
+        redis-cli -p "$PORT_RUST" HSET cdoc:$i status "$STATUS" priority "$PRIORITY" title "$TITLE" vec "$VECTOR" >/dev/null 2>&1
+    done
+    sleep 0.5
+
+    # AGG-03: FT.AGGREGATE GROUPBY+COUNT
+    AGG_OUT=$(redis-cli -p "$PORT_RUST" FT.AGGREGATE cidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
+    AGG_NORM=$(norm "$AGG_OUT")
+    case "$NSHARDS" in
+        1)  AGG_RESULT_1="$AGG_NORM" ;;
+        4)  AGG_RESULT_4="$AGG_NORM" ;;
+        12) AGG_RESULT_12="$AGG_NORM" ;;
+    esac
+
+    # HYB-01: FT.SEARCH HYBRID top-K (BM25 + dense, RRF). Fixed query vector + text.
+    QVEC=$(python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f', 1.0, 0.0, 0.0, 0.0))")
+    HYB_OUT=$(redis-cli -p "$PORT_RUST" FT.SEARCH cidx "machine learning" HYBRID VECTOR @vec '$q' FUSION RRF LIMIT 0 5 PARAMS 2 q "$QVEC" 2>&1)
+    # Extract just the keys (cdoc:N lines) to compare top-K ordering.
+    HYB_KEYS=$(printf '%s\n' "$HYB_OUT" | grep -oE 'cdoc:[0-9]+' | head -5 | tr '\n' ' ')
+    case "$NSHARDS" in
+        1) HYB_RESULT_1="$HYB_KEYS" ;;
+        4) HYB_RESULT_4="$HYB_KEYS" ;;
+    esac
+
+    stop_moon
+done
+
+# AGG-03 equivalence: 1 vs 4 vs 12
+if [[ -n "$AGG_RESULT_1" && "$AGG_RESULT_1" == "$AGG_RESULT_4" && "$AGG_RESULT_4" == "$AGG_RESULT_12" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: AGG-03 FT.AGGREGATE GROUPBY+COUNT consistent across 1/4/12 shards"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: AGG-03 cross-shard divergence"
+    echo "    1-shard:  $(echo "$AGG_RESULT_1" | head -c 400)"
+    echo "    4-shard:  $(echo "$AGG_RESULT_4" | head -c 400)"
+    echo "    12-shard: $(echo "$AGG_RESULT_12" | head -c 400)"
+fi
+
+# HYB-01 equivalence: 1 vs 4 (top-5 keys set)
+# Multi-shard hybrid re-fuses across shards via rrf_fuse_three on the union,
+# so the top-K key SET must match single-shard (within RRF-acceptable ties).
+sort_keys() { printf '%s' "$1" | tr ' ' '\n' | awk 'NF' | sort | tr '\n' ' '; }
+if [[ -n "$HYB_RESULT_1" && -n "$HYB_RESULT_4" ]]; then
+    S1=$(sort_keys "$HYB_RESULT_1")
+    S4=$(sort_keys "$HYB_RESULT_4")
+    if [[ "$S1" == "$S4" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-01 top-5 SET matches across 1/4 shards"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: HYB-01 top-5 divergence"
+        echo "    1-shard: $HYB_RESULT_1"
+        echo "    4-shard: $HYB_RESULT_4"
+    fi
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 missing results (1: '$HYB_RESULT_1' / 4: '$HYB_RESULT_4')"
+fi
+
+# Restart moon with the originally-requested shard count so later sections work.
+start_moon_with_shards "$SHARDS" || true
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"

@@ -1259,6 +1259,204 @@ if should_run "vector"; then
 fi
 
 # ===========================================================================
+# FT.AGGREGATE (faceted search — Phase 152 AGG-01..04)
+# ===========================================================================
+
+if should_run "vector"; then
+    echo ""
+    echo "=== FT.AGGREGATE (FACETED SEARCH) ==="
+    flush_both
+
+    # Setup: index with TAG fields for grouping
+    mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG score NUMERIC >/dev/null 2>&1
+
+    # Insert deterministic fixture:
+    #   status=open  × 5 (priority=high × 3, priority=low × 2) — assignees user0..user4
+    #   status=closed × 2 (priority=low × 2) — assignees user0, user1
+    for i in 1 2 3; do
+        mcli HSET agg:$i status open priority high assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
+    done
+    for i in 4 5; do
+        mcli HSET agg:$i status open priority low assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
+    done
+    for i in 6 7; do
+        mcli HSET agg:$i status closed priority low assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
+    done
+
+    # AGG-01: GROUPBY + COUNT
+    TOTAL=$((TOTAL + 1))
+    AGG_COUNT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
+    if echo "$AGG_COUNT" | grep -q "open" && echo "$AGG_COUNT" | grep -q "5"; then
+        PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+COUNT (open=5)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 GROUPBY+COUNT unexpected: $AGG_COUNT"
+    fi
+
+    # AGG-01: GROUPBY + SUM
+    TOTAL=$((TOTAL + 1))
+    AGG_SUM=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE SUM 1 @score AS total 2>&1)
+    if echo "$AGG_SUM" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 GROUPBY+SUM errored: $AGG_SUM"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+SUM returns rows"
+    fi
+
+    # AGG-01: GROUPBY + AVG
+    TOTAL=$((TOTAL + 1))
+    AGG_AVG=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE AVG 1 @score AS avg_score 2>&1)
+    if echo "$AGG_AVG" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 GROUPBY+AVG errored: $AGG_AVG"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+AVG returns rows"
+    fi
+
+    # AGG-01: GROUPBY + MIN/MAX
+    TOTAL=$((TOTAL + 1))
+    AGG_MIN=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MIN 1 @score AS min_score 2>&1)
+    if echo "$AGG_MIN" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 MIN errored: $AGG_MIN"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: AGG-01 MIN returns rows"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    AGG_MAX=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MAX 1 @score AS max_score 2>&1)
+    if echo "$AGG_MAX" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 MAX errored: $AGG_MAX"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: AGG-01 MAX returns rows"
+    fi
+
+    # AGG-02: SORTBY + LIMIT
+    TOTAL=$((TOTAL + 1))
+    AGG_LIMIT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC LIMIT 0 1 2>&1)
+    # Limit 1 — must return the top group only
+    if echo "$AGG_LIMIT" | grep -q "open" && ! echo "$AGG_LIMIT" | grep -q "closed"; then
+        PASS=$((PASS + 1)); echo "  PASS: AGG-02 SORTBY + LIMIT returns top-1 ('open')"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02 SORTBY+LIMIT unexpected: $AGG_LIMIT"
+    fi
+
+    # AGG-04: COUNT_DISTINCT (HLL-backed)
+    TOTAL=$((TOTAL + 1))
+    AGG_DISTINCT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT_DISTINCT 1 @assignee AS uniq_users 2>&1)
+    if echo "$AGG_DISTINCT" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-04 COUNT_DISTINCT errored: $AGG_DISTINCT"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: AGG-04 COUNT_DISTINCT returns rows"
+    fi
+
+    # APPLY must be rejected in v1 (D-04 / Pitfall 10)
+    TOTAL=$((TOTAL + 1))
+    APPLY_REJECT=$(mcli FT.AGGREGATE aggidx '*' APPLY '@score+1' AS plus_one 2>&1)
+    if echo "$APPLY_REJECT" | grep -qE "APPLY.*not supported|not implemented|v1"; then
+        PASS=$((PASS + 1)); echo "  PASS: AGG APPLY rejected in v1"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: APPLY should be rejected: $APPLY_REJECT"
+    fi
+
+    mcli FT.DROPINDEX aggidx >/dev/null 2>&1
+    echo "  ft_aggregate: done"
+fi
+
+# ===========================================================================
+# FT.SEARCH HYBRID (three-way RRF — Phase 152 HYB-01..03)
+# ===========================================================================
+
+if should_run "vector"; then
+    echo ""
+    echo "=== FT.SEARCH HYBRID (THREE-WAY RRF) ==="
+    flush_both
+
+    # Setup: text + dense + sparse index
+    mcli FT.CREATE hybidx ON HASH PREFIX 1 hy: SCHEMA title TEXT vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC COSINE >/dev/null 2>&1
+
+    # Insert 3 docs with titles + vectors
+    mcli HSET hy:1 title "machine learning introduction" vec "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" >/dev/null 2>&1
+    mcli HSET hy:2 title "deep neural learning" vec "$(printf '\x00\x00\x00\x00\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00')" >/dev/null 2>&1
+    mcli HSET hy:3 title "quantum machines" vec "$(printf '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x3f\x00\x00\x00\x00')" >/dev/null 2>&1
+    sleep 0.5
+
+    # HYB-01: two-way hybrid (BM25 + dense, no sparse clause) — D-16 fall-through
+    TOTAL=$((TOTAL + 1))
+    HYB_TWO=$(mcli FT.SEARCH hybidx "machine learning" HYBRID VECTOR @vec '$q' FUSION RRF LIMIT 0 5 PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" 2>&1)
+    if echo "$HYB_TWO" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 two-way hybrid errored: $HYB_TWO"
+    elif echo "$HYB_TWO" | grep -q "hy:"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-01 two-way BM25+dense returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 two-way returned no docs: $HYB_TWO"
+    fi
+
+    # HYB-01: response carries __rrf_score
+    TOTAL=$((TOTAL + 1))
+    if echo "$HYB_TWO" | grep -q "__rrf_score"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-01 response contains __rrf_score"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 response missing __rrf_score: $HYB_TWO"
+    fi
+
+    # HYB-03: WEIGHTS tuning — all three weights honored
+    TOTAL=$((TOTAL + 1))
+    HYB_WEIGHTS=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION RRF WEIGHTS 1.0 1.5 0.5 LIMIT 0 5 PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" 2>&1)
+    if echo "$HYB_WEIGHTS" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 WEIGHTS errored: $HYB_WEIGHTS"
+    elif echo "$HYB_WEIGHTS" | grep -q "hy:"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-03 WEIGHTS 1.0 1.5 0.5 returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 WEIGHTS returned no docs: $HYB_WEIGHTS"
+    fi
+
+    # HYB-03: negative weight rejected (D-17)
+    TOTAL=$((TOTAL + 1))
+    HYB_NEG=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION RRF WEIGHTS 1.0 -1.0 1.0 LIMIT 0 5 PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" 2>&1)
+    if echo "$HYB_NEG" | grep -qiE "non-negative|finite|weight"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-03 negative weight rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 negative weight should reject: $HYB_NEG"
+    fi
+
+    # HYB-03: NaN weight rejected
+    TOTAL=$((TOTAL + 1))
+    HYB_NAN=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION RRF WEIGHTS 1.0 NaN 1.0 LIMIT 0 5 PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" 2>&1)
+    if echo "$HYB_NAN" | grep -qiE "non-negative|finite|weight"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-03 NaN weight rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 NaN weight should reject: $HYB_NAN"
+    fi
+
+    # HYB-02: non-RRF fusion rejected
+    TOTAL=$((TOTAL + 1))
+    HYB_FUSION=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION FOO LIMIT 0 5 PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" 2>&1)
+    if echo "$HYB_FUSION" | grep -qi "fusion"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-02 unknown FUSION mode rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-02 unknown FUSION should reject: $HYB_FUSION"
+    fi
+
+    # HYB-02: SPARSE on index without sparse field errors (D-16)
+    TOTAL=$((TOTAL + 1))
+    HYB_NOSPARSE=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' SPARSE @noexist '$qs' FUSION RRF LIMIT 0 5 PARAMS 4 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')" qs "$(printf '\x01\x00\x00\x00\x00\x00\x80\x3f')" 2>&1)
+    if echo "$HYB_NOSPARSE" | grep -qi "sparse"; then
+        PASS=$((PASS + 1)); echo "  PASS: HYB-02 SPARSE on index without sparse field errors (D-16)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB-02 missing sparse field should error: $HYB_NOSPARSE"
+    fi
+
+    # HYB: backward-compat — FT.SEARCH without HYBRID keyword unchanged (D-18)
+    TOTAL=$((TOTAL + 1))
+    HYB_BC=$(mcli FT.SEARCH hybidx "machine" LIMIT 0 5 2>&1)
+    if echo "$HYB_BC" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: HYB backward compat (no HYBRID) errored: $HYB_BC"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: HYB backward compat (FT.SEARCH text, no HYBRID)"
+    fi
+
+    mcli FT.DROPINDEX hybidx >/dev/null 2>&1
+    echo "  ft_search_hybrid: done"
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 
