@@ -1180,11 +1180,13 @@ fn auto_index_hset(
         }
     }
 
-    // TEXT field indexing: use pre-computed text_matching from guard
+    // TEXT field indexing: use pre-computed text_matching from guard.
+    // args[0] is the Redis key; field-value pairs start at args[1..].
+    let text_args = if args.is_empty() { args } else { &args[1..] };
     for idx_name in text_matching {
         if let Some(idx) = text_store.get_index_mut(&idx_name) {
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
-            idx.index_document(key_hash, key, args);
+            idx.index_document(key_hash, key, text_args);
         }
     }
 }

@@ -541,5 +541,54 @@ mod tests {
             assert!(idx.field_stats[1].avg_doc_len() > 0.0, "body avg_doc_len should be > 0");
             assert!(idx.total_posting_bytes() > 0, "posting bytes should be > 0");
         }
+
+        /// Validates the fixed auto_index_hset guard: TEXT-only index with
+        /// no matching vector indexes still triggers text indexing.
+        #[test]
+        fn test_auto_index_text_only_guard() {
+            // Create a TextStore with a TEXT-only index
+            let mut text_store = TextStore::new();
+            let text_index = TextIndex::new(
+                Bytes::from_static(b"testidx"),
+                vec![Bytes::from_static(b"doc:")],
+                vec![TextFieldDef::new(Bytes::from_static(b"title"))],
+                BM25Config::default(),
+            );
+            text_store
+                .create_index(Bytes::from_static(b"testidx"), text_index)
+                .expect("create text index");
+
+            // Create an empty VectorStore (no vector indexes at all)
+            let mut vector_store = crate::vector::store::VectorStore::new();
+
+            // Build HSET-style args: [key, field, value, ...] matching real RESP layout.
+            // auto_index_hset receives args with key at args[0].
+            let args = vec![
+                Frame::BulkString(Bytes::from_static(b"doc:1")),
+                Frame::BulkString(Bytes::from_static(b"title")),
+                Frame::BulkString(Bytes::copy_from_slice(b"Machine Learning for NLP")),
+            ];
+
+            // Call auto_index_hset_public with empty VectorStore
+            crate::shard::spsc_handler::auto_index_hset_public(
+                &mut vector_store,
+                &mut text_store,
+                b"doc:1",
+                &args,
+            );
+
+            // Verify TEXT indexing fired despite no vector index matches
+            let idx = text_store.get_index(b"testidx").expect("index exists");
+            assert_eq!(
+                idx.num_docs(),
+                1,
+                "TEXT-only index should have 1 doc after HSET via auto_index_hset"
+            );
+            assert!(
+                idx.num_terms() > 0,
+                "TEXT-only index should have terms after HSET via auto_index_hset, got {}",
+                idx.num_terms()
+            );
+        }
     }
 }

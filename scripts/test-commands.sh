@@ -909,11 +909,25 @@ if should_run "vector"; then
     assert_moon_ok "HSET second doc" HSET doc:t2 title "Second document" body "Another test with more words"
     assert_moon_ok "HSET third doc" HSET doc:t3 title "Third title" body "Final body text here"
 
-    # FT.INFO reports text stats
-    TOTAL=$((TOTAL + 1)); FT_TEXT_INFO=$(mcli FT.INFO textidx 2>&1)
-    if echo "$FT_TEXT_INFO" | grep -q "num_docs"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_docs"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text num_docs"; fi
+    # FT.INFO reports text stats — num_docs and num_terms must be > 0 after HSET
+    FT_TEXT_INFO=$(mcli FT.INFO textidx 2>&1)
+
     TOTAL=$((TOTAL + 1))
-    if echo "$FT_TEXT_INFO" | grep -q "num_terms"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_terms"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text num_terms"; fi
+    TEXT_NUM_DOCS=$(echo "$FT_TEXT_INFO" | grep -A1 "num_docs" | tail -1 | tr -d '[:space:]')
+    if [ -n "$TEXT_NUM_DOCS" ] && [ "$TEXT_NUM_DOCS" != "0" ] && [ "$TEXT_NUM_DOCS" -gt 0 ] 2>/dev/null; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_docs = $TEXT_NUM_DOCS (should be > 0)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text num_docs should be > 0 (got: $TEXT_NUM_DOCS)"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TEXT_NUM_TERMS=$(echo "$FT_TEXT_INFO" | grep -A1 "num_terms" | tail -1 | tr -d '[:space:]')
+    if [ -n "$TEXT_NUM_TERMS" ] && [ "$TEXT_NUM_TERMS" != "0" ] && [ "$TEXT_NUM_TERMS" -gt 0 ] 2>/dev/null; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_terms = $TEXT_NUM_TERMS (should be > 0)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text num_terms should be > 0 (got: $TEXT_NUM_TERMS)"
+    fi
+
     TOTAL=$((TOTAL + 1))
     if echo "$FT_TEXT_INFO" | grep -q "avg_doc_len"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text avg_doc_len"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text avg_doc_len"; fi
     TOTAL=$((TOTAL + 1))
