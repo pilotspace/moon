@@ -8,7 +8,11 @@ use crate::vector::store::VectorStore;
 use super::extract_bulk;
 
 /// FT.DROPINDEX index_name
-pub fn ft_dropindex(store: &mut VectorStore, args: &[Frame]) -> Frame {
+pub fn ft_dropindex(
+    store: &mut VectorStore,
+    _text_store: &mut crate::text::store::TextStore,
+    args: &[Frame],
+) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.DROPINDEX' command",

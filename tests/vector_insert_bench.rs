@@ -145,6 +145,7 @@ fn bench_full_insert_pipeline_128d() {
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
         vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
     };
     let _ = store.create_index(meta);
 
@@ -223,6 +224,7 @@ fn bench_full_insert_pipeline_768d() {
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
         vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
     };
     let _ = store.create_index(meta);
 

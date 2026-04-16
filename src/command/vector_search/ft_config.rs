@@ -12,7 +12,11 @@ use super::extract_bulk;
 ///
 /// Per-index configuration. Currently supports AUTOCOMPACT only.
 /// args[0] = SET|GET, args[1] = index_name, args[2] = param_name, args[3] = value (SET only)
-pub fn ft_config(store: &mut VectorStore, args: &[Frame]) -> Frame {
+pub fn ft_config(
+    store: &mut VectorStore,
+    _text_store: &mut crate::text::store::TextStore,
+    args: &[Frame],
+) -> Frame {
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.CONFIG' command",

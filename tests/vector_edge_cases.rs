@@ -40,6 +40,7 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
         vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
     }
 }
 
@@ -230,7 +231,7 @@ fn test_ft_create_missing_args() {
     let mut store = VectorStore::new();
     // Fewer than 10 args
     let args = vec![bulk(b"myidx"), bulk(b"ON"), bulk(b"HASH")];
-    let result = ft_create(&mut store, &args);
+    let result = ft_create(&mut store, &mut moon::text::store::TextStore::new(), &args);
     assert_is_error(&result, "ft_create with < 10 args");
 }
 
@@ -258,7 +259,7 @@ fn test_ft_create_invalid_dim() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    let result = ft_create(&mut store, &args);
+    let result = ft_create(&mut store, &mut moon::text::store::TextStore::new(), &args);
     assert_is_error(&result, "ft_create with DIM=0");
 
     // DIM = non-numeric
@@ -281,7 +282,7 @@ fn test_ft_create_invalid_dim() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    let result2 = ft_create(&mut store, &args2);
+    let result2 = ft_create(&mut store, &mut moon::text::store::TextStore::new(), &args2);
     assert_is_error(&result2, "ft_create with DIM=notanumber");
 }
 
@@ -308,7 +309,7 @@ fn test_ft_create_missing_schema() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    let result = ft_create(&mut store, &args);
+    let result = ft_create(&mut store, &mut moon::text::store::TextStore::new(), &args);
     assert_is_error(&result, "ft_create without SCHEMA keyword");
 }
 
@@ -318,7 +319,7 @@ fn test_ft_search_missing_query_vector() {
 
     let mut store = VectorStore::new();
     let create_args = ft_create_args("search_idx", 128);
-    ft_create(&mut store, &create_args);
+    ft_create(&mut store, &mut moon::text::store::TextStore::new(), &create_args);
 
     // Only index name and query string, no PARAMS section
     let search_args = vec![bulk(b"search_idx"), bulk(b"*=>[KNN 10 @vec $query]")];
@@ -344,14 +345,14 @@ fn test_ft_search_nonexistent_index() {
 #[test]
 fn test_ft_info_nonexistent_index() {
     let store = VectorStore::new();
-    let result = ft_info(&store, &[bulk(b"no_such_index")]);
+    let result = ft_info(&store, &moon::text::store::TextStore::new(), &[bulk(b"no_such_index")]);
     assert_is_error(&result, "ft_info on nonexistent index");
 }
 
 #[test]
 fn test_ft_dropindex_missing_args() {
     let mut store = VectorStore::new();
-    let result = ft_dropindex(&mut store, &[]);
+    let result = ft_dropindex(&mut store, &mut moon::text::store::TextStore::new(), &[]);
     assert_is_error(&result, "ft_dropindex with no args");
 }
 
@@ -365,7 +366,7 @@ fn test_ft_search_dimension_mismatch_returns_error() {
 
     let mut store = VectorStore::new();
     let create_args = ft_create_args("dim_idx", 128);
-    ft_create(&mut store, &create_args);
+    ft_create(&mut store, &mut moon::text::store::TextStore::new(), &create_args);
 
     // Send a query blob that is 4 bytes (1 float) instead of 128*4
     let search_args = vec![

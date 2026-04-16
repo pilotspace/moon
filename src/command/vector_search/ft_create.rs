@@ -13,7 +13,11 @@ use super::{extract_bulk, matches_keyword, parse_u32};
 ///
 /// Parses the FT.CREATE syntax and creates a vector index in the store.
 /// args[0] = index_name, args[1..] = ON HASH PREFIX ... SCHEMA ...
-pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
+pub fn ft_create(
+    store: &mut VectorStore,
+    _text_store: &mut crate::text::store::TextStore,
+    args: &[Frame],
+) -> Frame {
     if args.len() < 10 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.CREATE' command",
@@ -183,6 +187,7 @@ pub fn ft_create(store: &mut VectorStore, args: &[Frame]) -> Frame {
         quantization: default_field.quantization,
         build_mode: default_field.build_mode,
         vector_fields,
+        schema_fields: Vec::new(),
     };
 
     let index_name_clone = meta.name.clone();

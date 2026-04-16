@@ -234,8 +234,10 @@ pub(crate) fn handle_shard_message_shared(
                         None
                     };
 
+                    let mut text_guard = shard_databases.text_store(shard_id);
                     let frame = dispatch_vector_command(
                         vector_store,
+                        &mut *text_guard,
                         #[cfg(feature = "graph")]
                         Some(&graph_guard),
                         &command,
@@ -940,8 +942,10 @@ pub(crate) fn handle_shard_message_shared(
                 None
             };
 
+            let mut text_guard = shard_databases.text_store(shard_id);
             let response = dispatch_vector_command(
                 vector_store,
+                &mut *text_guard,
                 #[cfg(feature = "graph")]
                 Some(&graph_guard),
                 &command,
@@ -1019,6 +1023,7 @@ pub(crate) fn handle_shard_message_shared(
 /// and perform graph-expanded search if requested (GraphRAG).
 pub(crate) fn dispatch_vector_command(
     vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
     #[cfg(feature = "graph")] graph_store: Option<&crate::graph::store::GraphStore>,
     command: &crate::protocol::Frame,
     db: Option<&mut crate::storage::db::Database>,
@@ -1033,7 +1038,7 @@ pub(crate) fn dispatch_vector_command(
     };
 
     if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-        vector_search::ft_create(vector_store, args)
+        vector_search::ft_create(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
         #[cfg(feature = "graph")]
         {
@@ -1044,15 +1049,15 @@ pub(crate) fn dispatch_vector_command(
             vector_search::ft_search(vector_store, args, db)
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-        vector_search::ft_dropindex(vector_store, args)
+        vector_search::ft_dropindex(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-        vector_search::ft_info(vector_store, args)
+        vector_search::ft_info(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
         vector_search::ft_list(vector_store)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
         vector_search::ft_compact(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-        vector_search::ft_config(vector_store, args)
+        vector_search::ft_config(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
         vector_search::cache_search::ft_cachesearch(vector_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {

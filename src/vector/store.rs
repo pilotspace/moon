@@ -38,6 +38,24 @@ pub struct VectorFieldMeta {
     pub build_mode: BuildMode,
 }
 
+/// Field type variants for mixed-schema indexes (TEXT + VECTOR).
+///
+/// Used by FT.INFO to report all field types in a unified schema view,
+/// and by mixed TEXT+VECTOR indexes to track the complete schema.
+#[derive(Debug, Clone)]
+pub enum FieldType {
+    /// Dense vector field with HNSW index.
+    Vector(VectorFieldMeta),
+    /// Full-text search field with BM25 scoring.
+    Text {
+        field_name: Bytes,
+        weight: f64,
+        nostem: bool,
+        sortable: bool,
+        noindex: bool,
+    },
+}
+
 /// Metadata describing a vector index (from FT.CREATE).
 #[derive(Clone)]
 pub struct IndexMeta {
@@ -72,6 +90,10 @@ pub struct IndexMeta {
     /// this contains exactly one entry matching the top-level fields.
     /// For multi-vector indexes, each entry describes one named vector field.
     pub vector_fields: Vec<VectorFieldMeta>,
+    /// Complete schema field list for mixed-type indexes (TEXT + VECTOR).
+    /// Empty for legacy vector-only indexes (backward compatible).
+    /// Used by FT.INFO to report all field types in a unified schema view.
+    pub schema_fields: Vec<FieldType>,
 }
 
 impl IndexMeta {
@@ -951,6 +973,7 @@ mod tests {
             quantization: QuantizationConfig::TurboQuant4,
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
             vector_fields: Vec::new(), // populated by create_index
+            schema_fields: Vec::new(),
         }
     }
 
@@ -969,6 +992,7 @@ mod tests {
             quantization: quant,
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
             vector_fields: Vec::new(), // populated by create_index
+            schema_fields: Vec::new(),
         }
     }
 

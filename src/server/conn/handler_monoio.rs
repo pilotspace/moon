@@ -1735,7 +1735,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                         let response = {
                             let vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            crate::command::vector_search::ft_info(&vs, cmd_args)
+                            let ts = ctx.shard_databases.text_store(ctx.shard_id);
+                            crate::command::vector_search::ft_info(&vs, &ts, cmd_args)
                         };
                         responses.push(response);
                         continue;
@@ -1769,7 +1770,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
                         let response = {
                             let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            crate::command::vector_search::ft_config(&mut vs, cmd_args)
+                            let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
+                            crate::command::vector_search::ft_config(&mut vs, &mut ts, cmd_args)
                         };
                         responses.push(response);
                         continue;
@@ -1832,8 +1834,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let response = {
                         let shard_databases_ref = &ctx.shard_databases;
                         let mut vs = shard_databases_ref.vector_store(ctx.shard_id);
+                        let mut ts = shard_databases_ref.text_store(ctx.shard_id);
                         if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                            crate::command::vector_search::ft_create(&mut vs, cmd_args)
+                            crate::command::vector_search::ft_create(&mut vs, &mut ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                             // Detect SESSION keyword to provide database access for sorted set tracking
                             let has_session = cmd_args.iter().any(|a| {
@@ -1854,9 +1857,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 crate::command::vector_search::ft_search(&mut vs, cmd_args, None)
                             }
                         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                            crate::command::vector_search::ft_dropindex(&mut vs, cmd_args)
+                            crate::command::vector_search::ft_dropindex(&mut vs, &mut ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                            crate::command::vector_search::ft_info(&vs, cmd_args)
+                            crate::command::vector_search::ft_info(&vs, &ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
                             crate::command::vector_search::ft_list(&vs)
                         } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1866,7 +1869,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 &mut vs, cmd_args,
                             )
                         } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                            crate::command::vector_search::ft_config(&mut vs, cmd_args)
+                            crate::command::vector_search::ft_config(&mut vs, &mut ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                             let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
                             crate::command::vector_search::recommend::ft_recommend(

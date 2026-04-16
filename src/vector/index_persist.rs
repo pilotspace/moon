@@ -204,6 +204,7 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
             quantization,
             build_mode,
             vector_fields,
+            schema_fields: Vec::new(),
         });
     }
 
@@ -403,6 +404,7 @@ mod tests {
                 quantization: QuantizationConfig::TurboQuant4,
                 build_mode: BuildMode::Light,
             }],
+            schema_fields: Vec::new(),
         }
     }
 

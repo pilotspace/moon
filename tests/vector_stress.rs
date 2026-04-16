@@ -56,6 +56,7 @@ fn make_index_meta(name: &str, dim: u32) -> IndexMeta {
         quantization: QuantizationConfig::TurboQuant4,
         build_mode: BuildMode::Light,
         vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
     }
 }
 

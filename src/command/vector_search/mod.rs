@@ -34,9 +34,11 @@ pub use helpers::{metric_to_bytes, quantize_f32_to_sq, quantization_to_bytes};
 
 // Re-export pub(crate) items for sibling submodules (cache_search, navigate, recommend, session).
 #[cfg(feature = "graph")]
+#[allow(unused_imports)] // Used by tests.rs, not by lib code directly
 pub(crate) use ft_search::{
     build_combined_response, extract_seeds_from_response, parse_expand_clause,
 };
+#[allow(unused_imports)] // parse_range_clause, parse_sparse_clause used by tests.rs only
 pub(crate) use ft_search::{
     build_search_response, extract_param_blob, parse_filter_clause, parse_knn_query,
     parse_limit_clause, parse_range_clause, parse_sparse_clause, parse_usize,

@@ -840,10 +840,12 @@ pub async fn broadcast_vector_command(
     // LOCAL: execute only after all remote shards succeeded
     let local_result = {
         let mut vs = shard_databases.vector_store(my_shard);
+        let mut ts = shard_databases.text_store(my_shard);
         #[cfg(feature = "graph")]
         let graph_guard = shard_databases.graph_store_read(my_shard);
         crate::shard::spsc_handler::dispatch_vector_command(
             &mut vs,
+            &mut *ts,
             #[cfg(feature = "graph")]
             Some(&graph_guard),
             &command,

@@ -5,6 +5,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(feature = "graph")]
 use crate::graph::store::GraphStore;
 use crate::storage::Database;
+use crate::text::store::TextStore;
 use crate::vector::store::VectorStore;
 
 /// Thread-safe wrapper over per-shard databases.
@@ -16,6 +17,8 @@ pub struct ShardDatabases {
     shards: Vec<Vec<RwLock<Database>>>,
     /// Per-shard VectorStore for FT.* commands in single-shard mode.
     vector_stores: Vec<Mutex<VectorStore>>,
+    /// Per-shard TextStore for full-text search indexes.
+    text_stores: Vec<Mutex<TextStore>>,
     /// Per-shard GraphStore for GRAPH.* commands.
     #[cfg(feature = "graph")]
     graph_stores: Vec<RwLock<GraphStore>>,
@@ -39,6 +42,9 @@ impl ShardDatabases {
         let vector_stores = (0..num_shards)
             .map(|_| Mutex::new(VectorStore::new()))
             .collect();
+        let text_stores = (0..num_shards)
+            .map(|_| Mutex::new(TextStore::new()))
+            .collect();
         #[cfg(feature = "graph")]
         let graph_stores = (0..num_shards)
             .map(|_| RwLock::new(GraphStore::new()))
@@ -47,6 +53,7 @@ impl ShardDatabases {
         Arc::new(Self {
             shards,
             vector_stores,
+            text_stores,
             #[cfg(feature = "graph")]
             graph_stores,
             wal_append_txs,
@@ -86,6 +93,12 @@ impl ShardDatabases {
     #[inline]
     pub fn vector_store(&self, shard_id: usize) -> MutexGuard<'_, VectorStore> {
         self.vector_stores[shard_id].lock()
+    }
+
+    /// Acquire exclusive access to a shard's TextStore.
+    #[inline]
+    pub fn text_store(&self, shard_id: usize) -> MutexGuard<'_, TextStore> {
+        self.text_stores[shard_id].lock()
     }
 
     /// Acquire shared read access to a shard's GraphStore.

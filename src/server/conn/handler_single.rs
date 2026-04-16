@@ -1083,8 +1083,14 @@ pub async fn handle_connection(
                             if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
                                 if let Some(ref vs) = vector_store {
                                     let mut store = vs.lock();
+                                    // Temporary dummy TextStore for handler_single path.
+                                    // Text indexes are dispatched via SPSC (spsc_handler) where
+                                    // the real per-shard TextStore is used. This handler path
+                                    // will be wired to SharedDatabases.text_store() when
+                                    // auto_index_hset integration is added.
+                                    let mut dummy_ts = crate::text::store::TextStore::new();
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                                        crate::command::vector_search::ft_create(&mut *store, cmd_args)
+                                        crate::command::vector_search::ft_create(&mut *store, &mut dummy_ts, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                         let has_session = cmd_args.iter().any(|a| {
                                             if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
@@ -1096,9 +1102,9 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_search(&mut *store, cmd_args, None)
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                        crate::command::vector_search::ft_dropindex(&mut *store, cmd_args)
+                                        crate::command::vector_search::ft_dropindex(&mut *store, &mut dummy_ts, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                        crate::command::vector_search::ft_info(&*store, cmd_args)
+                                        crate::command::vector_search::ft_info(&*store, &dummy_ts, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                         crate::command::vector_search::ft_list(&*store)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1106,7 +1112,7 @@ pub async fn handle_connection(
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                         crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                        crate::command::vector_search::ft_config(&mut *store, cmd_args)
+                                        crate::command::vector_search::ft_config(&mut *store, &mut dummy_ts, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                         let mut db_guard = db[conn.selected_db].write();
                                         crate::command::vector_search::recommend::ft_recommend(&mut *store, cmd_args, Some(&mut *db_guard))
@@ -1266,7 +1272,8 @@ pub async fn handle_connection(
                                                 crate::command::vector_search::ft_search(&mut *store, d_args, None)
                                             }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                            crate::command::vector_search::ft_info(&*store, d_args)
+                                            let dummy_ts = crate::text::store::TextStore::new();
+                                            crate::command::vector_search::ft_info(&*store, &dummy_ts, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                             crate::command::vector_search::ft_list(&*store)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1274,7 +1281,10 @@ pub async fn handle_connection(
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                             crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                            crate::command::vector_search::ft_config(&mut *store, d_args)
+                                            {
+                                                let mut dts = crate::text::store::TextStore::new();
+                                                crate::command::vector_search::ft_config(&mut *store, &mut dts, d_args)
+                                            }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                             drop(guard);
                                             let mut db_guard = db[conn.selected_db].write();
@@ -1379,15 +1389,17 @@ pub async fn handle_connection(
                                 if d_cmd.len() > 3 && d_cmd[..3].eq_ignore_ascii_case(b"FT.") {
                                     if let Some(ref vs) = vector_store {
                                         let mut store = vs.lock();
+                                        let mut dummy_ts = crate::text::store::TextStore::new();
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                                            crate::command::vector_search::ft_create(&mut *store, d_args)
+                                            crate::command::vector_search::ft_create(&mut *store, &mut dummy_ts, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                             // Write run: guard is already write-locked
                                             crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard))
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                            crate::command::vector_search::ft_dropindex(&mut *store, d_args)
+                                            crate::command::vector_search::ft_dropindex(&mut *store, &mut dummy_ts, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                                            crate::command::vector_search::ft_info(&*store, d_args)
+                                            let dummy_ts = crate::text::store::TextStore::new();
+                                            crate::command::vector_search::ft_info(&*store, &dummy_ts, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
                                             crate::command::vector_search::ft_list(&*store)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1395,7 +1407,10 @@ pub async fn handle_connection(
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                                             crate::command::vector_search::cache_search::ft_cachesearch(&mut *store, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                                            crate::command::vector_search::ft_config(&mut *store, d_args)
+                                            {
+                                                let mut dts = crate::text::store::TextStore::new();
+                                                crate::command::vector_search::ft_config(&mut *store, &mut dts, d_args)
+                                            }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                                             crate::command::vector_search::recommend::ft_recommend(&mut *store, d_args, Some(&mut *guard))
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {

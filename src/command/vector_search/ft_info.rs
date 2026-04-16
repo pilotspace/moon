@@ -12,7 +12,11 @@ use super::{extract_bulk, helpers::metric_to_bytes, helpers::quantization_to_byt
 /// Returns an array of key-value pairs describing the index.
 /// Includes backward-compatible top-level fields (from default field) plus
 /// a `vector_fields` nested array with per-field stats.
-pub fn ft_info(store: &VectorStore, args: &[Frame]) -> Frame {
+pub fn ft_info(
+    store: &VectorStore,
+    _text_store: &crate::text::store::TextStore,
+    args: &[Frame],
+) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.INFO' command",
