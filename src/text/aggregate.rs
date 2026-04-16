@@ -1,39 +1,14 @@
 //! FT.AGGREGATE pipeline core (Phase 152).
 //!
-//! Per CONTEXT.md decisions:
-//!   - **D-01:** Pipeline is `Vec<AggregateStep>` executed iteratively — not a trait
-//!     object, not a streaming iterator. Enum dispatch keeps control flow explicit
-//!     and shard-serialization-friendly.
-//!   - **D-02:** Rows flow between stages as `Vec<AggregateRow>` where
-//!     `AggregateRow = SmallVec<[(Bytes, AggregateValue); 8]>` — typical rows have
-//!     ≤ 8 fields so the inline buffer avoids heap traffic.
-//!   - **D-03:** v1 reducer set is COUNT / COUNT_DISTINCT / SUM / AVG / MIN / MAX.
-//!     TOLIST, STDDEV, QUANTILE, MEDIAN are deferred (AGG-05+).
-//!   - **D-04:** APPLY stage is parsed but `execute_pipeline` returns
-//!     `Frame::Error("ERR APPLY stage not supported in v1")`. The pipeline shape
-//!     is locked now; the expression evaluator lands post-v1.
-//!   - **D-05/D-06:** Reducer partial states are reducer-specific and all merges
-//!     are associative + commutative, enabling shard → coordinator fan-in.
+//! Honors CONTEXT.md D-01 (enum pipeline), D-02 (SmallVec row buffer), D-03
+//! (v1 reducer set COUNT/COUNT_DISTINCT/SUM/AVG/MIN/MAX), D-04 (APPLY errors),
+//! D-05/D-06 (associative-commutative merges for shard fan-in).
 //!
-//! **Source-audit override of D-06:** D-06 literally specifies "fixed 2^12
-//! registers = 4 KiB" for COUNT_DISTINCT, but Moon already ships a
-//! production-grade HyperLogLog in `crate::storage::hll::Hll` at P=14 (16384
-//! registers, ~0.81% error) with Redis-HYLL-wire-compatible dense/sparse
-//! encodings. This module **reuses** that implementation — zero new unsafe,
-//! zero new format to maintain, zero new bugs. See RESEARCH.md §Summary.
+//! Source-audit override of D-06: reuses production `crate::storage::hll::Hll`
+//! (P=14, 16384 registers, Redis-HYLL wire format) rather than hand-rolling a
+//! 4 KiB/P=12 sketch. Zero new unsafe, zero new format to maintain.
 //!
-//! **Non-goals for this module:**
-//!   - No FT.AGGREGATE parser (lives in Plan 02).
-//!   - No scatter-gather dispatch (lives in Plan 03).
-//!   - No I/O, no locking, no shard-local hash-store reads.
-//!
-//! The only external types this module touches are:
-//!   - `bytes::Bytes` — zero-copy field names and string values.
-//!   - `ordered_float::OrderedFloat<f64>` — NaN-safe numeric compares for SORTBY.
-//!   - `smallvec::SmallVec` — inline row buffer.
-//!   - `crate::storage::hll::Hll` — COUNT_DISTINCT sketch (reuse).
-//!   - `crate::vector::filter::expression::FilterExpr` — FILTER step AST (Plan 02
-//!     passes the parsed AST in; this module does not parse).
+//! Out of scope: parser (Plan 02), scatter-gather dispatch (Plan 03), I/O.
 
 #![cfg(feature = "text-index")]
 
@@ -254,17 +229,13 @@ impl PartialReducerState {
             }
             (Self::Min(a), Self::Min(b)) => {
                 *a = match (*a, b) {
-                    (Some(x), Some(y)) => {
-                        Some(OrderedFloat(x.into_inner().min(y.into_inner())))
-                    }
+                    (Some(x), Some(y)) => Some(OrderedFloat(x.into_inner().min(y.into_inner()))),
                     (None, v) | (v, None) => v,
                 };
             }
             (Self::Max(a), Self::Max(b)) => {
                 *a = match (*a, b) {
-                    (Some(x), Some(y)) => {
-                        Some(OrderedFloat(x.into_inner().max(y.into_inner())))
-                    }
+                    (Some(x), Some(y)) => Some(OrderedFloat(x.into_inner().max(y.into_inner()))),
                     (None, v) | (v, None) => v,
                 };
             }
@@ -455,9 +426,7 @@ fn init_states(reducers: &[ReducerSpec]) -> Vec<PartialReducerState> {
         .iter()
         .map(|s| match s.fn_name {
             ReducerFn::Count => PartialReducerState::Count(0),
-            ReducerFn::Sum | ReducerFn::Avg => {
-                PartialReducerState::Sum { sum: 0.0, count: 0 }
-            }
+            ReducerFn::Sum | ReducerFn::Avg => PartialReducerState::Sum { sum: 0.0, count: 0 },
             ReducerFn::Min => PartialReducerState::Min(None),
             ReducerFn::Max => PartialReducerState::Max(None),
             ReducerFn::CountDistinct => PartialReducerState::CountDistinct(Hll::new_sparse()),
@@ -551,10 +520,7 @@ fn value_to_bytes(v: Option<&AggregateValue>) -> Option<Bytes> {
     }
 }
 
-fn compare_values(
-    a: Option<&AggregateValue>,
-    b: Option<&AggregateValue>,
-) -> std::cmp::Ordering {
+fn compare_values(a: Option<&AggregateValue>, b: Option<&AggregateValue>) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     let af = value_to_f64(a);
     let bf = value_to_f64(b);
@@ -581,13 +547,83 @@ impl CloneAsBytes for Option<&AggregateValue> {
     fn cloned_as_bytes(&self) -> Bytes {
         match self {
             Some(AggregateValue::Str(b)) => b.clone(),
-            Some(AggregateValue::Int(n)) => {
-                Bytes::from(itoa::Buffer::new().format(*n).to_owned())
-            }
+            Some(AggregateValue::Int(n)) => Bytes::from(itoa::Buffer::new().format(*n).to_owned()),
             Some(AggregateValue::Float(of)) => Bytes::from(format!("{}", of.into_inner())),
             Some(AggregateValue::Null) | None => Bytes::from_static(b""),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator-side associative merge
+// ---------------------------------------------------------------------------
+
+/// A shard's contribution to an FT.AGGREGATE request.
+///
+/// One entry per distinct `GroupKey` on that shard, each carrying reducer
+/// states in **positional** correspondence with the `reducers` slice of the
+/// pipeline's GroupBy step. Positional (not named) is the cheapest way to
+/// keep shard/coordinator in sync because the pipeline is broadcast
+/// identically to every shard.
+///
+/// Inline size 4 matches the common case of ≤ 4 reducer clauses per
+/// FT.AGGREGATE query.
+pub type ShardPartial = Vec<(GroupKey, SmallVec<[PartialReducerState; 4]>)>;
+
+/// Associatively merge partial reducer states from multiple shards into a
+/// finalized row set.
+///
+/// All shards **MUST** have executed the same pipeline — the reducer order
+/// is implied by `reducers`, not serialized. `PartialReducerState::merge`
+/// handles the per-variant combine; type mismatches (which should not occur
+/// under this invariant) are silent no-ops.
+///
+/// Output shape matches per-shard `apply_groupby`: GroupBy field names first
+/// (in declared order), reducer aliases second (in declared order). This
+/// lets the coordinator feed the output straight into downstream SORTBY /
+/// LIMIT stages at the plan-03 gather site.
+pub fn merge_partial_states(
+    shard_partials: Vec<ShardPartial>,
+    groupby_fields: &[Bytes],
+    reducers: &[ReducerSpec],
+) -> Vec<AggregateRow> {
+    use std::collections::HashMap;
+
+    let mut merged: HashMap<GroupKey, SmallVec<[PartialReducerState; 4]>> = HashMap::new();
+    for partial in shard_partials {
+        for (key, states) in partial {
+            match merged.get_mut(&key) {
+                Some(acc) => {
+                    // Merge state-by-state in position order. A length
+                    // mismatch would indicate a pipeline-shape bug; `zip`
+                    // stops at the shorter side so we never panic on
+                    // mismatched data — the coordinator loses the surplus
+                    // states rather than crashing.
+                    for (a, b) in acc.iter_mut().zip(states) {
+                        a.merge(b);
+                    }
+                }
+                None => {
+                    merged.insert(key, states);
+                }
+            }
+        }
+    }
+
+    // Finalize: emit one AggregateRow per group.
+    let mut out = Vec::with_capacity(merged.len());
+    for (key, states) in merged {
+        let mut row: AggregateRow = SmallVec::new();
+        for (fname, val) in groupby_fields.iter().zip(key.iter()) {
+            row.push((fname.clone(), AggregateValue::Str(val.clone())));
+        }
+        for (spec, state) in reducers.iter().zip(states) {
+            let is_avg = matches!(spec.fn_name, ReducerFn::Avg);
+            row.push((spec.alias.clone(), state.finalize(is_avg)));
+        }
+        out.push(row);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -777,10 +813,9 @@ mod tests {
         right.merge(state_a);
 
         let (est_l, est_r) = match (&left, &right) {
-            (
-                PartialReducerState::CountDistinct(l),
-                PartialReducerState::CountDistinct(r),
-            ) => (l.count(), r.count()),
+            (PartialReducerState::CountDistinct(l), PartialReducerState::CountDistinct(r)) => {
+                (l.count(), r.count())
+            }
             _ => panic!("expected CountDistinct"),
         };
 
@@ -804,7 +839,10 @@ mod tests {
 
     #[test]
     fn test_partial_state_finalize_avg_divides() {
-        let s = PartialReducerState::Sum { sum: 10.0, count: 4 };
+        let s = PartialReducerState::Sum {
+            sum: 10.0,
+            count: 4,
+        };
         match s.finalize(true) {
             AggregateValue::Float(v) => {
                 assert!((v.into_inner() - 2.5).abs() < f64::EPSILON);
@@ -824,7 +862,10 @@ mod tests {
 
     #[test]
     fn test_partial_state_finalize_sum_returns_raw_sum() {
-        let s = PartialReducerState::Sum { sum: 10.0, count: 4 };
+        let s = PartialReducerState::Sum {
+            sum: 10.0,
+            count: 4,
+        };
         match s.finalize(false) {
             AggregateValue::Float(v) => {
                 assert!((v.into_inner() - 10.0).abs() < f64::EPSILON);
@@ -941,7 +982,10 @@ mod tests {
             alias: Bytes::from_static(b"b"),
         }];
         let err = execute_pipeline(rows, &pipeline).expect_err("APPLY must error");
-        assert_eq!(err, Bytes::from_static(b"ERR APPLY stage not supported in v1"));
+        assert_eq!(
+            err,
+            Bytes::from_static(b"ERR APPLY stage not supported in v1")
+        );
     }
 
     #[test]
@@ -949,7 +993,10 @@ mod tests {
         let rows: Vec<AggregateRow> = (0..10)
             .map(|i| row_mixed(&[], &[(b"@i", i as f64)]))
             .collect();
-        let pipeline = vec![AggregateStep::Limit { offset: 2, count: 3 }];
+        let pipeline = vec![AggregateStep::Limit {
+            offset: 2,
+            count: 3,
+        }];
         let out = execute_pipeline(rows, &pipeline).expect("limit ok");
         assert_eq!(out.len(), 3);
         assert_eq!(row_num(&out[0], b"@i"), Some(2.0));
@@ -959,8 +1006,13 @@ mod tests {
 
     #[test]
     fn test_execute_pipeline_limit_past_end() {
-        let rows: Vec<AggregateRow> = (0..5).map(|i| row_mixed(&[], &[(b"@i", i as f64)])).collect();
-        let pipeline = vec![AggregateStep::Limit { offset: 10, count: 3 }];
+        let rows: Vec<AggregateRow> = (0..5)
+            .map(|i| row_mixed(&[], &[(b"@i", i as f64)]))
+            .collect();
+        let pipeline = vec![AggregateStep::Limit {
+            offset: 10,
+            count: 3,
+        }];
         let out = execute_pipeline(rows, &pipeline).expect("limit past end ok");
         assert!(out.is_empty());
     }
@@ -975,7 +1027,10 @@ mod tests {
         keys.push((Bytes::from_static(b"@score"), SortOrder::Desc));
         let pipeline = vec![AggregateStep::SortBy { keys, max: None }];
         let out = execute_pipeline(rows, &pipeline).expect("sortby ok");
-        let ordered: Vec<f64> = out.iter().map(|r| row_num(r, b"@score").unwrap_or(0.0)).collect();
+        let ordered: Vec<f64> = out
+            .iter()
+            .map(|r| row_num(r, b"@score").unwrap_or(0.0))
+            .collect();
         assert_eq!(ordered, vec![4.0, 3.0, 2.0, 1.0]);
     }
 
@@ -1147,7 +1202,10 @@ mod tests {
                 keys: sort_keys,
                 max: None,
             },
-            AggregateStep::Limit { offset: 0, count: 2 },
+            AggregateStep::Limit {
+                offset: 0,
+                count: 2,
+            },
         ];
         let out = execute_pipeline(rows, &pipeline).expect("pipeline ok");
         assert_eq!(out.len(), 2);
@@ -1177,7 +1235,10 @@ mod tests {
         }];
         let pipeline = vec![AggregateStep::GroupBy { fields, reducers }];
         let err = execute_pipeline(rows, &pipeline).expect_err("should cap");
-        assert_eq!(err, Bytes::from_static(b"ERR GROUPBY cardinality limit exceeded"));
+        assert_eq!(
+            err,
+            Bytes::from_static(b"ERR GROUPBY cardinality limit exceeded")
+        );
     }
 
     #[test]
@@ -1212,6 +1273,223 @@ mod tests {
         rows.push(row_str(&[(b"@g", b"overflow")]));
         let pipeline2 = vec![AggregateStep::GroupBy { fields, reducers }];
         let err = execute_pipeline(rows, &pipeline2).expect_err("should cap on (N+1)th");
-        assert_eq!(err, Bytes::from_static(b"ERR GROUPBY cardinality limit exceeded"));
+        assert_eq!(
+            err,
+            Bytes::from_static(b"ERR GROUPBY cardinality limit exceeded")
+        );
+    }
+
+    // ============================================================
+    // merge_partial_states tests (Task 3)
+    // ============================================================
+
+    fn group_key(parts: &[&[u8]]) -> GroupKey {
+        let mut k: GroupKey = SmallVec::new();
+        for p in parts {
+            k.push(Bytes::copy_from_slice(p));
+        }
+        k
+    }
+
+    fn count_states(n: u64) -> SmallVec<[PartialReducerState; 4]> {
+        let mut v: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+        v.push(PartialReducerState::Count(n));
+        v
+    }
+
+    fn groupby_fields_single(field: &[u8]) -> Vec<Bytes> {
+        vec![Bytes::copy_from_slice(field)]
+    }
+
+    fn count_reducer(alias: &[u8]) -> Vec<ReducerSpec> {
+        vec![ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::copy_from_slice(alias),
+        }]
+    }
+
+    #[test]
+    fn test_merge_partial_states_associative_count() {
+        let key_a = group_key(&[b"a"]);
+        let key_b = group_key(&[b"b"]);
+        let key_c = group_key(&[b"c"]);
+
+        let shard0: ShardPartial = vec![
+            (key_a.clone(), count_states(3)),
+            (key_b.clone(), count_states(2)),
+        ];
+        let shard1: ShardPartial = vec![
+            (key_a.clone(), count_states(5)),
+            (key_c.clone(), count_states(1)),
+        ];
+
+        let fields = groupby_fields_single(b"@g");
+        let reducers = count_reducer(b"cnt");
+
+        let out = merge_partial_states(vec![shard0, shard1], &fields, &reducers);
+        assert_eq!(out.len(), 3);
+
+        let mut found_a = None;
+        let mut found_b = None;
+        let mut found_c = None;
+        for row in &out {
+            let g = row_str_val(row, b"@g");
+            let c = row_num(row, b"cnt");
+            match g.as_deref() {
+                Some(b"a") => found_a = c,
+                Some(b"b") => found_b = c,
+                Some(b"c") => found_c = c,
+                other => panic!("unexpected group {:?}", other),
+            }
+        }
+        assert_eq!(found_a, Some(8.0));
+        assert_eq!(found_b, Some(2.0));
+        assert_eq!(found_c, Some(1.0));
+    }
+
+    #[test]
+    fn test_merge_partial_states_commutative() {
+        // Swap shard order — counts must be unchanged (associative + commutative).
+        let key_a = group_key(&[b"a"]);
+        let key_b = group_key(&[b"b"]);
+        let key_c = group_key(&[b"c"]);
+
+        let shard0: ShardPartial = vec![
+            (key_a.clone(), count_states(3)),
+            (key_b.clone(), count_states(2)),
+        ];
+        let shard1: ShardPartial = vec![
+            (key_a.clone(), count_states(5)),
+            (key_c.clone(), count_states(1)),
+        ];
+
+        let fields = groupby_fields_single(b"@g");
+        let reducers = count_reducer(b"cnt");
+
+        // Reversed order.
+        let out = merge_partial_states(vec![shard1, shard0], &fields, &reducers);
+        assert_eq!(out.len(), 3);
+
+        let mut found_a = None;
+        let mut found_b = None;
+        let mut found_c = None;
+        for row in &out {
+            let g = row_str_val(row, b"@g");
+            let c = row_num(row, b"cnt");
+            match g.as_deref() {
+                Some(b"a") => found_a = c,
+                Some(b"b") => found_b = c,
+                Some(b"c") => found_c = c,
+                other => panic!("unexpected group {:?}", other),
+            }
+        }
+        assert_eq!(found_a, Some(8.0));
+        assert_eq!(found_b, Some(2.0));
+        assert_eq!(found_c, Some(1.0));
+    }
+
+    #[test]
+    fn test_merge_partial_states_empty_input() {
+        let fields = groupby_fields_single(b"@g");
+        let reducers = count_reducer(b"cnt");
+        let out: Vec<AggregateRow> = merge_partial_states(vec![vec![], vec![]], &fields, &reducers);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_merge_partial_states_handles_only_one_shard_has_group() {
+        let shard0: ShardPartial = vec![(group_key(&[b"a"]), count_states(4))];
+        let shard1: ShardPartial = vec![(group_key(&[b"b"]), count_states(7))];
+
+        let fields = groupby_fields_single(b"@g");
+        let reducers = count_reducer(b"cnt");
+
+        let out = merge_partial_states(vec![shard0, shard1], &fields, &reducers);
+        assert_eq!(out.len(), 2);
+        let mut found_a = None;
+        let mut found_b = None;
+        for row in &out {
+            match row_str_val(row, b"@g").as_deref() {
+                Some(b"a") => found_a = row_num(row, b"cnt"),
+                Some(b"b") => found_b = row_num(row, b"cnt"),
+                other => panic!("unexpected group {:?}", other),
+            }
+        }
+        assert_eq!(found_a, Some(4.0));
+        assert_eq!(found_b, Some(7.0));
+    }
+
+    #[test]
+    fn test_merge_partial_states_preserves_group_field_names() {
+        // Two GroupBy fields + one reducer alias — output must have all three
+        // columns in declared order: @f1, @f2, then cnt.
+        let mut fields: Vec<Bytes> = Vec::new();
+        fields.push(Bytes::from_static(b"@f1"));
+        fields.push(Bytes::from_static(b"@f2"));
+        let reducers = count_reducer(b"cnt");
+
+        let key = group_key(&[b"x", b"y"]);
+        let shard0: ShardPartial = vec![(key.clone(), count_states(1))];
+        let shard1: ShardPartial = vec![(key, count_states(2))];
+
+        let out = merge_partial_states(vec![shard0, shard1], &fields, &reducers);
+        assert_eq!(out.len(), 1);
+        let row = &out[0];
+        // Column 0 = @f1 = "x", column 1 = @f2 = "y", column 2 = cnt = 3.
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0].0.as_ref(), b"@f1".as_ref());
+        match &row[0].1 {
+            AggregateValue::Str(b) => assert_eq!(b.as_ref(), b"x".as_ref()),
+            other => panic!("expected Str(x), got {:?}", other),
+        }
+        assert_eq!(row[1].0.as_ref(), b"@f2".as_ref());
+        match &row[1].1 {
+            AggregateValue::Str(b) => assert_eq!(b.as_ref(), b"y".as_ref()),
+            other => panic!("expected Str(y), got {:?}", other),
+        }
+        assert_eq!(row[2].0.as_ref(), b"cnt".as_ref());
+        match &row[2].1 {
+            AggregateValue::Int(n) => assert_eq!(*n, 3),
+            other => panic!("expected Int(3), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_merge_partial_states_hll_across_shards() {
+        // Each shard builds its own HLL with distinct users for the same key.
+        // After coordinator merge the cardinality must be ≈ the sum of
+        // distinct users (not just max).
+        let mut hll_a = Hll::new_sparse();
+        for i in 0..500u32 {
+            hll_a.add(&i.to_le_bytes());
+        }
+        let mut hll_b = Hll::new_sparse();
+        for i in 500..1500u32 {
+            hll_b.add(&i.to_le_bytes());
+        }
+
+        let mut sa: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+        sa.push(PartialReducerState::CountDistinct(hll_a));
+        let mut sb: SmallVec<[PartialReducerState; 4]> = SmallVec::new();
+        sb.push(PartialReducerState::CountDistinct(hll_b));
+
+        let key = group_key(&[b"k"]);
+        let shard0: ShardPartial = vec![(key.clone(), sa)];
+        let shard1: ShardPartial = vec![(key, sb)];
+
+        let fields = groupby_fields_single(b"@g");
+        let reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::CountDistinct,
+            field: Some(Bytes::from_static(b"@user")),
+            alias: Bytes::from_static(b"uniq"),
+        }];
+
+        let out = merge_partial_states(vec![shard0, shard1], &fields, &reducers);
+        assert_eq!(out.len(), 1);
+        let est = row_num(&out[0], b"uniq").expect("uniq value");
+        let truth = 1500.0;
+        let err = (est - truth).abs() / truth;
+        assert!(err < 0.02, "HLL cross-shard error {} too high", err);
     }
 }
