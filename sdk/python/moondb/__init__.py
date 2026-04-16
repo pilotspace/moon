@@ -27,6 +27,7 @@ Quick start::
 __version__ = "0.1.0"
 
 from .client import AsyncMoonClient, MoonClient
+from .text import AsyncTextCommands, TextCommands
 from .types import (
     AggregateStep,
     Avg,
@@ -54,6 +55,8 @@ from .types import (
 __all__ = [
     "MoonClient",
     "AsyncMoonClient",
+    "TextCommands",
+    "AsyncTextCommands",
     "SearchResult",
     "GraphNode",
     "GraphEdge",

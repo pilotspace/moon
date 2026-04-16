@@ -7,7 +7,7 @@ semantic caching. All standard Redis commands remain available.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import redis
 import redis.asyncio
@@ -15,6 +15,7 @@ import redis.asyncio
 from .cache import AsyncCacheCommands, CacheCommands
 from .graph import AsyncGraphCommands, GraphCommands
 from .session import AsyncSessionCommands, SessionCommands
+from .text import AsyncTextCommands, TextCommands
 from .vector import AsyncVectorCommands, VectorCommands
 
 
@@ -64,9 +65,9 @@ class MoonClient(redis.Redis):  # type: ignore[type-arg]
         host: str = "localhost",
         port: int = 6379,
         db: int = 0,
-        password: Optional[str] = None,
+        password: str | None = None,
         decode_responses: bool = False,
-        **kwargs: Any,
+        **kwargs: Any,  # noqa: ANN401 -- forwarded to redis.Redis/redis.asyncio.Redis
     ) -> None:
         super().__init__(
             host=host,
@@ -80,6 +81,7 @@ class MoonClient(redis.Redis):  # type: ignore[type-arg]
         self._graph = GraphCommands(self)
         self._session = SessionCommands(self)
         self._cache = CacheCommands(self)
+        self._text = TextCommands(self)
 
     @property
     def vector(self) -> VectorCommands:
@@ -100,6 +102,11 @@ class MoonClient(redis.Redis):  # type: ignore[type-arg]
     def cache(self) -> CacheCommands:
         """Semantic cache commands (FT.CACHESEARCH)."""
         return self._cache
+
+    @property
+    def text(self) -> TextCommands:
+        """Full-text search commands (FT.SEARCH BM25 + FT.AGGREGATE + HYBRID)."""
+        return self._text
 
     def moon_info(self) -> dict[str, Any]:
         """Get Moon server info (parsed INFO output).
@@ -150,9 +157,9 @@ class AsyncMoonClient(redis.asyncio.Redis):  # type: ignore[type-arg]
         host: str = "localhost",
         port: int = 6379,
         db: int = 0,
-        password: Optional[str] = None,
+        password: str | None = None,
         decode_responses: bool = False,
-        **kwargs: Any,
+        **kwargs: Any,  # noqa: ANN401 -- forwarded to redis.Redis/redis.asyncio.Redis
     ) -> None:
         super().__init__(
             host=host,
@@ -166,6 +173,7 @@ class AsyncMoonClient(redis.asyncio.Redis):  # type: ignore[type-arg]
         self._graph = AsyncGraphCommands(self)
         self._session = AsyncSessionCommands(self)
         self._cache = AsyncCacheCommands(self)
+        self._text = AsyncTextCommands(self)
 
     @property
     def vector(self) -> AsyncVectorCommands:
@@ -186,6 +194,11 @@ class AsyncMoonClient(redis.asyncio.Redis):  # type: ignore[type-arg]
     def cache(self) -> AsyncCacheCommands:
         """Semantic cache commands (FT.CACHESEARCH, async)."""
         return self._cache
+
+    @property
+    def text(self) -> AsyncTextCommands:
+        """Full-text search commands (FT.SEARCH BM25 + FT.AGGREGATE + HYBRID, async)."""
+        return self._text
 
     async def moon_info(self) -> dict[str, Any]:
         """Get Moon server info (async).
