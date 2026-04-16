@@ -1690,6 +1690,88 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if ctx.num_shards > 1 {
                     // Multi-shard: dispatch via SPSC
                     if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                        // Check if this is a text query BEFORE trying parse_ft_search_args
+                        // (which would return an error for non-KNN queries).
+                        let query_bytes = cmd_args.get(1).and_then(|f| crate::command::vector_search::extract_bulk(f));
+                        let is_text = query_bytes.as_ref().map_or(false, |q| {
+                            crate::command::vector_search::is_text_query(q)
+                        });
+
+                        if is_text {
+                            // ── Text FT.SEARCH: two-phase DFS scatter-gather ──────────────────
+                            let index_name = match cmd_args.first().and_then(|f| crate::command::vector_search::extract_bulk(f)) {
+                                Some(b) => b,
+                                None => {
+                                    responses.push(Frame::Error(Bytes::from_static(b"ERR invalid index name")));
+                                    continue;
+                                }
+                            };
+                            let query_str = query_bytes.unwrap();
+
+                            // Parse query and resolve field_idx inside a block scope so the
+                            // MutexGuard from text_store() is dropped BEFORE .await.
+                            // We use the TextIndex's own field_analyzers (same pipeline used at index time).
+                            type ParseResult = Result<(Vec<String>, Option<usize>), String>;
+                            let parse_result: ParseResult = {
+                                let ts = ctx.shard_databases.text_store(ctx.shard_id);
+                                match ts.get_index(&index_name) {
+                                    None => Err("ERR no such index".to_owned()),
+                                    Some(text_index) => {
+                                        match text_index.field_analyzers.first() {
+                                            None => Err("ERR index has no TEXT fields".to_owned()),
+                                            Some(analyzer) => {
+                                                // analyzer borrows text_index which borrows ts — all in this block.
+                                                let parsed = crate::command::vector_search::parse_text_query(&query_str, analyzer);
+                                                match parsed {
+                                                    Err(e) => Err(e.to_owned()),
+                                                    Ok(clause) => {
+                                                        let field_idx = match &clause.field_name {
+                                                            None => Ok(None),
+                                                            Some(field_name) => {
+                                                                match text_index.text_fields.iter().position(|f| f.field_name.as_ref().eq_ignore_ascii_case(field_name.as_ref())) {
+                                                                    Some(idx) => Ok(Some(idx)),
+                                                                    None => Err(format!("ERR unknown field '{}'", String::from_utf8_lossy(field_name))),
+                                                                }
+                                                            }
+                                                        };
+                                                        field_idx.map(|idx| (clause.terms, idx))
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }; // MutexGuard dropped here
+
+                            let (query_terms, field_idx) = match parse_result {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    responses.push(Frame::Error(Bytes::from(e)));
+                                    continue;
+                                }
+                            };
+
+                            let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
+                            let top_k = if count == usize::MAX { 10000 } else { offset.saturating_add(count) }.max(1);
+
+                            let response = crate::shard::coordinator::scatter_text_search(
+                                index_name,
+                                query_terms,
+                                field_idx,
+                                top_k,
+                                offset,
+                                count,
+                                ctx.shard_id,
+                                ctx.num_shards,
+                                &ctx.shard_databases,
+                                &ctx.dispatch_tx,
+                                &ctx.spsc_notifiers,
+                            ).await;
+                            responses.push(response);
+                            continue;
+                        }
+
+                        // ── Vector FT.SEARCH (KNN / SPARSE): existing path ────────────────
                         let response =
                             match crate::command::vector_search::parse_ft_search_args(cmd_args) {
                                 Ok((index_name, query_blob, k, filter, _offset, _count)) => {
