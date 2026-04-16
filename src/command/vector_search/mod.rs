@@ -32,8 +32,9 @@ pub use ft_search::{
 #[cfg(feature = "graph")]
 pub use ft_search::ft_search_with_graph;
 pub use ft_text_search::{
-    execute_text_search_local, execute_text_search_with_global_idf, ft_text_search,
-    is_text_query, merge_text_results, parse_text_query, HighlightOpts, SummarizeOpts,
+    apply_post_processing, execute_text_search_local, execute_text_search_with_global_idf,
+    ft_text_search, highlight_field, is_text_query, merge_text_results, parse_highlight_clause,
+    parse_summarize_clause, parse_text_query, summarize_field, HighlightOpts, SummarizeOpts,
 };
 pub use helpers::{metric_to_bytes, quantize_f32_to_sq, quantization_to_bytes};
 

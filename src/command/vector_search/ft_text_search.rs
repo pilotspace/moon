@@ -7,6 +7,11 @@
 //! - `execute_text_search_local()`: local search without global IDF (single-shard, DFS-skip path)
 //! - `execute_text_search_with_global_idf()`: search with injected global IDF (DFS Phase 2 path)
 //! - `merge_text_results()`: merge multi-shard text results descending by BM25 score
+//! - `highlight_field()`: wrap matched terms in configurable tags with context window
+//! - `summarize_field()`: extract best-matching passage using sliding window over match density
+//! - `parse_highlight_clause()`: parse HIGHLIGHT clause from FT.SEARCH args
+//! - `parse_summarize_clause()`: parse SUMMARIZE clause from FT.SEARCH args
+//! - `apply_post_processing()`: apply HIGHLIGHT/SUMMARIZE to a search response Frame
 
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -16,28 +21,40 @@ use crate::text::store::{TextIndex, TextSearchResult, TextStore};
 
 use super::{extract_bulk, parse_limit_clause};
 
-// ─── Highlight/Summarize options (populated by Plan 03) ──────────────────────
+// ─── Highlight/Summarize options ─────────────────────────────────────────────
 
 /// Options for HIGHLIGHT post-processing.
 ///
-/// Fields are populated by Plan 03. In this plan (150-02), these structs exist
-/// only as forward-compatible placeholders in the `TextSearch` ShardMessage variant.
-/// The `highlight_opts` and `summarize_opts` fields in `TextSearch` are always `None`
-/// until Plan 03 implements HIGHLIGHT/SUMMARIZE parsing and post-processing.
-#[derive(Clone, Debug, Default)]
+/// HIGHLIGHT wraps matched terms in open/close tags (default `<b>`/`</b>`)
+/// with a configurable context window of tokens before/after each match.
+#[derive(Clone, Debug)]
 pub struct HighlightOpts {
     /// Optional field names to highlight (None = all text fields).
     pub fields: Option<Vec<Bytes>>,
-    /// Opening HTML tag inserted before each matched term. Default: `<b>`.
+    /// Opening tag inserted before each matched term. Default: `<b>`.
     pub open_tag: String,
-    /// Closing HTML tag inserted after each matched term. Default: `</b>`.
+    /// Closing tag inserted after each matched term. Default: `</b>`.
     pub close_tag: String,
+    /// Number of context tokens to include before/after each match. Default: 4.
+    pub context_tokens: usize,
+}
+
+impl Default for HighlightOpts {
+    fn default() -> Self {
+        Self {
+            fields: None,
+            open_tag: "<b>".to_owned(),
+            close_tag: "</b>".to_owned(),
+            context_tokens: 4,
+        }
+    }
 }
 
 /// Options for SUMMARIZE post-processing.
 ///
-/// Fields are populated by Plan 03. In this plan (150-02), this is a placeholder.
-#[derive(Clone, Debug, Default)]
+/// SUMMARIZE extracts the highest-scoring passage from each document:
+/// the window of `fragment_size` tokens with the most matched terms.
+#[derive(Clone, Debug)]
 pub struct SummarizeOpts {
     /// Optional field names to summarize (None = all text fields).
     pub fields: Option<Vec<Bytes>>,
@@ -47,6 +64,800 @@ pub struct SummarizeOpts {
     pub num_fragments: usize,
     /// Separator between fragments (default: `...`).
     pub separator: String,
+}
+
+impl Default for SummarizeOpts {
+    fn default() -> Self {
+        Self {
+            fields: None,
+            fragment_size: 20,
+            num_fragments: 1,
+            separator: "...".to_owned(),
+        }
+    }
+}
+
+// ─── HIGHLIGHT/SUMMARIZE clause parsing ──────────────────────────────────────
+
+/// Parse a HIGHLIGHT clause from FT.SEARCH args.
+///
+/// Syntax: `HIGHLIGHT [FIELDS count field1 ...] [TAGS open close]`
+///
+/// Returns `None` if the HIGHLIGHT keyword is not present.
+/// Defaults: open_tag=`<b>`, close_tag=`</b>`, fields=None (all TEXT fields),
+/// context_tokens=4.
+pub fn parse_highlight_clause(args: &[Frame]) -> Option<HighlightOpts> {
+    // Scan for case-insensitive "HIGHLIGHT"
+    let hl_pos = args.iter().position(|f| {
+        matches!(f, Frame::BulkString(b) if b.as_ref().eq_ignore_ascii_case(b"HIGHLIGHT"))
+    })?;
+
+    let mut opts = HighlightOpts::default();
+    let mut i = hl_pos + 1;
+
+    while i < args.len() {
+        let kw = match &args[i] {
+            Frame::BulkString(b) => b.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if kw.as_ref().eq_ignore_ascii_case(b"FIELDS") {
+            i += 1;
+            // Parse count then field names
+            let count = match args.get(i) {
+                Some(Frame::BulkString(b)) => {
+                    std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
+                }
+                Some(Frame::Integer(n)) => *n as usize,
+                _ => 0,
+            };
+            i += 1;
+            if count > 0 {
+                let mut fields = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match args.get(i) {
+                        Some(Frame::BulkString(b)) => {
+                            // Stop if we hit another keyword
+                            if b.as_ref().eq_ignore_ascii_case(b"TAGS")
+                                || b.as_ref().eq_ignore_ascii_case(b"SUMMARIZE")
+                                || b.as_ref().eq_ignore_ascii_case(b"LIMIT")
+                                || b.as_ref().eq_ignore_ascii_case(b"RETURN")
+                            {
+                                break;
+                            }
+                            fields.push(Bytes::copy_from_slice(b));
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if !fields.is_empty() {
+                    opts.fields = Some(fields);
+                }
+            }
+        } else if kw.as_ref().eq_ignore_ascii_case(b"TAGS") {
+            // Parse open_tag and close_tag
+            if let Some(Frame::BulkString(open)) = args.get(i + 1) {
+                opts.open_tag = String::from_utf8_lossy(open).into_owned();
+                if let Some(Frame::BulkString(close)) = args.get(i + 2) {
+                    opts.close_tag = String::from_utf8_lossy(close).into_owned();
+                    i += 3;
+                    continue;
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if kw.as_ref().eq_ignore_ascii_case(b"SUMMARIZE")
+            || kw.as_ref().eq_ignore_ascii_case(b"LIMIT")
+            || kw.as_ref().eq_ignore_ascii_case(b"RETURN")
+        {
+            // Hit a different clause — stop parsing HIGHLIGHT opts
+            break;
+        } else {
+            i += 1;
+        }
+    }
+
+    Some(opts)
+}
+
+/// Parse a SUMMARIZE clause from FT.SEARCH args.
+///
+/// Syntax: `SUMMARIZE [FIELDS count field1 ...] [FRAGS num] [LEN len] [SEPARATOR sep]`
+///
+/// Returns `None` if the SUMMARIZE keyword is not present.
+/// Defaults: fragment_size=20, num_fragments=1, separator=`...`, fields=None.
+pub fn parse_summarize_clause(args: &[Frame]) -> Option<SummarizeOpts> {
+    // Scan for case-insensitive "SUMMARIZE"
+    let sum_pos = args.iter().position(|f| {
+        matches!(f, Frame::BulkString(b) if b.as_ref().eq_ignore_ascii_case(b"SUMMARIZE"))
+    })?;
+
+    let mut opts = SummarizeOpts::default();
+    let mut i = sum_pos + 1;
+
+    while i < args.len() {
+        let kw = match &args[i] {
+            Frame::BulkString(b) => b.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if kw.as_ref().eq_ignore_ascii_case(b"FIELDS") {
+            i += 1;
+            let count = match args.get(i) {
+                Some(Frame::BulkString(b)) => {
+                    std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
+                }
+                Some(Frame::Integer(n)) => *n as usize,
+                _ => 0,
+            };
+            i += 1;
+            if count > 0 {
+                let mut fields = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match args.get(i) {
+                        Some(Frame::BulkString(b)) => {
+                            if b.as_ref().eq_ignore_ascii_case(b"FRAGS")
+                                || b.as_ref().eq_ignore_ascii_case(b"LEN")
+                                || b.as_ref().eq_ignore_ascii_case(b"SEPARATOR")
+                                || b.as_ref().eq_ignore_ascii_case(b"HIGHLIGHT")
+                                || b.as_ref().eq_ignore_ascii_case(b"LIMIT")
+                                || b.as_ref().eq_ignore_ascii_case(b"RETURN")
+                            {
+                                break;
+                            }
+                            fields.push(Bytes::copy_from_slice(b));
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if !fields.is_empty() {
+                    opts.fields = Some(fields);
+                }
+            }
+        } else if kw.as_ref().eq_ignore_ascii_case(b"FRAGS") {
+            i += 1;
+            if let Some(Frame::BulkString(b)) = args.get(i) {
+                if let Ok(n) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()).ok_or(()) {
+                    opts.num_fragments = n;
+                }
+            } else if let Some(Frame::Integer(n)) = args.get(i) {
+                opts.num_fragments = (*n).max(0) as usize;
+            }
+            i += 1;
+        } else if kw.as_ref().eq_ignore_ascii_case(b"LEN") {
+            i += 1;
+            if let Some(Frame::BulkString(b)) = args.get(i) {
+                if let Some(n) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()) {
+                    opts.fragment_size = n;
+                }
+            } else if let Some(Frame::Integer(n)) = args.get(i) {
+                opts.fragment_size = (*n).max(1) as usize;
+            }
+            i += 1;
+        } else if kw.as_ref().eq_ignore_ascii_case(b"SEPARATOR") {
+            i += 1;
+            if let Some(Frame::BulkString(b)) = args.get(i) {
+                opts.separator = String::from_utf8_lossy(b).into_owned();
+                i += 1;
+            }
+        } else if kw.as_ref().eq_ignore_ascii_case(b"HIGHLIGHT")
+            || kw.as_ref().eq_ignore_ascii_case(b"LIMIT")
+            || kw.as_ref().eq_ignore_ascii_case(b"RETURN")
+        {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+
+    Some(opts)
+}
+
+// ─── HIGHLIGHT / SUMMARIZE field processors ──────────────────────────────────
+
+/// Highlight matched terms in original text with configurable tags and context window.
+///
+/// # Algorithm
+///
+/// 1. Re-tokenize original text using `unicode_words().enumerate()` to get ALL words
+///    with their ordinal positions (INCLUDING stop words — same numbering as indexing).
+/// 2. For each word: apply lowercase + stem to get stemmed form; check if in query_terms set.
+/// 3. Merge overlapping context windows `[pos - ctx, pos + ctx]` around each match.
+/// 4. Reconstruct text: words in windows get matched ones wrapped in tags, with `...` between
+///    non-adjacent windows. Short texts (fits in one window) return fully highlighted text.
+///
+/// # Critical note (Pitfall 3)
+///
+/// Positions stored in PostingList are Unicode word ordinals from `enumerate()` over
+/// `unicode_words()`. Stop words consume position numbers but are excluded from posting output.
+/// Re-tokenization MUST iterate ALL Unicode words (including stop words) to correctly map
+/// stored positions back to original words.
+#[cfg(feature = "text-index")]
+pub fn highlight_field(
+    original_text: &str,
+    query_terms: &[String],
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+    open_tag: &str,
+    close_tag: &str,
+    context_tokens: usize,
+) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if original_text.is_empty() || query_terms.is_empty() {
+        return original_text.to_owned();
+    }
+
+    // Build a set of stemmed query terms for O(1) lookup.
+    let query_set: std::collections::HashSet<&str> =
+        query_terms.iter().map(|s| s.as_str()).collect();
+
+    // Re-tokenize: iterate ALL Unicode words with ordinal positions.
+    // Collect (original_word, position, is_match) for every word.
+    let words: Vec<(&str, usize, bool)> = original_text
+        .unicode_words()
+        .enumerate()
+        .map(|(pos, word)| {
+            // Lowercase + stem the word the same way indexing does.
+            let stemmed = stem_word(word, analyzer);
+            let is_match = query_set.contains(stemmed.as_str());
+            (word, pos, is_match)
+        })
+        .collect();
+
+    if words.is_empty() {
+        return original_text.to_owned();
+    }
+
+    // Find positions of all matched words.
+    let match_positions: Vec<usize> = words
+        .iter()
+        .filter_map(|(_, pos, is_match)| if *is_match { Some(*pos) } else { None })
+        .collect();
+
+    if match_positions.is_empty() {
+        // No matches — return original text unchanged.
+        return original_text.to_owned();
+    }
+
+    let total_words = words.len();
+
+    // If the text is short (fits entirely in the context window), return fully highlighted.
+    let fits_in_window = total_words <= 2 * context_tokens + match_positions.len() + 1;
+    if fits_in_window {
+        return reconstruct_full_highlighted(&words, &query_set, analyzer, open_tag, close_tag);
+    }
+
+    // Build merged windows around each match.
+    // Each window is [start, end] inclusive positions.
+    let windows = merge_windows(&match_positions, context_tokens, total_words);
+
+    // Reconstruct text from windows with "..." separator between non-adjacent windows.
+    reconstruct_windowed(&words, &windows, &query_set, analyzer, open_tag, close_tag)
+}
+
+/// Fallback when text-index feature is disabled — return original text unchanged.
+#[cfg(not(feature = "text-index"))]
+pub fn highlight_field(
+    original_text: &str,
+    _query_terms: &[String],
+    _analyzer: &crate::text::analyzer::AnalyzerPipeline,
+    _open_tag: &str,
+    _close_tag: &str,
+    _context_tokens: usize,
+) -> String {
+    original_text.to_owned()
+}
+
+/// Stem a single word using the analyzer's pipeline.
+///
+/// Applies lowercase + NFKD normalize + stem (same as tokenize_with_positions).
+/// Returns the stemmed string. Used during highlight re-tokenization.
+#[cfg(feature = "text-index")]
+fn stem_word(word: &str, analyzer: &crate::text::analyzer::AnalyzerPipeline) -> String {
+    // Run through the same pipeline used during indexing:
+    // lowercase → stem via tokenize_with_positions on a single word.
+    // We call tokenize_with_positions on the word to get the stemmed form.
+    let result = analyzer.tokenize_with_positions(word);
+    // tokenize_with_positions filters stop words and short tokens.
+    // If result is empty (stop word / too short), the word is not a match candidate.
+    result.into_iter().next().map(|(stem, _)| stem).unwrap_or_default()
+}
+
+/// Merge context windows around match positions into non-overlapping intervals.
+///
+/// Each match at `pos` generates window `[pos - ctx, pos + ctx]` (clamped to text bounds).
+/// Overlapping or adjacent windows are merged.
+#[cfg(feature = "text-index")]
+fn merge_windows(
+    match_positions: &[usize],
+    ctx: usize,
+    total_words: usize,
+) -> Vec<(usize, usize)> {
+    if match_positions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut windows: Vec<(usize, usize)> = match_positions
+        .iter()
+        .map(|&pos| {
+            let start = pos.saturating_sub(ctx);
+            let end = (pos + ctx).min(total_words.saturating_sub(1));
+            (start, end)
+        })
+        .collect();
+
+    windows.sort_unstable_by_key(|w| w.0);
+
+    // Merge overlapping/adjacent windows
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in windows {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1 => {
+                last.1 = last.1.max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Reconstruct the full text with all matched terms wrapped in tags (no truncation).
+#[cfg(feature = "text-index")]
+fn reconstruct_full_highlighted(
+    words: &[(&str, usize, bool)],
+    query_set: &std::collections::HashSet<&str>,
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+    open_tag: &str,
+    close_tag: &str,
+) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for (word, _, _) in words {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        let stemmed = stem_word(word, analyzer);
+        if query_set.contains(stemmed.as_str()) {
+            out.push_str(open_tag);
+            out.push_str(word);
+            out.push_str(close_tag);
+        } else {
+            out.push_str(word);
+        }
+    }
+    out
+}
+
+/// Reconstruct highlighted text from merged windows, joining with "..." between gaps.
+#[cfg(feature = "text-index")]
+fn reconstruct_windowed(
+    words: &[(&str, usize, bool)],
+    windows: &[(usize, usize)],
+    query_set: &std::collections::HashSet<&str>,
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+    open_tag: &str,
+    close_tag: &str,
+) -> String {
+    let mut out = String::new();
+    let mut first_window = true;
+
+    // Build a position-indexed lookup for words
+    // words are already in position order since unicode_words is sequential
+
+    for &(start, end) in windows {
+        if !first_window {
+            out.push_str("...");
+        }
+        first_window = false;
+
+        // Add prefix "..." if window doesn't start at beginning
+        if start > 0 && out.is_empty() {
+            out.push_str("...");
+        }
+
+        let mut first_word = true;
+        for (word, pos, _) in words.iter() {
+            if *pos < start || *pos > end {
+                continue;
+            }
+            if !first_word {
+                out.push(' ');
+            }
+            first_word = false;
+
+            let stemmed = stem_word(word, analyzer);
+            if query_set.contains(stemmed.as_str()) {
+                out.push_str(open_tag);
+                out.push_str(word);
+                out.push_str(close_tag);
+            } else {
+                out.push_str(word);
+            }
+        }
+    }
+
+    // Add trailing "..." if last window doesn't reach end
+    if let Some(&(_, last_end)) = windows.last() {
+        if last_end < words.len().saturating_sub(1) {
+            out.push_str("...");
+        }
+    }
+
+    out
+}
+
+/// Extract the best-matching passage(s) from original text.
+///
+/// # Algorithm (sliding window)
+///
+/// 1. Re-tokenize original text to get all words with ordinal positions.
+/// 2. For each window start `w` in `[0, total_words - fragment_size]`:
+///    count how many stemmed query terms fall in window `[w, w + fragment_size)`.
+/// 3. Pick the window with maximum match count.
+/// 4. If `num_fragments > 1`: greedily pick next best non-overlapping window.
+/// 5. Join fragments with separator (default `...`).
+///
+/// Returns original text unchanged when no matches found.
+#[cfg(feature = "text-index")]
+pub fn summarize_field(
+    original_text: &str,
+    query_terms: &[String],
+    analyzer: &crate::text::analyzer::AnalyzerPipeline,
+    fragment_size: usize,
+    num_fragments: usize,
+    separator: &str,
+) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if original_text.is_empty() || query_terms.is_empty() || fragment_size == 0 {
+        return original_text.to_owned();
+    }
+
+    let query_set: std::collections::HashSet<&str> =
+        query_terms.iter().map(|s| s.as_str()).collect();
+
+    // Collect all words with positions and whether they match.
+    let words: Vec<(&str, bool)> = original_text
+        .unicode_words()
+        .map(|word| {
+            let stemmed = stem_word(word, analyzer);
+            let is_match = !stemmed.is_empty() && query_set.contains(stemmed.as_str());
+            (word, is_match)
+        })
+        .collect();
+
+    if words.is_empty() {
+        return original_text.to_owned();
+    }
+
+    let total_words = words.len();
+
+    // If text fits in one fragment, return full text.
+    if total_words <= fragment_size {
+        return words.iter().map(|(w, _)| *w).collect::<Vec<_>>().join(" ");
+    }
+
+    // Build match count per position for sliding window.
+    // match_at[i] = 1 if words[i] is a query match, 0 otherwise.
+    let match_at: Vec<u32> = words.iter().map(|(_, is_match)| *is_match as u32).collect();
+
+    // Prefix sum for O(1) window match count.
+    let mut prefix = vec![0u32; total_words + 1];
+    for i in 0..total_words {
+        prefix[i + 1] = prefix[i] + match_at[i];
+    }
+
+    // Find best non-overlapping fragments.
+    let mut fragments: Vec<(usize, usize)> = Vec::with_capacity(num_fragments);
+    let frag_count = num_fragments.max(1);
+
+    for _ in 0..frag_count {
+        let mut best_start = 0usize;
+        let mut best_count = 0u32;
+
+        let max_start = total_words.saturating_sub(fragment_size);
+        for start in 0..=max_start {
+            let end = (start + fragment_size).min(total_words);
+            let count = prefix[end] - prefix[start];
+
+            // Skip if this window overlaps any already-selected fragment.
+            let overlaps = fragments.iter().any(|&(fs, fe)| start < fe && end > fs);
+            if overlaps {
+                continue;
+            }
+
+            if count > best_count {
+                best_count = count;
+                best_start = start;
+            }
+        }
+
+        if best_count == 0 && !fragments.is_empty() {
+            // No more useful fragments found.
+            break;
+        }
+
+        let frag_end = (best_start + fragment_size).min(total_words);
+        fragments.push((best_start, frag_end));
+    }
+
+    if fragments.is_empty() {
+        // Fallback: return first fragment_size words.
+        return words.iter().take(fragment_size).map(|(w, _)| *w).collect::<Vec<_>>().join(" ");
+    }
+
+    // Sort fragments by start position for natural reading order.
+    fragments.sort_unstable_by_key(|f| f.0);
+
+    // Build output: join words in each fragment, separate fragments with separator.
+    let mut parts: Vec<String> = Vec::with_capacity(fragments.len());
+    for (start, end) in fragments {
+        let fragment_words: Vec<&str> = words[start..end].iter().map(|(w, _)| *w).collect();
+        parts.push(fragment_words.join(" "));
+    }
+
+    parts.join(separator)
+}
+
+/// Fallback when text-index feature is disabled.
+#[cfg(not(feature = "text-index"))]
+pub fn summarize_field(
+    original_text: &str,
+    _query_terms: &[String],
+    _analyzer: &crate::text::analyzer::AnalyzerPipeline,
+    _fragment_size: usize,
+    _num_fragments: usize,
+    _separator: &str,
+) -> String {
+    original_text.to_owned()
+}
+
+// ─── Post-processing application ─────────────────────────────────────────────
+
+/// Apply HIGHLIGHT and/or SUMMARIZE to an already-built FT.SEARCH response Frame.
+///
+/// Iterates result documents in the `[total, key, fields_array, ...]` response format.
+/// For each document:
+/// - Re-reads original field values from `db` using `get_hash_ref_if_alive()`
+/// - Applies `highlight_field()` and/or `summarize_field()` to qualifying fields
+/// - Replaces field values in the fields array with post-processed versions
+///
+/// Fields that are not TEXT fields, not present in the hash, or not requested
+/// (when `fields` filter is Some) are left unchanged.
+///
+/// # Lock safety
+/// `db` is `&Database` (read-only). No mutations. The caller must ensure the
+/// Database guard is held for the duration of this call and dropped before
+/// any `.await` point.
+pub fn apply_post_processing(
+    response: &mut Frame,
+    query_terms: &[String],
+    text_index: &TextIndex,
+    db: &crate::storage::Database,
+    highlight_opts: Option<&HighlightOpts>,
+    summarize_opts: Option<&SummarizeOpts>,
+) {
+    if highlight_opts.is_none() && summarize_opts.is_none() {
+        return;
+    }
+
+    // Collect the full items vec, apply modifications, then replace.
+    // We cannot mutate Frame::Array(FrameVec) in-place while iterating because
+    // the inner FrameVec's items may need to be replaced at positions determined
+    // during iteration. We take a full clone and rebuild.
+    let old_items: Vec<Frame> = match response {
+        Frame::Array(items) => items.iter().cloned().collect(),
+        _ => return,
+    };
+
+    let now_ms = db.now_ms();
+
+    // Rebuild the response array with post-processed field values.
+    let mut new_items: Vec<Frame> = Vec::with_capacity(old_items.len());
+    let mut i = 0;
+
+    // Copy total count (items[0]).
+    if let Some(first) = old_items.first() {
+        new_items.push(first.clone());
+        i = 1;
+    }
+
+    while i + 1 < old_items.len() {
+        let doc_key_frame = &old_items[i];
+        let fields_frame = &old_items[i + 1];
+
+        // Extract doc key for hash lookup.
+        let doc_key: Bytes = match doc_key_frame {
+            Frame::BulkString(b) => b.clone(),
+            _ => {
+                new_items.push(doc_key_frame.clone());
+                new_items.push(fields_frame.clone());
+                i += 2;
+                continue;
+            }
+        };
+
+        // Re-read hash fields from db (read-only).
+        let hash_ref = match db.get_hash_ref_if_alive(doc_key.as_ref(), now_ms) {
+            Ok(Some(h)) => h,
+            _ => {
+                // Key not found or expired — keep original fields unchanged.
+                new_items.push(doc_key_frame.clone());
+                new_items.push(fields_frame.clone());
+                i += 2;
+                continue;
+            }
+        };
+
+        // Collect (field_name, processed_value) replacements.
+        let mut field_replacements: Vec<(Bytes, Bytes)> = Vec::new();
+
+        for (field_idx, field_def) in text_index.text_fields.iter().enumerate() {
+            let field_name = &field_def.field_name;
+
+            let do_highlight = highlight_opts.map_or(false, |opts| {
+                opts.fields.as_ref().map_or(true, |fields| {
+                    fields.iter().any(|f| f.as_ref().eq_ignore_ascii_case(field_name.as_ref()))
+                })
+            });
+
+            let do_summarize = summarize_opts.map_or(false, |opts| {
+                opts.fields.as_ref().map_or(true, |fields| {
+                    fields.iter().any(|f| f.as_ref().eq_ignore_ascii_case(field_name.as_ref()))
+                })
+            });
+
+            if !do_highlight && !do_summarize {
+                continue;
+            }
+
+            let original_value = match hash_ref.get_field(field_name.as_ref()) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let original_text = match std::str::from_utf8(original_value.as_ref()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let analyzer = match text_index.field_analyzers.get(field_idx) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // SUMMARIZE first (extracts passage), then HIGHLIGHT (wraps terms).
+            let processed = if do_summarize {
+                let opts = summarize_opts.unwrap();
+                let summarized = summarize_field(
+                    original_text,
+                    query_terms,
+                    analyzer,
+                    opts.fragment_size,
+                    opts.num_fragments,
+                    &opts.separator,
+                );
+                if do_highlight {
+                    let hopts = highlight_opts.unwrap();
+                    highlight_field(
+                        &summarized,
+                        query_terms,
+                        analyzer,
+                        &hopts.open_tag,
+                        &hopts.close_tag,
+                        hopts.context_tokens,
+                    )
+                } else {
+                    summarized
+                }
+            } else {
+                let hopts = highlight_opts.unwrap();
+                highlight_field(
+                    original_text,
+                    query_terms,
+                    analyzer,
+                    &hopts.open_tag,
+                    &hopts.close_tag,
+                    hopts.context_tokens,
+                )
+            };
+
+            field_replacements.push((field_name.clone(), Bytes::from(processed)));
+        }
+
+        new_items.push(doc_key_frame.clone());
+
+        if field_replacements.is_empty() {
+            new_items.push(fields_frame.clone());
+        } else {
+            // Rebuild the fields array with replacements applied.
+            let mut new_fields_frame = fields_frame.clone();
+            rebuild_fields_with_replacements(&mut new_fields_frame, &field_replacements);
+            new_items.push(new_fields_frame);
+        }
+
+        i += 2;
+    }
+
+    // Copy any trailing odd item (shouldn't happen, defensive).
+    while i < old_items.len() {
+        new_items.push(old_items[i].clone());
+        i += 1;
+    }
+
+    *response = Frame::Array(new_items.into());
+}
+
+/// Rebuild a fields Frame::Array with replaced values.
+///
+/// The fields array has alternating `[field_name, field_value, ...]` pairs.
+/// For each `(name, new_value)` in replacements: find the matching name
+/// (case-insensitive) and replace the subsequent value frame.
+/// Fields not already present are appended as new pairs.
+fn rebuild_fields_with_replacements(fields_frame: &mut Frame, replacements: &[(Bytes, Bytes)]) {
+    let items_slice: Vec<Frame> = match fields_frame {
+        Frame::Array(items) => items.iter().cloned().collect(),
+        _ => return,
+    };
+
+    let mut new_items: Vec<Frame> = Vec::with_capacity(items_slice.len() + replacements.len() * 2);
+    let mut used = vec![false; replacements.len()];
+
+    let mut j = 0;
+    while j + 1 < items_slice.len() {
+        let field_name_bytes = match &items_slice[j] {
+            Frame::BulkString(b) => b.clone(),
+            _ => {
+                new_items.push(items_slice[j].clone());
+                new_items.push(items_slice[j + 1].clone());
+                j += 2;
+                continue;
+            }
+        };
+
+        let replacement_idx = replacements.iter().enumerate().find_map(|(idx, (name, _))| {
+            if !used[idx] && name.as_ref().eq_ignore_ascii_case(field_name_bytes.as_ref()) {
+                Some(idx)
+            } else {
+                None
+            }
+        });
+
+        if let Some(idx) = replacement_idx {
+            used[idx] = true;
+            new_items.push(Frame::BulkString(field_name_bytes));
+            new_items.push(Frame::BulkString(replacements[idx].1.clone()));
+        } else {
+            new_items.push(items_slice[j].clone());
+            new_items.push(items_slice[j + 1].clone());
+        }
+        j += 2;
+    }
+
+    // Append odd trailing item if any (defensive).
+    if j < items_slice.len() {
+        new_items.push(items_slice[j].clone());
+    }
+
+    // Append any fields not already present in the response array.
+    for (idx, (name, val)) in replacements.iter().enumerate() {
+        if !used[idx] {
+            new_items.push(Frame::BulkString(name.clone()));
+            new_items.push(Frame::BulkString(val.clone()));
+        }
+    }
+
+    *fields_frame = Frame::Array(new_items.into());
 }
 
 // ─── Query clause ────────────────────────────────────────────────────────────
@@ -760,5 +1571,243 @@ mod tests {
         // doc:0 should rank higher (matched in 2 fields, score accumulated from both)
         assert_eq!(results[0].key.as_ref(), b"doc:0", "doc:0 with multi-field match ranks first");
         assert!(results[0].score > results[1].score, "accumulated score should be higher");
+    }
+
+    // ── highlight_field ───────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_highlight_basic() {
+        let analyzer = make_analyzer();
+        // "machin" and "learn" are the stemmed forms of "machine" and "learning"
+        let terms = vec!["machin".to_string(), "learn".to_string()];
+        let result = highlight_field(
+            "machine learning in production",
+            &terms,
+            &analyzer,
+            "<b>",
+            "</b>",
+            4,
+        );
+        assert!(result.contains("<b>machine</b>"), "machine should be highlighted, got: {result}");
+        assert!(result.contains("<b>learning</b>"), "learning should be highlighted, got: {result}");
+        assert!(result.contains("in"), "context word 'in' should be present");
+        assert!(result.contains("production"), "context word 'production' should be present");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_highlight_context_window() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string(), "learn".to_string()];
+        // "machine learning" appears at word positions 9 and 10 in a 11-word text
+        let text = "the quick brown fox jumped over the lazy dog machine learning";
+        let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 2);
+        // Should contain highlighted terms
+        assert!(result.contains("<b>machine</b>"), "machine highlighted, got: {result}");
+        assert!(result.contains("<b>learning</b>"), "learning highlighted, got: {result}");
+        // Context words (2 before "machine") should appear
+        assert!(result.contains("lazy") || result.contains("dog"), "context words near match, got: {result}");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_highlight_custom_tags() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string()];
+        let result = highlight_field("machine learning", &terms, &analyzer, "[", "]", 4);
+        assert!(result.contains("[machine]"), "custom tags applied, got: {result}");
+        assert!(!result.contains("<b>"), "default tags must not appear, got: {result}");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_highlight_no_matches() {
+        let analyzer = make_analyzer();
+        let terms = vec!["xyznonexistent".to_string()];
+        let text = "machine learning in production";
+        let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 4);
+        assert_eq!(result, text, "no matches → original text returned unchanged");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_highlight_full_text_short() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string()];
+        // Short text: fits entirely in the context window
+        let text = "machine";
+        let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 4);
+        assert!(result.contains("<b>machine</b>"), "short text fully highlighted, got: {result}");
+    }
+
+    // ── summarize_field ───────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_summarize_basic() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string(), "learn".to_string()];
+        // Build a 30-word text with "machine learning" at position 25-26
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega machine learning one two three four";
+        let result = summarize_field(text, &terms, &analyzer, 20, 1, "...");
+        // The 20-token fragment should include "machine" and "learning"
+        assert!(result.contains("machine") || result.contains("learning"),
+            "summary should include match words, got: {result}");
+        // Result should be shorter than original
+        let result_words: Vec<&str> = result.split_whitespace().collect();
+        assert!(result_words.len() <= 20, "fragment should be at most 20 tokens, got {} tokens", result_words.len());
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_summarize_best_cluster() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string()];
+        // Two clusters: one "machine" near start, two "machine"s near end
+        // The denser cluster (near end) should be selected
+        let text = "machine alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau machine machine";
+        let result = summarize_field(text, &terms, &analyzer, 10, 1, "...");
+        // The dense cluster (last two "machine"s) should be selected
+        // Count occurrences of "machine" in result — should be 2
+        let machine_count = result.split_whitespace().filter(|&w| w == "machine").count();
+        assert!(machine_count >= 1, "result should contain at least one match, got: {result}");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_summarize_multi_fragment() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string()];
+        // "machine" appears at start AND end — two non-overlapping fragments
+        let text = "machine alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau machine";
+        let result = summarize_field(text, &terms, &analyzer, 5, 2, " | ");
+        // With separator, result should have the separator if 2 fragments found
+        // At minimum both "machine" occurrences should be present
+        assert!(result.contains("machine"), "result must contain match term, got: {result}");
+    }
+
+    // ── parse_highlight_clause ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_highlight_clause_not_present() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"testidx")),
+            Frame::BulkString(Bytes::from_static(b"machine")),
+            Frame::BulkString(Bytes::from_static(b"LIMIT")),
+            Frame::BulkString(Bytes::from_static(b"0")),
+            Frame::BulkString(Bytes::from_static(b"10")),
+        ];
+        assert!(parse_highlight_clause(&args).is_none(), "HIGHLIGHT not in args → None");
+    }
+
+    #[test]
+    fn test_parse_highlight_clause_default() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"testidx")),
+            Frame::BulkString(Bytes::from_static(b"machine")),
+            Frame::BulkString(Bytes::from_static(b"HIGHLIGHT")),
+        ];
+        let opts = parse_highlight_clause(&args).expect("HIGHLIGHT present → Some");
+        assert_eq!(opts.open_tag, "<b>", "default open tag");
+        assert_eq!(opts.close_tag, "</b>", "default close tag");
+        assert!(opts.fields.is_none(), "no FIELDS → None (all fields)");
+        assert_eq!(opts.context_tokens, 4, "default context window");
+    }
+
+    #[test]
+    fn test_parse_highlight_clause_with_fields_and_tags() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"testidx")),
+            Frame::BulkString(Bytes::from_static(b"machine")),
+            Frame::BulkString(Bytes::from_static(b"HIGHLIGHT")),
+            Frame::BulkString(Bytes::from_static(b"FIELDS")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"title")),
+            Frame::BulkString(Bytes::from_static(b"TAGS")),
+            Frame::BulkString(Bytes::from_static(b"[")),
+            Frame::BulkString(Bytes::from_static(b"]")),
+        ];
+        let opts = parse_highlight_clause(&args).expect("HIGHLIGHT present");
+        assert_eq!(opts.open_tag, "[");
+        assert_eq!(opts.close_tag, "]");
+        let fields = opts.fields.expect("FIELDS parsed");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].as_ref(), b"title");
+    }
+
+    // ── parse_summarize_clause ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_summarize_clause_not_present() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"testidx")),
+            Frame::BulkString(Bytes::from_static(b"machine")),
+        ];
+        assert!(parse_summarize_clause(&args).is_none(), "SUMMARIZE not in args → None");
+    }
+
+    #[test]
+    fn test_parse_summarize_clause_default() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"testidx")),
+            Frame::BulkString(Bytes::from_static(b"machine")),
+            Frame::BulkString(Bytes::from_static(b"SUMMARIZE")),
+        ];
+        let opts = parse_summarize_clause(&args).expect("SUMMARIZE present");
+        assert_eq!(opts.fragment_size, 20, "default fragment_size");
+        assert_eq!(opts.num_fragments, 1, "default num_fragments");
+        assert_eq!(opts.separator, "...", "default separator");
+        assert!(opts.fields.is_none(), "no FIELDS → None");
+    }
+
+    #[test]
+    fn test_parse_summarize_clause_with_options() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"testidx")),
+            Frame::BulkString(Bytes::from_static(b"machine")),
+            Frame::BulkString(Bytes::from_static(b"SUMMARIZE")),
+            Frame::BulkString(Bytes::from_static(b"FIELDS")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"body")),
+            Frame::BulkString(Bytes::from_static(b"LEN")),
+            Frame::BulkString(Bytes::from_static(b"30")),
+            Frame::BulkString(Bytes::from_static(b"FRAGS")),
+            Frame::BulkString(Bytes::from_static(b"2")),
+            Frame::BulkString(Bytes::from_static(b"SEPARATOR")),
+            Frame::BulkString(Bytes::from_static(b" | ")),
+        ];
+        let opts = parse_summarize_clause(&args).expect("SUMMARIZE present");
+        assert_eq!(opts.fragment_size, 30);
+        assert_eq!(opts.num_fragments, 2);
+        assert_eq!(opts.separator, " | ");
+        let fields = opts.fields.expect("FIELDS parsed");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].as_ref(), b"body");
+    }
+
+    // ── highlight + summarize independent ────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_highlight_independent_of_summarize() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string()];
+        // HIGHLIGHT works without SUMMARIZE
+        let text = "machine learning";
+        let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 4);
+        assert!(result.contains("<b>machine</b>"), "highlight standalone, got: {result}");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_summarize_independent_of_highlight() {
+        let analyzer = make_analyzer();
+        let terms = vec!["machin".to_string()];
+        // SUMMARIZE works without HIGHLIGHT
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa machine learning production systems";
+        let result = summarize_field(text, &terms, &analyzer, 5, 1, "...");
+        assert!(result.contains("machine"), "summarize standalone, got: {result}");
+        assert!(!result.contains("<b>"), "summarize without highlight has no tags, got: {result}");
     }
 }

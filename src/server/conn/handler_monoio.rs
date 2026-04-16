@@ -1754,6 +1754,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
                             let top_k = if count == usize::MAX { 10000 } else { offset.saturating_add(count) }.max(1);
 
+                            // Parse optional HIGHLIGHT/SUMMARIZE clauses from args.
+                            let highlight_opts = crate::command::vector_search::parse_highlight_clause(cmd_args);
+                            let summarize_opts = crate::command::vector_search::parse_summarize_clause(cmd_args);
+
                             let response = crate::shard::coordinator::scatter_text_search(
                                 index_name,
                                 query_terms,
@@ -1766,6 +1770,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 &ctx.shard_databases,
                                 &ctx.dispatch_tx,
                                 &ctx.spsc_notifiers,
+                                highlight_opts,
+                                summarize_opts,
                             ).await;
                             responses.push(response);
                             continue;

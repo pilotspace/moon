@@ -970,28 +970,52 @@ pub(crate) fn handle_shard_message_shared(
             top_k,
             offset,
             count,
-            highlight_opts: _,   // Not used until Plan 03
-            summarize_opts: _,   // Not used until Plan 03
+            highlight_opts,
+            summarize_opts,
             reply_tx,
         } => {
             // DFS Phase 2: execute BM25 text search with global IDF injected by coordinator.
-            let text_guard = shard_databases.text_store(shard_id);
-            let response = match text_guard.get_index(&index_name) {
-                Some(text_index) => {
-                    crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
-                        text_index,
-                        field_idx,
-                        &query_terms,
-                        &global_df,
-                        global_n,
-                        top_k,
-                        offset,
-                        count,
-                    )
+            // After scoring, apply HIGHLIGHT/SUMMARIZE post-processing if requested.
+            // Each shard applies post-processing to its own results using its local hash store
+            // (direct access — no cross-shard reads needed, no .await — safe to hold guards).
+            let response = {
+                let text_guard = shard_databases.text_store(shard_id);
+                match text_guard.get_index(&index_name) {
+                    Some(text_index) => {
+                        let mut result =
+                            crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                                text_index,
+                                field_idx,
+                                &query_terms,
+                                &global_df,
+                                global_n,
+                                top_k,
+                                offset,
+                                count,
+                            );
+                        // Apply HIGHLIGHT/SUMMARIZE post-processing in-place.
+                        // Safe to hold both text_guard and db_guard here — synchronous context,
+                        // no .await points. Guards drop at end of this block.
+                        if highlight_opts.is_some() || summarize_opts.is_some() {
+                            let db_guard = shard_databases.read_db(shard_id, 0);
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut result,
+                                &query_terms,
+                                text_index,
+                                &*db_guard,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
+                            );
+                            // db_guard drops here.
+                        }
+                        result
+                    }
+                    None => crate::protocol::Frame::Error(
+                        bytes::Bytes::from_static(b"ERR unknown index"),
+                    ),
                 }
-                None => crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown index")),
+                // text_guard drops here (end of block).
             };
-            drop(text_guard);
             let _ = reply_tx.send(response);
         }
         ShardMessage::VectorCommand { command, reply_tx } => {

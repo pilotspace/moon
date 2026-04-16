@@ -882,13 +882,16 @@ pub async fn scatter_text_search(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    highlight_opts: Option<crate::command::vector_search::HighlightOpts>,
+    summarize_opts: Option<crate::command::vector_search::SummarizeOpts>,
 ) -> Frame {
     // ── Single-shard fast path (per D-06) ────────────────────────────────────
     if num_shards == 1 {
         // Local IDF is globally accurate with one shard — skip DFS pre-pass.
+        // Apply HIGHLIGHT/SUMMARIZE post-processing after local search.
         let result = {
             let ts = shard_databases.text_store(my_shard);
-            crate::command::vector_search::ft_text_search::execute_text_search_local(
+            let mut r = crate::command::vector_search::ft_text_search::execute_text_search_local(
                 &ts,
                 &index_name,
                 field_idx,
@@ -896,7 +899,23 @@ pub async fn scatter_text_search(
                 top_k,
                 offset,
                 count,
-            )
+            );
+            // Apply post-processing if requested — guards held, no .await below.
+            if highlight_opts.is_some() || summarize_opts.is_some() {
+                if let Some(text_index) = ts.get_index(&index_name) {
+                    let db_guard = shard_databases.read_db(my_shard, 0);
+                    crate::command::vector_search::ft_text_search::apply_post_processing(
+                        &mut r,
+                        &query_terms,
+                        text_index,
+                        &*db_guard,
+                        highlight_opts.as_ref(),
+                        summarize_opts.as_ref(),
+                    );
+                    // db_guard drops here.
+                }
+            }
+            r
         }; // MutexGuard dropped here — no .await held
         return result;
     }
@@ -976,16 +995,31 @@ pub async fn scatter_text_search(
                 let ts = shard_databases.text_store(shard_id);
                 match ts.get_index(&index_name) {
                     Some(text_index) => {
-                        crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
-                            text_index,
-                            field_idx,
-                            &query_terms,
-                            &global_df,
-                            global_n,
-                            top_k,
-                            0,      // each shard returns top_k; coordinator applies final offset
-                            top_k,
-                        )
+                        let mut r =
+                            crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                                text_index,
+                                field_idx,
+                                &query_terms,
+                                &global_df,
+                                global_n,
+                                top_k,
+                                0,      // each shard returns top_k; coordinator applies final offset
+                                top_k,
+                            );
+                        // Apply HIGHLIGHT/SUMMARIZE while guards are held — sync, no .await.
+                        if highlight_opts.is_some() || summarize_opts.is_some() {
+                            let db_guard = shard_databases.read_db(shard_id, 0);
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut r,
+                                &query_terms,
+                                text_index,
+                                &*db_guard,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
+                            );
+                            // db_guard drops here.
+                        }
+                        r
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 }
@@ -1002,8 +1036,9 @@ pub async fn scatter_text_search(
                 top_k,
                 offset: 0,      // each shard returns top_k; coordinator applies final offset+count
                 count: top_k,
-                highlight_opts: None, // Not used until Plan 03
-                summarize_opts: None, // Not used until Plan 03
+                // Pass opts to each remote shard — each applies post-processing locally.
+                highlight_opts: highlight_opts.clone(),
+                summarize_opts: summarize_opts.clone(),
                 reply_tx,
             };
             spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
