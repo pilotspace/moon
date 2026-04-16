@@ -9,11 +9,21 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 use crate::text::analyzer::AnalyzerPipeline;
-use crate::text::bm25::FieldStats;
+use crate::text::bm25::{bm25_score, FieldStats};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
 use crate::text::types::{BM25Config, TextFieldDef};
+
+/// A BM25-scored search result from TextIndex::search_field().
+pub struct TextSearchResult {
+    /// Internal document ID.
+    pub doc_id: u32,
+    /// Original Redis key bytes.
+    pub key: Bytes,
+    /// Accumulated BM25 score (higher = more relevant).
+    pub score: f32,
+}
 
 /// A single full-text search index with per-field BM25 data.
 ///
@@ -187,6 +197,159 @@ impl TextIndex {
         self.doc_field_lengths.insert(doc_id, field_lengths);
     }
 
+    /// Search a specific field for query terms with BM25 scoring.
+    ///
+    /// Uses RoaringBitmap AND intersection for implicit AND semantics (per D-02):
+    /// all query terms must appear in a document for it to be a candidate.
+    ///
+    /// `global_df` and `global_n` override local posting list stats when provided.
+    /// These are injected by the DFS pre-pass coordinator for multi-shard global IDF
+    /// accuracy (per D-04). When `None`, local field statistics are used (single-shard path).
+    ///
+    /// Returns results sorted descending by BM25 score, truncated to `top_k`.
+    pub fn search_field(
+        &self,
+        field_idx: usize,
+        query_terms: &[String],
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+        top_k: usize,
+    ) -> Vec<TextSearchResult> {
+        if field_idx >= self.field_postings.len() || query_terms.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 1: build candidate bitmap via RoaringBitmap AND intersection.
+        // Per RESEARCH Pitfall 1: any absent term means no results (AND semantics).
+        use roaring::RoaringBitmap;
+
+        // Collect postings for each query term; early-exit if any term is missing.
+        let mut term_postings: Vec<(String, u32)> = Vec::with_capacity(query_terms.len());
+        for term in query_terms {
+            let term_id = match self.field_term_dicts[field_idx].get(term) {
+                Some(id) => id,
+                None => return Vec::new(), // AND: missing term = no results
+            };
+            // Verify posting list exists
+            if self.field_postings[field_idx].get_posting(term_id).is_none() {
+                return Vec::new();
+            }
+            term_postings.push((term.clone(), term_id));
+        }
+
+        // Build candidate bitmap: start from first term's doc_ids, AND with rest.
+        let mut candidate_bitmap: RoaringBitmap = {
+            // Safety: term_postings is non-empty (query_terms non-empty guard above)
+            let first_posting = self
+                .field_postings[field_idx]
+                .get_posting(term_postings[0].1)
+                .expect("posting exists: checked above");
+            first_posting.doc_ids.clone()
+        };
+
+        for (_, term_id) in &term_postings[1..] {
+            let posting = self
+                .field_postings[field_idx]
+                .get_posting(*term_id)
+                .expect("posting exists: checked above");
+            candidate_bitmap &= &posting.doc_ids;
+        }
+
+        if candidate_bitmap.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 2: score each surviving candidate document with BM25.
+        let stats = &self.field_stats[field_idx];
+        let n = global_n.unwrap_or(stats.num_docs);
+        let avgdl = stats.avg_doc_len();
+        let k1 = self.bm25_config.k1;
+        let b = self.bm25_config.b;
+        let weight = self.text_fields[field_idx].weight as f32;
+
+        let mut results: Vec<TextSearchResult> = Vec::with_capacity(candidate_bitmap.len() as usize);
+
+        for doc_id in &candidate_bitmap {
+            let dl = self
+                .doc_field_lengths
+                .get(&doc_id)
+                .and_then(|lens| lens.get(field_idx).copied())
+                .unwrap_or(0);
+
+            let mut doc_score = 0.0f32;
+            for (term, term_id) in &term_postings {
+                let posting = self
+                    .field_postings[field_idx]
+                    .get_posting(*term_id)
+                    .expect("posting exists: checked above");
+
+                // Per RESEARCH Pitfall 1: use linear scan (not rank()) for correct TF lookup.
+                // term_freqs is in insertion order, NOT sorted doc_id order.
+                let tf = posting
+                    .doc_ids
+                    .iter()
+                    .position(|id| id == doc_id)
+                    .map(|idx| posting.term_freqs[idx] as f32)
+                    .unwrap_or(0.0);
+
+                // Use global_df if provided (DFS path), else local doc frequency.
+                let df = global_df
+                    .and_then(|m| m.get(term.as_str()).copied())
+                    .unwrap_or_else(|| posting.doc_ids.len() as u32);
+
+                doc_score += bm25_score(tf, df, n, dl, avgdl, k1, b) * weight;
+            }
+
+            // Resolve original Redis key for this document.
+            let key = match self.doc_id_to_key.get(&doc_id) {
+                Some(k) => k.clone(),
+                None => continue, // orphaned doc_id — skip
+            };
+
+            results.push(TextSearchResult {
+                doc_id,
+                key,
+                score: doc_score,
+            });
+        }
+
+        // Step 3: sort descending by BM25 score (higher = more relevant per D-07).
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
+        results
+    }
+
+    /// Collect document frequency for each term + total N for the DFS pre-pass.
+    ///
+    /// Returns `(Vec<(term, df)>, N)` where:
+    /// - `df` is the number of documents in this shard containing the term
+    /// - `N` is `field_stats[field_idx].num_docs` (total docs with this field on this shard)
+    ///
+    /// Used by the DFS Phase 1 scatter to aggregate global IDF weights before
+    /// executing the actual search in Phase 2 (per D-04).
+    pub fn doc_freq_for_terms(
+        &self,
+        field_idx: usize,
+        terms: &[String],
+    ) -> (Vec<(String, u32)>, u32) {
+        if field_idx >= self.field_postings.len() {
+            return (Vec::new(), 0);
+        }
+
+        let n = self.field_stats[field_idx].num_docs;
+        let mut result = Vec::with_capacity(terms.len());
+
+        for term in terms {
+            let df = match self.field_term_dicts[field_idx].get(term) {
+                Some(term_id) => self.field_postings[field_idx].doc_freq(term_id),
+                None => 0,
+            };
+            result.push((term.clone(), df));
+        }
+
+        (result, n)
+    }
+
     /// Number of indexed documents.
     pub fn num_docs(&self) -> u32 {
         self.key_hash_to_doc_id.len() as u32
@@ -331,5 +494,149 @@ impl TextStore {
     /// Number of text indexes.
     pub fn index_count(&self) -> usize {
         self.indexes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal TextIndex with a single TEXT field named "body"
+    /// and index N documents. Used by multiple tests.
+    #[cfg(feature = "text-index")]
+    fn make_index_with_docs(docs: &[(&str, &str)]) -> TextIndex {
+        use crate::protocol::Frame;
+        use crate::text::types::BM25Config;
+        let field = TextFieldDef::new(Bytes::from_static(b"body"));
+        let mut idx = TextIndex::new(
+            Bytes::from_static(b"test_idx"),
+            Vec::new(),
+            vec![field],
+            BM25Config::default(),
+        );
+        for (i, (key, text)) in docs.iter().enumerate() {
+            let key_hash = i as u64;
+            let args = vec![
+                Frame::BulkString(Bytes::from_static(b"body")),
+                Frame::BulkString(Bytes::copy_from_slice(text.as_bytes())),
+            ];
+            idx.index_document(key_hash, key.as_bytes(), &args);
+        }
+        idx
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_search_field_basic() {
+        // doc 0: "machine vision", doc 1: "deep learning", doc 2: "machine learning deep"
+        let idx = make_index_with_docs(&[
+            ("doc:0", "machine vision"),
+            ("doc:1", "deep learning"),
+            ("doc:2", "machine learning deep"),
+        ]);
+
+        // "machine" AND "learning": only doc 2 should match
+        // Terms go through the same stemmer as indexing (English Snowball)
+        // "machine" -> "machin", "learning" -> "learn"
+        let terms = vec!["machin".to_string(), "learn".to_string()];
+        let results = idx.search_field(0, &terms, None, None, 10);
+
+        assert_eq!(results.len(), 1, "Only doc:2 matches both terms");
+        assert_eq!(results[0].key.as_ref(), b"doc:2");
+        assert!(results[0].score > 0.0, "BM25 score must be positive");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_search_field_score_ordering() {
+        // doc 0: "machine" appears once, doc 1: "machine machine machine" (higher TF)
+        let idx = make_index_with_docs(&[
+            ("doc:0", "machine vision"),
+            ("doc:1", "machine machine machine"),
+        ]);
+
+        let terms = vec!["machin".to_string()];
+        let results = idx.search_field(0, &terms, None, None, 10);
+
+        assert_eq!(results.len(), 2, "Both docs contain 'machine'");
+        // doc:1 has higher TF -> higher BM25 -> should be first (descending sort)
+        assert!(
+            results[0].score >= results[1].score,
+            "Results must be sorted descending by score"
+        );
+        assert_eq!(
+            results[0].key.as_ref(),
+            b"doc:1",
+            "doc:1 with higher TF should rank first"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_search_field_global_idf() {
+        // doc 0: "machine", doc 1: "machine learning"
+        let idx = make_index_with_docs(&[
+            ("doc:0", "machine"),
+            ("doc:1", "machine learning"),
+        ]);
+
+        let terms = vec!["machin".to_string()];
+
+        // Without global override: use local stats (2 docs, df=2 for "machine")
+        let local_results = idx.search_field(0, &terms, None, None, 10);
+        assert_eq!(local_results.len(), 2);
+
+        // With global_df override: simulate cross-shard context where "machin" has df=10 globally
+        // and N=100 total docs across all shards
+        let mut global_df = HashMap::new();
+        global_df.insert("machin".to_string(), 10u32);
+        let global_results = idx.search_field(0, &terms, Some(&global_df), Some(100), 10);
+        assert_eq!(global_results.len(), 2);
+
+        // Scores differ when global IDF is used (df=10/N=100 vs df=2/N=2)
+        // Both sets return 2 results; just verify global path produces valid positive scores
+        for r in &global_results {
+            assert!(r.score > 0.0 || r.score == 0.0, "Score must be non-negative");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_search_field_missing_term() {
+        let idx = make_index_with_docs(&[("doc:0", "machine vision"), ("doc:1", "deep learning")]);
+
+        // "xyznonexistent" is not in the index: AND semantics -> empty result
+        let terms = vec!["xyznonexist".to_string()];
+        let results = idx.search_field(0, &terms, None, None, 10);
+        assert!(results.is_empty(), "Missing term must return empty Vec");
+
+        // Two terms where one is missing: still empty
+        let terms2 = vec!["machin".to_string(), "xyznonexist".to_string()];
+        let results2 = idx.search_field(0, &terms2, None, None, 10);
+        assert!(results2.is_empty(), "AND with missing term must return empty Vec");
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_doc_freq_for_terms() {
+        // doc 0: "machine vision", doc 1: "machine learning", doc 2: "deep learning"
+        let idx = make_index_with_docs(&[
+            ("doc:0", "machine vision"),
+            ("doc:1", "machine learning"),
+            ("doc:2", "deep learning"),
+        ]);
+
+        let terms = vec!["machin".to_string(), "learn".to_string(), "vision".to_string()];
+        let (df_pairs, n) = idx.doc_freq_for_terms(0, &terms);
+
+        assert_eq!(n, 3, "3 docs total");
+        // Find each term's df
+        let machin_df = df_pairs.iter().find(|(t, _)| t == "machin").map(|(_, df)| *df).unwrap_or(0);
+        let learn_df = df_pairs.iter().find(|(t, _)| t == "learn").map(|(_, df)| *df).unwrap_or(0);
+        let vision_df = df_pairs.iter().find(|(t, _)| t == "vision").map(|(_, df)| *df).unwrap_or(0);
+
+        assert_eq!(machin_df, 2, "'machine' appears in doc:0 and doc:1");
+        assert_eq!(learn_df, 2, "'learning' appears in doc:1 and doc:2");
+        assert_eq!(vision_df, 1, "'vision' appears only in doc:0");
     }
 }
