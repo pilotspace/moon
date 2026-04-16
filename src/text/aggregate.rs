@@ -301,6 +301,296 @@ impl PartialReducerState {
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline executor
+// ---------------------------------------------------------------------------
+
+/// Per-shard cap on the number of distinct GROUPBY keys the executor will
+/// accept (RESEARCH Pitfall 7, threat T-152-01-01 DoS mitigation).
+///
+/// The cap is enforced **before** the group is inserted into the HashMap so
+/// worst-case memory is bounded at `N * reducer-state-size` — never N+1.
+/// 10_000 distinct groups × the ~16 KiB dense HLL ceiling ≈ 160 MiB per shard
+/// in the worst COUNT_DISTINCT case; sparse encoding keeps the typical
+/// overhead to ~50 bytes per idle group.
+pub const GROUPBY_CARDINALITY_LIMIT: usize = 10_000;
+
+/// Execute the aggregation pipeline on a materialised row buffer.
+///
+/// Runs each stage iteratively; intermediate buffers are owned and replaced
+/// between stages so no row is held across a stage boundary.
+///
+/// Returns:
+/// - `Ok(rows)` on success.
+/// - `Err(Bytes)` when a stage cannot run (APPLY is always an error in v1
+///   per D-04; GROUPBY exceeding `GROUPBY_CARDINALITY_LIMIT` returns the
+///   registered DoS-mitigation error). The returned `Bytes` is suitable
+///   for wrapping in `Frame::Error`.
+pub fn execute_pipeline(
+    rows: Vec<AggregateRow>,
+    pipeline: &[AggregateStep],
+) -> Result<Vec<AggregateRow>, Bytes> {
+    let mut current = rows;
+    for step in pipeline {
+        current = match step {
+            AggregateStep::Filter(expr) => apply_filter(current, expr),
+            AggregateStep::GroupBy { fields, reducers } => {
+                apply_groupby(current, fields, reducers)?
+            }
+            AggregateStep::SortBy { keys, max } => apply_sortby(current, keys, *max),
+            AggregateStep::Apply { .. } => {
+                return Err(Bytes::from_static(b"ERR APPLY stage not supported in v1"));
+            }
+            AggregateStep::Limit { offset, count } => apply_limit(current, *offset, *count),
+        };
+    }
+    Ok(current)
+}
+
+/// FILTER stage. v1 evaluates filters **before** the pipeline runs (the
+/// handler in Plan 02 calls `PayloadIndex::evaluate_bitmap` at the TextIndex
+/// boundary and materialises rows only for the resulting doc set). If a
+/// FILTER step is encountered here it is a pass-through — kept as an
+/// explicit no-op rather than rejected so the pipeline stays a faithful
+/// record of the parsed request for later introspection.
+fn apply_filter(rows: Vec<AggregateRow>, _expr: &Arc<FilterExpr>) -> Vec<AggregateRow> {
+    rows
+}
+
+/// LIMIT stage with saturating arithmetic — offset past end yields an empty
+/// buffer without panicking.
+fn apply_limit(rows: Vec<AggregateRow>, offset: usize, count: usize) -> Vec<AggregateRow> {
+    if offset >= rows.len() {
+        return Vec::new();
+    }
+    let end = offset.saturating_add(count).min(rows.len());
+    // `end - offset` is always non-negative because of the `offset >= rows.len()`
+    // early return above.
+    rows.into_iter().skip(offset).take(end - offset).collect()
+}
+
+/// SORTBY stage. Uses a stable sort so ties preserve input order
+/// (RediSearch-compatible). Multi-key sort applies keys left-to-right.
+fn apply_sortby(
+    mut rows: Vec<AggregateRow>,
+    keys: &[(Bytes, SortOrder)],
+    max: Option<usize>,
+) -> Vec<AggregateRow> {
+    rows.sort_by(|a, b| {
+        for (field, order) in keys {
+            let av = row_get(a, field);
+            let bv = row_get(b, field);
+            let ord = compare_values(av, bv);
+            if ord != std::cmp::Ordering::Equal {
+                return if *order == SortOrder::Desc {
+                    ord.reverse()
+                } else {
+                    ord
+                };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    if let Some(n) = max {
+        rows.truncate(n);
+    }
+    rows
+}
+
+/// GROUPBY + REDUCE stage.
+///
+/// Groups are keyed by a `GroupKey` built from the declared field list in
+/// declared order (RESEARCH Pitfall 9 ensures cross-shard key stability).
+///
+/// **Cardinality cap (W5):** the check fires **before** the HashMap insert
+/// so memory use is bounded at `GROUPBY_CARDINALITY_LIMIT` distinct keys —
+/// not N+1. Re-seeing an existing key never triggers the cap.
+fn apply_groupby(
+    rows: Vec<AggregateRow>,
+    fields: &[Bytes],
+    reducers: &[ReducerSpec],
+) -> Result<Vec<AggregateRow>, Bytes> {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<GroupKey, Vec<PartialReducerState>> = HashMap::new();
+    for row in rows {
+        let key: GroupKey = fields
+            .iter()
+            .map(|f| row_get(&row, f).cloned_as_bytes())
+            .collect();
+
+        // W5 — check BEFORE mutating (mirror of Plan 03 `build_shard_partial`).
+        // A re-seen key does not trigger the cap; only the (N+1)th distinct
+        // key does, and the error fires before the insert so cardinality is
+        // never allowed to reach N+1.
+        if !groups.contains_key(&key) && groups.len() >= GROUPBY_CARDINALITY_LIMIT {
+            return Err(Bytes::from_static(
+                b"ERR GROUPBY cardinality limit exceeded",
+            ));
+        }
+
+        let states = groups.entry(key).or_insert_with(|| init_states(reducers));
+        update_reducers(states, &row, reducers);
+    }
+
+    // Emit one output row per group: GROUPBY fields first (in declared order),
+    // then reducer aliases in declared order.
+    let mut out = Vec::with_capacity(groups.len());
+    for (key, states) in groups {
+        let mut row: AggregateRow = SmallVec::new();
+        for (fname, val) in fields.iter().zip(key.iter()) {
+            row.push((fname.clone(), AggregateValue::Str(val.clone())));
+        }
+        for (spec, state) in reducers.iter().zip(states) {
+            let is_avg = matches!(spec.fn_name, ReducerFn::Avg);
+            row.push((spec.alias.clone(), state.finalize(is_avg)));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Build the initial reducer-state vector for a fresh group.
+fn init_states(reducers: &[ReducerSpec]) -> Vec<PartialReducerState> {
+    reducers
+        .iter()
+        .map(|s| match s.fn_name {
+            ReducerFn::Count => PartialReducerState::Count(0),
+            ReducerFn::Sum | ReducerFn::Avg => {
+                PartialReducerState::Sum { sum: 0.0, count: 0 }
+            }
+            ReducerFn::Min => PartialReducerState::Min(None),
+            ReducerFn::Max => PartialReducerState::Max(None),
+            ReducerFn::CountDistinct => PartialReducerState::CountDistinct(Hll::new_sparse()),
+        })
+        .collect()
+}
+
+/// Fold a row into each reducer state in position order.
+///
+/// Missing / null field values are skipped silently — the reducer simply
+/// does not advance for that row. This matches RediSearch semantics and is
+/// the correctness preserver for cross-shard merge (a missing value adds
+/// zero to `count`, leaves `min`/`max` unchanged, does not add a bucket to
+/// the HLL sketch).
+fn update_reducers(
+    states: &mut [PartialReducerState],
+    row: &AggregateRow,
+    reducers: &[ReducerSpec],
+) {
+    for (i, spec) in reducers.iter().enumerate() {
+        match (&mut states[i], spec.fn_name) {
+            (PartialReducerState::Count(n), ReducerFn::Count) => {
+                *n += 1;
+            }
+            (PartialReducerState::Sum { sum, count }, ReducerFn::Sum | ReducerFn::Avg) => {
+                if let Some(field) = &spec.field {
+                    if let Some(f) = value_to_f64(row_get(row, field)) {
+                        *sum += f;
+                        *count += 1;
+                    }
+                }
+            }
+            (PartialReducerState::Min(opt), ReducerFn::Min) => {
+                if let Some(field) = &spec.field {
+                    if let Some(f) = value_to_f64(row_get(row, field)) {
+                        *opt = match *opt {
+                            None => Some(OrderedFloat(f)),
+                            Some(cur) => Some(OrderedFloat(cur.into_inner().min(f))),
+                        };
+                    }
+                }
+            }
+            (PartialReducerState::Max(opt), ReducerFn::Max) => {
+                if let Some(field) = &spec.field {
+                    if let Some(f) = value_to_f64(row_get(row, field)) {
+                        *opt = match *opt {
+                            None => Some(OrderedFloat(f)),
+                            Some(cur) => Some(OrderedFloat(cur.into_inner().max(f))),
+                        };
+                    }
+                }
+            }
+            (PartialReducerState::CountDistinct(hll), ReducerFn::CountDistinct) => {
+                if let Some(field) = &spec.field {
+                    if let Some(bytes) = value_to_bytes(row_get(row, field)) {
+                        hll.add(&bytes);
+                    }
+                }
+            }
+            // Reducer / state mismatch shouldn't happen if init_states is in sync
+            // with the ReducerSpec slice. Silently skip rather than panic.
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row helpers (private)
+// ---------------------------------------------------------------------------
+
+fn row_get<'a>(row: &'a AggregateRow, field: &Bytes) -> Option<&'a AggregateValue> {
+    row.iter()
+        .find_map(|(f, v)| if f == field { Some(v) } else { None })
+}
+
+fn value_to_f64(v: Option<&AggregateValue>) -> Option<f64> {
+    match v? {
+        AggregateValue::Int(n) => Some(*n as f64),
+        AggregateValue::Float(of) => Some(of.into_inner()),
+        AggregateValue::Str(b) => std::str::from_utf8(b).ok()?.parse().ok(),
+        AggregateValue::Null => None,
+    }
+}
+
+fn value_to_bytes(v: Option<&AggregateValue>) -> Option<Bytes> {
+    match v? {
+        AggregateValue::Int(n) => Some(Bytes::from(itoa::Buffer::new().format(*n).to_owned())),
+        AggregateValue::Float(of) => Some(Bytes::from(format!("{}", of.into_inner()))),
+        AggregateValue::Str(b) => Some(b.clone()),
+        AggregateValue::Null => None,
+    }
+}
+
+fn compare_values(
+    a: Option<&AggregateValue>,
+    b: Option<&AggregateValue>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let af = value_to_f64(a);
+    let bf = value_to_f64(b);
+    match (af, bf) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
+        (Some(_), None) => Less,
+        (None, Some(_)) => Greater,
+        (None, None) => match (a, b) {
+            (Some(AggregateValue::Str(x)), Some(AggregateValue::Str(y))) => x.cmp(y),
+            _ => Equal,
+        },
+    }
+}
+
+/// Converter used by GROUPBY to build a stable `Bytes`-keyed `GroupKey`.
+///
+/// Null / missing values collapse to an empty byte string so every row
+/// produces a well-formed key even when a GROUPBY field is absent.
+trait CloneAsBytes {
+    fn cloned_as_bytes(&self) -> Bytes;
+}
+
+impl CloneAsBytes for Option<&AggregateValue> {
+    fn cloned_as_bytes(&self) -> Bytes {
+        match self {
+            Some(AggregateValue::Str(b)) => b.clone(),
+            Some(AggregateValue::Int(n)) => {
+                Bytes::from(itoa::Buffer::new().format(*n).to_owned())
+            }
+            Some(AggregateValue::Float(of)) => Bytes::from(format!("{}", of.into_inner())),
+            Some(AggregateValue::Null) | None => Bytes::from_static(b""),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -579,5 +869,349 @@ mod tests {
             }
             other => panic!("expected Int, got {:?}", other),
         }
+    }
+
+    // ============================================================
+    // execute_pipeline tests (Task 2)
+    // ============================================================
+
+    /// Build a row with string fields.
+    fn row_str(pairs: &[(&[u8], &[u8])]) -> AggregateRow {
+        let mut row: AggregateRow = SmallVec::new();
+        for (k, v) in pairs {
+            row.push((
+                Bytes::copy_from_slice(k),
+                AggregateValue::Str(Bytes::copy_from_slice(v)),
+            ));
+        }
+        row
+    }
+
+    /// Build a row with string + numeric fields.
+    fn row_mixed(string_fields: &[(&[u8], &[u8])], float_fields: &[(&[u8], f64)]) -> AggregateRow {
+        let mut row: AggregateRow = SmallVec::new();
+        for (k, v) in string_fields {
+            row.push((
+                Bytes::copy_from_slice(k),
+                AggregateValue::Str(Bytes::copy_from_slice(v)),
+            ));
+        }
+        for (k, f) in float_fields {
+            row.push((
+                Bytes::copy_from_slice(k),
+                AggregateValue::Float(OrderedFloat(*f)),
+            ));
+        }
+        row
+    }
+
+    /// Extract a numeric value from an output row.
+    fn row_num(row: &AggregateRow, field: &[u8]) -> Option<f64> {
+        for (f, v) in row {
+            if f.as_ref() == field {
+                return match v {
+                    AggregateValue::Int(n) => Some(*n as f64),
+                    AggregateValue::Float(of) => Some(of.into_inner()),
+                    AggregateValue::Null => None,
+                    AggregateValue::Str(b) => std::str::from_utf8(b).ok()?.parse().ok(),
+                };
+            }
+        }
+        None
+    }
+
+    /// Extract a string value from an output row.
+    fn row_str_val(row: &AggregateRow, field: &[u8]) -> Option<Bytes> {
+        for (f, v) in row {
+            if f.as_ref() == field {
+                return match v {
+                    AggregateValue::Str(b) => Some(b.clone()),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_execute_pipeline_apply_errors() {
+        let rows = vec![row_str(&[(b"@a", b"1")])];
+        let pipeline = vec![AggregateStep::Apply {
+            expr: Bytes::from_static(b"@a+1"),
+            alias: Bytes::from_static(b"b"),
+        }];
+        let err = execute_pipeline(rows, &pipeline).expect_err("APPLY must error");
+        assert_eq!(err, Bytes::from_static(b"ERR APPLY stage not supported in v1"));
+    }
+
+    #[test]
+    fn test_execute_pipeline_limit() {
+        let rows: Vec<AggregateRow> = (0..10)
+            .map(|i| row_mixed(&[], &[(b"@i", i as f64)]))
+            .collect();
+        let pipeline = vec![AggregateStep::Limit { offset: 2, count: 3 }];
+        let out = execute_pipeline(rows, &pipeline).expect("limit ok");
+        assert_eq!(out.len(), 3);
+        assert_eq!(row_num(&out[0], b"@i"), Some(2.0));
+        assert_eq!(row_num(&out[1], b"@i"), Some(3.0));
+        assert_eq!(row_num(&out[2], b"@i"), Some(4.0));
+    }
+
+    #[test]
+    fn test_execute_pipeline_limit_past_end() {
+        let rows: Vec<AggregateRow> = (0..5).map(|i| row_mixed(&[], &[(b"@i", i as f64)])).collect();
+        let pipeline = vec![AggregateStep::Limit { offset: 10, count: 3 }];
+        let out = execute_pipeline(rows, &pipeline).expect("limit past end ok");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_execute_pipeline_sortby_desc_numeric() {
+        let rows: Vec<AggregateRow> = [3.0, 1.0, 4.0, 2.0]
+            .iter()
+            .map(|&v| row_mixed(&[], &[(b"@score", v)]))
+            .collect();
+        let mut keys: SmallVec<[(Bytes, SortOrder); 4]> = SmallVec::new();
+        keys.push((Bytes::from_static(b"@score"), SortOrder::Desc));
+        let pipeline = vec![AggregateStep::SortBy { keys, max: None }];
+        let out = execute_pipeline(rows, &pipeline).expect("sortby ok");
+        let ordered: Vec<f64> = out.iter().map(|r| row_num(r, b"@score").unwrap_or(0.0)).collect();
+        assert_eq!(ordered, vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_execute_pipeline_sortby_stable_ties() {
+        // Two rows with identical sort keys but distinct ids; stable sort
+        // preserves input order (id 1 before id 2).
+        let r1 = row_mixed(&[(b"@id", b"1")], &[(b"@score", 5.0)]);
+        let r2 = row_mixed(&[(b"@id", b"2")], &[(b"@score", 5.0)]);
+        let rows = vec![r1, r2];
+        let mut keys: SmallVec<[(Bytes, SortOrder); 4]> = SmallVec::new();
+        keys.push((Bytes::from_static(b"@score"), SortOrder::Asc));
+        let pipeline = vec![AggregateStep::SortBy { keys, max: None }];
+        let out = execute_pipeline(rows, &pipeline).expect("sortby ok");
+        assert_eq!(row_str_val(&out[0], b"@id").as_deref(), Some(b"1".as_ref()));
+        assert_eq!(row_str_val(&out[1], b"@id").as_deref(), Some(b"2".as_ref()));
+    }
+
+    #[test]
+    fn test_execute_pipeline_groupby_count() {
+        let statuses = ["open", "open", "closed", "open", "closed"];
+        let rows: Vec<AggregateRow> = statuses
+            .iter()
+            .map(|s| row_str(&[(b"@status", s.as_bytes())]))
+            .collect();
+        let mut fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        fields.push(Bytes::from_static(b"@status"));
+        let reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::from_static(b"cnt"),
+        }];
+        let pipeline = vec![AggregateStep::GroupBy { fields, reducers }];
+        let out = execute_pipeline(rows, &pipeline).expect("groupby ok");
+        assert_eq!(out.len(), 2);
+
+        let mut open_count = None;
+        let mut closed_count = None;
+        for row in &out {
+            let status = row_str_val(row, b"@status");
+            let cnt = row_num(row, b"cnt");
+            match status.as_deref() {
+                Some(b"open") => open_count = cnt,
+                Some(b"closed") => closed_count = cnt,
+                other => panic!("unexpected status {:?}", other),
+            }
+        }
+        assert_eq!(open_count, Some(3.0));
+        assert_eq!(closed_count, Some(2.0));
+    }
+
+    #[test]
+    fn test_execute_pipeline_groupby_sum() {
+        let rows = vec![
+            row_mixed(&[(b"@priority", b"high")], &[(b"@value", 10.0)]),
+            row_mixed(&[(b"@priority", b"high")], &[(b"@value", 20.0)]),
+            row_mixed(&[(b"@priority", b"low")], &[(b"@value", 5.0)]),
+            row_mixed(&[(b"@priority", b"low")], &[(b"@value", 3.0)]),
+        ];
+        let mut fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        fields.push(Bytes::from_static(b"@priority"));
+        let reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::Sum,
+            field: Some(Bytes::from_static(b"@value")),
+            alias: Bytes::from_static(b"total"),
+        }];
+        let pipeline = vec![AggregateStep::GroupBy { fields, reducers }];
+        let out = execute_pipeline(rows, &pipeline).expect("groupby sum ok");
+        assert_eq!(out.len(), 2);
+
+        let mut high = None;
+        let mut low = None;
+        for row in &out {
+            match row_str_val(row, b"@priority").as_deref() {
+                Some(b"high") => high = row_num(row, b"total"),
+                Some(b"low") => low = row_num(row, b"total"),
+                other => panic!("unexpected priority {:?}", other),
+            }
+        }
+        assert_eq!(high, Some(30.0));
+        assert_eq!(low, Some(8.0));
+    }
+
+    #[test]
+    fn test_execute_pipeline_groupby_avg_count_distinct() {
+        // Four rows, group by category, AVG the @value field and COUNT_DISTINCT
+        // the @user field.
+        let rows = vec![
+            row_mixed(&[(b"@cat", b"a"), (b"@user", b"u1")], &[(b"@v", 2.0)]),
+            row_mixed(&[(b"@cat", b"a"), (b"@user", b"u2")], &[(b"@v", 4.0)]),
+            row_mixed(&[(b"@cat", b"a"), (b"@user", b"u1")], &[(b"@v", 6.0)]),
+            row_mixed(&[(b"@cat", b"b"), (b"@user", b"u3")], &[(b"@v", 10.0)]),
+        ];
+        let mut fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        fields.push(Bytes::from_static(b"@cat"));
+        let reducers = vec![
+            ReducerSpec {
+                fn_name: ReducerFn::Avg,
+                field: Some(Bytes::from_static(b"@v")),
+                alias: Bytes::from_static(b"avg_v"),
+            },
+            ReducerSpec {
+                fn_name: ReducerFn::CountDistinct,
+                field: Some(Bytes::from_static(b"@user")),
+                alias: Bytes::from_static(b"uniq_users"),
+            },
+        ];
+        let pipeline = vec![AggregateStep::GroupBy { fields, reducers }];
+        let out = execute_pipeline(rows, &pipeline).expect("groupby ok");
+        assert_eq!(out.len(), 2);
+
+        for row in &out {
+            let cat = row_str_val(row, b"@cat");
+            let avg = row_num(row, b"avg_v");
+            let uniq = row_num(row, b"uniq_users");
+            match cat.as_deref() {
+                Some(b"a") => {
+                    // (2+4+6)/3 = 4.0
+                    assert!((avg.unwrap_or(0.0) - 4.0).abs() < 1e-6);
+                    // 2 distinct users (u1 appears twice)
+                    let err = (uniq.unwrap_or(0.0) - 2.0).abs() / 2.0;
+                    assert!(err < 0.02, "HLL error {} for cat=a", err);
+                }
+                Some(b"b") => {
+                    assert!((avg.unwrap_or(0.0) - 10.0).abs() < 1e-6);
+                    // 1 distinct user
+                    let err = (uniq.unwrap_or(0.0) - 1.0).abs();
+                    assert!(err < 0.1, "HLL error {} for cat=b", err);
+                }
+                other => panic!("unexpected cat {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_pipeline_multi_stage() {
+        // Compose Filter (no-op) -> GroupBy -> SortBy DESC by count -> Limit 0,2.
+        use crate::vector::filter::expression::FilterExpr;
+
+        let statuses = ["a", "b", "a", "c", "a", "b", "d"];
+        let rows: Vec<AggregateRow> = statuses
+            .iter()
+            .map(|s| row_str(&[(b"@g", s.as_bytes())]))
+            .collect();
+
+        let filter_expr = Arc::new(FilterExpr::TagEq {
+            field: Bytes::from_static(b"@g"),
+            value: Bytes::from_static(b"any"),
+        });
+
+        let mut group_fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        group_fields.push(Bytes::from_static(b"@g"));
+        let group_reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::from_static(b"cnt"),
+        }];
+
+        let mut sort_keys: SmallVec<[(Bytes, SortOrder); 4]> = SmallVec::new();
+        sort_keys.push((Bytes::from_static(b"cnt"), SortOrder::Desc));
+
+        let pipeline = vec![
+            AggregateStep::Filter(filter_expr),
+            AggregateStep::GroupBy {
+                fields: group_fields,
+                reducers: group_reducers,
+            },
+            AggregateStep::SortBy {
+                keys: sort_keys,
+                max: None,
+            },
+            AggregateStep::Limit { offset: 0, count: 2 },
+        ];
+        let out = execute_pipeline(rows, &pipeline).expect("pipeline ok");
+        assert_eq!(out.len(), 2);
+        // Top group is "a" with count 3.
+        assert_eq!(row_str_val(&out[0], b"@g").as_deref(), Some(b"a".as_ref()));
+        assert_eq!(row_num(&out[0], b"cnt"), Some(3.0));
+        // Second group is "b" with count 2.
+        assert_eq!(row_str_val(&out[1], b"@g").as_deref(), Some(b"b".as_ref()));
+        assert_eq!(row_num(&out[1], b"cnt"), Some(2.0));
+    }
+
+    #[test]
+    fn test_execute_pipeline_groupby_cardinality_cap() {
+        // Generate > GROUPBY_CARDINALITY_LIMIT distinct keys — should error.
+        let n = GROUPBY_CARDINALITY_LIMIT + 5;
+        let mut rows: Vec<AggregateRow> = Vec::with_capacity(n);
+        for i in 0..n {
+            let key = format!("k{}", i);
+            rows.push(row_str(&[(b"@g", key.as_bytes())]));
+        }
+        let mut fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        fields.push(Bytes::from_static(b"@g"));
+        let reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::from_static(b"cnt"),
+        }];
+        let pipeline = vec![AggregateStep::GroupBy { fields, reducers }];
+        let err = execute_pipeline(rows, &pipeline).expect_err("should cap");
+        assert_eq!(err, Bytes::from_static(b"ERR GROUPBY cardinality limit exceeded"));
+    }
+
+    #[test]
+    fn test_execute_pipeline_groupby_rejects_on_new_key_past_cap() {
+        // Fill to exactly GROUPBY_CARDINALITY_LIMIT distinct keys, then:
+        //   - Re-seeing one of the existing keys must NOT error.
+        //   - The (N+1)th distinct key must error before insert.
+        let n = GROUPBY_CARDINALITY_LIMIT;
+        let mut rows: Vec<AggregateRow> = Vec::with_capacity(n);
+        for i in 0..n {
+            let key = format!("k{}", i);
+            rows.push(row_str(&[(b"@g", key.as_bytes())]));
+        }
+        // One re-seen key — must still succeed.
+        rows.push(row_str(&[(b"@g", b"k0")]));
+
+        let mut fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+        fields.push(Bytes::from_static(b"@g"));
+        let reducers = vec![ReducerSpec {
+            fn_name: ReducerFn::Count,
+            field: None,
+            alias: Bytes::from_static(b"cnt"),
+        }];
+        let pipeline = vec![AggregateStep::GroupBy {
+            fields: fields.clone(),
+            reducers: reducers.clone(),
+        }];
+        let out = execute_pipeline(rows.clone(), &pipeline).expect("re-seen key ok at cap");
+        assert_eq!(out.len(), n);
+
+        // Now push ONE new distinct key — must error.
+        rows.push(row_str(&[(b"@g", b"overflow")]));
+        let pipeline2 = vec![AggregateStep::GroupBy { fields, reducers }];
+        let err = execute_pipeline(rows, &pipeline2).expect_err("should cap on (N+1)th");
+        assert_eq!(err, Bytes::from_static(b"ERR GROUPBY cardinality limit exceeded"));
     }
 }
