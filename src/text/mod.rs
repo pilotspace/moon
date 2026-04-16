@@ -250,4 +250,229 @@ mod tests {
         assert!(!field.sortable);
         assert!(!field.noindex);
     }
+
+    // ===== TextStore / TextIndex integration tests =====
+
+    #[cfg(feature = "text-index")]
+    mod store_tests {
+        use super::super::store::{TextIndex, TextStore};
+        use super::super::types::{BM25Config, TextFieldDef};
+        use bytes::Bytes;
+        use crate::protocol::Frame;
+
+        /// Helper: create HSET-style args as [field1, value1, field2, value2, ...]
+        fn hset_args(pairs: &[(&str, &str)]) -> Vec<Frame> {
+            let mut args = Vec::new();
+            for (field, value) in pairs {
+                args.push(Frame::BulkString(Bytes::copy_from_slice(field.as_bytes())));
+                args.push(Frame::BulkString(Bytes::copy_from_slice(value.as_bytes())));
+            }
+            args
+        }
+
+        fn make_title_body_index() -> TextIndex {
+            let title_field = TextFieldDef {
+                field_name: Bytes::from_static(b"title"),
+                weight: 2.0,
+                nostem: false,
+                sortable: false,
+                noindex: false,
+            };
+            let body_field = TextFieldDef::new(Bytes::from_static(b"body"));
+            TextIndex::new(
+                Bytes::from_static(b"article_idx"),
+                vec![Bytes::from_static(b"doc:")],
+                vec![title_field, body_field],
+                BM25Config::default(),
+            )
+        }
+
+        #[test]
+        fn test_text_index_basic_document() {
+            let mut idx = make_title_body_index();
+            let args = hset_args(&[
+                ("title", "Machine Learning for NLP"),
+                ("body", "This article covers modern NLP techniques using deep learning"),
+            ]);
+            let key = b"doc:1";
+            let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+            idx.index_document(key_hash, key, &args);
+
+            assert_eq!(idx.num_docs(), 1, "should have 1 document");
+            assert!(idx.num_terms() > 0, "should have indexed some terms");
+            // Both fields should have stats
+            assert_eq!(idx.field_stats[0].num_docs, 1, "title field should have 1 doc");
+            assert_eq!(idx.field_stats[1].num_docs, 1, "body field should have 1 doc");
+            assert!(idx.field_stats[0].total_field_length > 0, "title should have tokens");
+            assert!(idx.field_stats[1].total_field_length > 0, "body should have tokens");
+        }
+
+        #[test]
+        fn test_text_index_upsert_no_double_count() {
+            let mut idx = make_title_body_index();
+            let key = b"doc:1";
+            let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+
+            // First insert
+            let args1 = hset_args(&[
+                ("title", "Original Title"),
+                ("body", "Original body content here"),
+            ]);
+            idx.index_document(key_hash, key, &args1);
+            let avg_after_first = idx.field_stats[0].avg_doc_len();
+
+            // Upsert same key_hash
+            let args2 = hset_args(&[
+                ("title", "Updated Title"),
+                ("body", "Updated body content here with more words"),
+            ]);
+            idx.index_document(key_hash, key, &args2);
+
+            assert_eq!(idx.num_docs(), 1, "upsert should not increase doc count");
+            assert_eq!(idx.field_stats[0].num_docs, 1, "field stats num_docs should stay 1");
+            // avg_doc_len should reflect the new document, not accumulate old + new
+            let avg_after_upsert = idx.field_stats[0].avg_doc_len();
+            assert!(avg_after_upsert > 0.0, "avg_doc_len should be positive after upsert");
+            // The title lengths are similar so avg should be close (not doubled)
+            assert!((avg_after_upsert - avg_after_first).abs() < 5.0,
+                "avg_doc_len should not drift significantly: first={}, upsert={}",
+                avg_after_first, avg_after_upsert);
+        }
+
+        #[test]
+        fn test_text_index_noindex_field() {
+            let mut idx = TextIndex::new(
+                Bytes::from_static(b"test_idx"),
+                vec![],
+                vec![
+                    TextFieldDef::new(Bytes::from_static(b"title")),
+                    TextFieldDef {
+                        field_name: Bytes::from_static(b"internal"),
+                        weight: 1.0,
+                        nostem: false,
+                        sortable: false,
+                        noindex: true,  // This field should NOT be indexed
+                    },
+                ],
+                BM25Config::default(),
+            );
+
+            let args = hset_args(&[
+                ("title", "Indexed Content"),
+                ("internal", "This should not be indexed"),
+            ]);
+            let key_hash = xxhash_rust::xxh64::xxh64(b"key:1", 0);
+            idx.index_document(key_hash, b"key:1", &args);
+
+            // Title field should be indexed
+            assert_eq!(idx.field_stats[0].num_docs, 1);
+            assert!(idx.field_stats[0].total_field_length > 0);
+
+            // NOINDEX field should have empty stats
+            assert_eq!(idx.field_stats[1].num_docs, 0);
+            assert_eq!(idx.field_stats[1].total_field_length, 0);
+            assert_eq!(idx.field_postings[1].term_count(), 0);
+        }
+
+        #[test]
+        fn test_text_index_multiple_documents() {
+            let mut idx = make_title_body_index();
+
+            for i in 0..5 {
+                let key = format!("doc:{}", i);
+                let title = format!("Article number {} about testing", i);
+                let body = format!("Body content for article {} with some words", i);
+                let args = hset_args(&[("title", &title), ("body", &body)]);
+                let key_hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+                idx.index_document(key_hash, key.as_bytes(), &args);
+            }
+
+            assert_eq!(idx.num_docs(), 5, "should have 5 documents");
+            assert_eq!(idx.field_stats[0].num_docs, 5);
+            assert_eq!(idx.field_stats[1].num_docs, 5);
+        }
+
+        #[test]
+        fn test_text_store_prefix_matching() {
+            let mut store = TextStore::new();
+            let idx1 = TextIndex::new(
+                Bytes::from_static(b"article_idx"),
+                vec![Bytes::from_static(b"article:")],
+                vec![TextFieldDef::new(Bytes::from_static(b"title"))],
+                BM25Config::default(),
+            );
+            let idx2 = TextIndex::new(
+                Bytes::from_static(b"blog_idx"),
+                vec![Bytes::from_static(b"blog:")],
+                vec![TextFieldDef::new(Bytes::from_static(b"title"))],
+                BM25Config::default(),
+            );
+
+            store.create_index(Bytes::from_static(b"article_idx"), idx1).expect("create");
+            store.create_index(Bytes::from_static(b"blog_idx"), idx2).expect("create");
+
+            let matches = store.find_matching_index_names(b"article:1");
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].as_ref(), b"article_idx");
+
+            let matches = store.find_matching_index_names(b"blog:hello");
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].as_ref(), b"blog_idx");
+
+            let matches = store.find_matching_index_names(b"other:key");
+            assert!(matches.is_empty(), "no prefix match for unrelated key");
+        }
+
+        #[test]
+        fn test_text_store_duplicate_index() {
+            let mut store = TextStore::new();
+            let idx = TextIndex::new(
+                Bytes::from_static(b"idx"),
+                vec![],
+                vec![TextFieldDef::new(Bytes::from_static(b"f"))],
+                BM25Config::default(),
+            );
+            store.create_index(Bytes::from_static(b"idx"), idx).expect("first create");
+
+            let idx2 = TextIndex::new(
+                Bytes::from_static(b"idx"),
+                vec![],
+                vec![TextFieldDef::new(Bytes::from_static(b"f"))],
+                BM25Config::default(),
+            );
+            assert!(store.create_index(Bytes::from_static(b"idx"), idx2).is_err());
+        }
+
+        #[test]
+        fn test_text_store_drop_index() {
+            let mut store = TextStore::new();
+            let idx = TextIndex::new(
+                Bytes::from_static(b"idx"),
+                vec![],
+                vec![TextFieldDef::new(Bytes::from_static(b"f"))],
+                BM25Config::default(),
+            );
+            store.create_index(Bytes::from_static(b"idx"), idx).expect("create");
+            assert_eq!(store.index_count(), 1);
+
+            assert!(store.drop_index(b"idx"));
+            assert_eq!(store.index_count(), 0);
+            assert!(!store.drop_index(b"idx"));
+        }
+
+        #[test]
+        fn test_text_store_empty_prefix_matches_all() {
+            let mut store = TextStore::new();
+            let idx = TextIndex::new(
+                Bytes::from_static(b"all_idx"),
+                vec![],  // Empty prefix = match all
+                vec![TextFieldDef::new(Bytes::from_static(b"title"))],
+                BM25Config::default(),
+            );
+            store.create_index(Bytes::from_static(b"all_idx"), idx).expect("create");
+
+            let matches = store.find_matching_index_names(b"any:key");
+            assert_eq!(matches.len(), 1, "empty prefix should match any key");
+        }
+    }
 }
