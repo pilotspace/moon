@@ -345,7 +345,11 @@ pub(super) fn apply_range_filter(
 
 /// Parse a sparse query blob: alternating u32 (LE dim_id) + f32 (LE weight) pairs.
 /// Returns empty Vec on invalid input.
-pub(super) fn parse_sparse_query_blob(blob: &[u8]) -> Vec<(u32, f32)> {
+///
+/// `pub(crate)` exposure (Phase 152 Plan 04): the hybrid path decodes sparse
+/// blobs the same way as the two-way SPARSE-only path — keeping a single shared
+/// decoder avoids drift if the wire format changes.
+pub(crate) fn parse_sparse_query_blob(blob: &[u8]) -> Vec<(u32, f32)> {
     if blob.len() % 8 != 0 || blob.is_empty() {
         return Vec::new();
     }

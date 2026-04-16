@@ -17,9 +17,9 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 use crate::protocol::Frame;
-use crate::text::store::{TextIndex, TextSearchResult, TextStore};
 #[cfg(feature = "text-index")]
 use crate::text::store::TermModifier;
+use crate::text::store::{TextIndex, TextSearchResult, TextStore};
 
 use super::{extract_bulk, parse_limit_clause};
 
@@ -994,7 +994,9 @@ fn detect_modifier(token: &str) -> (&str, TermModifier) {
     }
     // Count trailing '%'
     let mut trailing = 0usize;
-    while trailing < bytes.len().saturating_sub(leading) && bytes[bytes.len() - 1 - trailing] == b'%' {
+    while trailing < bytes.len().saturating_sub(leading)
+        && bytes[bytes.len() - 1 - trailing] == b'%'
+    {
         trailing += 1;
     }
     let dist = leading.min(trailing).min(3) as u8;
@@ -1109,7 +1111,10 @@ fn parse_bare_terms_query(
     };
 
     let terms = build_query_terms(text_str, analyzer)?;
-    Ok(TextQueryClause { field_name: None, terms })
+    Ok(TextQueryClause {
+        field_name: None,
+        terms,
+    })
 }
 
 /// Build query terms from a raw text string, dispatching to the correct analyzer path.
@@ -1364,7 +1369,13 @@ fn accumulate_cross_field(
 /// When all query terms are Exact, uses the existing AND path (`search_field` /
 /// `accumulate_cross_field`). When any term is Fuzzy or Prefix, expands each term
 /// via `TextIndex::expand_terms` and uses the OR-union path (`search_field_or`).
-fn execute_query_on_index(
+///
+/// `pub(crate)` exposure (Phase 152 Plan 04): the hybrid FT.SEARCH path needs raw
+/// `Vec<TextSearchResult>` — the BM25 stream — before converting to the unified
+/// `SearchResult` shape for RRF fusion. Keeping the logic here (instead of
+/// duplicating it in hybrid.rs) preserves the single source of truth for the
+/// exact/fuzzy dispatch + cross-field accumulation.
+pub(crate) fn execute_query_on_index(
     text_index: &TextIndex,
     clause: &TextQueryClause,
     global_df: Option<&HashMap<String, u32>>,
@@ -1681,7 +1692,10 @@ mod tests {
         );
         // All terms should be Exact (no modifiers in bare query)
         assert!(
-            result.terms.iter().all(|t| matches!(t.modifier, TermModifier::Exact)),
+            result
+                .terms
+                .iter()
+                .all(|t| matches!(t.modifier, TermModifier::Exact)),
             "bare terms must have Exact modifier"
         );
     }
@@ -2258,8 +2272,16 @@ mod tests {
         let analyzer = make_analyzer();
         let terms = tokenize_with_modifiers("machine learning", &analyzer);
         assert_eq!(terms.len(), 2);
-        assert!(terms.iter().any(|t| t.text == "machin" && matches!(t.modifier, TermModifier::Exact)));
-        assert!(terms.iter().any(|t| t.text == "learn" && matches!(t.modifier, TermModifier::Exact)));
+        assert!(
+            terms
+                .iter()
+                .any(|t| t.text == "machin" && matches!(t.modifier, TermModifier::Exact))
+        );
+        assert!(
+            terms
+                .iter()
+                .any(|t| t.text == "learn" && matches!(t.modifier, TermModifier::Exact))
+        );
     }
 
     #[test]
@@ -2268,14 +2290,25 @@ mod tests {
         let analyzer = make_analyzer();
         // "%%machne%%" = fuzzy-2, "learning" = exact (stemmed to "learn"), "mach*" = prefix
         let terms = tokenize_with_modifiers("%%machne%% learning mach*", &analyzer);
-        assert_eq!(terms.len(), 3, "expected 3 terms, got {:?}", terms.iter().map(|t| &t.text).collect::<Vec<_>>());
-        let fuzzy = terms.iter().find(|t| matches!(t.modifier, TermModifier::Fuzzy(2)));
+        assert_eq!(
+            terms.len(),
+            3,
+            "expected 3 terms, got {:?}",
+            terms.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        let fuzzy = terms
+            .iter()
+            .find(|t| matches!(t.modifier, TermModifier::Fuzzy(2)));
         assert!(fuzzy.is_some(), "expected Fuzzy(2) term");
         assert_eq!(fuzzy.unwrap().text, "machne");
-        let exact = terms.iter().find(|t| matches!(t.modifier, TermModifier::Exact));
+        let exact = terms
+            .iter()
+            .find(|t| matches!(t.modifier, TermModifier::Exact));
         assert!(exact.is_some(), "expected Exact term");
         assert_eq!(exact.unwrap().text, "learn");
-        let prefix = terms.iter().find(|t| matches!(t.modifier, TermModifier::Prefix));
+        let prefix = terms
+            .iter()
+            .find(|t| matches!(t.modifier, TermModifier::Prefix));
         assert!(prefix.is_some(), "expected Prefix term");
         assert_eq!(prefix.unwrap().text, "mach");
     }

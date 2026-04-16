@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 
 use crate::command::vector_search::session;
 use crate::protocol::Frame;
+use crate::text::store::TextStore;
 use crate::vector::store::VectorStore;
 use crate::vector::types::SearchResult;
 
@@ -38,10 +39,15 @@ use super::response::{build_hybrid_response, build_search_response};
 ///
 /// `db` is an optional mutable Database reference for SESSION clause support.
 /// When `None`, SESSION clause is silently ignored (backward compatible).
+///
+/// `text_store` is an optional TextStore reference for the HYBRID path (Phase 152).
+/// When `None`, HYBRID modifier is rejected with an error; all existing FT.SEARCH
+/// paths (KNN / SPARSE / two-way) are unaffected.
 pub fn ft_search(
     store: &mut VectorStore,
     args: &[Frame],
     mut db: Option<&mut crate::storage::db::Database>,
+    text_store: Option<&TextStore>,
 ) -> Frame {
     // args[0] = index_name, args[1] = query_string, args[2..] = PARAMS ...
     if args.len() < 2 {
@@ -59,6 +65,42 @@ pub fn ft_search(
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid query")),
     };
+
+    // ── HYBRID detection (Phase 152, per D-18 — zero impact when absent) ────────
+    // Must run BEFORE the KNN/SPARSE path so `HYBRID VECTOR @v $blob SPARSE ...`
+    // doesn't get misinterpreted as a standalone SPARSE clause.
+    match crate::command::vector_search::hybrid::parse_hybrid_modifier(args) {
+        Ok(Some(partial)) => {
+            let ts = match text_store {
+                Some(t) => t,
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR HYBRID requires text index (no TextStore available)",
+                    ));
+                }
+            };
+            let (limit_offset, limit_count) = parse_limit_clause(args);
+            let top_k = resolve_hybrid_top_k(limit_offset, limit_count);
+            let hq = crate::command::vector_search::hybrid::HybridQuery {
+                index_name: index_name.clone(),
+                text_query: query_str.clone(),
+                dense_field: partial.dense_field,
+                dense_blob: partial.dense_blob,
+                sparse: partial.sparse,
+                weights: partial.weights,
+                k_per_stream: partial.k_per_stream,
+                top_k,
+                offset: limit_offset,
+                count: limit_count,
+            };
+            crate::vector::metrics::increment_search();
+            return crate::command::vector_search::hybrid::execute_hybrid_search_local(
+                store, ts, &hq,
+            );
+        }
+        Ok(None) => { /* fall through to existing path */ }
+        Err(frame) => return frame,
+    }
 
     // Parse KNN from query string (optional — may be absent for sparse-only search)
     let knn_parsed = parse_knn_query(&query_str);
@@ -406,12 +448,13 @@ pub fn ft_search_with_graph(
     graph_store: Option<&crate::graph::store::GraphStore>,
     args: &[Frame],
     db: Option<&mut crate::storage::db::Database>,
+    text_store: Option<&TextStore>,
 ) -> Frame {
     let expand_depth = super::parse::parse_expand_clause(args);
 
     // No expansion requested or no graph store — fall back to standard search.
     if expand_depth.is_none() || graph_store.is_none() {
-        return ft_search(store, args, db);
+        return ft_search(store, args, db, text_store);
     }
 
     let depth = expand_depth.unwrap_or(1);
@@ -419,7 +462,7 @@ pub fn ft_search_with_graph(
     let gs = graph_store.unwrap();
 
     // Run the standard KNN search first (session filtering happens inside ft_search).
-    let knn_result = ft_search(store, args, db);
+    let knn_result = ft_search(store, args, db, text_store);
 
     // Extract (key, score) pairs from the KNN response for seeding graph expansion.
     let seed_keys = super::response::extract_seeds_from_response(&knn_result);
@@ -452,4 +495,19 @@ pub fn ft_search_with_graph(
 
     // Build combined response: original KNN results + expanded graph results.
     super::response::build_combined_response(&knn_result, &expanded)
+}
+
+/// Resolve hybrid top_k from LIMIT (offset, count).
+///
+/// LIMIT defaults to `(0, usize::MAX)` when absent (existing FT.SEARCH convention).
+/// For the hybrid path we need a concrete top_k for the fusion — use
+/// `offset + count` capped at 10 when count is MAX (standard FT.SEARCH default).
+#[inline]
+fn resolve_hybrid_top_k(offset: usize, count: usize) -> usize {
+    if count == usize::MAX {
+        // No explicit LIMIT — default to 10 (matches RediSearch FT.SEARCH default).
+        offset.saturating_add(10).max(1)
+    } else {
+        offset.saturating_add(count).max(1)
+    }
 }

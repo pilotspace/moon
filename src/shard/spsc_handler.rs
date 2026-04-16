@@ -1152,11 +1152,17 @@ pub(crate) fn dispatch_vector_command(
         // Existing vector search path (KNN / SPARSE / hybrid).
         #[cfg(feature = "graph")]
         {
-            vector_search::ft_search_with_graph(vector_store, graph_store, args, db)
+            vector_search::ft_search_with_graph(
+                vector_store,
+                graph_store,
+                args,
+                db,
+                Some(text_store),
+            )
         }
         #[cfg(not(feature = "graph"))]
         {
-            vector_search::ft_search(vector_store, args, db)
+            vector_search::ft_search(vector_store, args, db, Some(text_store))
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
         vector_search::ft_dropindex(vector_store, text_store, args)

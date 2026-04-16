@@ -1718,7 +1718,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // Parse query and resolve field_idx inside a block scope so the
                             // MutexGuard from text_store() is dropped BEFORE .await.
                             // We use the TextIndex's own field_analyzers (same pipeline used at index time).
-                            type ParseResult = Result<(Vec<crate::command::vector_search::QueryTerm>, Option<usize>), String>;
+                            type ParseResult = Result<
+                                (Vec<crate::command::vector_search::QueryTerm>, Option<usize>),
+                                String,
+                            >;
                             let parse_result: ParseResult = {
                                 let ts = ctx.shard_databases.text_store(ctx.shard_id);
                                 match ts.get_index(&index_name) {
@@ -1735,28 +1738,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 match parsed {
                                                     Err(e) => Err(e.to_owned()),
                                                     Ok(clause) => {
-                                                        let field_idx =
-                                                            match &clause.field_name {
-                                                                None => Ok(None),
-                                                                Some(field_name) => match text_index
-                                                                    .text_fields
-                                                                    .iter()
-                                                                    .position(|f| {
-                                                                        f.field_name
-                                                                            .as_ref()
-                                                                            .eq_ignore_ascii_case(
-                                                                                field_name.as_ref(),
-                                                                            )
-                                                                    }) {
-                                                                    Some(idx) => Ok(Some(idx)),
-                                                                    None => Err(format!(
-                                                                        "ERR unknown field '{}'",
-                                                                        String::from_utf8_lossy(
-                                                                            field_name
+                                                        let field_idx = match &clause.field_name {
+                                                            None => Ok(None),
+                                                            Some(field_name) => match text_index
+                                                                .text_fields
+                                                                .iter()
+                                                                .position(|f| {
+                                                                    f.field_name
+                                                                        .as_ref()
+                                                                        .eq_ignore_ascii_case(
+                                                                            field_name.as_ref(),
                                                                         )
-                                                                    )),
-                                                                },
-                                                            };
+                                                                }) {
+                                                                Some(idx) => Ok(Some(idx)),
+                                                                None => Err(format!(
+                                                                    "ERR unknown field '{}'",
+                                                                    String::from_utf8_lossy(
+                                                                        field_name
+                                                                    )
+                                                                )),
+                                                            },
+                                                        };
                                                         field_idx.map(|idx| (clause.terms, idx))
                                                     }
                                                 }
@@ -1973,9 +1975,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     &mut vs,
                                     cmd_args,
                                     Some(&mut *db_guard),
+                                    Some(&*ts),
                                 )
                             } else {
-                                crate::command::vector_search::ft_search(&mut vs, cmd_args, None)
+                                crate::command::vector_search::ft_search(
+                                    &mut vs,
+                                    cmd_args,
+                                    None,
+                                    Some(&*ts),
+                                )
                             }
                         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                             crate::command::vector_search::ft_dropindex(&mut vs, &mut ts, cmd_args)

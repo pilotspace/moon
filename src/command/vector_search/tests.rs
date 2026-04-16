@@ -529,7 +529,7 @@ fn test_ft_search_dimension_mismatch() {
         bulk(b"query"),
         bulk(b"tooshort"),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR query vector dimension"),
@@ -557,7 +557,7 @@ fn test_ft_search_empty_index() {
         Frame::BulkString(Bytes::from(query_vec)),
     ];
     crate::vector::distance::init();
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0)); // no results
@@ -691,7 +691,7 @@ fn test_end_to_end_create_insert_search() {
         Frame::BulkString(Bytes::from(query_blob)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             // First element is count
@@ -772,7 +772,7 @@ fn test_ft_search_unknown_index() {
         Frame::BulkString(Bytes::from_static(b"query")),
         Frame::BulkString(Bytes::from(vec![0u8; 16])),
     ];
-    let result = ft_search(&mut store, &args, None);
+    let result = ft_search(&mut store, &args, None, None);
     assert!(
         matches!(result, Frame::Error(_)),
         "Should error on unknown index, got {result:?}"
@@ -902,7 +902,7 @@ fn test_ft_search_with_filter_no_regression() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0));
@@ -951,7 +951,7 @@ fn test_vector_metrics_increment_decrement() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    ft_search(&mut store, &search_args, None);
+    ft_search(&mut store, &search_args, None, None);
     let after_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
     assert!(
         after_search > before_search,
@@ -2368,7 +2368,7 @@ fn test_ft_search_field_targeting() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec_4)),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             assert!(
@@ -2393,7 +2393,7 @@ fn test_ft_search_field_targeting() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec_8)),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             assert!(
@@ -2418,7 +2418,7 @@ fn test_ft_search_field_targeting() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(wrong_dim)),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     assert!(
         matches!(&result, Frame::Error(_)),
         "expected dimension mismatch error for body_vec, got {result:?}"
@@ -2459,7 +2459,7 @@ fn test_ft_search_default_field_compat() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             assert!(
@@ -2488,7 +2488,7 @@ fn test_ft_search_unknown_field_error() {
         Frame::BulkString(Bytes::from(query_vec)),
     ];
     crate::vector::distance::init();
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR unknown vector field"),
@@ -2794,7 +2794,7 @@ fn test_hybrid_search_basic() {
         Frame::BulkString(Bytes::from(sparse_query)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             let total = match &items[0] {
@@ -2849,7 +2849,7 @@ fn test_hybrid_search_sparse_only() {
         Frame::BulkString(Bytes::from(sparse_query)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             let total = match &items[0] {
@@ -2887,7 +2887,7 @@ fn test_hybrid_search_dense_only_backward_compat() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0)); // empty index
@@ -2936,7 +2936,7 @@ fn test_hybrid_search_hit_counts() {
         Frame::BulkString(Bytes::from(sparse_query)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             let len = items.len();
@@ -3090,7 +3090,7 @@ fn test_range_filter_l2_search() {
         Frame::BulkString(Bytes::from(query_blob.clone())),
     ];
 
-    let result = ft_search(&mut store, &search_args, None);
+    let result = ft_search(&mut store, &search_args, None, None);
     match &result {
         Frame::Array(items) => {
             let count = match &items[0] {
@@ -3129,7 +3129,7 @@ fn test_range_filter_l2_search() {
         Frame::BulkString(Bytes::from(query_blob)),
     ];
 
-    let result = ft_search(&mut store, &search_args_zero, None);
+    let result = ft_search(&mut store, &search_args_zero, None, None);
     match &result {
         Frame::Array(items) => {
             let count = match &items[0] {
