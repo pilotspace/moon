@@ -1043,6 +1043,86 @@ if should_run "vector"; then
     fi
     # ── End FT.SEARCH BM25 text search tests ─────────────────────────────────────
 
+    # ── HIGHLIGHT / SUMMARIZE tests (Plan 150-03) ─────────────────────────────
+    # Add a document with sufficient body text for SUMMARIZE truncation (> 20 words)
+    assert_moon_ok "HSET doc:long for HIGHLIGHT/SUMMARIZE" HSET doc:long title "machine learning overview" body "This is a comprehensive guide to machine learning covering supervised learning unsupervised learning and reinforcement learning techniques used in modern artificial intelligence and data science applications for production systems"
+
+    # 1. HIGHLIGHT basic: verify <b> tag in response
+    TOTAL=$((TOTAL + 1))
+    FT_HL=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT 2>&1)
+    if echo "$FT_HL" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT returned error: $FT_HL"
+    elif echo "$FT_HL" | grep -q "<b>"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT response contains <b> tag"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT response missing <b> tag (got: $FT_HL)"
+    fi
+
+    # 2. HIGHLIGHT FIELDS: only highlight specified field
+    TOTAL=$((TOTAL + 1))
+    FT_HL_FIELDS=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT FIELDS 1 title 2>&1)
+    if echo "$FT_HL_FIELDS" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT FIELDS returned error: $FT_HL_FIELDS"
+    elif echo "$FT_HL_FIELDS" | grep -q "<b>\|machine"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT FIELDS 1 title returns result with match"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT FIELDS 1 title returned no match (got: $FT_HL_FIELDS)"
+    fi
+
+    # 3. HIGHLIGHT custom TAGS: verify custom open/close tags
+    TOTAL=$((TOTAL + 1))
+    FT_HL_TAGS=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT TAGS "[[" "]]" 2>&1)
+    if echo "$FT_HL_TAGS" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT TAGS returned error: $FT_HL_TAGS"
+    elif echo "$FT_HL_TAGS" | grep -q "\[\["; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT TAGS [[ ]] response contains custom tag"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT TAGS response missing custom tag (got: $FT_HL_TAGS)"
+    fi
+
+    # 4. SUMMARIZE basic: verify response is returned without error
+    TOTAL=$((TOTAL + 1))
+    FT_SUM=$(mcli FT.SEARCH textidx "machine" SUMMARIZE 2>&1)
+    if echo "$FT_SUM" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE returned error: $FT_SUM"
+    elif echo "$FT_SUM" | grep -q "machine\|learning"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH SUMMARIZE response contains match terms"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE response missing match terms (got: $FT_SUM)"
+    fi
+
+    # 5. SUMMARIZE FIELDS: only summarize the body field
+    TOTAL=$((TOTAL + 1))
+    FT_SUM_FIELDS=$(mcli FT.SEARCH textidx "machine" SUMMARIZE FIELDS 1 body 2>&1)
+    if echo "$FT_SUM_FIELDS" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE FIELDS returned error: $FT_SUM_FIELDS"
+    elif echo "$FT_SUM_FIELDS" | grep -q "machine\|learning"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH SUMMARIZE FIELDS 1 body returns result"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE FIELDS 1 body missing match (got: $FT_SUM_FIELDS)"
+    fi
+
+    # 6. SUMMARIZE with LEN: fragment should be short (10 tokens)
+    TOTAL=$((TOTAL + 1))
+    FT_SUM_LEN=$(mcli FT.SEARCH textidx "machine" SUMMARIZE LEN 10 2>&1)
+    if echo "$FT_SUM_LEN" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE LEN returned error: $FT_SUM_LEN"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH SUMMARIZE LEN 10 does not error"
+    fi
+
+    # 7. HIGHLIGHT + SUMMARIZE combined: title highlighted, body summarized
+    TOTAL=$((TOTAL + 1))
+    FT_BOTH=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT FIELDS 1 title SUMMARIZE FIELDS 1 body 2>&1)
+    if echo "$FT_BOTH" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT + SUMMARIZE combined returned error: $FT_BOTH"
+    elif echo "$FT_BOTH" | grep -q "machine\|<b>"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT FIELDS 1 title SUMMARIZE FIELDS 1 body returns result"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH combined HIGHLIGHT+SUMMARIZE missing output (got: $FT_BOTH)"
+    fi
+    # ── End HIGHLIGHT / SUMMARIZE tests ──────────────────────────────────────
+
     # FT.DROPINDEX removes text index
     assert_moon_ok "FT.DROPINDEX text index" FT.DROPINDEX textidx
 
