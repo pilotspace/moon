@@ -656,6 +656,11 @@ impl super::Shard {
                 let mut vs = shard_databases.vector_store(shard_id);
                 vs.set_persist_dir(vdir.clone());
                 drop(vs);
+
+                // Text indexes share the same shard directory (different filename).
+                let mut ts = shard_databases.text_store(shard_id);
+                ts.set_persist_dir(vdir.clone());
+                drop(ts);
             }
 
             // Try loading saved index metadata from the vector persist dir.
@@ -666,14 +671,22 @@ impl super::Shard {
                 }
             });
 
-            if let Some(metas) = metas {
+            // Try loading saved text index metadata from the same persist dir.
+            let text_metas = vector_persist_dir.as_ref().and_then(|vdir| {
+                match crate::text::index_persist::load_text_index_metadata(vdir) {
+                    Ok(m) if !m.is_empty() => Some(m),
+                    _ => None,
+                }
+            });
+
+            if let Some(ref metas) = metas {
                 let mut vs = shard_databases.vector_store(shard_id);
                 info!(
                     "Shard {}: restoring {} vector index(es) from sidecar",
                     shard_id,
                     metas.len()
                 );
-                for meta in &metas {
+                for meta in metas {
                     if let Err(e) = vs.create_index(meta.clone()) {
                         tracing::warn!(
                             "Shard {}: failed to restore index '{}': {}",
@@ -684,8 +697,39 @@ impl super::Shard {
                     }
                 }
                 drop(vs); // release VectorStore lock before scanning databases
+            }
 
-                // Auto-reindex existing HASH keys that match index prefixes.
+            // Restore text indexes from sidecar metadata.
+            #[cfg(feature = "text-index")]
+            if let Some(ref text_metas) = text_metas {
+                let mut ts = shard_databases.text_store(shard_id);
+                info!(
+                    "Shard {}: restoring {} text index(es) from sidecar",
+                    shard_id,
+                    text_metas.len()
+                );
+                for meta in text_metas {
+                    let text_index = crate::text::store::TextIndex::new(
+                        meta.name.clone(),
+                        meta.key_prefixes.clone(),
+                        meta.text_fields.clone(),
+                        meta.bm25_config,
+                    );
+                    if let Err(e) = ts.create_index(meta.name.clone(), text_index) {
+                        tracing::warn!(
+                            "Shard {}: failed to restore text index '{}': {}",
+                            shard_id,
+                            String::from_utf8_lossy(&meta.name),
+                            e
+                        );
+                    }
+                }
+                drop(ts);
+            }
+
+            // Auto-reindex existing HASH keys that match vector or text index prefixes.
+            let has_indexes = metas.is_some() || text_metas.is_some();
+            if has_indexes {
                 let db_count = shard_databases.db_count();
                 let mut reindexed = 0usize;
                 for db_idx in 0..db_count {
@@ -693,10 +737,15 @@ impl super::Shard {
                     let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
                     for (key, entry) in guard.data().iter() {
                         let key_bytes = key.as_bytes();
-                        let matches_prefix = metas
-                            .iter()
-                            .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)));
-                        if !matches_prefix {
+                        let matches_vector = metas.as_ref().is_some_and(|ms| {
+                            ms.iter()
+                                .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
+                        });
+                        let matches_text = text_metas.as_ref().is_some_and(|ms| {
+                            ms.iter()
+                                .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
+                        });
+                        if !matches_vector && !matches_text {
                             continue;
                         }
                         let mut args = Vec::new();
@@ -746,7 +795,7 @@ impl super::Shard {
                 }
                 if reindexed > 0 {
                     info!(
-                        "Shard {}: auto-reindexed {} HASH key(s) into restored vector indexes",
+                        "Shard {}: auto-reindexed {} HASH key(s) into restored vector/text indexes",
                         shard_id, reindexed
                     );
                 }

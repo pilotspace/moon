@@ -15,6 +15,7 @@
 
 pub mod analyzer;
 pub mod bm25;
+pub mod index_persist;
 pub mod posting;
 pub mod store;
 pub mod term_dict;

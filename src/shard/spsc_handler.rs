@@ -1135,7 +1135,8 @@ fn auto_index_hset(
     args: &[crate::protocol::Frame],
 ) {
     let matching_names = vector_store.find_matching_index_names(key);
-    if matching_names.is_empty() {
+    let text_matching = text_store.find_matching_index_names(key);
+    if matching_names.is_empty() && text_matching.is_empty() {
         return;
     }
 
@@ -1179,8 +1180,7 @@ fn auto_index_hset(
         }
     }
 
-    // TEXT field indexing: find matching text indexes and index document
-    let text_matching = text_store.find_matching_index_names(key);
+    // TEXT field indexing: use pre-computed text_matching from guard
     for idx_name in text_matching {
         if let Some(idx) = text_store.get_index_mut(&idx_name) {
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);

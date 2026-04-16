@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::text::analyzer::AnalyzerPipeline;
 use crate::text::bm25::FieldStats;
+use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
 use crate::text::types::{BM25Config, TextFieldDef};
@@ -230,6 +231,9 @@ fn find_field_value<'a>(
 /// key matching for auto-indexing.
 pub struct TextStore {
     indexes: HashMap<Bytes, TextIndex>,
+    /// Shard directory for persisting text index metadata sidecar.
+    /// Set once during event loop init when persistence is enabled.
+    persist_dir: Option<std::path::PathBuf>,
 }
 
 impl TextStore {
@@ -237,7 +241,38 @@ impl TextStore {
     pub fn new() -> Self {
         Self {
             indexes: HashMap::new(),
+            persist_dir: None,
         }
+    }
+
+    /// Set the shard directory for index metadata persistence.
+    /// Called once during event loop init when persistence is enabled.
+    pub fn set_persist_dir(&mut self, dir: std::path::PathBuf) {
+        self.persist_dir = Some(dir);
+    }
+
+    /// Persist current text index metadata to the sidecar file.
+    /// No-op if persist_dir is not set (persistence disabled).
+    fn save_index_meta_sidecar(&self) {
+        if let Some(ref dir) = self.persist_dir {
+            let metas = self.collect_index_metas();
+            if let Err(e) = crate::text::index_persist::save_text_index_metadata(dir, &metas) {
+                tracing::warn!("Failed to save text index metadata: {}", e);
+            }
+        }
+    }
+
+    /// Collect schema-only metadata from all text indexes for persistence.
+    pub fn collect_index_metas(&self) -> Vec<TextIndexMeta> {
+        self.indexes
+            .values()
+            .map(|idx| TextIndexMeta {
+                name: idx.name.clone(),
+                bm25_config: idx.bm25_config,
+                key_prefixes: idx.key_prefixes.clone(),
+                text_fields: idx.text_fields.clone(),
+            })
+            .collect()
     }
 
     /// Create a new text index. Returns Err if the name already exists.
@@ -246,12 +281,17 @@ impl TextStore {
             return Err("Index already exists");
         }
         self.indexes.insert(name, index);
+        self.save_index_meta_sidecar();
         Ok(())
     }
 
     /// Drop a text index by name. Returns true if it existed.
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
-        self.indexes.remove(name).is_some()
+        let removed = self.indexes.remove(name).is_some();
+        if removed {
+            self.save_index_meta_sidecar();
+        }
+        removed
     }
 
     /// Get a read-only reference to a text index.
