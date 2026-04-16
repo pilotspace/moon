@@ -33,7 +33,7 @@ pub use ft_search::{
 pub use ft_search::ft_search_with_graph;
 pub use ft_text_search::{
     execute_text_search_local, execute_text_search_with_global_idf, ft_text_search,
-    is_text_query, merge_text_results, parse_text_query,
+    is_text_query, merge_text_results, parse_text_query, HighlightOpts, SummarizeOpts,
 };
 pub use helpers::{metric_to_bytes, quantize_f32_to_sq, quantization_to_bytes};
 

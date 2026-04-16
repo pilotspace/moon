@@ -855,6 +855,237 @@ pub async fn broadcast_vector_command(
     local_result
 }
 
+/// Two-phase DFS scatter-gather for globally accurate BM25 text search (per D-04).
+///
+/// **Phase 1** — DocFreq scatter: collect (term, df) + total N from every shard,
+/// aggregate into global document frequency statistics.
+///
+/// **Phase 2** — TextSearch scatter: execute BM25 search on every shard using the
+/// injected global IDF weights, then merge per-shard top-K results.
+///
+/// **Single-shard fast path** (per D-06): when `num_shards == 1`, the local shard's
+/// FieldStats are globally accurate, so the DFS pre-pass is skipped entirely.
+///
+/// # Lock safety
+/// Every access to `shard_databases.text_store(shard_id)` returns a `MutexGuard`.
+/// All local data extraction is wrapped in a block scope so the guard is dropped
+/// **before** any `.await` point — required by RESEARCH Pitfall 2.
+pub async fn scatter_text_search(
+    index_name: Bytes,
+    query_terms: Vec<String>,
+    field_idx: Option<usize>,
+    top_k: usize,
+    offset: usize,
+    count: usize,
+    my_shard: usize,
+    num_shards: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    // ── Single-shard fast path (per D-06) ────────────────────────────────────
+    if num_shards == 1 {
+        // Local IDF is globally accurate with one shard — skip DFS pre-pass.
+        let result = {
+            let ts = shard_databases.text_store(my_shard);
+            crate::command::vector_search::ft_text_search::execute_text_search_local(
+                &ts,
+                &index_name,
+                field_idx,
+                &query_terms,
+                top_k,
+                offset,
+                count,
+            )
+        }; // MutexGuard dropped here — no .await held
+        return result;
+    }
+
+    // ── Phase 1: scatter DocFreq to all shards ────────────────────────────────
+    // Collect (term, df, N) from each shard to build global IDF weights.
+    let field_queries = vec![(field_idx, query_terms.clone())];
+    let mut doc_freq_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
+        Vec::with_capacity(num_shards.saturating_sub(1));
+    let mut local_doc_freq: Option<Frame> = None;
+
+    for shard_id in 0..num_shards {
+        if shard_id == my_shard {
+            // Local: extract df/N directly — no SPSC overhead.
+            // CRITICAL: block scope drops MutexGuard before any .await (RESEARCH Pitfall 2).
+            let response = {
+                let ts = shard_databases.text_store(shard_id);
+                match ts.get_index(&index_name) {
+                    Some(text_index) => {
+                        let mut items: Vec<Frame> = Vec::new();
+                        for (field_idx_opt, terms) in &field_queries {
+                            let fidx = field_idx_opt.unwrap_or(0);
+                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                            for (term, df) in term_dfs {
+                                items.push(Frame::BulkString(Bytes::from(term)));
+                                items.push(Frame::Integer(i64::from(df)));
+                            }
+                            items.push(Frame::BulkString(Bytes::from_static(b"N")));
+                            items.push(Frame::Integer(i64::from(n)));
+                        }
+                        Frame::Array(items.into())
+                    }
+                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                }
+            }; // MutexGuard dropped here, before .await below
+            local_doc_freq = Some(response);
+        } else {
+            let (reply_tx, reply_rx) = channel::oneshot();
+            let msg = ShardMessage::DocFreq {
+                index_name: index_name.clone(),
+                field_queries: field_queries.clone(),
+                reply_tx,
+            };
+            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            doc_freq_receivers.push(reply_rx);
+        }
+    }
+
+    // Collect Phase 1 responses and aggregate.
+    let mut doc_freq_responses = Vec::with_capacity(num_shards);
+    if let Some(local) = local_doc_freq {
+        doc_freq_responses.push(local);
+    }
+    for rx in doc_freq_receivers {
+        match rx.recv().await {
+            Ok(frame) => doc_freq_responses.push(frame),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR DFS phase 1 channel closed unexpectedly",
+                ));
+            }
+        }
+    }
+
+    let (global_df, global_n) = aggregate_doc_freq(&doc_freq_responses);
+
+    // ── Phase 2: scatter TextSearch with global IDF to all shards ─────────────
+    let mut search_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
+        Vec::with_capacity(num_shards.saturating_sub(1));
+    let mut local_search: Option<Frame> = None;
+
+    for shard_id in 0..num_shards {
+        if shard_id == my_shard {
+            // Local: execute with global IDF directly — block scope drops guard.
+            // CRITICAL: guard dropped before any .await (RESEARCH Pitfall 2).
+            let response = {
+                let ts = shard_databases.text_store(shard_id);
+                match ts.get_index(&index_name) {
+                    Some(text_index) => {
+                        crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                            text_index,
+                            field_idx,
+                            &query_terms,
+                            &global_df,
+                            global_n,
+                            top_k,
+                            0,      // each shard returns top_k; coordinator applies final offset
+                            top_k,
+                        )
+                    }
+                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                }
+            }; // MutexGuard dropped here, before .await below
+            local_search = Some(response);
+        } else {
+            let (reply_tx, reply_rx) = channel::oneshot();
+            let msg = ShardMessage::TextSearch {
+                index_name: index_name.clone(),
+                field_idx,
+                query_terms: query_terms.clone(),
+                global_df: global_df.clone(),
+                global_n,
+                top_k,
+                offset: 0,      // each shard returns top_k; coordinator applies final offset+count
+                count: top_k,
+                highlight_opts: None, // Not used until Plan 03
+                summarize_opts: None, // Not used until Plan 03
+                reply_tx,
+            };
+            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            search_receivers.push(reply_rx);
+        }
+    }
+
+    // Collect Phase 2 responses.
+    let mut search_responses = Vec::with_capacity(num_shards);
+    if let Some(local) = local_search {
+        search_responses.push(local);
+    }
+    for rx in search_receivers {
+        match rx.recv().await {
+            Ok(frame) => search_responses.push(frame),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR DFS phase 2 channel closed unexpectedly",
+                ));
+            }
+        }
+    }
+
+    // Merge and apply final pagination.
+    crate::command::vector_search::merge_text_results(&search_responses, top_k, offset, count)
+}
+
+/// Aggregate document frequencies from multiple shard `DocFreq` responses.
+///
+/// Each response is a `Frame::Array` with interleaved `[term, df, ..., "N", n]` entries.
+/// This function sums `df` per term across shards and sums `N` (total docs) across shards.
+///
+/// Returns `(global_df: HashMap<String, u32>, global_n: u32)`.
+fn aggregate_doc_freq(
+    responses: &[Frame],
+) -> (std::collections::HashMap<String, u32>, u32) {
+    let mut global_df: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut global_n: u32 = 0;
+
+    for resp in responses {
+        let items = match resp {
+            Frame::Array(items) => items,
+            _ => continue, // Skip error frames from shards that don't have the index
+        };
+
+        let mut i = 0;
+        while i + 1 < items.len() {
+            match &items[i] {
+                Frame::BulkString(key) => {
+                    if key.as_ref() == b"N" {
+                        // "N" sentinel: next item is the total doc count for this shard
+                        if let Frame::Integer(n) = &items[i + 1] {
+                            global_n = global_n.saturating_add(*n as u32);
+                        }
+                        i += 2;
+                    } else {
+                        // term -> df pair
+                        let term = match std::str::from_utf8(key) {
+                            Ok(s) => s.to_owned(),
+                            Err(_) => {
+                                i += 2;
+                                continue;
+                            }
+                        };
+                        if let Frame::Integer(df) = &items[i + 1] {
+                            *global_df.entry(term).or_insert(0) =
+                                global_df.get(&term).copied().unwrap_or(0).saturating_add(*df as u32);
+                        }
+                        i += 2;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    (global_df, global_n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1250,132 @@ mod tests {
         )
         .await;
         assert_eq!(result, Frame::Integer(2)); // a and b deleted, nonexistent = 0
+    }
+
+    // ── aggregate_doc_freq tests ───────────────────────────────────────────────
+
+    /// Helper: build a DocFreq response frame from a list of (term, df) pairs + N.
+    fn make_doc_freq_frame(term_dfs: &[(&str, u32)], n: u32) -> Frame {
+        let mut items: Vec<Frame> = Vec::new();
+        for (term, df) in term_dfs {
+            items.push(Frame::BulkString(Bytes::copy_from_slice(term.as_bytes())));
+            items.push(Frame::Integer(i64::from(*df)));
+        }
+        items.push(Frame::BulkString(Bytes::from_static(b"N")));
+        items.push(Frame::Integer(i64::from(n)));
+        Frame::Array(items.into())
+    }
+
+    #[test]
+    fn test_aggregate_doc_freq_two_shards() {
+        // Shard A: "machine" df=3, N=10
+        // Shard B: "machine" df=5, N=15
+        // Global: "machine" df=8, N=25
+        let shard_a = make_doc_freq_frame(&[("machine", 3)], 10);
+        let shard_b = make_doc_freq_frame(&[("machine", 5)], 15);
+
+        let (global_df, global_n) = aggregate_doc_freq(&[shard_a, shard_b]);
+
+        assert_eq!(global_n, 25, "global N should be 10+15=25");
+        assert_eq!(
+            global_df.get("machine").copied(),
+            Some(8),
+            "global df for 'machine' should be 3+5=8"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_doc_freq_missing_term_on_one_shard() {
+        // Shard A: "rare" df=1, N=10
+        // Shard B: no "rare" entry, N=8
+        // Global: "rare" df=1, N=18
+        let shard_a = make_doc_freq_frame(&[("rare", 1)], 10);
+        let shard_b = make_doc_freq_frame(&[], 8); // empty term list, just N=8
+
+        let (global_df, global_n) = aggregate_doc_freq(&[shard_a, shard_b]);
+
+        assert_eq!(global_n, 18, "global N should be 10+8=18");
+        assert_eq!(
+            global_df.get("rare").copied(),
+            Some(1),
+            "global df for 'rare' should be 1 (only present on shard A)"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_doc_freq_multiple_terms() {
+        // Two shards each have two terms
+        let shard_a = make_doc_freq_frame(&[("rust", 4), ("async", 2)], 20);
+        let shard_b = make_doc_freq_frame(&[("rust", 6), ("async", 3)], 30);
+
+        let (global_df, global_n) = aggregate_doc_freq(&[shard_a, shard_b]);
+
+        assert_eq!(global_n, 50, "global N should be 20+30=50");
+        assert_eq!(global_df.get("rust").copied(), Some(10), "rust df=4+6=10");
+        assert_eq!(global_df.get("async").copied(), Some(5), "async df=2+3=5");
+    }
+
+    #[test]
+    fn test_aggregate_doc_freq_error_frame_skipped() {
+        // If one shard returns an error (e.g. index not found), it should be skipped.
+        let shard_a = make_doc_freq_frame(&[("term", 3)], 10);
+        let shard_err = Frame::Error(Bytes::from_static(b"ERR unknown index"));
+
+        let (global_df, global_n) = aggregate_doc_freq(&[shard_a, shard_err]);
+
+        // Error frame should be skipped; only shard_a contributes
+        assert_eq!(global_n, 10);
+        assert_eq!(global_df.get("term").copied(), Some(3));
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn test_scatter_text_search_single_shard_skips_dfs() {
+        // Single-shard (num_shards==1): scatter_text_search must return immediately
+        // from execute_text_search_local without sending any DocFreq or TextSearch
+        // ShardMessages via SPSC. We verify this by:
+        //   1. Passing an empty dispatch_tx (no SPSC channels — would panic if used)
+        //   2. Verifying the result is an Array (success format, not a channel error)
+        //
+        // We use an empty TextStore (no indexes), so the result is "ERR no such index".
+        // That's still the correct single-shard path — no channels were touched.
+        use crate::storage::Database;
+
+        let dbs = vec![Database::new()];
+        let shard_databases = Arc::new(ShardDatabases::new(vec![dbs]));
+
+        // Empty dispatch_tx — any SPSC send would panic (no channels configured).
+        let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
+
+        let result = scatter_text_search(
+            Bytes::from_static(b"nonexistent_index"),
+            vec!["machine".to_owned()],
+            None, // cross-field
+            10,
+            0,
+            10,
+            0,   // my_shard
+            1,   // num_shards = 1 -> single-shard fast path
+            &shard_databases,
+            &dispatch_tx,
+            &notifiers,
+        )
+        .await;
+
+        // Should be "ERR no such index" (local execute_text_search_local path),
+        // NOT a channel error. This proves the DFS pre-pass was skipped entirely.
+        match &result {
+            Frame::Error(e) => {
+                let msg = std::str::from_utf8(e).unwrap_or("");
+                assert!(
+                    msg.contains("no such index"),
+                    "expected 'no such index' error for missing index, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error frame, got: {:?}", other),
+        }
     }
 }

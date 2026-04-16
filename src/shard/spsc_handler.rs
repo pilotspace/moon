@@ -93,7 +93,9 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::PipelineBatchSlotted { .. }
                         | ShardMessage::MultiExecuteSlotted { .. }
                         | ShardMessage::VectorSearch { .. }
-                        | ShardMessage::VectorCommand { .. } => {
+                        | ShardMessage::VectorCommand { .. }
+                        | ShardMessage::DocFreq { .. }
+                        | ShardMessage::TextSearch { .. } => {
                             execute_batch.push(msg);
                         }
                         #[cfg(feature = "graph")]
@@ -929,6 +931,67 @@ pub(crate) fn handle_shard_message_shared(
             reply_tx,
         } => {
             let response = vector_search::search_local(vector_store, &index_name, &query_blob, k);
+            let _ = reply_tx.send(response);
+        }
+        ShardMessage::DocFreq {
+            index_name,
+            field_queries,
+            reply_tx,
+        } => {
+            // DFS Phase 1: collect per-term df + total N from this shard's TextIndex.
+            // Returns crate::protocol::Frame::Array with interleaved [term, df, ..., "N", n] per field_query.
+            let text_guard = shard_databases.text_store(shard_id);
+            let response = match text_guard.get_index(&index_name) {
+                Some(text_index) => {
+                    let mut items: Vec<crate::protocol::Frame> = Vec::new();
+                    for (field_idx_opt, terms) in &field_queries {
+                        let fidx = field_idx_opt.unwrap_or(0);
+                        let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                        for (term, df) in term_dfs {
+                            items.push(crate::protocol::Frame::BulkString(bytes::Bytes::from(term)));
+                            items.push(crate::protocol::Frame::Integer(i64::from(df)));
+                        }
+                        items.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"N")));
+                        items.push(crate::protocol::Frame::Integer(i64::from(n)));
+                    }
+                    crate::protocol::Frame::Array(items.into())
+                }
+                None => crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown index")),
+            };
+            drop(text_guard);
+            let _ = reply_tx.send(response);
+        }
+        ShardMessage::TextSearch {
+            index_name,
+            field_idx,
+            query_terms,
+            global_df,
+            global_n,
+            top_k,
+            offset,
+            count,
+            highlight_opts: _,   // Not used until Plan 03
+            summarize_opts: _,   // Not used until Plan 03
+            reply_tx,
+        } => {
+            // DFS Phase 2: execute BM25 text search with global IDF injected by coordinator.
+            let text_guard = shard_databases.text_store(shard_id);
+            let response = match text_guard.get_index(&index_name) {
+                Some(text_index) => {
+                    crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                        text_index,
+                        field_idx,
+                        &query_terms,
+                        &global_df,
+                        global_n,
+                        top_k,
+                        offset,
+                        count,
+                    )
+                }
+                None => crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown index")),
+            };
+            drop(text_guard);
             let _ = reply_tx.send(response);
         }
         ShardMessage::VectorCommand { command, reply_tx } => {

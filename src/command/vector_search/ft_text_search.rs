@@ -16,6 +16,39 @@ use crate::text::store::{TextIndex, TextSearchResult, TextStore};
 
 use super::{extract_bulk, parse_limit_clause};
 
+// ─── Highlight/Summarize options (populated by Plan 03) ──────────────────────
+
+/// Options for HIGHLIGHT post-processing.
+///
+/// Fields are populated by Plan 03. In this plan (150-02), these structs exist
+/// only as forward-compatible placeholders in the `TextSearch` ShardMessage variant.
+/// The `highlight_opts` and `summarize_opts` fields in `TextSearch` are always `None`
+/// until Plan 03 implements HIGHLIGHT/SUMMARIZE parsing and post-processing.
+#[derive(Clone, Debug, Default)]
+pub struct HighlightOpts {
+    /// Optional field names to highlight (None = all text fields).
+    pub fields: Option<Vec<Bytes>>,
+    /// Opening HTML tag inserted before each matched term. Default: `<b>`.
+    pub open_tag: String,
+    /// Closing HTML tag inserted after each matched term. Default: `</b>`.
+    pub close_tag: String,
+}
+
+/// Options for SUMMARIZE post-processing.
+///
+/// Fields are populated by Plan 03. In this plan (150-02), this is a placeholder.
+#[derive(Clone, Debug, Default)]
+pub struct SummarizeOpts {
+    /// Optional field names to summarize (None = all text fields).
+    pub fields: Option<Vec<Bytes>>,
+    /// Number of tokens per fragment (default: 20 per D-11).
+    pub fragment_size: usize,
+    /// Number of fragments to return per document (default: 1).
+    pub num_fragments: usize,
+    /// Separator between fragments (default: `...`).
+    pub separator: String,
+}
+
 // ─── Query clause ────────────────────────────────────────────────────────────
 
 /// Parsed text query: an optional field target + analyzed (stemmed) query terms.

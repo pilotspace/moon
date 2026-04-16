@@ -279,6 +279,39 @@ pub enum ShardMessage {
         k: usize,
         reply_tx: channel::OneshotSender<Frame>,
     },
+    /// DFS Phase 1: collect per-term document frequency from this shard.
+    ///
+    /// Returns `Frame::Array` with interleaved `[term1, df1, term2, df2, ..., "N", total_docs]`
+    /// for each (field_idx, terms) pair in `field_queries`.
+    /// The coordinator aggregates these across all shards to compute global IDF.
+    DocFreq {
+        index_name: Bytes,
+        /// (field_idx, terms) pairs -- None field_idx means use field 0 (all-field mode).
+        field_queries: Vec<(Option<usize>, Vec<String>)>,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
+    /// DFS Phase 2: execute BM25 text search with injected global IDF.
+    ///
+    /// Returns `Frame::Array` in the same format as `ft_text_search` response:
+    /// `[total, key1, ["__bm25_score", "N.NNNNNN"], key2, [...], ...]`
+    ///
+    /// `highlight_opts` and `summarize_opts` are passed through for Plan 03
+    /// post-processing. In this plan (150-02) they are always `None`.
+    TextSearch {
+        index_name: Bytes,
+        field_idx: Option<usize>,
+        query_terms: Vec<String>,
+        global_df: std::collections::HashMap<String, u32>,
+        global_n: u32,
+        top_k: usize,
+        offset: usize,
+        count: usize,
+        /// Placeholder for Plan 03 HIGHLIGHT post-processing (always None here).
+        highlight_opts: Option<crate::command::vector_search::ft_text_search::HighlightOpts>,
+        /// Placeholder for Plan 03 SUMMARIZE post-processing (always None here).
+        summarize_opts: Option<crate::command::vector_search::ft_text_search::SummarizeOpts>,
+        reply_tx: channel::OneshotSender<Frame>,
+    },
     /// Execute an FT.* command on this shard's VectorStore.
     /// For FT.CREATE, FT.DROPINDEX, FT.INFO -- operations that modify/read
     /// VectorStore state rather than search.
