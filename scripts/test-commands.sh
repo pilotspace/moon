@@ -1139,6 +1139,126 @@ if should_run "vector"; then
 fi
 
 # ===========================================================================
+# FUZZY AND PREFIX SEARCH TESTS (v0.1.7 typo-tolerance — FUZ-01/02/03)
+# ===========================================================================
+
+if should_run "vector"; then
+    echo ""
+    echo "=== FUZZY AND PREFIX SEARCH TESTS ==="
+    flush_both
+
+    # Setup: create text index and populate test documents
+    mcli FT.CREATE fuzzyidx ON HASH PREFIX 1 fz: SCHEMA title TEXT body TEXT >/dev/null 2>&1
+    mcli HSET fz:1 title "Machine Learning" body "Introduction to machine learning algorithms" >/dev/null 2>&1
+    mcli HSET fz:2 title "Deep Learning" body "Neural networks and deep architectures" >/dev/null 2>&1
+    mcli HSET fz:3 title "Natural Language" body "NLP processing with transformers" >/dev/null 2>&1
+    mcli HSET fz:4 title "Machinery Parts" body "Industrial machinery components" >/dev/null 2>&1
+    mcli HSET fz:5 title "Macro Economics" body "Study of macroeconomic indicators" >/dev/null 2>&1
+
+    # FT.COMPACT builds FST (required before fuzzy/prefix queries use FST path)
+    assert_moon_ok "FT.COMPACT fuzzyidx for FST build" FT.COMPACT fuzzyidx
+
+    # Test 1: FUZ-01 — Fuzzy search distance 2 (%% syntax)
+    TOTAL=$((TOTAL + 1))
+    FT_FUZZY2=$(mcli FT.SEARCH fuzzyidx "%%machne%%" LIMIT 0 10 2>&1)
+    if echo "$FT_FUZZY2" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %%machne%% returned error: $FT_FUZZY2"
+    elif echo "$FT_FUZZY2" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: FUZ-01 %%machne%% (fuzzy dist-2) returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %%machne%% returned no docs: $FT_FUZZY2"
+    fi
+
+    # Test 2: FUZ-01 — Fuzzy search distance 1 (% syntax)
+    TOTAL=$((TOTAL + 1))
+    FT_FUZZY1=$(mcli FT.SEARCH fuzzyidx "%machin%" LIMIT 0 10 2>&1)
+    if echo "$FT_FUZZY1" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %machin% returned error: $FT_FUZZY1"
+    elif echo "$FT_FUZZY1" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: FUZ-01 %machin% (fuzzy dist-1) returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %machin% returned no docs: $FT_FUZZY1"
+    fi
+
+    # Test 3: FUZ-03 — Prefix search (mach* syntax)
+    TOTAL=$((TOTAL + 1))
+    FT_PREFIX=$(mcli FT.SEARCH fuzzyidx "mach*" LIMIT 0 10 2>&1)
+    if echo "$FT_PREFIX" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 mach* returned error: $FT_PREFIX"
+    elif echo "$FT_PREFIX" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: FUZ-03 mach* prefix search returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 mach* returned no docs: $FT_PREFIX"
+    fi
+
+    # Test 4: FUZ-03 — Short prefix (ma*)
+    TOTAL=$((TOTAL + 1))
+    FT_SHORT_PREFIX=$(mcli FT.SEARCH fuzzyidx "ma*" LIMIT 0 10 2>&1)
+    if echo "$FT_SHORT_PREFIX" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 ma* returned error: $FT_SHORT_PREFIX"
+    elif echo "$FT_SHORT_PREFIX" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: FUZ-03 ma* short prefix returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 ma* returned no docs: $FT_SHORT_PREFIX"
+    fi
+
+    # Test 5: FUZ-01 — Fuzzy search with field target @title:(%%machne%%)
+    TOTAL=$((TOTAL + 1))
+    FT_FIELD_FUZZY=$(mcli FT.SEARCH fuzzyidx "@title:(%%machne%%)" LIMIT 0 10 2>&1)
+    if echo "$FT_FIELD_FUZZY" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 field-targeted fuzzy returned error: $FT_FIELD_FUZZY"
+    elif echo "$FT_FIELD_FUZZY" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: FUZ-01 @title:(%%machne%%) field-targeted fuzzy returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 @title:(%%machne%%) returned no docs: $FT_FIELD_FUZZY"
+    fi
+
+    # Test 6: REGRESSION — exact search still works after query parser changes
+    TOTAL=$((TOTAL + 1))
+    FT_EXACT=$(mcli FT.SEARCH fuzzyidx "machine" LIMIT 0 10 2>&1)
+    if echo "$FT_EXACT" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: REGRESSION exact search returned error: $FT_EXACT"
+    elif echo "$FT_EXACT" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: REGRESSION exact search still works (no regressions)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: REGRESSION exact 'machine' returned no docs: $FT_EXACT"
+    fi
+
+    # Test 7: MIXED — exact + fuzzy combined query
+    TOTAL=$((TOTAL + 1))
+    FT_MIXED=$(mcli FT.SEARCH fuzzyidx "%%machne%% deep" LIMIT 0 10 2>&1)
+    if echo "$FT_MIXED" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: MIXED exact+fuzzy returned error: $FT_MIXED"
+    elif echo "$FT_MIXED" | grep -q "fz:"; then
+        PASS=$((PASS + 1)); echo "  PASS: MIXED %%machne%% deep (fuzzy+exact) returns docs"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MIXED %%machne%% deep returned no docs: $FT_MIXED"
+    fi
+
+    # Test 8: FUZ-02 — FST build via FT.COMPACT on a fresh index
+    mcli FT.CREATE fuzzyidx2 ON HASH PREFIX 1 fzr: SCHEMA title TEXT >/dev/null 2>&1
+    mcli HSET fzr:1 title "Machine Learning" >/dev/null 2>&1
+    mcli HSET fzr:2 title "Machinery Parts" >/dev/null 2>&1
+    assert_moon_ok "FT.COMPACT fuzzyidx2 builds FST" FT.COMPACT fuzzyidx2
+
+    TOTAL=$((TOTAL + 1))
+    FT_COMPACT_FUZZY=$(mcli FT.SEARCH fuzzyidx2 "%%machne%%" LIMIT 0 10 2>&1)
+    if echo "$FT_COMPACT_FUZZY" | grep -qi "err"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-02 fuzzy after compact returned error: $FT_COMPACT_FUZZY"
+    elif echo "$FT_COMPACT_FUZZY" | grep -q "fzr:"; then
+        PASS=$((PASS + 1)); echo "  PASS: FUZ-02 fuzzy works after FT.COMPACT FST build"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-02 fuzzy after compact returned no docs: $FT_COMPACT_FUZZY"
+    fi
+
+    # Cleanup fuzzy indexes
+    mcli FT.DROPINDEX fuzzyidx >/dev/null 2>&1
+    mcli FT.DROPINDEX fuzzyidx2 >/dev/null 2>&1
+
+    echo "  fuzzy/prefix: done"
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 
