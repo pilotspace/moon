@@ -98,7 +98,10 @@ fn extract_key(frame: &Frame) -> Option<Bytes> {
 ///
 /// Calls `notify_one()` on the target shard's notifier after successful push
 /// for immediate wake (avoids relying on the 1ms periodic timer safety net).
-async fn spsc_send(
+///
+/// Exposed at `pub(crate)` so sibling files (e.g. `scatter_aggregate`)
+/// can dispatch via the same contention-safe path.
+pub(crate) async fn spsc_send(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     my_shard: usize,
     target_shard: usize,

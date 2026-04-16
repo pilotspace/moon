@@ -1454,6 +1454,32 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
                         if ctx.num_shards > 1 {
                             // Multi-shard: dispatch via SPSC
+                            #[cfg(feature = "text-index")]
+                            if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                                // ── FT.AGGREGATE: two-phase scatter-gather per Plan 03 (D-05/D-07) ──
+                                // scatter_text_aggregate acquires its own guards internally
+                                // inside the single-shard block, so we never hold a MutexGuard
+                                // across the .await below.
+                                let parsed = match crate::command::vector_search::ft_aggregate::parse_aggregate_args(cmd_args) {
+                                    Ok(p) => p,
+                                    Err(err_frame) => {
+                                        responses.push(err_frame);
+                                        continue;
+                                    }
+                                };
+                                let response = crate::shard::scatter_aggregate::scatter_text_aggregate(
+                                    parsed.index_name,
+                                    parsed.query,
+                                    parsed.pipeline,
+                                    ctx.shard_id,
+                                    ctx.num_shards,
+                                    &ctx.shard_databases,
+                                    &ctx.dispatch_tx,
+                                    &ctx.spsc_notifiers,
+                                ).await;
+                                responses.push(response);
+                                continue;
+                            }
                             if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                                 // Check if this is a text query BEFORE trying parse_ft_search_args
                                 // (which would return an error for non-KNN queries).
