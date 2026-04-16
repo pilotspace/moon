@@ -1,14 +1,18 @@
 """Type definitions for MoonDB Python SDK.
 
 Provides typed dataclasses for search results, graph nodes/edges,
-index info, and cache responses.
+index info, cache responses, and full-text aggregate pipelines.
 """
 
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Union
+
+if TYPE_CHECKING:  # pragma: no cover - import only for static type-checkers
+    import numpy as np  # type: ignore[import-not-found]
 
 
 @dataclass(frozen=True)
@@ -30,9 +34,9 @@ class SearchResult:
 
     key: str
     score: float
-    fields: Dict[str, str] = field(default_factory=dict)
-    graph_hops: Optional[int] = None
-    cache_hit: Optional[bool] = None
+    fields: dict[str, str] = field(default_factory=dict)
+    graph_hops: int | None = None
+    cache_hit: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -51,7 +55,7 @@ class GraphNode:
 
     node_id: int
     label: str
-    properties: Dict[str, str] = field(default_factory=dict)
+    properties: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -74,7 +78,7 @@ class GraphEdge:
     dst_id: int
     edge_type: str
     weight: float = 1.0
-    properties: Dict[str, str] = field(default_factory=dict)
+    properties: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -99,8 +103,8 @@ class IndexInfo:
     num_docs: int = 0
     dimension: int = 0
     distance_metric: str = "L2"
-    fields: List[Dict[str, str]] = field(default_factory=list)
-    extra: Dict[str, str] = field(default_factory=dict)
+    fields: list[dict[str, str]] = field(default_factory=list)
+    extra: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -119,9 +123,9 @@ class QueryResult:
             print(row)
     """
 
-    headers: List[str] = field(default_factory=list)
-    rows: List[List[Any]] = field(default_factory=list)
-    stats: Dict[str, str] = field(default_factory=dict)
+    headers: list[str] = field(default_factory=list)
+    rows: list[list[Any]] = field(default_factory=list)
+    stats: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -139,14 +143,199 @@ class CacheSearchResult:
             print("Served from cache!")
     """
 
-    results: List[SearchResult] = field(default_factory=list)
+    results: list[SearchResult] = field(default_factory=list)
     cache_hit: bool = False
+
+
+# -- Full-text search (FT.SEARCH BM25) response type --
+
+
+@dataclass(frozen=True)
+class TextSearchHit:
+    """A single FT.SEARCH / FT.SEARCH ... HYBRID result row.
+
+    Attributes:
+        id: Redis key of the matching document.
+        score: BM25 score (FT.SEARCH) or weighted RRF score (HYBRID).
+            Higher is better.
+        fields: Hash fields returned (minus internal score/highlight markers).
+        highlights: Optional map of field -> list of highlighted fragments
+            (populated only when HIGHLIGHT was requested).
+
+    Example::
+
+        hit = TextSearchHit(id="issue:1", score=3.14, fields={"title": "Hello"})
+        print(hit.id, hit.score)
+    """
+
+    id: str
+    score: float
+    fields: dict[str, Any] = field(default_factory=dict)
+    highlights: dict[str, list[str]] | None = None
+
+
+# -- FT.AGGREGATE pipeline DSL --
+#
+# No APPLY in v1 (APPLY is unsupported server-side, see 153-CONTEXT D-03).
+
+
+@dataclass(frozen=True)
+class Count:
+    """COUNT reducer for FT.AGGREGATE GROUPBY (`REDUCE COUNT 0`).
+
+    Attributes:
+        alias: Optional alias for the result column (`AS <alias>`).
+    """
+
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
+class Sum:
+    """SUM reducer for FT.AGGREGATE GROUPBY (`REDUCE SUM 1 @<field>`).
+
+    Attributes:
+        field: Field to sum (emitted as `@<field>`).
+        alias: Optional alias for the result column.
+    """
+
+    field: str
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
+class Avg:
+    """AVG reducer for FT.AGGREGATE GROUPBY (`REDUCE AVG 1 @<field>`).
+
+    Attributes:
+        field: Field to average.
+        alias: Optional alias for the result column.
+    """
+
+    field: str
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
+class Min:
+    """MIN reducer for FT.AGGREGATE GROUPBY (`REDUCE MIN 1 @<field>`).
+
+    Attributes:
+        field: Field to take the minimum of.
+        alias: Optional alias for the result column.
+    """
+
+    field: str
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
+class Max:
+    """MAX reducer for FT.AGGREGATE GROUPBY (`REDUCE MAX 1 @<field>`).
+
+    Attributes:
+        field: Field to take the maximum of.
+        alias: Optional alias for the result column.
+    """
+
+    field: str
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
+class CountDistinct:
+    """COUNT_DISTINCT reducer for FT.AGGREGATE GROUPBY.
+
+    Emits `REDUCE COUNT_DISTINCT 1 @<field>`.
+
+    Attributes:
+        field: Field to count distinct values of.
+        alias: Optional alias for the result column.
+    """
+
+    field: str
+    alias: str | None = None
+
+
+# Reducer union covers every supported reducer dataclass. Importable as a type
+# alias; not added to `__all__` (keep the public re-export surface narrow).
+Reducer = Union[Count, Sum, Avg, Min, Max, CountDistinct]
+
+
+@dataclass(frozen=True)
+class GroupBy:
+    """GROUPBY step for FT.AGGREGATE pipeline.
+
+    Attributes:
+        fields: Field names to group by (emitted as `@<field>` each).
+        reducers: Reducers applied within each group.
+
+    Example::
+
+        GroupBy(fields=["priority"], reducers=[Count(alias="n")])
+    """
+
+    fields: list[str]
+    reducers: list[Reducer] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SortBy:
+    """SORTBY step for FT.AGGREGATE pipeline.
+
+    Attributes:
+        field: Field to sort by (emitted as `@<field>`).
+        direction: "ASC" or "DESC" (validated at build time, not here).
+
+    Example::
+
+        SortBy("n", "DESC")
+    """
+
+    field: str
+    direction: str = "ASC"
+
+
+@dataclass(frozen=True)
+class Filter:
+    """FILTER step for FT.AGGREGATE pipeline.
+
+    Attributes:
+        expr: Filter expression (passed through as a single RESP arg).
+
+    Example::
+
+        Filter("@status:{open}")
+    """
+
+    expr: str
+
+
+@dataclass(frozen=True)
+class Limit:
+    """LIMIT step for FT.AGGREGATE pipeline.
+
+    Attributes:
+        offset: Row offset.
+        count: Max rows to return.
+
+    Example::
+
+        Limit(0, 10)
+    """
+
+    offset: int
+    count: int
+
+
+# Union of all supported pipeline step dataclasses.
+AggregateStep = Union[GroupBy, SortBy, Filter, Limit]
 
 
 # -- Utility functions for vector encoding --
 
 
-def encode_vector(vector: Union[Sequence[float], "numpy.ndarray"]) -> bytes:  # type: ignore[name-defined]
+def encode_vector(vector: Sequence[float] | np.ndarray) -> bytes:
     """Encode a float vector to bytes (little-endian float32).
 
     Args:
@@ -161,15 +350,15 @@ def encode_vector(vector: Union[Sequence[float], "numpy.ndarray"]) -> bytes:  # 
         # Use as PARAMS value in FT.SEARCH
     """
     try:
-        import numpy as np
+        import numpy as _np
 
-        arr = np.asarray(vector, dtype=np.float32)
-        return arr.tobytes()
+        arr = _np.asarray(vector, dtype=_np.float32)
+        return bytes(arr.tobytes())
     except ImportError:
         return struct.pack(f"<{len(vector)}f", *vector)
 
 
-def decode_vector(data: bytes, dim: int) -> List[float]:
+def decode_vector(data: bytes, dim: int) -> list[float]:
     """Decode bytes back to a list of floats (little-endian float32).
 
     Args:
