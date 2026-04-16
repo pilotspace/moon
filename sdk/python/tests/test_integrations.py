@@ -6,12 +6,9 @@ build correct commands and parse responses properly.
 
 from __future__ import annotations
 
-import struct
-from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # -- LangChain integration tests --
 
@@ -109,6 +106,67 @@ class TestLangChainAdapter:
 
         assert store is not None
 
+    def test_similarity_search_hybrid_dispatches_to_text_hybrid_search(
+        self, mock_deps: None
+    ) -> None:
+        """search_type='hybrid' must call client.text.hybrid_search, not vector.search."""
+        from moondb.integrations.langchain import MoonVectorStore
+        from moondb.types import TextSearchHit
+
+        mock_embedding = MagicMock()
+        mock_embedding.embed_query.return_value = [0.1] * 4
+
+        mock_client = MagicMock()
+        mock_client.text = MagicMock()
+        mock_client.text.hybrid_search.return_value = [
+            TextSearchHit(id="doc:1", score=5.0, fields={"content": "Hi"}),
+        ]
+
+        with patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(
+                index_name="test",
+                embedding=mock_embedding,
+                moon_client=mock_client,
+                dim=4,
+                create_index=False,
+            )
+
+        docs = store.similarity_search(
+            "q", k=3, search_type="hybrid", hybrid_weights=(1.0, 1.5, 0.0)
+        )
+
+        assert len(docs) == 1
+        assert docs[0].page_content == "Hi"
+        assert docs[0].metadata["score"] == 5.0
+        assert docs[0].metadata["key"] == "doc:1"
+        # Hybrid dispatch invariant: vector.search must NOT be called
+        mock_client.vector.search.assert_not_called()
+        mock_client.text.hybrid_search.assert_called_once()
+        kwargs = mock_client.text.hybrid_search.call_args.kwargs
+        assert kwargs["weights"] == (1.0, 1.5, 0.0)
+        assert kwargs["limit"] == 3
+        assert kwargs["vector_field"] == "vec"
+
+    def test_unsupported_search_type_raises(self, mock_deps: None) -> None:
+        """Unknown search_type must raise ValueError (no silent fallthrough)."""
+        from moondb.integrations.langchain import MoonVectorStore
+
+        mock_embedding = MagicMock()
+        mock_embedding.embed_query.return_value = [0.1] * 4
+        mock_client = MagicMock()
+
+        with patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(
+                index_name="test",
+                embedding=mock_embedding,
+                moon_client=mock_client,
+                dim=4,
+                create_index=False,
+            )
+
+        with pytest.raises(ValueError, match="Unsupported search_type"):
+            store.similarity_search("q", search_type="nope")
+
 
 # -- LlamaIndex integration tests --
 
@@ -130,6 +188,7 @@ class TestLlamaIndexAdapter:
 
     def test_add_nodes(self, mock_deps: None) -> None:
         from llama_index.core.schema import TextNode
+
         from moondb.integrations.llamaindex import MoonVectorStore
 
         mock_client = MagicMock()
@@ -152,6 +211,7 @@ class TestLlamaIndexAdapter:
 
     def test_query(self, mock_deps: None) -> None:
         from llama_index.core.vector_stores.types import VectorStoreQuery
+
         from moondb.integrations.llamaindex import MoonVectorStore
 
         mock_client = MagicMock()
@@ -176,3 +236,47 @@ class TestLlamaIndexAdapter:
         assert result.nodes[0].text == "Hello"
         assert len(result.similarities) == 1
         mock_client.vector.search.assert_called_once()
+
+    def test_query_hybrid_dispatches_to_text_hybrid_search(
+        self, mock_deps: None
+    ) -> None:
+        """Mode=HYBRID must call client.text.hybrid_search, not vector.search."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.integrations.llamaindex import MoonVectorStore
+        from moondb.types import TextSearchHit
+
+        mock_client = MagicMock()
+        mock_client.text = MagicMock()
+        mock_client.text.hybrid_search.return_value = [
+            TextSearchHit(
+                id="node:2",
+                score=8.5,
+                fields={"content": "World", "_node_id": "xyz", "meta_src": "q"},
+            ),
+        ]
+
+        with patch.object(MoonVectorStore, "_ensure_client", return_value=mock_client), \
+             patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(index_name="test", dim=4)
+            store._client = mock_client
+
+        q = VectorStoreQuery(
+            query_embedding=[0.1] * 4,
+            query_str="crash",
+            mode=VectorStoreQueryMode.HYBRID,
+            similarity_top_k=3,
+        )
+        result = store.query(q)
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].text == "World"
+        assert result.nodes[0].id_ == "xyz"
+        # text scores are higher-is-better; passed through verbatim (no inversion)
+        assert result.similarities == [8.5]
+        # Hybrid dispatch invariant: vector.search must NOT be called
+        mock_client.vector.search.assert_not_called()
+        mock_client.text.hybrid_search.assert_called_once()
