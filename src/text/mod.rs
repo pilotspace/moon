@@ -12,6 +12,7 @@
 /// - `posting` — Inverted index posting lists with RoaringBitmap
 /// - `term_dict` — Mutable term-to-ID dictionary
 /// - `store` — TextStore and TextIndex per-shard registry
+pub mod aggregate;
 pub mod analyzer;
 pub mod bm25;
 pub mod fst_dict;
