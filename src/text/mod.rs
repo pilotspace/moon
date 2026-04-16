@@ -12,7 +12,6 @@
 /// - `posting` — Inverted index posting lists with RoaringBitmap
 /// - `term_dict` — Mutable term-to-ID dictionary
 /// - `store` — TextStore and TextIndex per-shard registry
-
 pub mod analyzer;
 pub mod bm25;
 pub mod index_persist;
@@ -23,8 +22,9 @@ pub mod types;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "text-index")]
     use super::analyzer::AnalyzerPipeline;
-    use super::bm25::{bm25_score, FieldStats};
+    use super::bm25::{FieldStats, bm25_score};
     use super::posting::PostingStore;
     use super::term_dict::TermDictionary;
     use super::types::{BM25Config, TextFieldDef};
@@ -40,7 +40,11 @@ mod tests {
         let terms: Vec<&str> = tokens.iter().map(|(t, _)| t.as_str()).collect();
         assert!(!terms.contains(&"the"), "stop word 'the' should be removed");
         // "quick", "brown", "fox" should remain (possibly stemmed)
-        assert!(tokens.len() >= 3, "should have at least 3 non-stop tokens, got: {:?}", tokens);
+        assert!(
+            tokens.len() >= 3,
+            "should have at least 3 non-stop tokens, got: {:?}",
+            tokens
+        );
     }
 
     #[cfg(feature = "text-index")]
@@ -66,8 +70,12 @@ mod tests {
         let tokens = analyzer.tokenize_with_positions("Running runs ran");
         let terms: Vec<&str> = tokens.iter().map(|(t, _)| t.as_str()).collect();
         // "running" and "runs" should both stem to "run"
-        assert_eq!(terms.iter().filter(|t| **t == "run").count(), 2,
-            "running and runs should both stem to 'run', got: {:?}", terms);
+        assert_eq!(
+            terms.iter().filter(|t| **t == "run").count(),
+            2,
+            "running and runs should both stem to 'run', got: {:?}",
+            terms
+        );
     }
 
     #[cfg(feature = "text-index")]
@@ -77,8 +85,16 @@ mod tests {
         let tokens = analyzer.tokenize_with_positions("Running runs");
         let terms: Vec<&str> = tokens.iter().map(|(t, _)| t.as_str()).collect();
         // Without stemming, terms should be lowercase but not stemmed
-        assert!(terms.contains(&"running"), "without stemming, 'running' stays as is, got: {:?}", terms);
-        assert!(terms.contains(&"runs"), "without stemming, 'runs' stays as is, got: {:?}", terms);
+        assert!(
+            terms.contains(&"running"),
+            "without stemming, 'running' stays as is, got: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&"runs"),
+            "without stemming, 'runs' stays as is, got: {:?}",
+            terms
+        );
     }
 
     #[cfg(feature = "text-index")]
@@ -88,7 +104,11 @@ mod tests {
         // "cafe\u{0301}" = "cafe" + combining acute accent -> NFKD strips the accent
         let tokens = analyzer.tokenize_with_positions("caf\u{0065}\u{0301}");
         let terms: Vec<&str> = tokens.iter().map(|(t, _)| t.as_str()).collect();
-        assert!(terms.contains(&"cafe"), "NFKD should normalize cafe\\u0301 to cafe, got: {:?}", terms);
+        assert!(
+            terms.contains(&"cafe"),
+            "NFKD should normalize cafe\\u0301 to cafe, got: {:?}",
+            terms
+        );
     }
 
     // ===== BM25 tests =====
@@ -102,7 +122,11 @@ mod tests {
         // tf_norm = (1.0 * 2.2) / (1.0 + 1.2 * (0.25 + 0.75 * 100/120))
         //         = 2.2 / (1.0 + 1.2 * (0.25 + 0.625)) = 2.2 / (1.0 + 1.05) = 2.2 / 2.05 = 1.073
         // score = 4.557 * 1.073 = 4.889
-        assert!((score - 4.889).abs() < 0.1, "BM25 score should be ~4.89, got {}", score);
+        assert!(
+            (score - 4.889).abs() < 0.1,
+            "BM25 score should be ~4.89, got {}",
+            score
+        );
     }
 
     #[test]
@@ -133,7 +157,11 @@ mod tests {
     #[test]
     fn test_field_stats_avg_doc_len_zero_docs() {
         let stats = FieldStats::new();
-        assert_eq!(stats.avg_doc_len(), 0.0, "avg_doc_len should be 0.0 when num_docs is 0");
+        assert_eq!(
+            stats.avg_doc_len(),
+            0.0,
+            "avg_doc_len should be 0.0 when num_docs is 0"
+        );
     }
 
     #[test]
@@ -170,7 +198,10 @@ mod tests {
 
         assert_eq!(store.doc_freq(0), 1, "upsert should not duplicate doc_id");
         let posting = store.get_posting(0).expect("posting should exist");
-        assert_eq!(posting.term_freqs[0], 2, "term freq should increment on upsert");
+        assert_eq!(
+            posting.term_freqs[0], 2,
+            "term freq should increment on upsert"
+        );
         if let Some(ref positions) = posting.positions {
             assert_eq!(positions[0], vec![0, 5], "positions should be appended");
         } else {
@@ -185,7 +216,10 @@ mod tests {
         store.add_term_occurrence(0, 2, None);
 
         let posting = store.get_posting(0).expect("posting should exist");
-        assert!(posting.positions.is_none(), "positions should be None when not provided");
+        assert!(
+            posting.positions.is_none(),
+            "positions should be None when not provided"
+        );
         assert_eq!(posting.term_freqs.len(), 2);
     }
 
@@ -198,7 +232,10 @@ mod tests {
         store.add_term_occurrence(0, 2, Some(vec![3]));
 
         let posting = store.get_posting(0).expect("posting should exist");
-        assert!(posting.positions.is_some(), "positions should be upgraded to Some");
+        assert!(
+            posting.positions.is_some(),
+            "positions should be upgraded to Some"
+        );
     }
 
     #[test]
@@ -258,8 +295,8 @@ mod tests {
     mod store_tests {
         use super::super::store::{TextIndex, TextStore};
         use super::super::types::{BM25Config, TextFieldDef};
-        use bytes::Bytes;
         use crate::protocol::Frame;
+        use bytes::Bytes;
 
         /// Helper: create HSET-style args as [field1, value1, field2, value2, ...]
         fn hset_args(pairs: &[(&str, &str)]) -> Vec<Frame> {
@@ -293,7 +330,10 @@ mod tests {
             let mut idx = make_title_body_index();
             let args = hset_args(&[
                 ("title", "Machine Learning for NLP"),
-                ("body", "This article covers modern NLP techniques using deep learning"),
+                (
+                    "body",
+                    "This article covers modern NLP techniques using deep learning",
+                ),
             ]);
             let key = b"doc:1";
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
@@ -302,10 +342,22 @@ mod tests {
             assert_eq!(idx.num_docs(), 1, "should have 1 document");
             assert!(idx.num_terms() > 0, "should have indexed some terms");
             // Both fields should have stats
-            assert_eq!(idx.field_stats[0].num_docs, 1, "title field should have 1 doc");
-            assert_eq!(idx.field_stats[1].num_docs, 1, "body field should have 1 doc");
-            assert!(idx.field_stats[0].total_field_length > 0, "title should have tokens");
-            assert!(idx.field_stats[1].total_field_length > 0, "body should have tokens");
+            assert_eq!(
+                idx.field_stats[0].num_docs, 1,
+                "title field should have 1 doc"
+            );
+            assert_eq!(
+                idx.field_stats[1].num_docs, 1,
+                "body field should have 1 doc"
+            );
+            assert!(
+                idx.field_stats[0].total_field_length > 0,
+                "title should have tokens"
+            );
+            assert!(
+                idx.field_stats[1].total_field_length > 0,
+                "body should have tokens"
+            );
         }
 
         #[test]
@@ -330,14 +382,23 @@ mod tests {
             idx.index_document(key_hash, key, &args2);
 
             assert_eq!(idx.num_docs(), 1, "upsert should not increase doc count");
-            assert_eq!(idx.field_stats[0].num_docs, 1, "field stats num_docs should stay 1");
+            assert_eq!(
+                idx.field_stats[0].num_docs, 1,
+                "field stats num_docs should stay 1"
+            );
             // avg_doc_len should reflect the new document, not accumulate old + new
             let avg_after_upsert = idx.field_stats[0].avg_doc_len();
-            assert!(avg_after_upsert > 0.0, "avg_doc_len should be positive after upsert");
+            assert!(
+                avg_after_upsert > 0.0,
+                "avg_doc_len should be positive after upsert"
+            );
             // The title lengths are similar so avg should be close (not doubled)
-            assert!((avg_after_upsert - avg_after_first).abs() < 5.0,
+            assert!(
+                (avg_after_upsert - avg_after_first).abs() < 5.0,
                 "avg_doc_len should not drift significantly: first={}, upsert={}",
-                avg_after_first, avg_after_upsert);
+                avg_after_first,
+                avg_after_upsert
+            );
         }
 
         #[test]
@@ -352,7 +413,7 @@ mod tests {
                         weight: 1.0,
                         nostem: false,
                         sortable: false,
-                        noindex: true,  // This field should NOT be indexed
+                        noindex: true, // This field should NOT be indexed
                     },
                 ],
                 BM25Config::default(),
@@ -409,8 +470,12 @@ mod tests {
                 BM25Config::default(),
             );
 
-            store.create_index(Bytes::from_static(b"article_idx"), idx1).expect("create");
-            store.create_index(Bytes::from_static(b"blog_idx"), idx2).expect("create");
+            store
+                .create_index(Bytes::from_static(b"article_idx"), idx1)
+                .expect("create");
+            store
+                .create_index(Bytes::from_static(b"blog_idx"), idx2)
+                .expect("create");
 
             let matches = store.find_matching_index_names(b"article:1");
             assert_eq!(matches.len(), 1);
@@ -433,7 +498,9 @@ mod tests {
                 vec![TextFieldDef::new(Bytes::from_static(b"f"))],
                 BM25Config::default(),
             );
-            store.create_index(Bytes::from_static(b"idx"), idx).expect("first create");
+            store
+                .create_index(Bytes::from_static(b"idx"), idx)
+                .expect("first create");
 
             let idx2 = TextIndex::new(
                 Bytes::from_static(b"idx"),
@@ -441,7 +508,11 @@ mod tests {
                 vec![TextFieldDef::new(Bytes::from_static(b"f"))],
                 BM25Config::default(),
             );
-            assert!(store.create_index(Bytes::from_static(b"idx"), idx2).is_err());
+            assert!(
+                store
+                    .create_index(Bytes::from_static(b"idx"), idx2)
+                    .is_err()
+            );
         }
 
         #[test]
@@ -453,7 +524,9 @@ mod tests {
                 vec![TextFieldDef::new(Bytes::from_static(b"f"))],
                 BM25Config::default(),
             );
-            store.create_index(Bytes::from_static(b"idx"), idx).expect("create");
+            store
+                .create_index(Bytes::from_static(b"idx"), idx)
+                .expect("create");
             assert_eq!(store.index_count(), 1);
 
             assert!(store.drop_index(b"idx"));
@@ -466,11 +539,13 @@ mod tests {
             let mut store = TextStore::new();
             let idx = TextIndex::new(
                 Bytes::from_static(b"all_idx"),
-                vec![],  // Empty prefix = match all
+                vec![], // Empty prefix = match all
                 vec![TextFieldDef::new(Bytes::from_static(b"title"))],
                 BM25Config::default(),
             );
-            store.create_index(Bytes::from_static(b"all_idx"), idx).expect("create");
+            store
+                .create_index(Bytes::from_static(b"all_idx"), idx)
+                .expect("create");
 
             let matches = store.find_matching_index_names(b"any:key");
             assert_eq!(matches.len(), 1, "empty prefix should match any key");
@@ -499,15 +574,25 @@ mod tests {
             );
 
             let mut store = TextStore::new();
-            store.create_index(Bytes::from_static(b"stemmed_idx"), idx_stemmed).expect("create");
-            store.create_index(Bytes::from_static(b"nostem_idx"), idx_nostem).expect("create");
+            store
+                .create_index(Bytes::from_static(b"stemmed_idx"), idx_stemmed)
+                .expect("create");
+            store
+                .create_index(Bytes::from_static(b"nostem_idx"), idx_nostem)
+                .expect("create");
 
             let args = hset_args(&[("content", "running runs")]);
             let key_hash = xxhash_rust::xxh64::xxh64(b"doc:1", 0);
 
             // Index same document in both indexes
-            store.get_index_mut(b"stemmed_idx").expect("idx").index_document(key_hash, b"doc:1", &args);
-            store.get_index_mut(b"nostem_idx").expect("idx").index_document(key_hash, b"doc:1", &args);
+            store
+                .get_index_mut(b"stemmed_idx")
+                .expect("idx")
+                .index_document(key_hash, b"doc:1", &args);
+            store
+                .get_index_mut(b"nostem_idx")
+                .expect("idx")
+                .index_document(key_hash, b"doc:1", &args);
 
             // Stemmed index: "running" and "runs" both become "run" -> 1 unique term
             let stemmed = store.get_index(b"stemmed_idx").expect("idx");
@@ -516,7 +601,8 @@ mod tests {
             assert!(
                 nostem.num_terms() > stemmed.num_terms(),
                 "NOSTEM should have more unique terms ({}) than stemmed ({}) because 'running' and 'runs' stay distinct",
-                nostem.num_terms(), stemmed.num_terms()
+                nostem.num_terms(),
+                stemmed.num_terms()
             );
         }
 
@@ -525,9 +611,21 @@ mod tests {
             // Index 3 documents, verify num_docs==3, num_terms>0, avg_doc_len>0
             let mut idx = make_title_body_index();
             let docs = [
-                ("doc:1", "Machine Learning", "An introduction to ML techniques"),
-                ("doc:2", "Deep Learning", "Neural networks and deep architectures"),
-                ("doc:3", "Natural Language", "NLP processing with transformers"),
+                (
+                    "doc:1",
+                    "Machine Learning",
+                    "An introduction to ML techniques",
+                ),
+                (
+                    "doc:2",
+                    "Deep Learning",
+                    "Neural networks and deep architectures",
+                ),
+                (
+                    "doc:3",
+                    "Natural Language",
+                    "NLP processing with transformers",
+                ),
             ];
             for (key, title, body) in &docs {
                 let args = hset_args(&[("title", title), ("body", body)]);
@@ -537,8 +635,14 @@ mod tests {
 
             assert_eq!(idx.num_docs(), 3, "should have 3 documents");
             assert!(idx.num_terms() > 0, "should have indexed terms");
-            assert!(idx.field_stats[0].avg_doc_len() > 0.0, "title avg_doc_len should be > 0");
-            assert!(idx.field_stats[1].avg_doc_len() > 0.0, "body avg_doc_len should be > 0");
+            assert!(
+                idx.field_stats[0].avg_doc_len() > 0.0,
+                "title avg_doc_len should be > 0"
+            );
+            assert!(
+                idx.field_stats[1].avg_doc_len() > 0.0,
+                "body avg_doc_len should be > 0"
+            );
             assert!(idx.total_posting_bytes() > 0, "posting bytes should be > 0");
         }
 

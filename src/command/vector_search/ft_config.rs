@@ -66,10 +66,7 @@ fn ft_config_set(
             Some(i) => i,
             None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
         };
-        let parsed: f32 = match std::str::from_utf8(value)
-            .ok()
-            .and_then(|s| s.parse().ok())
-        {
+        let parsed: f32 = match std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()) {
             Some(v) => v,
             None => return Frame::Error(Bytes::from_static(b"ERR invalid numeric value")),
         };

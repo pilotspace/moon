@@ -1692,17 +1692,24 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                         // Check if this is a text query BEFORE trying parse_ft_search_args
                         // (which would return an error for non-KNN queries).
-                        let query_bytes = cmd_args.get(1).and_then(|f| crate::command::vector_search::extract_bulk(f));
-                        let is_text = query_bytes.as_ref().map_or(false, |q| {
-                            crate::command::vector_search::is_text_query(q)
-                        });
+                        let query_bytes = cmd_args
+                            .get(1)
+                            .and_then(|f| crate::command::vector_search::extract_bulk(f));
+                        let is_text = query_bytes
+                            .as_ref()
+                            .map_or(false, |q| crate::command::vector_search::is_text_query(q));
 
                         if is_text {
                             // ── Text FT.SEARCH: two-phase DFS scatter-gather ──────────────────
-                            let index_name = match cmd_args.first().and_then(|f| crate::command::vector_search::extract_bulk(f)) {
+                            let index_name = match cmd_args
+                                .first()
+                                .and_then(|f| crate::command::vector_search::extract_bulk(f))
+                            {
                                 Some(b) => b,
                                 None => {
-                                    responses.push(Frame::Error(Bytes::from_static(b"ERR invalid index name")));
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"ERR invalid index name",
+                                    )));
                                     continue;
                                 }
                             };
@@ -1721,19 +1728,35 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             None => Err("ERR index has no TEXT fields".to_owned()),
                                             Some(analyzer) => {
                                                 // analyzer borrows text_index which borrows ts — all in this block.
-                                                let parsed = crate::command::vector_search::parse_text_query(&query_str, analyzer);
+                                                let parsed =
+                                                    crate::command::vector_search::parse_text_query(
+                                                        &query_str, analyzer,
+                                                    );
                                                 match parsed {
                                                     Err(e) => Err(e.to_owned()),
                                                     Ok(clause) => {
-                                                        let field_idx = match &clause.field_name {
-                                                            None => Ok(None),
-                                                            Some(field_name) => {
-                                                                match text_index.text_fields.iter().position(|f| f.field_name.as_ref().eq_ignore_ascii_case(field_name.as_ref())) {
+                                                        let field_idx =
+                                                            match &clause.field_name {
+                                                                None => Ok(None),
+                                                                Some(field_name) => match text_index
+                                                                    .text_fields
+                                                                    .iter()
+                                                                    .position(|f| {
+                                                                        f.field_name
+                                                                            .as_ref()
+                                                                            .eq_ignore_ascii_case(
+                                                                                field_name.as_ref(),
+                                                                            )
+                                                                    }) {
                                                                     Some(idx) => Ok(Some(idx)),
-                                                                    None => Err(format!("ERR unknown field '{}'", String::from_utf8_lossy(field_name))),
-                                                                }
-                                                            }
-                                                        };
+                                                                    None => Err(format!(
+                                                                        "ERR unknown field '{}'",
+                                                                        String::from_utf8_lossy(
+                                                                            field_name
+                                                                        )
+                                                                    )),
+                                                                },
+                                                            };
                                                         field_idx.map(|idx| (clause.terms, idx))
                                                     }
                                                 }
@@ -1751,12 +1774,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                             };
 
-                            let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
-                            let top_k = if count == usize::MAX { 10000 } else { offset.saturating_add(count) }.max(1);
+                            let (offset, count) =
+                                crate::command::vector_search::parse_limit_clause(cmd_args);
+                            let top_k = if count == usize::MAX {
+                                10000
+                            } else {
+                                offset.saturating_add(count)
+                            }
+                            .max(1);
 
                             // Parse optional HIGHLIGHT/SUMMARIZE clauses from args.
-                            let highlight_opts = crate::command::vector_search::parse_highlight_clause(cmd_args);
-                            let summarize_opts = crate::command::vector_search::parse_summarize_clause(cmd_args);
+                            let highlight_opts =
+                                crate::command::vector_search::parse_highlight_clause(cmd_args);
+                            let summarize_opts =
+                                crate::command::vector_search::parse_summarize_clause(cmd_args);
 
                             let response = crate::shard::coordinator::scatter_text_search(
                                 index_name,
@@ -1772,7 +1803,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 &ctx.spsc_notifiers,
                                 highlight_opts,
                                 summarize_opts,
-                            ).await;
+                            )
+                            .await;
                             responses.push(response);
                             continue;
                         }

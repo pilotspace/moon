@@ -25,18 +25,19 @@ pub use ft_admin::{ft_compact, ft_dropindex, ft_list};
 pub use ft_config::ft_config;
 pub use ft_create::ft_create;
 pub use ft_info::ft_info;
+#[cfg(feature = "graph")]
+pub use ft_search::ft_search_with_graph;
 pub use ft_search::{
     ft_search, merge_search_results, parse_ft_search_args, parse_session_clause, search_local,
     search_local_filtered,
 };
-#[cfg(feature = "graph")]
-pub use ft_search::ft_search_with_graph;
 pub use ft_text_search::{
-    apply_post_processing, execute_text_search_local, execute_text_search_with_global_idf,
-    ft_text_search, highlight_field, is_text_query, merge_text_results, parse_highlight_clause,
-    parse_summarize_clause, parse_text_query, summarize_field, HighlightOpts, SummarizeOpts,
+    HighlightOpts, SummarizeOpts, apply_post_processing, execute_text_search_local,
+    execute_text_search_with_global_idf, ft_text_search, highlight_field, is_text_query,
+    merge_text_results, parse_highlight_clause, parse_summarize_clause, parse_text_query,
+    summarize_field,
 };
-pub use helpers::{metric_to_bytes, quantize_f32_to_sq, quantization_to_bytes};
+pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
 
 // Re-export pub(crate) items for sibling submodules (cache_search, navigate, recommend, session).
 #[cfg(feature = "graph")]

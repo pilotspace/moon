@@ -168,7 +168,9 @@ pub fn ft_info(
         items.push(Frame::Array(text_field_entries.into()));
         items.push(Frame::BulkString(Bytes::from_static(b"num_terms")));
         items.push(Frame::Integer(text_idx.num_terms() as i64));
-        items.push(Frame::BulkString(Bytes::from_static(b"total_inverted_index_size")));
+        items.push(Frame::BulkString(Bytes::from_static(
+            b"total_inverted_index_size",
+        )));
         items.push(Frame::Integer(text_idx.total_posting_bytes() as i64));
     }
 
@@ -252,7 +254,9 @@ fn ft_info_text_only(idx: &crate::text::store::TextIndex) -> Frame {
     };
     items.push(Frame::BulkString(Bytes::from_static(b"bytes_per_posting")));
     items.push(Frame::Integer(bytes_per as i64));
-    items.push(Frame::BulkString(Bytes::from_static(b"total_inverted_index_size")));
+    items.push(Frame::BulkString(Bytes::from_static(
+        b"total_inverted_index_size",
+    )));
     items.push(Frame::Integer(total_postings as i64));
 
     Frame::Array(items.into())

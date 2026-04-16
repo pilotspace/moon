@@ -8,7 +8,6 @@
 /// Positions are stored as `Option<Vec<Vec<u32>>>` per D-04: saves memory when
 /// positions are not needed, but stores them from day one for future phrase
 /// queries and HIGHLIGHT support.
-
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 
@@ -66,12 +65,7 @@ impl PostingStore {
     /// # Position handling
     /// - `positions: Some(pos)` -- store positions; upgrades a no-position list to have positions
     /// - `positions: None` -- don't track positions for this occurrence; keeps existing positions if any
-    pub fn add_term_occurrence(
-        &mut self,
-        term_id: u32,
-        doc_id: u32,
-        positions: Option<Vec<u32>>,
-    ) {
+    pub fn add_term_occurrence(&mut self, term_id: u32, doc_id: u32, positions: Option<Vec<u32>>) {
         let posting = self.postings.entry(term_id).or_insert_with(|| {
             if positions.is_some() {
                 PostingList::new_with_positions()
@@ -82,10 +76,7 @@ impl PostingStore {
 
         if posting.doc_ids.contains(doc_id) {
             // Upsert: find the index of this doc_id
-            let idx = posting
-                .doc_ids
-                .iter()
-                .position(|id| id == doc_id);
+            let idx = posting.doc_ids.iter().position(|id| id == doc_id);
             if let Some(idx) = idx {
                 posting.term_freqs[idx] += 1;
                 // Append positions if provided

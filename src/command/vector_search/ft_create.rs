@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::protocol::Frame;
-use crate::vector::store::{IndexMeta, VectorFieldMeta, VectorStore, MAX_VECTOR_FIELDS};
+use crate::vector::store::{IndexMeta, MAX_VECTOR_FIELDS, VectorFieldMeta, VectorStore};
 use crate::vector::turbo_quant::collection::QuantizationConfig;
 use crate::vector::types::DistanceMetric;
 
@@ -65,9 +65,11 @@ pub fn ft_create(
             if pos >= args.len() {
                 return Frame::Error(Bytes::from_static(b"ERR BM25_K1 requires a value"));
             }
-            bm25_k1 = match extract_bulk(&args[pos])
-                .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f32>().ok()))
-            {
+            bm25_k1 = match extract_bulk(&args[pos]).and_then(|b| {
+                std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+            }) {
                 Some(v) if v >= 0.0 => v,
                 _ => return Frame::Error(Bytes::from_static(b"ERR invalid BM25_K1 value")),
             };
@@ -77,9 +79,11 @@ pub fn ft_create(
             if pos >= args.len() {
                 return Frame::Error(Bytes::from_static(b"ERR BM25_B requires a value"));
             }
-            bm25_b = match extract_bulk(&args[pos])
-                .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f32>().ok()))
-            {
+            bm25_b = match extract_bulk(&args[pos]).and_then(|b| {
+                std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+            }) {
                 Some(v) if (0.0..=1.0).contains(&v) => v,
                 _ => {
                     return Frame::Error(Bytes::from_static(
@@ -153,7 +157,9 @@ pub fn ft_create(
                         return Frame::Error(Bytes::from_static(b"ERR WEIGHT requires a value"));
                     }
                     weight = match extract_bulk(&args[pos]).and_then(|b| {
-                        std::str::from_utf8(&b).ok().and_then(|s| s.parse::<f64>().ok())
+                        std::str::from_utf8(&b)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
                     }) {
                         Some(w) if w > 0.0 => w,
                         _ => {
@@ -274,7 +280,14 @@ pub fn ft_create(
         }
         #[cfg(not(feature = "text-index"))]
         {
-            let _ = (text_store, text_field_defs, bm25_k1, bm25_b, prefixes, index_name);
+            let _ = (
+                text_store,
+                text_field_defs,
+                bm25_k1,
+                bm25_b,
+                prefixes,
+                index_name,
+            );
             return Frame::Error(Bytes::from_static(
                 b"ERR TEXT fields require the text-index feature",
             ));

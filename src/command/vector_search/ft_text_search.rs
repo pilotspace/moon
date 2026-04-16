@@ -88,9 +88,9 @@ impl Default for SummarizeOpts {
 /// context_tokens=4.
 pub fn parse_highlight_clause(args: &[Frame]) -> Option<HighlightOpts> {
     // Scan for case-insensitive "HIGHLIGHT"
-    let hl_pos = args.iter().position(|f| {
-        matches!(f, Frame::BulkString(b) if b.as_ref().eq_ignore_ascii_case(b"HIGHLIGHT"))
-    })?;
+    let hl_pos = args.iter().position(
+        |f| matches!(f, Frame::BulkString(b) if b.as_ref().eq_ignore_ascii_case(b"HIGHLIGHT")),
+    )?;
 
     let mut opts = HighlightOpts::default();
     let mut i = hl_pos + 1;
@@ -108,9 +108,10 @@ pub fn parse_highlight_clause(args: &[Frame]) -> Option<HighlightOpts> {
             i += 1;
             // Parse count then field names
             let count = match args.get(i) {
-                Some(Frame::BulkString(b)) => {
-                    std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
-                }
+                Some(Frame::BulkString(b)) => std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0),
                 Some(Frame::Integer(n)) => *n as usize,
                 _ => 0,
             };
@@ -173,9 +174,9 @@ pub fn parse_highlight_clause(args: &[Frame]) -> Option<HighlightOpts> {
 /// Defaults: fragment_size=20, num_fragments=1, separator=`...`, fields=None.
 pub fn parse_summarize_clause(args: &[Frame]) -> Option<SummarizeOpts> {
     // Scan for case-insensitive "SUMMARIZE"
-    let sum_pos = args.iter().position(|f| {
-        matches!(f, Frame::BulkString(b) if b.as_ref().eq_ignore_ascii_case(b"SUMMARIZE"))
-    })?;
+    let sum_pos = args.iter().position(
+        |f| matches!(f, Frame::BulkString(b) if b.as_ref().eq_ignore_ascii_case(b"SUMMARIZE")),
+    )?;
 
     let mut opts = SummarizeOpts::default();
     let mut i = sum_pos + 1;
@@ -192,9 +193,10 @@ pub fn parse_summarize_clause(args: &[Frame]) -> Option<SummarizeOpts> {
         if kw.as_ref().eq_ignore_ascii_case(b"FIELDS") {
             i += 1;
             let count = match args.get(i) {
-                Some(Frame::BulkString(b)) => {
-                    std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
-                }
+                Some(Frame::BulkString(b)) => std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0),
                 Some(Frame::Integer(n)) => *n as usize,
                 _ => 0,
             };
@@ -226,7 +228,11 @@ pub fn parse_summarize_clause(args: &[Frame]) -> Option<SummarizeOpts> {
         } else if kw.as_ref().eq_ignore_ascii_case(b"FRAGS") {
             i += 1;
             if let Some(Frame::BulkString(b)) = args.get(i) {
-                if let Ok(n) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()).ok_or(()) {
+                if let Ok(n) = std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or(())
+                {
                     opts.num_fragments = n;
                 }
             } else if let Some(Frame::Integer(n)) = args.get(i) {
@@ -236,7 +242,10 @@ pub fn parse_summarize_clause(args: &[Frame]) -> Option<SummarizeOpts> {
         } else if kw.as_ref().eq_ignore_ascii_case(b"LEN") {
             i += 1;
             if let Some(Frame::BulkString(b)) = args.get(i) {
-                if let Some(n) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()) {
+                if let Some(n) = std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
                     opts.fragment_size = n;
                 }
             } else if let Some(Frame::Integer(n)) = args.get(i) {
@@ -369,7 +378,11 @@ fn stem_word(word: &str, analyzer: &crate::text::analyzer::AnalyzerPipeline) -> 
     let result = analyzer.tokenize_with_positions(word);
     // tokenize_with_positions filters stop words and short tokens.
     // If result is empty (stop word / too short), the word is not a match candidate.
-    result.into_iter().next().map(|(stem, _)| stem).unwrap_or_default()
+    result
+        .into_iter()
+        .next()
+        .map(|(stem, _)| stem)
+        .unwrap_or_default()
 }
 
 /// Merge context windows around match positions into non-overlapping intervals.
@@ -377,11 +390,7 @@ fn stem_word(word: &str, analyzer: &crate::text::analyzer::AnalyzerPipeline) -> 
 /// Each match at `pos` generates window `[pos - ctx, pos + ctx]` (clamped to text bounds).
 /// Overlapping or adjacent windows are merged.
 #[cfg(feature = "text-index")]
-fn merge_windows(
-    match_positions: &[usize],
-    ctx: usize,
-    total_words: usize,
-) -> Vec<(usize, usize)> {
+fn merge_windows(match_positions: &[usize], ctx: usize, total_words: usize) -> Vec<(usize, usize)> {
     if match_positions.is_empty() {
         return Vec::new();
     }
@@ -593,7 +602,12 @@ pub fn summarize_field(
 
     if fragments.is_empty() {
         // Fallback: return first fragment_size words.
-        return words.iter().take(fragment_size).map(|(w, _)| *w).collect::<Vec<_>>().join(" ");
+        return words
+            .iter()
+            .take(fragment_size)
+            .map(|(w, _)| *w)
+            .collect::<Vec<_>>()
+            .join(" ");
     }
 
     // Sort fragments by start position for natural reading order.
@@ -707,13 +721,17 @@ pub fn apply_post_processing(
 
             let do_highlight = highlight_opts.map_or(false, |opts| {
                 opts.fields.as_ref().map_or(true, |fields| {
-                    fields.iter().any(|f| f.as_ref().eq_ignore_ascii_case(field_name.as_ref()))
+                    fields
+                        .iter()
+                        .any(|f| f.as_ref().eq_ignore_ascii_case(field_name.as_ref()))
                 })
             });
 
             let do_summarize = summarize_opts.map_or(false, |opts| {
                 opts.fields.as_ref().map_or(true, |fields| {
-                    fields.iter().any(|f| f.as_ref().eq_ignore_ascii_case(field_name.as_ref()))
+                    fields
+                        .iter()
+                        .any(|f| f.as_ref().eq_ignore_ascii_case(field_name.as_ref()))
                 })
             });
 
@@ -825,13 +843,20 @@ fn rebuild_fields_with_replacements(fields_frame: &mut Frame, replacements: &[(B
             }
         };
 
-        let replacement_idx = replacements.iter().enumerate().find_map(|(idx, (name, _))| {
-            if !used[idx] && name.as_ref().eq_ignore_ascii_case(field_name_bytes.as_ref()) {
-                Some(idx)
-            } else {
-                None
-            }
-        });
+        let replacement_idx = replacements
+            .iter()
+            .enumerate()
+            .find_map(|(idx, (name, _))| {
+                if !used[idx]
+                    && name
+                        .as_ref()
+                        .eq_ignore_ascii_case(field_name_bytes.as_ref())
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
+            });
 
         if let Some(idx) = replacement_idx {
             used[idx] = true;
@@ -1130,7 +1155,13 @@ pub fn execute_text_search_with_global_idf(
     let results = if let Some(fidx) = field_idx {
         text_index.search_field(fidx, query_terms, Some(global_df), Some(global_n), top_k)
     } else {
-        accumulate_cross_field(text_index, query_terms, Some(global_df), Some(global_n), top_k)
+        accumulate_cross_field(
+            text_index,
+            query_terms,
+            Some(global_df),
+            Some(global_n),
+            top_k,
+        )
     };
 
     build_text_response(&results, offset, count)
@@ -1180,7 +1211,11 @@ fn accumulate_cross_field(
         .map(|(doc_id, (score, key))| TextSearchResult { doc_id, key, score })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(top_k);
     results
 }
@@ -1197,10 +1232,11 @@ fn execute_query_on_index(
         None => accumulate_cross_field(text_index, &clause.terms, global_df, global_n, top_k),
         Some(field_name) => {
             // Find the matching field index.
-            let field_idx = text_index
-                .text_fields
-                .iter()
-                .position(|f| f.field_name.as_ref().eq_ignore_ascii_case(field_name.as_ref()));
+            let field_idx = text_index.text_fields.iter().position(|f| {
+                f.field_name
+                    .as_ref()
+                    .eq_ignore_ascii_case(field_name.as_ref())
+            });
 
             match field_idx {
                 Some(fidx) => {
@@ -1222,7 +1258,11 @@ fn execute_query_on_index(
 /// Document entries are `results[offset..offset+count]`.
 fn build_text_response(results: &[TextSearchResult], offset: usize, count: usize) -> Frame {
     let total = results.len() as i64;
-    let page_count = if count == usize::MAX { results.len() } else { count };
+    let page_count = if count == usize::MAX {
+        results.len()
+    } else {
+        count
+    };
     let page = results.iter().skip(offset).take(page_count);
 
     let mut items = Vec::with_capacity(1 + results.len().min(page_count) * 2);
@@ -1297,13 +1337,15 @@ pub fn merge_text_results(
     }
 
     // Sort DESCENDING (higher BM25 score = better match, per D-09).
-    all_results.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    all_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     all_results.truncate(top_k);
 
     let total = all_results.len() as i64;
-    let page_count = if count == usize::MAX { all_results.len() } else { count };
+    let page_count = if count == usize::MAX {
+        all_results.len()
+    } else {
+        count
+    };
     let page: Vec<&(f32, Bytes, Frame)> =
         all_results.iter().skip(offset).take(page_count).collect();
 
@@ -1388,10 +1430,19 @@ mod tests {
     fn parse_text_query_bare_terms() {
         let analyzer = make_analyzer();
         let result = parse_text_query(b"machine learning", &analyzer).unwrap();
-        assert!(result.field_name.is_none(), "bare terms have no field target");
+        assert!(
+            result.field_name.is_none(),
+            "bare terms have no field target"
+        );
         // "machine" -> "machin", "learning" -> "learn" (English Snowball)
-        assert!(result.terms.contains(&"machin".to_string()), "expected stemmed 'machin'");
-        assert!(result.terms.contains(&"learn".to_string()), "expected stemmed 'learn'");
+        assert!(
+            result.terms.contains(&"machin".to_string()),
+            "expected stemmed 'machin'"
+        );
+        assert!(
+            result.terms.contains(&"learn".to_string()),
+            "expected stemmed 'learn'"
+        );
     }
 
     #[test]
@@ -1478,7 +1529,11 @@ mod tests {
             Frame::BulkString(b) => b.clone(),
             _ => panic!("expected BulkString key"),
         };
-        assert_eq!(first_key.as_ref(), b"doc:b", "doc:b (score=3.2) must rank first");
+        assert_eq!(
+            first_key.as_ref(),
+            b"doc:b",
+            "doc:b (score=3.2) must rank first"
+        );
     }
 
     #[test]
@@ -1498,7 +1553,11 @@ mod tests {
         let key_frame = &fields[0];
         match key_frame {
             Frame::BulkString(b) => {
-                assert_eq!(b.as_ref(), b"__bm25_score", "field name must be __bm25_score");
+                assert_eq!(
+                    b.as_ref(),
+                    b"__bm25_score",
+                    "field name must be __bm25_score"
+                );
             }
             _ => panic!("expected BulkString field name"),
         }
@@ -1524,7 +1583,10 @@ mod tests {
             Frame::Array(f) => f,
             _ => panic!("expected fields Array"),
         };
-        assert_eq!(fields[0], Frame::BulkString(Bytes::from_static(b"__bm25_score")));
+        assert_eq!(
+            fields[0],
+            Frame::BulkString(Bytes::from_static(b"__bm25_score"))
+        );
     }
 
     // ── cross_field_score_accumulation ─────────────────────────────────────────
@@ -1533,8 +1595,8 @@ mod tests {
     #[cfg(feature = "text-index")]
     fn cross_field_score_accumulation() {
         use crate::protocol::Frame as F;
-        use crate::text::types::{BM25Config, TextFieldDef};
         use crate::text::store::TextIndex;
+        use crate::text::types::{BM25Config, TextFieldDef};
 
         // Create a 2-field index (title + body)
         let title_field = TextFieldDef::new(Bytes::from_static(b"title"));
@@ -1569,8 +1631,15 @@ mod tests {
 
         assert_eq!(results.len(), 2, "both docs match 'machine'");
         // doc:0 should rank higher (matched in 2 fields, score accumulated from both)
-        assert_eq!(results[0].key.as_ref(), b"doc:0", "doc:0 with multi-field match ranks first");
-        assert!(results[0].score > results[1].score, "accumulated score should be higher");
+        assert_eq!(
+            results[0].key.as_ref(),
+            b"doc:0",
+            "doc:0 with multi-field match ranks first"
+        );
+        assert!(
+            results[0].score > results[1].score,
+            "accumulated score should be higher"
+        );
     }
 
     // ── highlight_field ───────────────────────────────────────────────────────
@@ -1589,10 +1658,19 @@ mod tests {
             "</b>",
             4,
         );
-        assert!(result.contains("<b>machine</b>"), "machine should be highlighted, got: {result}");
-        assert!(result.contains("<b>learning</b>"), "learning should be highlighted, got: {result}");
+        assert!(
+            result.contains("<b>machine</b>"),
+            "machine should be highlighted, got: {result}"
+        );
+        assert!(
+            result.contains("<b>learning</b>"),
+            "learning should be highlighted, got: {result}"
+        );
         assert!(result.contains("in"), "context word 'in' should be present");
-        assert!(result.contains("production"), "context word 'production' should be present");
+        assert!(
+            result.contains("production"),
+            "context word 'production' should be present"
+        );
     }
 
     #[test]
@@ -1604,10 +1682,19 @@ mod tests {
         let text = "the quick brown fox jumped over the lazy dog machine learning";
         let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 2);
         // Should contain highlighted terms
-        assert!(result.contains("<b>machine</b>"), "machine highlighted, got: {result}");
-        assert!(result.contains("<b>learning</b>"), "learning highlighted, got: {result}");
+        assert!(
+            result.contains("<b>machine</b>"),
+            "machine highlighted, got: {result}"
+        );
+        assert!(
+            result.contains("<b>learning</b>"),
+            "learning highlighted, got: {result}"
+        );
         // Context words (2 before "machine") should appear
-        assert!(result.contains("lazy") || result.contains("dog"), "context words near match, got: {result}");
+        assert!(
+            result.contains("lazy") || result.contains("dog"),
+            "context words near match, got: {result}"
+        );
     }
 
     #[test]
@@ -1616,8 +1703,14 @@ mod tests {
         let analyzer = make_analyzer();
         let terms = vec!["machin".to_string()];
         let result = highlight_field("machine learning", &terms, &analyzer, "[", "]", 4);
-        assert!(result.contains("[machine]"), "custom tags applied, got: {result}");
-        assert!(!result.contains("<b>"), "default tags must not appear, got: {result}");
+        assert!(
+            result.contains("[machine]"),
+            "custom tags applied, got: {result}"
+        );
+        assert!(
+            !result.contains("<b>"),
+            "default tags must not appear, got: {result}"
+        );
     }
 
     #[test]
@@ -1627,7 +1720,10 @@ mod tests {
         let terms = vec!["xyznonexistent".to_string()];
         let text = "machine learning in production";
         let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 4);
-        assert_eq!(result, text, "no matches → original text returned unchanged");
+        assert_eq!(
+            result, text,
+            "no matches → original text returned unchanged"
+        );
     }
 
     #[test]
@@ -1638,7 +1734,10 @@ mod tests {
         // Short text: fits entirely in the context window
         let text = "machine";
         let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 4);
-        assert!(result.contains("<b>machine</b>"), "short text fully highlighted, got: {result}");
+        assert!(
+            result.contains("<b>machine</b>"),
+            "short text fully highlighted, got: {result}"
+        );
     }
 
     // ── summarize_field ───────────────────────────────────────────────────────
@@ -1652,11 +1751,17 @@ mod tests {
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega machine learning one two three four";
         let result = summarize_field(text, &terms, &analyzer, 20, 1, "...");
         // The 20-token fragment should include "machine" and "learning"
-        assert!(result.contains("machine") || result.contains("learning"),
-            "summary should include match words, got: {result}");
+        assert!(
+            result.contains("machine") || result.contains("learning"),
+            "summary should include match words, got: {result}"
+        );
         // Result should be shorter than original
         let result_words: Vec<&str> = result.split_whitespace().collect();
-        assert!(result_words.len() <= 20, "fragment should be at most 20 tokens, got {} tokens", result_words.len());
+        assert!(
+            result_words.len() <= 20,
+            "fragment should be at most 20 tokens, got {} tokens",
+            result_words.len()
+        );
     }
 
     #[test]
@@ -1670,8 +1775,14 @@ mod tests {
         let result = summarize_field(text, &terms, &analyzer, 10, 1, "...");
         // The dense cluster (last two "machine"s) should be selected
         // Count occurrences of "machine" in result — should be 2
-        let machine_count = result.split_whitespace().filter(|&w| w == "machine").count();
-        assert!(machine_count >= 1, "result should contain at least one match, got: {result}");
+        let machine_count = result
+            .split_whitespace()
+            .filter(|&w| w == "machine")
+            .count();
+        assert!(
+            machine_count >= 1,
+            "result should contain at least one match, got: {result}"
+        );
     }
 
     #[test]
@@ -1684,7 +1795,10 @@ mod tests {
         let result = summarize_field(text, &terms, &analyzer, 5, 2, " | ");
         // With separator, result should have the separator if 2 fragments found
         // At minimum both "machine" occurrences should be present
-        assert!(result.contains("machine"), "result must contain match term, got: {result}");
+        assert!(
+            result.contains("machine"),
+            "result must contain match term, got: {result}"
+        );
     }
 
     // ── parse_highlight_clause ────────────────────────────────────────────────
@@ -1698,7 +1812,10 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"0")),
             Frame::BulkString(Bytes::from_static(b"10")),
         ];
-        assert!(parse_highlight_clause(&args).is_none(), "HIGHLIGHT not in args → None");
+        assert!(
+            parse_highlight_clause(&args).is_none(),
+            "HIGHLIGHT not in args → None"
+        );
     }
 
     #[test]
@@ -1744,7 +1861,10 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"testidx")),
             Frame::BulkString(Bytes::from_static(b"machine")),
         ];
-        assert!(parse_summarize_clause(&args).is_none(), "SUMMARIZE not in args → None");
+        assert!(
+            parse_summarize_clause(&args).is_none(),
+            "SUMMARIZE not in args → None"
+        );
     }
 
     #[test]
@@ -1796,7 +1916,10 @@ mod tests {
         // HIGHLIGHT works without SUMMARIZE
         let text = "machine learning";
         let result = highlight_field(text, &terms, &analyzer, "<b>", "</b>", 4);
-        assert!(result.contains("<b>machine</b>"), "highlight standalone, got: {result}");
+        assert!(
+            result.contains("<b>machine</b>"),
+            "highlight standalone, got: {result}"
+        );
     }
 
     #[test]
@@ -1807,7 +1930,13 @@ mod tests {
         // SUMMARIZE works without HIGHLIGHT
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa machine learning production systems";
         let result = summarize_field(text, &terms, &analyzer, 5, 1, "...");
-        assert!(result.contains("machine"), "summarize standalone, got: {result}");
-        assert!(!result.contains("<b>"), "summarize without highlight has no tags, got: {result}");
+        assert!(
+            result.contains("machine"),
+            "summarize standalone, got: {result}"
+        );
+        assert!(
+            !result.contains("<b>"),
+            "summarize without highlight has no tags, got: {result}"
+        );
     }
 }

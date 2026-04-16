@@ -948,15 +948,20 @@ pub(crate) fn handle_shard_message_shared(
                         let fidx = field_idx_opt.unwrap_or(0);
                         let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
                         for (term, df) in term_dfs {
-                            items.push(crate::protocol::Frame::BulkString(bytes::Bytes::from(term)));
+                            items
+                                .push(crate::protocol::Frame::BulkString(bytes::Bytes::from(term)));
                             items.push(crate::protocol::Frame::Integer(i64::from(df)));
                         }
-                        items.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"N")));
+                        items.push(crate::protocol::Frame::BulkString(
+                            bytes::Bytes::from_static(b"N"),
+                        ));
                         items.push(crate::protocol::Frame::Integer(i64::from(n)));
                     }
                     crate::protocol::Frame::Array(items.into())
                 }
-                None => crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown index")),
+                None => {
+                    crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown index"))
+                }
             };
             drop(text_guard);
             let _ = reply_tx.send(response);
@@ -1010,9 +1015,9 @@ pub(crate) fn handle_shard_message_shared(
                         }
                         result
                     }
-                    None => crate::protocol::Frame::Error(
-                        bytes::Bytes::from_static(b"ERR unknown index"),
-                    ),
+                    None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                        b"ERR unknown index",
+                    )),
                 }
                 // text_guard drops here (end of block).
             };

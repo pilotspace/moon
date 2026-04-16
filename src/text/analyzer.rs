@@ -9,7 +9,6 @@
 ///
 /// Feature-gated behind `text-index` for optional deps. When the feature
 /// is disabled, a simple whitespace-based fallback is provided.
-
 use std::collections::HashSet;
 
 /// Configurable text analysis pipeline.
@@ -52,7 +51,8 @@ impl AnalyzerPipeline {
         };
 
         let stop_words_slice = stop_words::get(stop_words::LANGUAGE::English);
-        let stop_words: HashSet<String> = stop_words_slice.iter().map(|s| (*s).to_owned()).collect();
+        let stop_words: HashSet<String> =
+            stop_words_slice.iter().map(|s| (*s).to_owned()).collect();
 
         Self {
             stemmer,

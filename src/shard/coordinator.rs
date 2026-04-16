@@ -1034,7 +1034,7 @@ pub async fn scatter_text_search(
                 global_df: global_df.clone(),
                 global_n,
                 top_k,
-                offset: 0,      // each shard returns top_k; coordinator applies final offset+count
+                offset: 0, // each shard returns top_k; coordinator applies final offset+count
                 count: top_k,
                 // Pass opts to each remote shard — each applies post-processing locally.
                 highlight_opts: highlight_opts.clone(),
@@ -1072,11 +1072,8 @@ pub async fn scatter_text_search(
 /// This function sums `df` per term across shards and sums `N` (total docs) across shards.
 ///
 /// Returns `(global_df: HashMap<String, u32>, global_n: u32)`.
-fn aggregate_doc_freq(
-    responses: &[Frame],
-) -> (std::collections::HashMap<String, u32>, u32) {
-    let mut global_df: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
+fn aggregate_doc_freq(responses: &[Frame]) -> (std::collections::HashMap<String, u32>, u32) {
+    let mut global_df: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut global_n: u32 = 0;
 
     for resp in responses {
@@ -1105,8 +1102,11 @@ fn aggregate_doc_freq(
                             }
                         };
                         if let Frame::Integer(df) = &items[i + 1] {
-                            *global_df.entry(term).or_insert(0) =
-                                global_df.get(&term).copied().unwrap_or(0).saturating_add(*df as u32);
+                            *global_df.entry(term).or_insert(0) = global_df
+                                .get(&term)
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(*df as u32);
                         }
                         i += 2;
                     }
@@ -1391,8 +1391,8 @@ mod tests {
             10,
             0,
             10,
-            0,   // my_shard
-            1,   // num_shards = 1 -> single-shard fast path
+            0, // my_shard
+            1, // num_shards = 1 -> single-shard fast path
             &shard_databases,
             &dispatch_tx,
             &notifiers,

@@ -664,12 +664,7 @@ pub fn get_rss_bytes() -> u64 {
     // SAFETY: These are stable Mach kernel ABI functions available on all macOS versions.
     unsafe extern "C" {
         fn mach_task_self() -> u32;
-        fn task_info(
-            target: u32,
-            flavor: u32,
-            info: *mut u8,
-            count: *mut u32,
-        ) -> i32;
+        fn task_info(target: u32, flavor: u32, info: *mut u8, count: *mut u32) -> i32;
     }
     // MACH_TASK_BASIC_INFO flavor returns mach_task_basic_info_data_t.
     // Layout (aarch64/x86_64): policy(i32), pad(i32), virtual_size(u64),

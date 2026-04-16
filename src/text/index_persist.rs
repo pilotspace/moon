@@ -72,9 +72,7 @@ pub fn serialize_text_index_metas(indexes: &[TextIndexMeta]) -> Vec<u8> {
             buf.extend_from_slice(&(f.field_name.len() as u16).to_le_bytes());
             buf.extend_from_slice(&f.field_name);
             buf.extend_from_slice(&f.weight.to_le_bytes());
-            let flags: u8 = (f.nostem as u8)
-                | ((f.sortable as u8) << 1)
-                | ((f.noindex as u8) << 2);
+            let flags: u8 = (f.nostem as u8) | ((f.sortable as u8) << 1) | ((f.noindex as u8) << 2);
             buf.push(flags);
         }
     }
@@ -290,7 +288,11 @@ mod tests {
     #[test]
     fn test_roundtrip_multiple() {
         let m1 = make_meta("article_idx", "article:", &[("title", 2.0, 0)]);
-        let m2 = make_meta("blog_idx", "blog:", &[("content", 1.0, 0), ("tags", 0.5, 0)]);
+        let m2 = make_meta(
+            "blog_idx",
+            "blog:",
+            &[("content", 1.0, 0), ("tags", 0.5, 0)],
+        );
         let data = serialize_text_index_metas(&[m1, m2]);
         let result = deserialize_text_index_metas(&data).expect("deserialize");
         assert_eq!(result.len(), 2);

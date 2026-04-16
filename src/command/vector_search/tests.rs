@@ -1,4 +1,5 @@
 use super::*;
+use smallvec::SmallVec;
 use std::sync::Mutex;
 
 /// Serialize tests that touch global atomic metrics to avoid flaky interference.
@@ -342,7 +343,11 @@ fn test_ft_create_duplicate() {
     assert!(matches!(r1, Frame::SimpleString(_)));
 
     let args2 = ft_create_args();
-    let r2 = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args2);
+    let r2 = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args2,
+    );
     match &r2 {
         Frame::Error(e) => assert!(e.starts_with(b"ERR")),
         other => panic!("expected error, got {other:?}"),
@@ -356,12 +361,20 @@ fn test_ft_dropindex() {
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
 
     // Drop existing
-    let result = ft_dropindex(&mut store, &mut crate::text::store::TextStore::new(), &[bulk(b"myidx")]);
+    let result = ft_dropindex(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &[bulk(b"myidx")],
+    );
     assert!(matches!(result, Frame::SimpleString(_)));
     assert!(store.is_empty());
 
     // Drop non-existing
-    let result = ft_dropindex(&mut store, &mut crate::text::store::TextStore::new(), &[bulk(b"myidx")]);
+    let result = ft_dropindex(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &[bulk(b"myidx")],
+    );
     assert!(matches!(result, Frame::Error(_)));
 }
 
@@ -559,7 +572,11 @@ fn test_ft_info() {
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
 
-    let result = ft_info(&store, &crate::text::store::TextStore::new(), &[bulk(b"myidx")]);
+    let result = ft_info(
+        &store,
+        &crate::text::store::TextStore::new(),
+        &[bulk(b"myidx")],
+    );
     match result {
         Frame::Array(items) => {
             // Should have 20 items (10 key-value pairs)
@@ -587,7 +604,11 @@ fn test_ft_info() {
     }
 
     // Non-existing index
-    let result = ft_info(&store, &crate::text::store::TextStore::new(), &[bulk(b"nonexistent")]);
+    let result = ft_info(
+        &store,
+        &crate::text::store::TextStore::new(),
+        &[bulk(b"nonexistent")],
+    );
     assert!(matches!(result, Frame::Error(_)));
 }
 
@@ -630,7 +651,11 @@ fn test_end_to_end_create_insert_search() {
 
     // 1. FT.CREATE
     let create_args = build_ft_create_args("e2eidx", "doc:", "embedding", dim as u32, "L2");
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &create_args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &create_args,
+    );
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.CREATE should return OK, got {result:?}"
@@ -935,7 +960,11 @@ fn test_vector_metrics_increment_decrement() {
 
     // FT.DROPINDEX should decrement VECTOR_INDEXES
     let before_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
-    ft_dropindex(&mut store, &mut crate::text::store::TextStore::new(), &[bulk(b"myidx")]);
+    ft_dropindex(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &[bulk(b"myidx")],
+    );
     let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
     assert!(
         after_drop < before_drop,
@@ -1249,7 +1278,11 @@ fn test_ft_config_autocompact_on_off() {
 
     // Default should be ON
     let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"AUTOCOMPACT")];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &get_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
         other => panic!("expected BulkString ON, got {other:?}"),
@@ -1262,11 +1295,19 @@ fn test_ft_config_autocompact_on_off() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"OFF"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(matches!(result, Frame::SimpleString(_)));
 
     // GET should return OFF
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &get_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"OFF"),
         other => panic!("expected BulkString OFF, got {other:?}"),
@@ -1279,11 +1320,19 @@ fn test_ft_config_autocompact_on_off() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"ON"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(matches!(result, Frame::SimpleString(_)));
 
     // GET should return ON
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &get_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
         other => panic!("expected BulkString ON, got {other:?}"),
@@ -1297,7 +1346,11 @@ fn test_ft_config_unknown_param() {
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
 
     let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"NOSUCHPARAM")];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &get_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
     assert!(
         matches!(result, Frame::Error(_)),
         "should error on unknown param"
@@ -1309,7 +1362,11 @@ fn test_ft_config_unknown_param() {
         bulk(b"NOSUCHPARAM"),
         bulk(b"foo"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(
         matches!(result, Frame::Error(_)),
         "should error on unknown param"
@@ -1321,7 +1378,11 @@ fn test_ft_config_unknown_index() {
     let mut store = VectorStore::new();
 
     let get_args = vec![bulk(b"GET"), bulk(b"nonexistent"), bulk(b"AUTOCOMPACT")];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &get_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+    );
     assert!(
         matches!(result, Frame::Error(_)),
         "should error on unknown index"
@@ -1341,7 +1402,11 @@ fn test_ft_config_autocompact_guards_try_compact() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"OFF"),
     ];
-    ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
 
     // Verify the flag is set correctly on the index
     let idx = store.get_index(b"myidx").unwrap();
@@ -1354,7 +1419,11 @@ fn test_ft_config_autocompact_guards_try_compact() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"ON"),
     ];
-    ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     let idx = store.get_index(b"myidx").unwrap();
     assert!(idx.autocompact_enabled, "autocompact should be enabled");
 }
@@ -1372,7 +1441,11 @@ fn test_ft_config_autocompact_accepts_variants() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"0"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(matches!(result, Frame::SimpleString(_)));
     let idx = store.get_index(b"myidx").unwrap();
     assert!(!idx.autocompact_enabled);
@@ -1383,7 +1456,11 @@ fn test_ft_config_autocompact_accepts_variants() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"1"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(matches!(result, Frame::SimpleString(_)));
     let idx = store.get_index(b"myidx").unwrap();
     assert!(idx.autocompact_enabled);
@@ -1395,7 +1472,11 @@ fn test_ft_config_autocompact_accepts_variants() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"FALSE"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(matches!(result, Frame::SimpleString(_)));
     let idx = store.get_index(b"myidx").unwrap();
     assert!(!idx.autocompact_enabled);
@@ -1407,7 +1488,11 @@ fn test_ft_config_autocompact_accepts_variants() {
         bulk(b"AUTOCOMPACT"),
         bulk(b"MAYBE"),
     ];
-    let result = ft_config(&mut store, &mut crate::text::store::TextStore::new(), &set_args);
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+    );
     assert!(matches!(result, Frame::Error(_)));
 }
 
@@ -1783,7 +1868,11 @@ mod cache_search_tests {
     fn test_ft_cachesearch_miss_on_empty_store() {
         let mut store = VectorStore::new();
         let create_args = ft_create_args();
-        ft_create(&mut store, &mut crate::text::store::TextStore::new(), &create_args);
+        ft_create(
+            &mut store,
+            &mut crate::text::store::TextStore::new(),
+            &create_args,
+        );
 
         let args = make_valid_cachesearch_args();
         let result = cache_search::ft_cachesearch(&mut store, &args);
@@ -2175,7 +2264,11 @@ fn test_ft_info_multi_field() {
     let args = ft_create_multi_field_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
 
-    let result = ft_info(&store, &crate::text::store::TextStore::new(), &[bulk(b"multiidx")]);
+    let result = ft_info(
+        &store,
+        &crate::text::store::TextStore::new(),
+        &[bulk(b"multiidx")],
+    );
     match result {
         Frame::Array(items) => {
             // Find the vector_fields key
@@ -2951,7 +3044,11 @@ fn test_range_filter_l2_search() {
 
     // Create L2 index
     let create_args = build_ft_create_args("rangeidx", "doc:", "vec", dim as u32, "L2");
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &create_args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &create_args,
+    );
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.CREATE failed: {result:?}"
@@ -3120,7 +3217,11 @@ fn test_recommend_missing_key_vectors() {
 
     let mut store = VectorStore::new();
     let create_args = build_ft_create_args("recidx", "doc:", "vec", 4, "L2");
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &create_args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &create_args,
+    );
 
     let mut db = crate::storage::db::Database::new();
     // doc:1 does NOT exist in db -- so no vectors can be read
@@ -3146,7 +3247,11 @@ fn test_recommend_basic_with_vectors() {
     let mut store = VectorStore::new();
     let dim: usize = 4;
     let create_args = build_ft_create_args("recidx2", "doc:", "vec", dim as u32, "L2");
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &create_args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &create_args,
+    );
 
     // Insert 5 vectors into the index
     let vectors: Vec<(&[u8], [f32; 4])> = vec![

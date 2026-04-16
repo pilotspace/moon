@@ -4,7 +4,6 @@
 /// storage. Uses a simple HashMap for the mutable phase; will be replaced
 /// with FST (finite state transducer) in Phase 151 for memory-efficient
 /// immutable term storage and prefix/fuzzy queries.
-
 use std::collections::HashMap;
 
 /// Dictionary mapping terms to unique integer IDs.

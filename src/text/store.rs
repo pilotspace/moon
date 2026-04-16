@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 use crate::text::analyzer::AnalyzerPipeline;
-use crate::text::bm25::{bm25_score, FieldStats};
+use crate::text::bm25::{FieldStats, bm25_score};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
@@ -112,12 +112,7 @@ impl TextIndex {
     /// * `key_hash` - xxh64 hash of the Redis key
     /// * `key` - Raw Redis key bytes
     /// * `args` - HSET arguments: [field1, value1, field2, value2, ...]
-    pub fn index_document(
-        &mut self,
-        key_hash: u64,
-        key: &[u8],
-        args: &[crate::protocol::Frame],
-    ) {
+    pub fn index_document(&mut self, key_hash: u64, key: &[u8], args: &[crate::protocol::Frame]) {
         let is_upsert = self.key_hash_to_doc_id.contains_key(&key_hash);
         let doc_id = if let Some(&existing_id) = self.key_hash_to_doc_id.get(&key_hash) {
             // Upsert: reuse existing doc_id
@@ -132,8 +127,10 @@ impl TextIndex {
                 if let Some(old_lengths) = self.doc_field_lengths.get(&existing_id) {
                     if field_idx < old_lengths.len() {
                         let old_len = old_lengths[field_idx] as u64;
-                        self.field_stats[field_idx].total_field_length =
-                            self.field_stats[field_idx].total_field_length.saturating_sub(old_len);
+                        self.field_stats[field_idx].total_field_length = self.field_stats
+                            [field_idx]
+                            .total_field_length
+                            .saturating_sub(old_len);
                     }
                 }
             }
@@ -231,7 +228,10 @@ impl TextIndex {
                 None => return Vec::new(), // AND: missing term = no results
             };
             // Verify posting list exists
-            if self.field_postings[field_idx].get_posting(term_id).is_none() {
+            if self.field_postings[field_idx]
+                .get_posting(term_id)
+                .is_none()
+            {
                 return Vec::new();
             }
             term_postings.push((term.clone(), term_id));
@@ -240,16 +240,14 @@ impl TextIndex {
         // Build candidate bitmap: start from first term's doc_ids, AND with rest.
         let mut candidate_bitmap: RoaringBitmap = {
             // Safety: term_postings is non-empty (query_terms non-empty guard above)
-            let first_posting = self
-                .field_postings[field_idx]
+            let first_posting = self.field_postings[field_idx]
                 .get_posting(term_postings[0].1)
                 .expect("posting exists: checked above");
             first_posting.doc_ids.clone()
         };
 
         for (_, term_id) in &term_postings[1..] {
-            let posting = self
-                .field_postings[field_idx]
+            let posting = self.field_postings[field_idx]
                 .get_posting(*term_id)
                 .expect("posting exists: checked above");
             candidate_bitmap &= &posting.doc_ids;
@@ -267,7 +265,8 @@ impl TextIndex {
         let b = self.bm25_config.b;
         let weight = self.text_fields[field_idx].weight as f32;
 
-        let mut results: Vec<TextSearchResult> = Vec::with_capacity(candidate_bitmap.len() as usize);
+        let mut results: Vec<TextSearchResult> =
+            Vec::with_capacity(candidate_bitmap.len() as usize);
 
         for doc_id in &candidate_bitmap {
             let dl = self
@@ -278,8 +277,7 @@ impl TextIndex {
 
             let mut doc_score = 0.0f32;
             for (term, term_id) in &term_postings {
-                let posting = self
-                    .field_postings[field_idx]
+                let posting = self.field_postings[field_idx]
                     .get_posting(*term_id)
                     .expect("posting exists: checked above");
 
@@ -314,7 +312,11 @@ impl TextIndex {
         }
 
         // Step 3: sort descending by BM25 score (higher = more relevant per D-07).
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(top_k);
         results
     }
@@ -362,7 +364,10 @@ impl TextIndex {
 
     /// Estimated total posting list memory in bytes.
     pub fn total_posting_bytes(&self) -> usize {
-        self.field_postings.iter().map(|p| p.estimated_bytes()).sum()
+        self.field_postings
+            .iter()
+            .map(|p| p.estimated_bytes())
+            .sum()
     }
 }
 
@@ -370,10 +375,7 @@ impl TextIndex {
 ///
 /// Args layout: [field1, value1, field2, value2, ...]
 /// Returns the raw bytes of the value for the matching field name.
-fn find_field_value<'a>(
-    args: &'a [crate::protocol::Frame],
-    field_name: &[u8],
-) -> Option<&'a [u8]> {
+fn find_field_value<'a>(args: &'a [crate::protocol::Frame], field_name: &[u8]) -> Option<&'a [u8]> {
     let mut i = 0;
     while i + 1 < args.len() {
         if let crate::protocol::Frame::BulkString(name) = &args[i] {
@@ -498,12 +500,12 @@ impl TextStore {
 }
 
 #[cfg(test)]
+#[cfg(feature = "text-index")]
 mod tests {
     use super::*;
 
     /// Build a minimal TextIndex with a single TEXT field named "body"
     /// and index N documents. Used by multiple tests.
-    #[cfg(feature = "text-index")]
     fn make_index_with_docs(docs: &[(&str, &str)]) -> TextIndex {
         use crate::protocol::Frame;
         use crate::text::types::BM25Config;
@@ -526,7 +528,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "text-index")]
     fn test_search_field_basic() {
         // doc 0: "machine vision", doc 1: "deep learning", doc 2: "machine learning deep"
         let idx = make_index_with_docs(&[
@@ -547,7 +548,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "text-index")]
     fn test_search_field_score_ordering() {
         // doc 0: "machine" appears once, doc 1: "machine machine machine" (higher TF)
         let idx = make_index_with_docs(&[
@@ -572,13 +572,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "text-index")]
     fn test_search_field_global_idf() {
         // doc 0: "machine", doc 1: "machine learning"
-        let idx = make_index_with_docs(&[
-            ("doc:0", "machine"),
-            ("doc:1", "machine learning"),
-        ]);
+        let idx = make_index_with_docs(&[("doc:0", "machine"), ("doc:1", "machine learning")]);
 
         let terms = vec!["machin".to_string()];
 
@@ -596,12 +592,14 @@ mod tests {
         // Scores differ when global IDF is used (df=10/N=100 vs df=2/N=2)
         // Both sets return 2 results; just verify global path produces valid positive scores
         for r in &global_results {
-            assert!(r.score > 0.0 || r.score == 0.0, "Score must be non-negative");
+            assert!(
+                r.score > 0.0 || r.score == 0.0,
+                "Score must be non-negative"
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "text-index")]
     fn test_search_field_missing_term() {
         let idx = make_index_with_docs(&[("doc:0", "machine vision"), ("doc:1", "deep learning")]);
 
@@ -613,11 +611,13 @@ mod tests {
         // Two terms where one is missing: still empty
         let terms2 = vec!["machin".to_string(), "xyznonexist".to_string()];
         let results2 = idx.search_field(0, &terms2, None, None, 10);
-        assert!(results2.is_empty(), "AND with missing term must return empty Vec");
+        assert!(
+            results2.is_empty(),
+            "AND with missing term must return empty Vec"
+        );
     }
 
     #[test]
-    #[cfg(feature = "text-index")]
     fn test_doc_freq_for_terms() {
         // doc 0: "machine vision", doc 1: "machine learning", doc 2: "deep learning"
         let idx = make_index_with_docs(&[
@@ -626,14 +626,30 @@ mod tests {
             ("doc:2", "deep learning"),
         ]);
 
-        let terms = vec!["machin".to_string(), "learn".to_string(), "vision".to_string()];
+        let terms = vec![
+            "machin".to_string(),
+            "learn".to_string(),
+            "vision".to_string(),
+        ];
         let (df_pairs, n) = idx.doc_freq_for_terms(0, &terms);
 
         assert_eq!(n, 3, "3 docs total");
         // Find each term's df
-        let machin_df = df_pairs.iter().find(|(t, _)| t == "machin").map(|(_, df)| *df).unwrap_or(0);
-        let learn_df = df_pairs.iter().find(|(t, _)| t == "learn").map(|(_, df)| *df).unwrap_or(0);
-        let vision_df = df_pairs.iter().find(|(t, _)| t == "vision").map(|(_, df)| *df).unwrap_or(0);
+        let machin_df = df_pairs
+            .iter()
+            .find(|(t, _)| t == "machin")
+            .map(|(_, df)| *df)
+            .unwrap_or(0);
+        let learn_df = df_pairs
+            .iter()
+            .find(|(t, _)| t == "learn")
+            .map(|(_, df)| *df)
+            .unwrap_or(0);
+        let vision_df = df_pairs
+            .iter()
+            .find(|(t, _)| t == "vision")
+            .map(|(_, df)| *df)
+            .unwrap_or(0);
 
         assert_eq!(machin_df, 2, "'machine' appears in doc:0 and doc:1");
         assert_eq!(learn_df, 2, "'learning' appears in doc:1 and doc:2");
