@@ -29,6 +29,9 @@ use crate::text::types::{BM25Config, TextFieldDef};
 const MAGIC: &[u8; 4] = b"TMIX";
 const VERSION: u8 = 1;
 
+const FST_MAGIC: &[u8; 4] = b"TFST";
+const FST_VERSION: u8 = 1;
+
 /// Lightweight schema-only representation of a TextIndex for persistence.
 ///
 /// Contains everything needed to reconstruct an empty TextIndex (without
@@ -236,6 +239,21 @@ fn read_f64(data: &[u8], cursor: &mut usize) -> io::Result<f64> {
 }
 
 #[inline]
+fn read_u32(data: &[u8], cursor: &mut usize) -> io::Result<u32> {
+    if *cursor + 4 > data.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u32"));
+    }
+    let v = u32::from_le_bytes([
+        data[*cursor],
+        data[*cursor + 1],
+        data[*cursor + 2],
+        data[*cursor + 3],
+    ]);
+    *cursor += 4;
+    Ok(v)
+}
+
+#[inline]
 fn read_bytes<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<&'a [u8]> {
     if *cursor + len > data.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "bytes"));
@@ -243,6 +261,105 @@ fn read_bytes<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<
     let v = &data[*cursor..*cursor + len];
     *cursor += len;
     Ok(v)
+}
+
+/// Persist per-field FST bytes to `{shard_dir}/{index_name}.fst`.
+///
+/// Format (TFST v1):
+/// ```text
+/// [magic: 4B "TFST"] [version: 1B] [field_count: 2B]
+/// Per field:
+///   [fst_len: 4B] [raw_fst_bytes: fst_len]
+///   (fst_len=0 means no FST for this field)
+/// ```
+///
+/// Atomic: write to `.{index_name}.fst.tmp`, then `std::fs::rename` (same as TMIX pattern).
+pub fn save_fst_sidecar(
+    shard_dir: &Path,
+    index_name: &[u8],
+    fst_bytes_per_field: &[Option<&[u8]>],
+) -> io::Result<()> {
+    let name_str = String::from_utf8_lossy(index_name);
+    let path = shard_dir.join(format!("{name_str}.fst"));
+    let tmp_path = shard_dir.join(format!(".{name_str}.fst.tmp"));
+
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(FST_MAGIC);
+    buf.push(FST_VERSION);
+    buf.extend_from_slice(&(fst_bytes_per_field.len() as u16).to_le_bytes());
+
+    for field_fst in fst_bytes_per_field {
+        match field_fst {
+            Some(bytes) => {
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => {
+                buf.extend_from_slice(&0u32.to_le_bytes()); // fst_len=0 = no FST for this field
+            }
+        }
+    }
+
+    let mut f = std::fs::File::create(&tmp_path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+/// Load per-field FST bytes from `{shard_dir}/{index_name}.fst`.
+///
+/// Returns empty Vec if file not present (D-11: missing sidecar = fst_maps stay None).
+/// Returns `Vec<Option<Vec<u8>>>` — one entry per field, None if that field had no FST.
+pub fn load_fst_sidecar(
+    shard_dir: &Path,
+    index_name: &[u8],
+) -> io::Result<Vec<Option<Vec<u8>>>> {
+    let name_str = String::from_utf8_lossy(index_name);
+    let path = shard_dir.join(format!("{name_str}.fst"));
+    if !path.exists() {
+        return Ok(Vec::new()); // D-11: missing sidecar -> fst_map = None
+    }
+
+    let mut f = std::fs::File::open(&path)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+
+    if data.len() < 7 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FST sidecar too short",
+        ));
+    }
+    if &data[0..4] != FST_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad FST magic",
+        ));
+    }
+    let version = data[4];
+    if version != FST_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported FST version {version}"),
+        ));
+    }
+
+    let field_count = u16::from_le_bytes([data[5], data[6]]) as usize;
+    let mut cursor = 7;
+    let mut result = Vec::with_capacity(field_count);
+
+    for _ in 0..field_count {
+        let fst_len = read_u32(&data, &mut cursor)? as usize;
+        if fst_len == 0 {
+            result.push(None);
+        } else {
+            let fst_bytes = read_bytes(&data, &mut cursor, fst_len)?.to_vec();
+            result.push(Some(fst_bytes));
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

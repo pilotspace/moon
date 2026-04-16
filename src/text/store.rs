@@ -15,6 +15,26 @@ use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
 use crate::text::types::{BM25Config, TextFieldDef};
 
+/// Modifier for a query term — controls expansion strategy (D-16).
+///
+/// Exact terms use direct HashMap TermDictionary lookup (unchanged path).
+/// Fuzzy/Prefix terms expand via FST + HashMap dual-path (D-12).
+///
+/// Canonical definition lives here; Plan 02 will re-import from this location
+/// into ft_text_search.rs rather than redefining it.
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum TermModifier {
+    /// Direct lookup — no expansion. Term is fully analyzed (stemmed).
+    Exact,
+    /// Levenshtein fuzzy match with edit distance 1–3 (D-03).
+    /// Term is lowercased + NFKD but NOT stemmed (D-06).
+    Fuzzy(u8),
+    /// Prefix match (trailing asterisk syntax, D-07).
+    /// Term is lowercased + NFKD but NOT stemmed (D-07).
+    Prefix,
+}
+
 /// A BM25-scored search result from TextIndex::search_field().
 pub struct TextSearchResult {
     /// Internal document ID.
@@ -47,6 +67,10 @@ pub struct TextIndex {
     pub field_stats: Vec<FieldStats>,
     /// Per-field term dictionaries.
     pub field_term_dicts: Vec<TermDictionary>,
+    /// Per-field FST maps for fuzzy/prefix expansion (one per TEXT field, parallel to field_term_dicts).
+    /// None = no FST built yet (built at FT.COMPACT time). Exact queries unaffected when None (D-13).
+    #[cfg(feature = "text-index")]
+    pub fst_maps: Vec<Option<fst::Map<Vec<u8>>>>,
     /// Per-document field lengths: doc_id -> lengths per field index.
     pub doc_field_lengths: HashMap<u32, Vec<u32>>,
     /// Key hash -> doc_id mapping (same pattern as VectorIndex).
@@ -95,6 +119,8 @@ impl TextIndex {
             field_postings,
             field_stats,
             field_term_dicts,
+            #[cfg(feature = "text-index")]
+            fst_maps: (0..field_count).map(|_| None).collect(),
             doc_field_lengths: HashMap::new(),
             key_hash_to_doc_id: HashMap::new(),
             doc_id_to_key: HashMap::new(),
@@ -352,6 +378,249 @@ impl TextIndex {
         (result, n)
     }
 
+    /// Build FST maps for all fields from current TermDictionary contents.
+    ///
+    /// Called at FT.COMPACT time. Replaces any existing FST maps atomically (D-14).
+    /// After build, updates `fst_high_water_mark` so post-compaction terms can be
+    /// identified for dual-path expansion (D-12).
+    ///
+    /// Build failures are logged as warnings but do not abort — FST is an
+    /// acceleration structure; its absence only affects fuzzy/prefix queries.
+    #[cfg(feature = "text-index")]
+    pub fn build_fst(&mut self) {
+        for field_idx in 0..self.field_term_dicts.len() {
+            match crate::text::fst_dict::build_fst_from_term_dict(
+                &self.field_term_dicts[field_idx],
+            ) {
+                Ok(bytes) => match fst::Map::new(bytes) {
+                    Ok(map) => {
+                        self.fst_maps[field_idx] = Some(map);
+                        // Update high water mark: terms with id >= this were added post-compaction.
+                        self.field_term_dicts[field_idx].fst_high_water_mark =
+                            self.field_term_dicts[field_idx].next_id();
+                    }
+                    Err(e) => tracing::warn!("FST load failed for field {field_idx}: {e}"),
+                },
+                Err(e) => tracing::warn!("FST build failed for field {field_idx}: {e}"),
+            }
+        }
+    }
+
+    /// Expand a single query term into matching term IDs via FST + HashMap fallback.
+    ///
+    /// Exact terms: direct TermDictionary lookup (unchanged path).
+    /// Fuzzy/Prefix: FST expansion + post-compaction HashMap scan (D-12).
+    /// Returns empty Vec if no FST and term is Fuzzy/Prefix (D-13: not an error).
+    #[cfg(feature = "text-index")]
+    pub fn expand_terms(
+        &self,
+        field_idx: usize,
+        text: &str,
+        modifier: &TermModifier,
+    ) -> Vec<u32> {
+        const MAX_EXPANDED: usize = 50; // D-09
+
+        match modifier {
+            TermModifier::Exact => {
+                self.field_term_dicts[field_idx]
+                    .get(text)
+                    .map(|id| vec![id])
+                    .unwrap_or_default()
+            }
+            TermModifier::Fuzzy(dist) => {
+                let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
+                match &self.fst_maps[field_idx] {
+                    Some(fst_map) => {
+                        let mut ids = crate::text::fst_dict::expand_fuzzy(
+                            fst_map,
+                            text,
+                            *dist,
+                            &self.field_postings[field_idx],
+                            MAX_EXPANDED,
+                        );
+                        // D-12 dual-path: also scan post-compaction HashMap terms.
+                        let mut extra = crate::text::fst_dict::expand_fuzzy_hashmap(
+                            &self.field_term_dicts[field_idx],
+                            text,
+                            *dist,
+                            &self.field_postings[field_idx],
+                            hwm,
+                            MAX_EXPANDED,
+                        );
+                        ids.append(&mut extra);
+                        // Deduplicate and re-cap.
+                        ids.sort_unstable();
+                        ids.dedup();
+                        if ids.len() > MAX_EXPANDED {
+                            let postings = &self.field_postings[field_idx];
+                            ids.sort_unstable_by(|a, b| {
+                                postings.doc_freq(*b).cmp(&postings.doc_freq(*a))
+                            });
+                            ids.truncate(MAX_EXPANDED);
+                        }
+                        ids
+                    }
+                    None => {
+                        // No FST: brute-force scan entire HashMap (no compaction happened yet).
+                        crate::text::fst_dict::expand_fuzzy_hashmap(
+                            &self.field_term_dicts[field_idx],
+                            text,
+                            *dist,
+                            &self.field_postings[field_idx],
+                            0,
+                            MAX_EXPANDED,
+                        )
+                    }
+                }
+            }
+            TermModifier::Prefix => {
+                let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
+                match &self.fst_maps[field_idx] {
+                    Some(fst_map) => {
+                        let mut ids = crate::text::fst_dict::expand_prefix(
+                            fst_map,
+                            text,
+                            &self.field_postings[field_idx],
+                            MAX_EXPANDED,
+                        );
+                        let mut extra = crate::text::fst_dict::expand_prefix_hashmap(
+                            &self.field_term_dicts[field_idx],
+                            text,
+                            &self.field_postings[field_idx],
+                            hwm,
+                            MAX_EXPANDED,
+                        );
+                        ids.append(&mut extra);
+                        ids.sort_unstable();
+                        ids.dedup();
+                        if ids.len() > MAX_EXPANDED {
+                            let postings = &self.field_postings[field_idx];
+                            ids.sort_unstable_by(|a, b| {
+                                postings.doc_freq(*b).cmp(&postings.doc_freq(*a))
+                            });
+                            ids.truncate(MAX_EXPANDED);
+                        }
+                        ids
+                    }
+                    None => {
+                        // No FST: brute-force scan entire HashMap.
+                        crate::text::fst_dict::expand_prefix_hashmap(
+                            &self.field_term_dicts[field_idx],
+                            text,
+                            &self.field_postings[field_idx],
+                            0,
+                            MAX_EXPANDED,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Search a field with OR union of expanded term IDs (fuzzy/prefix queries).
+    ///
+    /// Returns the union of docs matching ANY of the expanded_term_ids.
+    /// Each doc is scored by the BEST-matching expanded term's BM25 (not sum, per D-05).
+    ///
+    /// This is the OR counterpart to `search_field()` which uses AND intersection.
+    /// Called for fuzzy/prefix queries after `expand_terms()` produces expanded_term_ids.
+    #[cfg(feature = "text-index")]
+    pub fn search_field_or(
+        &self,
+        field_idx: usize,
+        expanded_term_ids: &[u32],
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+        top_k: usize,
+    ) -> Vec<TextSearchResult> {
+        use roaring::RoaringBitmap;
+
+        if field_idx >= self.field_postings.len() || expanded_term_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // OR: union all posting list bitmaps (any expanded term match counts, D-05).
+        let mut candidate_bitmap = RoaringBitmap::new();
+        for &term_id in expanded_term_ids {
+            if let Some(posting) = self.field_postings[field_idx].get_posting(term_id) {
+                candidate_bitmap |= &posting.doc_ids;
+            }
+        }
+        if candidate_bitmap.is_empty() {
+            return Vec::new();
+        }
+
+        // Score each candidate: MAX BM25 across all matching expanded terms (D-05: best, not sum).
+        let stats = &self.field_stats[field_idx];
+        let n = global_n.unwrap_or(stats.num_docs);
+        let avgdl = stats.avg_doc_len();
+        let k1 = self.bm25_config.k1;
+        let b = self.bm25_config.b;
+        let weight = self.text_fields[field_idx].weight as f32;
+
+        let mut results: Vec<TextSearchResult> =
+            Vec::with_capacity(candidate_bitmap.len() as usize);
+
+        // global_df maps term strings -> df, but we have term_ids here (OR-union path).
+        // For fuzzy/prefix expansion, always use local posting list doc_freq.
+        // The global_df parameter is accepted for API symmetry with search_field() but unused.
+        let _ = global_df;
+
+        for doc_id in &candidate_bitmap {
+            let dl = self
+                .doc_field_lengths
+                .get(&doc_id)
+                .and_then(|lens| lens.get(field_idx).copied())
+                .unwrap_or(0);
+
+            let mut best_score = 0.0f32;
+            for &term_id in expanded_term_ids {
+                let Some(posting) = self.field_postings[field_idx].get_posting(term_id) else {
+                    continue;
+                };
+                if !posting.doc_ids.contains(doc_id) {
+                    continue;
+                }
+
+                // Linear scan TF lookup (same as search_field — insertion order, not rank).
+                let tf = posting
+                    .doc_ids
+                    .iter()
+                    .position(|id| id == doc_id)
+                    .map(|idx| posting.term_freqs[idx] as f32)
+                    .unwrap_or(0.0);
+
+                // Use local posting list df for expanded term IDs.
+                let df = posting.doc_ids.len() as u32;
+
+                let score = bm25_score(tf, df, n, dl, avgdl, k1, b) * weight;
+                if score > best_score {
+                    best_score = score;
+                }
+            }
+
+            let key = match self.doc_id_to_key.get(&doc_id) {
+                Some(k) => k.clone(),
+                None => continue, // orphaned doc_id — skip
+            };
+
+            results.push(TextSearchResult {
+                doc_id,
+                key,
+                score: best_score,
+            });
+        }
+
+        // Sort descending by BM25 score, truncate to top_k.
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(top_k);
+        results
+    }
+
     /// Number of indexed documents.
     pub fn num_docs(&self) -> u32 {
         self.key_hash_to_doc_id.len() as u32
@@ -496,6 +765,74 @@ impl TextStore {
     /// Number of text indexes.
     pub fn index_count(&self) -> usize {
         self.indexes.len()
+    }
+
+    /// Save FST sidecar for a specific index. No-op if persist_dir not set.
+    ///
+    /// Called after `TextIndex::build_fst()` at FT.COMPACT time (D-11).
+    #[cfg(feature = "text-index")]
+    pub fn save_fst_sidecar_for_index(&self, index_name: &[u8]) {
+        if let Some(ref dir) = self.persist_dir {
+            if let Some(idx) = self.indexes.get(index_name) {
+                let fst_data: Vec<Option<&[u8]>> = idx
+                    .fst_maps
+                    .iter()
+                    .map(|opt| opt.as_ref().map(|m| m.as_fst().as_bytes()))
+                    .collect();
+                if let Err(e) = crate::text::index_persist::save_fst_sidecar(
+                    dir,
+                    index_name,
+                    &fst_data,
+                ) {
+                    tracing::warn!(
+                        "Failed to save FST sidecar for {}: {}",
+                        String::from_utf8_lossy(index_name),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Load FST sidecars for all indexes. Called during startup/recovery (D-11).
+    ///
+    /// If a sidecar is missing for an index, that index's fst_maps remain None
+    /// (fuzzy/prefix queries will fall back to HashMap brute-force, D-13).
+    #[cfg(feature = "text-index")]
+    pub fn load_fst_sidecars(&mut self) {
+        if let Some(ref dir) = self.persist_dir {
+            let dir = dir.clone();
+            let names: Vec<Bytes> = self.indexes.keys().cloned().collect();
+            for name in names {
+                match crate::text::index_persist::load_fst_sidecar(&dir, name.as_ref()) {
+                    Ok(field_fsts) if !field_fsts.is_empty() => {
+                        if let Some(idx) = self.indexes.get_mut(name.as_ref()) {
+                            for (field_idx, fst_bytes_opt) in field_fsts.into_iter().enumerate() {
+                                if field_idx < idx.fst_maps.len() {
+                                    if let Some(bytes) = fst_bytes_opt {
+                                        match fst::Map::new(bytes) {
+                                            Ok(map) => idx.fst_maps[field_idx] = Some(map),
+                                            Err(e) => tracing::warn!(
+                                                "FST load failed for {}[{}]: {}",
+                                                String::from_utf8_lossy(name.as_ref()),
+                                                field_idx,
+                                                e
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {} // No sidecar — ok, fst_maps stay None
+                    Err(e) => tracing::warn!(
+                        "Failed to load FST sidecar for {}: {}",
+                        String::from_utf8_lossy(name.as_ref()),
+                        e
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -654,5 +991,97 @@ mod tests {
         assert_eq!(machin_df, 2, "'machine' appears in doc:0 and doc:1");
         assert_eq!(learn_df, 2, "'learning' appears in doc:1 and doc:2");
         assert_eq!(vision_df, 1, "'vision' appears only in doc:0");
+    }
+
+    #[test]
+    fn test_build_fst_and_search_field_or() {
+        // doc:0 "machine vision", doc:1 "deep learning", doc:2 "machine learning deep"
+        let mut idx = make_index_with_docs(&[
+            ("doc:0", "machine vision"),
+            ("doc:1", "deep learning"),
+            ("doc:2", "machine learning deep"),
+        ]);
+
+        // Build FST from current TermDictionary
+        idx.build_fst();
+
+        // fst_maps[0] should now be Some
+        assert!(
+            idx.fst_maps[0].is_some(),
+            "FST map should be built after build_fst()"
+        );
+
+        // Expand "machin" (stemmed "machine") via expand_terms with Exact modifier
+        let term_ids = idx.expand_terms(0, "machin", &TermModifier::Exact);
+        assert_eq!(term_ids.len(), 1, "Exact 'machin' should find 1 term_id");
+
+        // search_field_or with the expanded ids (OR: docs 0 and 2 both have "machin")
+        let results = idx.search_field_or(0, &term_ids, None, None, 10);
+        assert_eq!(results.len(), 2, "OR search for 'machin' should match doc:0 and doc:2");
+        // All results should have positive scores
+        for r in &results {
+            assert!(r.score > 0.0, "BM25 score must be positive");
+        }
+    }
+
+    #[test]
+    fn test_expand_terms_exact() {
+        let idx = make_index_with_docs(&[("doc:0", "machine vision")]);
+        // "machin" is the stemmed form of "machine" stored in TermDictionary
+        let ids = idx.expand_terms(0, "machin", &TermModifier::Exact);
+        assert_eq!(ids.len(), 1, "Exact term lookup should return 1 id");
+
+        // Non-existent term returns empty
+        let missing = idx.expand_terms(0, "xyz_nonexistent", &TermModifier::Exact);
+        assert!(missing.is_empty(), "Missing term should return empty Vec");
+    }
+
+    #[test]
+    fn test_expand_terms_fuzzy_no_fst() {
+        // When fst_maps is None, fuzzy should fall back to HashMap brute-force
+        let idx = make_index_with_docs(&[("doc:0", "machine vision")]);
+        // fst_maps[0] is None (no build_fst called)
+        assert!(idx.fst_maps[0].is_none(), "fst_maps should be None initially");
+
+        // "machn" is edit-distance 1 from "machin" — brute-force should find it
+        let ids = idx.expand_terms(0, "machn", &TermModifier::Fuzzy(1));
+        assert!(
+            !ids.is_empty(),
+            "Fuzzy without FST should still find 'machin' via HashMap brute-force"
+        );
+    }
+
+    #[test]
+    fn test_fst_sidecar_roundtrip() {
+        use crate::text::index_persist::{load_fst_sidecar, save_fst_sidecar};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Build two mock field FSTs (just simple byte vecs for testing format)
+        let field0_bytes = b"some_fst_bytes_field0";
+        let field1_bytes: Option<&[u8]> = None; // field 1 has no FST
+
+        let fst_data: Vec<Option<&[u8]>> = vec![Some(field0_bytes), field1_bytes];
+        save_fst_sidecar(tmp.path(), b"test_idx", &fst_data).expect("save FST sidecar");
+
+        let loaded = load_fst_sidecar(tmp.path(), b"test_idx").expect("load FST sidecar");
+        assert_eq!(loaded.len(), 2, "Should have 2 field entries");
+        assert!(loaded[0].is_some(), "Field 0 should have FST bytes");
+        assert_eq!(
+            loaded[0].as_deref().unwrap(),
+            field0_bytes,
+            "Field 0 FST bytes should match"
+        );
+        assert!(loaded[1].is_none(), "Field 1 should be None");
+    }
+
+    #[test]
+    fn test_fst_sidecar_missing_returns_empty() {
+        use crate::text::index_persist::load_fst_sidecar;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No file written — load should return empty Vec (not error)
+        let loaded = load_fst_sidecar(tmp.path(), b"nonexistent_idx").expect("load");
+        assert!(loaded.is_empty(), "Missing sidecar should return empty Vec");
     }
 }
