@@ -2360,4 +2360,145 @@ mod tests {
         assert_eq!(result.terms[0].modifier, TermModifier::Fuzzy(1));
         assert_eq!(result.terms[0].text, "machin");
     }
+
+    // ── Contract tests for execute_text_search_local (151-03 gap closure) ─────
+    // These lock in the library-level guarantees that the single-shard handler
+    // fast-path relies on. If the handler routing code regresses, the integration
+    // gate (scripts/test-commands.sh on --shards 1) is the end-to-end canary; these
+    // unit tests freeze the library contract so we know the substrate is sound.
+
+    #[cfg(feature = "text-index")]
+    fn build_fuzzy_test_textstore() -> crate::text::store::TextStore {
+        use crate::text::store::{TextIndex, TextStore};
+        use crate::text::types::{BM25Config, TextFieldDef};
+
+        let field = TextFieldDef::new(bytes::Bytes::from_static(b"title"));
+        let mut idx = TextIndex::new(
+            bytes::Bytes::from_static(b"fuzzyidx"),
+            Vec::new(),
+            vec![field],
+            BM25Config::default(),
+        );
+        let docs: &[(&[u8], &[u8])] = &[
+            (b"fz:1", b"Machine Learning"),
+            (b"fz:2", b"Deep Learning"),
+            (b"fz:3", b"Machinery Parts"),
+        ];
+        for (i, (key, text)) in docs.iter().enumerate() {
+            let key_hash = i as u64;
+            let args = vec![
+                Frame::BulkString(bytes::Bytes::from_static(b"title")),
+                Frame::BulkString(bytes::Bytes::copy_from_slice(text)),
+            ];
+            idx.index_document(key_hash, key, &args);
+        }
+        idx.build_fst(); // required for fuzzy/prefix expansion
+        let mut ts = TextStore::new();
+        // .unwrap() permitted in test code per CLAUDE.md Error Handling rules.
+        ts.create_index(bytes::Bytes::from_static(b"fuzzyidx"), idx)
+            .unwrap();
+        ts
+    }
+
+    /// Helper: flatten Frame::Array(items) result and find doc-key hits.
+    #[cfg(feature = "text-index")]
+    fn extract_hits(frame: &Frame) -> (i64, Vec<Bytes>) {
+        match frame {
+            Frame::Array(items) => {
+                let total = match items.first() {
+                    Some(Frame::Integer(n)) => *n,
+                    _ => -1,
+                };
+                // Items alternate: [total, key1, fields1, key2, fields2, ...]
+                let keys = items
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .filter_map(|f| match f {
+                        Frame::BulkString(b) => Some(b.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (total, keys)
+            }
+            other => panic!("expected Frame::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_execute_text_search_local_fuzzy_single_shard() {
+        let ts = build_fuzzy_test_textstore();
+        // Use a fresh analyzer matching the one used to index (English + stemming).
+        // AnalyzerPipeline is not Clone; the index owns its pipeline so we build a
+        // parallel instance with identical config for the test query.
+        let analyzer = make_analyzer();
+        // "%%machne%%" -> Fuzzy(distance=2) on "machne" -> should match
+        // "machin" (stemmed "Machine") within edit distance 2.
+        let clause =
+            parse_text_query(b"%%machne%%", &analyzer).expect("parse_text_query must succeed");
+        let frame = execute_text_search_local(&ts, b"fuzzyidx", None, &clause.terms, 10, 0, 10);
+        assert!(
+            !matches!(frame, Frame::Error(_)),
+            "fuzzy search returned Frame::Error: {frame:?}"
+        );
+        let (total, keys) = extract_hits(&frame);
+        assert!(
+            total >= 1,
+            "expected ≥1 fuzzy hit for %%machne%%, got total={total}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_ref() == b"fz:1"),
+            "expected fz:1 (Machine Learning) in hits, got {keys:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_execute_text_search_local_prefix_single_shard() {
+        let ts = build_fuzzy_test_textstore();
+        let analyzer = make_analyzer();
+        // "mach*" -> Prefix on "mach" -> should match both "machin" (Machine)
+        // and "machineri" (Machinery) after stemming/prefix expansion.
+        let clause = parse_text_query(b"mach*", &analyzer).expect("parse_text_query must succeed");
+        let frame = execute_text_search_local(&ts, b"fuzzyidx", None, &clause.terms, 10, 0, 10);
+        assert!(
+            !matches!(frame, Frame::Error(_)),
+            "prefix search returned Frame::Error: {frame:?}"
+        );
+        let (total, keys) = extract_hits(&frame);
+        assert!(total >= 2, "expected ≥2 prefix hits for mach*, got {total}");
+        assert!(
+            keys.iter().any(|k| k.as_ref() == b"fz:1"),
+            "expected fz:1 in prefix hits, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_ref() == b"fz:3"),
+            "expected fz:3 in prefix hits, got {keys:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "text-index")]
+    fn test_execute_text_search_local_exact_single_shard() {
+        let ts = build_fuzzy_test_textstore();
+        let analyzer = make_analyzer();
+        // "machine" -> Exact "machine" -> stemmer yields "machin" -> match fz:1.
+        let clause =
+            parse_text_query(b"machine", &analyzer).expect("parse_text_query must succeed");
+        let frame = execute_text_search_local(&ts, b"fuzzyidx", None, &clause.terms, 10, 0, 10);
+        assert!(
+            !matches!(frame, Frame::Error(_)),
+            "exact search returned Frame::Error: {frame:?}"
+        );
+        let (total, keys) = extract_hits(&frame);
+        assert!(
+            total >= 1,
+            "expected ≥1 exact hit for 'machine', got {total}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_ref() == b"fz:1"),
+            "expected fz:1 in exact hits, got {keys:?}"
+        );
+    }
 }
