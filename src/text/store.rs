@@ -13,6 +13,8 @@ use crate::text::bm25::{FieldStats, bm25_score};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
+#[cfg(feature = "text-index")]
+use crate::text::types::TagFieldDef;
 use crate::text::types::{BM25Config, TextFieldDef};
 
 /// Modifier for a query term — controls expansion strategy (D-16).
@@ -79,6 +81,25 @@ pub struct TextIndex {
     pub doc_id_to_key: HashMap<u32, Bytes>,
     /// Next doc_id to assign.
     next_doc_id: u32,
+
+    // ── TAG index (Plan 152-06, Phase 152) ────────────────────────────────
+    //
+    // TAG semantics bypass the BM25 analyzer entirely. Storage is a two-level
+    // map: field_name -> (normalized tag_value -> doc_id bitmap). `doc_tag_entries`
+    // tracks the per-doc tag list so per-field upserts can evict stale entries
+    // without wiping untouched fields (partial HSET case, Blocker 4).
+    /// TAG field definitions from the FT.CREATE schema (empty on TEXT-only indexes).
+    #[cfg(feature = "text-index")]
+    pub tag_fields: Vec<TagFieldDef>,
+    /// `field_name -> (tag_value -> RoaringBitmap<doc_id>)`.
+    /// Outer key is the canonical declared field name (from `TagFieldDef::field_name`).
+    /// Inner key is the normalized tag value (ASCII-lowercased unless CASESENSITIVE).
+    #[cfg(feature = "text-index")]
+    pub tag_indexes: HashMap<Bytes, HashMap<Bytes, roaring::RoaringBitmap>>,
+    /// `doc_id -> list of (canonical_field, normalized_value)` entries currently
+    /// indexed for that document. Used to revoke stale entries on per-field upsert.
+    #[cfg(feature = "text-index")]
+    pub doc_tag_entries: HashMap<u32, smallvec::SmallVec<[(Bytes, Bytes); 8]>>,
 }
 
 impl TextIndex {
@@ -125,7 +146,61 @@ impl TextIndex {
             key_hash_to_doc_id: HashMap::new(),
             doc_id_to_key: HashMap::new(),
             next_doc_id: 0,
+            #[cfg(feature = "text-index")]
+            tag_fields: Vec::new(),
+            #[cfg(feature = "text-index")]
+            tag_indexes: HashMap::new(),
+            #[cfg(feature = "text-index")]
+            doc_tag_entries: HashMap::new(),
         }
+    }
+
+    /// Create a TextIndex with an explicit TAG schema (Plan 152-06).
+    ///
+    /// This is the constructor used by `FT.CREATE` when the parsed schema
+    /// includes TAG fields. Text-only callers continue to use `new()` — the
+    /// signature for `new()` is unchanged, so the 33 existing call sites
+    /// compile untouched.
+    ///
+    /// The outer `tag_indexes` map is seeded with one empty inner map per
+    /// declared TAG field so `search_tag` on never-inserted fields returns
+    /// empty-but-present rather than missing-key (determinism).
+    #[cfg(feature = "text-index")]
+    pub fn new_with_schema(
+        name: Bytes,
+        key_prefixes: Vec<Bytes>,
+        text_fields: Vec<TextFieldDef>,
+        tag_fields: Vec<TagFieldDef>,
+        bm25_config: BM25Config,
+    ) -> Self {
+        let mut idx = Self::new(name, key_prefixes, text_fields, bm25_config);
+        for tag_def in &tag_fields {
+            idx.tag_indexes
+                .entry(tag_def.field_name.clone())
+                .or_default();
+        }
+        idx.tag_fields = tag_fields;
+        idx
+    }
+
+    /// Allocate (or fetch) the internal doc_id for this key_hash.
+    ///
+    /// Shared by `index_document`, `tag_index_document`, and (Plan 07)
+    /// `numeric_index_document` so doc_ids are stable regardless of which
+    /// method sees a key first. Removes the implicit ordering dependency
+    /// that existed when each method managed `next_doc_id` independently
+    /// (Blocker 7).
+    #[cfg(feature = "text-index")]
+    pub(crate) fn ensure_doc_id(&mut self, key_hash: u64, key: &[u8]) -> u32 {
+        if let Some(&id) = self.key_hash_to_doc_id.get(&key_hash) {
+            return id;
+        }
+        let id = self.next_doc_id;
+        self.next_doc_id += 1;
+        self.key_hash_to_doc_id.insert(key_hash, id);
+        self.doc_id_to_key
+            .insert(id, Bytes::copy_from_slice(key));
+        id
     }
 
     /// Index a document from HSET args.
@@ -389,9 +464,8 @@ impl TextIndex {
     #[cfg(feature = "text-index")]
     pub fn build_fst(&mut self) {
         for field_idx in 0..self.field_term_dicts.len() {
-            match crate::text::fst_dict::build_fst_from_term_dict(
-                &self.field_term_dicts[field_idx],
-            ) {
+            match crate::text::fst_dict::build_fst_from_term_dict(&self.field_term_dicts[field_idx])
+            {
                 Ok(bytes) => match fst::Map::new(bytes) {
                     Ok(map) => {
                         self.fst_maps[field_idx] = Some(map);
@@ -412,21 +486,14 @@ impl TextIndex {
     /// Fuzzy/Prefix: FST expansion + post-compaction HashMap scan (D-12).
     /// Returns empty Vec if no FST and term is Fuzzy/Prefix (D-13: not an error).
     #[cfg(feature = "text-index")]
-    pub fn expand_terms(
-        &self,
-        field_idx: usize,
-        text: &str,
-        modifier: &TermModifier,
-    ) -> Vec<u32> {
+    pub fn expand_terms(&self, field_idx: usize, text: &str, modifier: &TermModifier) -> Vec<u32> {
         const MAX_EXPANDED: usize = 50; // D-09
 
         match modifier {
-            TermModifier::Exact => {
-                self.field_term_dicts[field_idx]
-                    .get(text)
-                    .map(|id| vec![id])
-                    .unwrap_or_default()
-            }
+            TermModifier::Exact => self.field_term_dicts[field_idx]
+                .get(text)
+                .map(|id| vec![id])
+                .unwrap_or_default(),
             TermModifier::Fuzzy(dist) => {
                 let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
                 match &self.fst_maps[field_idx] {
@@ -621,6 +688,189 @@ impl TextIndex {
         results
     }
 
+    // ── TAG indexing (Plan 152-06) ─────────────────────────────────────────
+
+    /// Index TAG fields from an HSET payload.
+    ///
+    /// Per-field upsert semantics (Blocker 4): only fields present in `args`
+    /// have their prior entries revoked before re-inserting. Fields absent
+    /// from the HSET payload preserve their previous tag assignments — this
+    /// is what makes `HSET doc:1 priority low` not clobber a prior
+    /// `HSET doc:1 status open priority high`.
+    ///
+    /// Safety caps:
+    /// - `TAG_VALUE_MAX_LEN = 4096` bytes per HSET value (rejected with warn).
+    /// - `TAG_VALUES_PER_FIELD_PER_DOC = 1024` distinct values per field per doc.
+    ///
+    /// Allocation profile: write-path, not dispatch hot-path. One
+    /// `Bytes::copy_from_slice` per touched TAG field (bounded by
+    /// TAG_VALUE_MAX_LEN); ASCII-lowercase fast-path avoids a second copy
+    /// when the value is already lowercase.
+    #[cfg(feature = "text-index")]
+    pub fn tag_index_document(
+        &mut self,
+        key_hash: u64,
+        key: &[u8],
+        args: &[crate::protocol::Frame],
+    ) {
+        if self.tag_fields.is_empty() {
+            return;
+        }
+
+        const TAG_VALUE_MAX_LEN: usize = 4096;
+        const TAG_VALUES_PER_FIELD_PER_DOC: usize = 1_024;
+
+        let doc_id = self.ensure_doc_id(key_hash, key);
+
+        // Determine which declared TAG fields the HSET payload touches.
+        let mut touched: smallvec::SmallVec<[Bytes; 8]> = smallvec::SmallVec::new();
+        for tag_def in &self.tag_fields {
+            if tag_def.noindex {
+                continue;
+            }
+            if find_field_value(args, &tag_def.field_name).is_some() {
+                touched.push(tag_def.field_name.clone()); // Arc bump, not deep copy
+            }
+        }
+
+        // Rebuild `doc_tag_entries[doc_id]`: keep untouched-field entries, drop touched-field entries.
+        let prior = self.doc_tag_entries.remove(&doc_id).unwrap_or_default();
+        let mut next: smallvec::SmallVec<[(Bytes, Bytes); 8]> = smallvec::SmallVec::new();
+        for (field, value) in prior.into_iter() {
+            let is_touched = touched.iter().any(|f| f == &field);
+            if is_touched {
+                if let Some(field_map) = self.tag_indexes.get_mut(&field) {
+                    if let Some(bm) = field_map.get_mut(&value) {
+                        bm.remove(doc_id);
+                        if bm.is_empty() {
+                            field_map.remove(&value);
+                        }
+                    }
+                }
+            } else {
+                next.push((field, value));
+            }
+        }
+
+        // Insert fresh entries for each touched field.
+        for tag_def in &self.tag_fields {
+            if tag_def.noindex {
+                continue;
+            }
+            let Some(value_bytes_slice) = find_field_value(args, &tag_def.field_name) else {
+                continue;
+            };
+            if value_bytes_slice.len() > TAG_VALUE_MAX_LEN {
+                tracing::warn!(
+                    field = ?tag_def.field_name,
+                    len = value_bytes_slice.len(),
+                    "TAG value exceeds 4 KiB — skipped"
+                );
+                continue;
+            }
+
+            // Bounded write-path allocation: one Bytes::copy_from_slice per touched
+            // tag field. `Frame::BulkString` stores Bytes but `find_field_value`
+            // yields `&[u8]` (cross-cutting refactor out of scope for gap closure).
+            let value_bytes: Bytes = Bytes::copy_from_slice(value_bytes_slice);
+
+            let mut seen: smallvec::SmallVec<[Bytes; 16]> = smallvec::SmallVec::new();
+            let mut truncated = false;
+            let mut cursor = 0usize;
+            while cursor <= value_bytes.len() {
+                let end = value_bytes[cursor..]
+                    .iter()
+                    .position(|b| *b == tag_def.separator)
+                    .map(|p| cursor + p)
+                    .unwrap_or(value_bytes.len());
+                let chunk_len = end.saturating_sub(cursor);
+                if chunk_len > 0 {
+                    let normalized = normalize_tag_value(
+                        &value_bytes,
+                        cursor,
+                        chunk_len,
+                        tag_def.case_sensitive,
+                    );
+                    if !seen.iter().any(|s| s == &normalized) {
+                        if seen.len() < TAG_VALUES_PER_FIELD_PER_DOC {
+                            seen.push(normalized);
+                        } else {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                }
+                if end == value_bytes.len() {
+                    break;
+                }
+                cursor = end + 1;
+            }
+            if truncated {
+                tracing::warn!(
+                    field = ?tag_def.field_name,
+                    limit = TAG_VALUES_PER_FIELD_PER_DOC,
+                    "TAG values truncated"
+                );
+            }
+
+            let canonical_field = tag_def.field_name.clone(); // Arc bump
+            let field_map = self
+                .tag_indexes
+                .entry(canonical_field.clone())
+                .or_default();
+            for value in seen.into_iter() {
+                field_map
+                    .entry(value.clone())
+                    .or_default()
+                    .insert(doc_id);
+                next.push((canonical_field.clone(), value));
+            }
+        }
+
+        if !next.is_empty() {
+            self.doc_tag_entries.insert(doc_id, next);
+        }
+    }
+
+    /// Look up documents tagged with a specific value on a specific field.
+    ///
+    /// Returns doc_ids in ascending order. Field resolution is
+    /// case-insensitive: `@Status:{open}` on an index declaring `status`
+    /// resolves correctly (Blocker 2). The value is normalized using the
+    /// same rules used on insert (ASCII-lowercase unless CASESENSITIVE).
+    #[cfg(feature = "text-index")]
+    pub fn search_tag(&self, field: &Bytes, value: &Bytes) -> Vec<u32> {
+        let (canonical_field, case_sensitive) = match self
+            .tag_fields
+            .iter()
+            .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
+        {
+            Some(f) => (f.field_name.clone(), f.case_sensitive),
+            None => return Vec::new(),
+        };
+
+        let normalized_value: Bytes = if case_sensitive {
+            value.clone()
+        } else if value.iter().all(|b| !b.is_ascii_uppercase()) {
+            value.clone()
+        } else {
+            let mut v = Vec::with_capacity(value.len());
+            for b in value.iter() {
+                v.push(b.to_ascii_lowercase());
+            }
+            Bytes::from(v)
+        };
+
+        match self
+            .tag_indexes
+            .get(&canonical_field)
+            .and_then(|m| m.get(&normalized_value))
+        {
+            Some(bm) => bm.iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Number of indexed documents.
     pub fn num_docs(&self) -> u32 {
         self.key_hash_to_doc_id.len() as u32
@@ -638,6 +888,46 @@ impl TextIndex {
             .map(|p| p.estimated_bytes())
             .sum()
     }
+}
+
+#[cfg(feature = "text-index")]
+thread_local! {
+    /// Scratch buffer for ASCII-lowercase normalization of TAG values on the
+    /// HSET write path. Reused across calls to avoid per-tag Vec allocation
+    /// on the slow path. Retained capacity is bounded by the tag-value cap
+    /// (4 KiB) so it does not leak a large buffer across shards.
+    static TAG_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Normalize a TAG value slice for storage / lookup.
+///
+/// Fast path: if the slice is already ASCII-lowercase (or `case_sensitive`
+/// is set), return a zero-copy `Bytes::slice` — no allocation. Slow path:
+/// fill the per-thread TAG_SCRATCH buffer and return one `Bytes::copy_from_slice`.
+#[cfg(feature = "text-index")]
+fn normalize_tag_value(
+    value_bytes: &Bytes,
+    offset: usize,
+    len: usize,
+    case_sensitive: bool,
+) -> Bytes {
+    let slice = value_bytes.slice(offset..offset + len);
+    if case_sensitive {
+        return slice;
+    }
+    if slice.iter().all(|b| !b.is_ascii_uppercase()) {
+        return slice;
+    }
+    TAG_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.reserve(slice.len());
+        for b in slice.iter() {
+            buf.push(b.to_ascii_lowercase());
+        }
+        Bytes::copy_from_slice(&buf)
+    })
 }
 
 /// Find a field value in HSET-style pairwise args.
@@ -779,11 +1069,9 @@ impl TextStore {
                     .iter()
                     .map(|opt| opt.as_ref().map(|m| m.as_fst().as_bytes()))
                     .collect();
-                if let Err(e) = crate::text::index_persist::save_fst_sidecar(
-                    dir,
-                    index_name,
-                    &fst_data,
-                ) {
+                if let Err(e) =
+                    crate::text::index_persist::save_fst_sidecar(dir, index_name, &fst_data)
+                {
                     tracing::warn!(
                         "Failed to save FST sidecar for {}: {}",
                         String::from_utf8_lossy(index_name),
@@ -1017,7 +1305,11 @@ mod tests {
 
         // search_field_or with the expanded ids (OR: docs 0 and 2 both have "machin")
         let results = idx.search_field_or(0, &term_ids, None, None, 10);
-        assert_eq!(results.len(), 2, "OR search for 'machin' should match doc:0 and doc:2");
+        assert_eq!(
+            results.len(),
+            2,
+            "OR search for 'machin' should match doc:0 and doc:2"
+        );
         // All results should have positive scores
         for r in &results {
             assert!(r.score > 0.0, "BM25 score must be positive");
@@ -1041,7 +1333,10 @@ mod tests {
         // When fst_maps is None, fuzzy should fall back to HashMap brute-force
         let idx = make_index_with_docs(&[("doc:0", "machine vision")]);
         // fst_maps[0] is None (no build_fst called)
-        assert!(idx.fst_maps[0].is_none(), "fst_maps should be None initially");
+        assert!(
+            idx.fst_maps[0].is_none(),
+            "fst_maps should be None initially"
+        );
 
         // "machn" is edit-distance 1 from "machin" — brute-force should find it
         let ids = idx.expand_terms(0, "machn", &TermModifier::Fuzzy(1));

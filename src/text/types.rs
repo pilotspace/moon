@@ -51,3 +51,45 @@ impl Default for BM25Config {
         Self { k1: 1.2, b: 0.75 }
     }
 }
+
+/// TAG field definition parsed from FT.CREATE.
+///
+/// TAG semantics (matches RediSearch):
+/// - Exact membership lookup via `@field:{value}` — no stemming, no stopword filtering.
+/// - Case-insensitive by default (ASCII lowercase); `CASESENSITIVE` modifier flips this.
+/// - Multi-value split on `separator` (default `,`). Empty tokens between separators are skipped.
+/// - Field-name resolution is case-insensitive (`@Status:{open}` resolves `status`).
+///
+/// Plan 07 mirrors this shape for NUMERIC fields. The `FieldFilter` enum
+/// (declared in `command::vector_search::ft_text_search`) carries TAG / NUMERIC
+/// clauses through the query path without invoking the text analyzer.
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone)]
+pub struct TagFieldDef {
+    /// Canonical field name. Stored once; comparisons use `eq_ignore_ascii_case`
+    /// so queries for `@Status:{open}` still resolve `status`.
+    pub field_name: bytes::Bytes,
+    /// Separator byte used to split multi-value tag payloads (default `b','`).
+    pub separator: u8,
+    /// When true, store tag values byte-for-byte. When false (default), values
+    /// are ASCII-lowercased on both insert and lookup.
+    pub case_sensitive: bool,
+    /// Whether to expose the field for SORTABLE-aware aggregation (v1: stored, not consumed).
+    pub sortable: bool,
+    /// Declared but not indexed (schema recall only).
+    pub noindex: bool,
+}
+
+#[cfg(feature = "text-index")]
+impl TagFieldDef {
+    /// Create a new TAG field definition with RediSearch-compatible defaults.
+    pub fn new(field_name: bytes::Bytes) -> Self {
+        Self {
+            field_name,
+            separator: b',',
+            case_sensitive: false,
+            sortable: false,
+            noindex: false,
+        }
+    }
+}

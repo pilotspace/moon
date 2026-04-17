@@ -1403,6 +1403,10 @@ fn auto_index_hset(
         if let Some(idx) = text_store.get_index_mut(&idx_name) {
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
             idx.index_document(key_hash, key, text_args);
+            // TAG auto-indexing (Plan 152-06): safe no-op on indexes with no
+            // TAG fields (tag_index_document returns early on empty tag_fields).
+            #[cfg(feature = "text-index")]
+            idx.tag_index_document(key_hash, key, text_args);
         }
     }
 }
