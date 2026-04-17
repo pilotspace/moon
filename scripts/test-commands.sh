@@ -889,6 +889,59 @@ if should_run "vector"; then
     # Verify index is gone
     assert_moon "FT._LIST empty" "" FT._LIST
 
+    # ── FT.DROPINDEX DD flag tests ──────────────────────────────────────────
+    # DD flag deletes all indexed documents along with the index
+
+    # Create a fresh index for DD tests
+    assert_moon_ok "FT.CREATE dd_test" FT.CREATE ddtest ON HASH PREFIX 1 dd: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
+
+    # Insert documents
+    printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
+        | redis-cli -x -p "$PORT" HSET dd:1 vec >/dev/null 2>&1
+    printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
+        | redis-cli -x -p "$PORT" HSET dd:2 vec >/dev/null 2>&1
+
+    # Verify documents exist
+    TOTAL=$((TOTAL + 1)); DD_EXISTS=$(mcli EXISTS dd:1 dd:2 2>&1)
+    if [ "$DD_EXISTS" = "2" ]; then PASS=$((PASS + 1)); echo "  PASS: DD docs exist before drop"; else FAIL=$((FAIL + 1)); echo "  FAIL: DD docs should exist (got: $DD_EXISTS)"; fi
+
+    # Drop with DD flag — documents should be deleted
+    assert_moon_ok "FT.DROPINDEX DD" FT.DROPINDEX ddtest DD
+
+    # Verify documents are gone
+    TOTAL=$((TOTAL + 1)); DD_AFTER=$(mcli EXISTS dd:1 dd:2 2>&1)
+    if [ "$DD_AFTER" = "0" ]; then PASS=$((PASS + 1)); echo "  PASS: DD docs deleted after FT.DROPINDEX DD"; else FAIL=$((FAIL + 1)); echo "  FAIL: DD docs should be deleted (got: $DD_AFTER)"; fi
+
+    # Test case insensitivity: create another index
+    assert_moon_ok "FT.CREATE dd_test2" FT.CREATE ddtest2 ON HASH PREFIX 1 dd2: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
+    printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
+        | redis-cli -x -p "$PORT" HSET dd2:1 vec >/dev/null 2>&1
+
+    # Drop with lowercase dd flag
+    assert_moon_ok "FT.DROPINDEX dd (lowercase)" FT.DROPINDEX ddtest2 dd
+
+    TOTAL=$((TOTAL + 1)); DD2_AFTER=$(mcli EXISTS dd2:1 2>&1)
+    if [ "$DD2_AFTER" = "0" ]; then PASS=$((PASS + 1)); echo "  PASS: lowercase dd flag works"; else FAIL=$((FAIL + 1)); echo "  FAIL: lowercase dd should work (got: $DD2_AFTER)"; fi
+
+    # Test without DD — documents should remain
+    assert_moon_ok "FT.CREATE no_dd_test" FT.CREATE noddtest ON HASH PREFIX 1 ndd: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
+    printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
+        | redis-cli -x -p "$PORT" HSET ndd:1 vec >/dev/null 2>&1
+
+    assert_moon_ok "FT.DROPINDEX no DD" FT.DROPINDEX noddtest
+
+    TOTAL=$((TOTAL + 1)); NDD_AFTER=$(mcli EXISTS ndd:1 2>&1)
+    if [ "$NDD_AFTER" = "1" ]; then PASS=$((PASS + 1)); echo "  PASS: no DD preserves documents"; else FAIL=$((FAIL + 1)); echo "  FAIL: no DD should preserve docs (got: $NDD_AFTER)"; fi
+
+    # Cleanup
+    mcli DEL ndd:1 >/dev/null 2>&1
+
+    # Test DD on non-existent index returns error
+    TOTAL=$((TOTAL + 1)); DD_NONEXIST=$(mcli FT.DROPINDEX nonexistent_idx DD 2>&1)
+    if echo "$DD_NONEXIST" | grep -qi "unknown\|err"; then PASS=$((PASS + 1)); echo "  PASS: DD on non-existent index errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: DD on non-existent should error (got: $DD_NONEXIST)"; fi
+
+    # ── End DD flag tests ────────────────────────────────────────────────────
+
     echo "  vector: $PASS passed (of $TOTAL total)"
 fi
 
