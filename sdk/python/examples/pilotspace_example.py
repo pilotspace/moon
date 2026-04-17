@@ -333,7 +333,15 @@ def _probe_tag_support(client: Any) -> bool:  # noqa: ANN401 -- Mock|MoonClient
     if isinstance(cached, bool):
         return cached
     try:
-        client.text.create_text_index(_PROBE_INDEX, [("f", "TAG", {})])
+        # NOTE: pass a `prefix=` so the underlying FT.CREATE clears
+        # moon's 8-arg arity floor (FT.CREATE <name> ON HASH PREFIX 1
+        # <prefix> SCHEMA f TAG == 10 args). Without PREFIX the probe
+        # would itself fail with "wrong number of arguments" on moon
+        # even when TAG is supported, producing a false-negative
+        # fallback to the TEXT-only schema.
+        client.text.create_text_index(
+            _PROBE_INDEX, [("f", "TAG", {})], prefix="__moon_probe_tag__:"
+        )
     except Exception:  # noqa: BLE001 -- any server-side rejection → TAG unsupported
         client.__dict__[_PROBE_CACHE_KEY] = False
         return False
