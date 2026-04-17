@@ -603,3 +603,63 @@ class TestLangChainHybridRetriever:
 
         # Should NOT be MoonHybridRetriever — it must be the LangChain default.
         assert not isinstance(retriever, MoonHybridRetriever)
+
+
+# =============================================================================
+# LlamaIndex hybrid mode — end-to-end client-preservation (Plan 153-05 Gap 4)
+# =============================================================================
+
+
+class TestLlamaIndexHybridMode:
+    """End-to-end verification that a user-supplied moon_client is actually
+    the one invoked during a hybrid query.
+
+    This class locks the Plan 153-05 fix at the integration boundary: not
+    just "_client is c" (that is what test_integrations.py asserts) but
+    "the hybrid query path routes through c.text.hybrid_search and nowhere
+    else". Catches regressions where a future refactor reintroduces a
+    shadow client at query time.
+    """
+
+    def test_llamaindex_hybrid_uses_supplied_client(self, li_deps: None) -> None:
+        """HYBRID query on a store built with moon_client=c dispatches to c.text.hybrid_search."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.integrations.llamaindex import MoonVectorStore
+        from moondb.types import TextSearchHit
+
+        user_client = MagicMock(name="user-supplied-client")
+        user_client.text = MagicMock()
+        user_client.text.hybrid_search.return_value = [
+            TextSearchHit(
+                id="node:1",
+                score=7.5,
+                fields={"content": "answer", "_node_id": "abc"},
+            ),
+        ]
+
+        # Patch _ensure_index only; DO NOT patch _ensure_client — we want
+        # the real code path to resolve self._client from the popped kwarg.
+        with patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(
+                index_name="test",
+                moon_client=user_client,
+                dim=4,
+            )
+
+        result = store.query(VectorStoreQuery(
+            query_embedding=[0.1] * 4,
+            query_str="q",
+            mode=VectorStoreQueryMode.HYBRID,
+            similarity_top_k=1,
+        ))
+
+        # The supplied client's hybrid_search MUST have been invoked.
+        user_client.text.hybrid_search.assert_called_once()
+        # And the dense KNN path must NOT have been invoked.
+        user_client.vector.search.assert_not_called()
+        assert len(result.nodes) == 1
+        assert result.nodes[0].text == "answer"

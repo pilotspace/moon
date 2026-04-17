@@ -280,3 +280,87 @@ class TestLlamaIndexAdapter:
         # Hybrid dispatch invariant: vector.search must NOT be called
         mock_client.vector.search.assert_not_called()
         mock_client.text.hybrid_search.assert_called_once()
+
+    # -- Gap 4 fix (Plan 153-05): moon_client kwarg must be preserved -------
+
+    def test_moon_client_kwarg_is_preserved(self, mock_deps: None) -> None:
+        """MoonVectorStore(moon_client=c, ...) must retain the supplied client.
+
+        Gap 4 regression guard: prior to Plan 153-05, ``__init__`` reset
+        ``self._client = None`` after ``super().__init__(**kwargs)``,
+        discarding any caller-supplied client and routing commands to a
+        fresh default ``moon_url`` client instead.
+        """
+        from moondb.integrations.llamaindex import MoonVectorStore
+
+        mock_client = MagicMock(name="user-supplied-client")
+        with patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(
+                index_name="test",
+                moon_client=mock_client,
+                dim=4,
+            )
+
+        # Canonical pydantic-v2 storage (or object.__setattr__ fallback).
+        assert store._client is mock_client
+        # _ensure_client must return the same instance (no re-creation).
+        assert store._ensure_client() is mock_client
+
+    def test_moon_client_kwarg_uses_pydantic_private_storage(
+        self, mock_deps: None
+    ) -> None:
+        """Lock the canonical PrivateAttr storage path (WARNING 5 iter-1 fix).
+
+        Asserts the supplied client lands in ``__pydantic_private__["_client"]``
+        — the pydantic-v2 canonical private-attribute storage shape. If this
+        test fails with KeyError/AttributeError, the implementation has fallen
+        back to ``object.__setattr__`` and SUMMARY.md must document it.
+        """
+        from moondb.integrations.llamaindex import MoonVectorStore
+
+        mock_client = MagicMock()
+        with patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(index_name="t", moon_client=mock_client, dim=4)
+
+        # pydantic-v2 private-attr storage — present iff PrivateAttr path is live
+        assert hasattr(store, "__pydantic_private__")
+        assert store.__pydantic_private__.get("_client") is mock_client
+
+    def test_moon_client_default_still_works(self, mock_deps: None) -> None:
+        """Without moon_client kwarg, _ensure_client falls back to MoonClient.from_url."""
+        from moondb.integrations.llamaindex import MoonVectorStore
+
+        with patch(
+            "moondb.integrations.llamaindex.MoonClient.from_url",
+            return_value=MagicMock(name="default-url-client"),
+        ) as from_url, patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(
+                index_name="test",
+                moon_url="redis://example:6379",
+                dim=4,
+            )
+
+        # from_url called exactly once, with the declared moon_url.
+        from_url.assert_called_once_with("redis://example:6379")
+        # _ensure_client on subsequent calls reuses the cached client.
+        assert store._ensure_client() is from_url.return_value
+
+    def test_moon_client_kwarg_does_not_leak_into_pydantic_model_dump(
+        self, mock_deps: None
+    ) -> None:
+        """moon_client popped pre-super() + PrivateAttr storage means model_dump() is clean.
+
+        Threat T-153-05-02: a live MoonClient leaking into model_dump would
+        be serialised into logs / telemetry / checkpoints. Neither the
+        non-declared ``moon_client`` kwarg nor the private ``_client``
+        attribute must appear in the dumped representation.
+        """
+        from moondb.integrations.llamaindex import MoonVectorStore
+
+        mock_client = MagicMock()
+        with patch.object(MoonVectorStore, "_ensure_index"):
+            store = MoonVectorStore(index_name="t", moon_client=mock_client, dim=4)
+
+        dump = store.model_dump()
+        assert "moon_client" not in dump
+        assert "_client" not in dump
