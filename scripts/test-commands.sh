@@ -66,6 +66,7 @@ while [[ $# -gt 0 ]]; do
             echo "  vector       - Vector search commands (FT.CREATE, FT.SEARCH, FT.INFO, FT.DROPINDEX)"
             echo "  persistence  - Persistence commands (BGSAVE, BGREWRITEAOF, etc.)"
             echo "  blocking     - Blocking commands (BLPOP, BRPOP, BZPOPMIN, etc.)"
+            echo "  temporal     - Temporal commands (TEMPORAL.SNAPSHOT_AT, TEMPORAL.INVALIDATE)"
             echo "  benchmark    - redis-benchmark throughput for all benchmarkable commands"
             exit 0
             ;;
@@ -1674,6 +1675,86 @@ if should_run "vector"; then
 
     mcli FT.DROPINDEX hybidx >/dev/null 2>&1
     echo "  ft_search_hybrid: done"
+fi
+
+# ===========================================================================
+# TEMPORAL COMMANDS (moon-only -- no Redis equivalent)
+# ===========================================================================
+
+if should_run "temporal"; then
+    echo ""
+    echo "=== TEMPORAL COMMANDS ==="
+    mcli FLUSHALL >/dev/null 2>&1
+
+    # TEMP-01: TEMPORAL.SNAPSHOT_AT basic — records wall-clock->LSN binding
+    assert_moon "TEMPORAL.SNAPSHOT_AT basic" "OK" TEMPORAL.SNAPSHOT_AT
+
+    # TEMP-02: TEMPORAL.SNAPSHOT_AT wrong args — extra argument rejected
+    TOTAL=$((TOTAL + 1))
+    SNAP_ERR=$(mcli TEMPORAL.SNAPSHOT_AT extraarg 2>&1)
+    if echo "$SNAP_ERR" | grep -qi "wrong number of arguments"; then
+        PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.SNAPSHOT_AT wrong args rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.SNAPSHOT_AT wrong args should reject: $SNAP_ERR"
+    fi
+
+    # TEMP-03: TEMPORAL.INVALIDATE basic — create graph, add node, invalidate
+    mcli GRAPH.CREATE testgraph >/dev/null 2>&1
+    ADDNODE_OUT=$(mcli GRAPH.ADDNODE testgraph :TestLabel 2>&1)
+    # Extract numeric node_id from ADDNODE response (format: "(integer) <id>" or just "<id>")
+    NODE_ID=$(echo "$ADDNODE_OUT" | grep -oE '[0-9]+' | head -1)
+    if [[ -n "$NODE_ID" ]]; then
+        TOTAL=$((TOTAL + 1))
+        INV_OK=$(mcli TEMPORAL.INVALIDATE "$NODE_ID" NODE testgraph 2>&1)
+        if echo "$INV_OK" | grep -q "OK"; then
+            PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE basic OK (node_id=$NODE_ID)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE basic should return OK: $INV_OK"
+        fi
+
+        # Verify node is still visible (no VALID_AT filter = sees all)
+        TOTAL=$((TOTAL + 1))
+        QUERY_OUT=$(mcli GRAPH.QUERY testgraph "MATCH (n:TestLabel) RETURN n" 2>&1)
+        if echo "$QUERY_OUT" | grep -qiE "TestLabel|node|result"; then
+            PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE node still visible without VALID_AT"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE node should be visible: $QUERY_OUT"
+        fi
+    else
+        TOTAL=$((TOTAL + 2))
+        FAIL=$((FAIL + 2))
+        echo "  FAIL: Could not extract node_id from GRAPH.ADDNODE: $ADDNODE_OUT"
+    fi
+
+    # TEMP-04: TEMPORAL.INVALIDATE not found — nonexistent graph
+    TOTAL=$((TOTAL + 1))
+    INV_NOTFOUND=$(mcli TEMPORAL.INVALIDATE 999999 NODE nonexistent 2>&1)
+    if echo "$INV_NOTFOUND" | grep -qi "graph not found"; then
+        PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE graph not found"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE should error graph not found: $INV_NOTFOUND"
+    fi
+
+    # TEMP-05: TEMPORAL.INVALIDATE wrong args — no arguments
+    TOTAL=$((TOTAL + 1))
+    INV_NOARGS=$(mcli TEMPORAL.INVALIDATE 2>&1)
+    if echo "$INV_NOARGS" | grep -qi "wrong number of arguments"; then
+        PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE wrong args (none)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE no args should reject: $INV_NOARGS"
+    fi
+
+    # TEMP-06: TEMPORAL.INVALIDATE bad entity kind — VERTEX not valid
+    TOTAL=$((TOTAL + 1))
+    INV_BADKIND=$(mcli TEMPORAL.INVALIDATE 42 VERTEX testgraph 2>&1)
+    if echo "$INV_BADKIND" | grep -qi "entity kind must be NODE or EDGE"; then
+        PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE bad entity kind rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE bad kind should reject: $INV_BADKIND"
+    fi
+
+    mcli GRAPH.DELETE testgraph >/dev/null 2>&1
+    echo "  temporal: done"
 fi
 
 # ===========================================================================

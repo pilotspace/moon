@@ -701,6 +701,90 @@ fi
 # Restart moon with the originally-requested shard count so later sections work.
 start_moon_with_shards "$SHARDS" || true
 
+# ===========================================================================
+# TEMPORAL COMMANDS -- cross-shard consistency (moon-only)
+# ===========================================================================
+
+echo ""
+echo "=== TEMPORAL CROSS-SHARD CONSISTENCY ==="
+
+# Stop the current instance to cycle through shard configs
+stop_moon
+
+TEMP_SNAP_RESULT_1=""
+TEMP_SNAP_RESULT_4=""
+TEMP_SNAP_RESULT_12=""
+TEMP_INV_RESULT_1=""
+TEMP_INV_RESULT_4=""
+TEMP_INV_RESULT_12=""
+
+for NSHARDS in 1 4 12; do
+    log "  -- temporal shards=$NSHARDS --"
+    start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
+    redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
+
+    # TEMPORAL.SNAPSHOT_AT consistency — should return OK on all configs
+    SNAP_OUT=$(redis-cli -p "$PORT_RUST" TEMPORAL.SNAPSHOT_AT 2>&1)
+    case "$NSHARDS" in
+        1)  TEMP_SNAP_RESULT_1="$SNAP_OUT" ;;
+        4)  TEMP_SNAP_RESULT_4="$SNAP_OUT" ;;
+        12) TEMP_SNAP_RESULT_12="$SNAP_OUT" ;;
+    esac
+
+    # TEMPORAL.INVALIDATE with graph entity — create graph, add node, invalidate
+    redis-cli -p "$PORT_RUST" GRAPH.CREATE tempgraph >/dev/null 2>&1
+    ADDNODE_OUT=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE tempgraph :TempLabel 2>&1)
+    NODE_ID=$(echo "$ADDNODE_OUT" | grep -oE '[0-9]+' | head -1)
+    if [[ -n "$NODE_ID" ]]; then
+        INV_OUT=$(redis-cli -p "$PORT_RUST" TEMPORAL.INVALIDATE "$NODE_ID" NODE tempgraph 2>&1)
+        # Verify node is still visible without VALID_AT filter
+        QUERY_OUT=$(redis-cli -p "$PORT_RUST" GRAPH.QUERY tempgraph "MATCH (n:TempLabel) RETURN n" 2>&1)
+        VISIBLE="no"
+        if echo "$QUERY_OUT" | grep -qiE "TempLabel|node|result"; then
+            VISIBLE="yes"
+        fi
+        case "$NSHARDS" in
+            1)  TEMP_INV_RESULT_1="$INV_OUT|$VISIBLE" ;;
+            4)  TEMP_INV_RESULT_4="$INV_OUT|$VISIBLE" ;;
+            12) TEMP_INV_RESULT_12="$INV_OUT|$VISIBLE" ;;
+        esac
+    else
+        case "$NSHARDS" in
+            1)  TEMP_INV_RESULT_1="ADDNODE_FAIL" ;;
+            4)  TEMP_INV_RESULT_4="ADDNODE_FAIL" ;;
+            12) TEMP_INV_RESULT_12="ADDNODE_FAIL" ;;
+        esac
+    fi
+    redis-cli -p "$PORT_RUST" GRAPH.DELETE tempgraph >/dev/null 2>&1
+
+    stop_moon
+done
+
+# TEMP-SNAP consistency: all shard configs should return OK
+if [[ "$TEMP_SNAP_RESULT_1" == "OK" && "$TEMP_SNAP_RESULT_4" == "OK" && "$TEMP_SNAP_RESULT_12" == "OK" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.SNAPSHOT_AT consistent across 1/4/12 shards"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: TEMPORAL.SNAPSHOT_AT cross-shard divergence"
+    echo "    1-shard:  $TEMP_SNAP_RESULT_1"
+    echo "    4-shard:  $TEMP_SNAP_RESULT_4"
+    echo "    12-shard: $TEMP_SNAP_RESULT_12"
+fi
+
+# TEMP-INV consistency: all shard configs should return OK and node visible
+if [[ "$TEMP_INV_RESULT_1" == "OK|yes" && "$TEMP_INV_RESULT_4" == "OK|yes" && "$TEMP_INV_RESULT_12" == "OK|yes" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE consistent across 1/4/12 shards (node still visible)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: TEMPORAL.INVALIDATE cross-shard divergence"
+    echo "    1-shard:  $TEMP_INV_RESULT_1"
+    echo "    4-shard:  $TEMP_INV_RESULT_4"
+    echo "    12-shard: $TEMP_INV_RESULT_12"
+fi
+
+# Restart moon with the originally-requested shard count so later sections work.
+start_moon_with_shards "$SHARDS" || true
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"
