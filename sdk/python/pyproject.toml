@@ -69,3 +69,6 @@ ignore = ["ANN101", "ANN102"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: marks tests that require a live moon server on 127.0.0.1:6399 (deselect with '-m \"not integration\"')",
+]
