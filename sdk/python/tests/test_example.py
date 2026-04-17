@@ -364,22 +364,26 @@ class TestRunDemoProbeFallback:
         assert "TAG field type not supported" in err
 
     def test_probe_does_not_interfere_with_dropindex_error_classification(self) -> None:
-        """BLOCKER 3 extra safety: when the probe fires (no cache), its
-        DROPINDEX failure/success must not confuse the real-drop error
-        classifier. Call 1 (probe DROPINDEX) returns OK; Call 2 (real
-        DROPINDEX) raises 'auth required' — must re-raise."""
+        """BLOCKER 3 extra safety: the probe's own FT.DROPINDEX success
+        must not mask a REAL drop-index failure downstream. In run_demo
+        the execute_command call order is:
+
+        1. Real FT.DROPINDEX 'issues'  (via _safe_drop_index, pre-probe)
+        2. Probe FT.DROPINDEX '__moon_probe_tag__'  (probe cleanup)
+
+        Call 1 raises 'auth required' — must propagate and not be
+        swallowed by the probe's own try/except clean-up."""
         client = _build_dry_run_client()
-        # Clear the cache so the probe actually runs.
+        # Clear the cache so the probe actually runs downstream.
         client.__dict__.pop("_probe_tag_cached", None)
-        call_count = {"n": 0}
 
         def execute_side(*args: Any, **_kwargs: Any) -> Any:  # noqa: ANN401
-            call_count["n"] += 1
-            # Call 1 = probe's FT.DROPINDEX __moon_probe_tag__ → OK
-            # Call 2 = real FT.DROPINDEX issues → auth error (must re-raise)
-            if call_count["n"] == 1:
-                return "OK"
-            raise Exception("auth required")
+            # First and only call: real FT.DROPINDEX 'issues' →
+            # raise. Probe never reaches its own execute_command
+            # because run_demo re-raises before then.
+            if args[:2] == ("FT.DROPINDEX", "issues"):
+                raise Exception("auth required")
+            return "OK"
 
         client.execute_command.side_effect = execute_side
         with pytest.raises(Exception, match="auth required"):

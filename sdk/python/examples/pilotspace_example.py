@@ -26,6 +26,7 @@ before every creation so re-runs against the same server do not error.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import sys
 from dataclasses import dataclass, field
@@ -278,16 +279,68 @@ def _safe_drop_index(client: Any, index: str) -> None:  # noqa: ANN401 -- Mock|M
     """Best-effort ``FT.DROPINDEX`` for idempotent re-runs.
 
     Swallows only errors whose message indicates the index does not exist
-    (threat_model T-153-03-06). Any other error (auth, network, server
-    bug) is re-raised so users see the real problem.
+    or that the server rejects the RediSearch-only ``DD`` flag. Any other
+    error (auth, network, server bug) is re-raised so users see the real
+    problem (threat_model T-153-03-06 / T-153-06-01).
+
+    Plan 06 (Gap 1): the call path omits the ``DD`` flag because moon's
+    ``FT.DROPINDEX`` is strict-arity 1. Both moon and RediSearch accept
+    the single-argument form. The ``"wrong number of arguments"`` match
+    is kept in the swallow list so older on-disk caches of this module
+    (or downstream forks that still pass ``DD``) fail softly.
     """
     try:
-        client.execute_command("FT.DROPINDEX", index, "DD")
+        client.execute_command("FT.DROPINDEX", index)
     except Exception as exc:  # noqa: BLE001 -- we re-raise non-matching errors
         msg = str(exc).lower()
-        if "unknown" in msg or "not found" in msg or "no such index" in msg:
+        if any(
+            marker in msg
+            for marker in (
+                "unknown",
+                "not found",
+                "no such index",
+                "wrong number of arguments",
+            )
+        ):
             return
         raise
+
+
+# -- TAG-support capability probe (Plan 06) ---------------------------------
+
+_PROBE_CACHE_KEY = "_probe_tag_cached"
+_PROBE_INDEX = "__moon_probe_tag__"
+
+
+def _probe_tag_support(client: Any) -> bool:  # noqa: ANN401 -- Mock|MoonClient
+    """Return ``True`` iff the server accepts ``TAG`` in ``FT.CREATE`` schema.
+
+    Result is cached on ``client.__dict__[_PROBE_CACHE_KEY]`` so:
+
+    - repeat probes during a single demo run don't re-query the server,
+    - tests can pre-populate the cache for deterministic ordering
+      (the dry-run MagicMock client ships with the key pre-set to
+      ``True``, so existing TestRunDemo assertions on
+      ``assert_called_once`` and ``call_args_list[0]`` keep their
+      single-call semantics — see threat_model T-153-06-05 / T-153-06-07).
+
+    When the cached value is a ``bool`` it is returned verbatim with
+    zero server calls. Otherwise the probe creates a tiny throw-away
+    ``FT.CREATE __moon_probe_tag__ SCHEMA f TAG`` index, drops it, and
+    caches the outcome.
+    """
+    cached = client.__dict__.get(_PROBE_CACHE_KEY)
+    if isinstance(cached, bool):
+        return cached
+    try:
+        client.text.create_text_index(_PROBE_INDEX, [("f", "TAG", {})])
+    except Exception:  # noqa: BLE001 -- any server-side rejection → TAG unsupported
+        client.__dict__[_PROBE_CACHE_KEY] = False
+        return False
+    with contextlib.suppress(Exception):
+        client.execute_command("FT.DROPINDEX", _PROBE_INDEX)
+    client.__dict__[_PROBE_CACHE_KEY] = True
+    return True
 
 
 def run_demo(
@@ -329,16 +382,28 @@ def run_demo(
     # We keep this plan-faithful to Plan 01's create_text_index contract
     # which is TEXT/TAG/NUMERIC-only.
     prefix = "issue:" if index == "issues" else f"{index.rstrip('s')}:"
-    client.text.create_text_index(
-        index,
-        [
+    supports_tag = _probe_tag_support(client)
+    schema: list[tuple[str, str, dict[str, Any]]]
+    if supports_tag:
+        schema = [
             ("title", "TEXT", {"WEIGHT": 2.0}),
             ("body", "TEXT", {}),
             ("status", "TAG", {}),
             ("priority", "TAG", {"SORTABLE": True}),
-        ],
-        prefix=prefix,
-    )
+        ]
+    else:
+        print(
+            "[warning] TAG field type not supported by server; "
+            "falling back to TEXT for status/priority.",
+            file=sys.stderr,
+        )
+        schema = [
+            ("title", "TEXT", {"WEIGHT": 2.0}),
+            ("body", "TEXT", {}),
+            ("status", "TEXT", {}),
+            ("priority", "TEXT", {"SORTABLE": True}),
+        ]
+    client.text.create_text_index(index, schema, prefix=prefix)
 
     # 3. Seed the hashes. Use a pipeline when the client exposes one
     # (real MoonClient), otherwise fall back to per-issue execute_command

@@ -118,6 +118,24 @@ issues = build_sample_issues(n=50, dim=384, seed=0xCAFE)
 # ... use issues.embedding / issues.title / etc.
 ```
 
+## Server compatibility
+
+This example targets both Moon (compatible as of 2026-04-17) and
+RediSearch-compatible servers.
+
+- `FT.DROPINDEX` is called as a single-argument command. The Redis-only
+  `DD` flag is omitted because Moon's `FT.DROPINDEX` is strict-arity 1.
+  Both servers accept the single-argument form.
+- The `TAG` field type is optional. Before creating the index, the
+  example probes support with a small `FT.CREATE ... SCHEMA f TAG` plus
+  drop. If the server rejects `TAG`, the schema falls back to `TEXT`
+  for `status` and `priority`. A one-line warning is printed on stderr
+  when this fallback triggers. The demo queries work identically in
+  both modes.
+- The probe result is cached on the client instance
+  (`client.__dict__["_probe_tag_cached"]`) so the capability check
+  happens at most once per client lifetime.
+
 ## Related
 
 - `moondb.TextCommands` — full-text command surface (`create_text_index`,
