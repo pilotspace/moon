@@ -55,10 +55,33 @@ pub fn replay_wal_auto(
                 let mut commands_replayed = 0usize;
                 let mut selected_db = 0usize;
                 let on_command = &mut |record: &WalRecord| {
-                    if record.record_type == WalRecordType::Command {
-                        // Parse RESP from payload and dispatch
-                        // For now, pass raw payload as command bytes
-                        engine.replay_command(databases, &record.payload, &[], &mut selected_db);
+                    match record.record_type {
+                        WalRecordType::Command => {
+                            // Parse RESP from payload and dispatch
+                            engine.replay_command(
+                                databases,
+                                &record.payload,
+                                &[],
+                                &mut selected_db,
+                            );
+                        }
+                        WalRecordType::XactBegin => {
+                            // XactBegin: payload contains txn_id (u64 LE)
+                            // No action needed - commit or abort will follow
+                            tracing::trace!(lsn = record.lsn, "WAL replay: XactBegin");
+                        }
+                        WalRecordType::XactCommit => {
+                            // XactCommit: replay KV ops from payload
+                            replay_xact_commit(databases, &record.payload);
+                            tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
+                        }
+                        WalRecordType::XactAbort => {
+                            // XactAbort: no action - changes were never committed
+                            tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
+                        }
+                        _ => {
+                            // Other record types (Vector*, Checkpoint, etc.)
+                        }
                     }
                     commands_replayed += 1;
                 };
@@ -209,6 +232,110 @@ pub fn replay_wal_v3_file(
     }
 
     Ok(result)
+}
+
+/// Replay a cross-store transaction commit record.
+///
+/// The XactCommit payload format (little-endian):
+/// - txn_id: u64
+/// - kv_op_count: u32
+/// - For each KV op:
+///   - op_type: u8 (0=SET, 1=DEL)
+///   - key_len: u32
+///   - key: [u8; key_len]
+///   - value_len: u32 (only for SET)
+///   - value: [u8; value_len] (only for SET)
+///
+/// Vector and graph ops are handled by their respective replay paths
+/// (VectorTxnCommit already exists).
+fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]) {
+    if payload.len() < 12 {
+        tracing::warn!("XactCommit payload too short: {} bytes", payload.len());
+        return;
+    }
+
+    let txn_id = u64::from_le_bytes([
+        payload[0],
+        payload[1],
+        payload[2],
+        payload[3],
+        payload[4],
+        payload[5],
+        payload[6],
+        payload[7],
+    ]);
+    let kv_op_count = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+
+    tracing::debug!(txn_id, kv_op_count, "Replaying XactCommit");
+
+    if kv_op_count == 0 {
+        return;
+    }
+
+    let mut offset = 12;
+    let db = &mut databases[0]; // TODO: support multi-db in cross-store txn
+
+    for _ in 0..kv_op_count {
+        if offset >= payload.len() {
+            tracing::warn!("XactCommit payload truncated at op boundary");
+            break;
+        }
+
+        let op_type = payload[offset];
+        offset += 1;
+
+        if offset + 4 > payload.len() {
+            tracing::warn!("XactCommit payload truncated reading key_len");
+            break;
+        }
+        let key_len = u32::from_le_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        if offset + key_len > payload.len() {
+            tracing::warn!("XactCommit payload truncated reading key");
+            break;
+        }
+        let key = bytes::Bytes::copy_from_slice(&payload[offset..offset + key_len]);
+        offset += key_len;
+
+        match op_type {
+            0 => {
+                // SET
+                if offset + 4 > payload.len() {
+                    tracing::warn!("XactCommit payload truncated reading value_len");
+                    break;
+                }
+                let value_len = u32::from_le_bytes([
+                    payload[offset],
+                    payload[offset + 1],
+                    payload[offset + 2],
+                    payload[offset + 3],
+                ]) as usize;
+                offset += 4;
+
+                if offset + value_len > payload.len() {
+                    tracing::warn!("XactCommit payload truncated reading value");
+                    break;
+                }
+                let value = bytes::Bytes::copy_from_slice(&payload[offset..offset + value_len]);
+                offset += value_len;
+
+                db.set_string(key, value);
+            }
+            1 => {
+                // DEL
+                db.remove(&key);
+            }
+            _ => {
+                tracing::warn!(op_type, "Unknown KV op type in XactCommit");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
