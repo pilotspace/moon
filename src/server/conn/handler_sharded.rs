@@ -1696,6 +1696,34 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // Single-shard: no SPSC channels available.
                             // Dispatch directly to shard's VectorStore via shared access.
                             //
+                            // ── 154-01 single-shard FT.AGGREGATE fast path ────────
+                            // scatter_text_aggregate internally fast-paths num_shards
+                            // == 1 to execute_local_full. Kept byte-symmetric with
+                            // the multi-shard arm at line 1458 so the two code paths
+                            // share a single dispatch body shape.
+                            #[cfg(feature = "text-index")]
+                            if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                                let parsed = match crate::command::vector_search::ft_aggregate::parse_aggregate_args(cmd_args) {
+                                    Ok(p) => p,
+                                    Err(err_frame) => {
+                                        responses.push(err_frame);
+                                        continue;
+                                    }
+                                };
+                                let response = crate::shard::scatter_aggregate::scatter_text_aggregate(
+                                    parsed.index_name,
+                                    parsed.query,
+                                    parsed.pipeline,
+                                    ctx.shard_id,
+                                    ctx.num_shards,
+                                    &ctx.shard_databases,
+                                    &ctx.dispatch_tx,
+                                    &ctx.spsc_notifiers,
+                                ).await;
+                                responses.push(response);
+                                continue;
+                            }
+                            //
                             // ── 151-03 single-shard text FT.SEARCH fast path ──────
                             // Parity with handler_monoio.rs. See that file's block
                             // for the full rationale — bare text queries bypass

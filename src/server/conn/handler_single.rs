@@ -1346,6 +1346,34 @@ pub async fn handle_connection(
                                         {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
                                         }
+                                    } else if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                                        // ── 154-01: FT.AGGREGATE non-sharded single-shard local exec ──
+                                        // handler_single has no SPSC dispatch — call execute_local_full
+                                        // directly, reusing the already-held `store` (vs) and `ts_mut`
+                                        // borrows. Acquire a fresh `db` read-guard in the match arm;
+                                        // it drops at arm-scope end, before the response is returned
+                                        // from the surrounding else-if chain. No `.await` in scope.
+                                        #[cfg(feature = "text-index")]
+                                        {
+                                            match crate::command::vector_search::ft_aggregate::parse_aggregate_args(cmd_args) {
+                                                Ok(parsed) => {
+                                                    let db_guard = db[conn.selected_db].read();
+                                                    crate::command::vector_search::ft_aggregate::execute_local_full(
+                                                        &mut *store,
+                                                        &*ts_mut,
+                                                        &parsed.index_name,
+                                                        &parsed.query,
+                                                        &parsed.pipeline,
+                                                        &*db_guard,
+                                                    )
+                                                }
+                                                Err(err_frame) => err_frame,
+                                            }
+                                        }
+                                        #[cfg(not(feature = "text-index"))]
+                                        {
+                                            Frame::Error(bytes::Bytes::from_static(b"ERR FT.AGGREGATE requires text-index feature"))
+                                        }
                                     } else {
                                         Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                     };
@@ -1519,6 +1547,30 @@ pub async fn handle_connection(
                                             {
                                                 Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
                                             }
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                                            // ── 154-01: FT.AGGREGATE read-run local exec ──
+                                            // Outer `guard = db[conn.selected_db].read()` is already
+                                            // held (acquired at the read-run entry); reuse it via
+                                            // `&*guard`. `ts_m2` is the read-run TextStore borrow.
+                                            // Synchronous — no `.await` inside the arm.
+                                            #[cfg(feature = "text-index")]
+                                            {
+                                                match crate::command::vector_search::ft_aggregate::parse_aggregate_args(d_args) {
+                                                    Ok(parsed) => crate::command::vector_search::ft_aggregate::execute_local_full(
+                                                        &mut *store,
+                                                        &*ts_m2,
+                                                        &parsed.index_name,
+                                                        &parsed.query,
+                                                        &parsed.pipeline,
+                                                        &*guard,
+                                                    ),
+                                                    Err(err_frame) => err_frame,
+                                                }
+                                            }
+                                            #[cfg(not(feature = "text-index"))]
+                                            {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.AGGREGATE requires text-index feature"))
+                                            }
                                         } else {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
                                         };
@@ -1637,6 +1689,30 @@ pub async fn handle_connection(
                                             #[cfg(not(feature = "graph"))]
                                             {
                                                 Frame::Error(bytes::Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                                            }
+                                        } else if d_cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                                            // ── 154-01: FT.AGGREGATE write-run local exec ──
+                                            // Outer `guard = db[conn.selected_db].write()` is already
+                                            // held; pass as `&*guard` (mut → immut reborrow is safe —
+                                            // execute_local_full takes &Database). `ts_m3` is the
+                                            // write-run TextStore borrow. Synchronous.
+                                            #[cfg(feature = "text-index")]
+                                            {
+                                                match crate::command::vector_search::ft_aggregate::parse_aggregate_args(d_args) {
+                                                    Ok(parsed) => crate::command::vector_search::ft_aggregate::execute_local_full(
+                                                        &mut *store,
+                                                        &*ts_m3,
+                                                        &parsed.index_name,
+                                                        &parsed.query,
+                                                        &parsed.pipeline,
+                                                        &*guard,
+                                                    ),
+                                                    Err(err_frame) => err_frame,
+                                                }
+                                            }
+                                            #[cfg(not(feature = "text-index"))]
+                                            {
+                                                Frame::Error(bytes::Bytes::from_static(b"ERR FT.AGGREGATE requires text-index feature"))
                                             }
                                         } else {
                                             Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT.* command"))
