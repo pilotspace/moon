@@ -640,16 +640,21 @@ class TextCommands:
         args = _build_create_index_args(name, schema, prefix, on)
         return self._client.execute_command(*args)  # type: ignore[no-any-return,no-untyped-call]
 
-    def drop_text_index(self, name: str) -> str:
+    def drop_text_index(self, name: str, *, delete_docs: bool = False) -> str:
         """Drop a full-text index (alias for ``FT.DROPINDEX``).
 
         Args:
             name: Index name.
+            delete_docs: If True, also delete all indexed documents (DD flag).
+                Default False preserves documents.
 
         Returns:
             ``"OK"`` on success.
         """
-        return self._client.execute_command("FT.DROPINDEX", name)  # type: ignore[no-any-return,no-untyped-call]
+        args: list[str] = ["FT.DROPINDEX", name]
+        if delete_docs:
+            args.append("DD")
+        return self._client.execute_command(*args)  # type: ignore[no-any-return,no-untyped-call]
 
     # -- FT.SEARCH (BM25) ---------------------------------------------------
 
@@ -845,9 +850,12 @@ class AsyncTextCommands:
         args = _build_create_index_args(name, schema, prefix, on)
         return await self._client.execute_command(*args)  # type: ignore[no-any-return]
 
-    async def drop_text_index(self, name: str) -> str:
+    async def drop_text_index(self, name: str, *, delete_docs: bool = False) -> str:
         """Async variant. See :meth:`TextCommands.drop_text_index`."""
-        return await self._client.execute_command("FT.DROPINDEX", name)  # type: ignore[no-any-return]
+        args: list[str] = ["FT.DROPINDEX", name]
+        if delete_docs:
+            args.append("DD")
+        return await self._client.execute_command(*args)  # type: ignore[no-any-return]
 
     async def text_search(
         self,

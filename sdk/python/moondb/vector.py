@@ -113,20 +113,26 @@ class VectorCommands:
 
         return self._client.execute_command(*args)  # type: ignore[no-any-return]
 
-    def drop_index(self, name: str) -> str:
+    def drop_index(self, name: str, *, delete_docs: bool = False) -> str:
         """Drop a vector search index.
 
         Args:
             name: Index name to drop.
+            delete_docs: If True, also delete all indexed documents (DD flag).
+                Default False preserves documents.
 
         Returns:
             "OK" on success.
 
         Example::
 
-            client.vector.drop_index("my_idx")
+            client.vector.drop_index("my_idx")  # Preserves documents
+            client.vector.drop_index("my_idx", delete_docs=True)  # Deletes documents
         """
-        return self._client.execute_command("FT.DROPINDEX", name)  # type: ignore[no-any-return]
+        args: list[str] = ["FT.DROPINDEX", name]
+        if delete_docs:
+            args.append("DD")
+        return self._client.execute_command(*args)  # type: ignore[no-any-return]
 
     def index_info(self, name: str) -> IndexInfo:
         """Get index metadata.
@@ -475,9 +481,12 @@ class AsyncVectorCommands:
 
         return await self._client.execute_command(*args)  # type: ignore[no-any-return]
 
-    async def drop_index(self, name: str) -> str:
+    async def drop_index(self, name: str, *, delete_docs: bool = False) -> str:
         """Drop a vector search index (async). See ``VectorCommands.drop_index``."""
-        return await self._client.execute_command("FT.DROPINDEX", name)  # type: ignore[no-any-return]
+        args: list[str] = ["FT.DROPINDEX", name]
+        if delete_docs:
+            args.append("DD")
+        return await self._client.execute_command(*args)  # type: ignore[no-any-return]
 
     async def index_info(self, name: str) -> IndexInfo:
         """Get index metadata (async). See ``VectorCommands.index_info``."""
