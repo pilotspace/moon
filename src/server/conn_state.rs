@@ -19,6 +19,7 @@ use crate::shard::dispatch::ShardMessage;
 use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
 use crate::tracking::{TrackingState, TrackingTable};
+use crate::transaction::CrossStoreTxn;
 
 /// Shared immutable state provided to each connection handler by the shard.
 ///
@@ -71,6 +72,9 @@ pub struct ConnectionState {
     pub current_user: String,
     /// Whether the client is in a MULTI transaction block
     pub in_multi: bool,
+    /// Active cross-store transaction (None if not in transaction).
+    /// Mutually exclusive with in_multi (MULTI/EXEC is KV-only).
+    pub active_cross_txn: Option<CrossStoreTxn>,
     /// Queued commands for MULTI/EXEC
     pub command_queue: Vec<Frame>,
     /// Client-side tracking state
@@ -106,6 +110,7 @@ impl ConnectionState {
             authenticated: !requirepass_set,
             current_user: "default".to_string(),
             in_multi: false,
+            active_cross_txn: None,
             command_queue: Vec::new(),
             tracking_state: TrackingState::default(),
             tracking_rx: None,
@@ -128,6 +133,24 @@ impl ConnectionState {
     /// Returns true if the client is in a MULTI transaction block.
     pub fn is_in_transaction(&self) -> bool {
         self.in_multi
+    }
+
+    /// Check if connection is in a cross-store transaction.
+    #[inline]
+    pub fn in_cross_txn(&self) -> bool {
+        self.active_cross_txn.is_some()
+    }
+
+    /// Get the active transaction's ID, if any.
+    #[inline]
+    pub fn cross_txn_id(&self) -> Option<u64> {
+        self.active_cross_txn.as_ref().map(|t| t.txn_id)
+    }
+
+    /// Get the active transaction's snapshot LSN, if any.
+    #[inline]
+    pub fn cross_txn_snapshot(&self) -> Option<u64> {
+        self.active_cross_txn.as_ref().map(|t| t.snapshot_lsn)
     }
 }
 

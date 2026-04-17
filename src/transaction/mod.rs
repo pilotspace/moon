@@ -68,10 +68,10 @@ impl CrossStoreTxn {
         self.kv_undo.record_insert(key);
     }
 
-    /// Record a KV update (key had previous value).
+    /// Record a KV update (key had previous entry).
     #[inline]
-    pub fn record_kv_update(&mut self, key: Bytes, old_value: crate::storage::entry::RedisValue) {
-        self.kv_undo.record_update(key, old_value);
+    pub fn record_kv_update(&mut self, key: Bytes, old_entry: crate::storage::entry::Entry) {
+        self.kv_undo.record_update(key, old_entry);
     }
 
     /// Record a KV delete.

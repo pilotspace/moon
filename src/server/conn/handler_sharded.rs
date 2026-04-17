@@ -16,7 +16,12 @@ use std::sync::Arc;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
+use crate::command::transaction::{
+    is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate, txn_begin_validate,
+    txn_commit_validate, ERR_MULTI_TXN_CONFLICT,
+};
 use crate::command::{DispatchResult, dispatch, dispatch_read};
+use crate::transaction::CrossStoreTxn;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
@@ -1151,10 +1156,97 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- TXN.BEGIN ---
+                    if is_txn_begin(cmd, cmd_args) {
+                        match txn_begin_validate(conn.in_multi, conn.in_cross_txn()) {
+                            Ok(()) => {
+                                // Get next txn_id and snapshot_lsn from vector store's transaction manager
+                                let mut vector_store =
+                                    ctx.shard_databases.vector_store(ctx.shard_id);
+                                let active = vector_store.txn_manager_mut().begin();
+                                conn.active_cross_txn =
+                                    Some(CrossStoreTxn::new(active.txn_id, active.snapshot_lsn));
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                            }
+                            Err(e) => responses.push(e),
+                        }
+                        continue;
+                    }
+
+                    // --- TXN.COMMIT ---
+                    if is_txn_commit(cmd, cmd_args) {
+                        match txn_commit_validate(conn.in_cross_txn()) {
+                            Ok(()) => {
+                                if let Some(txn) = conn.active_cross_txn.take() {
+                                    let mut vector_store =
+                                        ctx.shard_databases.vector_store(ctx.shard_id);
+                                    vector_store.txn_manager_mut().commit(txn.txn_id);
+                                    // TODO Phase 157-04: Write WAL XactCommit record
+                                    // TODO Phase 157-04: Process deferred HNSW inserts
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                } else {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"ERR not in transaction",
+                                    )));
+                                }
+                            }
+                            Err(e) => responses.push(e),
+                        }
+                        continue;
+                    }
+
+                    // --- TXN.ABORT ---
+                    if is_txn_abort(cmd, cmd_args) {
+                        match txn_abort_validate(conn.in_cross_txn()) {
+                            Ok(()) => {
+                                if let Some(txn) = conn.active_cross_txn.take() {
+                                    // Replay undo log in reverse order
+                                    {
+                                        let mut db = ctx
+                                            .shard_databases
+                                            .write_db(ctx.shard_id, conn.selected_db);
+                                        for record in txn.kv_undo.into_rollback_order() {
+                                            match record {
+                                                crate::transaction::UndoRecord::Insert { key } => {
+                                                    db.remove(&key);
+                                                }
+                                                crate::transaction::UndoRecord::Update {
+                                                    key,
+                                                    old_entry,
+                                                } => {
+                                                    db.set(key, old_entry);
+                                                }
+                                                crate::transaction::UndoRecord::Delete { .. } => {
+                                                    // No-op: key was deleted, nothing to restore
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Abort in TransactionManager
+                                    let mut vector_store =
+                                        ctx.shard_databases.vector_store(ctx.shard_id);
+                                    vector_store.txn_manager_mut().abort(txn.txn_id);
+                                    // TODO Phase 157-04: Discard deferred HNSW inserts for this txn
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                } else {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"ERR not in transaction",
+                                    )));
+                                }
+                            }
+                            Err(e) => responses.push(e),
+                        }
+                        continue;
+                    }
+
                     // --- MULTI ---
                     if cmd.eq_ignore_ascii_case(b"MULTI") {
-                        if conn.in_multi {
-                            responses.push(Frame::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
+                        if conn.in_cross_txn() {
+                            responses.push(Frame::Error(Bytes::from_static(ERR_MULTI_TXN_CONFLICT)));
+                        } else if conn.in_multi {
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR MULTI calls can not be nested",
+                            )));
                         } else {
                             conn.in_multi = true;
                             conn.command_queue.clear();

@@ -6,15 +6,15 @@
 use bytes::Bytes;
 use smallvec::SmallVec;
 
-use crate::storage::entry::RedisValue;
+use crate::storage::entry::Entry;
 
 /// A single undo record capturing the before-image of a KV write.
 #[derive(Debug, Clone)]
 pub enum UndoRecord {
     /// Key did not exist before write - remove on rollback.
     Insert { key: Bytes },
-    /// Key had this value before write - restore on rollback.
-    Update { key: Bytes, old_value: RedisValue },
+    /// Key had this entry before write - restore on rollback.
+    Update { key: Bytes, old_entry: Entry },
     /// Key was deleted - no rollback action needed (already gone).
     Delete { key: Bytes },
 }
@@ -41,10 +41,10 @@ impl UndoLog {
         self.records.push(UndoRecord::Insert { key });
     }
 
-    /// Record an update (key had a previous value).
+    /// Record an update (key had a previous entry).
     #[inline]
-    pub fn record_update(&mut self, key: Bytes, old_value: RedisValue) {
-        self.records.push(UndoRecord::Update { key, old_value });
+    pub fn record_update(&mut self, key: Bytes, old_entry: Entry) {
+        self.records.push(UndoRecord::Update { key, old_entry });
     }
 
     /// Record a delete (key will be removed - no rollback needed).
