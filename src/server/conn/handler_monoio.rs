@@ -28,7 +28,7 @@ use crate::command::workspace::{
     parse_workspace_id_from_bytes,
     ERR_WS_NOT_FOUND, ERR_WS_ALREADY_BOUND, ERR_WS_UNKNOWN_SUB,
 };
-use crate::workspace::{is_ws_command, WorkspaceId};
+use crate::workspace::{is_ws_command, workspace_rewrite_args, strip_workspace_prefix_from_response, WorkspaceId};
 use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
 use crate::transaction::CrossStoreTxn;
 use crate::persistence::aof::{self, AofMessage};
@@ -1923,6 +1923,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
+            // --- Workspace key prefix injection ---
+            // MUST happen before key_to_shard() so the {ws_id} hash tag determines
+            // shard routing. This is the ONLY code path where workspace prefixing
+            // occurs (WS-07, WS-12). All subsequent dispatch uses cmd_args (shadowed).
+            let rewritten = conn
+                .workspace_id
+                .as_ref()
+                .map(|ws_id| workspace_rewrite_args(cmd, cmd_args, ws_id));
+            let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
+
             // --- BLOCKING COMMANDS ---
             if cmd.eq_ignore_ascii_case(b"BLPOP")
                 || cmd.eq_ignore_ascii_case(b"BRPOP")
@@ -1984,7 +1994,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE ---
             if ctx.num_shards > 1 {
                 if cmd.eq_ignore_ascii_case(b"KEYS") {
-                    let response = crate::shard::coordinator::coordinate_keys(
+                    let mut response = crate::shard::coordinator::coordinate_keys(
                         cmd_args,
                         ctx.shard_id,
                         ctx.num_shards,
@@ -1996,11 +2006,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         &(), // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
                     responses.push(response);
                     continue;
                 }
                 if cmd.eq_ignore_ascii_case(b"SCAN") {
-                    let response = crate::shard::coordinator::coordinate_scan(
+                    let mut response = crate::shard::coordinator::coordinate_scan(
                         cmd_args,
                         ctx.shard_id,
                         ctx.num_shards,
@@ -2012,6 +2025,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         &(), // monoio: coordinator uses oneshot, not response_pool
                     )
                     .await;
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
                     responses.push(response);
                     continue;
                 }
@@ -2152,6 +2168,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             &ctx.spsc_notifiers,
                                         )
                                         .await;
+                                    let mut response = response;
+                                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                    }
                                     responses.push(response);
                                     continue;
                                 }
@@ -2215,6 +2235,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     &ctx.spsc_notifiers,
                                                 )
                                                 .await;
+                                            let mut response = response;
+                                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                            }
                                             responses.push(response);
                                             continue;
                                         }
@@ -2319,6 +2343,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 summarize_opts,
                             )
                             .await;
+                            let mut response = response;
+                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                            }
                             responses.push(response);
                             continue;
                         }
@@ -2347,6 +2375,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                                 Err(err_frame) => err_frame,
                             };
+                        let mut response = response;
+                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -2569,6 +2601,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         }
                                                     };
                                                     drop(ts_guard);
+                                                    let mut response = response;
+                                                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                                    }
                                                     responses.push(response);
                                                     continue;
                                                 }
@@ -2709,6 +2745,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         // Explicit drop order: inner db_guard first, outer ts_guard last.
                                         drop(db_guard_opt);
                                         drop(ts_guard);
+                                        let mut response = response;
+                                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                        }
                                         responses.push(response);
                                         continue;
                                     }
@@ -2830,6 +2870,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
                         }
                     };
+                    let mut response = response;
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
                     responses.push(response);
                     continue;
                 }
@@ -2858,6 +2902,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 for record in wal_records {
                     ctx.shard_databases
                         .wal_append(ctx.shard_id, bytes::Bytes::from(record));
+                }
+                let mut response = response;
+                if let Some(ws_id) = conn.workspace_id.as_ref() {
+                    strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                 }
                 responses.push(response);
                 continue;
@@ -3026,7 +3074,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         }
                     }
-                    let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
                     responses.push(response);
                 } else {
                     // READ PATH: shared lock — no contention with other shards' reads
@@ -3075,7 +3126,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             );
                         }
                     }
-                    let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
                     responses.push(response);
                 } // end read/write split
 
@@ -3122,7 +3176,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             );
                         }
                     }
-                    let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
                     responses.push(response);
                     continue;
                 }

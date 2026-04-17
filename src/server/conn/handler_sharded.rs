@@ -26,7 +26,7 @@ use crate::command::workspace::{
     parse_workspace_id_from_bytes,
     ERR_WS_NOT_FOUND, ERR_WS_ALREADY_BOUND, ERR_WS_UNKNOWN_SUB,
 };
-use crate::workspace::{is_ws_command, WorkspaceId};
+use crate::workspace::{is_ws_command, workspace_rewrite_args, strip_workspace_prefix_from_response, WorkspaceId};
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::transaction::CrossStoreTxn;
 use crate::persistence::aof::{self, AofMessage};
@@ -1458,6 +1458,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- Workspace key prefix injection ---
+                    // MUST happen before key_to_shard() so the {ws_id} hash tag determines
+                    // shard routing. This is the ONLY code path where workspace prefixing
+                    // occurs (WS-07, WS-12). All subsequent dispatch uses cmd_args (shadowed).
+                    let rewritten = conn
+                        .workspace_id
+                        .as_ref()
+                        .map(|ws_id| workspace_rewrite_args(cmd, cmd_args, ws_id));
+                    let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
+
                     // --- BLOCKING COMMANDS ---
                     if cmd.eq_ignore_ascii_case(b"BLPOP") || cmd.eq_ignore_ascii_case(b"BRPOP")
                         || cmd.eq_ignore_ascii_case(b"BLMOVE") || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
@@ -1705,12 +1715,18 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if cmd.eq_ignore_ascii_case(b"KEYS") {
-                        let response = crate::shard::coordinator::coordinate_keys(cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
+                        let mut response = crate::shard::coordinator::coordinate_keys(cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
+                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                        }
                         responses.push(response);
                         continue;
                     }
                     if cmd.eq_ignore_ascii_case(b"SCAN") {
-                        let response = crate::shard::coordinator::coordinate_scan(cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
+                        let mut response = crate::shard::coordinator::coordinate_scan(cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
+                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -1807,6 +1823,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 &ctx.dispatch_tx,
                                                 &ctx.spsc_notifiers,
                                             ).await;
+                                            let mut response = response;
+                                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                            }
                                             responses.push(response);
                                             continue;
                                         }
@@ -1852,6 +1872,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                         &ctx.dispatch_tx,
                                                         &ctx.spsc_notifiers,
                                                     ).await;
+                                                    let mut response = response;
+                                                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                                    }
                                                     responses.push(response);
                                                     continue;
                                                 }
@@ -1914,7 +1938,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     let highlight_opts = crate::command::vector_search::parse_highlight_clause(cmd_args);
                                     let summarize_opts = crate::command::vector_search::parse_summarize_clause(cmd_args);
 
-                                    let response = crate::shard::coordinator::scatter_text_search(
+                                    let mut response = crate::shard::coordinator::scatter_text_search(
                                         index_name,
                                         query_terms,
                                         field_idx,
@@ -1929,6 +1953,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         highlight_opts,
                                         summarize_opts,
                                     ).await;
+                                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                    }
                                     responses.push(response);
                                     continue;
                                 }
@@ -1951,6 +1978,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                     Err(err_frame) => err_frame,
                                 };
+                                let mut response = response;
+                                if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                    strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                }
                                 responses.push(response);
                                 continue;
                             }
@@ -2046,6 +2077,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                                 }
                                                             };
                                                             drop(ts_guard);
+                                                            let mut response = response;
+                                                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                                            }
                                                             responses.push(response);
                                                             continue;
                                                         }
@@ -2185,6 +2220,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 // Explicit drop order: db_guard first, ts_guard last.
                                                 drop(db_guard_opt);
                                                 drop(ts_guard);
+                                                let mut response = response;
+                                                if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                    strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                                }
                                                 responses.push(response);
                                                 continue;
                                             }
@@ -2248,6 +2287,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
                                 }
                             };
+                            let mut response = response;
+                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                            }
                             responses.push(response);
                             continue;
                         }
@@ -2275,6 +2318,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                         };
                         for record in wal_records {
                             ctx.shard_databases.wal_append(ctx.shard_id, bytes::Bytes::from(record));
+                        }
+                        let mut response = response;
+                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                         }
                         responses.push(response);
                         continue;
@@ -2406,7 +2453,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                             }
-                            let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                            }
                             responses.push(response);
                         } else {
                             // READ PATH: shared lock — no contention with other shards' reads
@@ -2442,7 +2492,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     ctx.tracking_table.borrow_mut().track_key(client_id, &key, conn.tracking_state.noloop);
                                 }
                             }
-                            let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                            }
                             responses.push(response);
                         }
                     } else if let Some(target) = target_shard {
@@ -2476,7 +2529,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     ctx.tracking_table.borrow_mut().track_key(client_id, &key, conn.tracking_state.noloop);
                                 }
                             }
-                            let response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
+                            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                            }
                             responses.push(response);
                             continue;
                         }
