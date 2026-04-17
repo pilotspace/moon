@@ -205,9 +205,7 @@ pub fn ft_create(
                 if matches_keyword(&args[pos], b"SEPARATOR") {
                     pos += 1;
                     if pos >= args.len() {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR SEPARATOR requires a value",
-                        ));
+                        return Frame::Error(Bytes::from_static(b"ERR SEPARATOR requires a value"));
                     }
                     let sep_bytes = match extract_bulk(&args[pos]) {
                         Some(b) => b,

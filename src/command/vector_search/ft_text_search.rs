@@ -1147,7 +1147,7 @@ pub fn pre_parse_field_filter(query: &[u8]) -> Result<Option<TextQueryClause>, &
             if value.len() > 4096 {
                 return Err("ERR tag value too long");
             }
-            if value.iter().any(|b| *b == b'|') {
+            if value.contains(&b'|') {
                 return Err(
                     "ERR multi-tag OR syntax not supported in v1 — use separate queries and union on the client",
                 );

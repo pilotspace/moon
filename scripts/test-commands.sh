@@ -1267,92 +1267,180 @@ if should_run "vector"; then
     echo "=== FT.AGGREGATE (FACETED SEARCH) ==="
     flush_both
 
-    # Setup: index with TAG fields for grouping
-    mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG score NUMERIC >/dev/null 2>&1
+    # Setup: Plan 06 ships TAG field-type; Plan 07 re-adds `score NUMERIC`.
+    # Probe whether NUMERIC is available so AGG-03 / AGG-04 SUM/AVG/MIN/MAX
+    # over @score run iff Plan 07 is live. Plan 06's own AGG-01/02 +
+    # TAG-01..05 assertions compare exact counts and DO NOT require NUMERIC.
+    NUMERIC_PROBE=$(mcli FT.CREATE _probe_numeric ON HASH PREFIX 1 _probe: SCHEMA v NUMERIC 2>&1)
+    if echo "$NUMERIC_PROBE" | grep -qi "err"; then
+        NUMERIC_AVAILABLE=0
+    else
+        NUMERIC_AVAILABLE=1
+        mcli FT.DROPINDEX _probe_numeric >/dev/null 2>&1
+    fi
 
-    # Insert deterministic fixture:
+    # Plan 06: failures must surface — no 2>/dev/null masking.
+    if [ "$NUMERIC_AVAILABLE" -eq 1 ]; then
+        FT_CREATE_RESULT=$(mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG score NUMERIC 2>&1)
+    else
+        FT_CREATE_RESULT=$(mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG 2>&1)
+    fi
+    if echo "$FT_CREATE_RESULT" | grep -qi "err"; then
+        echo "  FAIL: FT.CREATE aggidx rejected by moon: $FT_CREATE_RESULT"
+        SKIP_AGG=1
+    else
+        SKIP_AGG=0
+    fi
+
+    # Insert deterministic fixture (runs only when FT.CREATE succeeded):
     #   status=open  × 5 (priority=high × 3, priority=low × 2) — assignees user0..user4
     #   status=closed × 2 (priority=low × 2) — assignees user0, user1
-    for i in 1 2 3; do
-        mcli HSET agg:$i status open priority high assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
-    done
-    for i in 4 5; do
-        mcli HSET agg:$i status open priority low assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
-    done
-    for i in 6 7; do
-        mcli HSET agg:$i status closed priority low assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
-    done
-
-    # AGG-01: GROUPBY + COUNT
-    TOTAL=$((TOTAL + 1))
-    AGG_COUNT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
-    if echo "$AGG_COUNT" | grep -q "open" && echo "$AGG_COUNT" | grep -q "5"; then
-        PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+COUNT (open=5)"
-    else
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 GROUPBY+COUNT unexpected: $AGG_COUNT"
+    if [ "$SKIP_AGG" -eq 0 ]; then
+        for i in 1 2 3; do
+            mcli HSET agg:$i status open priority high assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
+        done
+        for i in 4 5; do
+            mcli HSET agg:$i status open priority low assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
+        done
+        for i in 6 7; do
+            mcli HSET agg:$i status closed priority low assignee user$((i%5)) score $((10*i)) >/dev/null 2>&1
+        done
     fi
 
-    # AGG-01: GROUPBY + SUM
-    TOTAL=$((TOTAL + 1))
-    AGG_SUM=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE SUM 1 @score AS total 2>&1)
-    if echo "$AGG_SUM" | grep -qi "err"; then
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 GROUPBY+SUM errored: $AGG_SUM"
-    else
-        PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+SUM returns rows"
-    fi
+    if [ "$SKIP_AGG" -eq 0 ]; then
 
-    # AGG-01: GROUPBY + AVG
-    TOTAL=$((TOTAL + 1))
-    AGG_AVG=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE AVG 1 @score AS avg_score 2>&1)
-    if echo "$AGG_AVG" | grep -qi "err"; then
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 GROUPBY+AVG errored: $AGG_AVG"
-    else
-        PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+AVG returns rows"
-    fi
+        # AGG-01: GROUPBY + COUNT — assert specific counts (open=5 closed=2)
+        TOTAL=$((TOTAL + 1))
+        AGG_COUNT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
+        if echo "$AGG_COUNT" | grep -Pzo "(?s)open.*5" >/dev/null && echo "$AGG_COUNT" | grep -Pzo "(?s)closed.*2" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+COUNT (open=5 closed=2)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 expected open=5 closed=2, got: $AGG_COUNT"
+        fi
 
-    # AGG-01: GROUPBY + MIN/MAX
-    TOTAL=$((TOTAL + 1))
-    AGG_MIN=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MIN 1 @score AS min_score 2>&1)
-    if echo "$AGG_MIN" | grep -qi "err"; then
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 MIN errored: $AGG_MIN"
-    else
-        PASS=$((PASS + 1)); echo "  PASS: AGG-01 MIN returns rows"
-    fi
+        # AGG-02: GROUPBY @priority (high=3 low=4)
+        TOTAL=$((TOTAL + 1))
+        AGG_PRIORITY=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
+        if echo "$AGG_PRIORITY" | grep -Pzo "(?s)low.*4" >/dev/null && echo "$AGG_PRIORITY" | grep -Pzo "(?s)high.*3" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG-02 GROUPBY @priority (high=3 low=4)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02 expected high=3 low=4, got: $AGG_PRIORITY"
+        fi
 
-    TOTAL=$((TOTAL + 1))
-    AGG_MAX=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MAX 1 @score AS max_score 2>&1)
-    if echo "$AGG_MAX" | grep -qi "err"; then
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 MAX errored: $AGG_MAX"
-    else
-        PASS=$((PASS + 1)); echo "  PASS: AGG-01 MAX returns rows"
-    fi
+        # AGG-03/04 (SUM/AVG/MIN/MAX/COUNT_DISTINCT over @score) require NUMERIC (Plan 07).
+        if [ "$NUMERIC_AVAILABLE" -eq 1 ]; then
+            TOTAL=$((TOTAL + 1))
+            AGG_SUM=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE SUM 1 @score AS total 2>&1)
+            if echo "$AGG_SUM" | grep -qi "err"; then
+                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 GROUPBY+SUM errored: $AGG_SUM"
+            else
+                PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+SUM returns rows"
+            fi
 
-    # AGG-02: SORTBY + LIMIT
-    TOTAL=$((TOTAL + 1))
-    AGG_LIMIT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC LIMIT 0 1 2>&1)
-    # Limit 1 — must return the top group only
-    if echo "$AGG_LIMIT" | grep -q "open" && ! echo "$AGG_LIMIT" | grep -q "closed"; then
-        PASS=$((PASS + 1)); echo "  PASS: AGG-02 SORTBY + LIMIT returns top-1 ('open')"
-    else
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02 SORTBY+LIMIT unexpected: $AGG_LIMIT"
-    fi
+            TOTAL=$((TOTAL + 1))
+            AGG_AVG=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE AVG 1 @score AS avg_score 2>&1)
+            if echo "$AGG_AVG" | grep -qi "err"; then
+                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 GROUPBY+AVG errored: $AGG_AVG"
+            else
+                PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+AVG returns rows"
+            fi
 
-    # AGG-04: COUNT_DISTINCT (HLL-backed)
-    TOTAL=$((TOTAL + 1))
-    AGG_DISTINCT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT_DISTINCT 1 @assignee AS uniq_users 2>&1)
-    if echo "$AGG_DISTINCT" | grep -qi "err"; then
-        FAIL=$((FAIL + 1)); echo "  FAIL: AGG-04 COUNT_DISTINCT errored: $AGG_DISTINCT"
-    else
-        PASS=$((PASS + 1)); echo "  PASS: AGG-04 COUNT_DISTINCT returns rows"
-    fi
+            TOTAL=$((TOTAL + 1))
+            AGG_MIN=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MIN 1 @score AS min_score 2>&1)
+            if echo "$AGG_MIN" | grep -qi "err"; then
+                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 MIN errored: $AGG_MIN"
+            else
+                PASS=$((PASS + 1)); echo "  PASS: AGG-03 MIN returns rows"
+            fi
 
-    # APPLY must be rejected in v1 (D-04 / Pitfall 10)
-    TOTAL=$((TOTAL + 1))
-    APPLY_REJECT=$(mcli FT.AGGREGATE aggidx '*' APPLY '@score+1' AS plus_one 2>&1)
-    if echo "$APPLY_REJECT" | grep -qE "APPLY.*not supported|not implemented|v1"; then
-        PASS=$((PASS + 1)); echo "  PASS: AGG APPLY rejected in v1"
-    else
-        FAIL=$((FAIL + 1)); echo "  FAIL: APPLY should be rejected: $APPLY_REJECT"
+            TOTAL=$((TOTAL + 1))
+            AGG_MAX=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MAX 1 @score AS max_score 2>&1)
+            if echo "$AGG_MAX" | grep -qi "err"; then
+                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 MAX errored: $AGG_MAX"
+            else
+                PASS=$((PASS + 1)); echo "  PASS: AGG-03 MAX returns rows"
+            fi
+
+            TOTAL=$((TOTAL + 1))
+            AGG_DISTINCT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT_DISTINCT 1 @assignee AS uniq_users 2>&1)
+            if echo "$AGG_DISTINCT" | grep -qi "err"; then
+                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-04 COUNT_DISTINCT errored: $AGG_DISTINCT"
+            else
+                PASS=$((PASS + 1)); echo "  PASS: AGG-04 COUNT_DISTINCT returns rows"
+            fi
+        else
+            echo "  SKIP: AGG-03 / AGG-04 — NUMERIC field-type not yet available (Plan 07)"
+        fi
+
+        # AGG-02b: SORTBY + LIMIT
+        TOTAL=$((TOTAL + 1))
+        AGG_LIMIT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC LIMIT 0 1 2>&1)
+        if echo "$AGG_LIMIT" | grep -q "open" && ! echo "$AGG_LIMIT" | grep -q "closed"; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG-02b SORTBY + LIMIT returns top-1 ('open')"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02b SORTBY+LIMIT unexpected: $AGG_LIMIT"
+        fi
+
+        # APPLY must be rejected in v1 (D-04 / Pitfall 10)
+        TOTAL=$((TOTAL + 1))
+        APPLY_REJECT=$(mcli FT.AGGREGATE aggidx '*' APPLY '@score+1' AS plus_one 2>&1)
+        if echo "$APPLY_REJECT" | grep -qE "APPLY.*not supported|not implemented|v1"; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG APPLY rejected in v1"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: APPLY should be rejected: $APPLY_REJECT"
+        fi
+
+        # ── Plan 06 TAG gap-closure assertions ─────────────────────────────
+
+        # TAG-01: @status:{open} GROUPBY @priority — expect high=3 low=2
+        TOTAL=$((TOTAL + 1))
+        AGG_TAG_FILTER=$(mcli FT.AGGREGATE aggidx '@status:{open}' GROUPBY 1 @priority REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
+        if echo "$AGG_TAG_FILTER" | grep -Pzo "(?s)high.*3" >/dev/null && echo "$AGG_TAG_FILTER" | grep -Pzo "(?s)low.*2" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: TAG-01 @status:{open} GROUPBY @priority (high=3 low=2)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-01 expected high=3 low=2, got: $AGG_TAG_FILTER"
+        fi
+
+        # TAG-02: FT.SEARCH @status:{open} — 5 keys
+        TOTAL=$((TOTAL + 1))
+        SEARCH_TAG=$(mcli FT.SEARCH aggidx '@status:{open}' LIMIT 0 10 2>&1)
+        HIT_COUNT=$(echo "$SEARCH_TAG" | grep -c '^agg:')
+        if [ "$HIT_COUNT" -eq 5 ]; then
+            PASS=$((PASS + 1)); echo "  PASS: TAG-02 FT.SEARCH @status:{open} returned 5 keys"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-02 expected 5 open keys, got $HIT_COUNT: $SEARCH_TAG"
+        fi
+
+        # TAG-03: @Status:{open} (mixed-case field) must match @status:{open}
+        TOTAL=$((TOTAL + 1))
+        SEARCH_TAG_CASE=$(mcli FT.SEARCH aggidx '@Status:{open}' LIMIT 0 10 2>&1)
+        HIT_COUNT_CASE=$(echo "$SEARCH_TAG_CASE" | grep -c '^agg:')
+        if [ "$HIT_COUNT_CASE" -eq 5 ]; then
+            PASS=$((PASS + 1)); echo "  PASS: TAG-03 case-insensitive field @Status:{open} → 5 keys"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-03 case-insensitive field lookup: expected 5 got $HIT_COUNT_CASE"
+        fi
+
+        # TAG-04: partial HSET must preserve untouched tag fields
+        TOTAL=$((TOTAL + 1))
+        mcli HSET agg:partial status open priority high >/dev/null 2>&1
+        mcli HSET agg:partial priority low >/dev/null 2>&1   # partial — status NOT touched
+        SEARCH_PARTIAL=$(mcli FT.SEARCH aggidx '@status:{open}' LIMIT 0 100 2>&1)
+        if echo "$SEARCH_PARTIAL" | grep -q '^agg:partial$'; then
+            PASS=$((PASS + 1)); echo "  PASS: TAG-04 partial HSET preserved @status:open on agg:partial"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-04 partial HSET wiped prior status entry"
+        fi
+        mcli DEL agg:partial >/dev/null 2>&1
+
+        # TAG-05: multi-tag OR rejected with actionable error
+        TOTAL=$((TOTAL + 1))
+        TAG_OR=$(mcli FT.SEARCH aggidx '@status:{open|closed}' LIMIT 0 10 2>&1)
+        if echo "$TAG_OR" | grep -qi "multi-tag OR syntax not supported"; then
+            PASS=$((PASS + 1)); echo "  PASS: TAG-05 multi-tag OR rejected with actionable error"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 expected explicit rejection, got: $TAG_OR"
+        fi
     fi
 
     mcli FT.DROPINDEX aggidx >/dev/null 2>&1

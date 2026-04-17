@@ -38,14 +38,14 @@ pub use ft_search::{
     ft_search, merge_search_results, parse_ft_search_args, parse_session_clause, search_local,
     search_local_filtered,
 };
+#[cfg(feature = "text-index")]
+pub use ft_text_search::{FieldFilter, pre_parse_field_filter};
 pub use ft_text_search::{
     HighlightOpts, QueryTerm, SummarizeOpts, apply_post_processing, execute_text_search_local,
     execute_text_search_with_global_idf, ft_text_search, highlight_field, is_text_query,
     merge_text_results, parse_highlight_clause, parse_summarize_clause, parse_text_query,
     summarize_field,
 };
-#[cfg(feature = "text-index")]
-pub use ft_text_search::{FieldFilter, pre_parse_field_filter};
 pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
 pub use hybrid::{HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
 #[cfg(feature = "text-index")]

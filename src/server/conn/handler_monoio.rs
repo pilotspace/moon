@@ -2114,10 +2114,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             Ok(Some(clause)) => {
                                                 if clause.filter.is_some() {
                                                     let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
-                                                    let top_k = if count == usize::MAX { 10000 } else { offset.saturating_add(count) }.max(1);
-                                                    let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
-                                                    let response = match ts_guard.get_index(&index_name) {
-                                                        None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+                                                    let top_k = if count == usize::MAX {
+                                                        10000
+                                                    } else {
+                                                        offset.saturating_add(count)
+                                                    }
+                                                    .max(1);
+                                                    let ts_guard = ctx
+                                                        .shard_databases
+                                                        .text_store(ctx.shard_id);
+                                                    let response = match ts_guard
+                                                        .get_index(&index_name)
+                                                    {
+                                                        None => Frame::Error(Bytes::from_static(
+                                                            b"ERR no such index",
+                                                        )),
                                                         Some(text_index) => {
                                                             let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
                                                                 text_index, &clause, None, None, top_k,
