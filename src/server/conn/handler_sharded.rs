@@ -2433,6 +2433,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         read_buf_remainder: read_buf.split(),
                         client_id,
                         peer_addr: peer_addr.clone(),
+                        workspace_id: conn.workspace_id,
                     };
                     return (
                         HandlerResult::MigrateConnection { state: migrated_state, target_shard },

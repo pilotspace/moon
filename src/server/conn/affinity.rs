@@ -10,6 +10,8 @@
 
 use bytes::{Bytes, BytesMut};
 
+use crate::workspace::WorkspaceId;
+
 /// Minimum number of key samples before making a migration decision.
 const SAMPLE_SIZE: u16 = 16;
 
@@ -134,6 +136,9 @@ pub struct MigratedConnectionState {
     pub client_id: u64,
     /// Peer address string for logging/CLIENT LIST.
     pub peer_addr: String,
+    /// Workspace binding at migration time. Preserved so workspace-bound
+    /// connections continue to see workspace-scoped keys after shard migration.
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 #[cfg(test)]
@@ -294,6 +299,7 @@ mod tests {
             read_buf_remainder: BytesMut::from(&b"partial"[..]),
             client_id: 42,
             peer_addr: "127.0.0.1:54321".to_string(),
+            workspace_id: None,
         };
         assert_eq!(state.selected_db, 3);
         assert!(state.authenticated);

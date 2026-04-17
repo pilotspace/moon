@@ -29,6 +29,7 @@ use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
 use crate::tracking::{TrackingState, TrackingTable};
 use crate::transaction::CrossStoreTxn;
+use crate::workspace::WorkspaceId;
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
 
@@ -195,6 +196,9 @@ pub(crate) struct ConnectionState {
     /// Active cross-store transaction (None if not in transaction).
     /// Mutually exclusive with in_multi (MULTI/EXEC is KV-only).
     pub active_cross_txn: Option<CrossStoreTxn>,
+    /// Active workspace binding for this connection (None = no workspace context).
+    /// Set by WS.AUTH, cleared on connection drop.
+    pub workspace_id: Option<WorkspaceId>,
     pub command_queue: Vec<Frame>,
 
     // Tracking
@@ -241,6 +245,7 @@ impl ConnectionState {
             pubsub_rx: None,
             in_multi: false,
             active_cross_txn: None,
+            workspace_id: migrated.and_then(|s| s.workspace_id),
             command_queue: Vec::new(),
             tracking_state: TrackingState::default(),
             tracking_rx: None,
@@ -308,6 +313,13 @@ impl ConnectionState {
     #[inline]
     pub fn acl_skip_allowed(&self) -> bool {
         self.cached_acl_unrestricted && self.acl_cache_fresh()
+    }
+
+    /// Check if connection is bound to a workspace.
+    #[inline]
+    #[allow(dead_code)] // Used once WS.* handler intercepts are wired (Plan 02/03)
+    pub fn in_workspace(&self) -> bool {
+        self.workspace_id.is_some()
     }
 
     /// Check if connection is in a cross-store transaction.

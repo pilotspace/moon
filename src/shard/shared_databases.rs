@@ -8,6 +8,8 @@ use crate::storage::Database;
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
 use crate::text::store::TextStore;
 use crate::vector::store::VectorStore;
+use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
+use crate::workspace::wal::{decode_workspace_create, decode_workspace_drop};
 
 /// Thread-safe wrapper over per-shard databases.
 ///
@@ -33,6 +35,9 @@ pub struct ShardDatabases {
     /// Per-shard TemporalKvIndex for versioned KV reads.
     /// Lazy-init: None until first TemporalUpsert WAL write.
     temporal_kv_indexes: Vec<Mutex<Option<Box<TemporalKvIndex>>>>,
+    /// Per-shard WorkspaceRegistry for workspace metadata.
+    /// Lazy-init: None until first WS.CREATE call on this shard.
+    workspace_registries: Vec<Mutex<Option<Box<WorkspaceRegistry>>>>,
     num_shards: usize,
     db_count: usize,
 }
@@ -63,6 +68,9 @@ impl ShardDatabases {
         let temporal_kv_indexes = (0..num_shards)
             .map(|_| Mutex::new(None))
             .collect();
+        let workspace_registries = (0..num_shards)
+            .map(|_| Mutex::new(None))
+            .collect();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -72,6 +80,7 @@ impl ShardDatabases {
             wal_append_txs,
             temporal_registries,
             temporal_kv_indexes,
+            workspace_registries,
             num_shards,
             db_count,
         })
@@ -148,6 +157,96 @@ impl ShardDatabases {
         shard_id: usize,
     ) -> MutexGuard<'_, Option<Box<TemporalKvIndex>>> {
         self.temporal_kv_indexes[shard_id].lock()
+    }
+
+    /// Acquire the per-shard WorkspaceRegistry lock.
+    /// Caller lazy-inits via `get_or_insert_with(|| Box::new(WorkspaceRegistry::new()))`.
+    #[inline]
+    pub fn workspace_registry(
+        &self,
+        shard_id: usize,
+    ) -> MutexGuard<'_, Option<Box<WorkspaceRegistry>>> {
+        self.workspace_registries[shard_id].lock()
+    }
+
+    /// Replay WAL WorkspaceCreate and WorkspaceDrop records to restore workspace registry.
+    ///
+    /// Called during server startup after graph and temporal WAL replay.
+    /// Scans per-shard WAL directories for v3 segment files and processes
+    /// WorkspaceCreate/WorkspaceDrop records to restore workspace metadata.
+    pub fn replay_workspace_wal(&self, persistence_dir: &std::path::Path) {
+        use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
+
+        for shard_id in 0..self.num_shards {
+            let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
+            if !wal_dir.exists() {
+                continue;
+            }
+
+            let mut create_count = 0u64;
+            let mut drop_count = 0u64;
+
+            let on_command = &mut |record: &WalRecord| {
+                match record.record_type {
+                    WalRecordType::WorkspaceCreate => {
+                        if let Some((ws_bytes, name)) = decode_workspace_create(&record.payload) {
+                            let ws_id = WorkspaceId::from_bytes(ws_bytes);
+                            let meta = WorkspaceMetadata {
+                                id: ws_id,
+                                name: bytes::Bytes::from(name),
+                                created_at: 0, // WAL doesn't store created_at; use 0 as placeholder
+                            };
+                            let mut guard = self.workspace_registries[shard_id].lock();
+                            let reg =
+                                guard.get_or_insert_with(|| Box::new(WorkspaceRegistry::new()));
+                            reg.insert(ws_id, meta);
+                            create_count += 1;
+                        }
+                    }
+                    WalRecordType::WorkspaceDrop => {
+                        if let Some(ws_bytes) = decode_workspace_drop(&record.payload) {
+                            let ws_id = WorkspaceId::from_bytes(ws_bytes);
+                            let mut guard = self.workspace_registries[shard_id].lock();
+                            if let Some(reg) = guard.as_mut() {
+                                reg.remove(&ws_id);
+                            }
+                            drop_count += 1;
+                        }
+                    }
+                    _ => {} // Skip non-workspace records
+                }
+            };
+            let on_fpi = &mut |_: &WalRecord| {};
+
+            // Scan WAL files in the shard directory
+            if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+                let mut wal_files: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.ends_with(".wal"))
+                    })
+                    .map(|e| e.path())
+                    .collect();
+                wal_files.sort();
+
+                for wal_file in &wal_files {
+                    let _ = crate::persistence::wal_v3::replay::replay_wal_v3_file(
+                        wal_file, 0, on_command, on_fpi,
+                    );
+                }
+            }
+
+            if create_count > 0 || drop_count > 0 {
+                tracing::info!(
+                    "Shard {}: replayed {} WorkspaceCreate + {} WorkspaceDrop WAL records",
+                    shard_id,
+                    create_count,
+                    drop_count,
+                );
+            }
+        }
     }
 
     /// Recover graph stores from persistence for all shards.

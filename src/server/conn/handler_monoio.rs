@@ -3174,6 +3174,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 read_buf_remainder: read_buf.split(),
                 client_id,
                 peer_addr: peer_addr.clone(),
+                workspace_id: conn.workspace_id,
             };
             return (
                 MonoioHandlerResult::MigrateConnection {
