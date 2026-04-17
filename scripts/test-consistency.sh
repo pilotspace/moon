@@ -83,7 +83,7 @@ wait_for_port() {
 
 if [[ "$SKIP_BUILD" == false ]]; then
     log "Building..."
-    RUSTFLAGS="-C target-cpu=native" cargo build --release 2>&1 | tail -2
+    RUSTFLAGS="-C target-cpu=native" cargo build --release --features text-index 2>&1 | tail -2
 fi
 
 log "Starting Redis on :$PORT_REDIS ..."

@@ -276,7 +276,7 @@ log "=== Moon Command Coverage Test ==="
 
 if [[ "$SKIP_BUILD" == "false" ]]; then
     log "Building moon..."
-    cargo build --release --quiet 2>/dev/null
+    cargo build --release --features text-index --quiet 2>/dev/null
 fi
 
 if [[ "$MOON_ONLY" == "false" ]]; then
