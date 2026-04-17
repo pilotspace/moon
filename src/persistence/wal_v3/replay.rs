@@ -79,6 +79,51 @@ pub fn replay_wal_auto(
                             // XactAbort: no action - changes were never committed
                             tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
                         }
+                        WalRecordType::TemporalUpsert => {
+                            // Decode payload and log for temporal KV index restoration.
+                            // Full state restoration happens in ShardDatabases::replay_temporal_wal
+                            // (TemporalKvIndex lives on ShardDatabases, not on databases: &mut [Database]).
+                            if let Some((key, valid_from, _system_from, _value)) =
+                                crate::persistence::wal_v3::record::decode_temporal_upsert(
+                                    &record.payload,
+                                )
+                            {
+                                tracing::debug!(
+                                    lsn = record.lsn,
+                                    key_len = key.len(),
+                                    valid_from = valid_from,
+                                    "WAL replay: TemporalUpsert (deferred to temporal replay path)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    lsn = record.lsn,
+                                    "WAL replay: malformed TemporalUpsert payload"
+                                );
+                            }
+                        }
+                        WalRecordType::GraphTemporal => {
+                            // Decode payload and log for graph entity valid_to restoration.
+                            // Full state restoration happens in ShardDatabases::replay_temporal_wal
+                            // (GraphStore lives on ShardDatabases, not on databases: &mut [Database]).
+                            if let Some((entity_id, is_node, valid_to, _system_from)) =
+                                crate::persistence::wal_v3::record::decode_graph_temporal(
+                                    &record.payload,
+                                )
+                            {
+                                tracing::debug!(
+                                    lsn = record.lsn,
+                                    entity_id = entity_id,
+                                    is_node = is_node,
+                                    valid_to = valid_to,
+                                    "WAL replay: GraphTemporal (deferred to temporal replay path)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    lsn = record.lsn,
+                                    "WAL replay: malformed GraphTemporal payload"
+                                );
+                            }
+                        }
                         _ => {
                             // Other record types (Vector*, Checkpoint, etc.)
                         }

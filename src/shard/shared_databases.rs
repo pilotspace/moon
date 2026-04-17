@@ -222,6 +222,112 @@ impl ShardDatabases {
         }
     }
 
+    /// Replay temporal WAL records into per-shard TemporalKvIndex and GraphStore.
+    ///
+    /// Called after `recover_graph_stores` and `replay_graph_wal` during startup.
+    /// Scans per-shard WAL directories for v3 segment files and processes
+    /// TemporalUpsert and GraphTemporal records to restore temporal state.
+    #[cfg(feature = "graph")]
+    pub fn replay_temporal_wal(&self, persistence_dir: &std::path::Path) {
+        use crate::persistence::wal_v3::record::{
+            WalRecord, WalRecordType, decode_graph_temporal, decode_temporal_upsert,
+        };
+
+        for shard_id in 0..self.num_shards {
+            let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
+            if !wal_dir.exists() {
+                continue;
+            }
+
+            let mut temporal_upsert_count = 0usize;
+            let mut graph_temporal_count = 0usize;
+
+            let on_command = &mut |record: &WalRecord| {
+                match record.record_type {
+                    WalRecordType::TemporalUpsert => {
+                        if let Some((key, valid_from, _system_from, value)) =
+                            decode_temporal_upsert(&record.payload)
+                        {
+                            let mut guard = self.temporal_kv_indexes[shard_id].lock();
+                            let idx = guard.get_or_insert_with(|| {
+                                Box::new(crate::temporal::TemporalKvIndex::new())
+                            });
+                            idx.record(
+                                bytes::Bytes::copy_from_slice(key),
+                                valid_from,
+                                bytes::Bytes::copy_from_slice(value),
+                            );
+                            temporal_upsert_count += 1;
+                        }
+                    }
+                    WalRecordType::GraphTemporal => {
+                        if let Some((entity_id, is_node, valid_to, _system_from)) =
+                            decode_graph_temporal(&record.payload)
+                        {
+                            let mut gs = self.graph_stores[shard_id].write();
+                            for named_graph in gs.iter_graphs_mut() {
+                                let found = if is_node {
+                                    let nk: crate::graph::types::NodeKey =
+                                        slotmap::KeyData::from_ffi(entity_id).into();
+                                    if let Some(node) = named_graph.write_buf.get_node_mut(nk) {
+                                        node.valid_to = valid_to;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    let ek: crate::graph::types::EdgeKey =
+                                        slotmap::KeyData::from_ffi(entity_id).into();
+                                    if let Some(edge) = named_graph.write_buf.get_edge_mut(ek) {
+                                        edge.valid_to = valid_to;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if found {
+                                    graph_temporal_count += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // Other record types handled by their respective replay paths
+                }
+            };
+            let on_fpi = &mut |_: &WalRecord| {};
+
+            // Scan WAL files in the shard directory
+            if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+                let mut wal_files: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.ends_with(".wal"))
+                    })
+                    .map(|e| e.path())
+                    .collect();
+                wal_files.sort();
+
+                for wal_file in &wal_files {
+                    let _ = crate::persistence::wal_v3::replay::replay_wal_v3_file(
+                        wal_file, 0, on_command, on_fpi,
+                    );
+                }
+            }
+
+            if temporal_upsert_count > 0 || graph_temporal_count > 0 {
+                tracing::info!(
+                    "Shard {}: replayed {} TemporalUpsert + {} GraphTemporal WAL records",
+                    shard_id,
+                    temporal_upsert_count,
+                    graph_temporal_count,
+                );
+            }
+        }
+    }
+
     /// Acquire a shared read lock on a specific database.
     #[inline]
     pub fn read_db(&self, shard_id: usize, db_index: usize) -> RwLockReadGuard<'_, Database> {

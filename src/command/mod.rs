@@ -19,6 +19,7 @@ pub mod set;
 pub mod sorted_set;
 pub mod stream;
 pub mod string;
+pub mod temporal;
 pub mod transaction;
 pub mod vector_search;
 // NOTE: ACL is an intercepted command handled at the connection level (like AUTH/BGSAVE),

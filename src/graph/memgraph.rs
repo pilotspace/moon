@@ -199,6 +199,11 @@ impl MemGraph {
         self.edges.get(key)
     }
 
+    /// O(1) mutable edge lookup by key.
+    pub fn get_edge_mut(&mut self, key: EdgeKey) -> Option<&mut MutableEdge> {
+        self.edges.get_mut(key)
+    }
+
     /// Returns neighbors of `node` visible at the given `lsn`, filtered by direction.
     ///
     /// Yields `(EdgeKey, NodeKey)` pairs -- the edge and the neighbor node.

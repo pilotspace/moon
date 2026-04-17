@@ -192,6 +192,11 @@ impl GraphStore {
         self.graphs.as_mut()?.get_mut(name)
     }
 
+    /// Iterate all named graphs mutably (for WAL replay).
+    pub fn iter_graphs_mut(&mut self) -> impl Iterator<Item = &mut NamedGraph> {
+        self.graphs.iter_mut().flat_map(|m| m.values_mut())
+    }
+
     /// List all graph names. Returns empty vec if no graphs exist.
     pub fn list_graphs(&self) -> Vec<&Bytes> {
         match &self.graphs {

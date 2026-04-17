@@ -396,3 +396,22 @@ pub(crate) fn parse_expand_clause(args: &[Frame]) -> Option<u32> {
     }
     None
 }
+
+/// Parse AS_OF <timestamp_ms> clause from FT.SEARCH args.
+///
+/// Returns the wall-clock timestamp (i64 Unix millis) if present.
+/// Used with TemporalRegistry.lsn_at() to resolve to a snapshot LSN.
+pub(crate) fn parse_as_of_clause(args: &[Frame]) -> Option<i64> {
+    for i in 0..args.len().saturating_sub(1) {
+        if matches_keyword(&args[i], b"AS_OF") {
+            if let Some(val_bytes) = extract_bulk(&args[i + 1]) {
+                return std::str::from_utf8(&val_bytes)
+                    .ok()?
+                    .trim()
+                    .parse::<i64>()
+                    .ok();
+            }
+        }
+    }
+    None
+}

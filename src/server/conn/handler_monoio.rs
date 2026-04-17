@@ -14,6 +14,10 @@ use std::sync::Arc;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
+use crate::command::temporal::{
+    capture_wall_ms, is_temporal_invalidate, is_temporal_snapshot_at, validate_invalidate,
+    validate_snapshot_at, ERR_ENTITY_NOT_FOUND, ERR_GRAPH_NOT_FOUND,
+};
 use crate::command::transaction::{
     is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate, txn_begin_validate,
     txn_commit_validate, ERR_MULTI_TXN_CONFLICT,
@@ -1584,6 +1588,107 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         } else {
                             responses
                                 .push(Frame::Error(Bytes::from_static(b"ERR not in transaction")));
+                        }
+                    }
+                    Err(e) => responses.push(e),
+                }
+                continue;
+            }
+
+            // --- TEMPORAL.SNAPSHOT_AT ---
+            if is_temporal_snapshot_at(cmd) {
+                match validate_snapshot_at(cmd_args) {
+                    Ok(()) => {
+                        let wall_ms = capture_wall_ms();
+                        // Get current LSN from the vector store's transaction manager
+                        let lsn = {
+                            let vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
+                            vector_store.txn_manager().current_lsn()
+                        };
+                        // Lazy-init and record the wall-clock -> LSN binding
+                        {
+                            let mut guard =
+                                ctx.shard_databases.temporal_registry(ctx.shard_id);
+                            let registry = guard.get_or_insert_with(|| {
+                                Box::new(crate::temporal::TemporalRegistry::new())
+                            });
+                            registry.record(wall_ms, lsn);
+                        }
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                    }
+                    Err(e) => responses.push(e),
+                }
+                continue;
+            }
+
+            // --- TEMPORAL.INVALIDATE ---
+            if is_temporal_invalidate(cmd) {
+                match validate_invalidate(cmd_args) {
+                    Ok((entity_id, is_node, graph_name)) => {
+                        let wall_ms = capture_wall_ms();
+                        #[cfg(feature = "graph")]
+                        {
+                            let mut gs =
+                                ctx.shard_databases.graph_store_write(ctx.shard_id);
+                            if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
+                                let mutated = if is_node {
+                                    let node_key: crate::graph::types::NodeKey =
+                                        slotmap::KeyData::from_ffi(entity_id).into();
+                                    if let Some(node) =
+                                        named_graph.write_buf.get_node_mut(node_key)
+                                    {
+                                        node.valid_to = wall_ms;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    let edge_key: crate::graph::types::EdgeKey =
+                                        slotmap::KeyData::from_ffi(entity_id).into();
+                                    if let Some(edge) =
+                                        named_graph.write_buf.get_edge_mut(edge_key)
+                                    {
+                                        edge.valid_to = wall_ms;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if mutated {
+                                    // Write GraphTemporal WAL record with literal system_from
+                                    let payload =
+                                        crate::persistence::wal_v3::record::encode_graph_temporal(
+                                            entity_id, is_node, wall_ms, wall_ms,
+                                        );
+                                    gs.wal_pending.push(payload);
+                                    let wal_records = gs.drain_wal();
+                                    drop(gs);
+                                    for record in wal_records {
+                                        ctx.shard_databases
+                                            .wal_append(ctx.shard_id, Bytes::from(record));
+                                    }
+                                    responses.push(Frame::SimpleString(
+                                        Bytes::from_static(b"OK"),
+                                    ));
+                                } else {
+                                    drop(gs);
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        ERR_ENTITY_NOT_FOUND,
+                                    )));
+                                }
+                            } else {
+                                drop(gs);
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    ERR_GRAPH_NOT_FOUND,
+                                )));
+                            }
+                        }
+                        #[cfg(not(feature = "graph"))]
+                        {
+                            let _ = (entity_id, is_node, graph_name, wall_ms);
+                            responses.push(Frame::Error(Bytes::from_static(
+                                b"ERR graph feature not enabled",
+                            )));
                         }
                     }
                     Err(e) => responses.push(e),

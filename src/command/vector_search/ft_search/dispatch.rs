@@ -25,8 +25,9 @@ use super::execute::{
     search_local_raw,
 };
 use super::parse::{
-    extract_param_blob, parse_filter_clause, parse_inline_filter, parse_knn_query,
-    parse_limit_clause, parse_range_clause, parse_session_clause, parse_sparse_clause,
+    extract_param_blob, parse_as_of_clause, parse_filter_clause, parse_inline_filter,
+    parse_knn_query, parse_limit_clause, parse_range_clause, parse_session_clause,
+    parse_sparse_clause,
 };
 use super::response::{build_hybrid_response, build_search_response};
 
@@ -124,6 +125,11 @@ pub fn ft_search(
 
     // Parse optional RANGE threshold for distance filtering (AGNT-05)
     let range_threshold = parse_range_clause(args);
+
+    // Parse optional AS_OF clause for temporal queries (TEMP-04).
+    // The wall-clock timestamp is parsed here; LSN resolution via TemporalRegistry
+    // happens at the handler level before calling ft_search.
+    let _as_of_ts = parse_as_of_clause(args);
 
     // Look up metric for range filtering (cheap immutable borrow before search paths)
     let range_metric = if range_threshold.is_some() {
