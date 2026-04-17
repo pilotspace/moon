@@ -360,10 +360,11 @@ fn test_ft_dropindex() {
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
 
-    // Drop existing
+    // Drop existing (no DD flag, no db needed)
     let result = ft_dropindex(
         &mut store,
         &mut crate::text::store::TextStore::new(),
+        None,
         &[bulk(b"myidx")],
     );
     assert!(matches!(result, Frame::SimpleString(_)));
@@ -373,6 +374,7 @@ fn test_ft_dropindex() {
     let result = ft_dropindex(
         &mut store,
         &mut crate::text::store::TextStore::new(),
+        None,
         &[bulk(b"myidx")],
     );
     assert!(matches!(result, Frame::Error(_)));
@@ -963,6 +965,7 @@ fn test_vector_metrics_increment_decrement() {
     ft_dropindex(
         &mut store,
         &mut crate::text::store::TextStore::new(),
+        None,
         &[bulk(b"myidx")],
     );
     let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
@@ -3394,4 +3397,299 @@ mod ft_navigate_tests {
             other => panic!("expected error, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FT.DROPINDEX DD Flag Tests (Phase 156)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ft_dropindex_dd_deletes_docs() {
+    use crate::storage::db::Database;
+
+    // Create database and vector store
+    let mut db = Database::new();
+    let mut store = VectorStore::new();
+    let mut text_store = crate::text::store::TextStore::new();
+
+    // Create index
+    let create_args = vec![
+        bulk(b"ddtest"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"dd:"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ];
+    ft_create(&mut store, &mut text_store, &create_args);
+
+    // Insert document into database (simulating HSET)
+    let key1 = Bytes::from_static(b"dd:1");
+    let key2 = Bytes::from_static(b"dd:2");
+    db.set(key1.clone(), crate::storage::entry::Entry::new_hash());
+    db.set(key2.clone(), crate::storage::entry::Entry::new_hash());
+
+    // Register keys in the vector index (simulating auto_index_hset)
+    if let Some(idx) = store.get_index_mut(b"ddtest") {
+        let h1 = xxhash_rust::xxh64::xxh64(&key1, 0);
+        let h2 = xxhash_rust::xxh64::xxh64(&key2, 0);
+        idx.key_hash_to_key.insert(h1, key1.clone());
+        idx.key_hash_to_key.insert(h2, key2.clone());
+    }
+
+    // Verify keys exist in database
+    assert!(db.get(&key1).is_some(), "key dd:1 should exist before drop");
+    assert!(db.get(&key2).is_some(), "key dd:2 should exist before drop");
+
+    // Drop index with DD flag
+    let result = ft_dropindex(
+        &mut store,
+        &mut text_store,
+        Some(&mut db),
+        &[bulk(b"ddtest"), bulk(b"DD")],
+    );
+    assert!(
+        matches!(result, Frame::SimpleString(_)),
+        "FT.DROPINDEX DD should return OK, got {result:?}"
+    );
+
+    // Verify documents are deleted
+    assert!(
+        db.get(&key1).is_none(),
+        "key dd:1 should be deleted after FT.DROPINDEX DD"
+    );
+    assert!(
+        db.get(&key2).is_none(),
+        "key dd:2 should be deleted after FT.DROPINDEX DD"
+    );
+}
+
+#[test]
+fn test_ft_dropindex_preserves_docs() {
+    use crate::storage::db::Database;
+
+    let mut db = Database::new();
+    let mut store = VectorStore::new();
+    let mut text_store = crate::text::store::TextStore::new();
+
+    // Create index
+    let create_args = vec![
+        bulk(b"preservetest"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"pres:"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ];
+    ft_create(&mut store, &mut text_store, &create_args);
+
+    // Insert document into database
+    let key1 = Bytes::from_static(b"pres:1");
+    db.set(key1.clone(), crate::storage::entry::Entry::new_hash());
+
+    // Register key in vector index
+    if let Some(idx) = store.get_index_mut(b"preservetest") {
+        let h1 = xxhash_rust::xxh64::xxh64(&key1, 0);
+        idx.key_hash_to_key.insert(h1, key1.clone());
+    }
+
+    // Drop index WITHOUT DD flag (using None for db since we don't need it)
+    let result = ft_dropindex(&mut store, &mut text_store, None, &[bulk(b"preservetest")]);
+    assert!(
+        matches!(result, Frame::SimpleString(_)),
+        "FT.DROPINDEX should return OK"
+    );
+
+    // Verify document is preserved
+    assert!(
+        db.get(&key1).is_some(),
+        "key pres:1 should be preserved after FT.DROPINDEX without DD"
+    );
+}
+
+#[test]
+fn test_ft_dropindex_dd_case_insensitive() {
+    use crate::storage::db::Database;
+
+    // Test lowercase 'dd'
+    {
+        let mut db = Database::new();
+        let mut store = VectorStore::new();
+        let mut text_store = crate::text::store::TextStore::new();
+
+        let create_args = vec![
+            bulk(b"casetest1"),
+            bulk(b"ON"),
+            bulk(b"HASH"),
+            bulk(b"PREFIX"),
+            bulk(b"1"),
+            bulk(b"c1:"),
+            bulk(b"SCHEMA"),
+            bulk(b"vec"),
+            bulk(b"VECTOR"),
+            bulk(b"HNSW"),
+            bulk(b"6"),
+            bulk(b"TYPE"),
+            bulk(b"FLOAT32"),
+            bulk(b"DIM"),
+            bulk(b"4"),
+            bulk(b"DISTANCE_METRIC"),
+            bulk(b"L2"),
+        ];
+        ft_create(&mut store, &mut text_store, &create_args);
+
+        let key = Bytes::from_static(b"c1:doc");
+        db.set(key.clone(), crate::storage::entry::Entry::new_hash());
+        if let Some(idx) = store.get_index_mut(b"casetest1") {
+            idx.key_hash_to_key
+                .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
+        }
+
+        let result = ft_dropindex(
+            &mut store,
+            &mut text_store,
+            Some(&mut db),
+            &[bulk(b"casetest1"), bulk(b"dd")], // lowercase
+        );
+        assert!(
+            matches!(result, Frame::SimpleString(_)),
+            "lowercase dd should work"
+        );
+        assert!(
+            db.get(&key).is_none(),
+            "lowercase dd should delete documents"
+        );
+    }
+
+    // Test mixed case 'Dd'
+    {
+        let mut db = Database::new();
+        let mut store = VectorStore::new();
+        let mut text_store = crate::text::store::TextStore::new();
+
+        let create_args = vec![
+            bulk(b"casetest2"),
+            bulk(b"ON"),
+            bulk(b"HASH"),
+            bulk(b"PREFIX"),
+            bulk(b"1"),
+            bulk(b"c2:"),
+            bulk(b"SCHEMA"),
+            bulk(b"vec"),
+            bulk(b"VECTOR"),
+            bulk(b"HNSW"),
+            bulk(b"6"),
+            bulk(b"TYPE"),
+            bulk(b"FLOAT32"),
+            bulk(b"DIM"),
+            bulk(b"4"),
+            bulk(b"DISTANCE_METRIC"),
+            bulk(b"L2"),
+        ];
+        ft_create(&mut store, &mut text_store, &create_args);
+
+        let key = Bytes::from_static(b"c2:doc");
+        db.set(key.clone(), crate::storage::entry::Entry::new_hash());
+        if let Some(idx) = store.get_index_mut(b"casetest2") {
+            idx.key_hash_to_key
+                .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
+        }
+
+        let result = ft_dropindex(
+            &mut store,
+            &mut text_store,
+            Some(&mut db),
+            &[bulk(b"casetest2"), bulk(b"Dd")], // mixed case
+        );
+        assert!(
+            matches!(result, Frame::SimpleString(_)),
+            "mixed case Dd should work"
+        );
+        assert!(
+            db.get(&key).is_none(),
+            "mixed case Dd should delete documents"
+        );
+    }
+}
+
+#[test]
+fn test_ft_dropindex_dd_unknown_index() {
+    use crate::storage::db::Database;
+
+    let mut db = Database::new();
+    let mut store = VectorStore::new();
+    let mut text_store = crate::text::store::TextStore::new();
+
+    // Try to drop non-existent index with DD flag
+    let result = ft_dropindex(
+        &mut store,
+        &mut text_store,
+        Some(&mut db),
+        &[bulk(b"nonexistent"), bulk(b"DD")],
+    );
+
+    assert!(
+        matches!(result, Frame::Error(_)),
+        "FT.DROPINDEX DD on non-existent index should return error"
+    );
+}
+
+#[test]
+fn test_ft_dropindex_extra_args_error() {
+    let mut store = VectorStore::new();
+    let mut text_store = crate::text::store::TextStore::new();
+
+    // Create index
+    let create_args = vec![
+        bulk(b"extratest"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ];
+    ft_create(&mut store, &mut text_store, &create_args);
+
+    // Try with extra arguments beyond DD
+    let result = ft_dropindex(
+        &mut store,
+        &mut text_store,
+        None,
+        &[bulk(b"extratest"), bulk(b"DD"), bulk(b"EXTRA")],
+    );
+
+    assert!(
+        matches!(result, Frame::Error(_)),
+        "FT.DROPINDEX with extra args should return arity error"
+    );
 }

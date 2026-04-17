@@ -2381,7 +2381,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 )
                             }
                         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                            crate::command::vector_search::ft_dropindex(&mut vs, &mut ts, cmd_args)
+                            let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
+                            crate::command::vector_search::ft_dropindex(
+                                &mut vs,
+                                &mut ts,
+                                Some(&mut *db_guard),
+                                cmd_args,
+                            )
                         } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                             crate::command::vector_search::ft_info(&vs, &ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {

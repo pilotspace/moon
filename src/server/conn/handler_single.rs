@@ -1302,7 +1302,8 @@ pub async fn handle_connection(
                                             crate::command::vector_search::ft_search(&mut *store, cmd_args, None, Some(&*ts_mut))
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                        crate::command::vector_search::ft_dropindex(&mut *store, ts_mut, cmd_args)
+                                        let mut db_guard = db[conn.selected_db].write();
+                                        crate::command::vector_search::ft_dropindex(&mut *store, ts_mut, Some(&mut *db_guard), cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                         crate::command::vector_search::ft_info(&*store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
@@ -1649,7 +1650,7 @@ pub async fn handle_connection(
                                             // Write run: guard is already write-locked
                                             crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard), Some(&*ts_m3))
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                                            crate::command::vector_search::ft_dropindex(&mut *store, ts_m3, d_args)
+                                            crate::command::vector_search::ft_dropindex(&mut *store, ts_m3, Some(&mut *guard), d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, ts_m3, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {

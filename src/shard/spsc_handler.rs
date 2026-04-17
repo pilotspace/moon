@@ -1294,7 +1294,7 @@ pub(crate) fn dispatch_vector_command(
             vector_search::ft_search(vector_store, args, db, Some(text_store))
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-        vector_search::ft_dropindex(vector_store, text_store, args)
+        vector_search::ft_dropindex(vector_store, text_store, db, args)
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
         vector_search::ft_info(vector_store, text_store, args)
     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {

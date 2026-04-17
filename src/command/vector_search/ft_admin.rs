@@ -3,33 +3,103 @@
 use bytes::Bytes;
 
 use crate::protocol::{Frame, FrameVec};
+use crate::storage::db::Database;
 use crate::vector::store::VectorStore;
 
 use super::extract_bulk;
 
-/// FT.DROPINDEX index_name
+/// FT.DROPINDEX index_name [DD]
+///
+/// Drops a vector or text index. With the optional DD flag, also deletes
+/// all documents that were indexed by the dropped index.
+///
+/// # Arguments
+/// - `store`: The VectorStore containing vector indexes
+/// - `text_store`: The TextStore containing text indexes
+/// - `db`: Optional database reference (required when DD flag is used)
+/// - `args`: Command arguments: `[index_name]` or `[index_name, DD]`
+///
+/// # Returns
+/// - `OK` on success
+/// - Error if index doesn't exist or wrong number of arguments
 pub fn ft_dropindex(
     store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
+    db: Option<&mut Database>,
     args: &[Frame],
 ) -> Frame {
-    if args.len() != 1 {
+    // Accept 1 argument (index_name) or 2 arguments (index_name DD)
+    if args.is_empty() || args.len() > 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.DROPINDEX' command",
         ));
     }
+
     let name = match extract_bulk(&args[0]) {
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
     };
+
+    // Parse DD flag (case-insensitive)
+    let delete_docs = args.len() == 2
+        && matches!(&args[1], Frame::BulkString(b) if b.eq_ignore_ascii_case(b"DD"));
+
+    // If DD flag provided but something other than "DD", reject as invalid
+    if args.len() == 2 && !delete_docs {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'FT.DROPINDEX' command",
+        ));
+    }
+
+    // Check if index exists before attempting deletion
+    let vector_exists = store.get_index(&name).is_some();
+    let text_exists = text_store.get_index(name.as_ref()).is_some();
+
+    if !vector_exists && !text_exists {
+        return Frame::Error(Bytes::from_static(b"Unknown Index name"));
+    }
+
+    // If DD flag is set, collect and delete all indexed documents BEFORE dropping the index
+    if delete_docs {
+        let Some(db) = db else {
+            return Frame::Error(Bytes::from_static(b"ERR DD flag requires database access"));
+        };
+
+        // Collect keys from vector index (key_hash_to_key maps hash -> original key bytes)
+        let mut keys_to_delete: Vec<Bytes> = Vec::new();
+        if let Some(idx) = store.get_index(&name) {
+            keys_to_delete.extend(idx.key_hash_to_key.values().cloned());
+        }
+
+        // Collect keys from text index (doc_id_to_key maps doc_id -> original key bytes)
+        // Deduplicate with vector keys to avoid double-deletion
+        if let Some(idx) = text_store.get_index(name.as_ref()) {
+            for key in idx.doc_id_to_key.values() {
+                if !keys_to_delete.iter().any(|k| k == key) {
+                    keys_to_delete.push(key.clone());
+                }
+            }
+        }
+
+        // Delete all collected keys from the database
+        for key in &keys_to_delete {
+            db.remove(key);
+        }
+    }
+
+    // Drop the index metadata (existing logic)
     let vector_dropped = store.drop_index(&name);
     let text_dropped = text_store.drop_index(&name);
+
     if vector_dropped {
         crate::vector::metrics::decrement_indexes();
     }
+
+    // We already verified at least one index exists, so this should always succeed
     if vector_dropped || text_dropped {
         Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
+        // Shouldn't reach here given the existence check above, but handle defensively
         Frame::Error(Bytes::from_static(b"Unknown Index name"))
     }
 }
