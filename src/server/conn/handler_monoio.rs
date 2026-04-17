@@ -1689,6 +1689,36 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
                 if ctx.num_shards > 1 {
                     // Multi-shard: dispatch via SPSC
+                    #[cfg(feature = "text-index")]
+                    if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                        // ── FT.AGGREGATE: multi-shard scatter-gather (Phase 152 Plan 03). ──
+                        // Mirrors handler_sharded.rs:1458. scatter_text_aggregate acquires
+                        // its own per-shard guards inside the single-shard block internally,
+                        // so we never hold a MutexGuard across the .await below.
+                        let parsed =
+                            match crate::command::vector_search::ft_aggregate::parse_aggregate_args(
+                                cmd_args,
+                            ) {
+                                Ok(p) => p,
+                                Err(err_frame) => {
+                                    responses.push(err_frame);
+                                    continue;
+                                }
+                            };
+                        let response = crate::shard::scatter_aggregate::scatter_text_aggregate(
+                            parsed.index_name,
+                            parsed.query,
+                            parsed.pipeline,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            &ctx.shard_databases,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        responses.push(response);
+                        continue;
+                    }
                     if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                         // Check if this is a text query BEFORE trying parse_ft_search_args
                         // (which would return an error for non-KNN queries).
@@ -2069,6 +2099,39 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 } else {
                     // Single-shard: no SPSC channels needed.
                     // Dispatch directly to shard's VectorStore via shared access.
+                    //
+                    // ── 154-01 single-shard FT.AGGREGATE fast path ────────────────
+                    // scatter_text_aggregate internally fast-paths num_shards == 1
+                    // to execute_local_full with locally-acquired guards dropped
+                    // before any .await. Calling the scatter entry here (instead
+                    // of execute_local_full directly) keeps the dispatch body
+                    // byte-symmetric with the multi-shard site above.
+                    #[cfg(feature = "text-index")]
+                    if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
+                        let parsed =
+                            match crate::command::vector_search::ft_aggregate::parse_aggregate_args(
+                                cmd_args,
+                            ) {
+                                Ok(p) => p,
+                                Err(err_frame) => {
+                                    responses.push(err_frame);
+                                    continue;
+                                }
+                            };
+                        let response = crate::shard::scatter_aggregate::scatter_text_aggregate(
+                            parsed.index_name,
+                            parsed.query,
+                            parsed.pipeline,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            &ctx.shard_databases,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        responses.push(response);
+                        continue;
+                    }
                     //
                     // ── 151-03 single-shard text FT.SEARCH fast path ──────────────
                     // Bare text queries (exact / fuzzy / prefix / field-targeted)
