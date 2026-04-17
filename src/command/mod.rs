@@ -22,6 +22,7 @@ pub mod string;
 pub mod temporal;
 pub mod transaction;
 pub mod vector_search;
+pub mod workspace;
 // NOTE: ACL is an intercepted command handled at the connection level (like AUTH/BGSAVE),
 // not dispatched through the dispatch() function below.
 

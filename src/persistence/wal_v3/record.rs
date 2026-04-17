@@ -61,6 +61,10 @@ pub enum WalRecordType {
     XactCommit = 0x51,
     /// Cross-store transaction abort.
     XactAbort = 0x52,
+    /// Workspace creation record.
+    WorkspaceCreate = 0x60,
+    /// Workspace deletion record.
+    WorkspaceDrop = 0x61,
 }
 
 impl WalRecordType {
@@ -84,6 +88,8 @@ impl WalRecordType {
             0x50 => Some(Self::XactBegin),
             0x51 => Some(Self::XactCommit),
             0x52 => Some(Self::XactAbort),
+            0x60 => Some(Self::WorkspaceCreate),
+            0x61 => Some(Self::WorkspaceDrop),
             _ => None,
         }
     }
@@ -358,11 +364,13 @@ mod tests {
         assert_eq!(WalRecordType::XactBegin as u8, 0x50);
         assert_eq!(WalRecordType::XactCommit as u8, 0x51);
         assert_eq!(WalRecordType::XactAbort as u8, 0x52);
+        assert_eq!(WalRecordType::WorkspaceCreate as u8, 0x60);
+        assert_eq!(WalRecordType::WorkspaceDrop as u8, 0x61);
 
         // from_u8 roundtrips
         for &v in &[
             0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x40, 0x41, 0x42, 0x50,
-            0x51, 0x52,
+            0x51, 0x52, 0x60, 0x61,
         ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }
