@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map;
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 
 /// Error returned when a write-write conflict is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,13 +20,11 @@ pub struct ActiveTxn {
 /// Per-shard MVCC transaction manager.
 ///
 /// Owns: monotonic LSN counter, active txn map, write-intent map,
-/// committed bitmap, oldest_snapshot watermark.
+/// committed treemap, oldest_snapshot watermark.
 ///
 /// NOT Send/Sync -- owned exclusively by shard thread (same as VectorStore).
 ///
-/// Note: txn_ids are stored as u32 in RoaringBitmap. This limits the committed
-/// set to 4 billion transactions. For Phase 65 this is acceptable.
-/// All `as u32` casts are guarded against overflow.
+/// Uses RoaringTreemap for u64 txn_ids with no overflow risk.
 pub struct TransactionManager {
     next_lsn: u64,
     /// Active transactions: txn_id -> snapshot_lsn.
@@ -37,8 +35,8 @@ pub struct TransactionManager {
     /// Used for node/edge conflict detection in graph operations.
     #[cfg(feature = "graph")]
     graph_write_intents: HashMap<u64, u64>,
-    /// Committed transaction IDs (stored as u32 -- wraps beyond u32::MAX).
-    committed: RoaringBitmap,
+    /// Committed transaction IDs (u64-native, no overflow).
+    committed: RoaringTreemap,
     /// Oldest active snapshot LSN (for zombie cleanup watermark).
     oldest_snapshot: u64,
 }
@@ -52,7 +50,7 @@ impl TransactionManager {
             write_intents: HashMap::new(),
             #[cfg(feature = "graph")]
             graph_write_intents: HashMap::new(),
-            committed: RoaringBitmap::new(),
+            committed: RoaringTreemap::new(),
             oldest_snapshot: 0,
         }
     }
@@ -98,9 +96,7 @@ impl TransactionManager {
                 if owner == txn_id {
                     // Idempotent re-acquire
                     Ok(())
-                } else if Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id))
-                    || !self.active.contains_key(&owner)
-                {
+                } else if self.committed.contains(owner) || !self.active.contains_key(&owner) {
                     // Owner committed or aborted -- steal the intent
                     e.insert(txn_id);
                     Ok(())
@@ -112,15 +108,13 @@ impl TransactionManager {
         }
     }
 
-    /// Commit a transaction. Adds to committed bitmap, removes from active,
+    /// Commit a transaction. Adds to committed treemap, removes from active,
     /// releases write intents. Returns false if txn was not active.
     pub fn commit(&mut self, txn_id: u64) -> bool {
         if self.active.remove(&txn_id).is_none() {
             return false;
         }
-        if let Some(id) = Self::txn_id_to_u32(txn_id) {
-            self.committed.insert(id);
-        }
+        self.committed.insert(txn_id);
         self.write_intents.retain(|_, owner| *owner != txn_id);
         #[cfg(feature = "graph")]
         self.graph_write_intents.retain(|_, owner| *owner != txn_id);
@@ -175,9 +169,7 @@ impl TransactionManager {
                 let owner = *e.get();
                 if owner == txn_id {
                     Ok(())
-                } else if Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id))
-                    || !self.active.contains_key(&owner)
-                {
+                } else if self.committed.contains(owner) || !self.active.contains_key(&owner) {
                     e.insert(txn_id);
                     Ok(())
                 } else {
@@ -195,9 +187,7 @@ impl TransactionManager {
     pub fn sweep_graph_zombies(&self) -> Vec<(u64, u64)> {
         let mut zombies = Vec::new();
         for (&entity_id, &owner) in &self.graph_write_intents {
-            let in_committed =
-                Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id));
-            if !self.active.contains_key(&owner) && !in_committed {
+            if !self.active.contains_key(&owner) && !self.committed.contains(owner) {
                 zombies.push((entity_id, owner));
             }
         }
@@ -207,7 +197,7 @@ impl TransactionManager {
     /// Check if a transaction ID has been committed.
     #[inline]
     pub fn is_committed(&self, txn_id: u64) -> bool {
-        Self::txn_id_to_u32(txn_id).is_some_and(|id| self.committed.contains(id))
+        self.committed.contains(txn_id)
     }
 
     /// Get the oldest active snapshot LSN.
@@ -223,9 +213,7 @@ impl TransactionManager {
     pub fn sweep_zombies(&self) -> Vec<(u64, u64)> {
         let mut zombies = Vec::new();
         for (&point_id, &owner) in &self.write_intents {
-            let in_committed =
-                Self::txn_id_to_u32(owner).is_some_and(|id| self.committed.contains(id));
-            if !self.active.contains_key(&owner) && !in_committed {
+            if !self.active.contains_key(&owner) && !self.committed.contains(owner) {
                 zombies.push((point_id, owner));
             }
         }
@@ -244,25 +232,10 @@ impl TransactionManager {
         self.committed.len()
     }
 
-    /// Access the committed bitmap (for visibility checks).
+    /// Access the committed treemap (for visibility checks).
     #[inline]
-    pub fn committed_bitmap(&self) -> &RoaringBitmap {
+    pub fn committed_treemap(&self) -> &RoaringTreemap {
         &self.committed
-    }
-
-    /// Try to convert a u64 txn_id to u32 for RoaringBitmap operations.
-    /// Returns `None` and logs an error if the id exceeds u32::MAX.
-    #[inline]
-    fn txn_id_to_u32(id: u64) -> Option<u32> {
-        if id > u32::MAX as u64 {
-            tracing::error!(
-                txn_id = id,
-                "txn_id exceeds u32::MAX, cannot store in RoaringBitmap"
-            );
-            None
-        } else {
-            Some(id as u32)
-        }
     }
 
     /// Recalculate oldest_snapshot from active transactions.

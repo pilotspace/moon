@@ -110,7 +110,7 @@ pub(super) fn search_local_raw(
         idx.payload_index.evaluate_bitmap(f, total)
     });
 
-    let empty_committed = roaring::RoaringBitmap::new();
+    let empty_committed = roaring::RoaringTreemap::new();
 
     // Dispatch to correct field's segments
     if use_default_field {
@@ -272,7 +272,7 @@ pub fn search_local_filtered(
         idx.payload_index.evaluate_bitmap(f, total)
     });
 
-    let empty_committed = roaring::RoaringBitmap::new();
+    let empty_committed = roaring::RoaringTreemap::new();
 
     // Dispatch to correct field's segments
     if use_default_field {

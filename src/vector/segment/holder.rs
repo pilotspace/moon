@@ -28,7 +28,7 @@ const DEFAULT_NPROBE: usize = 32;
 pub struct MvccContext<'a> {
     pub snapshot_lsn: u64,
     pub my_txn_id: u64,
-    pub committed: &'a roaring::RoaringBitmap,
+    pub committed: &'a roaring::RoaringTreemap,
     /// Dirty set: uncommitted entries from the active transaction.
     pub dirty_set: &'a [MutableEntry],
     pub dimension: u32,
@@ -627,7 +627,7 @@ mod tests {
         let _query_sq = make_sq_vector(dim as usize, 1);
         let query_f32 = vec![0.0f32; dim as usize];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
-        let committed = roaring::RoaringBitmap::new();
+        let committed = roaring::RoaringTreemap::new();
 
         let non_mvcc = holder.search(&query_f32, 3, 64, &mut scratch);
         let mvcc_ctx = super::MvccContext {
@@ -662,7 +662,7 @@ mod tests {
         let _query_sq = vec![0i8; dim as usize];
         let query_f32 = vec![0.0f32; dim as usize];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
-        let committed = roaring::RoaringBitmap::new();
+        let committed = roaring::RoaringTreemap::new();
         let mvcc_ctx = super::MvccContext {
             snapshot_lsn: 5,
             my_txn_id: 99,
@@ -693,7 +693,7 @@ mod tests {
         let _query_sq = vec![0i8; dim];
         let query_f32 = vec![0.0f32; dim];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
-        let committed = roaring::RoaringBitmap::new();
+        let committed = roaring::RoaringTreemap::new();
 
         // Dirty set has one entry close to query
         let dirty_entry = crate::vector::segment::mutable::MutableEntry {
@@ -757,7 +757,7 @@ mod tests {
         let _query_sq = make_sq_vector(dim as usize, 1);
         let query_f32 = vec![0.0f32; dim as usize];
         let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
-        let committed = roaring::RoaringBitmap::new();
+        let committed = roaring::RoaringTreemap::new();
 
         let mvcc_empty = super::MvccContext {
             snapshot_lsn: 10,

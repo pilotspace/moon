@@ -404,7 +404,7 @@ impl MutableSegment {
         allow_bitmap: Option<&RoaringBitmap>,
         snapshot_lsn: u64,
         my_txn_id: u64,
-        committed: &RoaringBitmap,
+        committed: &roaring::RoaringTreemap,
     ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
         let dim = inner.dimension as usize;
@@ -997,7 +997,7 @@ mod tests {
 
         let _q_rot = rotate_query(&vectors[0], &col);
         let _codebook = col.codebook_16();
-        let committed = roaring::RoaringBitmap::new();
+        let committed = roaring::RoaringTreemap::new();
         let qs = make_query_state(&vectors[0], &col);
 
         let non_mvcc = seg.brute_force_search(&vectors[0], Some(&qs), 3);

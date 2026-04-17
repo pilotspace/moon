@@ -462,7 +462,7 @@ pub(super) fn run_dense_knn(
         (base * dim_factor / 2).clamp(200, 1000)
     };
 
-    let empty_committed = roaring::RoaringBitmap::new();
+    let empty_committed = roaring::RoaringTreemap::new();
 
     let results = if use_default_field {
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {

@@ -1,4 +1,4 @@
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 
 /// MVCC visibility check for a single entry during search.
 ///
@@ -19,7 +19,7 @@ use roaring::RoaringBitmap;
 /// - `txn_id`: entry's owning transaction ID (0 = no transaction / pre-MVCC)
 /// - `snapshot_lsn`: the querying transaction's snapshot (0 = non-transactional)
 /// - `my_txn_id`: the querying transaction's ID (0 = non-transactional)
-/// - `committed`: bitmap of committed transaction IDs
+/// - `committed`: treemap of committed transaction IDs
 #[inline(always)]
 pub fn is_visible(
     insert_lsn: u64,
@@ -27,11 +27,11 @@ pub fn is_visible(
     txn_id: u64,
     snapshot_lsn: u64,
     my_txn_id: u64,
-    committed: &RoaringBitmap,
+    committed: &RoaringTreemap,
 ) -> bool {
     // Non-transactional read (snapshot_lsn == 0): skip MVCC, just check ownership + delete
     if snapshot_lsn == 0 {
-        if txn_id != 0 && !committed.contains(txn_id as u32) {
+        if txn_id != 0 && !committed.contains(txn_id) {
             return false; // uncommitted by some txn
         }
         return delete_lsn == 0;
@@ -48,7 +48,7 @@ pub fn is_visible(
     // Transaction ownership check
     if txn_id != 0 && txn_id != my_txn_id {
         // Entry belongs to another transaction -- must be committed to be visible
-        if !committed.contains(txn_id as u32) {
+        if !committed.contains(txn_id) {
             return false;
         }
     }
@@ -65,16 +65,16 @@ pub fn is_visible(
 mod tests {
     use super::*;
 
-    fn empty_committed() -> RoaringBitmap {
-        RoaringBitmap::new()
+    fn empty_committed() -> RoaringTreemap {
+        RoaringTreemap::new()
     }
 
-    fn committed_with(ids: &[u32]) -> RoaringBitmap {
-        let mut bm = RoaringBitmap::new();
+    fn committed_with(ids: &[u64]) -> RoaringTreemap {
+        let mut tm = RoaringTreemap::new();
         for &id in ids {
-            bm.insert(id);
+            tm.insert(id);
         }
-        bm
+        tm
     }
 
     #[test]

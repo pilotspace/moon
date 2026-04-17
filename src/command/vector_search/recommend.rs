@@ -334,7 +334,7 @@ pub fn ft_recommend(store: &mut VectorStore, args: &[Frame], db: Option<&mut Dat
         (base * dim_factor / 2).clamp(200, 1000)
     };
 
-    let empty_committed = roaring::RoaringBitmap::new();
+    let empty_committed = roaring::RoaringTreemap::new();
     let mvcc_ctx = MvccContext {
         snapshot_lsn: 0,
         my_txn_id: 0,
