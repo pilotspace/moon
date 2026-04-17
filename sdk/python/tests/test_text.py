@@ -956,3 +956,195 @@ class TestEnsureBytesHelper:
         out = _ensure_bytes([1.0, 2.0])
         assert isinstance(out, bytes)
         assert len(out) == 8
+
+
+# -- Parser: hybrid response (Plan 153-04 — Gap 3 + Gap 5 fix) --------------
+
+
+class TestParseHybridResponse:
+    """Parser handling of FT.SEARCH HYBRID responses.
+
+    The server response is::
+
+        [total_count,
+         key1, [__rrf_score, "0.5"],
+         key2, [__rrf_score, "0.3"],
+         bm25_hits, 5,
+         dense_hits, 4,
+         sparse_hits, 0]
+
+    The parser MUST:
+      - Recognise ``__rrf_score`` / ``__vec_score`` as score markers.
+      - Stop the doc-pair loop via type-guard (second element not a list →
+        trailer start). Raw[0] is a capped count, not a reliable stop signal.
+      - Optionally extract the ``bm25_hits``/``dense_hits``/``sparse_hits``
+        trailer into a ``{"bm25": int, "dense": int, "sparse": int}`` dict
+        when ``return_stream_hits=True``.
+      - Preserve backward-compat (list return when ``return_stream_hits=False``).
+    """
+
+    def test_parse_extracts_rrf_score(self) -> None:
+        """__rrf_score marker populates hit.score (Gap 3 root cause #2)."""
+        raw = [1, "doc:1", ["__rrf_score", "0.033"]]
+        hits = _parse_text_search_results(raw)
+        assert len(hits) == 1
+        assert hits[0].id == "doc:1"
+        assert hits[0].score == pytest.approx(0.033)
+
+    def test_parse_strips_bm25_dense_sparse_trailer(self) -> None:
+        """Flat 6-item trailer must not be parsed as synthetic docs (Gap 3 root cause #1)."""
+        raw = [
+            2,
+            "doc:1", ["__rrf_score", "0.5"],
+            "doc:2", ["__rrf_score", "0.3"],
+            "bm25_hits", 5,
+            "dense_hits", 4,
+            "sparse_hits", 0,
+        ]
+        hits = _parse_text_search_results(raw)
+        # Expect exactly 2 real docs — NOT 5 (2 docs + 3 synthetic rows).
+        assert len(hits) == 2
+        assert [h.id for h in hits] == ["doc:1", "doc:2"]
+        assert hits[0].score == pytest.approx(0.5)
+        assert hits[1].score == pytest.approx(0.3)
+
+    def test_parse_strips_dense_sparse_only_trailer(self) -> None:
+        """Vector-only hybrid has a 4-item trailer (no bm25_hits)."""
+        raw = [
+            1,
+            "doc:1", ["__vec_score", "0.5"],
+            "dense_hits", 3,
+            "sparse_hits", 2,
+        ]
+        hits = _parse_text_search_results(raw)
+        assert len(hits) == 1
+        assert hits[0].id == "doc:1"
+        assert hits[0].score == pytest.approx(0.5)
+
+    def test_parse_return_stream_hits_flag(self) -> None:
+        """return_stream_hits=True yields (hits, trailer_dict) tuple."""
+        raw = [
+            2,
+            "doc:1", ["__rrf_score", "0.5"],
+            "doc:2", ["__rrf_score", "0.3"],
+            "bm25_hits", 5,
+            "dense_hits", 4,
+            "sparse_hits", 0,
+        ]
+        result = _parse_text_search_results(raw, return_stream_hits=True)
+        assert isinstance(result, tuple)
+        hits, stream = result
+        assert len(hits) == 2
+        assert stream == {"bm25": 5, "dense": 4, "sparse": 0}
+
+    @pytest.mark.parametrize(
+        "marker",
+        ["__score__", "__text_score__", "__rrf_score", "__vec_score"],
+    )
+    def test_parse_mixed_rrf_and_score_markers(self, marker: str) -> None:
+        """Parser accepts all four score markers equivalently."""
+        raw = [1, "doc:1", [marker, "0.25"]]
+        hits = _parse_text_search_results(raw)
+        assert hits[0].score == pytest.approx(0.25)
+
+    def test_parse_ignores_malformed_trailer(self) -> None:
+        """A truncated or malformed trailer must not crash; return real docs + empty stream."""
+        raw = [
+            1,
+            "doc:1", ["__rrf_score", "0.5"],
+            "bm25_hits",  # value missing
+        ]
+        hits, stream = _parse_text_search_results(raw, return_stream_hits=True)
+        assert len(hits) == 1
+        assert hits[0].id == "doc:1"
+        # Malformed trailer silently drops — must not crash.
+        assert isinstance(stream, dict)
+
+    def test_parse_preserves_existing_backward_compat_shape(self) -> None:
+        """Without the kwarg, return type stays list[TextSearchHit] (96+ existing tests lock)."""
+        raw = [
+            2,
+            "doc:1", ["__rrf_score", "0.5"],
+            "doc:2", ["__rrf_score", "0.3"],
+        ]
+        result = _parse_text_search_results(raw)
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+
+# -- Public hybrid_search kwarg (WARNING 7 fix) -----------------------------
+
+
+class TestPublicHybridSearchKwarg:
+    """``TextCommands.hybrid_search(return_stream_hits=True)`` must return (hits, trailer).
+
+    Locks the public contract adapters use so there are no private
+    ``_build_hybrid_args`` imports.
+    """
+
+    def test_hybrid_search_public_kwarg_return_stream_hits_true(self) -> None:
+        """Sync hybrid_search with the new kwarg yields a 2-tuple."""
+        client: Any = MagicMock()
+        client.execute_command.return_value = [
+            2,
+            "doc:1", ["__rrf_score", "0.5"],
+            "doc:2", ["__rrf_score", "0.3"],
+            "bm25_hits", 5,
+            "dense_hits", 4,
+            "sparse_hits", 0,
+        ]
+        tc = TextCommands(client)
+        result = tc.hybrid_search(
+            "idx",
+            "q",
+            vector=[0.1, 0.2, 0.3, 0.4],
+            return_stream_hits=True,
+        )
+        assert isinstance(result, tuple)
+        hits, stream = result
+        assert len(hits) == 2
+        assert stream == {"bm25": 5, "dense": 4, "sparse": 0}
+
+    def test_hybrid_search_public_kwarg_default_preserves_list_contract(self) -> None:
+        """Default call (no kwarg) still returns list[TextSearchHit]."""
+        client: Any = MagicMock()
+        client.execute_command.return_value = [
+            2,
+            "doc:1", ["__rrf_score", "0.5"],
+            "doc:2", ["__rrf_score", "0.3"],
+            "bm25_hits", 5,
+            "dense_hits", 4,
+            "sparse_hits", 0,
+        ]
+        tc = TextCommands(client)
+        result = tc.hybrid_search(
+            "idx", "q", vector=[0.1, 0.2, 0.3, 0.4]
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_async_hybrid_search_public_kwarg_return_stream_hits(self) -> None:
+        """AsyncTextCommands.hybrid_search mirrors the sync 2-tuple contract."""
+        client: Any = MagicMock()
+        client.execute_command = AsyncMock(
+            return_value=[
+                2,
+                "doc:1", ["__rrf_score", "0.5"],
+                "doc:2", ["__rrf_score", "0.3"],
+                "bm25_hits", 5,
+                "dense_hits", 4,
+                "sparse_hits", 0,
+            ]
+        )
+        atc = AsyncTextCommands(client)
+        result = await atc.hybrid_search(
+            "idx",
+            "q",
+            vector=[0.1, 0.2, 0.3, 0.4],
+            return_stream_hits=True,
+        )
+        assert isinstance(result, tuple)
+        hits, stream = result
+        assert len(hits) == 2
+        assert stream == {"bm25": 5, "dense": 4, "sparse": 0}
