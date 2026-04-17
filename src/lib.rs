@@ -61,6 +61,7 @@ pub mod server;
 pub mod shard;
 pub mod storage;
 pub mod telemetry;
+pub mod temporal;
 pub mod text;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-monoio"))]
 pub mod tls;
