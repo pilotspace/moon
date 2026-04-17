@@ -238,8 +238,10 @@ pub(crate) fn handle_shard_message_shared(
                     // FT.RECOMMEND always needs Database access (reads hash keys).
                     // FT.AGGREGATE materialises rows from the hash store (Phase 152,
                     // Plan 02 — reads @field values per doc).
+                    // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
                     let needs_db = cmd.eq_ignore_ascii_case(b"FT.RECOMMEND")
                         || cmd.eq_ignore_ascii_case(b"FT.AGGREGATE")
+                        || cmd.eq_ignore_ascii_case(b"FT.DROPINDEX")
                         || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
                             || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
                             && has_session_keyword(&command));
@@ -1047,9 +1049,14 @@ pub(crate) fn handle_shard_message_shared(
             let graph_guard = shard_databases.graph_store_read(shard_id);
 
             // SESSION clause needs Database access for sorted set storage.
+            // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
+            let cmd_bytes = extract_command_static(&command).map(|(c, _)| c);
+            let is_dropindex = cmd_bytes
+                .map(|c| c.eq_ignore_ascii_case(b"FT.DROPINDEX"))
+                .unwrap_or(false);
             let has_session = has_session_keyword(&command);
             let mut db_guard;
-            let db_opt = if has_session {
+            let db_opt = if has_session || is_dropindex {
                 db_guard = shard_databases.write_db(shard_id, 0);
                 Some(&mut *db_guard)
             } else {

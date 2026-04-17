@@ -841,18 +841,33 @@ pub async fn broadcast_vector_command(
     }
 
     // LOCAL: execute only after all remote shards succeeded
+    // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
+    let is_dropindex = match command.as_ref() {
+        Frame::Array(arr) if !arr.is_empty() => {
+            matches!(&arr[0], Frame::BulkString(b) if b.eq_ignore_ascii_case(b"FT.DROPINDEX"))
+        }
+        _ => false,
+    };
+
     let local_result = {
         let mut vs = shard_databases.vector_store(my_shard);
         let mut ts = shard_databases.text_store(my_shard);
         #[cfg(feature = "graph")]
         let graph_guard = shard_databases.graph_store_read(my_shard);
+        let mut db_guard;
+        let db_opt = if is_dropindex {
+            db_guard = shard_databases.write_db(my_shard, 0);
+            Some(&mut *db_guard)
+        } else {
+            None
+        };
         crate::shard::spsc_handler::dispatch_vector_command(
             &mut vs,
             &mut *ts,
             #[cfg(feature = "graph")]
             Some(&graph_guard),
             &command,
-            None,
+            db_opt,
         )
     };
     local_result
