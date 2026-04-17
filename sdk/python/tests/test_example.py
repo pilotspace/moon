@@ -216,9 +216,11 @@ class TestRunDemo:
     def test_ft_dropindex_called_first(self) -> None:
         run_demo(self.client)
         first_call = self.client.execute_command.call_args_list[0]
-        assert first_call.args[0] == "FT.DROPINDEX"
-        assert first_call.args[1] == "issues"
-        assert first_call.args[2] == "DD"
+        # Plan 06 drops the Redis-only DD flag (BLOCKER 1). Moon's
+        # FT.DROPINDEX is strict-arity 1. With `_probe_tag_cached=True`
+        # pre-populated on the dry-run client, the probe never fires
+        # execute_command, so the first call is the real drop.
+        assert first_call.args == ("FT.DROPINDEX", "issues")
 
     def test_dropindex_error_swallowed_when_index_missing(self) -> None:
         # Simulate server saying the index does not exist
@@ -271,6 +273,117 @@ class TestSafeDropIndex:
         client.execute_command.side_effect = Exception("NOAUTH required")
         with pytest.raises(Exception, match="NOAUTH"):
             _safe_drop_index(client, "foo")
+
+    def test_safe_drop_index_swallows_wrong_number_of_arguments(self) -> None:
+        """Plan 06 (Gap 1): moon's FT.DROPINDEX returns
+        'wrong number of arguments' when the caller passes extra tokens
+        such as the Redis-only DD flag. _safe_drop_index must treat this
+        as benign so older RediSearch-style scripts don't hard-fail."""
+        client = MagicMock()
+        client.execute_command.side_effect = Exception(
+            "wrong number of arguments for 'FT.DROPINDEX' command"
+        )
+        _safe_drop_index(client, "foo")  # must not raise
+
+    def test_safe_drop_index_calls_ft_dropindex_without_dd_flag(self) -> None:
+        """Plan 06 (Gap 1): the real call path must omit the DD flag."""
+        client = MagicMock()
+        client.execute_command.return_value = "OK"
+        _safe_drop_index(client, "issues")
+        client.execute_command.assert_called_once_with("FT.DROPINDEX", "issues")
+
+
+# -- _probe_tag_support: capability probe + cache ---------------------------
+
+
+class TestProbeTagSupport:
+    """Plan 06: _probe_tag_support honours the on-client cache and short-
+    circuits without any server calls when the cache key is set."""
+
+    def test_probe_tag_support_uses_cache_when_present(self) -> None:
+        """When the cache key is pre-populated, the probe MUST short-
+        circuit — no call to create_text_index, no call to
+        execute_command. This is what preserves the existing
+        TestRunDemo assertions (BLOCKER 1/2/3)."""
+        probe = pilotspace_example._probe_tag_support
+        client = MagicMock()
+        client.__dict__["_probe_tag_cached"] = False
+        assert probe(client) is False
+        assert client.text.create_text_index.call_count == 0
+        assert client.execute_command.call_count == 0
+
+    def test_probe_tag_support_returns_false_when_create_rejects_tag(self) -> None:
+        probe = pilotspace_example._probe_tag_support
+        client = MagicMock()
+        # No pre-populated cache → probe path runs.
+        client.__dict__.pop("_probe_tag_cached", None)
+        client.text.create_text_index.side_effect = Exception(
+            "ERR expected VECTOR, SPARSE, or TEXT after field name"
+        )
+        assert probe(client) is False
+        # Cache must now be populated as False so repeat probes are free.
+        assert client.__dict__["_probe_tag_cached"] is False
+
+    def test_probe_tag_support_returns_true_and_drops_probe_index(self) -> None:
+        probe = pilotspace_example._probe_tag_support
+        client = MagicMock()
+        client.__dict__.pop("_probe_tag_cached", None)
+        client.text.create_text_index.return_value = "OK"
+        client.execute_command.return_value = "OK"
+        assert probe(client) is True
+        # execute_command must have been called with FT.DROPINDEX on the
+        # synthetic probe index name.
+        dropindex_calls = [
+            c
+            for c in client.execute_command.call_args_list
+            if c.args[:2] == ("FT.DROPINDEX", "__moon_probe_tag__")
+        ]
+        assert len(dropindex_calls) >= 1
+        assert client.__dict__["_probe_tag_cached"] is True
+
+
+class TestRunDemoProbeFallback:
+    """Plan 06: run_demo must fall back to a TEXT-only schema when the
+    probe reports that TAG is not accepted by the server."""
+
+    def test_run_demo_falls_back_to_text_schema_when_tag_unsupported(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        client = _build_dry_run_client()
+        # Force fallback path: mark probe as "tag not supported".
+        client.__dict__["_probe_tag_cached"] = False
+        run_demo(client, num_issues=2, dim=4)
+        # Schema must not contain any TAG fields; all four should be TEXT.
+        call = client.text.create_text_index.call_args
+        schema = call.args[1]
+        field_types = [f[1] for f in schema]
+        assert field_types.count("TAG") == 0
+        assert field_types.count("TEXT") == 4
+        # Stderr warning must surface the fallback event.
+        err = capsys.readouterr().err
+        assert "TAG field type not supported" in err
+
+    def test_probe_does_not_interfere_with_dropindex_error_classification(self) -> None:
+        """BLOCKER 3 extra safety: when the probe fires (no cache), its
+        DROPINDEX failure/success must not confuse the real-drop error
+        classifier. Call 1 (probe DROPINDEX) returns OK; Call 2 (real
+        DROPINDEX) raises 'auth required' — must re-raise."""
+        client = _build_dry_run_client()
+        # Clear the cache so the probe actually runs.
+        client.__dict__.pop("_probe_tag_cached", None)
+        call_count = {"n": 0}
+
+        def execute_side(*args: Any, **_kwargs: Any) -> Any:  # noqa: ANN401
+            call_count["n"] += 1
+            # Call 1 = probe's FT.DROPINDEX __moon_probe_tag__ → OK
+            # Call 2 = real FT.DROPINDEX issues → auth error (must re-raise)
+            if call_count["n"] == 1:
+                return "OK"
+            raise Exception("auth required")
+
+        client.execute_command.side_effect = execute_side
+        with pytest.raises(Exception, match="auth required"):
+            run_demo(client)
 
 
 # -- main / CLI --------------------------------------------------------------

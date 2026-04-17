@@ -481,6 +481,13 @@ def _build_dry_run_client() -> MagicMock:
     # Pipeline: return a mock pipeline with fluent .hset + .execute
     pipe = MagicMock(name="DryRunPipeline")
     client.pipeline.return_value = pipe
+    # BLOCKER 1/2/3 fix (Plan 153-06): pre-populate the TAG-support probe
+    # cache so `_probe_tag_support(client)` short-circuits to True without
+    # firing any server calls. Existing TestRunDemo assertions on
+    # `create_text_index.assert_called_once()` and
+    # `execute_command.call_args_list[0]` are preserved because the probe
+    # branch is never entered during dry-run tests.
+    client.__dict__["_probe_tag_cached"] = True
     return client
 
 
