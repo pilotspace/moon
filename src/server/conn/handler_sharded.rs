@@ -20,6 +20,13 @@ use crate::command::transaction::{
     is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate, txn_begin_validate,
     txn_commit_validate, ERR_MULTI_TXN_CONFLICT,
 };
+use crate::command::workspace::{
+    parse_ws_subcommand, validate_ws_create, validate_ws_drop,
+    validate_ws_auth, validate_ws_info, validate_ws_list,
+    parse_workspace_id_from_bytes,
+    ERR_WS_NOT_FOUND, ERR_WS_ALREADY_BOUND, ERR_WS_UNKNOWN_SUB,
+};
+use crate::workspace::{is_ws_command, WorkspaceId};
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::transaction::CrossStoreTxn;
 use crate::persistence::aof::{self, AofMessage};
@@ -1236,6 +1243,177 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             Err(e) => responses.push(e),
                         }
+                        continue;
+                    }
+
+                    // --- WS.* ---
+                    if is_ws_command(cmd) {
+                        let sub = match parse_ws_subcommand(cmd_args) {
+                            Ok(s) => s,
+                            Err(e) => { responses.push(e); continue; }
+                        };
+
+                        if sub.eq_ignore_ascii_case(b"CREATE") {
+                            match validate_ws_create(cmd_args) {
+                                Ok(ws_name) => {
+                                    let ws_id = WorkspaceId::new_v7();
+                                    let created_at = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as i64;
+                                    let meta = crate::workspace::WorkspaceMetadata {
+                                        id: ws_id,
+                                        name: ws_name.clone(),
+                                        created_at,
+                                    };
+                                    {
+                                        let mut guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                        let reg = guard.get_or_insert_with(|| {
+                                            Box::new(crate::workspace::WorkspaceRegistry::new())
+                                        });
+                                        reg.insert(ws_id, meta);
+                                    }
+                                    // WAL: WorkspaceCreate record
+                                    let payload = crate::workspace::wal::encode_workspace_create(
+                                        ws_id.as_bytes(), &ws_name,
+                                    );
+                                    let mut wal_buf = Vec::new();
+                                    crate::persistence::wal_v3::record::write_wal_v3_record(
+                                        &mut wal_buf, 0,
+                                        crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
+                                        &payload,
+                                    );
+                                    ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                                    responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
+                                }
+                                Err(e) => responses.push(e),
+                            }
+                            continue;
+                        }
+
+                        if sub.eq_ignore_ascii_case(b"DROP") {
+                            match validate_ws_drop(cmd_args) {
+                                Ok(ws_id_raw) => {
+                                    match parse_workspace_id_from_bytes(&ws_id_raw) {
+                                        Some(ws_id) => {
+                                            let removed = {
+                                                let mut guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                                match guard.as_mut() {
+                                                    Some(reg) => reg.remove(&ws_id).is_some(),
+                                                    None => false,
+                                                }
+                                            };
+                                            if removed {
+                                                // WAL: WorkspaceDrop record
+                                                let payload = crate::workspace::wal::encode_workspace_drop(
+                                                    ws_id.as_bytes(),
+                                                );
+                                                let mut wal_buf = Vec::new();
+                                                crate::persistence::wal_v3::record::write_wal_v3_record(
+                                                    &mut wal_buf, 0,
+                                                    crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
+                                                    &payload,
+                                                );
+                                                ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                            } else {
+                                                responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND)));
+                                            }
+                                        }
+                                        None => responses.push(Frame::Error(Bytes::from_static(
+                                            crate::command::workspace::ERR_WS_INVALID_ID,
+                                        ))),
+                                    }
+                                }
+                                Err(e) => responses.push(e),
+                            }
+                            continue;
+                        }
+
+                        if sub.eq_ignore_ascii_case(b"LIST") {
+                            match validate_ws_list(cmd_args) {
+                                Ok(()) => {
+                                    let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                    let entries: Vec<Frame> = match guard.as_ref() {
+                                        Some(reg) => reg.iter().map(|(id, meta)| {
+                                            Frame::Array(vec![
+                                                Frame::BulkString(Bytes::from(id.to_string())),
+                                                Frame::BulkString(meta.name.clone()),
+                                                Frame::Integer(meta.created_at),
+                                            ].into())
+                                        }).collect(),
+                                        None => vec![],
+                                    };
+                                    responses.push(Frame::Array(entries.into()));
+                                }
+                                Err(e) => responses.push(e),
+                            }
+                            continue;
+                        }
+
+                        if sub.eq_ignore_ascii_case(b"INFO") {
+                            match validate_ws_info(cmd_args) {
+                                Ok(ws_id_raw) => {
+                                    match parse_workspace_id_from_bytes(&ws_id_raw) {
+                                        Some(ws_id) => {
+                                            let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                            let found = guard.as_ref().and_then(|reg| reg.get(&ws_id));
+                                            match found {
+                                                Some(meta) => {
+                                                    responses.push(Frame::Array(vec![
+                                                        Frame::BulkString(Bytes::from_static(b"id")),
+                                                        Frame::BulkString(Bytes::from(meta.id.to_string())),
+                                                        Frame::BulkString(Bytes::from_static(b"name")),
+                                                        Frame::BulkString(meta.name.clone()),
+                                                        Frame::BulkString(Bytes::from_static(b"created_at")),
+                                                        Frame::Integer(meta.created_at),
+                                                    ].into()));
+                                                }
+                                                None => responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND))),
+                                            }
+                                        }
+                                        None => responses.push(Frame::Error(Bytes::from_static(
+                                            crate::command::workspace::ERR_WS_INVALID_ID,
+                                        ))),
+                                    }
+                                }
+                                Err(e) => responses.push(e),
+                            }
+                            continue;
+                        }
+
+                        if sub.eq_ignore_ascii_case(b"AUTH") {
+                            match validate_ws_auth(cmd_args) {
+                                Ok(ws_id_raw) => {
+                                    if conn.workspace_id.is_some() {
+                                        responses.push(Frame::Error(Bytes::from_static(ERR_WS_ALREADY_BOUND)));
+                                    } else {
+                                        match parse_workspace_id_from_bytes(&ws_id_raw) {
+                                            Some(ws_id) => {
+                                                let found = {
+                                                    let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                                    guard.as_ref().map_or(false, |reg| reg.get(&ws_id).is_some())
+                                                };
+                                                if found {
+                                                    conn.workspace_id = Some(ws_id);
+                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                                } else {
+                                                    responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND)));
+                                                }
+                                            }
+                                            None => responses.push(Frame::Error(Bytes::from_static(
+                                                crate::command::workspace::ERR_WS_INVALID_ID,
+                                            ))),
+                                        }
+                                    }
+                                }
+                                Err(e) => responses.push(e),
+                            }
+                            continue;
+                        }
+
+                        // Unknown WS subcommand
+                        responses.push(Frame::Error(Bytes::from_static(ERR_WS_UNKNOWN_SUB)));
                         continue;
                     }
 
