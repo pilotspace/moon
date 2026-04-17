@@ -55,6 +55,10 @@ pub struct MutableNode {
     pub deleted_lsn: u64,
     /// Transaction ID that created this node (0 = no transaction / pre-MVCC).
     pub txn_id: u64,
+    /// Valid-time start (Unix millis). 0 = beginning of time (default).
+    pub valid_from: i64,
+    /// Valid-time end (Unix millis). i64::MAX = still valid / open-ended (default).
+    pub valid_to: i64,
 }
 
 /// Mutable edge in MemGraph.
@@ -76,6 +80,10 @@ pub struct MutableEdge {
     pub deleted_lsn: u64,
     /// Transaction ID that created this edge (0 = no transaction / pre-MVCC).
     pub txn_id: u64,
+    /// Valid-time start (Unix millis). 0 = beginning of time (default).
+    pub valid_from: i64,
+    /// Valid-time end (Unix millis). i64::MAX = still valid / open-ended (default).
+    pub valid_to: i64,
 }
 
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.
@@ -131,10 +139,16 @@ pub struct NodeMeta {
     pub created_lsn: u64,
     /// LSN at which this node was soft-deleted (u64::MAX if alive).
     pub deleted_lsn: u64,
+    /// Valid-time start (Unix millis). 0 = beginning of time.
+    /// Only present in CSR version >= 2; version 1 zero-fills to 0.
+    pub valid_from: i64,
+    /// Valid-time end (Unix millis). i64::MAX = still valid / open-ended.
+    /// Only present in CSR version >= 2; version 1 zero-fills to i64::MAX.
+    pub valid_to: i64,
 }
 
-// 8 + 4 + 4 + 8 + 8 = 32 bytes
-const _: () = assert!(core::mem::size_of::<NodeMeta>() == 32);
+// 8 + 4 + 4 + 8 + 8 + 8 + 8 = 48 bytes
+const _: () = assert!(core::mem::size_of::<NodeMeta>() == 48);
 
 #[cfg(test)]
 mod tests {
@@ -153,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_node_meta_size() {
-        assert_eq!(core::mem::size_of::<NodeMeta>(), 32);
+        assert_eq!(core::mem::size_of::<NodeMeta>(), 48);
     }
 
     #[test]

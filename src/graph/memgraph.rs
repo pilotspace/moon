@@ -70,6 +70,8 @@ impl MemGraph {
             created_lsn: lsn,
             deleted_lsn: u64::MAX,
             txn_id: 0,
+            valid_from: 0,
+            valid_to: i64::MAX,
         });
         self.live_node_count += 1;
         key
@@ -113,6 +115,8 @@ impl MemGraph {
             created_lsn: lsn,
             deleted_lsn: u64::MAX,
             txn_id: 0,
+            valid_from: 0,
+            valid_to: i64::MAX,
         });
 
         // Push edge key into src.outgoing and dst.incoming.

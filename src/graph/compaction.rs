@@ -216,6 +216,8 @@ pub fn compact_segments(
                             property_offset: 0,
                             created_lsn: nm.created_lsn,
                             deleted_lsn: nm.deleted_lsn,
+                            valid_from: nm.valid_from,
+                            valid_to: nm.valid_to,
                         };
                     }
                 })
@@ -225,6 +227,8 @@ pub fn compact_segments(
                     property_offset: 0,
                     created_lsn: nm.created_lsn,
                     deleted_lsn: nm.deleted_lsn,
+                    valid_from: nm.valid_from,
+                    valid_to: nm.valid_to,
                 });
         }
     }
@@ -239,6 +243,8 @@ pub fn compact_segments(
                 property_offset: 0,
                 created_lsn: nm.created_lsn,
                 deleted_lsn: nm.deleted_lsn,
+                valid_from: nm.valid_from,
+                valid_to: nm.valid_to,
             });
         } else {
             node_meta_vec.push(NodeMeta {
@@ -247,6 +253,8 @@ pub fn compact_segments(
                 property_offset: 0,
                 created_lsn: 0,
                 deleted_lsn: u64::MAX,
+                valid_from: 0,
+                valid_to: i64::MAX,
             });
         }
     }

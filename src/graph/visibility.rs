@@ -26,15 +26,24 @@ pub fn is_node_visible(
     snapshot_lsn: u64,
     my_txn_id: u64,
     committed: &RoaringBitmap,
+    valid_at: Option<i64>,
 ) -> bool {
-    is_entity_visible(
+    if !is_entity_visible(
         node.created_lsn,
         node.deleted_lsn,
         node.txn_id,
         snapshot_lsn,
         my_txn_id,
         committed,
-    )
+    ) {
+        return false;
+    }
+    if let Some(t) = valid_at {
+        if t < node.valid_from || t > node.valid_to {
+            return false;
+        }
+    }
+    true
 }
 
 /// Check if an edge is visible at the given snapshot.
@@ -46,15 +55,24 @@ pub fn is_edge_visible(
     snapshot_lsn: u64,
     my_txn_id: u64,
     committed: &RoaringBitmap,
+    valid_at: Option<i64>,
 ) -> bool {
-    is_entity_visible(
+    if !is_entity_visible(
         edge.created_lsn,
         edge.deleted_lsn,
         edge.txn_id,
         snapshot_lsn,
         my_txn_id,
         committed,
-    )
+    ) {
+        return false;
+    }
+    if let Some(t) = valid_at {
+        if t < edge.valid_from || t > edge.valid_to {
+            return false;
+        }
+    }
+    true
 }
 
 /// Check if a transaction is in the committed bitmap.
@@ -146,6 +164,8 @@ mod tests {
             created_lsn,
             deleted_lsn,
             txn_id,
+            valid_from: 0,
+            valid_to: i64::MAX,
         }
     }
 
@@ -161,6 +181,8 @@ mod tests {
             created_lsn,
             deleted_lsn,
             txn_id,
+            valid_from: 0,
+            valid_to: i64::MAX,
         }
     }
 
@@ -170,77 +192,77 @@ mod tests {
     fn test_node_committed_visible() {
         let node = make_node(5, u64::MAX, 0);
         let committed = empty_committed();
-        assert!(is_node_visible(&node, 10, 1, &committed));
+        assert!(is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_created_after_snapshot_invisible() {
         let node = make_node(15, u64::MAX, 0);
         let committed = empty_committed();
-        assert!(!is_node_visible(&node, 10, 1, &committed));
+        assert!(!is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_committed_txn_visible() {
         let node = make_node(5, u64::MAX, 2);
         let committed = committed_with(&[2]);
-        assert!(is_node_visible(&node, 10, 1, &committed));
+        assert!(is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_uncommitted_other_txn_invisible() {
         let node = make_node(5, u64::MAX, 3);
         let committed = empty_committed();
-        assert!(!is_node_visible(&node, 10, 1, &committed));
+        assert!(!is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_own_writes_visible() {
         let node = make_node(5, u64::MAX, 1);
         let committed = empty_committed();
-        assert!(is_node_visible(&node, 10, 1, &committed));
+        assert!(is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_own_writes_visible_even_after_snapshot() {
         let node = make_node(15, u64::MAX, 1);
         let committed = empty_committed();
-        assert!(is_node_visible(&node, 10, 1, &committed));
+        assert!(is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_deleted_before_snapshot_invisible() {
         let node = make_node(5, 8, 0);
         let committed = empty_committed();
-        assert!(!is_node_visible(&node, 10, 1, &committed));
+        assert!(!is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_deleted_after_snapshot_visible() {
         let node = make_node(5, 15, 0);
         let committed = empty_committed();
-        assert!(is_node_visible(&node, 10, 1, &committed));
+        assert!(is_node_visible(&node, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_node_non_transactional_read_committed() {
         let node = make_node(5, u64::MAX, 2);
         let committed = committed_with(&[2]);
-        assert!(is_node_visible(&node, 0, 0, &committed));
+        assert!(is_node_visible(&node, 0, 0, &committed, None));
     }
 
     #[test]
     fn test_node_non_transactional_read_uncommitted_invisible() {
         let node = make_node(5, u64::MAX, 3);
         let committed = empty_committed();
-        assert!(!is_node_visible(&node, 0, 0, &committed));
+        assert!(!is_node_visible(&node, 0, 0, &committed, None));
     }
 
     #[test]
     fn test_node_non_transactional_deleted_invisible() {
         let node = make_node(5, 10, 0);
         let committed = empty_committed();
-        assert!(!is_node_visible(&node, 0, 0, &committed));
+        assert!(!is_node_visible(&node, 0, 0, &committed, None));
     }
 
     // --- Edge visibility tests ---
@@ -249,41 +271,100 @@ mod tests {
     fn test_edge_committed_visible() {
         let edge = make_edge(5, u64::MAX, 0);
         let committed = empty_committed();
-        assert!(is_edge_visible(&edge, 10, 1, &committed));
+        assert!(is_edge_visible(&edge, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_edge_created_after_snapshot_invisible() {
         let edge = make_edge(15, u64::MAX, 0);
         let committed = empty_committed();
-        assert!(!is_edge_visible(&edge, 10, 1, &committed));
+        assert!(!is_edge_visible(&edge, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_edge_own_writes_visible() {
         let edge = make_edge(5, u64::MAX, 1);
         let committed = empty_committed();
-        assert!(is_edge_visible(&edge, 10, 1, &committed));
+        assert!(is_edge_visible(&edge, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_edge_deleted_before_snapshot_invisible() {
         let edge = make_edge(5, 8, 0);
         let committed = empty_committed();
-        assert!(!is_edge_visible(&edge, 10, 1, &committed));
+        assert!(!is_edge_visible(&edge, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_edge_boundary_created_at_snapshot() {
         let edge = make_edge(10, u64::MAX, 0);
         let committed = empty_committed();
-        assert!(is_edge_visible(&edge, 10, 1, &committed));
+        assert!(is_edge_visible(&edge, 10, 1, &committed, None));
     }
 
     #[test]
     fn test_edge_boundary_deleted_at_snapshot() {
         let edge = make_edge(5, 10, 0);
         let committed = empty_committed();
-        assert!(!is_edge_visible(&edge, 10, 1, &committed));
+        assert!(!is_edge_visible(&edge, 10, 1, &committed, None));
+    }
+
+    // --- Bi-temporal visibility tests ---
+
+    #[test]
+    fn test_node_valid_at_within_window() {
+        let mut node = make_node(5, u64::MAX, 0);
+        node.valid_from = 1000;
+        node.valid_to = 2000;
+        let committed = empty_committed();
+        assert!(is_node_visible(&node, 10, 1, &committed, Some(1500)));
+    }
+
+    #[test]
+    fn test_node_valid_at_before_window() {
+        let mut node = make_node(5, u64::MAX, 0);
+        node.valid_from = 1000;
+        node.valid_to = 2000;
+        let committed = empty_committed();
+        assert!(!is_node_visible(&node, 10, 1, &committed, Some(500)));
+    }
+
+    #[test]
+    fn test_node_valid_at_after_window() {
+        let mut node = make_node(5, u64::MAX, 0);
+        node.valid_from = 1000;
+        node.valid_to = 2000;
+        let committed = empty_committed();
+        assert!(!is_node_visible(&node, 10, 1, &committed, Some(3000)));
+    }
+
+    #[test]
+    fn test_node_valid_at_none_ignores_window() {
+        let mut node = make_node(5, u64::MAX, 0);
+        node.valid_from = 1000;
+        node.valid_to = 2000;
+        let committed = empty_committed();
+        assert!(is_node_visible(&node, 10, 1, &committed, None));
+    }
+
+    #[test]
+    fn test_node_valid_at_boundary_inclusive() {
+        let mut node = make_node(5, u64::MAX, 0);
+        node.valid_from = 1000;
+        node.valid_to = 2000;
+        let committed = empty_committed();
+        assert!(is_node_visible(&node, 10, 1, &committed, Some(1000)));
+        assert!(is_node_visible(&node, 10, 1, &committed, Some(2000)));
+    }
+
+    #[test]
+    fn test_edge_valid_at_filtering() {
+        let mut edge = make_edge(5, u64::MAX, 0);
+        edge.valid_from = 500;
+        edge.valid_to = 1500;
+        let committed = empty_committed();
+        assert!(is_edge_visible(&edge, 10, 1, &committed, Some(1000)));
+        assert!(!is_edge_visible(&edge, 10, 1, &committed, Some(2000)));
+        assert!(is_edge_visible(&edge, 10, 1, &committed, None));
     }
 }

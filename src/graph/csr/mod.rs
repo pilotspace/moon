@@ -158,6 +158,8 @@ impl CsrSegment {
                 property_offset: 0,
                 created_lsn: node.created_lsn,
                 deleted_lsn: node.deleted_lsn,
+                valid_from: node.valid_from,
+                valid_to: node.valid_to,
             });
         }
 
@@ -531,6 +533,8 @@ impl CsrSegment {
                 property_offset,
                 created_lsn: nm_created_lsn,
                 deleted_lsn,
+                valid_from: 0,
+                valid_to: i64::MAX,
             });
             pos += nm_elem_size;
         }

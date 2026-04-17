@@ -323,6 +323,8 @@ mod tests {
                 property_offset: 0,
                 created_lsn: 1,
                 deleted_lsn: u64::MAX,
+                valid_from: 0,
+                valid_to: i64::MAX,
             },
             NodeMeta {
                 external_id: 2,
@@ -330,6 +332,8 @@ mod tests {
                 property_offset: 0,
                 created_lsn: 1,
                 deleted_lsn: u64::MAX,
+                valid_from: 0,
+                valid_to: i64::MAX,
             },
             NodeMeta {
                 external_id: 3,
@@ -337,6 +341,8 @@ mod tests {
                 property_offset: 0,
                 created_lsn: 1,
                 deleted_lsn: u64::MAX,
+                valid_from: 0,
+                valid_to: i64::MAX,
             },
         ];
 
@@ -383,6 +389,8 @@ mod tests {
             property_offset: 0,
             created_lsn: 1,
             deleted_lsn: u64::MAX,
+            valid_from: 0,
+            valid_to: i64::MAX,
         }];
         let idx = LabelIndex::build(&node_meta);
         assert!(idx.is_empty());
