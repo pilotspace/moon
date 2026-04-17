@@ -5,6 +5,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(feature = "graph")]
 use crate::graph::store::GraphStore;
 use crate::storage::Database;
+use crate::temporal::{TemporalKvIndex, TemporalRegistry};
 use crate::text::store::TextStore;
 use crate::vector::store::VectorStore;
 
@@ -26,6 +27,12 @@ pub struct ShardDatabases {
     /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
     /// Mutex<Option<>> for single-writer init, then read-only via wal_append().
     wal_append_txs: Vec<Mutex<Option<crate::runtime::channel::MpscSender<bytes::Bytes>>>>,
+    /// Per-shard TemporalRegistry for wall-clock-to-LSN bindings.
+    /// Lazy-init: None until first TEMPORAL.SNAPSHOT_AT call.
+    temporal_registries: Vec<Mutex<Option<Box<TemporalRegistry>>>>,
+    /// Per-shard TemporalKvIndex for versioned KV reads.
+    /// Lazy-init: None until first TemporalUpsert WAL write.
+    temporal_kv_indexes: Vec<Mutex<Option<Box<TemporalKvIndex>>>>,
     num_shards: usize,
     db_count: usize,
 }
@@ -50,6 +57,12 @@ impl ShardDatabases {
             .map(|_| RwLock::new(GraphStore::new()))
             .collect();
         let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let temporal_registries = (0..num_shards)
+            .map(|_| Mutex::new(None))
+            .collect();
+        let temporal_kv_indexes = (0..num_shards)
+            .map(|_| Mutex::new(None))
+            .collect();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -57,6 +70,8 @@ impl ShardDatabases {
             #[cfg(feature = "graph")]
             graph_stores,
             wal_append_txs,
+            temporal_registries,
+            temporal_kv_indexes,
             num_shards,
             db_count,
         })
@@ -113,6 +128,26 @@ impl ShardDatabases {
     #[inline]
     pub fn graph_store_write(&self, shard_id: usize) -> RwLockWriteGuard<'_, GraphStore> {
         self.graph_stores[shard_id].write()
+    }
+
+    /// Acquire the per-shard TemporalRegistry lock. Caller must lazy-init
+    /// via `get_or_insert_with(|| Box::new(TemporalRegistry::new()))`.
+    #[inline]
+    pub fn temporal_registry(
+        &self,
+        shard_id: usize,
+    ) -> MutexGuard<'_, Option<Box<TemporalRegistry>>> {
+        self.temporal_registries[shard_id].lock()
+    }
+
+    /// Acquire the per-shard TemporalKvIndex lock. Caller must lazy-init
+    /// via `get_or_insert_with(|| Box::new(TemporalKvIndex::new()))`.
+    #[inline]
+    pub fn temporal_kv_index(
+        &self,
+        shard_id: usize,
+    ) -> MutexGuard<'_, Option<Box<TemporalKvIndex>>> {
+        self.temporal_kv_indexes[shard_id].lock()
     }
 
     /// Recover graph stores from persistence for all shards.

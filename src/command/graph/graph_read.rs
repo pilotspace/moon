@@ -13,6 +13,23 @@ use crate::protocol::Frame;
 
 use super::graph_write::extract_bulk;
 
+/// Parse an optional `VALID_AT <timestamp_ms>` argument from command args.
+///
+/// Scans the args array for a `VALID_AT` keyword followed by an i64 timestamp.
+/// Returns `None` if not present or unparseable (non-temporal query).
+fn parse_valid_at(args: &[Frame]) -> Option<i64> {
+    for i in 0..args.len().saturating_sub(1) {
+        if let Frame::BulkString(ref bs) = args[i] {
+            if bs.eq_ignore_ascii_case(b"VALID_AT") {
+                if let Frame::BulkString(ref val) = args[i + 1] {
+                    return std::str::from_utf8(val).ok()?.trim().parse::<i64>().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 /// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>]
 ///
 /// Returns an array of neighbor nodes/edges as RESP3 Maps.
@@ -322,7 +339,12 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
     };
 
     let params = std::collections::HashMap::new();
-    let result = match cypher::executor::execute(graph, &plan, &params) {
+    let valid_at = parse_valid_at(args);
+    let ctx = cypher::executor::ExecutionContext {
+        valid_time_as_of: valid_at,
+        ..Default::default()
+    };
+    let result = match cypher::executor::execute(graph, &plan, &params, &ctx) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("ERR Cypher execution error: {e}");
@@ -491,7 +513,12 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         };
 
         let params = std::collections::HashMap::new();
-        let result = match cypher::executor::execute(graph, &plan, &params) {
+        let valid_at = parse_valid_at(args);
+        let ctx = cypher::executor::ExecutionContext {
+            valid_time_as_of: valid_at,
+            ..Default::default()
+        };
+        let result = match cypher::executor::execute(graph, &plan, &params, &ctx) {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("ERR Cypher execution error: {e}");
@@ -721,7 +748,12 @@ pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
     };
 
     let params = std::collections::HashMap::new();
-    let profile = match cypher::executor::execute_profile(graph, &plan, &params) {
+    let valid_at = parse_valid_at(args);
+    let ctx = cypher::executor::ExecutionContext {
+        valid_time_as_of: valid_at,
+        ..Default::default()
+    };
+    let profile = match cypher::executor::execute_profile(graph, &plan, &params, &ctx) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("ERR Cypher execution error: {e}");

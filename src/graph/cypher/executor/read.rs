@@ -7,6 +7,7 @@ pub fn execute(
     graph: &NamedGraph,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
+    ctx: &ExecutionContext,
 ) -> Result<ExecResult, ExecError> {
     let start = std::time::Instant::now();
 
@@ -29,6 +30,7 @@ pub fn execute(
         match op {
             PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
+                let committed = roaring::RoaringBitmap::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     for (key, node) in memgraph.iter_nodes() {
@@ -36,6 +38,16 @@ pub fn execute(
                             if !node.labels.contains(&lid) {
                                 continue;
                             }
+                        }
+                        // Bi-temporal + MVCC visibility filter
+                        if !crate::graph::visibility::is_node_visible(
+                            node,
+                            ctx.snapshot_lsn,
+                            ctx.my_txn_id,
+                            &committed,
+                            ctx.valid_time_as_of,
+                        ) {
+                            continue;
                         }
                         let mut new_row = row.clone();
                         new_row.insert(variable.clone(), Value::Node(key));
@@ -79,6 +91,7 @@ pub fn execute(
                     edge_type_filter,
                 );
 
+                let committed = roaring::RoaringBitmap::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -93,6 +106,18 @@ pub fn execute(
                             // single-type; we need extra check for multi-type).
                             if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
                                 continue;
+                            }
+                            // Bi-temporal visibility check on target node
+                            if let Some(target_node) = memgraph.get_node(merged.node) {
+                                if !crate::graph::visibility::is_node_visible(
+                                    target_node,
+                                    ctx.snapshot_lsn,
+                                    ctx.my_txn_id,
+                                    &committed,
+                                    ctx.valid_time_as_of,
+                                ) {
+                                    continue;
+                                }
                             }
                             let mut new_row = row.clone();
                             new_row.insert(target.clone(), Value::Node(merged.node));
@@ -374,6 +399,7 @@ pub fn execute_profile(
     graph: &NamedGraph,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
+    ctx: &ExecutionContext,
 ) -> Result<ProfileResult, ExecError> {
     let start = std::time::Instant::now();
 
@@ -393,6 +419,7 @@ pub fn execute_profile(
         match op {
             PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
+                let committed = roaring::RoaringBitmap::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     for (key, node) in memgraph.iter_nodes() {
@@ -400,6 +427,16 @@ pub fn execute_profile(
                             if !node.labels.contains(&lid) {
                                 continue;
                             }
+                        }
+                        // Bi-temporal + MVCC visibility filter
+                        if !crate::graph::visibility::is_node_visible(
+                            node,
+                            ctx.snapshot_lsn,
+                            ctx.my_txn_id,
+                            &committed,
+                            ctx.valid_time_as_of,
+                        ) {
+                            continue;
                         }
                         let mut new_row = row.clone();
                         new_row.insert(variable.clone(), Value::Node(key));
@@ -428,6 +465,7 @@ pub fn execute_profile(
                     EdgeDirection::Both => Direction::Both,
                 };
 
+                let committed = roaring::RoaringBitmap::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -442,6 +480,18 @@ pub fn execute_profile(
                                     if !type_ids.contains(&edge.edge_type) {
                                         continue;
                                     }
+                                }
+                            }
+                            // Bi-temporal visibility check on target node
+                            if let Some(target_node) = memgraph.get_node(neighbor_key) {
+                                if !crate::graph::visibility::is_node_visible(
+                                    target_node,
+                                    ctx.snapshot_lsn,
+                                    ctx.my_txn_id,
+                                    &committed,
+                                    ctx.valid_time_as_of,
+                                ) {
+                                    continue;
                                 }
                             }
                             let mut new_row = row.clone();

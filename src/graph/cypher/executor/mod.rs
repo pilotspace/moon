@@ -105,6 +105,21 @@ pub struct ExecResult {
     pub mutations: Vec<MutationRecord>,
 }
 
+/// Context passed to the Cypher executor for MVCC + bi-temporal queries.
+///
+/// All fields have zero-value defaults: `ExecutionContext::default()` is
+/// equivalent to the current non-transactional, non-temporal read behavior.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionContext {
+    /// Snapshot LSN for MVCC reads (0 = non-transactional).
+    pub snapshot_lsn: u64,
+    /// Caller's transaction ID (0 = no transaction).
+    pub my_txn_id: u64,
+    /// Valid-time filter: only entities with valid_from <= T <= valid_to.
+    /// None = no valid-time filter (current behavior).
+    pub valid_time_as_of: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Use slotmap::Key for as_ffi()
 // ---------------------------------------------------------------------------
@@ -136,7 +151,7 @@ mod tests {
             crate::graph::cypher::parse_cypher(b"MATCH (n:Person) RETURN n.name").expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
-        let result = execute(graph, &plan, &HashMap::new()).expect("exec");
+        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.columns.len(), 1);
         assert_eq!(result.columns[0], "n.name");
@@ -175,7 +190,7 @@ mod tests {
                 .expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
-        let result = execute(graph, &plan, &HashMap::new()).expect("exec");
+        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.rows.len(), 1);
         match &result.rows[0][0] {
@@ -206,7 +221,7 @@ mod tests {
             .expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
-        let result = execute(graph, &plan, &HashMap::new()).expect("exec");
+        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.rows.len(), 3);
     }
