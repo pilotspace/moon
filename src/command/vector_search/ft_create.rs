@@ -106,6 +106,8 @@ pub fn ft_create(
     let mut vector_fields: Vec<VectorFieldMeta> = Vec::new();
     let mut sparse_field_defs: Vec<(Bytes, u32)> = Vec::new();
     let mut text_field_defs: Vec<crate::text::types::TextFieldDef> = Vec::new();
+    #[cfg(feature = "text-index")]
+    let mut tag_field_defs: Vec<crate::text::types::TagFieldDef> = Vec::new();
     // Index-level HNSW params from the first field (backward compat)
     let mut first_hnsw_m: u32 = 16;
     let mut first_hnsw_ef_construction: u32 = 200;
@@ -191,9 +193,63 @@ pub fn ft_create(
             continue;
         }
 
+        // Check for TAG field type (Plan 152-06). Must come before the VECTOR catch-all.
+        #[cfg(feature = "text-index")]
+        if pos < args.len() && matches_keyword(&args[pos], b"TAG") {
+            pos += 1;
+            let mut separator: u8 = b',';
+            let mut case_sensitive = false;
+            let mut sortable = false;
+            let mut noindex = false;
+            while pos < args.len() {
+                if matches_keyword(&args[pos], b"SEPARATOR") {
+                    pos += 1;
+                    if pos >= args.len() {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR SEPARATOR requires a value",
+                        ));
+                    }
+                    let sep_bytes = match extract_bulk(&args[pos]) {
+                        Some(b) => b,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid SEPARATOR value",
+                            ));
+                        }
+                    };
+                    if sep_bytes.len() != 1 {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR SEPARATOR must be a single byte",
+                        ));
+                    }
+                    separator = sep_bytes[0];
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"CASESENSITIVE") {
+                    case_sensitive = true;
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"SORTABLE") {
+                    sortable = true;
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"NOINDEX") {
+                    noindex = true;
+                    pos += 1;
+                } else {
+                    break; // next token begins a new field
+                }
+            }
+            tag_field_defs.push(crate::text::types::TagFieldDef {
+                field_name,
+                separator,
+                case_sensitive,
+                sortable,
+                noindex,
+            });
+            continue;
+        }
+
         if pos >= args.len() || !matches_keyword(&args[pos], b"VECTOR") {
             return Frame::Error(Bytes::from_static(
-                b"ERR expected VECTOR, SPARSE, or TEXT after field name",
+                b"ERR expected VECTOR, SPARSE, TEXT, or TAG after field name",
             ));
         }
         pos += 1;
@@ -250,24 +306,40 @@ pub fn ft_create(
         }
     }
 
-    if vector_fields.is_empty() && sparse_field_defs.is_empty() && text_field_defs.is_empty() {
+    #[cfg(feature = "text-index")]
+    let no_tag_fields = tag_field_defs.is_empty();
+    #[cfg(not(feature = "text-index"))]
+    let no_tag_fields = true;
+
+    if vector_fields.is_empty()
+        && sparse_field_defs.is_empty()
+        && text_field_defs.is_empty()
+        && no_tag_fields
+    {
         return Frame::Error(Bytes::from_static(
-            b"ERR at least one VECTOR, SPARSE, or TEXT field is required in SCHEMA",
+            b"ERR at least one VECTOR, SPARSE, TEXT, or TAG field is required in SCHEMA",
         ));
     }
 
-    // TEXT-only index: create TextIndex without VectorIndex
-    if vector_fields.is_empty() && !text_field_defs.is_empty() {
+    // TEXT / TAG-only index (no VECTOR, no SPARSE): create TextIndex without VectorIndex.
+    // Plan 152-06 extends this branch to accept TAG-only schemas (text_field_defs may be empty).
+    #[cfg(feature = "text-index")]
+    let has_text_or_tag = !text_field_defs.is_empty() || !tag_field_defs.is_empty();
+    #[cfg(not(feature = "text-index"))]
+    let has_text_or_tag = !text_field_defs.is_empty();
+
+    if vector_fields.is_empty() && has_text_or_tag {
         #[cfg(feature = "text-index")]
         {
             let bm25_config = crate::text::types::BM25Config {
                 k1: bm25_k1,
                 b: bm25_b,
             };
-            let text_index = crate::text::store::TextIndex::new(
+            let text_index = crate::text::store::TextIndex::new_with_schema(
                 index_name.clone(),
                 prefixes,
                 text_field_defs,
+                tag_field_defs.clone(),
                 bm25_config,
             );
             if let Err(e) = text_store.create_index(index_name, text_index) {
@@ -349,17 +421,19 @@ pub fn ft_create(
                     }
                 }
             }
-            // Create TextIndex for mixed TEXT+VECTOR indexes
+            // Create TextIndex for mixed TEXT+VECTOR / TAG+VECTOR indexes (Plan 152-06
+            // allows TAG fields to coexist with VECTOR in a schema).
             #[cfg(feature = "text-index")]
-            if !text_field_defs.is_empty() {
+            if !text_field_defs.is_empty() || !tag_field_defs.is_empty() {
                 let bm25_config = crate::text::types::BM25Config {
                     k1: bm25_k1,
                     b: bm25_b,
                 };
-                let text_index = crate::text::store::TextIndex::new(
+                let text_index = crate::text::store::TextIndex::new_with_schema(
                     index_name_clone.clone(),
                     prefixes,
                     text_field_defs,
+                    tag_field_defs,
                     bm25_config,
                 );
                 if let Err(e) = text_store.create_index(index_name_clone.clone(), text_index) {

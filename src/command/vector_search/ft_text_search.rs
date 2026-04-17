@@ -910,16 +910,63 @@ pub struct QueryTerm {
     pub text: String,
 }
 
+/// Non-BM25 filter clauses attached to a text query (Plan 152-06 / -07).
+///
+/// # Invariants
+///
+/// - **Analyzer bypass:** A `FieldFilter` NEVER invokes the text analyzer
+///   pipeline. Stopword removal, stemming, tokenization are all skipped.
+///   This is what makes `@status:{open}` work on an index whose analyzer
+///   would otherwise strip "open" as a stopword (UAT Gap 2).
+/// - **Case-insensitive field resolution:** `@Status:{open}` on an index
+///   declaring `status` matches. The stored `tag_def` / `numeric_def`
+///   `field_name` is the canonical form; the variant's `field` byte slice
+///   preserves client input and is resolved at lookup time by
+///   `search_tag` / `search_numeric_range`.
+/// - **`FieldFilter::Tag { field, value }`:** exact membership,
+///   post-normalization. If the tag def is `case_sensitive: false`
+///   (default), stored and queried values are both ASCII-lowercased. The
+///   multi-tag OR syntax `@status:{a|b}` is NOT supported in v1 — it is
+///   rejected at parse time with an actionable error.
+/// - **`FieldFilter::NumericRange` (Plan 07):** Closed or half-open range
+///   over an `OrderedFloat<f64>` BTreeMap. `f64::NEG_INFINITY` /
+///   `f64::INFINITY` encode unbounded bounds. Inverted ranges (finite
+///   `min > max`) are rejected at parse time.
+///
+/// Plan 06 introduces the enum with one variant (`Tag`); Plan 07 adds
+/// `NumericRange`. New variants MUST preserve the invariants above or
+/// update this docstring.
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone)]
+pub enum FieldFilter {
+    /// Exact membership lookup on a TAG field.
+    ///
+    /// `field` is the raw client-provided field name (case preserved);
+    /// normalization happens in `TextIndex::search_tag`.
+    /// `value` is the raw client-provided tag value (normalization applied
+    /// at lookup to match the insert-time normalization).
+    Tag { field: Bytes, value: Bytes },
+    // Plan 07: NumericRange { field, min, max, min_exclusive, max_exclusive },
+}
+
 /// Parsed text query: an optional field target + analyzed (stemmed) query terms.
 ///
 /// `field_name = None` means cross-field search (all non-NOINDEX TEXT fields).
 /// `field_name = Some(name)` means search only that field.
+///
+/// When `filter` is `Some`, the clause bypasses the BM25 pipeline entirely —
+/// `terms` is empty and `field_name` is unused. See `FieldFilter` docstring
+/// for invariants.
 #[derive(Debug)]
 pub struct TextQueryClause {
     /// Target field name (from `@field:(terms)` syntax), or None for all fields.
     pub field_name: Option<Bytes>,
     /// Analyzed query terms with per-term expansion modifiers.
     pub terms: Vec<QueryTerm>,
+    /// Non-BM25 clause (TAG / NUMERIC filter). When `Some`, execute_query_on_index
+    /// short-circuits to the FieldFilter dispatch path.
+    #[cfg(feature = "text-index")]
+    pub filter: Option<FieldFilter>,
 }
 
 // ─── Query detection ─────────────────────────────────────────────────────────
@@ -1060,11 +1107,77 @@ fn tokenize_with_modifiers(
     result
 }
 
+/// Pre-scan a query for a non-BM25 FieldFilter clause (Plan 152-06).
+///
+/// Returns:
+/// - `Ok(Some(clause))` — query is a pure filter (`@field:{value}` TAG, or
+///   Plan 07 `@field:[min max]` numeric range). `clause.filter` is populated,
+///   `clause.terms` is empty. Safe to dispatch on indexes with zero TEXT fields.
+/// - `Ok(None)` — query is BM25 (bare terms or `@field:(terms)`); caller must
+///   fall through to the analyzer path.
+/// - `Err(msg)` — syntax failure. Caller surfaces `Frame::Error`.
+///
+/// Does NOT invoke the analyzer. This is the ONE predicate FT.SEARCH and
+/// FT.AGGREGATE share for entry-point routing; duplicating it would invite
+/// drift. Runs on a ≤ 4 KiB slice; cost is dwarfed by any downstream work.
+///
+/// Limits: tag value length capped at 4 KiB; multi-tag OR syntax
+/// (`@status:{a|b}`) rejected with an actionable error (HYGIENE-06).
+#[cfg(feature = "text-index")]
+pub fn pre_parse_field_filter(query: &[u8]) -> Result<Option<TextQueryClause>, &'static str> {
+    if !query.starts_with(b"@") {
+        return Ok(None);
+    }
+    let colon_pos = query
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or("ERR invalid field query syntax: missing ':'")?;
+    let field_name_bytes = &query[1..colon_pos];
+    if field_name_bytes.is_empty() {
+        return Err("ERR invalid field query syntax: empty field name");
+    }
+    let after_colon = &query[colon_pos + 1..];
+    match after_colon.first() {
+        Some(b'{') => {
+            let close_pos = after_colon
+                .iter()
+                .position(|&b| b == b'}')
+                .ok_or("ERR unterminated tag filter")?;
+            let value = &after_colon[1..close_pos];
+            if value.len() > 4096 {
+                return Err("ERR tag value too long");
+            }
+            if value.iter().any(|b| *b == b'|') {
+                return Err(
+                    "ERR multi-tag OR syntax not supported in v1 — use separate queries and union on the client",
+                );
+            }
+            Ok(Some(TextQueryClause {
+                field_name: None,
+                terms: Vec::new(),
+                filter: Some(FieldFilter::Tag {
+                    field: Bytes::copy_from_slice(field_name_bytes),
+                    value: Bytes::copy_from_slice(value),
+                }),
+            }))
+        }
+        // Plan 07 will add: Some(b'[') => { /* NumericRange */ }
+        _ => Ok(None),
+    }
+}
+
 /// Parse `@field:(terms)` or `@field:terms` syntax.
 fn parse_field_targeted_query(
     query: &[u8],
     analyzer: &crate::text::analyzer::AnalyzerPipeline,
 ) -> Result<TextQueryClause, &'static str> {
+    // Fast path (Plan 152-06 B-01): non-BM25 FieldFilter. If detected,
+    // return without ever invoking the analyzer — safe on TAG-only indexes.
+    #[cfg(feature = "text-index")]
+    if let Some(clause) = pre_parse_field_filter(query)? {
+        return Ok(clause);
+    }
+
     // Find the colon separator: "@field_name:..."
     let colon_pos = match query.iter().position(|&b| b == b':') {
         Some(p) => p,
@@ -1097,6 +1210,8 @@ fn parse_field_targeted_query(
     Ok(TextQueryClause {
         field_name: Some(field_name),
         terms,
+        #[cfg(feature = "text-index")]
+        filter: None,
     })
 }
 
@@ -1114,6 +1229,8 @@ fn parse_bare_terms_query(
     Ok(TextQueryClause {
         field_name: None,
         terms,
+        #[cfg(feature = "text-index")]
+        filter: None,
     })
 }
 
@@ -1224,6 +1341,21 @@ pub fn ft_text_search(text_store: &TextStore, args: &[Frame]) -> Frame {
     };
     let top_k = top_k.max(1);
 
+    // B-01 SITE 1 FIX (Plan 152-06): FieldFilter short-circuit BEFORE analyzer
+    // lookup. If the query is `@field:{value}` (or Plan 07 `@field:[min max]`),
+    // dispatch through the inverted-index path — TAG-only indexes (zero TEXT
+    // fields) and indexes whose analyzer would strip the tag value as a
+    // stopword (UAT Gap 2) work without touching the analyzer.
+    #[cfg(feature = "text-index")]
+    match pre_parse_field_filter(query_bytes.as_ref()) {
+        Ok(Some(clause)) => {
+            let results = execute_query_on_index(text_index, &clause, None, None, top_k);
+            return build_text_response(&results, limit_offset, limit_count);
+        }
+        Ok(None) => { /* fall through to BM25 path */ }
+        Err(e) => return Frame::Error(Bytes::copy_from_slice(e.as_bytes())),
+    }
+
     // Use the first field's analyzer for query parsing (per D-03: all fields share same language).
     let analyzer = match text_index.field_analyzers.first() {
         Some(a) => a,
@@ -1273,6 +1405,8 @@ pub fn execute_text_search_local(
                 .map(|f| f.field_name.clone())
         }),
         terms: query_terms.to_vec(),
+        #[cfg(feature = "text-index")]
+        filter: None,
     };
     let results = execute_query_on_index(text_index, &clause, None, None, top_k);
 
@@ -1304,6 +1438,8 @@ pub fn execute_text_search_with_global_idf(
                 .map(|f| f.field_name.clone())
         }),
         terms: query_terms.to_vec(),
+        #[cfg(feature = "text-index")]
+        filter: None,
     };
     let results =
         execute_query_on_index(text_index, &clause, Some(global_df), Some(global_n), top_k);
@@ -1382,6 +1518,32 @@ pub(crate) fn execute_query_on_index(
     global_n: Option<u32>,
     top_k: usize,
 ) -> Vec<TextSearchResult> {
+    // Plan 152-06 short-circuit: FieldFilter clauses (TAG / Plan 07 numeric) bypass
+    // BM25 entirely. score=0.0; sorted ascending by doc_id for determinism.
+    #[cfg(feature = "text-index")]
+    if let Some(filter) = &clause.filter {
+        let doc_ids: Vec<u32> = match filter {
+            FieldFilter::Tag { field, value } => text_index.search_tag(field, value),
+            // Plan 07: FieldFilter::NumericRange { .. } => text_index.search_numeric_range(...),
+        };
+        let mut results: Vec<TextSearchResult> = doc_ids
+            .into_iter()
+            .take(top_k)
+            .filter_map(|doc_id| {
+                text_index
+                    .doc_id_to_key
+                    .get(&doc_id)
+                    .map(|key| TextSearchResult {
+                        doc_id,
+                        key: key.clone(),
+                        score: 0.0,
+                    })
+            })
+            .collect();
+        results.sort_by_key(|r| r.doc_id);
+        return results;
+    }
+
     // Check whether any term requires fuzzy/prefix expansion (text-index feature only).
     #[cfg(feature = "text-index")]
     let has_fuzzy_or_prefix = clause

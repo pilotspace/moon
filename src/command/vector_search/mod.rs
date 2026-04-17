@@ -44,6 +44,8 @@ pub use ft_text_search::{
     merge_text_results, parse_highlight_clause, parse_summarize_clause, parse_text_query,
     summarize_field,
 };
+#[cfg(feature = "text-index")]
+pub use ft_text_search::{FieldFilter, pre_parse_field_filter};
 pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
 pub use hybrid::{HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
 #[cfg(feature = "text-index")]

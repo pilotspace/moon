@@ -86,6 +86,8 @@ pub fn execute_hybrid_search_local_raw_streams(
     let clause = crate::command::vector_search::ft_text_search::TextQueryClause {
         field_name: None,
         terms: query_terms.to_vec(),
+        #[cfg(feature = "text-index")]
+        filter: None,
     };
     let text_results = crate::command::vector_search::ft_text_search::execute_query_on_index(
         text_index,
