@@ -46,6 +46,7 @@ except ImportError as e:
 
 from ..client import MoonClient
 from ..types import SearchResult, TextSearchHit, encode_vector
+from ._hybrid_parse import hydrate_hits_content
 
 # Valid search_type values accepted by MoonVectorStore.similarity_search /
 # MoonVectorStore.as_retriever. Listed here so the ValueError message stays in
@@ -331,9 +332,20 @@ class MoonVectorStore(VectorStore):
         hybrid_weights: tuple[float, float, float],
         k_per_stream: int | None,
     ) -> list[tuple[Document, float]]:
-        """BM25 + dense [+ sparse] hybrid fused server-side via RRF."""
+        """BM25 + dense [+ sparse] hybrid fused server-side via RRF.
+
+        Plan 153-04 (Gap 2 + Gap 3 + Gap 5 fix):
+          * Calls the public ``hybrid_search(return_stream_hits=True)``
+            kwarg (no private ``_build_hybrid_args`` coupling).
+          * Hydrates empty ``hit.fields`` via ``hydrate_hits_content``
+            (safe-fallback contract: populated fields bypass HGETALL).
+          * Surfaces ``stream_hits`` from BOTH the server trailer AND any
+            per-hit ``__bm25_score__`` / ``__dense_score__`` /
+            ``__sparse_score__`` markers (trailer wins on conflict —
+            WARNING 6 two-source resolution).
+        """
         vector = self._embedding.embed_query(query)
-        hits: list[TextSearchHit] = self._client.text.hybrid_search(
+        result = self._client.text.hybrid_search(
             self._index_name,
             query,
             vector=vector,
@@ -341,8 +353,21 @@ class MoonVectorStore(VectorStore):
             weights=hybrid_weights,
             k_per_stream=k_per_stream,
             limit=k,
+            return_stream_hits=True,
         )
-        return [(self._hit_to_document(h), h.score) for h in hits]
+        # Public contract with return_stream_hits=True → (hits, trailer).
+        # Defensive: if the caller (mock) returns a plain list, wrap it.
+        if isinstance(result, tuple) and len(result) == 2:
+            hits, stream_trailer = result
+        else:
+            hits = result  # type: ignore[assignment]
+            stream_trailer = {}
+
+        hits = hydrate_hits_content(self._client, hits)  # type: ignore[arg-type]
+        return [
+            (self._hit_to_document(h, stream_trailer=stream_trailer), h.score)
+            for h in hits
+        ]
 
     # -- Hit -> Document converters ------------------------------------------
 
@@ -390,13 +415,29 @@ class MoonVectorStore(VectorStore):
             metadata["stream_hits"] = stream_hits
         return Document(page_content=content, metadata=metadata)
 
-    def _hit_to_document(self, hit: TextSearchHit) -> Document:
-        """Convert a hybrid/text :class:`TextSearchHit` to a LangChain Document."""
-        content, metadata, stream_hits = self._split_metadata(hit.fields)
+    def _hit_to_document(
+        self,
+        hit: TextSearchHit,
+        *,
+        stream_trailer: dict[str, int] | dict[str, float] | None = None,
+    ) -> Document:
+        """Convert a hybrid/text :class:`TextSearchHit` to a LangChain Document.
+
+        Plan 153-04 (WARNING 6 two-source stream_hits resolution):
+          1. Non-empty ``stream_trailer`` (from server response trailer)
+             wins — surfaced as ``metadata["stream_hits"]`` verbatim.
+          2. Fall back to per-hit ``__bm25_score__``/``__dense_score__``/
+             ``__sparse_score__`` markers extracted by ``_split_metadata``.
+          3. If neither source is populated, omit ``stream_hits`` entirely.
+        """
+        content, metadata, per_hit_stream = self._split_metadata(hit.fields)
         metadata["key"] = hit.id
         metadata["score"] = hit.score
-        if stream_hits:
-            metadata["stream_hits"] = stream_hits
+        if stream_trailer:
+            # Trailer wins on conflict — server's authoritative counts.
+            metadata["stream_hits"] = dict(stream_trailer)
+        elif per_hit_stream:
+            metadata["stream_hits"] = per_hit_stream
         return Document(page_content=content, metadata=metadata)
 
     def similarity_search_by_vector(

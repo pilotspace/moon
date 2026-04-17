@@ -56,9 +56,28 @@ def li_deps() -> None:
 # -- Helpers -----------------------------------------------------------------
 
 
+def _normalise_hybrid_return(value: Any) -> tuple[Any, Any]:  # noqa: ANN401 -- mock duck-type
+    """Shape-absorber for the ``hybrid_search`` mock return value (B-01 iter-3).
+
+    Plan 153-04 switches the adapters to call
+    ``client.text.hybrid_search(..., return_stream_hits=True)`` which returns
+    a 2-tuple ``(hits, trailer_dict)``. Pre-existing test call sites pass
+    ``hybrid_return=[hit, ...]`` as a plain list. This helper wraps a list
+    into ``(list, {})``, passes 2-tuples through verbatim, and turns ``None``
+    into ``([], {})``. Centralising here keeps the 21 existing call sites
+    (lines 120, 133, 154, 173, 200, 227, 261, 276, 293, 318, 337, 370, 389,
+    406, 442, 516, 530, 541, 563, 578, 600) byte-for-byte unchanged.
+    """
+    if value is None:
+        return ([], {})
+    if isinstance(value, tuple) and len(value) == 2:
+        return value
+    return (value, {})
+
+
 def _build_langchain_store(
     *,
-    hybrid_return: list[Any] | None = None,
+    hybrid_return: Any = None,  # noqa: ANN401 -- list or pre-wrapped 2-tuple
     embedding_dim: int = 4,
 ) -> tuple[Any, MagicMock, MagicMock]:
     """Construct a LangChain MoonVectorStore wired to mocks."""
@@ -69,7 +88,7 @@ def _build_langchain_store(
 
     mock_client = MagicMock()
     mock_client.text = MagicMock()
-    mock_client.text.hybrid_search.return_value = hybrid_return or []
+    mock_client.text.hybrid_search.return_value = _normalise_hybrid_return(hybrid_return)
 
     with patch.object(MoonVectorStore, "_ensure_index"):
         store = MoonVectorStore(
@@ -85,7 +104,7 @@ def _build_langchain_store(
 
 def _build_llamaindex_store(
     *,
-    hybrid_return: list[Any] | None = None,
+    hybrid_return: Any = None,  # noqa: ANN401 -- list or pre-wrapped 2-tuple
     text_return: list[Any] | None = None,
     embedding_dim: int = 4,
 ) -> tuple[Any, MagicMock]:
@@ -94,7 +113,7 @@ def _build_llamaindex_store(
 
     mock_client = MagicMock()
     mock_client.text = MagicMock()
-    mock_client.text.hybrid_search.return_value = hybrid_return or []
+    mock_client.text.hybrid_search.return_value = _normalise_hybrid_return(hybrid_return)
     mock_client.text.text_search.return_value = text_return or []
 
     with patch.object(MoonVectorStore, "_ensure_client", return_value=mock_client), \
@@ -663,3 +682,376 @@ class TestLlamaIndexHybridMode:
         user_client.vector.search.assert_not_called()
         assert len(result.nodes) == 1
         assert result.nodes[0].text == "answer"
+
+
+# =============================================================================
+# Plan 153-04 — Hybrid parser bug fixes (Gap 2 / Gap 3 / Gap 5)
+# =============================================================================
+
+
+class TestLangChainHybridHydration:
+    """Gap 2 + Gap 3 — LangChain hybrid must hydrate page_content + return k docs."""
+
+    def test_hybrid_hydrates_via_hgetall_when_fields_empty(self, lc_deps: None) -> None:
+        """Empty hit.fields → adapter HGETALLs content via the pipeline helper."""
+        from moondb.types import TextSearchHit
+
+        hits = [
+            TextSearchHit(id="doc:1", score=0.5, fields={}),
+            TextSearchHit(id="doc:2", score=0.3, fields={}),
+        ]
+        store, mock_client, _ = _build_langchain_store(hybrid_return=hits)
+
+        # Stub the pipelined HGETALL: one dict per queued hit.
+        pipe = mock_client.pipeline.return_value
+        pipe.execute.return_value = [
+            {b"content": b"Hello", b"metadata_src": b"a"},
+            {b"content": b"World", b"metadata_src": b"b"},
+        ]
+
+        docs = store.similarity_search("q", k=2, search_type="hybrid")
+
+        assert len(docs) == 2
+        assert docs[0].page_content == "Hello"
+        assert docs[1].page_content == "World"
+        assert docs[0].metadata["src"] == "a"
+        assert docs[1].metadata["src"] == "b"
+
+    def test_hybrid_returns_exactly_k_documents(self, lc_deps: None) -> None:
+        """Three hits with populated fields → exactly 3 docs (Gap 3 k+3 fix)."""
+        from moondb.types import TextSearchHit
+
+        hits = [
+            TextSearchHit(id=f"doc:{i}", score=0.5 - i * 0.1, fields={"content": f"c{i}"})
+            for i in range(3)
+        ]
+        store, _, _ = _build_langchain_store(hybrid_return=hits)
+
+        docs = store.similarity_search("q", k=3, search_type="hybrid")
+
+        assert len(docs) == 3
+
+    def test_hybrid_score_is_rrf_score(self, lc_deps: None) -> None:
+        """docs[0].metadata['score'] carries hit.score (the parsed __rrf_score)."""
+        from moondb.types import TextSearchHit
+
+        store, _, _ = _build_langchain_store(
+            hybrid_return=[
+                TextSearchHit(id="doc:1", score=0.832, fields={"content": "X"}),
+            ],
+        )
+
+        docs = store.similarity_search("q", k=1, search_type="hybrid")
+
+        assert docs[0].metadata["score"] == 0.832
+
+    def test_hybrid_populated_fields_skip_hydration(self, lc_deps: None) -> None:
+        """BLOCKER 4 lock at the adapter boundary — mock without pipeline stub stays green."""
+        from moondb.types import TextSearchHit
+
+        # Hit ALREADY has populated fields → hydrate_hits_content fast-path
+        # must NOT invoke mock_client.pipeline(). This is the iter-1
+        # safe-fallback contract at the LangChain adapter boundary.
+        store, mock_client, _ = _build_langchain_store(
+            hybrid_return=[TextSearchHit(id="doc:1", score=0.4, fields={"content": "Hi"})],
+        )
+
+        docs = store.similarity_search("q", k=1, search_type="hybrid")
+
+        assert len(docs) == 1
+        assert docs[0].page_content == "Hi"
+        mock_client.pipeline.assert_not_called()
+
+
+class TestLangChainHybridStreamHits:
+    """WARNING 6 — stream_hits surfaced from trailer AND per-hit markers."""
+
+    def test_stream_hits_from_trailer_when_present(self, lc_deps: None) -> None:
+        """Server trailer wins — explicit int counts flow through to metadata."""
+        from moondb.types import TextSearchHit
+
+        store, _, _ = _build_langchain_store(
+            hybrid_return=(
+                [TextSearchHit(id="d:1", score=0.5, fields={"content": "X"})],
+                {"bm25": 5, "dense": 4, "sparse": 0},
+            ),
+        )
+
+        docs = store.similarity_search("q", k=1, search_type="hybrid")
+
+        assert docs[0].metadata["stream_hits"] == {"bm25": 5, "dense": 4, "sparse": 0}
+
+    def test_stream_hits_from_per_hit_markers_when_trailer_empty(self, lc_deps: None) -> None:
+        """Empty trailer → fall back to per-hit __bm25_score__/__dense_score__ fields."""
+        from moondb.types import TextSearchHit
+
+        hit = TextSearchHit(
+            id="d:1",
+            score=0.5,
+            fields={
+                "content": "X",
+                "__bm25_score__": "0.45",
+                "__dense_score__": "0.32",
+            },
+        )
+        store, _, _ = _build_langchain_store(hybrid_return=[hit])
+
+        docs = store.similarity_search("q", k=1, search_type="hybrid")
+
+        stream = docs[0].metadata["stream_hits"]
+        assert math.isclose(stream["bm25"], 0.45)
+        assert math.isclose(stream["dense"], 0.32)
+
+    def test_stream_hits_trailer_wins_when_both_present(self, lc_deps: None) -> None:
+        """Trailer int counts take priority over per-hit float markers."""
+        from moondb.types import TextSearchHit
+
+        hit = TextSearchHit(
+            id="d:1",
+            score=0.5,
+            fields={
+                "content": "X",
+                "__bm25_score__": "0.45",
+                "__dense_score__": "0.32",
+            },
+        )
+        store, _, _ = _build_langchain_store(
+            hybrid_return=([hit], {"bm25": 5, "dense": 4}),
+        )
+
+        docs = store.similarity_search("q", k=1, search_type="hybrid")
+
+        # Trailer ints override per-hit floats.
+        assert docs[0].metadata["stream_hits"] == {"bm25": 5, "dense": 4}
+
+    def test_stream_hits_omitted_when_both_empty(self, lc_deps: None) -> None:
+        """No trailer + no per-hit markers → stream_hits key absent from metadata."""
+        from moondb.types import TextSearchHit
+
+        store, _, _ = _build_langchain_store(
+            hybrid_return=[TextSearchHit(id="d:1", score=0.5, fields={"content": "X"})],
+        )
+
+        docs = store.similarity_search("q", k=1, search_type="hybrid")
+
+        assert "stream_hits" not in docs[0].metadata
+
+
+class TestLlamaIndexHybridHydration:
+    """Gap 5 — LlamaIndex HYBRID must hydrate node.text + similarity from __rrf_score."""
+
+    def test_hybrid_hydrates_node_text_via_hgetall(self, li_deps: None) -> None:
+        """Empty hit.fields → adapter HGETALLs content; node.text populated."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.types import TextSearchHit
+
+        store, mock_client = _build_llamaindex_store(
+            hybrid_return=[TextSearchHit(id="node:1", score=0.5, fields={})],
+        )
+
+        pipe = mock_client.pipeline.return_value
+        pipe.execute.return_value = [
+            {b"content": b"Hello", b"_node_id": b"abc", b"meta_src": b"kb"},
+        ]
+
+        result = store.query(VectorStoreQuery(
+            query_embedding=[0.1] * 4,
+            query_str="q",
+            mode=VectorStoreQueryMode.HYBRID,
+            similarity_top_k=1,
+        ))
+
+        assert len(result.nodes) == 1
+        assert result.nodes[0].text == "Hello"
+
+    def test_hybrid_returns_exactly_k_nodes(self, li_deps: None) -> None:
+        """Three hits with populated fields → exactly 3 nodes (Gap 5 k+3 fix)."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.types import TextSearchHit
+
+        hits = [
+            TextSearchHit(id=f"n:{i}", score=0.5 - i * 0.1, fields={"content": f"c{i}"})
+            for i in range(3)
+        ]
+        store, _ = _build_llamaindex_store(hybrid_return=hits)
+
+        result = store.query(VectorStoreQuery(
+            query_embedding=[0.1] * 4,
+            query_str="q",
+            mode=VectorStoreQueryMode.HYBRID,
+            similarity_top_k=3,
+        ))
+
+        assert len(result.nodes) == 3
+
+    def test_hybrid_similarity_is_rrf_score(self, li_deps: None) -> None:
+        """result.similarities carries hit.score (parsed __rrf_score)."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.types import TextSearchHit
+
+        store, _ = _build_llamaindex_store(
+            hybrid_return=[
+                TextSearchHit(id="n:1", score=0.832, fields={"content": "X"}),
+            ],
+        )
+
+        result = store.query(VectorStoreQuery(
+            query_embedding=[0.1] * 4,
+            query_str="q",
+            mode=VectorStoreQueryMode.HYBRID,
+            similarity_top_k=1,
+        ))
+
+        assert result.similarities == [0.832]
+
+    def test_text_search_hydrates_node_text(self, li_deps: None) -> None:
+        """TEXT_SEARCH path: hits with empty fields also get HGETALL hydration."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.types import TextSearchHit
+
+        store, mock_client = _build_llamaindex_store(
+            text_return=[TextSearchHit(id="n:1", score=2.5, fields={})],
+        )
+
+        pipe = mock_client.pipeline.return_value
+        pipe.execute.return_value = [
+            {b"content": b"from_hgetall", b"_node_id": b"abc"},
+        ]
+
+        result = store.query(VectorStoreQuery(
+            query_str="q",
+            mode=VectorStoreQueryMode.TEXT_SEARCH,
+            similarity_top_k=1,
+        ))
+
+        assert result.nodes[0].text == "from_hgetall"
+
+    def test_hybrid_stream_hits_from_per_hit_markers_preserved(self, li_deps: None) -> None:
+        """WARNING 6 lock — LlamaIndex hybrid surfaces per-hit markers when trailer empty."""
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+        )
+
+        from moondb.types import TextSearchHit
+
+        hit = TextSearchHit(
+            id="n:1",
+            score=0.5,
+            fields={
+                "content": "X",
+                "__bm25_score__": "0.5",
+                "__dense_score__": "0.7",
+            },
+        )
+        store, _ = _build_llamaindex_store(hybrid_return=[hit])
+
+        result = store.query(VectorStoreQuery(
+            query_embedding=[0.1] * 4,
+            query_str="q",
+            mode=VectorStoreQueryMode.HYBRID,
+            similarity_top_k=1,
+        ))
+
+        stream = result.nodes[0].metadata["stream_hits"]
+        assert math.isclose(stream["bm25"], 0.5)
+        assert math.isclose(stream["dense"], 0.7)
+
+
+class TestHybridRegressionGuard:
+    """BLOCKER 4 — hydrate_hits_content safe-fallback preserves populated fields."""
+
+    def test_hydrate_hits_preserves_populated_fields(self) -> None:
+        """All hits have fields → fast-path returns list verbatim, no pipeline call."""
+        from moondb.integrations._hybrid_parse import hydrate_hits_content
+        from moondb.types import TextSearchHit
+
+        mock_client = MagicMock()
+        hits = [TextSearchHit(id="x", score=1.0, fields={"content": "Hi"})]
+
+        out = hydrate_hits_content(mock_client, hits)
+
+        assert out[0].fields == {"content": "Hi"}
+        mock_client.pipeline.assert_not_called()
+
+    def test_hydrate_empty_list(self) -> None:
+        """hydrate_hits_content([]) → []."""
+        from moondb.integrations._hybrid_parse import hydrate_hits_content
+
+        out = hydrate_hits_content(MagicMock(), [])
+        assert out == []
+
+    def test_hydrate_pipeline_shape_mismatch_falls_back(self) -> None:
+        """pipe.execute() returns non-list → keep originals unchanged (BLOCKER 4 #3)."""
+        from moondb.integrations._hybrid_parse import hydrate_hits_content
+        from moondb.types import TextSearchHit
+
+        mock_client = MagicMock()
+        pipe = mock_client.pipeline.return_value
+        # Non-list return from execute() (realistic MagicMock default shape).
+        pipe.execute.return_value = MagicMock()
+
+        hits = [TextSearchHit(id="x", score=1.0, fields={})]
+        out = hydrate_hits_content(mock_client, hits)
+
+        assert out == hits
+
+    def test_hydrate_server_fields_win_over_hgetall(self) -> None:
+        """hit.fields with content → fast-path short-circuits; stays unchanged."""
+        from moondb.integrations._hybrid_parse import hydrate_hits_content
+        from moondb.types import TextSearchHit
+
+        mock_client = MagicMock()
+        hit = TextSearchHit(id="x", score=1.0, fields={"content": "original"})
+
+        out = hydrate_hits_content(mock_client, [hit])
+
+        assert out[0].fields["content"] == "original"
+        mock_client.pipeline.assert_not_called()
+
+
+class TestHybridHelperContract:
+    """B-01 iter-3 — lock the _normalise_hybrid_return shape absorber."""
+
+    def test_build_langchain_store_wraps_list_into_two_tuple(self, lc_deps: None) -> None:
+        """Passing a list hybrid_return → mock returns (list, {}) 2-tuple."""
+        from moondb.types import TextSearchHit
+
+        _, mock_client, _ = _build_langchain_store(
+            hybrid_return=[TextSearchHit(id="d:1", score=1.0, fields={"content": "X"})],
+        )
+        assigned = mock_client.text.hybrid_search.return_value
+
+        assert isinstance(assigned, tuple)
+        assert len(assigned) == 2
+        assert isinstance(assigned[0], list)
+        assert len(assigned[0]) == 1
+        assert assigned[1] == {}
+
+    def test_build_llamaindex_store_passes_through_prewrapped_two_tuple(
+        self, li_deps: None
+    ) -> None:
+        """Passing a pre-wrapped 2-tuple → mock returns it verbatim."""
+        from moondb.types import TextSearchHit
+
+        hits = [TextSearchHit(id="n:1", score=0.5, fields={"content": "Y"})]
+        trailer = {"bm25": 3, "dense": 2}
+        _, mock_client = _build_llamaindex_store(hybrid_return=(hits, trailer))
+
+        assert mock_client.text.hybrid_search.return_value == (hits, trailer)

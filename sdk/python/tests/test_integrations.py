@@ -118,9 +118,13 @@ class TestLangChainAdapter:
 
         mock_client = MagicMock()
         mock_client.text = MagicMock()
-        mock_client.text.hybrid_search.return_value = [
-            TextSearchHit(id="doc:1", score=5.0, fields={"content": "Hi"}),
-        ]
+        # Plan 153-04: hybrid_search(return_stream_hits=True) returns a
+        # 2-tuple (hits, trailer_dict). Adapter unpacks; empty trailer →
+        # no stream_hits metadata emitted.
+        mock_client.text.hybrid_search.return_value = (
+            [TextSearchHit(id="doc:1", score=5.0, fields={"content": "Hi"})],
+            {},
+        )
 
         with patch.object(MoonVectorStore, "_ensure_index"):
             store = MoonVectorStore(
@@ -251,13 +255,19 @@ class TestLlamaIndexAdapter:
 
         mock_client = MagicMock()
         mock_client.text = MagicMock()
-        mock_client.text.hybrid_search.return_value = [
-            TextSearchHit(
-                id="node:2",
-                score=8.5,
-                fields={"content": "World", "_node_id": "xyz", "meta_src": "q"},
-            ),
-        ]
+        # Plan 153-04: hybrid_search(return_stream_hits=True) returns a
+        # 2-tuple (hits, trailer_dict). Empty trailer → no stream_hits
+        # leakage into node.metadata.
+        mock_client.text.hybrid_search.return_value = (
+            [
+                TextSearchHit(
+                    id="node:2",
+                    score=8.5,
+                    fields={"content": "World", "_node_id": "xyz", "meta_src": "q"},
+                ),
+            ],
+            {},
+        )
 
         with patch.object(MoonVectorStore, "_ensure_client", return_value=mock_client), \
              patch.object(MoonVectorStore, "_ensure_index"):

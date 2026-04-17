@@ -48,6 +48,7 @@ from pydantic import PrivateAttr
 
 from ..client import MoonClient
 from ..types import SearchResult, TextSearchHit, encode_vector
+from ._hybrid_parse import hydrate_hits_content
 
 # Stream-score field markers emitted by the server-side hybrid path
 # (mirrors src/command/vector_search/hybrid.rs). When present on a
@@ -347,7 +348,18 @@ class MoonVectorStore(BasePydanticVectorStore):
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
 
     def _query_hybrid(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
-        """BM25 + dense (+ optional sparse) RRF fusion via Plan 01 TextCommands."""
+        """BM25 + dense (+ optional sparse) RRF fusion via Plan 01 TextCommands.
+
+        Plan 153-04 (Gap 5 fix):
+          * Calls ``hybrid_search(return_stream_hits=True)`` and unpacks the
+            public 2-tuple contract.
+          * Hydrates empty ``hit.fields`` via ``hydrate_hits_content`` so
+            ``node.text`` is populated even when the server only returned
+            ``[key, [__rrf_score, "…"]]`` pairs.
+          * Propagates the server trailer into ``_hits_to_result`` so
+            ``metadata["stream_hits"]`` honours the trailer-wins rule
+            (WARNING 6 two-source resolution).
+        """
         if query.query_embedding is None or not (query.query_str or "").strip():
             raise ValueError(
                 "HYBRID mode requires both query_embedding and query_str"
@@ -357,7 +369,7 @@ class MoonVectorStore(BasePydanticVectorStore):
         k = query.similarity_top_k or 10
         weights = self._resolve_hybrid_weights(query)
 
-        hits = client.text.hybrid_search(
+        result = client.text.hybrid_search(
             self.index_name,
             query.query_str or "",
             vector=query.query_embedding,
@@ -365,11 +377,23 @@ class MoonVectorStore(BasePydanticVectorStore):
             weights=weights,
             k_per_stream=self.hybrid_k_per_stream,
             limit=k,
+            return_stream_hits=True,
         )
-        return self._hits_to_result(hits)
+        if isinstance(result, tuple) and len(result) == 2:
+            hits, stream_trailer = result
+        else:
+            hits = result  # type: ignore[assignment]
+            stream_trailer = {}
+
+        hits = hydrate_hits_content(client, hits)  # type: ignore[arg-type]
+        return self._hits_to_result(hits, stream_trailer=stream_trailer)
 
     def _query_text(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
-        """BM25-only path via Plan 01 TextCommands.text_search."""
+        """BM25-only path via Plan 01 TextCommands.text_search.
+
+        Plan 153-04 (Gap 5 parity): hydrate empty ``hit.fields`` via HGETALL
+        so node.text is populated for live-server responses.
+        """
         text = (query.query_str or "").strip()
         if not text:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
@@ -377,6 +401,7 @@ class MoonVectorStore(BasePydanticVectorStore):
         client = self._ensure_client()
         k = query.similarity_top_k or 10
         hits = client.text.text_search(self.index_name, text, limit=k)
+        hits = hydrate_hits_content(client, hits)
         return self._hits_to_result(hits)
 
     # -- Hybrid weight resolution -------------------------------------------
@@ -406,17 +431,25 @@ class MoonVectorStore(BasePydanticVectorStore):
     def _hits_to_result(
         self,
         hits: list[TextSearchHit],
+        *,
+        stream_trailer: dict[str, int] | dict[str, float] | None = None,
     ) -> VectorStoreQueryResult:
         """Convert ``TextSearchHit`` list (text/hybrid) to a query result.
 
         BM25 / RRF scores are already similarity-shaped (higher = better),
         so they pass through verbatim — no ``1/(1+d)`` inversion (D-09).
+
+        Plan 153-04 ``stream_trailer`` kwarg: when the server response
+        carried a ``bm25_hits`` / ``dense_hits`` / ``sparse_hits`` trailer,
+        the parser surfaces it here so every node's metadata reflects the
+        SAME authoritative counts. Absent trailer → per-hit marker fallback
+        inside :meth:`_hit_to_node` (WARNING 6 two-source resolution).
         """
         nodes: list[TextNode] = []
         similarities: list[float] = []
         ids: list[str] = []
         for hit in hits:
-            node = self._hit_to_node(hit)
+            node = self._hit_to_node(hit, stream_trailer=stream_trailer)
             nodes.append(node)
             similarities.append(hit.score)
             ids.append(node.id_)
@@ -469,11 +502,27 @@ class MoonVectorStore(BasePydanticVectorStore):
             metadata=metadata,
         )
 
-    def _hit_to_node(self, hit: TextSearchHit) -> TextNode:
-        """Build a :class:`TextNode` from a hybrid/text :class:`TextSearchHit`."""
-        text, node_id, metadata, stream_hits = self._split_metadata(hit.fields)
-        if stream_hits:
-            metadata["stream_hits"] = stream_hits
+    def _hit_to_node(
+        self,
+        hit: TextSearchHit,
+        *,
+        stream_trailer: dict[str, int] | dict[str, float] | None = None,
+    ) -> TextNode:
+        """Build a :class:`TextNode` from a hybrid/text :class:`TextSearchHit`.
+
+        Plan 153-04 WARNING 6 two-source resolution:
+          1. Non-empty ``stream_trailer`` (from server trailer) wins —
+             surfaces as ``metadata["stream_hits"]`` verbatim.
+          2. Falls back to per-hit ``__bm25_score__``/``__dense_score__``/
+             ``__sparse_score__`` markers extracted by ``_split_metadata``.
+          3. Neither source populated → ``stream_hits`` key is omitted.
+        """
+        text, node_id, metadata, per_hit_stream = self._split_metadata(hit.fields)
+        if stream_trailer:
+            # Trailer wins — authoritative counts from the server response.
+            metadata["stream_hits"] = dict(stream_trailer)
+        elif per_hit_stream:
+            metadata["stream_hits"] = per_hit_stream
         return TextNode(
             text=text,
             id_=node_id or hit.id,
