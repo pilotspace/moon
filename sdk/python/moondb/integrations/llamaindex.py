@@ -44,6 +44,8 @@ except ImportError as e:
         "Install with: pip install moondb[llamaindex]"
     ) from e
 
+from pydantic import PrivateAttr
+
 from ..client import MoonClient
 from ..types import SearchResult, TextSearchHit, encode_vector
 
@@ -101,16 +103,36 @@ class MoonVectorStore(BasePydanticVectorStore):
     hybrid_weights: tuple[float, float, float] = (1.0, 1.0, 0.0)
     hybrid_k_per_stream: int | None = None
 
-    # Private client (not serialized)
-    _client: MoonClient | None = None
+    # Private client (not serialized). Canonical pydantic-v2 private-attr
+    # declaration: writes via ``self._client = ...`` route through the
+    # pydantic descriptor into ``self.__pydantic_private__["_client"]``,
+    # and ``model_dump()`` excludes the attribute by construction.
+    _client: MoonClient | None = PrivateAttr(default=None)
 
     # Pydantic v2 model config (replaces deprecated class-based Config) —
     # MoonClient is not a pydantic model, so allow arbitrary types.
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401 -- pydantic init contract
+        # Pop the non-declared ``moon_client`` kwarg BEFORE ``super().__init__``.
+        # BasePydanticVectorStore uses strict field validation; if we let
+        # pydantic see a live MoonClient under an undeclared key it would
+        # raise "extra input not permitted". This also prevents the client
+        # from ever touching the serialisable model state (T-153-05-02).
+        #
+        # NOTE: this is an ``__init__`` override, NOT a ``model_post_init``
+        # hook — ``model_post_init(self, __context)`` cannot see popped
+        # kwargs. ``__context`` carries only the ``context=`` dict from
+        # ``model_validate(..., context=...)`` calls.
+        client = kwargs.pop("moon_client", None)
         super().__init__(**kwargs)
-        self._client = None
+        # PrivateAttr storage: direct assignment after ``super().__init__``
+        # routes through the pydantic descriptor into
+        # ``self.__pydantic_private__["_client"]``. Preserves the caller-
+        # supplied client so ``_ensure_client()`` short-circuits to it
+        # instead of rebuilding one from the default ``moon_url``.
+        if client is not None:
+            self._client = client
         self._ensure_client()
         self._ensure_index()
 
