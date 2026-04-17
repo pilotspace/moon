@@ -176,7 +176,7 @@ impl CsrSegment {
 
         let header = GraphSegmentHeader {
             magic: *b"MNGR",
-            version: 1,
+            version: 2,
             node_count: node_count as u32,
             edge_count: edge_count as u32,
             min_node_id,
@@ -384,13 +384,15 @@ impl CsrSegment {
             buf.extend_from_slice(&em.property_offset.to_le_bytes());
         }
 
-        // Write node_meta.
+        // Write node_meta (version 2: 48 bytes per entry with bi-temporal fields).
         for nm in &self.node_meta {
             buf.extend_from_slice(&nm.external_id.to_le_bytes());
             buf.extend_from_slice(&nm.label_bitmap.to_le_bytes());
             buf.extend_from_slice(&nm.property_offset.to_le_bytes());
             buf.extend_from_slice(&nm.created_lsn.to_le_bytes());
             buf.extend_from_slice(&nm.deleted_lsn.to_le_bytes());
+            buf.extend_from_slice(&nm.valid_from.to_le_bytes());
+            buf.extend_from_slice(&nm.valid_to.to_le_bytes());
         }
 
         // Compute CRC32 over the entire buffer (with checksum field zeroed),
@@ -439,7 +441,9 @@ impl CsrSegment {
         let nc = node_count as usize;
         let ec = edge_count as usize;
         let em_elem_size = core::mem::size_of::<EdgeMeta>(); // 8
-        let nm_elem_size = core::mem::size_of::<NodeMeta>(); // 32
+        // Version 1: 32-byte NodeMeta (no bi-temporal fields).
+        // Version 2+: 48-byte NodeMeta (includes valid_from and valid_to).
+        let nm_elem_size: usize = if version >= 2 { 48 } else { 32 };
 
         // Use checked arithmetic to prevent integer overflow from attacker-controlled
         // node_count/edge_count values bypassing the size validation.
@@ -520,6 +524,8 @@ impl CsrSegment {
         }
 
         // Parse node_meta.
+        // Version 1: 32-byte records — zero-fill valid_from=0, valid_to=i64::MAX.
+        // Version 2+: 48-byte records — read valid_from and valid_to from bytes.
         let mut node_meta = Vec::with_capacity(nc);
         for _ in 0..nc {
             let external_id = u64::from_le_bytes(read8(data, pos)?);
@@ -527,14 +533,22 @@ impl CsrSegment {
             let property_offset = u32::from_le_bytes(read4(data, pos + 12)?);
             let nm_created_lsn = u64::from_le_bytes(read8(data, pos + 16)?);
             let deleted_lsn = u64::from_le_bytes(read8(data, pos + 24)?);
+            let (valid_from, valid_to) = if version >= 2 {
+                let vf = i64::from_le_bytes(read8(data, pos + 32)?);
+                let vt = i64::from_le_bytes(read8(data, pos + 40)?);
+                (vf, vt)
+            } else {
+                // Version 1 migration: zero-fill with open-ended defaults.
+                (0i64, i64::MAX)
+            };
             node_meta.push(NodeMeta {
                 external_id,
                 label_bitmap,
                 property_offset,
                 created_lsn: nm_created_lsn,
                 deleted_lsn,
-                valid_from: 0,
-                valid_to: i64::MAX,
+                valid_from,
+                valid_to,
             });
             pos += nm_elem_size;
         }
@@ -674,7 +688,7 @@ mod tests {
         assert_eq!(csr.node_count(), 5);
         assert_eq!(csr.edge_count(), 10);
         assert_eq!(csr.header.magic, *b"MNGR");
-        assert_eq!(csr.header.version, 1);
+        assert_eq!(csr.header.version, 2);
     }
 
     #[test]
@@ -732,7 +746,7 @@ mod tests {
         // Read back header fields.
         assert_eq!(&bytes[0..4], b"MNGR");
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let nc = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
         assert_eq!(nc, 5);
         let ec = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
@@ -886,7 +900,7 @@ mod tests {
         let restored = CsrSegment::from_bytes(&bytes).expect("from_bytes ok");
 
         assert_eq!(restored.header.magic, *b"MNGR");
-        assert_eq!(restored.header.version, 1);
+        assert_eq!(restored.header.version, 2);
         assert_eq!(restored.node_count(), original.node_count());
         assert_eq!(restored.edge_count(), original.edge_count());
         assert_eq!(restored.created_lsn, 42);
@@ -1067,5 +1081,133 @@ mod tests {
         assert!(matches!(storage, CsrStorage::Heap(_)));
         assert_eq!(storage.node_count(), 5);
         assert_eq!(storage.edge_count(), 10);
+    }
+
+    // --- Phase 158: CSR v2 bi-temporal migration tests ---
+
+    #[test]
+    fn test_csr_v1_migration_zero_fill() {
+        // Build a v2 CSR, serialize to bytes, then manually construct v1-format
+        // bytes by: patching version to 1, truncating each NodeMeta from 48 to
+        // 32 bytes (dropping valid_from/valid_to), and recomputing the CRC.
+        let frozen = build_small_graph();
+        let csr = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
+        let v2_bytes = csr.to_bytes();
+
+        // Verify it is version 2.
+        let ver = u32::from_le_bytes(v2_bytes[4..8].try_into().expect("4 bytes"));
+        assert_eq!(ver, 2);
+
+        let header_size = core::mem::size_of::<GraphSegmentHeader>(); // 128
+        let nc = csr.node_count() as usize;
+        let ec = csr.edge_count() as usize;
+        let em_elem_size = core::mem::size_of::<EdgeMeta>(); // 8
+
+        // Compute offsets into the v2 buffer.
+        let ro_size = (nc + 1) * 4;
+        let ci_size = ec * 4;
+        let em_size = ec * em_elem_size;
+        let nm_v2_elem = 48usize;
+        let nm_v1_elem = 32usize;
+
+        let nm_start = header_size + ro_size + ci_size + em_size;
+
+        // Build v1 bytes: header + arrays (ro + ci + em) + truncated node_meta.
+        let mut v1_bytes = Vec::with_capacity(nm_start + nc * nm_v1_elem);
+        // Copy everything up to node_meta unchanged.
+        v1_bytes.extend_from_slice(&v2_bytes[..nm_start]);
+
+        // For each NodeMeta, copy only the first 32 bytes (skip valid_from/valid_to).
+        for i in 0..nc {
+            let offset = nm_start + i * nm_v2_elem;
+            v1_bytes.extend_from_slice(&v2_bytes[offset..offset + nm_v1_elem]);
+        }
+
+        // Patch version field at offset 4 from 2 to 1.
+        v1_bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+        // Recompute CRC with checksum field zeroed.
+        v1_bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = compute_csr_checksum(&v1_bytes) as u64;
+        v1_bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
+
+        // Load v1 bytes via from_bytes -- should succeed with zero-fill migration.
+        let restored = CsrSegment::from_bytes(&v1_bytes).expect("v1 migration ok");
+        assert_eq!(restored.header.version, 1);
+        assert_eq!(restored.node_count(), csr.node_count());
+        assert_eq!(restored.edge_count(), csr.edge_count());
+
+        // All node_meta entries must have valid_from=0, valid_to=i64::MAX.
+        for (i, nm) in restored.node_meta.iter().enumerate() {
+            assert_eq!(nm.valid_from, 0, "node {i} valid_from should be 0");
+            assert_eq!(nm.valid_to, i64::MAX, "node {i} valid_to should be i64::MAX");
+            // Original fields must be preserved.
+            assert_eq!(nm.external_id, csr.node_meta[i].external_id);
+            assert_eq!(nm.label_bitmap, csr.node_meta[i].label_bitmap);
+            assert_eq!(nm.created_lsn, csr.node_meta[i].created_lsn);
+            assert_eq!(nm.deleted_lsn, csr.node_meta[i].deleted_lsn);
+        }
+
+        // Neighbor queries still work after v1 migration.
+        for row in 0..restored.node_count() {
+            assert_eq!(restored.neighbors_out(row), csr.neighbors_out(row));
+        }
+    }
+
+    #[test]
+    fn test_csr_v2_temporal_roundtrip() {
+        // Create a graph with nodes, set non-default valid_from/valid_to,
+        // freeze, build CSR, serialize, deserialize, and verify temporal
+        // fields survive the roundtrip.
+        let mut g = MemGraph::new(100);
+        let mut nodes = Vec::new();
+        for i in 0..3u16 {
+            nodes.push(g.add_node(smallvec![i], smallvec![], None, 1));
+        }
+        // Set non-default temporal values on the mutable nodes.
+        for (idx, nk) in nodes.iter().enumerate() {
+            if let Some(node) = g.get_node_mut(*nk) {
+                node.valid_from = 1000 + idx as i64;
+                node.valid_to = 9000 + idx as i64;
+            }
+        }
+        // Add edges so CSR has something to serialize.
+        g.add_edge(nodes[0], nodes[1], 1, 1.0, None, 2).expect("ok");
+        g.add_edge(nodes[1], nodes[2], 1, 1.0, None, 2).expect("ok");
+
+        let frozen = g.freeze().expect("freeze ok");
+        let csr = CsrSegment::from_frozen(frozen, 50).expect("csr ok");
+        assert_eq!(csr.header.version, 2);
+
+        // Verify from_frozen propagated temporal fields.
+        // Note: sorted_nodes order may differ from insertion order,
+        // so verify by external_id -> temporal field mapping.
+        let temporal_map: std::collections::HashMap<u64, (i64, i64)> = csr
+            .node_meta
+            .iter()
+            .map(|nm| (nm.external_id, (nm.valid_from, nm.valid_to)))
+            .collect();
+        // At least one node should have non-default temporal values.
+        let has_nondefault = temporal_map
+            .values()
+            .any(|(vf, vt)| *vf != 0 || *vt != i64::MAX);
+        assert!(has_nondefault, "expected non-default temporal values from from_frozen");
+
+        // Serialize and deserialize.
+        let bytes = csr.to_bytes();
+        let restored = CsrSegment::from_bytes(&bytes).expect("roundtrip ok");
+        assert_eq!(restored.header.version, 2);
+
+        // Verify temporal fields survive roundtrip.
+        for (i, nm) in restored.node_meta.iter().enumerate() {
+            assert_eq!(
+                nm.valid_from, csr.node_meta[i].valid_from,
+                "node {i} valid_from mismatch"
+            );
+            assert_eq!(
+                nm.valid_to, csr.node_meta[i].valid_to,
+                "node {i} valid_to mismatch"
+            );
+        }
     }
 }
